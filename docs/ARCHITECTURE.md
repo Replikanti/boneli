@@ -314,6 +314,21 @@ All code is Rust. Dependencies are guarded by an allowlist in the workspace and 
 - **Agent:** Claude Code is a Node binary inside the sandbox, not part of our code. Our own harness in Rust will come as another adapter.
 - **Control plane:** multi-tenant Postgres and many connections. We will choose the async runtime and the Postgres client when we get there.
 
+## Repositories and what stays private
+
+Everything that runs at the customer is open source. Everything that makes up the service, including prompts and benchmark cases, stays private.
+
+| Repository | Visibility | Contents |
+| --- | --- | --- |
+| `Replikanti/boneli` | public, Apache 2.0 | Cargo workspace: domain, application, ports, sandbox runtime, shim, gateway, egress, adapters, runner binary, CLI, bench harness, playbook format |
+| `Replikanti/boneli-cloud` | private | control plane, UI, billing, agent prompts and playbooks, benchmark cases, hosted runner deployment |
+
+- `boneli-cloud` depends on the public crates through a git dependency pinned to a tag, so the domain and ports live in one place.
+- **Prompts and playbooks** are not part of the runner. The runner receives them from the control plane with each job and keeps them in memory only. Stored transcripts replace the playbook text with its id and version hash. Before the control plane exists, the CLI loads them from a local checkout of the private repository.
+- **Benchmark cases** are private, because published cases end up in the training data of future models and contaminate the benchmark. The harness is public; only results are published.
+- **Limit:** in the hybrid tier the agent has to read the prompts in plain text on the customer's machine. Protection there is contractual: the terms prohibit extracting them.
+- **Contributions** to the public repository only under a CLA, to keep the option to relicense.
+
 ## First stack: TypeScript/Node and Postgres
 
 The core does not depend on the stack. Only the env builder and case builder adapters do.
