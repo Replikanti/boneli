@@ -1,0 +1,13 @@
+[package]
+name = "boneli-store-mem"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "../../../outside/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]

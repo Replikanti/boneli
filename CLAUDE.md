@@ -26,11 +26,34 @@ harness. Rust workspace, hexagonal architecture. Public repository
 2. **Core purity** (domain, app): no external dependencies, no wall clock,
    filesystem, network, environment, threads, processes, async or
    `HashMap`/`HashSet`. Runs replay deterministically from the event log.
-3. **Pure Rust, minimal dependencies:** external crates only from the
-   per-crate allowlist in `tools/check-architecture.sh`; the "do not use"
-   list is enforced in `deny.toml`. Widening either needs an ADR.
+   Both crates are `#![no_std]` with `alloc` and must build for
+   `x86_64-unknown-none`; a token scan covers what `no_std` cannot remove
+   (async, `core::arch`, atomics, pointer addresses, format specs that end
+   in `p` in any file of the package and after escapes, `concat`,
+   `stringify`, `env`, `option_env`, glob imports from `fmt`, `use` items
+   built from macro metavariables, `core::task` and its wakers, `{` or `}`
+   in core file paths, `include_str!` paths that are absolute or contain
+   `..` or a backslash). The scan is a best-effort first layer; the gate for address
+   leaks is the two-process replay tests of #2 (domain) and #3 (app),
+   decided at STOP 2 of #28. Dependency `cfg`s of core crates are also
+   evaluated on `x86_64-unknown-none` (ADR-001).
+3. **Pure Rust, minimal dependencies:** every edge into an external crate,
+   transitive ones included, needs a record with a reason in
+   `tools/architecture.toml`; a new crate name needs an ADR or a row in
+   ARCHITECTURE, and every edge into `libc` needs its own accepted ADR that
+   names it. Edges count unless their `cfg` is false on every checked Linux
+   target (x86_64 and aarch64, gnu and musl); flag-dependent cfgs such as
+   `crt-static` count as true. Sources are crates.io only; path dependencies
+   point to members. The "do not use" list is enforced in `deny.toml`.
+   Widening either needs an ADR (ADR-001).
 4. **Unsafe only in `boneli-sys`.** Every other crate inherits the workspace
-   lints, which forbid it.
+   lints, which forbid it; the check also scans every other crate for the
+   `unsafe` token and requires the doctest attribute
+   `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. No
+   `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
+   `#[path]`, `include!` or target source outside `.rs`; no build script
+   outside `roles.build-script` in `tools/architecture.toml` (empty; adding
+   a crate needs an ADR) (ADR-001).
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.
@@ -43,11 +66,15 @@ harness. Rust workspace, hexagonal architecture. Public repository
 
 ## Validation (CI equivalent — run before every commit)
 
+Once per machine: `rustup target add x86_64-unknown-none`. The architecture
+check needs Python 3.11 or newer.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 tools/check-architecture.sh
+tools/check-architecture.sh --fixtures
 cargo deny check
 ```
 

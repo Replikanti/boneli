@@ -1,0 +1,2 @@
+# extra: include_str! turns a non-.rs file into the format string
+core-token

@@ -1,0 +1,2 @@
+# extra: include! invoked through a macro metavariable
+source-redirect

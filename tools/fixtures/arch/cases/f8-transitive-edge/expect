@@ -1,0 +1,2 @@
+# review finding 8: only direct dependencies were checked; httparse 1.1.0 pulls libc
+dep-edge

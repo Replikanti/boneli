@@ -224,8 +224,8 @@ flowchart LR
 
 Arrows show the direction of dependencies between crates. The domain and the application know nothing about Linux, the network or formats. All of that lives in adapters, which tests replace with in-memory ones. The gateway, egress proxy and shim (`boneli-gw`, `boneli-egress`, `boneli-shim`) are separate processes behind the security boundary and talk to the runner over Unix sockets.
 
-- **Domain** (`boneli-domain`): types, run and case state machines, policies, gates, budget accounting. Pure functions, no I/O, no dependencies, `#![forbid(unsafe_code)]`.
-- **Application** (`boneli-app`): use cases and ports as traits. Depends only on the domain.
+- **Domain** (`boneli-domain`): types, run and case state machines, policies, gates, budget accounting. Pure functions, no I/O, no dependencies, `#![no_std]` with `alloc` (ADR-001); `unsafe` is forbidden by the workspace lints.
+- **Application** (`boneli-app`): use cases and ports as traits. Depends only on the domain; `#![no_std]` with `alloc` like the domain (ADR-001).
 - **Adapters** (`boneli-<port>-<impl>`): port implementations, each in its own crate on top of `boneli-app`.
 - **Support crates** (`boneli-sys`, `boneli-http`, `boneli-https`, ...): generic plumbing that adapters use, without any knowledge of the domain. `boneli-https` is the only place for TLS.
 - **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
@@ -264,17 +264,17 @@ impl Run {
 
 **Ports are synchronous.** The runner runs on `std` threads, without an async runtime. That is enough for dozens of runs per runner and saves the largest dependency.
 
-**Testing:** every port has an in-memory adapter and a set of contract tests that both the real and the in-memory adapter must pass. The domain and use cases are tested without Linux and without a network.
+**Testing:** every port has an in-memory adapter and a set of contract tests that both the real and the in-memory adapter must pass. The domain and use cases are tested without Linux and without a network. In-memory adapters that need `std` (a `Mutex`, for example) live in adapter crates, because the core crates are `no_std` (ADR-001); contract suites, generic functions over a port, can stay in `boneli-app`.
 
 **Gateway, egress and shim** are separate processes because of the security boundary. The gateway and the egress proxy each have their own small hexagon: a domain (budget, routing, allowlist) and ports (upstream, transcript store).
 
 ## Pure Rust and dependencies
 
-All code is Rust. Dependencies are guarded by an allowlist in the workspace and a CI script that fails on any crate outside it, transitive ones included.
+All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl; for the core crates also the no-std build target); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts, and with them native `links` (cargo accepts `links` only with a build script), are allowed only for crates listed in `roles.build-script` of that file, each with its own ADR; the list is empty.
 
 | Crate | Why | Where it may appear |
 | --- | --- | --- |
-| `libc` | syscall declarations (namespaces, mount, seccomp, Landlock) | only `boneli-sys` |
+| `libc` | syscall declarations (namespaces, mount, seccomp, Landlock) | only `boneli-sys`; each further edge needs its own ADR (ADR-001) |
 | `httparse` | HTTP/1.x parsing without further dependencies | `boneli-http` |
 | `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries | only `boneli-https` |
 | `sha2` | content addressing, evidence | `boneli-store-fs` |
@@ -284,7 +284,7 @@ All code is Rust. Dependencies are guarded by an allowlist in the workspace and 
 
 **We do not use:** tokio, serde, clap, tracing, anyhow, rusqlite.
 
-**Unsafe** only in `boneli-sys`; everywhere else `#![forbid(unsafe_code)]`.
+**Unsafe** only in `boneli-sys`; everywhere else the workspace lints forbid it, the architecture check scans every other crate for the `unsafe` token, and every other lib root carries `#![doc(test(attr(forbid(unsafe_code))))]`, because the lints do not reach doctests. Every crate root is a `.rs` file inside its package, and no `rust-toolchain` file, cargo config or clippy config is committed, so the scans and CI see the code and tools that actually build (ADR-001).
 
 **JSON without derive** fits the hexagon: the domain does not know JSON, and mapping to DTOs belongs in the adapters.
 

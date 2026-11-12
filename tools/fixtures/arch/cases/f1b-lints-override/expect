@@ -1,0 +1,2 @@
+# review finding 1b: a `workspace = true` line in a dependency table satisfied the grep
+lints-inherit

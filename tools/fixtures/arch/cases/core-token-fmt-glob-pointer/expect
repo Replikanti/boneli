@@ -1,0 +1,2 @@
+# review round 2, F1g: a glob import from core::fmt brings Pointer into scope and method resolution picks it
+core-token

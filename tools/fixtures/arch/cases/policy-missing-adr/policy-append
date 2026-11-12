@@ -1,0 +1,7 @@
+[external.leftpad]
+reason = "padding"
+decision = "ARCHITECTURE"
+
+[external.leftpad.pulled-by.boneli-http]
+reason = "pads"
+decision = "ADR-404"

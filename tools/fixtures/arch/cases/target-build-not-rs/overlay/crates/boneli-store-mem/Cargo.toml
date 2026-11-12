@@ -1,0 +1,12 @@
+[package]
+name = "boneli-store-mem"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+build = "build.txt"
+
+[lints]
+workspace = true
+
+[dependencies]

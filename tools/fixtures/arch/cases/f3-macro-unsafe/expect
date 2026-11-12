@@ -1,0 +1,2 @@
+# review finding 3: an exported macro expands `unsafe` that forbid(unsafe_code) does not see
+unsafe-token

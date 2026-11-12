@@ -20,6 +20,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # The toolchain this workflow installs outranks any rust-toolchain file
+      # in the checkout, so a committed one cannot redirect cargo or rustc
+      # here (ADR-001; the architecture check also rejects such files).
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       # Every PR closes its issue ("Closes #N") or states why none applies
@@ -43,16 +48,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # The core crates must build for a target without std (ADR-001).
+          targets: x86_64-unknown-none
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - name: Architecture rules
         run: ./tools/check-architecture.sh
+      # Every rule has fail cases; a weakened rule turns this step red.
+      - name: Architecture rule fixtures
+        run: ./tools/check-architecture.sh --fixtures
 
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # cargo-deny runs cargo metadata: same pin as in `check` (ADR-001).
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       # Prebuilt binary instead of compiling cargo-deny from source.

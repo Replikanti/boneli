@@ -1,0 +1,3 @@
+# CI runs clippy on this host triple.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["--cap-lints", "allow"]

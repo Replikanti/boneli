@@ -1,0 +1,3 @@
+# review finding 4a: an import that rustfmt wraps bypassed the purity scan
+core-no-std-build
+core-token

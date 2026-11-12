@@ -1,0 +1,13 @@
+[package]
+name = "boneli-derive"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]

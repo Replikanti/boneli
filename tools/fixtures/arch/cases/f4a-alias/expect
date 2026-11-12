@@ -1,0 +1,3 @@
+# review finding 4a: an aliased import bypassed the purity scan
+core-no-std-build
+core-token

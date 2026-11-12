@@ -1,0 +1,13 @@
+[package]
+name = "boneli-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(not(all(target_feature = "crt-static", unix)))'.dependencies]
+leftpad = "1"

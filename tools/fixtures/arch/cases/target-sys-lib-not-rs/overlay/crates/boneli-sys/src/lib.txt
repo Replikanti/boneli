@@ -1,0 +1,9 @@
+//! sys
+#![no_std]
+/// Reads the byte at an address.
+#[macro_export]
+macro_rules! peek {
+    ($p:expr) => {
+        unsafe { *($p as *const u8) }
+    };
+}
