@@ -1,0 +1,2 @@
+# QA round 3: all() with an unknown and a true operand is unknown, so the edge applies
+dep-edge

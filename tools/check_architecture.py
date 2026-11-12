@@ -96,6 +96,10 @@ CORE_TOKENS = [
     re.compile(B + "(?:ptr|UnsafeCell|addr|expose_provenance)" + E),
     re.compile(B + "(?:as_ptr|as_mut_ptr|into_raw)"),
     re.compile(B + "Pointer" + E),
+    # core::task: its Debug output holds vtable and data addresses, and the
+    # core has no async to need it. The module path itself is matched on the
+    # token stream (task_paths).
+    re.compile(B + "(?:Waker" + E + "|RawWaker)"),
     # Macros that build a format string from pieces no single literal holds
     # (concat!("{:", "p}"), stringify!({:p})), or from the build environment
     # (env!, option_env!), which is also an impure input on its own. Matched
@@ -108,7 +112,9 @@ CORE_TOKENS = [
 # ({:}>16p}). Matched on the raw content of every file in a core package
 # (comments included, any extension: include_str! can read any of them) and
 # on every string literal after its escapes are decoded.
-FORMAT_SPEC = re.compile(r"\{[^{}]*:(?:[\s\S][<^>])?[^{}]*p\}")
+# rustc also accepts whitespace between the type and the closing brace
+# ({:p }, {:p\u{a0}}); Python's Unicode \s covers every such character.
+FORMAT_SPEC = re.compile(r"\{[^{}]*:(?:[\s\S][<^>])?[^{}]*p\s*\}")
 EXTERN_CRATE = re.compile(B + "extern" + WS + "+crate" + E)
 EXTERN_ALLOC = re.compile(WS + "+alloc" + WS + "*;")
 UNSAFE = re.compile(B + "unsafe" + E)
@@ -374,8 +380,9 @@ def tokenize(text):
 
 def fmt_imports(toks):
     """Lines of `use` items that glob-import from a `fmt` module path or
-    rename it: a glob brings `Pointer` into scope without naming it, and a
-    rename hides the path from this check."""
+    rename it (a glob brings `Pointer` into scope without naming it, and a
+    rename hides the path from this check), that are built from macro
+    metavariables (`use core::$m::*;` can be either), or that name `task`."""
     hits, k, n = [], 0, len(toks)
     while k < n:
         if not (toks[k][0] == "ident" and toks[k][1] == "use"):
@@ -385,6 +392,10 @@ def fmt_imports(toks):
         while k < n and not (toks[k][0] == "punct" and toks[k][1] == ";"):
             kind, value, _ = toks[k]
             chain = [seg for level in levels for seg in level]
+            if kind == "punct" and value == "$":
+                hits.append((line, "use item built from a macro metavariable"))
+            elif kind == "ident" and value == "task":
+                hits.append((line, "imports from a task module (Waker and Context print addresses)"))
             if kind == "ident" and value == "as":
                 prev = levels[-1][-1] if levels[-1] else None
                 if prev == "fmt" or (prev == "self" and "fmt" in chain):
@@ -402,6 +413,29 @@ def fmt_imports(toks):
                 hits.append((line, "glob import from a fmt module brings Pointer into scope"))
             k += 1
     return hits
+
+
+def task_paths(toks):
+    """Lines where a path goes through a `task` module (`core::task::...`)."""
+    return [(line, "path through a task module (Waker and Context print addresses)")
+            for k, (kind, value, line) in enumerate(toks)
+            if kind == "ident" and value == "task" and k >= 2
+            and toks[k - 1][:2] == ("punct", ":") and toks[k - 2][:2] == ("punct", ":")]
+
+
+def include_path_problem(path):
+    """Why an include_str!/include_bytes! path is not allowed in core, or None.
+
+    rustc resolves the path from the file where a macro is invoked, not
+    where its body is written, so a `..` inside a macro can climb past the
+    package. Only plain relative paths downwards are allowed."""
+    if path.startswith("/"):
+        return "absolute path"
+    if "\\" in path:
+        return "backslash in path"
+    if ".." in path.split("/"):
+        return "`..` component"
+    return None
 
 
 def source_redirects(toks):
@@ -921,7 +955,7 @@ def check(root):
                         rep.fail("core-token", rel(root, f), "banned in core crates: %s" % show(m.group(0)), line_of(code, m.start()))
                 for m in FORMAT_SPEC.finditer(text):
                     rep.fail("core-token", rel(root, f), "banned in core crates: format spec %s" % show(m.group(0)), line_of(text, m.start()))
-                for line, message in fmt_imports(toks):
+                for line, message in fmt_imports(toks) + task_paths(toks):
                     rep.fail("core-token", rel(root, f), message, line)
                 for m in EXTERN_CRATE.finditer(code):
                     if not EXTERN_ALLOC.match(code, m.end()):
@@ -936,12 +970,19 @@ def check(root):
                         lit = toks[k + 3] if k + 4 < len(toks) else None
                         ok = (lit is not None and toks[k + 1][:2] == ("punct", "!") and toks[k + 2][0] == "punct"
                               and lit[0] == "str" and toks[k + 4][0] == "punct")
+                        problem = None if ok else "not a single string literal"
                         if ok:
-                            target = (f.parent / (lit[1][1] if lit[1][0] else unescape(lit[1][1]))).resolve()
-                            ok = pkg_dir.resolve() in target.parents
-                        if not ok:
-                            rep.fail("core-token", rel(root, f), "%s! must take one literal path inside the package" % value, line)
+                            # As written: every escape needs a backslash,
+                            # which is rejected, so no decoding is needed.
+                            problem = include_path_problem(lit[1][1])
+                        if problem:
+                            rep.fail("core-token", rel(root, f), "%s!: %s; only a plain relative path without `..` is allowed" % (value, problem), line)
         if is_core:
+            # file!() turns a path into a string literal, format strings
+            # included: no `{` or `}` in the path of any file of the package.
+            for f in sorted(set(files + others + [Path(t["src_path"]) for t in pkg["targets"]])):
+                if "{" in rel(root, f) or "}" in rel(root, f):
+                    rep.fail("core-token", rel(root, f), "`{` or `}` in a core file path (file!() can make it a format string)")
             # include_str! turns these into string literals, format strings
             # included.
             for f in others:

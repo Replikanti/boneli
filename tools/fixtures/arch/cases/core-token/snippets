@@ -45,4 +45,14 @@ pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, 
 #[allow(unused_imports)] use core::fmt::{self, *};
 #[allow(unused_imports)] use core::{fmt::*, ops};
 #[allow(unused_imports)] use core::fmt as f;
+#[allow(unused_imports)] use core::fmt::{self as ff};
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:p }", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:p\u{a0}}", x) }
+pub static B: &str = include_str!("/dev/null");
+pub static B: &str = include_str!("\x2e\x2e/src/extra.rs");
+macro_rules! glob { ($m:ident) => { #[allow(unused_imports)] use core::$m::*; }; } glob!(fmt);
+pub struct Waker;
+pub struct RawWaker;
+#[allow(unused_imports)] use core::{task as t};
+pub fn f() -> bool { core::task::Poll::<u8>::Pending.is_pending() }
 pub struct S<'a>(&'a u8); impl core::fmt::Display for S<'_> { fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Pointer::fmt(&self.0, f) } }

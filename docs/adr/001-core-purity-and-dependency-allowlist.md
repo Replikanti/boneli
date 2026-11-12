@@ -57,6 +57,14 @@ the fill character, and a glob import from `core::fmt` that brings
 evaluator branches (`any`/`all` with an unknown operand, plain target
 triples, a cfg the parser rejects) that no fixture pinned.
 
+A third round found that `include_str!` inside a `macro_rules!` body
+resolves its path from the file where the macro is invoked, so a `..` in a
+deep module climbs past the package, and four more address-leak forms with
+a cheap rule: whitespace before the closing brace of a spec (`{:p }`), a
+spec in a core file's name read through `file!()`, a glob import built by
+a macro (`use core::$m::*;`), and `core::task::Waker`, whose `Debug` output
+holds addresses.
+
 ### Measurements
 
 All runs used cargo 1.98.0, clippy 0.1.98 and cargo-deny 0.20.2 on a scratch
@@ -191,9 +199,20 @@ reads its policy data from `tools/architecture.toml`.
     also matched on every string literal after its escapes are decoded
     (`\u{..}`, `\x..`, line continuations), because rustc decodes them
     before it parses the spec. The fill character may be any character,
-    `{` and `}` included (`{:}>16p}` compiles). `include_str!` and
-    `include_bytes!` take exactly one literal path inside the package, so
-    the file they read is one of those.
+    `{` and `}` included (`{:}>16p}` compiles), and whitespace may follow
+    the `p` before the closing brace (`{:p }`, `{:p\u{a0}}`; rustc accepts
+    any `char::is_whitespace` there).
+  - `include_str!` and `include_bytes!` take exactly one string literal
+    whose path, as written, is relative, has no `..` component and no
+    backslash (every escape needs one, so an encoded `..` such as `\x2e\x2e`
+    is rejected too). rustc resolves the path from the file where a macro is
+    invoked, not where its body is written, so the checker cannot know the
+    base; a path that only goes downwards stays inside the package from any
+    base inside it (symlinks are banned), so the file it reads is one the
+    spec scan covers.
+  - `{` or `}` anywhere in the path of a core file, target sources
+    included: `file!()` turns the path into a string literal, which can be
+    a format string (`src/{:p}.rs`, reproduced in review).
   - `concat`, `stringify`, `env` and `option_env`, as identifiers with or
     without a following `!`: the first two build a format string from pieces
     that are no single literal (`concat!("{:", "p}")`), and matching the bare
@@ -202,17 +221,37 @@ reads its policy data from `tools/architecture.toml`.
     build environment at compile time, an impure input to the core on its
     own, and can carry a format string (from a manifest field, for example).
   - A glob import from a `fmt` module path (`core::fmt::*`, `alloc::fmt::*`,
-    `fmt::{self, *}`, also inside use-groups) and a rename of a `fmt` module
-    (`use core::fmt as f;`): the glob brings the `Pointer` trait into scope,
-    and method resolution can then print an address without the name
-    `Pointer` appearing (reproduced in review).
-  - **Limit, stated plainly.** A text scan cannot enumerate every way to
-    obtain an address; a function pointer cast to an integer
-    (`marker as fn() as usize`) has no token at all. The token list is a
-    best-effort first layer. The gate for this class is #2's acceptance
-    test: folding the same event sequence through `Run::handle` in two
-    separate processes gives byte-identical `Debug` output for the final
-    run and every command list.
+    `fmt::{self, *}`, also inside use-groups), a rename of a `fmt` module
+    (`use core::fmt as f;`, `use core::fmt::{self as f};`) and any `use`
+    item that contains a macro metavariable (`use core::$m::*;`): the glob
+    brings the `Pointer` trait into scope, and method resolution can then
+    print an address without the name `Pointer` appearing (reproduced in
+    review); a rename or a metavariable hides the `fmt` path from this
+    check.
+  - `Waker`, `RawWaker...` and any path through a `task` module
+    (`core::task::...`, `use core::{task}`): the `Debug` output of a waker
+    or a `Context` prints its data and vtable addresses, and the core has
+    no async that would need them.
+  - **Limit, stated plainly, and the gate (decided by the operator at
+    STOP 2 of #28).** A text scan cannot enumerate every way to obtain an
+    address: a function pointer cast to an integer
+    (`marker as fn() as usize`) or the `Debug` output of function items
+    coerced to function pointers (`[one, two]`) has no token at all. The
+    gate for address leaks from the core is therefore the two-process
+    replay tests, not this scan: #2 for `boneli-domain` (every event
+    sequence the unit tests use is folded through `Run::handle` in two
+    separate processes, and the `Debug` output of the final run and of
+    every command list is byte-identical) and #3 for `boneli-app`
+    (`DebugTicket` end to end on in-memory adapters with a fixed `Clock`
+    and `Ids`, in two processes, byte-identical events, commands and final
+    run). Both first check that the two processes see different addresses
+    for the same heap allocation and fail if they do not, because without
+    address randomization the comparison proves nothing. The token list
+    stays as a cheap, best-effort first layer: a newly found address-leak
+    form gets a token or a fixture when a cheap rule exists, and does not
+    block a pull request on its own. Why: three review rounds found 1, 7
+    and 5 new forms, one of them ordinary code with no text rule, while a
+    two-process comparison catches any form on an exercised path.
   - The old `fs::`/`net::`/`env::`/`thread::`/`process::` and `.elapsed()`
     patterns are dropped: the `std` token covers them without aliases, and
     they flag names the domain needs, such as a budget's `elapsed`.
@@ -428,17 +467,26 @@ and upstream releases would change the results.
   through a metavariable (`#[$meta]`). Rename, or widen the rule through a
   new ADR.
 - **Residual risks:** a pointer address can still leak through a `core` or
-  `alloc` API that is not listed, or through a function pointer cast to an
-  integer (`marker as fn() as usize`, reproduced in review); see "Limit,
-  stated plainly" in D1. The gate is #2's two-process replay test.
+  `alloc` API that is not listed, through a function pointer cast to an
+  integer (`marker as fn() as usize`), or through the `Debug` output of
+  function items coerced to function pointers without any function-pointer
+  syntax (`write!(w, "{:?}", [one, two])` prints both addresses); both were
+  reproduced in review and have no cheap rule. See "Limit, stated plainly"
+  in D1; the gate is the two-process replay tests of #2 and #3. Those see
+  only the paths the tests run: the gap is an address leak on an untested
+  path, such as a rare error message, which passes until a test reaches it.
+  The strict check is a text match, so an accepted ADR that names an edge
+  only to reject it passes the checker; review owns the meaning, and the
+  checker makes sure no edge into `libc` lands without an accepted ADR
+  naming it. The runner itself can be weakened (for example by comparing as
+  a superset); the exact comparison, the coverage check and review of
+  `tools/` guard it.
 - **More false positives** in core crates: a field or variable named
-  `env`, a glob import from `core::fmt`, or a `{...p}` pattern in a comment
-  or a data file of a core package fail the check. The strict check is a text match, so an accepted ADR
-  that names an edge only to reject it passes the checker; review owns the
-  meaning, and the checker makes sure no edge into `libc` lands without an
-  accepted ADR naming it. The runner itself can be weakened (for example by
-  comparing as a superset); the exact comparison, the coverage check and
-  review of `tools/` guard it.
+  `env`, a glob import from `core::fmt`, a rename such as
+  `use core::fmt as f;`, a path through any module named `task`, a `use`
+  item in a macro that takes a path fragment, `{` or `}` in a file name,
+  an `include_str!` path with `..`, or a `{...p}` pattern in a comment or a
+  data file of a core package fail the check.
 
 ## Alternatives considered
 

@@ -30,9 +30,12 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `x86_64-unknown-none`; a token scan covers what `no_std` cannot remove
    (async, `core::arch`, atomics, pointer addresses, format specs that end
    in `p` in any file of the package and after escapes, `concat`,
-   `stringify`, `env`, `option_env`, glob imports from `fmt`). The scan is
-   a first layer; the two-process replay test (#2) is the gate for address
-   leaks it cannot enumerate. Dependency `cfg`s of core crates are also
+   `stringify`, `env`, `option_env`, glob imports from `fmt`, `use` items
+   built from macro metavariables, `core::task` and its wakers, `{` or `}`
+   in core file paths, `include_str!` paths that are absolute or contain
+   `..`). The scan is a best-effort first layer; the gate for address
+   leaks is the two-process replay tests of #2 (domain) and #3 (app),
+   decided at STOP 2 of #28. Dependency `cfg`s of core crates are also
    evaluated on `x86_64-unknown-none` (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,
    transitive ones included, needs a record with a reason in

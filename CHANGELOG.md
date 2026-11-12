@@ -39,5 +39,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `roles.build-script` (empty), and `rust-toolchain` files; CI pins
   `RUSTUP_TOOLCHAIN`. The core token scan matches `{:p}`-style specs (any
   fill character) in the raw content of every core file and in string
-  literals after escape decoding, and also bans `Pointer`, `concat`,
-  `stringify`, `env`, `option_env` and glob imports from `fmt`.
+  literals after escape decoding (whitespace before the closing brace
+  included), and also bans `Pointer`, `concat`, `stringify`, `env`,
+  `option_env`, glob imports from `fmt`, `use` items built from macro
+  metavariables, `core::task` paths and wakers, `{` or `}` in core file
+  paths, and `include_str!`/`include_bytes!` paths that are absolute or
+  contain `..` or a backslash.

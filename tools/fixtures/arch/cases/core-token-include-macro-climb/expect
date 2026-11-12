@@ -1,0 +1,2 @@
+# review round 3, II-1: include_str! in a macro resolves from the calling file, so `..` climbs past the package
+core-token
