@@ -1,0 +1,7 @@
+[external."lіbc"]
+reason = "look-alike"
+decision = "ARCHITECTURE"
+
+[external."lіbc".pulled-by.boneli-http]
+reason = "pads"
+decision = "ARCHITECTURE"

@@ -1,0 +1,5 @@
+[external.leftpad]
+reason = "padding"
+decision = "ARCHITECTURE"
+
+[external.leftpad.pulled-by]

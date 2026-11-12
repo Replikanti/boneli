@@ -12,6 +12,8 @@ publish = false
 
 # Unsafe code lives only in boneli-sys, which opts out of these lints
 # explicitly (docs/ARCHITECTURE.md, "Pure Rust and dependencies").
+# tools/check-architecture.sh asserts that unsafe_code stays "forbid" and
+# that every other crate inherits this table unchanged (ADR-001).
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
@@ -21,8 +23,9 @@ dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
 
-# Dependencies: every external crate must be on the allowlist in
-# tools/check-architecture.sh and justified in a comment where it is added.
+# Dependencies: every edge into an external crate needs a record in
+# tools/architecture.toml (ADR-001), and the crate is justified in a comment
+# where it is added.
 [workspace.dependencies]
 boneli-domain = { path = "crates/boneli-domain" }
 boneli-app = { path = "crates/boneli-app" }

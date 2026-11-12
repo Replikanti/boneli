@@ -1,8 +1,11 @@
 # cargo-deny policy, run by the `audit` CI job.
 # Widening the license list, adding an exception or a new source is a
 # conscious decision: record the reason next to the entry, in the PR that
-# needs it. Direct dependencies are also limited per crate by the allowlist
-# in tools/check-architecture.sh.
+# needs it. Which crate may pull which external crate, transitive edges
+# included, is limited by tools/architecture.toml (ADR-001). There is no
+# [bans] allow list here: it is a set of names that cannot say which parent
+# may pull a crate and lets a vendored path crate pass by name (ADR-001,
+# "Alternatives considered").
 
 [graph]
 # Dev-dependencies are checked too: their build scripts and proc macros run

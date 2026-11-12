@@ -1,0 +1,2 @@
+//! Binary.
+fn main() {}

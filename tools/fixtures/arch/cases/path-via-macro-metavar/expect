@@ -1,0 +1,2 @@
+# extra: the attribute is assembled from a macro metavariable, so `path` never appears inside #[...]
+source-redirect

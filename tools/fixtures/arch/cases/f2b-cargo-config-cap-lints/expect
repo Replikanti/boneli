@@ -1,0 +1,2 @@
+# review finding 2b: a committed .cargo/config.toml with --cap-lints allow switched every lint off
+cargo-config

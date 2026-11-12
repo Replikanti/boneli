@@ -1,0 +1,8 @@
+[external.leftpad]
+reason = "padding"
+decision = "ARCHITECTURE"
+approved-by = "someone"
+
+[external.leftpad.pulled-by.boneli-http]
+reason = "pads"
+decision = "ARCHITECTURE"

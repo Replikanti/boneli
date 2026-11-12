@@ -1,0 +1,12 @@
+[package]
+name = "boneli-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+httparse = "=1.0.0"
+httparse-old = { package = "httparse", version = "0.9" }

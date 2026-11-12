@@ -1,0 +1,3 @@
+# review finding 5: a vendored path crate with an allowlisted name passed
+dep-source
+manifest-redirect

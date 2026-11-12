@@ -1,0 +1,3 @@
+# review finding 1a: a crate whose directory differs from its package name was skipped
+lints-inherit
+unsafe-token

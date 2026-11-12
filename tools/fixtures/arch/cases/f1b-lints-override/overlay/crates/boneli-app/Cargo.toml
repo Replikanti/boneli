@@ -1,0 +1,11 @@
+[package]
+name = "boneli-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+rust.unsafe_code = "allow"
+
+[dependencies.boneli-domain]
+workspace = true

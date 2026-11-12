@@ -1,0 +1,2 @@
+# extra: a whole-line // comment that closes a block comment is code after the */
+core-token

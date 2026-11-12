@@ -1,0 +1,3 @@
+# review finding 4b: a #[path] module outside src/ was not scanned
+core-token
+source-redirect

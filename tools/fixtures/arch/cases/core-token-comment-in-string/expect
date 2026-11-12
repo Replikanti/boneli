@@ -1,0 +1,2 @@
+# extra: a whole-line // inside a multi-line string is code after the closing quote
+core-token

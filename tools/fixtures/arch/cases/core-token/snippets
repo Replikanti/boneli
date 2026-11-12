@@ -1,0 +1,28 @@
+pub mod std {}
+#[cfg(not(target_os = "none"))] extern crate std;
+extern crate core as c;
+extern‎crate core as c;
+pub async fn f() {}
+pub fn r#await() {}
+pub struct HashMap;
+pub struct HashSet;
+pub struct RandomState;
+pub struct SystemTime;
+pub struct Instant;
+pub const UNIX_EPOCH: u8 = 0;
+pub fn cpuid() -> u32 { core::arch::x86_64::__cpuid(0).eax }
+pub static A: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub fn f(x: &u8) -> *const u8 { x }
+pub fn f(x: &mut u8) -> *mut u8 { x }
+pub fn f(x: &u8) { let _ = &raw const *x; }
+pub fn f(x: &mut u8) { let _ = &raw mut *x; }
+pub fn f(a: &u8, b: &u8) -> bool { core::ptr::eq(a, b) }
+pub struct S(pub core::cell::UnsafeCell<u8>);
+pub fn f(x: &[u8]) -> bool { x.as_ptr().is_null() }
+pub fn f(x: &mut [u8]) -> bool { x.as_mut_ptr().is_null() }
+pub trait R { fn into_raw(self); }
+pub trait P { fn addr(&self) -> usize; }
+pub trait E { fn expose_provenance(&self) -> usize; }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:p}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{x:#p}") }
+pub fn f() -> &'static str { "//" } pub async fn g() {}
