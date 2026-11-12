@@ -1,0 +1,54 @@
+# cargo-deny policy, run by the `audit` CI job.
+# Widening the license list, adding an exception or a new source is a
+# conscious decision: record the reason next to the entry, in the PR that
+# needs it. Direct dependencies are also limited per crate by the allowlist
+# in tools/check-architecture.sh.
+
+[graph]
+# Dev-only tooling may be looser; what ships may not.
+exclude-dev = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+]
+# Per-crate exceptions, each with the dependency path that pulls it in.
+# Expected with boneli-https (rustls with the ring provider): ISC for ring,
+# untrusted and rustls-webpki, BSD-3-Clause for subtle. Add them with the
+# PR that introduces boneli-https.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates reference each other by path without a version. They are
+# private (publish = false), so path wildcards are fine.
+allow-wildcard-paths = true
+# What docs/ARCHITECTURE.md says we write ourselves instead.
+deny = [
+    { crate = "tokio", reason = "no async runtime in the runner: ports are synchronous, std threads" },
+    { crate = "async-std", reason = "no async runtime in the runner" },
+    { crate = "serde", reason = "own JSON without derive; mapping to DTOs lives in adapters" },
+    { crate = "serde_json", reason = "own JSON without derive" },
+    { crate = "clap", reason = "own argument parsing" },
+    { crate = "tracing", reason = "own structured logging" },
+    { crate = "anyhow", reason = "own error types" },
+    { crate = "thiserror", reason = "own error types" },
+    { crate = "rusqlite", reason = "bundles C SQLite; append-only log and content-addressed store instead" },
+    { crate = "hyper", reason = "own HTTP/1.1 on httparse" },
+    { crate = "reqwest", reason = "own HTTP/1.1 client over rustls" },
+    { crate = "openssl-sys", reason = "C TLS; rustls with ring only" },
+    { crate = "aws-lc-sys", reason = "C crypto build; ring provider only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

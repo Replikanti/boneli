@@ -6,7 +6,7 @@ Boneli builds a replica of your application with data for every bug, reproduces 
 
 ## Status
 
-Early design. There is no code yet. Start with the [architecture proposal](docs/ARCHITECTURE.md).
+Early design. The workspace holds only the empty core crates so far. Start with the [architecture proposal](docs/ARCHITECTURE.md); work is tracked in GitHub issues, and the pinned task ledger issue lists them in processing order.
 
 ## Principles
 

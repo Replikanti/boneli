@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Replikanti/boneli"
+publish = false
+
+# Unsafe code lives only in boneli-sys, which opts out of these lints
+# explicitly (docs/ARCHITECTURE.md, "Pure Rust and dependencies").
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+# Dependencies: every external crate must be on the allowlist in
+# tools/check-architecture.sh and justified in a comment where it is added.
+[workspace.dependencies]
+boneli-domain = { path = "crates/boneli-domain" }
+boneli-app = { path = "crates/boneli-app" }

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Every pull request, deliberately without path filters: `check` and `audit`
+  # are required status checks, and a filtered-out PR would leave them pending
+  # forever. `edited` re-runs the issue-link gate when only the PR body changes.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Every PR closes its issue ("Closes #N") or states why none applies
+      # ("No-Issue: <reason>"). The body goes through an env var, never
+      # interpolated into the script (untrusted input).
+      - name: PR links an issue
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if grep -qiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' <<<"$PR_BODY"; then
+            echo "OK: PR closes an issue"
+          elif grep -qE '^No-Issue: .+' <<<"$PR_BODY"; then
+            echo "OK: explicit No-Issue exception"
+          else
+            echo "FAIL: PR body needs 'Closes #N' or a 'No-Issue: <reason>' line"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+      - name: Architecture rules
+        run: ./tools/check-architecture.sh
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Prebuilt binary instead of compiling cargo-deny from source.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
