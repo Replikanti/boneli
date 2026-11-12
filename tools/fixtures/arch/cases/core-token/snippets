@@ -55,4 +55,6 @@ pub struct Waker;
 pub struct RawWaker;
 #[allow(unused_imports)] use core::{task as t};
 pub fn f() -> bool { core::task::Poll::<u8>::Pending.is_pending() }
+use core::include_str as inc; pub static B: &str = inc!("../../../Cargo.toml");
+pub static B: &str = include_str!("./../../../Cargo.toml");
 pub struct S<'a>(&'a u8); impl core::fmt::Display for S<'_> { fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Pointer::fmt(&self.0, f) } }

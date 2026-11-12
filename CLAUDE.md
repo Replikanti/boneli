@@ -33,7 +33,7 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `stringify`, `env`, `option_env`, glob imports from `fmt`, `use` items
    built from macro metavariables, `core::task` and its wakers, `{` or `}`
    in core file paths, `include_str!` paths that are absolute or contain
-   `..`). The scan is a best-effort first layer; the gate for address
+   `..` or a backslash). The scan is a best-effort first layer; the gate for address
    leaks is the two-process replay tests of #2 (domain) and #3 (app),
    decided at STOP 2 of #28. Dependency `cfg`s of core crates are also
    evaluated on `x86_64-unknown-none` (ADR-001).
