@@ -1,0 +1,67 @@
+# CLAUDE.md — boneli
+
+Boneli reproduces bugs in a replica of the application with data, finds the
+root cause with verified evidence and opens the fix as a pull request. This
+repository holds everything that runs at the customer: domain, application,
+sandbox runtime, shim, gateway, egress, adapters, runner, CLI and the bench
+harness. Rust workspace, hexagonal architecture. Public repository
+(Apache-2.0).
+
+## Sources of truth
+
+- Design: `docs/ARCHITECTURE.md` is the design baseline.
+- Decisions since: `docs/adr/` (process in its README). A PR that makes a
+  design decision adds or flips an ADR.
+- Work: GitHub issues, labelled `area::*`, `P1`–`P3`, `size::*`, `epic`,
+  `needs-adr`. The pinned "Task ledger" issue lists them in processing order.
+
+## Invariants
+
+1. **Crate graph:** `boneli-domain` → nothing; `boneli-app` → domain;
+   adapters → domain, app and support crates; support crates (`boneli-sys`,
+   `boneli-http`, `boneli-https`, ...) stay generic; composition roots
+   (`boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`,
+   `boneli-cli`) wire adapters and nothing depends on them.
+   `tools/check-architecture.sh` enforces it.
+2. **Core purity** (domain, app): no external dependencies, no wall clock,
+   filesystem, network, environment, threads, processes, async or
+   `HashMap`/`HashSet`. Runs replay deterministically from the event log.
+3. **Pure Rust, minimal dependencies:** external crates only from the
+   per-crate allowlist in `tools/check-architecture.sh`; the "do not use"
+   list is enforced in `deny.toml`. Widening either needs an ADR.
+4. **Unsafe only in `boneli-sys`.** Every other crate inherits the workspace
+   lints, which forbid it.
+5. **The sandbox holds no secrets and has no network.** Capabilities reach it
+   only through broker sockets. The MVP subscription token is the one
+   documented exception.
+6. **Gates are deterministic and fail closed.** A fix is verified in a clean
+   sandbox from the base SHA and the diff only; nothing from the agent's
+   sandbox is trusted.
+7. **Ports are synchronous traits** in `boneli-app` (std threads, no async
+   runtime). Every port has an in-memory adapter and a contract test suite
+   that the real adapters reuse.
+
+## Validation (CI equivalent — run before every commit)
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+tools/check-architecture.sh
+cargo deny check
+```
+
+## Conventions
+
+- English in code, comments, commits, PRs and issues.
+- Branch and PR for every change; never push to main. The PR body carries
+  `Closes #N` or a
+  `No-Issue: <reason>` line (CI-enforced).
+- Domain items cite the design section or ADR they implement.
+- Every new dependency is justified in a `Cargo.toml` comment; licenses per
+  `deny.toml`. Core crates take none.
+- Changes go to `CHANGELOG.md` under `## [Unreleased]`.
+- **Public repository:** no local paths, credentials, API keys or private
+  data. Agent prompts and playbooks, benchmark cases, pricing and strategy
+  belong to the private `Replikanti/boneli-cloud`, never here. Only the
+  playbook and case *formats* are defined in this repository.

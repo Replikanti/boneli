@@ -1,0 +1,16 @@
+[package]
+name = "boneli-app"
+description = "Boneli application layer: use cases and ports as traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Core crate: depends only on the domain (docs/ARCHITECTURE.md, "Code architecture").
+[dependencies]
+boneli-domain.workspace = true

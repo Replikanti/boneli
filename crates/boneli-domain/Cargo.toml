@@ -1,0 +1,15 @@
+[package]
+name = "boneli-domain"
+description = "Boneli domain: run and case state machines, gates, policies. No I/O, no dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Core crate: no dependencies (docs/ARCHITECTURE.md, "Code architecture").
+[dependencies]
