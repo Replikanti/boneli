@@ -5,8 +5,12 @@
 # in tools/check-architecture.sh.
 
 [graph]
-# Dev-only tooling may be looser; what ships may not.
-exclude-dev = true
+# Dev-dependencies are checked too: their build scripts and proc macros run
+# in CI and on every developer machine, so they are supply chain as well.
+exclude-dev = false
+# The `check` job builds with --all-features; check the same graph here, so a
+# crate behind a feature cannot slip past the bans.
+all-features = true
 
 [advisories]
 version = 2

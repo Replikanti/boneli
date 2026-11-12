@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-[`../ARCHITECTURE.md`](../ARCHITECTURE.md) is the accepted baseline design.
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) is the baseline design.
 Decisions made since get one file each here:
 
 - **File**: `NNN-kebab-slug.md`, where `NNN` is the next free number, starting

@@ -30,9 +30,11 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          if grep -qiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' <<<"$PR_BODY"; then
+          # A whole closing keyword ("unresolved #12" and "prefix #3" do not
+          # count), an optional colon, then #N or owner/repo#N.
+          if grep -qiE '(^|[^[:alnum:]_])(close[sd]?|fix(e[sd])?|resolve[sd]?):?[[:space:]]+([[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[0-9]+' <<<"$PR_BODY"; then
             echo "OK: PR closes an issue"
-          elif grep -qE '^No-Issue: .+' <<<"$PR_BODY"; then
+          elif grep -qE '^No-Issue:[[:space:]]*[^[:space:]]' <<<"$PR_BODY"; then
             echo "OK: explicit No-Issue exception"
           else
             echo "FAIL: PR body needs 'Closes #N' or a 'No-Issue: <reason>' line"

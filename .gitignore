@@ -1,6 +1,3 @@
 /target
 **/*.rs.bk
 .DS_Store
-
-# Worktrees live inside the repo (house convention)
-/worktrees/

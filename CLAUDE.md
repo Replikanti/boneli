@@ -9,7 +9,7 @@ harness. Rust workspace, hexagonal architecture. Public repository
 
 ## Sources of truth
 
-- Design: `docs/ARCHITECTURE.md` is the accepted baseline.
+- Design: `docs/ARCHITECTURE.md` is the design baseline.
 - Decisions since: `docs/adr/` (process in its README). A PR that makes a
   design decision adds or flips an ADR.
 - Work: GitHub issues, labelled `area::*`, `P1`–`P3`, `size::*`, `epic`,
@@ -37,6 +37,9 @@ harness. Rust workspace, hexagonal architecture. Public repository
 6. **Gates are deterministic and fail closed.** A fix is verified in a clean
    sandbox from the base SHA and the diff only; nothing from the agent's
    sandbox is trusted.
+7. **Ports are synchronous traits** in `boneli-app` (std threads, no async
+   runtime). Every port has an in-memory adapter and a contract test suite
+   that the real adapters reuse.
 
 ## Validation (CI equivalent — run before every commit)
 
@@ -51,8 +54,8 @@ cargo deny check
 ## Conventions
 
 - English in code, comments, commits, PRs and issues.
-- Branch and PR for every change; worktrees under `/worktrees/` (gitignored);
-  never push to main. The PR body carries `Closes #N` or a
+- Branch and PR for every change; never push to main. The PR body carries
+  `Closes #N` or a
   `No-Issue: <reason>` line (CI-enforced).
 - Domain items cite the design section or ADR they implement.
 - Every new dependency is justified in a `Cargo.toml` comment; licenses per

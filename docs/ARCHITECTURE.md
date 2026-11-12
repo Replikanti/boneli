@@ -75,7 +75,7 @@ Target state: during the agent phase the only way out is through the gateway to 
 2. **Agent:** no network, only the gateway socket (in the MVP, the egress socket with an Anthropic-only allowlist). Dependencies are read-only.
 3. **Verify:** a clean sandbox with neither network nor gateway. It gets only the base SHA and the diff.
 
-**Residual risk.** We share the host kernel, so a kernel exploit remains possible. Mitigation: one customer per VM and, from v1, one host for sandboxes and a separate one for the gateway and the git token, so escaping a container does not yield keys.
+**Residual risk.** We share the host kernel, so a kernel exploit remains possible. Mitigation: one customer per VM and, from v1, one host for sandboxes and a separate one for the gateway and the git token, so escaping a container does not yield keys. Our own runtime is more work than Podman, and a bug in it is a security bug, so it needs a red-team suite and fuzzing of the seccomp and mount logic.
 
 ## LLM access and egress
 
@@ -140,7 +140,7 @@ Inside the sandbox the agent has full control over the replica. It reaches the c
 
 Every bug gets a clean copy via `CREATE DATABASE bug_123 TEMPLATE snapshot`.
 
-**Brokers** (Enterprise): SQL against a read-only replica, Sentry, logs. They enforce row limits, timeouts and column masking, and every query goes to the log and into the pull request. Credentials stay in the broker, never in the sandbox.
+**Brokers** (optional, for runners inside the customer's network): SQL against a read-only replica, Sentry, logs. They enforce row limits, timeouts and column masking, and every query goes to the log and into the pull request. Credentials stay in the broker, never in the sandbox.
 
 **Replay:** a request is reconstructed from a Sentry event, trace or access log and sent to the replica as an anonymized user. Asynchronous jobs are started from the console with the payload from the log.
 
@@ -208,7 +208,6 @@ flowchart LR
         store["boneli-store-fs"]
         oci["boneli-oci"]
         data["boneli-data-postgres"]
-        https["boneli-https, TLS"]
     end
     cli --> app
     webhooks --> app
@@ -221,7 +220,6 @@ flowchart LR
     store --> app
     oci --> app
     data --> app
-    https --> app
 ```
 
 Arrows show the direction of dependencies between crates. The domain and the application know nothing about Linux, the network or formats. All of that lives in adapters, which tests replace with in-memory ones. The gateway, egress proxy and shim (`boneli-gw`, `boneli-egress`, `boneli-shim`) are separate processes behind the security boundary and talk to the runner over Unix sockets.
@@ -229,7 +227,8 @@ Arrows show the direction of dependencies between crates. The domain and the app
 - **Domain** (`boneli-domain`): types, run and case state machines, policies, gates, budget accounting. Pure functions, no I/O, no dependencies, `#![forbid(unsafe_code)]`.
 - **Application** (`boneli-app`): use cases and ports as traits. Depends only on the domain.
 - **Adapters** (`boneli-<port>-<impl>`): port implementations, each in its own crate on top of `boneli-app`.
-- **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
+- **Support crates** (`boneli-sys`, `boneli-http`, `boneli-https`, ...): generic plumbing that adapters use, without any knowledge of the domain. `boneli-https` is the only place for TLS.
+- **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
 
 **Use cases** cover every part on top of one core: `BuildEnvironment`, `OnboardRepo`, `DebugTicket`, `BuildCase`, `RunBench`.
 
@@ -308,7 +307,7 @@ Everything that runs at the customer is open source. Everything that makes up th
 - `boneli-cloud` depends on the public crates through a git dependency pinned to a tag, so the domain and ports live in one place.
 - **Prompts and playbooks** are not part of the runner. The runner receives them from the control plane with each job and keeps them in memory only. Stored transcripts replace the playbook text with its id and version hash. Before the control plane exists, the CLI loads them from a local checkout of the private repository.
 - **Benchmark cases** are private, because published cases end up in the training data of future models and contaminate the benchmark. The harness is public; only results are published.
-- **Limit:** in the hybrid tier the agent has to read the prompts in plain text on the customer's machine. Protection there is contractual: the terms prohibit extracting them.
+- **Limit:** when the runner runs in the customer's network, the agent has to read the prompts in plain text on the customer's machine. Protection there is contractual: the terms prohibit extracting them.
 - **Contributions** to the public repository only under a CLA, to keep the option to relicense.
 
 ## First stack: TypeScript/Node and Postgres
