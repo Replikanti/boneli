@@ -1,0 +1,2 @@
+# review round 1, finding 6: only the declared-dependency source check sees a git dependency that never builds on Linux
+dep-source

@@ -1,0 +1,2 @@
+# extra: include_str! of a file outside the package, which no scan reads
+core-token

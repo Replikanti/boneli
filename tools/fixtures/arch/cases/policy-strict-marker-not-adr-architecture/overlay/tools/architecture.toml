@@ -22,10 +22,16 @@ support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-t
 roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli"]
 # The only crates that may contain `unsafe`.
 unsafe = ["boneli-sys"]
+# The only crates that may have a build script or a `links` key: a build
+# script can compile and link native code that no scan sees. Empty today;
+# adding a crate needs an ADR that names it (ADR-001).
+build-script = []
 
 [check]
-# The runner is Linux-only; both architectures it ships for are checked.
-platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# The runner is Linux-only. Both architectures it ships for, with glibc and
+# with musl (static binaries such as the shim may ship on musl). Dependency
+# targets are evaluated against these; flag-dependent cfgs count as true.
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # A target without std: the core crates must build for it.
 no-std-target = "x86_64-unknown-none"
 

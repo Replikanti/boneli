@@ -56,10 +56,12 @@ RULES = [
     "lints-unsafe",
     "cargo-config",
     "clippy-config",
+    "toolchain-file",
     "doctest-unsafe",
     "unsafe-token",
     "sys-macro-export",
     "proc-macro",
+    "build-script",
     "source-redirect",
     "symlink",
     "core-no-std-attr",
@@ -93,8 +95,16 @@ CORE_TOKENS = [
     re.compile("&" + WS + "*raw" + WS + "+(?:const|mut)" + E),
     re.compile(B + "(?:ptr|UnsafeCell|addr|expose_provenance)" + E),
     re.compile(B + "(?:as_ptr|as_mut_ptr|into_raw)"),
-    re.compile(r"\{[^{}]*:[^{}]*p\}"),
+    re.compile(B + "Pointer" + E),
+    # Macros that build a format string from pieces the spec check below
+    # cannot see as one literal: concat!("{:", "p}"), stringify!({:p}).
+    re.compile(B + "(?:concat|stringify)" + WS + "*!(?!=)"),
 ]
+# A format spec that ends in `p` prints an address: {:p}, {0:p}, {name:p},
+# {:#p}, {:>10p}, {:x^#12.3p}. Matched on the raw text, on every string
+# literal after its escapes are decoded, and on every other file in a core
+# package directory (include_str! reads them).
+FORMAT_SPEC = re.compile(r"\{[^{}]*:[^{}]*p\}")
 EXTERN_CRATE = re.compile(B + "extern" + WS + "+crate" + E)
 EXTERN_ALLOC = re.compile(WS + "+alloc" + WS + "*;")
 UNSAFE = re.compile(B + "unsafe" + E)
@@ -282,7 +292,7 @@ def rust_tokens(text):
             end = text.find('"' + m.group(1), m.end())
             if end < 0:
                 raise ValueError("unterminated raw string at line %d" % line_of(text, i))
-            toks.append(("lit", "", line_of(text, i)))
+            toks.append(("str", (True, text[m.end() : end]), line_of(text, i)))
             i = end + 1 + len(m.group(1))
             continue
         m = STR.match(text, i)
@@ -292,7 +302,7 @@ def rust_tokens(text):
                 j += 2 if text[j] == "\\" else 1
             if j >= n:
                 raise ValueError("unterminated string at line %d" % line_of(text, i))
-            toks.append(("lit", "", line_of(text, i)))
+            toks.append(("str", (False, text[m.end() : j]), line_of(text, i)))
             i = j + 1
             continue
         for kind, rx in (("lit", CHAR), ("lifetime", LIFETIME), ("ident", IDENT), ("lit", NUMBER)):
@@ -310,14 +320,58 @@ def rust_tokens(text):
     return toks
 
 
-def source_redirects(text):
+def unescape(body):
+    """Decode the escapes of a non-raw Rust string literal body, as rustc does
+    before it parses a format string."""
+    simple = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "0": "\0", "'": "'", '"': '"'}
+    out, i, n = [], 0, len(body)
+    while i < n:
+        c = body[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        e = body[i + 1]
+        if e in "\r\n":
+            # Line continuation: skip the newline and the leading whitespace.
+            i += 2
+            while i < n and body[i] in " \t\n\r":
+                i += 1
+            continue
+        if e in simple:
+            out.append(simple[e])
+            i += 2
+            continue
+        m = re.match(r"x([0-9A-Fa-f]{2})", body[i + 1 :])
+        if m:
+            out.append(chr(int(m.group(1), 16)))
+            i += 1 + m.end()
+            continue
+        m = re.match(r"u\{([0-9A-Fa-f_]{1,8})\}", body[i + 1 :])
+        if m:
+            try:
+                out.append(chr(int(m.group(1).replace("_", ""), 16)))
+            except (ValueError, OverflowError):
+                out.append(body[i : i + 1 + m.end()])
+            i += 1 + m.end()
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def tokenize(text):
+    """(tokens, error message or None) for a file."""
+    try:
+        return rust_tokens(text), None
+    except ValueError as err:
+        return [], "cannot tokenize (%s), so the file set cannot be verified" % err
+
+
+def source_redirects(toks):
     """Lines where a file reaches the compiler past the scans: #[path = ...]
     (also inside cfg_attr), include!, and attributes or macro names built
     from macro metavariables, which can carry either."""
-    try:
-        toks = rust_tokens(text)
-    except ValueError as err:
-        return [(1, "cannot tokenize (%s), so the file set cannot be verified" % err)]
 
     def is_punct(k, ch):
         return 0 <= k < len(toks) and toks[k][0] == "punct" and toks[k][1] == ch
@@ -354,8 +408,9 @@ def source_redirects(text):
 
 
 def walk_package(pkg_dir):
-    """(rs files, symlinks) under a package directory; symlinks are not followed."""
-    files, links = [], []
+    """(rs files, other files, symlinks) under a package directory; symlinks
+    are not followed."""
+    files, others, links = [], [], []
     for dirpath, dirnames, filenames in os.walk(pkg_dir):
         for name in sorted(dirnames + filenames):
             p = Path(dirpath) / name
@@ -364,9 +419,122 @@ def walk_package(pkg_dir):
         dirnames[:] = sorted(d for d in dirnames if not (Path(dirpath) / d).is_symlink())
         for name in sorted(filenames):
             p = Path(dirpath) / name
-            if name.endswith(".rs") and not p.is_symlink():
-                files.append(p)
-    return files, links
+            if p.is_symlink():
+                continue
+            (files if name.endswith(".rs") else others).append(p)
+    return files, others, links
+
+
+# Target cfg evaluation (ADR-001 D3). Names whose whole value set rustc
+# prints for a target with no flags: a value it does not print is false.
+# Every other name (target_feature, panic, debug_assertions, overflow_checks,
+# custom cfgs, ...) depends on flags or the profile and is unknown.
+CFG_KNOWN = {"target_os", "target_family", "target_arch", "target_env", "target_abi",
+             "target_vendor", "target_endian", "target_pointer_width", "target_has_atomic",
+             "unix", "windows"}
+UNKNOWN = "unknown"
+CFG_TOKEN = re.compile(r"\s*(?:(?P<ident>(?:r#)?[A-Za-z_][A-Za-z0-9_]*)|\"(?P<str>[^\"\\]*)\"|(?P<punct>[(),=]))")
+
+
+def parse_cfg(expr):
+    """Parse a cargo cfg expression (without the outer cfg(...))."""
+    toks, i = [], 0
+    while i < len(expr):
+        if expr[i:].strip() == "":
+            break
+        m = CFG_TOKEN.match(expr, i)
+        if not m:
+            raise ValueError("cannot parse cfg(%s)" % expr)
+        toks.append(m)
+        i = m.end()
+    pos = [0]
+
+    def peek(kind, value=None):
+        if pos[0] >= len(toks):
+            return False
+        g = toks[pos[0]].group(kind)
+        return g is not None and (value is None or g == value)
+
+    def take(kind, value=None):
+        if not peek(kind, value):
+            raise ValueError("cannot parse cfg(%s)" % expr)
+        pos[0] += 1
+        return toks[pos[0] - 1].group(kind)
+
+    def pred():
+        name = take("ident").removeprefix("r#")
+        if name in ("all", "any", "not") and peek("punct", "("):
+            take("punct", "(")
+            args = []
+            while not peek("punct", ")"):
+                args.append(pred())
+                if not peek("punct", ")"):
+                    take("punct", ",")
+            take("punct", ")")
+            if name == "not" and len(args) != 1:
+                raise ValueError("cannot parse cfg(%s)" % expr)
+            return (name, args)
+        if peek("punct", "="):
+            take("punct", "=")
+            return ("pred", name, take("str"))
+        return ("pred", name, None)
+
+    tree = pred()
+    if pos[0] != len(toks):
+        raise ValueError("cannot parse cfg(%s)" % expr)
+    return tree
+
+
+def eval_cfg(tree, cfg):
+    """Three-valued: True, False or UNKNOWN on one target's printed cfg."""
+    kind = tree[0]
+    if kind == "pred":
+        name, value = tree[1], tree[2]
+        if value is None and name in ("true", "false"):
+            return name == "true"
+        if name not in CFG_KNOWN:
+            return UNKNOWN
+        return (name, value) in cfg
+    vals = [eval_cfg(t, cfg) for t in tree[1]]
+    if kind == "not":
+        return UNKNOWN if vals[0] is UNKNOWN else not vals[0]
+    if kind == "all":
+        return False if False in vals else (UNKNOWN if UNKNOWN in vals else True)
+    return True if True in vals else (UNKNOWN if UNKNOWN in vals else False)
+
+
+class Platforms:
+    """The checked Linux targets and their cfg, from rustc."""
+
+    def __init__(self, root, triples):
+        self.cfgs = {}
+        for t in triples:
+            res = run(["rustc", "--print", "cfg", "--target", t], root)
+            if res.returncode != 0:
+                sys.stderr.write(res.stderr)
+                raise ToolError(POLICY, "rustc --print cfg --target %s failed" % t)
+            cfg = set()
+            for line in res.stdout.splitlines():
+                name, _, value = line.partition("=")
+                cfg.add((name, value[1:-1] if value else None))
+            self.cfgs[t] = cfg
+        self.cache = {}
+
+    def applies(self, target):
+        """False only when the target spec is false on every checked platform
+        under every value of the unknown names; a malformed cfg is a tool error."""
+        if target is None:
+            return True
+        if target not in self.cache:
+            if target.startswith("cfg(") and target.endswith(")"):
+                try:
+                    tree = parse_cfg(target[4:-1])
+                except ValueError as err:
+                    raise ToolError("Cargo.toml", "%s in a dependency target" % err) from err
+                self.cache[target] = any(eval_cfg(tree, c) is not False for c in self.cfgs.values())
+            else:
+                self.cache[target] = target in self.cfgs
+        return self.cache[target]
 
 
 def adr_files(root, number):
@@ -436,13 +604,13 @@ def check_policy(data, root, rep):
         usable = False
     else:
         for key in roles:
-            if key not in ("core", "support", "roots", "unsafe"):
+            if key not in ("core", "support", "roots", "unsafe", "build-script"):
                 bad("unknown key roles.%s" % show(key))
-        for key in ("core", "support", "roots", "unsafe"):
+        for key in ("core", "support", "roots", "unsafe", "build-script"):
             value = names(roles.get(key), "roles." + key)
             if value is None:
                 usable = False
-            setattr(pol, key, value or [])
+            setattr(pol, key.replace("-", "_"), value or [])
     if not isinstance(check, dict):
         bad("missing [check]")
         usable = False
@@ -472,6 +640,9 @@ def check_policy(data, root, rep):
     for name in pol.unsafe:
         if name in pol.core:
             bad("%s is in both roles.core and roles.unsafe" % name)
+    for name in pol.build_script:
+        if name in pol.core:
+            bad("%s is in both roles.core and roles.build-script" % name)
 
     pol.edges = {}
     pol.strict = {}
@@ -546,11 +717,11 @@ def check_policy(data, root, rep):
     return pol
 
 
-def cargo_metadata(root, platforms):
+def cargo_metadata(root):
+    # No --filter-platform: cargo evaluates cfg() without the flags a real
+    # build uses (crt-static, custom --cfg), so edges are filtered here.
     args = ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features",
             "--manifest-path", str(root / "Cargo.toml")]
-    for p in platforms:
-        args += ["--filter-platform", p]
     res = run(args, root)
     if res.returncode != 0:
         sys.stderr.write(res.stderr)
@@ -563,8 +734,8 @@ def cargo_metadata(root, platforms):
 
 
 def walk_config_files(root, skip):
-    """Cargo and clippy config files anywhere in the tree."""
-    cargo, clippy = [], []
+    """Cargo, clippy and rustup toolchain files anywhere in the tree."""
+    cargo, clippy, toolchain = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         kept = []
@@ -583,7 +754,9 @@ def walk_config_files(root, skip):
         for name in sorted(filenames):
             if name in ("clippy.toml", ".clippy.toml"):
                 clippy.append(here / name)
-    return cargo, clippy
+            if name in ("rust-toolchain", "rust-toolchain.toml"):
+                toolchain.append(here / name)
+    return cargo, clippy, toolchain
 
 
 def check(root):
@@ -594,7 +767,21 @@ def check(root):
     if pol is None:
         return rep
 
-    meta = cargo_metadata(root, pol.platforms)
+    # Files that change which tools run or how: checked before any cargo
+    # call, because a toolchain file can replace cargo itself.
+    skip = {(root / "target").resolve()}
+    if os.environ.get("CARGO_TARGET_DIR"):
+        skip.add(Path(os.environ["CARGO_TARGET_DIR"]).resolve())
+    cargo_cfg, clippy_cfg, toolchain = walk_config_files(root, skip)
+    for p in cargo_cfg:
+        rep.fail("cargo-config", rel(root, p), "a cargo config can cap lints, replace sources, patch or wrap rustc")
+    for p in clippy_cfg:
+        rep.fail("clippy-config", rel(root, p), "a clippy config can relax lints")
+    for p in toolchain:
+        rep.fail("toolchain-file", rel(root, p), "a toolchain file picks the cargo and rustc that CI and this check run")
+
+    platforms = Platforms(root, pol.platforms)
+    meta = cargo_metadata(root)
     packages = {p["id"]: p for p in meta["packages"]}
     member_ids = set(meta["workspace_members"])
     members = sorted((packages[i] for i in member_ids), key=lambda p: p["manifest_path"])
@@ -620,13 +807,6 @@ def check(root):
         if core not in names:
             rep.fail("core-missing", "Cargo.toml", "core crate %s is not a workspace member" % core)
 
-    target_dir = Path(meta["target_directory"]).resolve()
-    cargo_cfg, clippy_cfg = walk_config_files(root, {target_dir, (root / "target").resolve()})
-    for p in cargo_cfg:
-        rep.fail("cargo-config", rel(root, p), "a cargo config can cap lints, replace sources, patch or wrap rustc")
-    for p in clippy_cfg:
-        rep.fail("clippy-config", rel(root, p), "a clippy config can relax lints")
-
     # Per-member rules.
     texts = {}
     for pkg in members:
@@ -641,22 +821,33 @@ def check(root):
         if not is_unsafe and member_manifest.get("lints") != {"workspace": True}:
             rep.fail("lints-inherit", mpath(pkg), "%s: [lints] must be exactly `workspace = true`" % name)
 
-        files, links = walk_package(pkg_dir)
+        files, others, links = walk_package(pkg_dir)
         for link in links:
             rep.fail("symlink", rel(root, link), "symlinks in a package are not followed by the scans")
-        for f in files:
-            if f not in texts:
-                texts[f] = read_text(f, root)
 
         lib_roots = []
         for t in pkg["targets"]:
             src = Path(t["src_path"])
-            if pkg_dir.resolve() not in src.resolve().parents:
+            inside = pkg_dir.resolve() in src.resolve().parents
+            if not inside:
                 rep.fail("source-redirect", mpath(pkg), "target %s reads %s, outside the package" % (t["name"], rel(root, src)))
+            if not src.name.endswith(".rs"):
+                # The scans read .rs files; a crate root under another name
+                # would be invisible to them. It is scanned below anyway.
+                rep.fail("source-redirect", mpath(pkg), "target %s has source %s, not a .rs file" % (t["name"], rel(root, src)))
+                if inside and src not in files and not src.is_symlink():
+                    files.append(src)
             if "proc-macro" in t["kind"]:
                 rep.fail("proc-macro", mpath(pkg), "%s: proc macros can emit unsafe that no scan sees" % name)
+            if "custom-build" in t["kind"] and name not in pol.build_script:
+                rep.fail("build-script", mpath(pkg), "%s: a build script can compile and link native code no scan sees" % name)
             if LIB_KINDS.intersection(t["kind"]):
                 lib_roots.append(src)
+        if dig(member_manifest, "package", "links") is not None and name not in pol.build_script:
+            rep.fail("build-script", mpath(pkg), "%s: `links` declares a native library" % name)
+        for f in files:
+            if f not in texts:
+                texts[f] = read_text(f, root)
         for src in lib_roots:
             attrs = leading_attributes(texts.get(src) or read_text(src, root))
             if not is_unsafe and DOCTEST_ATTR not in attrs:
@@ -667,8 +858,8 @@ def check(root):
         if is_core:
             kinds = [(t["kind"], t["crate_types"]) for t in pkg["targets"]]
             libs = [k for k in kinds if k == (["lib"], ["lib"])]
-            others = [k for k in kinds if k != (["lib"], ["lib"]) and k[0] != ["test"]]
-            if len(libs) != 1 or others:
+            extra = [k for k in kinds if k != (["lib"], ["lib"]) and k[0] != ["test"]]
+            if len(libs) != 1 or extra:
                 rep.fail("core-targets", mpath(pkg), "%s: a core crate has one lib target and test targets only" % name)
             if pkg["features"]:
                 rep.fail("core-features", mpath(pkg), "%s: a core crate declares no features" % name)
@@ -682,24 +873,57 @@ def check(root):
             else:
                 for m in MACRO_EXPORT.finditer(code):
                     rep.fail("sys-macro-export", rel(root, f), "an exported macro would carry unsafe out of %s" % name, line_of(code, m.start()))
-            for line, message in source_redirects(text):
+            toks, error = tokenize(text)
+            if error:
+                rep.fail("source-redirect", rel(root, f), error, 1)
+            for line, message in source_redirects(toks):
                 rep.fail("source-redirect", rel(root, f), message, line)
             if is_core:
-                for rx in CORE_TOKENS:
+                for rx in CORE_TOKENS + [FORMAT_SPEC]:
                     for m in rx.finditer(code):
                         rep.fail("core-token", rel(root, f), "banned in core crates: %s" % show(m.group(0)), line_of(code, m.start()))
                 for m in EXTERN_CRATE.finditer(code):
                     if not EXTERN_ALLOC.match(code, m.end()):
                         rep.fail("core-token", rel(root, f), "banned in core crates: extern crate (only `extern crate alloc;`)", line_of(code, m.start()))
+                for k, (kind, value, line) in enumerate(toks):
+                    if kind == "str":
+                        raw, body = value
+                        m = FORMAT_SPEC.search(body if raw else unescape(body))
+                        if m:
+                            rep.fail("core-token", rel(root, f), "banned in core crates: format spec %s (after escapes)" % show(m.group(0)), line)
+                    if kind == "ident" and value in ("include_str", "include_bytes"):
+                        lit = toks[k + 3] if k + 4 < len(toks) else None
+                        ok = (lit is not None and toks[k + 1][:2] == ("punct", "!") and toks[k + 2][0] == "punct"
+                              and lit[0] == "str" and toks[k + 4][0] == "punct")
+                        if ok:
+                            target = (f.parent / (lit[1][1] if lit[1][0] else unescape(lit[1][1]))).resolve()
+                            ok = pkg_dir.resolve() in target.parents
+                        if not ok:
+                            rep.fail("core-token", rel(root, f), "%s! must take one literal path inside the package" % value, line)
+        if is_core:
+            # include_str! turns these into string literals, format strings
+            # included.
+            for f in others:
+                try:
+                    data = f.read_bytes().decode("utf-8", errors="replace")
+                except OSError as err:
+                    raise ToolError(rel(root, f), "cannot read: %s" % err.strerror) from err
+                for m in FORMAT_SPEC.finditer(data):
+                    rep.fail("core-token", rel(root, f), "banned in core crates: format spec %s" % show(m.group(0)), line_of(data, m.start()))
 
         # Graph rules over declared dependencies on other members.
         if not MEMBER_NAME.fullmatch(name):
             continue
         for dep in pkg["dependencies"]:
-            if dep["kind"] == "dev" or not dep.get("path"):
+            if dep["kind"] == "dev" or not platforms.applies(dep.get("target")):
                 continue
-            target = member_dirs.get(Path(dep["path"]).resolve())
+            target = member_dirs.get(Path(dep["path"]).resolve()) if dep.get("path") else None
             if target is None:
+                # External: core crates take none (dev-dependencies aside).
+                if name == DOMAIN:
+                    rep.fail("graph-domain", mpath(pkg), "%s -> %s: the domain depends on nothing" % (name, dep["name"]))
+                elif name == APP:
+                    rep.fail("graph-app", mpath(pkg), "%s -> %s: the application depends only on the domain" % (name, dep["name"]))
                 continue
             dname = target["name"]
             if dname in pol.roots:
@@ -716,9 +940,27 @@ def check(root):
                 if dname not in (DOMAIN, APP) and dname not in pol.support:
                     rep.fail("graph-adapter", mpath(pkg), "%s -> %s: adapters depend on the domain, the application and support crates only" % (name, dname))
 
-    # Sources: crates.io only, path dependencies only to members.
+    # The graph that builds on a checked platform: edges whose target is not
+    # false everywhere, reachable from the members.
+    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
+    reachable, todo, edges = set(member_ids), sorted(member_ids), []
+    while todo:
+        pid = todo.pop()
+        for d in nodes[pid]["deps"]:
+            kinds = [k for k in d["dep_kinds"] if platforms.applies(k.get("target"))]
+            if not kinds:
+                continue
+            edges.append((pid, d["pkg"], kinds))
+            if d["pkg"] not in reachable:
+                reachable.add(d["pkg"])
+                todo.append(d["pkg"])
+
+    # Sources: crates.io only, path dependencies only to members. Declared
+    # dependencies count on every target; an unreachable package can only
+    # come from one of them, because crates.io crates cannot depend on git
+    # or path crates.
     for pid, pkg in sorted(packages.items()):
-        if pid not in member_ids and pkg.get("source") != CRATES_IO:
+        if pid in reachable and pid not in member_ids and pkg.get("source") != CRATES_IO:
             rep.fail("dep-source", "Cargo.lock", "%s %s comes from %s, not crates.io" % (pkg["name"], pkg["version"], pkg.get("source") or "a path"))
     for pkg in members:
         for dep in pkg["dependencies"]:
@@ -729,16 +971,14 @@ def check(root):
                 rep.fail("dep-source", mpath(pkg), "%s -> %s: source %s is not crates.io" % (pkg["name"], dep["name"], dep.get("source")))
 
     # Edges into external crates, over the resolved graph.
-    for node in sorted(meta["resolve"]["nodes"], key=lambda n: n["id"]):
-        parent = packages[node["id"]]["name"]
-        for d in node["deps"]:
-            if d["pkg"] in member_ids:
-                continue
-            child = packages[d["pkg"]]["name"]
-            if (parent, child) not in pol.edges:
-                kinds = sorted({k["kind"] or "normal" for k in d["dep_kinds"]})
-                rep.fail("dep-edge", POLICY, "%s -> %s (%s): no record [external.%s.pulled-by.%s]"
-                         % (parent, child, ", ".join(kinds), child, parent))
+    for pid, cid, dep_kinds in sorted(edges, key=lambda e: (e[0], e[1])):
+        if cid in member_ids:
+            continue
+        parent, child = packages[pid]["name"], packages[cid]["name"]
+        if (parent, child) not in pol.edges:
+            kinds = sorted({k["kind"] or "normal" for k in dep_kinds})
+            rep.fail("dep-edge", POLICY, "%s -> %s (%s): no record [external.%s.pulled-by.%s]"
+                     % (parent, child, ", ".join(kinds), child, parent))
 
     # The core must build for a target without std.
     core_ids = [p["id"] for p in members if p["name"] in pol.core]

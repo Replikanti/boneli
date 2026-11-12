@@ -26,3 +26,12 @@ pub trait E { fn expose_provenance(&self) -> usize; }
 pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:p}", x) }
 pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{x:#p}") }
 pub fn f() -> &'static str { "//" } pub async fn g() {}
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:\u{70}}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:\x70}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{0:p}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{v:>10p}", v = x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:x^#12.3p}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, concat!("{:", "p}"), x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, stringify!({:p}), x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, concat!("{:", '\x70', "}"), x) }
+pub struct S<'a>(&'a u8); impl core::fmt::Display for S<'_> { fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Pointer::fmt(&self.0, f) } }

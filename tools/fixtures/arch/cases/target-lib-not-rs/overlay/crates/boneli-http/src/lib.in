@@ -1,0 +1,10 @@
+//! Support crate.
+#![doc(test(attr(forbid(unsafe_code))))]
+
+/// Reads the byte at an address.
+#[macro_export]
+macro_rules! peek {
+    ($p:expr) => {
+        unsafe { *($p as *const u8) }
+    };
+}

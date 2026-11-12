@@ -1,0 +1,11 @@
+//! Fixture domain crate.
+#![no_std]
+#![doc(test(attr(forbid(unsafe_code))))]
+
+use core::sync::atomic::{AtomicU64, Ordering};
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Shared state and an address as an integer.
+pub async fn next(x: &u8) -> u64 {
+    COUNTER.fetch_add((x as *const u8).addr() as u64, Ordering::Relaxed)
+}

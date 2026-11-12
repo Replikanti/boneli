@@ -29,6 +29,24 @@ invariant while CI stays green (issue #28):
 None of these was reachable yet, because the workspace has no external crate.
 This decision lands before the first one (#5, #6).
 
+The adversarial review of the first version of this decision (PR #36)
+reproduced six more holes, all closed below:
+
+- A target source that is not a `.rs` file (`[lib] path = "src/lib.in"`)
+  hid a whole crate root, including an exported `unsafe` macro, from every
+  scan.
+- A build script in an adapter compiled and linked C code that ran before
+  `main`; no `unsafe` rule sees the C compiler.
+- A committed `rust-toolchain.toml` with `path = ...` replaced the `cargo`
+  that CI and the checker run, and that `cargo` rewrote the metadata.
+- `--filter-platform` evaluates `cfg(...)` without the flags a real build
+  uses, so an edge behind `cfg(target_feature = "crt-static")` (a static
+  binary) disappeared, also into a core crate or into `libc`.
+- Escapes in a format string (`"{:\u{70}}"`), `concat!`, and
+  `core::fmt::Pointer` printed addresses without the listed `{...:p}` token.
+- Two rule branches (declared dependency sources, build-dependencies in
+  the member graph) had no fixture, so weakening them kept the suite green.
+
 ### Measurements
 
 All runs used cargo 1.98.0, clippy 0.1.98 and cargo-deny 0.20.2 on a scratch
@@ -84,6 +102,27 @@ Other measurements:
   only on aarch64, and `libc` also arrives through `getrandom`.
 - `cargo metadata` has no `lints` field, so lint inheritance can only be
   checked by parsing the manifests.
+- Re-measured on 2026-11-12 for the cfg evaluation of D3, same setup and
+  cargo 1.98.0, resolving rustls 0.23.46, ring 0.17.14, getrandom 0.2.17,
+  libc 0.2.191 (scratch workspace, review round of PR #36): 27 external
+  crates and 35 edges without a filter; 16 and 23 with
+  `--filter-platform x86_64-unknown-linux-gnu`; 16 and 24 with aarch64 gnu
+  added, and still 16 and 24 with both musl targets added. The cfg
+  evaluation of D3 over the four targets, walking only reachable packages,
+  gives the same 16 crates and 24 edges: the new method needs no extra
+  policy records for this stack. The two conditional edges into `libc` are
+  `getrandom -> libc` (`cfg(unix)`) and `ring -> libc` (aarch64 Linux
+  only). All 13 distinct target specs in that graph parse.
+- `rustc --print cfg --target <t>` works for targets whose standard library
+  is not installed, and for musl it prints `target_feature="crt-static"`
+  (a default that `-C target-feature=-crt-static` turns off).
+- Format strings: `format!` accepts `"{:\u{70}}"`, `"{:\x70}"`, a line
+  continuation inside the spec, `concat!("{:", "p}")`, `stringify!({:p})`
+  and `include_str!("fmt.txt")` with a file containing `{:p}`; all compile
+  and print an address.
+- cargo rejects a malformed `cfg(...)` in a target table and a `links` key
+  without a build script when it loads the manifest, and it lists
+  build-dependencies even when the package has no build script.
 - TOML (Python 3.14 `tomllib`): declaring the same edge table twice is an
   error, not last-wins.
 
@@ -107,8 +146,9 @@ reads its policy data from `tools/architecture.toml`.
   shipped targets, so `usize` behaves the same. `#![no_std]` removes all of
   `std` by construction; clippy `disallowed-*` lists cover only what someone
   enumerated (they missed `println!` and `stdin`, table above).
-- **Token layer** over every `.rs` file in the core package directories, for
-  what `no_std` cannot remove and for `std` behind a `cfg`. Whole-line `//`
+- **Token layer** over every `.rs` file in the core package directories
+  (and every target source, see D2), for what `no_std` cannot remove and
+  for `std` behind a `cfg`. Whole-line `//`
   comments are blanked, unless the line contains `*/` or `"`: such a line can
   close a block comment or a string from an earlier line, and what follows is
   code. Everything else, block comments and strings included, is scanned
@@ -126,8 +166,20 @@ reads its policy data from `tools/architecture.toml`.
     `unsafe` on 1.98), and `asm!` lives there.
   - `atomic`: shared mutable state across runs and threads.
   - `*const`, `*mut`, `&raw const`, `&raw mut`, `ptr`, `UnsafeCell`,
-    `as_ptr...`, `as_mut_ptr...`, `into_raw...`, `addr`, `expose_provenance`
-    and `{...:p}` format specs: addresses differ per run (ASLR).
+    `as_ptr...`, `as_mut_ptr...`, `into_raw...`, `addr`, `expose_provenance`,
+    `Pointer` (`core::fmt::Pointer::fmt` prints an address without a format
+    spec) and format specs that end in `p` (`{:p}`, `{0:p}`, `{name:p}`,
+    `{:#p}`, fill, width and precision variants): addresses differ per run
+    (ASLR).
+  - The format spec is matched three times: on the raw text; on every
+    string literal after its escapes are decoded (`\u{..}`, `\x..`, line
+    continuations), because rustc decodes them before it parses the spec;
+    and on every non-`.rs` file in a core package directory, because
+    `include_str!` turns such a file into a format string.
+    `include_str!`/`include_bytes!` take exactly one literal path inside the
+    package, so the file they read is one of those.
+  - `concat!` and `stringify!`: they build a format string from pieces that
+    are no single literal (`concat!("{:", "p}")`).
   - The old `fs::`/`net::`/`env::`/`thread::`/`process::` and `.elapsed()`
     patterns are dropped: the `std` token covers them without aliases, and
     they flag names the domain needs, such as a budget's `elapsed`.
@@ -151,9 +203,30 @@ reads its policy data from `tools/architecture.toml`.
   proc macro can emit `unsafe` built from strings that no text scan sees.
 - **Complete file set.** No member uses `#[path = ...]` (also in
   `cfg_attr`) or `include!`, no attribute or macro name is built from a
-  macro metavariable (it could carry either), no target's source file lies
-  outside its package, and no package directory contains a symlink. The
-  scans therefore see every file the compiler reads.
+  macro metavariable (it could carry either), every target's source file
+  (lib, bin, test, bench, example, build script) ends in `.rs` and lies
+  inside its package, and no package directory contains a symlink. The
+  scans read `.rs` files, and `mod` declarations only resolve `.rs` files,
+  so they see every crate root and every module. A non-`.rs` crate root is
+  scanned as well, so its content is reported too.
+- **No build scripts and no `links`** outside `roles.build-script` in the
+  policy, in any member, core or not. A build script runs arbitrary code at
+  build time and can compile and link native code (measured in review: a C
+  constructor ran before `main`) that no Rust scan sees. `links` declares a
+  native library; cargo already requires a build script for it, so it is
+  banned on the same terms as defense in depth. The list is empty today. A
+  crate that needs one (for example a vendored C library) is added in the
+  same PR as an ADR that names it; review enforces that, as for a new
+  crate name.
+- **No toolchain files.** No `rust-toolchain` or `rust-toolchain.toml`
+  anywhere in the tree. Such a file picks the `cargo` and `rustc` that CI
+  and this check run: `path = ...` can point at a committed fake `cargo`
+  (reproduced in review), and a nightly `channel` unlocks
+  `profile-rustflags`, which can cap lints. A pin is out of scope here; the
+  ADR that adds one will allow `channel` and forbid `path`. As defense in
+  depth, both CI jobs set `RUSTUP_TOOLCHAIN` to the toolchain the workflow
+  installs, which outranks any toolchain file. The check looks for these
+  files before it runs any cargo command.
 - **No config files.** No `.cargo/config` or `.cargo/config.toml` anywhere in
   the tree: each can open a bypass (`--cap-lints allow`, `[source]`
   replacement, `[patch]`, `[env]`, `build.rustc-wrapper`). No `clippy.toml`
@@ -163,25 +236,48 @@ reads its policy data from `tools/architecture.toml`.
 
 ### D3. Dependencies: an edge allowlist, sources from crates.io only
 
-- **Graph.** The checker reads `cargo metadata --locked --all-features` with
-  `--filter-platform` for `x86_64-unknown-linux-gnu` and
-  `aarch64-unknown-linux-gnu`. Every resolved edge whose child is not a
-  workspace member needs a record `[external.<child>.pulled-by.<parent>]`.
-  All dependency kinds count (normal, build, dev). Edges match by package
-  name, not version; member status comes from package IDs, never from a
-  `boneli-` prefix.
+- **Graph.** The checker reads `cargo metadata --locked --all-features`
+  without `--filter-platform` and filters edges itself. Every edge whose
+  child is not a workspace member, from a package reachable from the
+  members over applying edges, needs a record
+  `[external.<child>.pulled-by.<parent>]`. All dependency kinds count
+  (normal, build, dev). Edges match by package name, not version; member
+  status comes from package IDs, never from a `boneli-` prefix.
+- **Which edges apply.** An edge's `cfg(...)` (or target triple) is
+  evaluated with three-valued logic against each checked target, with the
+  values `rustc --print cfg --target <t>` prints. Names whose whole value
+  set that output covers (`target_os`, `target_family`, `target_arch`,
+  `target_env`, `target_abi`, `target_vendor`, `target_endian`,
+  `target_pointer_width`, `target_has_atomic`, `unix`, `windows`) are
+  known: a value it does not print is false. Every other name is unknown,
+  because it depends on flags, the profile or the build: `target_feature`
+  (`crt-static` for a static binary), `debug_assertions`, `panic`,
+  `overflow_checks`, any custom `--cfg`. An edge is ignored only when it is
+  false on every checked target under every value of the unknowns. A
+  malformed cfg is a tool error. Why not `--filter-platform`: cargo
+  evaluates the cfg without the flags a real build uses, so an edge behind
+  `crt-static` vanished from the checked graph (reproduced in review) while
+  a static release build compiles it. The same evaluation decides which
+  declared dependencies of members the crate-graph rules see.
+- **Core crates take no external dependency** on any applying target: a
+  declared non-member dependency of `boneli-domain` or `boneli-app` (dev
+  aside) fails the graph rule, besides the missing edge record.
 - **Why edges and not a set of names:** `libc` reaches `boneli-https` through
   `getrandom` (measured). With a name set, `libc`, approved for
   `boneli-sys`, would pass under any parent. Edges keep ARCHITECTURE's
   "Where it may appear" column true transitively.
-- **Platforms.** The runner is Linux-only. Without a filter the policy would
-  need 11 crates that never build here (27 vs 16 crates); without aarch64 the
-  aarch64-only edge `ring -> libc` would go unchecked. Release triples such
-  as musl are added by the release work (#22).
-- **Sources.** Every non-member package has the crates.io source; every
-  declared dependency of a member is a path to a member directory or comes
-  from crates.io; the root manifest has no `[patch]`, `[replace]` or
-  `workspace.exclude`.
+- **Platforms.** The runner is Linux-only: x86_64 and aarch64, each with
+  glibc and with musl, because static binaries such as the shim may ship on
+  musl. Without filtering, the policy would need 11 crates that never build
+  here (27 vs 16 crates); without aarch64 the aarch64-only edge
+  `ring -> libc` would go unchecked. Further release triples are added by
+  the release work (#22).
+- **Sources.** Every reachable non-member package has the crates.io source;
+  every declared dependency of a member, on any target, is a path to a
+  member directory or comes from crates.io; the root manifest has no
+  `[patch]`, `[replace]` or `workspace.exclude`. An unreachable package can
+  only enter through a member's declared dependency, because crates.io
+  does not accept crates with git or path dependencies.
 - **Policy shape.** `[external.<crate>]` has `reason` and `decision`: why the
   crate is allowed and what approved its name. Each allowed parent has its
   own `[external.<crate>.pulled-by.<parent>]` with `reason` and `decision`.
@@ -217,6 +313,7 @@ change to the checker, its policy and its fixtures gets.
 | A new external crate name | an ADR, or a row in the ARCHITECTURE table | a crate table with `reason` and `decision`; an `ADR-NNN` resolves to one file | that the ADR or the row actually approves the crate |
 | A new edge into a non-strict crate already in the policy | a record with `reason` and the ADR (or `ARCHITECTURE`) that approved the parent's stack | the record and both keys exist; an `ADR-NNN` resolves to one file | that the cited ADR covers the edge. This is the known weak spot: for non-strict crates the checker verifies only that the cited ADR file exists |
 | A new edge into a strict crate (`libc`) | its own accepted ADR that names the edge | everything under "Strict crates" | that the ADR approves the edge instead of only mentioning it, and that no accepted ADR was edited to add it (the ADR README allows only status changes) |
+| Adding a crate to `roles.build-script` | an ADR that names the crate and why it needs native code or a build step | the crate has a build script or `links` only if listed; a core crate cannot be listed | that the ADR approves this crate's build script |
 | Marking a crate strict, or removing the marker | an ADR | `strict` cites an existing ADR; removing `libc`'s marker turns the `strict-edge-architecture` fixture red | that an ADR admitting another crate with raw syscall access (for example `rustix`, `linux-raw-sys` or `nix`) marks it strict |
 
 **Rejected: cargo-deny `[bans] allow` as the allowlist or as a second layer**
@@ -292,8 +389,11 @@ and upstream releases would change the results.
   through a metavariable (`#[$meta]`). Rename, or widen the rule through a
   new ADR.
 - **Residual risks:** a pointer address can still leak through a `core` or
-  `alloc` API that is not listed plus an `as usize` cast; the replay tests of
-  #2 are the backstop. The strict check is a text match, so an accepted ADR
+  `alloc` API that is not listed, or through a function pointer cast to an
+  integer (`marker as fn() as usize`, reproduced in review). The backstop is
+  #2's acceptance test: folding the same event sequence through
+  `Run::handle` in two separate processes gives byte-identical `Debug`
+  output for the final run and every command list. The strict check is a text match, so an accepted ADR
   that names an edge only to reject it passes the checker; review owns the
   meaning, and the checker makes sure no edge into `libc` lands without an
   accepted ADR naming it. The runner itself can be weakened (for example by
@@ -311,3 +411,12 @@ and upstream releases would change the results.
   D2.
 - **Canned metadata fixtures, real crates.io crates:** see D5.
 - **Rust or bash for the checker:** see D4.
+- **`--filter-platform` for the platform filter:** see D3, "Which edges
+  apply".
+- **An allow list of toolchain-file keys** (`channel`, `components`,
+  `targets`, `profile`) instead of banning the files: there is no pin to
+  keep yet, so the ban is the smaller surface; the ADR that adds a pin
+  allows `channel` and forbids `path`.
+- **Build scripts allowed outside core, `unsafe` scan only:** a build script
+  compiles C without any Rust token (reproduced in review); listing the
+  few crates that need one keeps each in front of a reviewer.

@@ -20,6 +20,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # The toolchain this workflow installs outranks any rust-toolchain file
+      # in the checkout, so a committed one cannot redirect cargo or rustc
+      # here (ADR-001; the architecture check also rejects such files).
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       # Every PR closes its issue ("Closes #N") or states why none applies
@@ -58,6 +63,9 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # cargo-deny runs cargo metadata: same pin as in `check` (ADR-001).
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       # Prebuilt binary instead of compiling cargo-deny from source.

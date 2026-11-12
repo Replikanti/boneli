@@ -28,20 +28,25 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `HashMap`/`HashSet`. Runs replay deterministically from the event log.
    Both crates are `#![no_std]` with `alloc` and must build for
    `x86_64-unknown-none`; a token scan covers what `no_std` cannot remove
-   (async, `core::arch`, atomics, pointer addresses) (ADR-001).
+   (async, `core::arch`, atomics, pointer addresses, format specs that end
+   in `p` also after escapes, `concat!`, `stringify!`) (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,
    transitive ones included, needs a record with a reason in
    `tools/architecture.toml`; a new crate name needs an ADR or a row in
    ARCHITECTURE, and every edge into `libc` needs its own accepted ADR that
-   names it. Sources are crates.io only; path dependencies point to members.
-   The "do not use" list is enforced in `deny.toml`. Widening either needs an
-   ADR (ADR-001).
+   names it. Edges count unless their `cfg` is false on every checked Linux
+   target (x86_64 and aarch64, gnu and musl); flag-dependent cfgs such as
+   `crt-static` count as true. Sources are crates.io only; path dependencies
+   point to members. The "do not use" list is enforced in `deny.toml`.
+   Widening either needs an ADR (ADR-001).
 4. **Unsafe only in `boneli-sys`.** Every other crate inherits the workspace
    lints, which forbid it; the check also scans every other crate for the
    `unsafe` token and requires the doctest attribute
    `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. No
-   `.cargo/config*`, `clippy.toml`, proc-macro crate, `#[path]` or
-   `include!` (ADR-001).
+   `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
+   `#[path]`, `include!` or target source outside `.rs`; no build script or
+   `links` key outside `roles.build-script` in `tools/architecture.toml`
+   (empty; adding a crate needs an ADR) (ADR-001).
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.

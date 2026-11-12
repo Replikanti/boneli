@@ -270,7 +270,7 @@ impl Run {
 
 ## Pure Rust and dependencies
 
-All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001).
+All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts and native `links` are allowed only for crates listed in `roles.build-script` of that file, each with its own ADR; the list is empty.
 
 | Crate | Why | Where it may appear |
 | --- | --- | --- |
@@ -284,7 +284,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 
 **We do not use:** tokio, serde, clap, tracing, anyhow, rusqlite.
 
-**Unsafe** only in `boneli-sys`; everywhere else the workspace lints forbid it, the architecture check scans every other crate for the `unsafe` token, and every other lib root carries `#![doc(test(attr(forbid(unsafe_code))))]`, because the lints do not reach doctests (ADR-001).
+**Unsafe** only in `boneli-sys`; everywhere else the workspace lints forbid it, the architecture check scans every other crate for the `unsafe` token, and every other lib root carries `#![doc(test(attr(forbid(unsafe_code))))]`, because the lints do not reach doctests. Every crate root is a `.rs` file inside its package, and no `rust-toolchain` file, cargo config or clippy config is committed, so the scans and CI see the code and tools that actually build (ADR-001).
 
 **JSON without derive** fits the hexagon: the domain does not know JSON, and mapping to DTOs belongs in the adapters.
 
