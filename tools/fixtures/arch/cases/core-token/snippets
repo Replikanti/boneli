@@ -34,4 +34,15 @@ pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, 
 pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, concat!("{:", "p}"), x) }
 pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, stringify!({:p}), x) }
 pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, concat!("{:", '\x70', "}"), x) }
+pub fn f() -> &'static str { stringify!(x) }
+use core::concat as cc; pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, cc!("{:", "\x70}"), x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, concat/**/!("{:", "\x70}"), x) }
+pub const N: &str = env!("CARGO_PKG_NAME");
+pub const N: Option<&str> = option_env!("BONELI_FIXTURE");
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:}>16p}", x) }
+pub fn f(x: &u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result { write!(w, "{:{<16p}", x) }
+#[allow(unused_imports)] use core::fmt::*;
+#[allow(unused_imports)] use core::fmt::{self, *};
+#[allow(unused_imports)] use core::{fmt::*, ops};
+#[allow(unused_imports)] use core::fmt as f;
 pub struct S<'a>(&'a u8); impl core::fmt::Display for S<'_> { fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Pointer::fmt(&self.0, f) } }

@@ -1,0 +1,2 @@
+# review round 2, F1d: include_str! of a .rs file whose only line is a comment holding {:p}
+core-token

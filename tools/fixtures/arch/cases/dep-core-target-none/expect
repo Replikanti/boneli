@@ -1,0 +1,3 @@
+# review round 2, F2: a core dependency that only the no-std build target compiles
+dep-edge
+graph-domain

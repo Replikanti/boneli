@@ -29,7 +29,11 @@ harness. Rust workspace, hexagonal architecture. Public repository
    Both crates are `#![no_std]` with `alloc` and must build for
    `x86_64-unknown-none`; a token scan covers what `no_std` cannot remove
    (async, `core::arch`, atomics, pointer addresses, format specs that end
-   in `p` also after escapes, `concat!`, `stringify!`) (ADR-001).
+   in `p` in any file of the package and after escapes, `concat`,
+   `stringify`, `env`, `option_env`, glob imports from `fmt`). The scan is
+   a first layer; the two-process replay test (#2) is the gate for address
+   leaks it cannot enumerate. Dependency `cfg`s of core crates are also
+   evaluated on `x86_64-unknown-none` (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,
    transitive ones included, needs a record with a reason in
    `tools/architecture.toml`; a new crate name needs an ADR or a row in
@@ -44,9 +48,9 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `unsafe` token and requires the doctest attribute
    `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. No
    `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
-   `#[path]`, `include!` or target source outside `.rs`; no build script or
-   `links` key outside `roles.build-script` in `tools/architecture.toml`
-   (empty; adding a crate needs an ADR) (ADR-001).
+   `#[path]`, `include!` or target source outside `.rs`; no build script
+   outside `roles.build-script` in `tools/architecture.toml` (empty; adding
+   a crate needs an ADR) (ADR-001).
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.

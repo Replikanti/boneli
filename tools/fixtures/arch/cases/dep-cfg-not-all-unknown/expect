@@ -1,0 +1,2 @@
+# QA round 2: all() with an unknown and a true operand stays unknown, so not() of it applies
+dep-edge

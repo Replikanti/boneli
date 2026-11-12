@@ -47,6 +47,16 @@ reproduced six more holes, all closed below:
 - Two rule branches (declared dependency sources, build-dependencies in
   the member graph) had no fixture, so weakening them kept the suite green.
 
+A second review round and QA found more, also closed below: seven more ways
+for a core crate to print an address (an alias of `concat!`, a comment
+before its `!`, `env!` reading a format string from the manifest,
+`include_str!` of a `.rs` file holding the spec in a comment, `{` or `}` as
+the fill character, and a glob import from `core::fmt` that brings
+`Pointer` into scope without naming it); a core dependency under
+`cfg(target_os = "none")` that only the no-std build compiles; and cfg
+evaluator branches (`any`/`all` with an unknown operand, plain target
+triples, a cfg the parser rejects) that no fixture pinned.
+
 ### Measurements
 
 All runs used cargo 1.98.0, clippy 0.1.98 and cargo-deny 0.20.2 on a scratch
@@ -121,8 +131,11 @@ Other measurements:
   and `include_str!("fmt.txt")` with a file containing `{:p}`; all compile
   and print an address.
 - cargo rejects a malformed `cfg(...)` in a target table and a `links` key
-  without a build script when it loads the manifest, and it lists
-  build-dependencies even when the package has no build script.
+  without a build script when it loads the manifest ("package specifies
+  that it links to `native` but does not have a custom build script"), and
+  it lists build-dependencies even when the package has no build script.
+  It takes a backslash in a cfg string literally: `cfg(target_os = "li\nux")`
+  loads, and the checker's parser rejects it.
 - TOML (Python 3.14 `tomllib`): declaring the same edge table twice is an
   error, not last-wins.
 
@@ -171,15 +184,35 @@ reads its policy data from `tools/architecture.toml`.
     spec) and format specs that end in `p` (`{:p}`, `{0:p}`, `{name:p}`,
     `{:#p}`, fill, width and precision variants): addresses differ per run
     (ASLR).
-  - The format spec is matched three times: on the raw text; on every
-    string literal after its escapes are decoded (`\u{..}`, `\x..`, line
-    continuations), because rustc decodes them before it parses the spec;
-    and on every non-`.rs` file in a core package directory, because
-    `include_str!` turns such a file into a format string.
-    `include_str!`/`include_bytes!` take exactly one literal path inside the
-    package, so the file they read is one of those.
-  - `concat!` and `stringify!`: they build a format string from pieces that
-    are no single literal (`concat!("{:", "p}")`).
+  - The format spec is matched on the raw content of every file in a core
+    package, any extension and comments included, because `include_str!`
+    turns any file, also a `.rs` file whose only line is a comment, into a
+    format string; a spec inside a comment therefore fails closed. It is
+    also matched on every string literal after its escapes are decoded
+    (`\u{..}`, `\x..`, line continuations), because rustc decodes them
+    before it parses the spec. The fill character may be any character,
+    `{` and `}` included (`{:}>16p}` compiles). `include_str!` and
+    `include_bytes!` take exactly one literal path inside the package, so
+    the file they read is one of those.
+  - `concat`, `stringify`, `env` and `option_env`, as identifiers with or
+    without a following `!`: the first two build a format string from pieces
+    that are no single literal (`concat!("{:", "p}")`), and matching the bare
+    identifier also catches an alias (`use core::concat as cc;`) and a
+    comment between the name and `!`. `env!` and `option_env!` read the
+    build environment at compile time, an impure input to the core on its
+    own, and can carry a format string (from a manifest field, for example).
+  - A glob import from a `fmt` module path (`core::fmt::*`, `alloc::fmt::*`,
+    `fmt::{self, *}`, also inside use-groups) and a rename of a `fmt` module
+    (`use core::fmt as f;`): the glob brings the `Pointer` trait into scope,
+    and method resolution can then print an address without the name
+    `Pointer` appearing (reproduced in review).
+  - **Limit, stated plainly.** A text scan cannot enumerate every way to
+    obtain an address; a function pointer cast to an integer
+    (`marker as fn() as usize`) has no token at all. The token list is a
+    best-effort first layer. The gate for this class is #2's acceptance
+    test: folding the same event sequence through `Run::handle` in two
+    separate processes gives byte-identical `Debug` output for the final
+    run and every command list.
   - The old `fs::`/`net::`/`env::`/`thread::`/`process::` and `.elapsed()`
     patterns are dropped: the `std` token covers them without aliases, and
     they flag names the domain needs, such as a budget's `elapsed`.
@@ -209,15 +242,17 @@ reads its policy data from `tools/architecture.toml`.
   scans read `.rs` files, and `mod` declarations only resolve `.rs` files,
   so they see every crate root and every module. A non-`.rs` crate root is
   scanned as well, so its content is reported too.
-- **No build scripts and no `links`** outside `roles.build-script` in the
-  policy, in any member, core or not. A build script runs arbitrary code at
-  build time and can compile and link native code (measured in review: a C
-  constructor ran before `main`) that no Rust scan sees. `links` declares a
-  native library; cargo already requires a build script for it, so it is
-  banned on the same terms as defense in depth. The list is empty today. A
-  crate that needs one (for example a vendored C library) is added in the
-  same PR as an ADR that names it; review enforces that, as for a new
-  crate name.
+- **No build scripts** outside `roles.build-script` in the policy, in any
+  member, core or not. A build script runs arbitrary code at build time and
+  can compile and link native code (measured in review: a C constructor ran
+  before `main`) that no Rust scan sees. A native library declared with
+  `links` is covered too: cargo rejects `links` without a build script
+  when it loads the manifest (measured), so the build-script rule always
+  fires for such a crate, and a separate `links` check would be dead code
+  that no fixture can pin. The list is empty today, and a core crate cannot
+  be listed. A crate that needs one (for example a vendored C library) is
+  added in the same PR as an ADR that names it; review enforces that, as
+  for a new crate name.
 - **No toolchain files.** No `rust-toolchain` or `rust-toolchain.toml`
   anywhere in the tree. Such a file picks the `cargo` and `rustc` that CI
   and this check run: `path = ...` can point at a committed fake `cargo`
@@ -254,7 +289,11 @@ reads its policy data from `tools/architecture.toml`.
   (`crt-static` for a static binary), `debug_assertions`, `panic`,
   `overflow_checks`, any custom `--cfg`. An edge is ignored only when it is
   false on every checked target under every value of the unknowns. A
-  malformed cfg is a tool error. Why not `--filter-platform`: cargo
+  malformed cfg is a tool error. Edges of the core crates are also
+  evaluated on the no-std build target (`x86_64-unknown-none`), because the
+  checker builds them there: a dependency under `cfg(target_os = "none")`
+  reaches no shipped binary but is compiled, build script included, in CI
+  (reproduced in review). Why not `--filter-platform`: cargo
   evaluates the cfg without the flags a real build uses, so an edge behind
   `crt-static` vanished from the checked graph (reproduced in review) while
   a static release build compiles it. The same evaluation decides which
@@ -313,7 +352,7 @@ change to the checker, its policy and its fixtures gets.
 | A new external crate name | an ADR, or a row in the ARCHITECTURE table | a crate table with `reason` and `decision`; an `ADR-NNN` resolves to one file | that the ADR or the row actually approves the crate |
 | A new edge into a non-strict crate already in the policy | a record with `reason` and the ADR (or `ARCHITECTURE`) that approved the parent's stack | the record and both keys exist; an `ADR-NNN` resolves to one file | that the cited ADR covers the edge. This is the known weak spot: for non-strict crates the checker verifies only that the cited ADR file exists |
 | A new edge into a strict crate (`libc`) | its own accepted ADR that names the edge | everything under "Strict crates" | that the ADR approves the edge instead of only mentioning it, and that no accepted ADR was edited to add it (the ADR README allows only status changes) |
-| Adding a crate to `roles.build-script` | an ADR that names the crate and why it needs native code or a build step | the crate has a build script or `links` only if listed; a core crate cannot be listed | that the ADR approves this crate's build script |
+| Adding a crate to `roles.build-script` | an ADR that names the crate and why it needs native code or a build step | the crate has a build script only if listed (cargo allows `links` only with one); a core crate cannot be listed | that the ADR approves this crate's build script |
 | Marking a crate strict, or removing the marker | an ADR | `strict` cites an existing ADR; removing `libc`'s marker turns the `strict-edge-architecture` fixture red | that an ADR admitting another crate with raw syscall access (for example `rustix`, `linux-raw-sys` or `nix`) marks it strict |
 
 **Rejected: cargo-deny `[bans] allow` as the allowlist or as a second layer**
@@ -390,10 +429,11 @@ and upstream releases would change the results.
   new ADR.
 - **Residual risks:** a pointer address can still leak through a `core` or
   `alloc` API that is not listed, or through a function pointer cast to an
-  integer (`marker as fn() as usize`, reproduced in review). The backstop is
-  #2's acceptance test: folding the same event sequence through
-  `Run::handle` in two separate processes gives byte-identical `Debug`
-  output for the final run and every command list. The strict check is a text match, so an accepted ADR
+  integer (`marker as fn() as usize`, reproduced in review); see "Limit,
+  stated plainly" in D1. The gate is #2's two-process replay test.
+- **More false positives** in core crates: a field or variable named
+  `env`, a glob import from `core::fmt`, or a `{...p}` pattern in a comment
+  or a data file of a core package fail the check. The strict check is a text match, so an accepted ADR
   that names an edge only to reject it passes the checker; review owns the
   meaning, and the checker makes sure no edge into `libc` lands without an
   accepted ADR naming it. The runner itself can be weakened (for example by

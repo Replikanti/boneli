@@ -1,1 +1,2 @@
+# links is pinned only through the build script cargo requires for it (cargo rejects links without one)
 build-script

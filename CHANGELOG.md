@@ -32,10 +32,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-domain` and `boneli-app` are `#![no_std]` and build for
   `x86_64-unknown-none`; their doctests cannot use `unsafe`.
 - The architecture check evaluates dependency `cfg`s itself against x86_64
-  and aarch64 Linux with glibc and musl, treating flag-dependent conditions
-  such as `crt-static` as true, instead of `--filter-platform`. It rejects
-  crate roots that are not `.rs` files, build scripts and `links` outside
+  and aarch64 Linux with glibc and musl (core crates also on
+  `x86_64-unknown-none`), treating flag-dependent conditions such as
+  `crt-static` as true, instead of `--filter-platform`. It rejects crate
+  roots that are not `.rs` files, build scripts outside
   `roles.build-script` (empty), and `rust-toolchain` files; CI pins
-  `RUSTUP_TOOLCHAIN`. The core token scan decodes string escapes before
-  matching `{:p}`-style specs and also bans `Pointer`, `concat!` and
-  `stringify!`.
+  `RUSTUP_TOOLCHAIN`. The core token scan matches `{:p}`-style specs (any
+  fill character) in the raw content of every core file and in string
+  literals after escape decoding, and also bans `Pointer`, `concat`,
+  `stringify`, `env`, `option_env` and glob imports from `fmt`.

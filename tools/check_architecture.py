@@ -96,15 +96,19 @@ CORE_TOKENS = [
     re.compile(B + "(?:ptr|UnsafeCell|addr|expose_provenance)" + E),
     re.compile(B + "(?:as_ptr|as_mut_ptr|into_raw)"),
     re.compile(B + "Pointer" + E),
-    # Macros that build a format string from pieces the spec check below
-    # cannot see as one literal: concat!("{:", "p}"), stringify!({:p}).
-    re.compile(B + "(?:concat|stringify)" + WS + "*!(?!=)"),
+    # Macros that build a format string from pieces no single literal holds
+    # (concat!("{:", "p}"), stringify!({:p})), or from the build environment
+    # (env!, option_env!), which is also an impure input on its own. Matched
+    # as identifiers, so an alias (`use core::concat as c;`) or a comment
+    # before the `!` does not hide them.
+    re.compile(B + "(?:concat|stringify|env|option_env)" + E),
 ]
 # A format spec that ends in `p` prints an address: {:p}, {0:p}, {name:p},
-# {:#p}, {:>10p}, {:x^#12.3p}. Matched on the raw text, on every string
-# literal after its escapes are decoded, and on every other file in a core
-# package directory (include_str! reads them).
-FORMAT_SPEC = re.compile(r"\{[^{}]*:[^{}]*p\}")
+# {:#p}, {:>10p}, {:x^#12.3p}, and with `{` or `}` as the fill character
+# ({:}>16p}). Matched on the raw content of every file in a core package
+# (comments included, any extension: include_str! can read any of them) and
+# on every string literal after its escapes are decoded.
+FORMAT_SPEC = re.compile(r"\{[^{}]*:(?:[\s\S][<^>])?[^{}]*p\}")
 EXTERN_CRATE = re.compile(B + "extern" + WS + "+crate" + E)
 EXTERN_ALLOC = re.compile(WS + "+alloc" + WS + "*;")
 UNSAFE = re.compile(B + "unsafe" + E)
@@ -366,6 +370,38 @@ def tokenize(text):
         return rust_tokens(text), None
     except ValueError as err:
         return [], "cannot tokenize (%s), so the file set cannot be verified" % err
+
+
+def fmt_imports(toks):
+    """Lines of `use` items that glob-import from a `fmt` module path or
+    rename it: a glob brings `Pointer` into scope without naming it, and a
+    rename hides the path from this check."""
+    hits, k, n = [], 0, len(toks)
+    while k < n:
+        if not (toks[k][0] == "ident" and toks[k][1] == "use"):
+            k += 1
+            continue
+        line, levels, k = toks[k][2], [[]], k + 1
+        while k < n and not (toks[k][0] == "punct" and toks[k][1] == ";"):
+            kind, value, _ = toks[k]
+            chain = [seg for level in levels for seg in level]
+            if kind == "ident" and value == "as":
+                prev = levels[-1][-1] if levels[-1] else None
+                if prev == "fmt" or (prev == "self" and "fmt" in chain):
+                    hits.append((line, "renames a fmt module in a use item"))
+            elif kind == "ident":
+                levels[-1].append(value)
+            elif kind == "punct" and value == "{":
+                levels.append([])
+            elif kind == "punct" and value == "}":
+                if len(levels) > 1:
+                    levels.pop()
+            elif kind == "punct" and value == ",":
+                levels[-1] = []
+            elif kind == "punct" and value == "*" and "fmt" in chain:
+                hits.append((line, "glob import from a fmt module brings Pointer into scope"))
+            k += 1
+    return hits
 
 
 def source_redirects(toks):
@@ -781,6 +817,9 @@ def check(root):
         rep.fail("toolchain-file", rel(root, p), "a toolchain file picks the cargo and rustc that CI and this check run")
 
     platforms = Platforms(root, pol.platforms)
+    # Core crates are also built for the no-std target, so their edges are
+    # evaluated there too.
+    core_platforms = Platforms(root, pol.platforms + [pol.no_std_target])
     meta = cargo_metadata(root)
     packages = {p["id"]: p for p in meta["packages"]}
     member_ids = set(meta["workspace_members"])
@@ -843,8 +882,6 @@ def check(root):
                 rep.fail("build-script", mpath(pkg), "%s: a build script can compile and link native code no scan sees" % name)
             if LIB_KINDS.intersection(t["kind"]):
                 lib_roots.append(src)
-        if dig(member_manifest, "package", "links") is not None and name not in pol.build_script:
-            rep.fail("build-script", mpath(pkg), "%s: `links` declares a native library" % name)
         for f in files:
             if f not in texts:
                 texts[f] = read_text(f, root)
@@ -879,9 +916,13 @@ def check(root):
             for line, message in source_redirects(toks):
                 rep.fail("source-redirect", rel(root, f), message, line)
             if is_core:
-                for rx in CORE_TOKENS + [FORMAT_SPEC]:
+                for rx in CORE_TOKENS:
                     for m in rx.finditer(code):
                         rep.fail("core-token", rel(root, f), "banned in core crates: %s" % show(m.group(0)), line_of(code, m.start()))
+                for m in FORMAT_SPEC.finditer(text):
+                    rep.fail("core-token", rel(root, f), "banned in core crates: format spec %s" % show(m.group(0)), line_of(text, m.start()))
+                for line, message in fmt_imports(toks):
+                    rep.fail("core-token", rel(root, f), message, line)
                 for m in EXTERN_CRATE.finditer(code):
                     if not EXTERN_ALLOC.match(code, m.end()):
                         rep.fail("core-token", rel(root, f), "banned in core crates: extern crate (only `extern crate alloc;`)", line_of(code, m.start()))
@@ -914,8 +955,9 @@ def check(root):
         # Graph rules over declared dependencies on other members.
         if not MEMBER_NAME.fullmatch(name):
             continue
+        plats = core_platforms if name in pol.core else platforms
         for dep in pkg["dependencies"]:
-            if dep["kind"] == "dev" or not platforms.applies(dep.get("target")):
+            if dep["kind"] == "dev" or not plats.applies(dep.get("target")):
                 continue
             target = member_dirs.get(Path(dep["path"]).resolve()) if dep.get("path") else None
             if target is None:
@@ -946,8 +988,9 @@ def check(root):
     reachable, todo, edges = set(member_ids), sorted(member_ids), []
     while todo:
         pid = todo.pop()
+        plats = core_platforms if pid in member_ids and packages[pid]["name"] in pol.core else platforms
         for d in nodes[pid]["deps"]:
-            kinds = [k for k in d["dep_kinds"] if platforms.applies(k.get("target"))]
+            kinds = [k for k in d["dep_kinds"] if plats.applies(k.get("target"))]
             if not kinds:
                 continue
             edges.append((pid, d["pkg"], kinds))

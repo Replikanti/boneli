@@ -22,9 +22,10 @@ support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-t
 roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli"]
 # The only crates that may contain `unsafe`.
 unsafe = ["boneli-sys"]
-# The only crates that may have a build script or a `links` key: a build
-# script can compile and link native code that no scan sees. Empty today;
-# adding a crate needs an ADR that names it (ADR-001).
+# The only crates that may have a build script (and with it a `links` key,
+# which cargo allows only with a build script): a build script can compile
+# and link native code that no scan sees. Empty today; adding a crate needs
+# an ADR that names it, and core crates cannot be listed (ADR-001).
 build-script = ["boneli-store-mem"]
 
 [check]

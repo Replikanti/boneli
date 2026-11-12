@@ -9,5 +9,5 @@ workspace = true
 
 [dependencies]
 
-[target.'cfg(unix linux)'.dependencies]
+[target.'cfg(target_os = "li\nux")'.dependencies]
 leftpad = "1"
