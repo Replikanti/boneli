@@ -775,6 +775,9 @@ enum GitBug {
     DropsNewFiles,
     /// `diff` drops removed files.
     DropsRemovals,
+    /// A diff that does not apply is ignored instead of refused: `apply`
+    /// returns the checkout it was given.
+    ToleratesMismatch,
 }
 
 const HEADER: &[u8] = b"diff\n";
@@ -870,6 +873,10 @@ impl Git for GitMutant {
             GitBug::Header => self
                 .inner
                 .apply(&from, diff.strip_prefix(HEADER).unwrap_or(diff)),
+            GitBug::ToleratesMismatch => match self.inner.apply(&from, diff) {
+                Err(GitError::Failed { .. }) => Ok(checkout.clone()),
+                other => other,
+            },
             GitBug::InPlace => {
                 let applied = self.inner.apply(&from, diff)?;
                 let mut moved = self.moved.lock().expect("not poisoned");
@@ -1234,6 +1241,7 @@ pub fn mutants() -> Vec<Mutant> {
         git("unchanged-snapshot-empty-diff", GitBug::Header),
         git("added-file", GitBug::DropsNewFiles),
         git("removed-file", GitBug::DropsRemovals),
+        git("apply-mismatch-fails", GitBug::ToleratesMismatch),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),

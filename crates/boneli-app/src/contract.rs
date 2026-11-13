@@ -1275,6 +1275,7 @@ pub mod git {
         "unchanged-snapshot-empty-diff",
         "added-file",
         "removed-file",
+        "apply-mismatch-fails",
     ];
 
     /// An adapter with a repository whose content at the base commit the
@@ -1319,7 +1320,8 @@ pub mod git {
         base_refetch_unchanged(&make(), &edit)?;
         unchanged_snapshot_empty_diff(&make())?;
         added_file(&make(), &edit)?;
-        removed_file(&make(), &edit)
+        removed_file(&make(), &edit)?;
+        apply_mismatch_fails(&make(), &edit)
     }
 
     fn call<T>(
@@ -1470,6 +1472,38 @@ pub mod git {
         let clause = "removed-file";
         let (_, after) = changed(r, clause, |snapshot| edit(snapshot, &r.path, None))?;
         expect_read(r, clause, &after, &r.path, None)
+    }
+
+    /// Applying a patch fails closed. A diff that removes the file is taken
+    /// from the base and applied once; applied again, to the checkout that
+    /// no longer has the file, it must be an error, and that checkout must
+    /// read as before. Built from the adapter's own operations only, so it
+    /// holds for any diff format. That no new checkout appears cannot be
+    /// observed through the port; the error is what the clause pins.
+    fn apply_mismatch_fails<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "apply-mismatch-fails";
+        let base = checkout(r, clause)?;
+        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
+        let workspace = edit(&snapshot, &r.path, None);
+        let diff = call(clause, "diff", r.adapter.diff(&base, &workspace))?;
+        let once = call(clause, "apply", r.adapter.apply(&base, &diff))?;
+        let before = call(clause, "snapshot", r.adapter.snapshot(&once))?;
+        let again = r.adapter.apply(&once, &diff);
+        ensure(again.is_err(), PORT, clause, || {
+            format!(
+                "a diff that removes {:?}, applied to {once:?}, which does not have it, gave \
+                 {again:?}, expected an error",
+                r.path
+            )
+        })?;
+        let after = call(clause, "snapshot", r.adapter.snapshot(&once))?;
+        ensure(after == before, PORT, clause, || {
+            format!("{once:?} changed when a diff failed to apply to it")
+        })?;
+        expect_read(r, clause, &once, &r.path, None)
     }
 
     fn unchanged_snapshot_empty_diff<G: Git>(r: &Repository<G>) -> Result<(), Violation> {

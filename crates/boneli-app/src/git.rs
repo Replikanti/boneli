@@ -94,6 +94,10 @@ pub trait Git {
     fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError>;
 
     /// Applies a diff to the checkout and returns a new checkout; the one
-    /// it was applied to does not change.
+    /// it was applied to does not change. A diff that does not apply to
+    /// this checkout (for example, one that removes a file the checkout
+    /// does not have) is an error: no checkout is created and nothing
+    /// changes, so a fix is never verified on a tree it was not written
+    /// against.
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError>;
 }

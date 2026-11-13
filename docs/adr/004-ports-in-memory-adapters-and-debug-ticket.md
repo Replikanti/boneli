@@ -114,8 +114,8 @@ in `boneli-app`, no `Send + Sync` supertraits.
   3 verifier and 2 forge operations) has one mutant per operation that
   breaks only that operation, and its violation detail must start with that
   operation's name, so each sub-check is shown to bite, not only the first.
-  `mutant_table_covers_every_clause` prints the counts: 47 clauses, 53
-  mutant cases (part 1: 23 and 29; part 2 adds 24 clauses with one mutant
+  `mutant_table_covers_every_clause` prints the counts: 48 clauses, 54
+  mutant cases (part 1: 23 and 29; part 2 adds 25 clauses with one mutant
   each). Without them a suite could pass every adapter vacuously.
   The table lives in the replay check, not in `boneli-memory`'s tests, so
   the replay binary can render every mutant's violation (D10).
@@ -522,7 +522,7 @@ The clauses:
 | Port | Clauses |
 | --- | --- |
 | `Sandbox` | `distinct-ids`, `copy-out-after-write`, `copy-out-missing`, `isolated`, `fresh-after-destroy`, `exit-status`, `destroyed-is-unknown` |
-| `Git` | `read-at-base`, `read-missing`, `unknown-commit`, `apply-then-read`, `apply-leaves-base`, `base-refetch-unchanged`, `unchanged-snapshot-empty-diff`, `added-file`, `removed-file` |
+| `Git` | `read-at-base`, `read-missing`, `unknown-commit`, `apply-then-read`, `apply-leaves-base`, `base-refetch-unchanged`, `unchanged-snapshot-empty-diff`, `added-file`, `removed-file`, `apply-mismatch-fails` |
 | `ImageStore` | `pull-idempotent`, `missing-image`, `digest-pinned`, `platform-pinned` |
 | `DataSnapshot` | `distinct-copies`, `copies-independent`, `removed-copy-unknown`, `hostile-run-ids` |
 
@@ -545,6 +545,13 @@ The clauses:
   reaches the diff, and so does a removed one. Reproduction tests are
   usually new files, and a diff of tracked files only (`git diff` without
   the untracked files) passed every other clause with a 0-byte diff.
+  **`apply-mismatch-fails`**: applying a patch fails closed. A diff that
+  removes a file, applied a second time to the checkout that no longer has
+  it, is an error and leaves that checkout as it was; an adapter that
+  ignored such a diff passed every other clause, and the fix would then be
+  verified on a tree it was not written against. The clause uses only the
+  adapter's own operations, so it holds for any diff format; that no new
+  checkout appears is not observable through the port.
 - **`digest-pinned`** and **`platform-pinned`**: an image that differs from
   a present one in its digest only, or its platform only, is `NotFound`,
   also after the present one was pulled. A store that resolved by name
