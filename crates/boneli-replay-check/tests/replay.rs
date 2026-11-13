@@ -5,7 +5,8 @@ use std::process::Command;
 
 use boneli_domain::scenarios::all;
 use boneli_replay_check::{
-    Probe, RENDERED_APP_FMT_IMPLS, RENDERED_FMT_IMPLS, app, first_difference, parse_probe, render,
+    Probe, RENDERED_APP_FMT_IMPLS, RENDERED_FMT_IMPLS, app, first_difference, mutants, parse_probe,
+    render,
 };
 
 /// Runs the harness binary and returns its probe and the rest of its output.
@@ -60,6 +61,17 @@ fn two_processes_produce_identical_debug_output() {
     assert_eq!(
         app_headers, app_names,
         "the harness skipped or reordered app scenarios"
+    );
+    // Every contract mutant's violation is rendered and compared too
+    // (ADR-004, D10).
+    let mutant_headers = out_a.lines().filter(|l| l.starts_with("mutant ")).count();
+    assert_eq!(mutant_headers, mutants::mutants().len());
+    assert_eq!(
+        out_a
+            .lines()
+            .filter(|l| l.starts_with("blank-status "))
+            .count(),
+        3
     );
 }
 
@@ -209,51 +221,93 @@ fn hand_written_fmt_impls(krate: &str, min_files: usize) -> Vec<String> {
     found
 }
 
-/// Contract-suite output never reaches run data (ADR-004, D10). Only
-/// `contract.rs` builds a `Violation`, and nothing else in `boneli-app`
-/// names the `contract` module or the type, so no use case, and with it no
-/// event, evidence or forge request, can carry violation text. Nothing in
-/// `boneli-memory`'s library or the replay check's library names them
-/// either; their tests do. The replay gate therefore covers the core's run
-/// data without playing the suites.
+/// The identifiers of Rust source, with comments, string and character
+/// literals removed: enough to see paths and `use` trees.
+fn identifiers(code: &str) -> Vec<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < chars.len() {
+        let c = chars[k];
+        if c == '/' && chars.get(k + 1) == Some(&'/') {
+            while k < chars.len() && chars[k] != '\n' {
+                k += 1;
+            }
+        } else if c == '/' && chars.get(k + 1) == Some(&'*') {
+            k += 2;
+            while k + 1 < chars.len() && !(chars[k] == '*' && chars[k + 1] == '/') {
+                k += 1;
+            }
+            k += 2;
+        } else if c == '"' {
+            k += 1;
+            while k < chars.len() && chars[k] != '"' {
+                k += if chars[k] == '\\' { 2 } else { 1 };
+            }
+            k += 1;
+        } else if c.is_alphabetic() || c == '_' {
+            let start = k;
+            while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
+                k += 1;
+            }
+            out.push(chars[start..k].iter().collect());
+        } else {
+            if matches!(c, ';' | '{' | '}' | ':') {
+                out.push(c.to_string());
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+/// Tripwire behind ADR-004 D10: outside the `contract` module and outside
+/// `#[cfg(test)]` code, no source of `boneli-app` or `boneli-memory` names
+/// the contract suites. Every `use` tree is parsed, so a brace group or a
+/// rename (`use crate::{contract as suites};`) is caught, and so is any
+/// `contract::` path or the `Violation` type. The gate for what violation
+/// text holds is the replay of every mutant's violation, not this scan.
 #[test]
-fn contract_output_never_reaches_run_data() {
+fn contract_suites_stay_out_of_library_code() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let named = |text: &str| -> bool {
-        let code: String = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-        compact.contains("contract::")
-            || compact.contains("Violation")
-            || compact.contains("modcontract")
-            || compact.contains("usecrate::contract")
-            || compact.contains("usesuper::contract")
-    };
     let mut scanned = 0;
-    for krate in ["boneli-app", "boneli-memory", "boneli-replay-check"] {
+    for krate in ["boneli-app", "boneli-memory"] {
         for file in std::fs::read_dir(root.join(krate).join("src")).expect("sources") {
             let path = file.expect("a directory entry").path();
-            let name = path.file_name().expect("a file name").to_string_lossy();
-            let text = std::fs::read_to_string(&path).expect("UTF-8 source");
-            scanned += 1;
+            let name = path
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
             if krate == "boneli-app" && name == "contract.rs" {
                 continue;
             }
-            if krate == "boneli-app" && name == "lib.rs" {
-                // The only mention outside the module: its declaration.
-                let code: Vec<&str> = text
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .filter(|line| line.contains("contract"))
-                    .collect();
-                assert_eq!(code, ["pub mod contract;"], "{krate}/{name}");
-                continue;
+            let text = std::fs::read_to_string(&path).expect("UTF-8 source");
+            // Unit tests sit at the end of a file, after `#[cfg(test)]`.
+            let library = text.split("#[cfg(test)]").next().unwrap_or_default();
+            let words = identifiers(library);
+            scanned += 1;
+            let mut in_use = false;
+            for (k, word) in words.iter().enumerate() {
+                match word.as_str() {
+                    "use" => in_use = true,
+                    ";" => in_use = false,
+                    _ => {}
+                }
+                let next_is_path = words.get(k + 1).map(String::as_str) == Some(":");
+                let named = word == "Violation" || (word == "contract" && (in_use || next_is_path));
+                let declaration = krate == "boneli-app"
+                    && name == "lib.rs"
+                    && word == "contract"
+                    && k > 1
+                    && words[k - 1] == "mod"
+                    && words[k - 2] == "pub";
+                assert!(
+                    !named || declaration,
+                    "{krate}/{name} names the contract suites outside tests"
+                );
             }
-            assert!(!named(&text), "{krate}/{name} names the contract suites");
         }
     }
-    assert!(scanned >= 20, "too few sources scanned: {scanned}");
+    assert!(scanned >= 17, "too few sources scanned: {scanned}");
 }

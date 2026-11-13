@@ -17,6 +17,7 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::fmt;
 
 use boneli_domain::{
@@ -239,8 +240,11 @@ impl DebugTicket<'_> {
 
         let mut commands = first.clone();
         let mut queue = VecDeque::from(first);
+        // The run's latest `Clock` reading: every reading is checked against
+        // the one before it, within a job and across jobs (ADR-004, D5).
+        let last = Cell::new(None);
         while let Some(command) = queue.pop_front() {
-            let event = self.execute(&id, command, context.as_ref());
+            let event = self.execute(&id, command, context.as_ref(), &last);
             let (next, more) = run
                 .handle(event.clone())
                 .map_err(DebugTicketError::Domain)?;
@@ -312,9 +316,10 @@ impl DebugTicket<'_> {
         id: &RunId,
         command: RunCommand,
         previous: Option<&PreviousTriage>,
+        last: &Cell<Option<u64>>,
     ) -> RunEvent {
         match command {
-            RunCommand::Triage { ticket, base } => self.measured(|| {
+            RunCommand::Triage { ticket, base } => self.measured(last, || {
                 let request = TriageRequest {
                     ticket,
                     base,
@@ -335,7 +340,7 @@ impl DebugTicket<'_> {
                     Err(failure) => forge_failed(String::from(failure.detail())),
                 }
             }
-            RunCommand::WriteReproduction { ticket, base } => self.measured(|| {
+            RunCommand::WriteReproduction { ticket, base } => self.measured(last, || {
                 let request = ReproductionRequest { ticket, base };
                 match self.agent.write_reproduction(&request) {
                     Ok(written) => Job {
@@ -347,7 +352,7 @@ impl DebugTicket<'_> {
                     Err(failure) => Job::agent_failed(failure),
                 }
             }),
-            RunCommand::CheckReproduction { base, test } => self.measured(|| {
+            RunCommand::CheckReproduction { base, test } => self.measured(last, || {
                 let test = match self.load("reproduction test", &test) {
                     Ok(test) => test,
                     Err(detail) => return Job::failed(0, detail),
@@ -357,7 +362,7 @@ impl DebugTicket<'_> {
                     Err(failure) => Job::verifier_failed(&failure),
                 }
             }),
-            RunCommand::AnalyzeRootCause { ticket, base, test } => self.measured(|| {
+            RunCommand::AnalyzeRootCause { ticket, base, test } => self.measured(last, || {
                 let test = match self.load("reproduction test", &test) {
                     Ok(test) => test,
                     Err(detail) => return Job::failed(0, detail),
@@ -373,18 +378,18 @@ impl DebugTicket<'_> {
                     Err(failure) => Job::agent_failed(failure),
                 }
             }),
-            RunCommand::VerifyCitations { base, citations } => {
-                self.measured(|| match self.verifier.verify_citations(&base, &citations) {
+            RunCommand::VerifyCitations { base, citations } => self.measured(last, || {
+                match self.verifier.verify_citations(&base, &citations) {
                     Ok(results) => Job::done(0, Produced::Citations(results)),
                     Err(failure) => Job::verifier_failed(&failure),
-                })
-            }
+                }
+            }),
             RunCommand::WriteFix {
                 ticket,
                 base,
                 test,
                 analysis,
-            } => self.measured(|| {
+            } => self.measured(last, || {
                 let inputs = self
                     .load("reproduction test", &test)
                     .and_then(|test| Ok((test, self.load("analysis", &analysis)?)));
@@ -406,7 +411,7 @@ impl DebugTicket<'_> {
                     Err(failure) => Job::agent_failed(failure),
                 }
             }),
-            RunCommand::VerifyFix { base, diff, test } => self.measured(|| {
+            RunCommand::VerifyFix { base, diff, test } => self.measured(last, || {
                 let inputs = self
                     .load("diff", &diff)
                     .and_then(|diff| Ok((diff, self.load("reproduction test", &test)?)));
@@ -466,17 +471,26 @@ impl DebugTicket<'_> {
 
     /// Runs a job between two `Clock` readings and turns its end into the
     /// event: the job's cost and the difference of the readings as its
-    /// usage (ADR-002, D3). A second reading lower than the first ends the
-    /// job as `JobFailed` with duration 0 and the job's cost: a clock that
-    /// goes backwards would under-charge the duration budget, and ending the
-    /// run stops all further spending (ADR-004, D5).
-    fn measured(&self, job: impl FnOnce() -> Job) -> RunEvent {
+    /// usage (ADR-002, D3). Every reading is checked against the one before
+    /// it in the run (ADR-004, D5). A first reading lower than the run's
+    /// previous one ends the job as `JobFailed` before it runs, with zero
+    /// usage; a second reading lower than the first ends it with duration 0
+    /// and the job's cost. A clock that goes backwards would under-charge
+    /// the duration budget, and ending the run stops all further spending.
+    fn measured(&self, last: &Cell<Option<u64>>, job: impl FnOnce() -> Job) -> RunEvent {
         let before = self.clock.now_ms();
+        if let Some(previous) = last.get().filter(|previous| before < *previous) {
+            return RunEvent::JobFailed {
+                detail: format!("the clock went backwards: {previous} ms, then {before} ms"),
+                usage: Usage::default(),
+            };
+        }
         let Job {
             cost_micro_usd,
             result,
         } = job();
         let after = self.clock.now_ms();
+        last.set(Some(after));
         let Some(duration_ms) = after.checked_sub(before) else {
             return RunEvent::JobFailed {
                 detail: format!("the clock went backwards: {before} ms, then {after} ms"),

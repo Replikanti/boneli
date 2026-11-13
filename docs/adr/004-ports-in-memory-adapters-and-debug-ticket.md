@@ -100,16 +100,18 @@ in `boneli-app`, no `Send + Sync` supertraits.
   output and the status it must then report; a verifier set up to answer
   given citations), because only the adapter's own test knows the inputs
   that make a real process or forge do that.
-- **One mutant per clause, and per operation.** `boneli-memory/tests/mutants.rs`
-  wraps the in-memory adapter once per clause so that exactly that clause
-  breaks, and checks that the suite names it; a second test checks that
-  mutants and clause cases are a bijection. A clause that checks several
-  operations (`silent-failure-detail`: 4 agent, 3 verifier and 2 forge
-  operations) has one mutant per operation that breaks only that
-  operation, and its violation detail must start with that operation's
-  name, so each sub-check is shown to bite, not only the first. 22 clauses
-  give 30 mutant cases. Without them a suite could pass every adapter
-  vacuously.
+- **One mutant per clause, and per operation.** The mutant table
+  (`boneli_replay_check::mutants`) wraps an in-memory adapter once per
+  clause so that exactly that clause breaks; `tests/mutants.rs` checks that
+  the suite names it and that mutants and clause cases are a bijection. A
+  clause that checks several operations (`silent-failure-detail`: 4 agent,
+  3 verifier and 2 forge operations) has one mutant per operation that
+  breaks only that operation, and its violation detail must start with that
+  operation's name, so each sub-check is shown to bite, not only the first.
+  `mutant_table_covers_every_clause` prints the counts: 23 clauses, 29
+  mutant cases. Without them a suite could pass every adapter vacuously.
+  The table lives in the replay check, not in `boneli-memory`'s tests, so
+  the replay binary can render every mutant's violation (D10).
 - **A fixture cannot make a clause vacuous.** `silent-failure-detail`
   checks that the detail contains the fixture's status, and every text
   contains the empty string, so a blank fixture status (by `is_blank`) is
@@ -120,7 +122,7 @@ The clauses of part 1:
 | Port | Clauses |
 | --- | --- |
 | `EventStore` | `create-then-load`, `append-order`, `duplicates-kept`, `runs-isolated`, `unknown-run`, `create-twice`, `round-trip`, `hostile-run-ids` |
-| `Evidence` | `round-trip`, `content-addressed`, `distinct-content`, `unknown-reference`, `hostile-references`, `tampered-content-rejected` (D9) |
+| `Evidence` | `round-trip`, `content-addressed`, `distinct-content`, `reference-from-content` (D9), `unknown-reference`, `hostile-references`, `tampered-content-rejected` (D9) |
 | `Clock` | `non-decreasing` |
 | `Ids` | `not-blank`, `distinct` |
 | `Agent` | `silent-failure-detail` |
@@ -228,10 +230,16 @@ adapters therefore cannot produce one.
   and evidence steps cost 0, because µUSD are provider prices (ADR-002 D3);
   a cost a verifier reports with its failure is not charged. Duration is the
   `Clock` reading after the job minus the reading before it; equal readings
-  are 0 ms and legal. A second reading lower than the first ends the job as
-  `JobFailed` with `the clock went backwards: <a> ms, then <b> ms`, duration
-  0 and the job's cost: a clock that goes backwards under-charges the
-  duration budget, and ending the run stops all further spending. Forge
+  are 0 ms and legal. Every reading is checked against the run's reading
+  before it, so a clock that goes backwards is caught within a job and
+  between jobs, with `the clock went backwards: <a> ms, then <b> ms`. A
+  second reading lower than the first ends the job as `JobFailed` with
+  duration 0 and the job's cost, and this takes precedence over the job's
+  own failure; a first reading lower than the previous job's last ends the
+  run before the job runs, with zero usage. Why: a clock that goes
+  backwards under-charges the duration budget, and ending the run stops all
+  further spending. A run's first reading has nothing to compare with.
+  Forge
   calls read no clock and carry no usage, so a forge failure is `JobFailed`
   with zero usage (ADR-002 D3).
 - **Pull request.** `Forge::open_pull_request` gets a structured
@@ -269,42 +277,64 @@ adapters therefore cannot produce one.
 ### D7. The replay gate, app mode
 
 - **Corpus:** `boneli_replay_check::app::scenarios()` and `play()`, which
-  runs one scenario on fresh in-memory adapters and returns each request's
-  result, every run log in `RunId` order, every request the agent, verifier
-  and forge recorded, and how often the stores and the clock were called.
-  77 scenarios: 31 written by hand (budgets, re-runs, gates, invalid input)
-  and 46 from the fault matrix below. `tests/debug_ticket.rs` checks each
-  scenario against its expected results, call counts and spending, with a
-  bijection test between scenarios and expectations, and checks that every
-  reported run equals the replay of its log.
-- **Fault matrix.** `fault_scenarios()` plays the delivered run once and,
-  for every call it made to a port that can fail, adds one scenario that
-  fails exactly that call, per failure kind: each of the 4 agent, 3
-  verifier and 1 forge calls fails with a scripted failure; each of the 3
-  evidence `put`s and 9 `get`s fails as unavailable, and each `get` also
-  meets content overwritten behind the store's back (D9); the event-store
-  `create` and each of the 9 `append`s fail; and the clock goes back 1 ms at
-  the second reading of each of the 7 measured jobs. That is 46 scenarios.
-  The first reading of a job is no fault point, because `DebugTicket` only
-  compares the two readings of one job. Why generated: a fail-closed branch
-  that no scenario plays is invisible to both the tests and the replay gate
-  (the review of this pull request showed four such branches that a mutant
-  could open or make leak). A port call added to `DebugTicket` later adds
-  its own scenarios here, and the bijection test fails until each has an
-  expectation.
-- **Fault expectations from an independent model.** The test writes the
-  delivered run out as a table of jobs (the evidence each loads, the port
-  it calls, the evidence it stores) and derives every fault scenario's name,
-  outcome, charged usage and call counts from it: agent jobs cost 1 000 µUSD
-  and 700 µUSD when they fail, measured jobs last 1 000 ms, verifier failure
-  costs and forge calls are not charged, and a backwards clock charges the
-  job's cost with 0 ms. Spot checks pin worked numbers (a failed `write_fix`
-  after five jobs spends 3 700 µUSD and 6 000 ms), so a model bug cannot
-  silently agree with a `DebugTicket` bug. The 700 µUSD differs from the
-  1 000 µUSD of a success so that charging a failure as a success, or as
-  zero, changes the total. The backwards clock starts at 10 000 ms, above
-  the triage scenario's 5 000 ms, so a guard that checks only early
-  readings is caught too.
+  runs one scenario on fresh in-memory adapters behind recording adapters
+  and returns each request's result, every run log in `RunId` order, every
+  request the agent, verifier and forge recorded, and every port call with
+  its request. 31 scenarios are written by hand (budgets, re-runs, gates,
+  invalid input); the fault matrix below adds the rest. The test
+  `expectations_and_scenarios_are_a_bijection` prints the counts: 1 786
+  scenarios, 31 hand-written, 25 bases, 1 755 from the fault matrix, 140
+  with exact expectations. `tests/debug_ticket.rs` checks those 140 against expected
+  results, call counts and spending, every fault scenario against
+  fail-closed properties, and every reported run against the replay of its
+  log.
+- **Fault matrix.** `fault_scenarios()` plays every hand-written scenario
+  that has no fault of its own as a base (25 make a fallible port call, the
+  re-runs after triage questions included; the two invalid-input scenarios
+  make none) and, for every port call the base made, adds
+  one scenario per fault kind that fails exactly that call (the N-th call of
+  that operation, for every N). The kinds are tied to the port operations
+  without a hand-kept list: the recording adapters implement every port
+  trait, so a new port operation does not compile until it records a `Call`
+  variant, and `Call::fault_kinds` matches every variant. A job port call
+  fails with a scripted failure; every `EventStore` call (`create`,
+  `append`, `load`) fails with each `StoreError` variant and every
+  `Evidence` call with each `EvidenceError` variant, both enumerated by an
+  exhaustive match, so a new variant becomes a new fault kind; the clock
+  reads 1 ms below its previous reading. `Ids` cannot fail, and the first
+  clock reading of a request is no fault point, because nothing earlier in
+  the run exists to go back from. Why generated, and from every base: a
+  fail-closed branch that no scenario plays is invisible to both the tests
+  and the replay gate. The review of this pull request found such branches
+  twice: loads in later jobs of the delivered run, and then the store
+  failure while loading the previous run of a re-run, which only a re-run
+  base reaches.
+- **Expectations.** The faults of the delivered run (109 scenarios) get
+  exact expectations from an independent model: the test writes that run
+  out as a table of jobs (the evidence each loads, the port it calls, the
+  evidence it stores) and derives each fault's name, outcome, charged usage
+  and call counts from it. Agent jobs cost 1 000 µUSD, and 700 µUSD when the
+  injected failure hits them, so charging a failure as a success or as zero
+  changes the total; measured jobs last 1 000 ms; verifier failure costs and
+  forge calls are not charged; a backwards reading charges as D5 says.
+  Spot checks pin worked numbers (a failed `write_fix` after five jobs
+  spends 3 700 µUSD and 6 000 ms), so a model bug cannot silently agree with
+  a `DebugTicket` bug. Every fault scenario, of every base, must fail
+  closed at the faulted call (`every_fault_fails_closed`): the requests
+  before it end as in its base, and the faulted request ends as the fault
+  calls for, never as if the call had succeeded. A job fault ends the run
+  as `JobFailed` awaiting that job, with the injected detail or the
+  evidence error in it. It may instead end as `BudgetExceeded`, when the
+  job's usage crosses a limit, or with a backwards-clock detail, when the
+  base's clock already goes back in that job (D5 precedence). A store
+  fault returns that `StoreError`. A `load` that finds no run returns
+  `PreviousRun(Unknown)`, and any other `load` failure returns `Store`, so
+  a re-run never goes on without its previous questions. When the faulted
+  request is a scenario's last, the store also holds exactly the runs and
+  events the base had before the fault.
+- **Size.** The replay output is about 658 000 lines (20 MB); one run of
+  the debug-build binary took 1 to 5 s on the dev host. It is compared in
+  two child processes and the test process.
 - **Output of the binary:** the probe line; the domain section, unchanged;
   for each app scenario `app-scenario <name>`, the pretty `Debug` of the
   played result and `display <k>: <error>` for each error; then the
@@ -322,7 +352,8 @@ adapters therefore cannot produce one.
   `boneli-memory` into the production CLI, so test data there would ship.
   The corpus is also the only place `DebugTicket` tests run, so the gate sees
   every path those tests exercise (the ADR-002 D4 principle).
-- **Clock:** `StepClock` from 0 in steps of 1 000 ms. A constant clock would
+- **Clock:** `StepClock` from 1 000 ms in steps of 1 000 ms (not from 0,
+  so a backwards fault always has 1 ms to go back). A constant clock would
   make every duration 0 and leave the duration budget untested through
   `DebugTicket`; 1 000 ms keeps the arithmetic readable (the delivered path
   has 7 measured jobs, so 7 000 ms). **Ids:** `SequentialIds` (`run-1`,
@@ -333,11 +364,13 @@ adapters therefore cannot produce one.
   one unit below or exactly at that spend (999 µUSD, 6 999 ms, 4 000 µUSD
   and 7 000 ms), the boundaries where an inclusive limit differs from an
   exclusive one.
-- **Fault doubles** in the replay check knowingly break their port's
-  contract, to reach paths no conforming adapter reaches: a clock with
-  given readings, an evidence store that fails the n-th `put` or `get`, and
-  an event store that fails the n-th `append`. Scripts are plain data, so
-  nothing printed holds a function pointer or a reference.
+- **Fault injection** happens in the recording adapters, which knowingly
+  break their port's contract to reach paths no conforming adapter
+  reaches; `ScriptedClock` gives fixed readings. A job port is called
+  before the fault replaces its result, so its script and request record
+  advance as for a real failure; a store fails instead of being called.
+  Scripts and faults are plain data, so nothing printed holds a function
+  pointer or a reference.
 
 ### D8. Mutex poisoning
 
@@ -352,48 +385,91 @@ thread into failures in unrelated ones.
 
 `VerifyFix` and `OpenPullRequest` each load the diff and the test by
 reference, so the forge gets the bytes the verifier checked only if a
-reference always reads back what was put under it. That is now part of the
-`Evidence` contract: content that changed after it was put is
-`EvidenceError::Corrupted` on `get`, never returned. A file store re-hashes
-what it reads (its references are content hashes); the in-memory store
-checks the bytes against its content index. The clause
-`tampered-content-rejected` overwrites a blob through an adapter-supplied
-`tamper` hook (only the adapter's own test knows how to write behind its
-store) with bytes of the same length, so a length check is not enough, and
-requires `Corrupted`. A changed blob then ends the run as `JobFailed` with
-`loading the <what> failed: the stored content does not match its
-reference`, and the forge is never called. The fault matrix plays this for
-every load, including the diff for the pull request (`fault-evidence-tamper-7`),
-and a test checks that in every corpus scenario where the forge got a pull
-request, its diff and test equal the bytes of that run's `VerifyFix`.
+reference always reads back what was put under it. The `Evidence`
+contract makes references come from content, and makes `get` check it:
 
-- Why in the store: the reference already names the content, so the check
-  needs no new state, survives a run resumed from its log (#33), and keeps
-  `DebugTicket` deterministic (ADR-002): the decision depends only on what
-  the store returns.
+- `content-addressed`: the same bytes give the same reference.
+- `distinct-content`: different bytes give different references.
+- `reference-from-content`: the reference is a function of the bytes
+  alone. Two fresh stores that get the same blobs in opposite orders issue
+  the same reference for each, so a counter, a timestamp or any other state
+  in the reference fails. Why: a store with counter references and a
+  checksum kept beside each blob passed the other clauses, and a writer
+  who rewrites the blob and its checksum together then has `get` return
+  the forged bytes. With content-derived references there is no side
+  record that decides what is genuine.
+- `tampered-content-rejected`: `get` re-derives the reference from the
+  bytes it read, so content changed after `put` is
+  `EvidenceError::Corrupted`, never returned. The clause overwrites a blob
+  through an adapter-supplied `tamper` hook with bytes of the same length,
+  so a length check is not enough. The hook must write only the stored
+  blob, nothing the store keeps beside it. A black-box suite cannot tell a
+  hook that cooperates (for example, by marking the reference bad), so the
+  real adapter's review checks the hook.
+
+A changed blob then ends the run as `JobFailed` with `loading the <what>
+failed: the stored content does not match its reference`, and the forge is
+never called. The fault matrix plays `Corrupted` on every load of every
+base, including the diff for the pull request, and
+`forge_gets_the_bytes_the_verifier_checked` checks that in every corpus
+scenario where the forge got a pull request, its diff and test equal the
+bytes of that run's `VerifyFix`.
+
+- **Digest.** `MemoryEvidence` names a blob `fnv1a64-<digest>`, the 64-bit
+  FNV-1a digest of its bytes, and refuses a second blob with the same
+  digest, so a collision fails closed instead of aliasing. FNV-1a is not
+  cryptographic, and it does not need to be here: the store's memory
+  belongs to the process, so no untrusted writer exists who could look for
+  a collision. Real adapters, whose bytes another process can write (#4,
+  a file store), must use a cryptographic digest from a vetted crate
+  (`sha2` is already planned for `boneli-store-fs` in ARCHITECTURE), never
+  hand-rolled cryptography; that is part of #4's acceptance. This pull
+  request adds no dependency edge.
+- **The tamper hook is test code only.** `MemoryEvidence` has no method
+  that writes behind its own index. Its contract test lives in the
+  `#[cfg(test)]` unit tests of `crates/boneli-memory/src/evidence.rs`, where
+  the hook can reach the private map, so the shipped build has no tamper
+  capability. Rejected: a non-default cargo feature. The replay corpus
+  plays the faults in its binary, so the feature would be enabled in every
+  workspace build that includes the replay check. Cargo unifies features
+  across a build, so the composition roots (#32) would link a tamper
+  method too. Enabling it through a dev-dependency only would add the
+  first dev-dependency edge, which the architecture check does not
+  inspect. The corpus therefore injects `Corrupted` with its recording
+  adapter, and the unit test proves that `MemoryEvidence` returns it on a
+  real overwrite.
+- Why the check sits in the store: the reference already names the
+  content, so the check needs no new state, survives a run resumed from
+  its log (#33), and keeps `DebugTicket` deterministic (ADR-002): the
+  decision depends only on what the store returns.
 - Rejected: keeping the verified bytes in `DebugTicket` between the two
   commands. It breaks a resumed run, which has only the log.
 - Rejected: `DebugTicket` putting the loaded bytes again and comparing the
-  reference. It works over the other `Evidence` clauses, but every load
-  would write attacker-controlled bytes into the store as a side effect.
+  reference. Every load would write attacker-controlled bytes into the
+  store as a side effect.
 - Rejected: declaring the evidence store trusted. Another process with
   write access to its directory is exactly the case the review raised, and
   the check costs one hash per read.
 
-### D10. Contract output never reaches run data
+### D10. Contract violations are under the replay gate
 
-The contract suites ship in `boneli-app`, but the replay gate does not run
-them, so a leak form in a `Violation` detail would not be gated. It does
-not need to be: a `Violation` is built only in `boneli_app::contract` and
-returned to the test that called the suite. No use case and no other
-module of `boneli-app`, and no library code of `boneli-memory` or the
-replay check, names the module or the type, so violation text cannot reach
-an event, the evidence store or a forge request. The test
-`contract_output_never_reaches_run_data` checks this mechanically on every
-source file of those three crates (the only mention outside the module is
-its `pub mod contract;`). The replay gate covers the run data of the core:
-the domain's traces and everything `DebugTicket` produces.
+The contract suites ship in `boneli-app`, so the text of a `Violation`
+must not hold an address or other nondeterministic data either. The replay
+binary renders the result of every mutant in the table (D2) and the three
+blank-status violations after the app section, in both child processes
+and the test process, and the replay compares them byte for byte like run
+data. So every violation that a mutant produces is gated, wherever
+violations flow. A violation site that no mutant reaches is not: each
+clause case is reached once, by its mutant, and a clause with several
+`ensure` sites has the others unplayed. A cheap tripwire,
+`contract_suites_stay_out_of_library_code`, parses the identifiers and
+`use` trees of every library source of `boneli-app` (outside the module)
+and `boneli-memory` (outside `#[cfg(test)]`). It fails if any of them names
+the `contract` module or `Violation`, so a use case cannot turn violation
+text into run data without a visible change. It does not scan real
+adapters or roots, which call the suites from their tests.
 
+## Consequences
 ## Consequences
 
 - The contract suites and their fixtures ship in the `boneli-app` library,
@@ -404,12 +480,15 @@ the domain's traces and everything `DebugTicket` produces.
 - `boneli-memory` is a production crate (#32 wires it into the CLI for local
   runs), so it carries no test data; the corpus lives in the replay check.
 - The replay gate sees only exercised paths. A path reached through a
-  failing port call is generated by the fault matrix; any other new
-  `DebugTicket` path needs a hand-written scenario. The bijection test makes
-  a forgotten expectation fail, and a new port call changes the fault model,
-  which must then be updated by hand.
-- Every `Evidence` adapter verifies content on read (D9), one hash per
-  `get` for a file store.
+  failing port call of any hand-written base is generated by the fault
+  matrix; any other new `DebugTicket` path needs a hand-written scenario.
+  The bijection test makes a forgotten expectation fail, and a new port call
+  on the delivered path changes its fault model, which must then be updated
+  by hand.
+- The replay output grows with the matrix (D7, size); a new base adds about
+  one scenario per port call and fault kind.
+- Every `Evidence` adapter derives its references from content and verifies
+  them on read (D9), one hash per `get` for a file store.
 - A re-run chain is followed one link at a time. A reporter who answers an
   old questions comment after a newer one starts from the older run; the
   check that it ended with questions still holds.
@@ -442,8 +521,11 @@ the domain's traces and everything `DebugTicket` produces.
 - **Hand-picking fault scenarios:** the first version did, and left the
   loads in `VerifyFix` and `OpenPullRequest`, later agent and verifier
   failures and later clock faults unplayed.
-- **Running the contract suites in the replay binary:** possible, but
-  violations are test output that D10 shows cannot reach run data.
+- **Faults only on the delivered run:** the second version did, and left
+  the store failure while loading a re-run's previous run unplayed.
+- **Proving by name scan that violations never reach run data:** a scan
+  is a tripwire, not a proof (a renamed import got past the first one);
+  replaying the violations removes the dependency on where they flow.
 - **Language:** the ports, adapters and suites are Rust because the whole
   workspace is; no other language was a candidate for code inside the
   crate graph.

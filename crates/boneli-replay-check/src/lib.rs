@@ -5,7 +5,8 @@
 //! pretty `Debug` output of every domain scenario folded through
 //! [`boneli_domain::scenarios::fold`], then of every app scenario played
 //! through `DebugTicket` on in-memory adapters ([`app`]), then the
-//! `Display` and `Debug` of every `boneli-app` error variant. The domain and
+//! `Display` and `Debug` of every `boneli-app` error variant, then the
+//! violation every contract mutant produces ([`mutants`]). The domain and
 //! the application link statically into this one position-independent
 //! binary, so one probe covers both. The integration test runs the binary
 //! twice, checks that the two probes differ (address randomization is on, so
@@ -22,6 +23,7 @@
 use std::fmt::Write as _;
 
 pub mod app;
+pub mod mutants;
 
 use boneli_domain::scenarios::{Scenario, all, fold};
 use boneli_domain::{
@@ -141,11 +143,13 @@ pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
 
 /// The domain section ([`render_scenarios`] over the whole corpus, in
 /// [`all`] order), then the app section ([`app::render_app`] over
-/// [`app::scenarios`]), then [`app::render_app_errors`].
+/// [`app::scenarios`]), then [`app::render_app_errors`], then the
+/// violation of every contract mutant ([`mutants::render_violations`]).
 pub fn render() -> Result<String, DomainError> {
     let mut out = render_scenarios(&all())?;
     out.push_str(&app::render_app(&app::scenarios()));
     out.push_str(&app::render_app_errors());
+    out.push_str(&mutants::render_violations());
     Ok(out)
 }
 

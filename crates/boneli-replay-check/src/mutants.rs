@@ -1,9 +1,17 @@
-//! Every contract clause can fail (ADR-004, D2): one mutant adapter per
-//! clause wraps the in-memory adapter and breaks exactly that clause, and
-//! its suite must return a violation naming it. A clause that no mutant
-//! breaks would be a vacuous check.
+//! Mutant adapters: every contract clause can fail (ADR-004, D2).
+//!
+//! One mutant adapter per clause case wraps an in-memory adapter and breaks
+//! exactly that case; `tests/mutants.rs` checks that its suite returns a
+//! violation naming it, and that mutants and clause cases are a bijection.
+//! A clause that no mutant breaks would be a vacuous check.
+//!
+//! The table lives in this test-only library, not in `boneli-memory`'s
+//! tests, so that the replay binary can render the violation of every
+//! mutant in two processes and compare them (ADR-004, D10): a violation
+//! detail that held an address or other nondeterministic text would fail
+//! the replay like run data does.
 
-use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use boneli_app::contract::{self, SilentFailure, Violation};
@@ -187,6 +195,9 @@ enum EvidenceBug {
     /// `get` returns what is on disk without checking it against the
     /// reference.
     SkipsIntegrity,
+    /// References come from a counter, as in a store that keeps a checksum
+    /// beside each blob instead of naming blobs by their digest.
+    CounterReferences,
 }
 
 struct EvidenceMutant {
@@ -194,8 +205,21 @@ struct EvidenceMutant {
     inner: MemoryEvidence,
     by_length: Mutex<Vec<(usize, EvidenceRef)>>,
     puts: Mutex<u64>,
-    /// What `tamper` wrote, for the store that reads it unchecked.
+    /// What `tamper` wrote.
     on_disk: Mutex<Vec<(EvidenceRef, Vec<u8>)>>,
+    /// Counter references and the content-derived ones behind them.
+    aliases: Mutex<Vec<(EvidenceRef, EvidenceRef)>>,
+}
+
+impl EvidenceMutant {
+    fn overwritten(&self, reference: &EvidenceRef) -> Option<Vec<u8>> {
+        let on_disk = self.on_disk.lock().expect("not poisoned");
+        on_disk
+            .iter()
+            .rev()
+            .find(|(r, _)| r == reference)
+            .map(|(_, content)| content.clone())
+    }
 }
 
 fn evidence_mutant(bug: EvidenceBug) -> impl Fn() -> EvidenceMutant {
@@ -205,19 +229,20 @@ fn evidence_mutant(bug: EvidenceBug) -> impl Fn() -> EvidenceMutant {
         by_length: Mutex::new(Vec::new()),
         puts: Mutex::new(0),
         on_disk: Mutex::new(Vec::new()),
+        aliases: Mutex::new(Vec::new()),
     }
 }
 
 /// The tamper hook of every evidence mutant.
+/// The tamper hook of every evidence mutant: it records the overwrite, and
+/// every mutant but `SkipsIntegrity` then rejects that reference as
+/// `Corrupted`, as `MemoryEvidence` does after re-deriving the reference.
 fn tamper_mutant(store: &EvidenceMutant, reference: &EvidenceRef, content: &[u8]) {
-    match store.bug {
-        EvidenceBug::SkipsIntegrity => store
-            .on_disk
-            .lock()
-            .expect("not poisoned")
-            .push((reference.clone(), content.to_vec())),
-        _ => store.inner.tamper(reference, content),
-    }
+    store
+        .on_disk
+        .lock()
+        .expect("not poisoned")
+        .push((reference.clone(), content.to_vec()));
 }
 
 fn evidence_suite(bug: EvidenceBug) -> Result<(), Violation> {
@@ -245,6 +270,17 @@ impl Evidence for EvidenceMutant {
                 seen.push((content.len(), reference.clone()));
                 Ok(reference)
             }
+            EvidenceBug::CounterReferences => {
+                let inner = self.inner.put(content)?;
+                let mut aliases = self.aliases.lock().expect("not poisoned");
+                if let Some((alias, _)) = aliases.iter().find(|(_, i)| *i == inner) {
+                    return Ok(alias.clone());
+                }
+                let n = aliases.len() + 1;
+                let alias = EvidenceRef::parse(&format!("blob-{n}")).expect("not blank");
+                aliases.push((alias.clone(), inner));
+                Ok(alias)
+            }
             _ => self.inner.put(content),
         }
     }
@@ -260,11 +296,17 @@ impl Evidence for EvidenceMutant {
                     Err(_) => Err(EvidenceError::NotFound),
                 }
             }
-            EvidenceBug::SkipsIntegrity => {
-                let on_disk = self.on_disk.lock().expect("not poisoned");
-                match on_disk.iter().rev().find(|(r, _)| r == reference) {
-                    Some((_, content)) => Ok(content.clone()),
-                    None => self.inner.get(reference),
+            _ if self.overwritten(reference).is_some() => {
+                match (self.bug, self.overwritten(reference)) {
+                    (EvidenceBug::SkipsIntegrity, Some(content)) => Ok(content),
+                    _ => Err(EvidenceError::Corrupted),
+                }
+            }
+            EvidenceBug::CounterReferences => {
+                let aliases = self.aliases.lock().expect("not poisoned");
+                match aliases.iter().find(|(alias, _)| alias == reference) {
+                    Some((_, inner)) => self.inner.get(inner),
+                    None => Err(EvidenceError::NotFound),
                 }
             }
             _ => self.inner.get(reference),
@@ -504,12 +546,16 @@ fn silent_forge() -> MemoryForge {
 // --------------------------------------------------------------------- Table
 
 /// One mutant: the port and clause it breaks, the operation whose check it
-/// targets (empty for clauses without operations), and the suite's result.
-struct Mutant {
-    port: &'static str,
-    clause: &'static str,
-    operation: &'static str,
-    run: Box<dyn Fn() -> Result<(), Violation>>,
+/// targets (empty for clauses without operations), and the suite run on it.
+pub struct Mutant {
+    /// The port, as in [`Violation::port`].
+    pub port: &'static str,
+    /// The clause it breaks.
+    pub clause: &'static str,
+    /// For `silent-failure-detail`, the one operation it breaks.
+    pub operation: &'static str,
+    /// Runs the port's suite on the mutant.
+    pub run: Box<dyn Fn() -> Result<(), Violation>>,
 }
 
 fn mutant(
@@ -538,7 +584,8 @@ fn silent_mutant(
     }
 }
 
-fn mutants() -> Vec<Mutant> {
+/// The mutant table, in a fixed order.
+pub fn mutants() -> Vec<Mutant> {
     let store = |clause, bug| {
         mutant("EventStore", clause, move || {
             contract::event_store::run(store_mutant(bug))
@@ -557,6 +604,7 @@ fn mutants() -> Vec<Mutant> {
         evidence("round-trip", EvidenceBug::Truncates),
         evidence("content-addressed", EvidenceBug::NoDedup),
         evidence("distinct-content", EvidenceBug::KeyedByLength),
+        evidence("reference-from-content", EvidenceBug::CounterReferences),
         evidence("unknown-reference", EvidenceBug::UnknownIsEmpty),
         evidence("hostile-references", EvidenceBug::LastComponent),
         evidence("tampered-content-rejected", EvidenceBug::SkipsIntegrity),
@@ -621,72 +669,66 @@ fn mutants() -> Vec<Mutant> {
     all
 }
 
-#[test]
-fn every_clause_is_killed() {
-    for m in mutants() {
-        let (port, clause, operation) = (m.port, m.clause, m.operation);
-        match (m.run)() {
-            Ok(()) => panic!("the {port} mutant for {clause} {operation} passed its suite"),
-            Err(violation) => {
-                assert_eq!(
-                    (violation.port, violation.clause),
-                    (port, clause),
-                    "the {port} mutant for {clause} {operation} broke another clause first: \
-                     {violation:?}"
-                );
-                // A per-operation mutant must be caught by that operation's
-                // check, not an earlier one.
-                assert!(
-                    violation.detail.starts_with(&format!("{operation}:")) || operation.is_empty(),
-                    "the {port} mutant for {operation} was caught elsewhere: {violation:?}"
-                );
+/// The violations of fixtures with a blank status, one per job-port
+/// suite: the suite rejects the fixture instead of passing vacuously.
+pub fn blank_status_violations() -> Vec<(&'static str, Result<(), Violation>)> {
+    let blank = |status: &str| ScriptedFailure {
+        status: String::from(status),
+        ..silent()
+    };
+    let agent = contract::agent::run(|| SilentFailure {
+        adapter: silent_agent(),
+        status: String::new(),
+    });
+    let verifier = contract::verifier::run(
+        || {
+            let base = CommitSha::parse(BASE).expect("valid SHA");
+            let citations = contract::verifier::sample(&base);
+            let statuses = vec![CitationStatus::Verified; citations.len()];
+            contract::verifier::Answering {
+                adapter: MemoryVerifier::new(VerifierScript {
+                    verify_citations: vec![Response::Answer(statuses)],
+                    ..VerifierScript::default()
+                }),
+                base,
+                citations,
             }
-        }
-    }
+        },
+        || SilentFailure {
+            adapter: MemoryVerifier::new(VerifierScript {
+                check_reproduction: vec![Response::Fail(blank("\u{200B}"))],
+                ..VerifierScript::default()
+            }),
+            status: String::from("\u{200B}"),
+        },
+    );
+    let forge = contract::forge::run(MemoryForge::new, || SilentFailure {
+        adapter: MemoryForge::scripted(ForgeScript {
+            post_questions: vec![Response::Fail(blank(" "))],
+            open_pull_request: vec![Response::Fail(blank(" "))],
+        }),
+        status: String::from(" "),
+    });
+    vec![("Agent", agent), ("Verifier", verifier), ("Forge", forge)]
 }
 
-/// Every clause has a mutant, and `silent-failure-detail` has one per
-/// operation of its port.
-#[test]
-fn mutant_table_covers_every_clause() {
-    let suites: [(&str, &[&str], &[&str]); 7] = [
-        ("EventStore", contract::event_store::CLAUSES, &[]),
-        ("Evidence", contract::evidence::CLAUSES, &[]),
-        ("Clock", contract::clock::CLAUSES, &[]),
-        ("Ids", contract::ids::CLAUSES, &[]),
-        (
-            "Agent",
-            contract::agent::CLAUSES,
-            contract::agent::OPERATIONS,
-        ),
-        (
-            "Verifier",
-            contract::verifier::CLAUSES,
-            contract::verifier::OPERATIONS,
-        ),
-        (
-            "Forge",
-            contract::forge::CLAUSES,
-            contract::forge::OPERATIONS,
-        ),
-    ];
-    let mut wanted = BTreeSet::new();
-    for (port, clauses, operations) in suites {
-        for &clause in clauses {
-            if clause == "silent-failure-detail" {
-                for &operation in operations {
-                    wanted.insert((port, clause, operation));
-                }
-            } else {
-                wanted.insert((port, clause, ""));
-            }
-        }
+/// For each mutant: `mutant <port> <clause> <operation>` and the pretty
+/// `Debug` of its suite's result; then the blank-status violations.
+pub fn render_violations() -> String {
+    let mut out = String::new();
+    for m in mutants() {
+        // Writing to a String cannot fail.
+        let _ = write!(
+            out,
+            "mutant {} {} {}\n{:#?}\n",
+            m.port,
+            m.clause,
+            m.operation,
+            (m.run)()
+        );
     }
-    let table = mutants();
-    let have: BTreeSet<(&str, &str, &str)> = table
-        .iter()
-        .map(|m| (m.port, m.clause, m.operation))
-        .collect();
-    assert_eq!(have.len(), table.len(), "a case has two mutants");
-    assert_eq!(have, wanted, "mutants and clause cases are not a bijection");
+    for (port, result) in blank_status_violations() {
+        let _ = write!(out, "blank-status {port}\n{result:#?}\n");
+    }
+    out
 }

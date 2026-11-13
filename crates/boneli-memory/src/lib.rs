@@ -6,8 +6,9 @@
 //! ([`MemoryAgent`], [`MemoryVerifier`], [`MemoryForge`]) answer from a
 //! script of plain data and record every request; the stores keep their
 //! data in a `BTreeMap`. Each adapter passes its port's contract suite in
-//! `boneli_app::contract` (`tests/contract.rs`), and `tests/mutants.rs`
-//! shows that every clause of those suites can fail.
+//! `boneli_app::contract` (`tests/contract.rs`; the `Evidence` suite in the
+//! unit tests of `src/evidence.rs`), and the mutant table of
+//! `boneli-replay-check` shows that every clause of those suites can fail.
 //!
 //! State sits behind a `std::sync::Mutex`, so the adapters are `Sync` and a
 //! root can share them across threads. A poisoned lock is recovered with

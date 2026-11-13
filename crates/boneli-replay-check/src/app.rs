@@ -3,22 +3,24 @@
 //!
 //! Every `DebugTicket` test runs through this corpus, so the two-process
 //! replay sees every path those tests exercise. A scenario is plain data:
-//! scripts for the in-memory agent, verifier and forge, a clock, optional
-//! store faults and the requests, in order. [`play`] runs it with a fixed
-//! `Clock` and `SequentialIds` and returns everything that is compared:
-//! each request's result, every run log and every recorded job request.
+//! scripts for the in-memory agent, verifier and forge, a clock, an
+//! optional injected [`Fault`] and the requests, in order. [`play`] runs it
+//! with a fixed `Clock` and `SequentialIds` behind recording adapters and
+//! returns everything that is compared: each request's result, every run
+//! log, every recorded job request and every port call.
 //!
-//! Three fault doubles here knowingly break their port's contract, to drive
-//! paths no contract-abiding adapter reaches: [`ScriptedClock`] goes
-//! backwards, [`FailingEvidence`] and [`FailingEventStore`] fail one call.
+//! [`fault_scenarios`] derives the fault matrix from the hand-written
+//! scenarios. [`ScriptedClock`] knowingly breaks the `Clock` contract, to
+//! reach a backwards clock with given readings.
 
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
 use boneli_app::{
-    Clock, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore, Evidence,
-    EvidenceError, PreviousRunError, RootCauseReport, RunLog, RunStart, StoreError, TriageReport,
-    Written,
+    Agent, Clock, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore, Evidence,
+    EvidenceError, FixRequest, Forge, ForgeRef, Ids, JobFailure, PreviousRunError, PullRequest,
+    ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog, RunStart, StoreError,
+    TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, CheckStatus, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef,
@@ -47,6 +49,10 @@ pub const AGENT_COST: u64 = 1_000;
 /// delivered path's 7 measured jobs take 7 000 ms.
 pub const STEP_MS: u64 = 1_000;
 
+/// The first reading of the default clock. Not 0, so a backwards fault
+/// always has 1 ms to go back.
+pub const CLOCK_START: u64 = 1_000;
+
 /// The clock a scenario runs on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClockSetup {
@@ -74,43 +80,192 @@ pub struct AppScenario {
     pub forge: ForgeScript,
     /// The clock.
     pub clock: ClockSetup,
-    /// Store faults.
-    pub faults: Faults,
+    /// The injected fault, if any.
+    pub fault: Option<Fault>,
+    /// For a fault-matrix scenario, the hand-written scenario it varies.
+    pub base: Option<String>,
     /// The requests, played in order on the same adapters.
     pub requests: Vec<DebugRequest>,
 }
 
-/// Store faults of a scenario. Calls are counted from 1, over all requests.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Faults {
-    /// The evidence `put` that fails as unavailable.
-    pub evidence_put: Option<usize>,
-    /// The evidence `get` that fails as unavailable.
-    pub evidence_get: Option<usize>,
-    /// The evidence `get` before which the stored content is overwritten
-    /// behind the store's back (ADR-004, D9).
-    pub evidence_tamper: Option<usize>,
-    /// Whether every event-store `create` fails as unavailable.
-    pub event_create: bool,
-    /// The event-store `append` that fails as unavailable.
-    pub event_append: Option<usize>,
+/// A port call as `play` records it: one variant per operation of every
+/// port. The recording adapters around the in-memory ones implement every
+/// port trait, so a new port operation does not compile until it records
+/// a variant here, and [`Call::fault_kinds`] matches every variant, so the
+/// variant does not compile without its fault kinds (ADR-004, D7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Call {
+    /// `Agent::triage`.
+    Triage,
+    /// `Agent::write_reproduction`.
+    WriteReproduction,
+    /// `Agent::analyze_root_cause`.
+    AnalyzeRootCause,
+    /// `Agent::write_fix`.
+    WriteFix,
+    /// `Verifier::check_reproduction`.
+    CheckReproduction,
+    /// `Verifier::verify_citations`.
+    VerifyCitations,
+    /// `Verifier::verify_fix`.
+    VerifyFix,
+    /// `Forge::post_questions`.
+    PostQuestions,
+    /// `Forge::open_pull_request`.
+    OpenPullRequest,
+    /// `EventStore::create`.
+    Create,
+    /// `EventStore::append`.
+    Append,
+    /// `EventStore::load`.
+    Load,
+    /// `Evidence::put`.
+    Put,
+    /// `Evidence::get`.
+    Get,
+    /// `Clock::now_ms`.
+    Now,
+    /// `Ids::run_id`.
+    RunId,
 }
 
-/// How often each fallible port was called while a scenario played. The
-/// fault matrix ([`fault_scenarios`]) injects a fault at each of these
-/// calls of the delivered run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Calls {
-    /// Evidence `put` calls.
-    pub evidence_put: usize,
-    /// Evidence `get` calls.
-    pub evidence_get: usize,
-    /// Event-store `create` calls.
-    pub event_create: usize,
-    /// Event-store `append` calls.
-    pub event_append: usize,
-    /// `Clock` readings.
-    pub clock: usize,
+impl Call {
+    /// The call's name in scenario names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Call::Triage => "triage",
+            Call::WriteReproduction => "write-reproduction",
+            Call::AnalyzeRootCause => "analyze-root-cause",
+            Call::WriteFix => "write-fix",
+            Call::CheckReproduction => "check-reproduction",
+            Call::VerifyCitations => "verify-citations",
+            Call::VerifyFix => "verify-fix",
+            Call::PostQuestions => "post-questions",
+            Call::OpenPullRequest => "open-pull-request",
+            Call::Create => "create",
+            Call::Append => "append",
+            Call::Load => "load",
+            Call::Put => "put",
+            Call::Get => "get",
+            Call::Now => "now",
+            Call::RunId => "run-id",
+        }
+    }
+
+    /// Every way this call can fail: a job failure for the job ports, every
+    /// `StoreError` and `EvidenceError` variant for the stores, a backwards
+    /// reading for the clock. `Ids::run_id` cannot fail.
+    pub fn fault_kinds(self) -> Vec<FaultKind> {
+        match self {
+            Call::Triage
+            | Call::WriteReproduction
+            | Call::AnalyzeRootCause
+            | Call::WriteFix
+            | Call::CheckReproduction
+            | Call::VerifyCitations
+            | Call::VerifyFix
+            | Call::PostQuestions
+            | Call::OpenPullRequest => vec![FaultKind::Fails],
+            Call::Create | Call::Append | Call::Load => every_store_error()
+                .into_iter()
+                .map(FaultKind::Store)
+                .collect(),
+            Call::Put | Call::Get => every_evidence_error()
+                .into_iter()
+                .map(FaultKind::Evidence)
+                .collect(),
+            Call::Now => vec![FaultKind::Backwards],
+            Call::RunId => vec![],
+        }
+    }
+}
+
+/// Every `StoreError` variant. Each is listed by the variant before it, in
+/// an exhaustive match, so a new variant does not compile until it is in
+/// the chain.
+pub fn every_store_error() -> Vec<StoreError> {
+    let mut all = Vec::new();
+    let mut next = Some(StoreError::UnknownRun);
+    while let Some(error) = next {
+        next = match &error {
+            StoreError::UnknownRun => Some(StoreError::AlreadyExists),
+            StoreError::AlreadyExists => Some(StoreError::InvalidRunId),
+            StoreError::InvalidRunId => Some(StoreError::Unavailable {
+                detail: String::from(FAULT),
+            }),
+            StoreError::Unavailable { .. } => None,
+        };
+        all.push(error);
+    }
+    all
+}
+
+/// Every `EvidenceError` variant, chained the same way.
+pub fn every_evidence_error() -> Vec<EvidenceError> {
+    let mut all = Vec::new();
+    let mut next = Some(EvidenceError::NotFound);
+    while let Some(error) = next {
+        next = match &error {
+            EvidenceError::NotFound => Some(EvidenceError::InvalidReference),
+            EvidenceError::InvalidReference => Some(EvidenceError::Corrupted),
+            EvidenceError::Corrupted => Some(EvidenceError::Unavailable {
+                detail: String::from(FAULT),
+            }),
+            EvidenceError::Unavailable { .. } => None,
+        };
+        all.push(error);
+    }
+    all
+}
+
+/// How an injected fault fails a call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaultKind {
+    /// A job port fails with [`injected_failure`].
+    Fails,
+    /// An event-store call returns this error.
+    Store(StoreError),
+    /// An evidence call returns this error.
+    Evidence(EvidenceError),
+    /// The clock reads 1 ms below its previous reading.
+    Backwards,
+}
+
+impl FaultKind {
+    /// The kind's name in scenario names.
+    pub fn name(&self) -> &'static str {
+        match self {
+            FaultKind::Fails => "fails",
+            FaultKind::Store(StoreError::UnknownRun) => "unknown-run",
+            FaultKind::Store(StoreError::AlreadyExists) => "already-exists",
+            FaultKind::Store(StoreError::InvalidRunId) => "invalid-run-id",
+            FaultKind::Store(StoreError::Unavailable { .. })
+            | FaultKind::Evidence(EvidenceError::Unavailable { .. }) => "unavailable",
+            FaultKind::Evidence(EvidenceError::NotFound) => "not-found",
+            FaultKind::Evidence(EvidenceError::InvalidReference) => "invalid-reference",
+            FaultKind::Evidence(EvidenceError::Corrupted) => "corrupted",
+            FaultKind::Backwards => "backwards",
+        }
+    }
+}
+
+/// One injected fault: the `occurrence`-th call (from 1, over all requests
+/// of the scenario) of `call` fails as `kind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fault {
+    /// The call.
+    pub call: Call,
+    /// Which of its calls.
+    pub occurrence: usize,
+    /// How it fails.
+    pub kind: FaultKind,
+}
+
+/// The failure an injected `Fails` fault returns. Its 700 µUSD differ from
+/// an agent job's 1 000, so charging it as a success or as zero changes the
+/// total; a verifier's or forge's cost is not charged at all.
+pub fn injected_failure() -> JobFailure {
+    JobFailure::new("injected failure", "exit status 70", 700)
 }
 
 /// Everything a played scenario left behind.
@@ -126,11 +281,11 @@ pub struct Played {
     pub verifier: Vec<VerifierRequest>,
     /// The requests the forge received.
     pub forge: Vec<ForgeRequest>,
-    /// How often the stores and the clock were called.
-    pub calls: Calls,
+    /// Every port call, with the index of the request it belonged to.
+    pub calls: Vec<(usize, Call)>,
 }
 
-/// The detail every fault double reports.
+/// The detail of every injected `Unavailable` error.
 pub const FAULT: &str = "the disk is full";
 
 /// A `Clock` that returns the given readings in order, then repeats the
@@ -161,155 +316,218 @@ impl Clock for ScriptedClock {
     }
 }
 
-/// The bytes a tamper fault writes over the stored content.
-pub const TAMPERED: &[u8] = b"tampered";
-
-/// [`MemoryEvidence`] with the evidence faults of [`Faults`]: one `put` or
-/// `get` fails as unavailable, or the content under one `get`'s reference
-/// is overwritten just before it, which the store must reject.
+/// Records every port call and says when the scenario's fault hits.
 #[derive(Debug, Default)]
-pub struct FailingEvidence {
-    inner: MemoryEvidence,
-    fail_put: Option<usize>,
-    fail_get: Option<usize>,
-    tamper_get: Option<usize>,
-    puts: Mutex<usize>,
-    gets: Mutex<usize>,
+struct Recorder {
+    fault: Option<Fault>,
+    request: Mutex<usize>,
+    calls: Mutex<Vec<(usize, Call)>>,
 }
 
-impl FailingEvidence {
-    /// A store with the evidence faults of `faults`.
-    pub fn new(faults: &Faults) -> FailingEvidence {
-        FailingEvidence {
-            fail_put: faults.evidence_put,
-            fail_get: faults.evidence_get,
-            tamper_get: faults.evidence_tamper,
-            ..FailingEvidence::default()
-        }
-    }
-
-    fn count(calls: &Mutex<usize>) -> usize {
-        let mut calls = calls.lock().unwrap_or_else(PoisonError::into_inner);
-        *calls += 1;
-        *calls
+impl Recorder {
+    /// Records the call; the fault kind when this call is the faulted one.
+    fn record(&self, call: Call) -> Option<FaultKind> {
+        let request = *self.request.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        calls.push((request, call));
+        let occurrence = calls.iter().filter(|(_, c)| *c == call).count();
+        self.fault
+            .as_ref()
+            .filter(|f| f.call == call && f.occurrence == occurrence)
+            .map(|f| f.kind.clone())
     }
 }
 
-impl Evidence for FailingEvidence {
-    fn put(&self, content: &[u8]) -> Result<EvidenceRef, EvidenceError> {
-        if Some(FailingEvidence::count(&self.puts)) == self.fail_put {
-            return Err(EvidenceError::Unavailable {
-                detail: String::from(FAULT),
-            });
+/// The adapters of one played scenario, each recording its calls in the
+/// shared [`Recorder`] and failing where its fault says. A job port is
+/// called before its fault replaces the result, so its script and request
+/// record advance as for a real failure; a store or the clock fails
+/// instead of being called.
+struct Recording<'a, P> {
+    inner: P,
+    recorder: &'a Recorder,
+}
+
+impl<P> Recording<'_, P> {
+    fn job<T>(&self, call: Call, result: Result<T, JobFailure>) -> Result<T, JobFailure> {
+        match self.recorder.record(call) {
+            Some(_) => Err(injected_failure()),
+            None => result,
         }
-        self.inner.put(content)
     }
 
-    fn get(&self, reference: &EvidenceRef) -> Result<Vec<u8>, EvidenceError> {
-        let n = Some(FailingEvidence::count(&self.gets));
-        if n == self.fail_get {
-            return Err(EvidenceError::Unavailable {
-                detail: String::from(FAULT),
-            });
+    fn store<T>(
+        &self,
+        call: Call,
+        run: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match self.recorder.record(call) {
+            Some(FaultKind::Store(error)) => Err(error),
+            _ => run(),
         }
-        if n == self.tamper_get {
-            self.inner.tamper(reference, TAMPERED);
+    }
+
+    fn evidence<T>(
+        &self,
+        call: Call,
+        run: impl FnOnce() -> Result<T, EvidenceError>,
+    ) -> Result<T, EvidenceError> {
+        match self.recorder.record(call) {
+            Some(FaultKind::Evidence(error)) => Err(error),
+            _ => run(),
         }
-        self.inner.get(reference)
     }
 }
 
-/// [`MemoryEventStore`] with the event-store faults of [`Faults`].
-#[derive(Debug, Default)]
-pub struct FailingEventStore {
-    inner: MemoryEventStore,
-    fail_create: bool,
-    fail_append: Option<usize>,
-    creates: Mutex<usize>,
-    appends: Mutex<usize>,
-}
-
-impl FailingEventStore {
-    /// A store with the event-store faults of `faults`.
-    pub fn new(faults: &Faults) -> FailingEventStore {
-        FailingEventStore {
-            fail_create: faults.event_create,
-            fail_append: faults.event_append,
-            ..FailingEventStore::default()
-        }
+impl Agent for Recording<'_, MemoryAgent> {
+    fn triage(&self, request: &TriageRequest) -> Result<TriageReport, JobFailure> {
+        let result = self.inner.triage(request);
+        self.job(Call::Triage, result)
     }
-
-    /// Every log, in `RunId` order.
-    pub fn logs(&self) -> Vec<(RunId, RunLog)> {
-        self.inner.logs()
+    fn write_reproduction(&self, request: &ReproductionRequest) -> Result<Written, JobFailure> {
+        let result = self.inner.write_reproduction(request);
+        self.job(Call::WriteReproduction, result)
+    }
+    fn analyze_root_cause(
+        &self,
+        request: &RootCauseRequest,
+    ) -> Result<RootCauseReport, JobFailure> {
+        let result = self.inner.analyze_root_cause(request);
+        self.job(Call::AnalyzeRootCause, result)
+    }
+    fn write_fix(&self, request: &FixRequest) -> Result<Written, JobFailure> {
+        let result = self.inner.write_fix(request);
+        self.job(Call::WriteFix, result)
     }
 }
 
-impl EventStore for FailingEventStore {
+impl Verifier for Recording<'_, MemoryVerifier> {
+    fn check_reproduction(&self, base: &CommitSha, test: &[u8]) -> Result<TestStatus, JobFailure> {
+        let result = self.inner.check_reproduction(base, test);
+        self.job(Call::CheckReproduction, result)
+    }
+    fn verify_citations(
+        &self,
+        base: &CommitSha,
+        citations: &[Citation],
+    ) -> Result<Vec<CitationStatus>, JobFailure> {
+        let result = self.inner.verify_citations(base, citations);
+        self.job(Call::VerifyCitations, result)
+    }
+    fn verify_fix(
+        &self,
+        base: &CommitSha,
+        diff: &[u8],
+        test: &[u8],
+    ) -> Result<FixChecks, JobFailure> {
+        let result = self.inner.verify_fix(base, diff, test);
+        self.job(Call::VerifyFix, result)
+    }
+}
+
+impl Forge for Recording<'_, MemoryForge> {
+    fn post_questions(
+        &self,
+        ticket: &Ticket,
+        questions: &[String],
+    ) -> Result<ForgeRef, JobFailure> {
+        let result = self.inner.post_questions(ticket, questions);
+        self.job(Call::PostQuestions, result)
+    }
+    fn open_pull_request(&self, request: &PullRequest) -> Result<ForgeRef, JobFailure> {
+        let result = self.inner.open_pull_request(request);
+        self.job(Call::OpenPullRequest, result)
+    }
+}
+
+impl EventStore for Recording<'_, MemoryEventStore> {
     fn create(&self, id: &RunId, start: &RunStart) -> Result<(), StoreError> {
-        FailingEvidence::count(&self.creates);
-        if self.fail_create {
-            return Err(StoreError::Unavailable {
-                detail: String::from(FAULT),
-            });
-        }
-        self.inner.create(id, start)
+        self.store(Call::Create, || self.inner.create(id, start))
     }
-
     fn append(&self, id: &RunId, event: &RunEvent) -> Result<(), StoreError> {
-        if Some(FailingEvidence::count(&self.appends)) == self.fail_append {
-            return Err(StoreError::Unavailable {
-                detail: String::from(FAULT),
-            });
-        }
-        self.inner.append(id, event)
+        self.store(Call::Append, || self.inner.append(id, event))
     }
-
     fn load(&self, id: &RunId) -> Result<RunLog, StoreError> {
-        self.inner.load(id)
+        self.store(Call::Load, || self.inner.load(id))
     }
 }
 
-/// Counts the readings of the clock it wraps.
-struct CountingClock<'a> {
-    inner: &'a dyn Clock,
-    readings: Mutex<usize>,
+impl Evidence for Recording<'_, MemoryEvidence> {
+    fn put(&self, content: &[u8]) -> Result<EvidenceRef, EvidenceError> {
+        self.evidence(Call::Put, || self.inner.put(content))
+    }
+    fn get(&self, reference: &EvidenceRef) -> Result<Vec<u8>, EvidenceError> {
+        self.evidence(Call::Get, || self.inner.get(reference))
+    }
 }
 
-impl Clock for CountingClock<'_> {
+/// The scenario's clock, recording its readings; a `Backwards` fault reads
+/// 1 ms below the reading before it.
+struct RecordingClock<'a> {
+    inner: Box<dyn Clock>,
+    recorder: &'a Recorder,
+    last: Mutex<Option<u64>>,
+}
+
+impl Clock for RecordingClock<'_> {
     fn now_ms(&self) -> u64 {
-        FailingEvidence::count(&self.readings);
-        self.inner.now_ms()
+        let reading = self.inner.now_ms();
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = match (self.recorder.record(Call::Now), *last) {
+            (Some(FaultKind::Backwards), Some(previous)) => previous.saturating_sub(1),
+            _ => reading,
+        };
+        *last = Some(now);
+        now
     }
 }
 
-fn taken(calls: &Mutex<usize>) -> usize {
-    *calls.lock().unwrap_or_else(PoisonError::into_inner)
+impl Ids for Recording<'_, SequentialIds> {
+    fn run_id(&self) -> RunId {
+        let _ = self.recorder.record(Call::RunId);
+        self.inner.run_id()
+    }
 }
 
 /// Plays one scenario on fresh adapters.
 pub fn play(scenario: &AppScenario) -> Played {
-    let agent = MemoryAgent::new(scenario.agent.clone());
-    let verifier = MemoryVerifier::new(scenario.verifier.clone());
-    let forge = MemoryForge::scripted(scenario.forge.clone());
-    let events = FailingEventStore::new(&scenario.faults);
-    let evidence = FailingEvidence::new(&scenario.faults);
-    let ids = SequentialIds::new();
-    let step;
-    let scripted;
-    let inner: &dyn Clock = match &scenario.clock {
-        ClockSetup::Step { start, increment } => {
-            step = StepClock::new(*start, *increment);
-            &step
-        }
-        ClockSetup::Readings(readings) => {
-            scripted = ScriptedClock::new(readings.clone());
-            &scripted
-        }
+    let recorder = Recorder {
+        fault: scenario.fault.clone(),
+        ..Recorder::default()
     };
-    let clock = CountingClock {
+    let wrap = |inner| Recording {
         inner,
-        readings: Mutex::new(0),
+        recorder: &recorder,
+    };
+    let agent = wrap(MemoryAgent::new(scenario.agent.clone()));
+    let verifier = Recording {
+        inner: MemoryVerifier::new(scenario.verifier.clone()),
+        recorder: &recorder,
+    };
+    let forge = Recording {
+        inner: MemoryForge::scripted(scenario.forge.clone()),
+        recorder: &recorder,
+    };
+    let events = Recording {
+        inner: MemoryEventStore::new(),
+        recorder: &recorder,
+    };
+    let evidence = Recording {
+        inner: MemoryEvidence::new(),
+        recorder: &recorder,
+    };
+    let ids = Recording {
+        inner: SequentialIds::new(),
+        recorder: &recorder,
+    };
+    let inner: Box<dyn Clock> = match &scenario.clock {
+        ClockSetup::Step { start, increment } => Box::new(StepClock::new(*start, *increment)),
+        ClockSetup::Readings(readings) => Box::new(ScriptedClock::new(readings.clone())),
+    };
+    let clock = RecordingClock {
+        inner,
+        recorder: &recorder,
+        last: Mutex::new(None),
     };
     let use_case = DebugTicket {
         agent: &agent,
@@ -320,24 +538,26 @@ pub fn play(scenario: &AppScenario) -> Played {
         clock: &clock,
         ids: &ids,
     };
-    let results = scenario
-        .requests
-        .iter()
-        .map(|request| use_case.run(request.clone()))
-        .collect();
+    let mut results = Vec::new();
+    for (k, request) in scenario.requests.iter().enumerate() {
+        *recorder
+            .request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = k;
+        results.push(use_case.run(request.clone()));
+    }
+    let calls = recorder
+        .calls
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     Played {
         results,
-        logs: events.logs(),
-        agent: agent.requests(),
-        verifier: verifier.requests(),
-        forge: forge.requests(),
-        calls: Calls {
-            evidence_put: taken(&evidence.puts),
-            evidence_get: taken(&evidence.gets),
-            event_create: taken(&events.creates),
-            event_append: taken(&events.appends),
-            clock: taken(&clock.readings),
-        },
+        logs: events.inner.logs(),
+        agent: agent.inner.requests(),
+        verifier: verifier.inner.requests(),
+        forge: forge.inner.requests(),
+        calls,
     }
 }
 
@@ -551,10 +771,11 @@ fn scenario(name: &str, requests: Vec<DebugRequest>) -> AppScenario {
         verifier: delivering_verifier(),
         forge: ForgeScript::default(),
         clock: ClockSetup::Step {
-            start: 0,
+            start: CLOCK_START,
             increment: STEP_MS,
         },
-        faults: Faults::default(),
+        fault: None,
+        base: None,
         requests,
     }
 }
@@ -567,201 +788,53 @@ pub fn scenarios() -> Vec<AppScenario> {
     all
 }
 
-/// The failure every agent fault returns: it ran up provider cost.
-pub fn agent_fault() -> ScriptedFailure {
-    failure("agent crashed", "exit status 2", 700)
-}
-
-/// The failure every verifier fault returns; its cost is not charged.
-pub fn verifier_fault() -> ScriptedFailure {
-    failure("runner crashed", "exit status 1", 5)
-}
-
-/// The failure every forge fault returns; forge calls carry no usage.
-pub fn forge_fault() -> ScriptedFailure {
-    failure("bad gateway", "HTTP 502", 9)
-}
-
-/// The first reading of the clock in the clock-backwards faults: above
-/// 5 000 ms, so a guard that only checks early readings is caught too.
-pub const BACKWARDS_START: u64 = 10_000;
-
-/// The script with its `occurrence`-th response (from 1) failing.
-fn fail_at<T: Clone>(
-    script: &[Response<T>],
-    occurrence: usize,
-    fault: ScriptedFailure,
-) -> Vec<Response<T>> {
-    let mut script = script.to_vec();
-    let failing = Response::Fail(fault);
-    match script.get_mut(occurrence - 1) {
-        Some(slot) => *slot = failing,
-        None => script.push(failing),
-    }
-    script
-}
-
-/// The occurrence (from 1) of each element among those with the same key.
-fn occurrences<K: PartialEq>(keys: &[K]) -> Vec<usize> {
-    keys.iter()
-        .enumerate()
-        .map(|(k, key)| keys[..=k].iter().filter(|other| *other == key).count())
-        .collect()
-}
-
-/// The fault matrix (ADR-004, D7): the delivered run is played once, and
-/// for every call it made to a port that can fail there is one scenario
-/// that fails exactly that call, per failure kind:
+/// The fault matrix (ADR-004, D7): every hand-written scenario without a
+/// fault of its own is played once as a base, and for every port call it
+/// made there is one scenario per fault kind of that call
+/// ([`Call::fault_kinds`]) that fails exactly that call. The first clock
+/// reading of a request is no fault point: no earlier reading of the run
+/// exists to go back from.
 ///
-/// - every agent, verifier and forge call fails with a scripted failure;
-/// - every evidence `put` and `get` fails as unavailable, and every `get`
-///   also meets content overwritten behind the store's back;
-/// - the event-store `create` and every `append` fail as unavailable;
-/// - the clock goes back 1 ms at the second reading of every measured job.
-///   The first reading of a job is not a fault point: `DebugTicket` only
-///   compares the two readings of one job.
-///
-/// A branch added to `DebugTicket` later adds port calls, so its scenarios
-/// appear here without anyone writing them, and the replay plays them.
+/// A branch added to `DebugTicket` later adds port calls to some base, so
+/// its fault scenarios appear here without anyone writing them, and the
+/// replay plays them.
 pub fn fault_scenarios() -> Vec<AppScenario> {
-    let happy = scenario("delivered", vec![request()]);
-    let played = play(&happy);
-    let calls = played.calls;
     let mut all = Vec::new();
-    let fault = |name: String, faults: Faults| AppScenario {
-        name,
-        faults,
-        ..happy.clone()
-    };
-
-    let agent_ops: Vec<&str> = played.agent.iter().map(agent_operation).collect();
-    for (op, occurrence) in agent_ops.iter().zip(occurrences(&agent_ops)) {
-        let mut agent = happy.agent.clone();
-        let f = agent_fault();
-        match *op {
-            "triage" => agent.triage = fail_at(&agent.triage, occurrence, f),
-            "write_reproduction" => {
-                agent.write_reproduction = fail_at(&agent.write_reproduction, occurrence, f);
+    for base in hand_written().into_iter().filter(|s| s.fault.is_none()) {
+        let played = play(&base);
+        let mut seen: Vec<Call> = Vec::new();
+        let mut timed: Vec<usize> = Vec::new();
+        for &(request, call) in &played.calls {
+            seen.push(call);
+            let occurrence = seen.iter().filter(|c| **c == call).count();
+            if call == Call::Now && !timed.contains(&request) {
+                timed.push(request);
+                continue;
             }
-            "analyze_root_cause" => {
-                agent.analyze_root_cause = fail_at(&agent.analyze_root_cause, occurrence, f);
+            for kind in call.fault_kinds() {
+                all.push(AppScenario {
+                    name: format!(
+                        "fault-{}-{}-{occurrence}-{}",
+                        base.name,
+                        call.name(),
+                        kind.name()
+                    ),
+                    base: Some(base.name.clone()),
+                    fault: Some(Fault {
+                        call,
+                        occurrence,
+                        kind,
+                    }),
+                    ..base.clone()
+                });
             }
-            _ => agent.write_fix = fail_at(&agent.write_fix, occurrence, f),
         }
-        all.push(AppScenario {
-            name: format!("fault-agent-{}-{occurrence}", op.replace('_', "-")),
-            agent,
-            ..happy.clone()
-        });
-    }
-    let verifier_ops: Vec<&str> = played.verifier.iter().map(verifier_operation).collect();
-    for (op, occurrence) in verifier_ops.iter().zip(occurrences(&verifier_ops)) {
-        let mut verifier = happy.verifier.clone();
-        let f = verifier_fault();
-        match *op {
-            "check_reproduction" => {
-                verifier.check_reproduction = fail_at(&verifier.check_reproduction, occurrence, f);
-            }
-            "verify_citations" => {
-                verifier.verify_citations = fail_at(&verifier.verify_citations, occurrence, f);
-            }
-            _ => verifier.verify_fix = fail_at(&verifier.verify_fix, occurrence, f),
-        }
-        all.push(AppScenario {
-            name: format!("fault-verifier-{}-{occurrence}", op.replace('_', "-")),
-            verifier,
-            ..happy.clone()
-        });
-    }
-    let forge_ops: Vec<&str> = played.forge.iter().map(forge_operation).collect();
-    for (op, occurrence) in forge_ops.iter().zip(occurrences(&forge_ops)) {
-        let mut forge = happy.forge.clone();
-        let failing = |script: &[Response<()>]| fail_at(script, occurrence, forge_fault());
-        match *op {
-            "post_questions" => forge.post_questions = failing(&forge.post_questions),
-            _ => forge.open_pull_request = failing(&forge.open_pull_request),
-        }
-        all.push(AppScenario {
-            name: format!("fault-forge-{}-{occurrence}", op.replace('_', "-")),
-            forge,
-            ..happy.clone()
-        });
-    }
-    for n in 1..=calls.evidence_put {
-        let faults = Faults {
-            evidence_put: Some(n),
-            ..Faults::default()
-        };
-        all.push(fault(format!("fault-evidence-put-{n}"), faults));
-    }
-    for n in 1..=calls.evidence_get {
-        let faults = Faults {
-            evidence_get: Some(n),
-            ..Faults::default()
-        };
-        all.push(fault(format!("fault-evidence-get-{n}"), faults));
-        let faults = Faults {
-            evidence_tamper: Some(n),
-            ..Faults::default()
-        };
-        all.push(fault(format!("fault-evidence-tamper-{n}"), faults));
-    }
-    if calls.event_create > 0 {
-        let faults = Faults {
-            event_create: true,
-            ..Faults::default()
-        };
-        all.push(fault(String::from("fault-event-create"), faults));
-    }
-    for n in 1..=calls.event_append {
-        let faults = Faults {
-            event_append: Some(n),
-            ..Faults::default()
-        };
-        all.push(fault(format!("fault-event-append-{n}"), faults));
-    }
-    for job in 1..=calls.clock / 2 {
-        let before = (1..2 * job).map(|k| BACKWARDS_START + STEP_MS * (k as u64 - 1));
-        let mut readings: Vec<u64> = before.collect();
-        let last = readings.last().copied().unwrap_or(BACKWARDS_START);
-        readings.push(last - 1);
-        all.push(AppScenario {
-            name: format!("fault-clock-backwards-{job}"),
-            clock: ClockSetup::Readings(readings),
-            ..happy.clone()
-        });
     }
     all
 }
 
-/// The operation an agent request was for.
-pub fn agent_operation(request: &AgentRequest) -> &'static str {
-    match request {
-        AgentRequest::Triage(_) => "triage",
-        AgentRequest::WriteReproduction(_) => "write_reproduction",
-        AgentRequest::AnalyzeRootCause(_) => "analyze_root_cause",
-        AgentRequest::WriteFix(_) => "write_fix",
-    }
-}
-
-/// The operation a verifier request was for.
-pub fn verifier_operation(request: &VerifierRequest) -> &'static str {
-    match request {
-        VerifierRequest::CheckReproduction { .. } => "check_reproduction",
-        VerifierRequest::VerifyCitations { .. } => "verify_citations",
-        VerifierRequest::VerifyFix { .. } => "verify_fix",
-    }
-}
-
-/// The operation a forge request was for.
-pub fn forge_operation(request: &ForgeRequest) -> &'static str {
-    match request {
-        ForgeRequest::PostQuestions { .. } => "post_questions",
-        ForgeRequest::OpenPullRequest(_) => "open_pull_request",
-    }
-}
-
-fn hand_written() -> Vec<AppScenario> {
+/// The hand-written scenarios, in a fixed order.
+pub fn hand_written() -> Vec<AppScenario> {
     vec![
         scenario("delivered", vec![request()]),
         scenario("delivered-at-limits", vec![limited(4_000, 7_000)]),
@@ -781,7 +854,7 @@ fn hand_written() -> Vec<AppScenario> {
         },
         AppScenario {
             clock: ClockSetup::Step {
-                start: 0,
+                start: CLOCK_START,
                 increment: 0,
             },
             ..scenario("equal-clock-readings", vec![request()])
@@ -817,10 +890,13 @@ fn hand_written() -> Vec<AppScenario> {
         },
         scenario("rerun-previous-delivered", vec![request(), after("run-1")]),
         AppScenario {
-            faults: Faults {
-                event_append: Some(3),
-                ..Faults::default()
-            },
+            fault: Some(Fault {
+                call: Call::Append,
+                occurrence: 3,
+                kind: FaultKind::Store(StoreError::Unavailable {
+                    detail: String::from(FAULT),
+                }),
+            }),
             ..scenario("rerun-previous-unfinished", vec![request(), after("run-1")])
         },
         AppScenario {
@@ -909,24 +985,33 @@ fn hand_written() -> Vec<AppScenario> {
             ..scenario("agent-script-exhausted", vec![request()])
         },
         AppScenario {
-            faults: Faults {
-                event_append: Some(3),
-                ..Faults::default()
-            },
+            fault: Some(Fault {
+                call: Call::Append,
+                occurrence: 3,
+                kind: FaultKind::Store(StoreError::Unavailable {
+                    detail: String::from(FAULT),
+                }),
+            }),
             ..scenario("event-store-append-fails", vec![request()])
         },
         AppScenario {
-            faults: Faults {
-                evidence_put: Some(1),
-                ..Faults::default()
-            },
+            fault: Some(Fault {
+                call: Call::Put,
+                occurrence: 1,
+                kind: FaultKind::Evidence(EvidenceError::Unavailable {
+                    detail: String::from(FAULT),
+                }),
+            }),
             ..scenario("evidence-store-fails", vec![request()])
         },
         AppScenario {
-            faults: Faults {
-                evidence_get: Some(1),
-                ..Faults::default()
-            },
+            fault: Some(Fault {
+                call: Call::Get,
+                occurrence: 1,
+                kind: FaultKind::Evidence(EvidenceError::Unavailable {
+                    detail: String::from(FAULT),
+                }),
+            }),
             ..scenario("evidence-load-fails", vec![request()])
         },
         scenario(

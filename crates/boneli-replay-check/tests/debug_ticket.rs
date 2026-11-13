@@ -6,14 +6,17 @@
 
 use std::collections::BTreeSet;
 
-use boneli_app::{DebugTicketError, PreviousRunError, PreviousTriage, StoreError, replay};
+use boneli_app::{
+    DebugTicketError, EvidenceError, PreviousRunError, PreviousTriage, StoreError, replay,
+};
 use boneli_domain::{
     AgentOutputProblem, Budget, BudgetDimension, DomainError, EventKind, FixCheck, GateFailure,
     Outcome, Overrun, RunId, Stage, TicketField, Usage,
 };
 use boneli_memory::{AgentRequest, ForgeRequest, VerifierRequest};
 use boneli_replay_check::app::{
-    AppScenario, FAULT, Played, play, questions, scenarios, second_questions,
+    AppScenario, CLOCK_START, Call, FAULT, Fault, FaultKind, Played, STEP_MS, play, questions,
+    scenarios, second_questions,
 };
 
 type Want = Result<(Stage, Usage), DebugTicketError>;
@@ -384,16 +387,16 @@ fn hand_written_expectations() -> Vec<Expectation> {
 
 /// One job of the delivered run, written out independently of
 /// `DebugTicket`: the evidence it loads, the port it calls and the evidence
-/// it stores, in that order. The fault expectations are derived from this
-/// table, not from the scenarios, so a change in what `DebugTicket` calls
-/// shows up as a mismatch.
+/// it stores, in that order. The expectations of the delivered run's fault
+/// scenarios are derived from this table, not from `DebugTicket`, so a
+/// change in what `DebugTicket` calls or charges shows up as a mismatch.
 struct Job {
     awaiting: EventKind,
     loads: &'static [&'static str],
-    agent: Option<&'static str>,
-    verifier: Option<&'static str>,
-    forge: Option<&'static str>,
+    call: Call,
+    agent: bool,
     stores: Option<&'static str>,
+    measured: bool,
 }
 
 const TEST: &str = "reproduction test";
@@ -402,214 +405,222 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::TriageFinished,
         loads: &[],
-        agent: Some("triage"),
-        verifier: None,
-        forge: None,
+        call: Call::Triage,
+        agent: true,
         stores: None,
+        measured: true,
     },
     Job {
         awaiting: EventKind::ReproductionWritten,
         loads: &[],
-        agent: Some("write_reproduction"),
-        verifier: None,
-        forge: None,
+        call: Call::WriteReproduction,
+        agent: true,
         stores: Some(TEST),
+        measured: true,
     },
     Job {
         awaiting: EventKind::ReproductionChecked,
         loads: &[TEST],
-        agent: None,
-        verifier: Some("check_reproduction"),
-        forge: None,
+        call: Call::CheckReproduction,
+        agent: false,
         stores: None,
+        measured: true,
     },
     Job {
         awaiting: EventKind::RootCauseProposed,
         loads: &[TEST],
-        agent: Some("analyze_root_cause"),
-        verifier: None,
-        forge: None,
+        call: Call::AnalyzeRootCause,
+        agent: true,
         stores: Some("analysis"),
+        measured: true,
     },
     Job {
         awaiting: EventKind::CitationsChecked,
         loads: &[],
-        agent: None,
-        verifier: Some("verify_citations"),
-        forge: None,
+        call: Call::VerifyCitations,
+        agent: false,
         stores: None,
+        measured: true,
     },
     Job {
         awaiting: EventKind::FixWritten,
         loads: &[TEST, "analysis"],
-        agent: Some("write_fix"),
-        verifier: None,
-        forge: None,
+        call: Call::WriteFix,
+        agent: true,
         stores: Some("diff"),
+        measured: true,
     },
     Job {
         awaiting: EventKind::FixVerified,
         loads: &["diff", TEST],
-        agent: None,
-        verifier: Some("verify_fix"),
-        forge: None,
+        call: Call::VerifyFix,
+        agent: false,
         stores: None,
+        measured: true,
     },
     Job {
         awaiting: EventKind::PullRequestOpened,
         loads: &["diff", TEST, "analysis"],
-        agent: None,
-        verifier: None,
-        forge: Some("open_pull_request"),
+        call: Call::OpenPullRequest,
+        agent: false,
         stores: None,
+        measured: false,
     },
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Fault {
-    Agent(&'static str),
-    Verifier(&'static str),
-    Forge(&'static str),
-    Put(usize),
-    Get(usize),
-    Tamper(usize),
-    Create,
-    Append(usize),
-    ClockBackwards(usize),
+/// The model's run of the delivered scenario under one fault (or none):
+/// every call it makes, and what it ends with.
+struct Model<'a> {
+    fault: Option<&'a Fault>,
+    calls: Vec<Call>,
 }
 
-/// What the delivered run does under one fault, by the model: the result,
-/// and the agent, verifier and forge calls. Agent jobs cost 1 000 µUSD
-/// (700 when they fail), measured jobs last 1 000 ms, a verifier's failure
-/// cost and every forge call are free, and a backwards clock charges the
-/// job's cost with 0 ms.
-fn model(fault: Fault) -> (Want, (usize, usize, usize)) {
-    const UNAVAILABLE: &str = "the evidence store is unavailable: the disk is full";
-    const CORRUPTED: &str = "the stored content does not match its reference";
-    let mut calls = (0, 0, 0);
-    if fault == Fault::Create {
-        return (unavailable(), calls);
+impl Model<'_> {
+    /// Records a call; the fault kind when this call is the faulted one.
+    fn hit(&mut self, call: Call) -> Option<FaultKind> {
+        self.calls.push(call);
+        let occurrence = self.calls.iter().filter(|c| **c == call).count();
+        self.fault
+            .filter(|f| f.call == call && f.occurrence == occurrence)
+            .map(|f| f.kind.clone())
     }
-    let (mut puts, mut gets, mut appends, mut measured) = (0, 0, 1, 0);
-    if fault == Fault::Append(1) {
-        return (unavailable(), calls);
-    }
-    let mut spent = Usage::default();
-    for job in &DELIVERED_RUN {
-        let is_measured = job.forge.is_none();
-        measured += usize::from(is_measured);
-        let mut cost = 0;
-        let mut failed: Option<String> = None;
-        for what in job.loads {
-            gets += 1;
-            if fault == Fault::Get(gets) {
-                failed = Some(format!("loading the {what} failed: {UNAVAILABLE}"));
-            } else if fault == Fault::Tamper(gets) {
-                failed = Some(format!("loading the {what} failed: {CORRUPTED}"));
-            }
-            if failed.is_some() {
-                break;
-            }
+
+    /// The `r`-th reading of the step clock, 1 ms below the one before when
+    /// the fault hits it.
+    fn now(&mut self, previous: Option<u64>) -> u64 {
+        let reading =
+            CLOCK_START + STEP_MS * self.calls.iter().filter(|c| **c == Call::Now).count() as u64;
+        match (self.hit(Call::Now), previous) {
+            (Some(FaultKind::Backwards), Some(previous)) => previous - 1,
+            _ => reading,
         }
-        if failed.is_none() {
-            if let Some(op) = job.agent {
-                calls.0 += 1;
-                if fault == Fault::Agent(op) {
-                    cost = 700;
-                    failed = Some(String::from("exit status 2: agent crashed"));
-                } else {
+    }
+
+    /// The result and the agent, verifier and forge calls. Agent jobs cost
+    /// 1 000 µUSD and 700 µUSD when they fail, measured jobs last 1 000 ms,
+    /// verifier and forge failures charge no cost, a backwards reading
+    /// within a job charges the job's cost with 0 ms, and a backwards first
+    /// reading ends the run before the job runs.
+    fn run(&mut self) -> (Want, (usize, usize, usize)) {
+        let mut counts = (0, 0, 0);
+        let _ = self.hit(Call::RunId);
+        if let Some(FaultKind::Store(error)) = self.hit(Call::Create) {
+            return (Err(DebugTicketError::Store(error)), counts);
+        }
+        if let Some(FaultKind::Store(error)) = self.hit(Call::Append) {
+            return (Err(DebugTicketError::Store(error)), counts);
+        }
+        let mut spent = Usage::default();
+        let mut last: Option<u64> = None;
+        let mut previous: Option<u64> = None;
+        for job in &DELIVERED_RUN {
+            let backwards =
+                |a: u64, b: u64| format!("the clock went backwards: {a} ms, then {b} ms");
+            let mut before = 0;
+            if job.measured {
+                before = self.now(previous);
+                previous = Some(before);
+                if let Some(last) = last.filter(|last| before < *last) {
+                    let outcome = job_failed(job.awaiting, &backwards(last, before));
+                    return (done(outcome, spent), counts);
+                }
+            }
+            let mut cost = 0;
+            let mut failed: Option<String> = None;
+            for what in job.loads {
+                if let Some(FaultKind::Evidence(error)) = self.hit(Call::Get) {
+                    failed = Some(format!("loading the {what} failed: {error}"));
+                    break;
+                }
+            }
+            if failed.is_none() {
+                let hit = self.hit(job.call);
+                match job.call {
+                    Call::OpenPullRequest => counts.2 += 1,
+                    _ if job.agent => counts.0 += 1,
+                    _ => counts.1 += 1,
+                }
+                if hit.is_some() {
+                    failed = Some(String::from("exit status 70: injected failure"));
+                    cost = if job.agent { 700 } else { 0 };
+                } else if job.agent {
                     cost = 1_000;
                 }
             }
-            if let Some(op) = job.verifier {
-                calls.1 += 1;
-                if fault == Fault::Verifier(op) {
-                    failed = Some(String::from("exit status 1: runner crashed"));
+            if let (None, Some(what)) = (&failed, job.stores) {
+                if let Some(FaultKind::Evidence(error)) = self.hit(Call::Put) {
+                    failed = Some(format!("storing the {what} failed: {error}"));
                 }
             }
-            if let Some(op) = job.forge {
-                calls.2 += 1;
-                if fault == Fault::Forge(op) {
-                    failed = Some(String::from("HTTP 502: bad gateway"));
+            let mut duration = 0;
+            if job.measured {
+                let after = self.now(previous);
+                previous = Some(after);
+                last = Some(after);
+                match after.checked_sub(before) {
+                    Some(elapsed) => duration = elapsed,
+                    None => failed = Some(backwards(before, after)),
                 }
             }
-        }
-        if let (None, Some(what)) = (&failed, job.stores) {
-            puts += 1;
-            if fault == Fault::Put(puts) {
-                failed = Some(format!("storing the {what} failed: {UNAVAILABLE}"));
+            spent = usage(spent.cost_micro_usd + cost, spent.duration_ms + duration);
+            if let Some(detail) = failed {
+                return (done(job_failed(job.awaiting, &detail), spent), counts);
+            }
+            if let Some(FaultKind::Store(error)) = self.hit(Call::Append) {
+                return (Err(DebugTicketError::Store(error)), counts);
             }
         }
-        let mut duration = if is_measured { 1_000 } else { 0 };
-        if is_measured && fault == Fault::ClockBackwards(measured) {
-            let before = 10_000 + 1_000 * (2 * measured as u64 - 2);
-            let after = before - 1;
-            failed = Some(format!(
-                "the clock went backwards: {before} ms, then {after} ms"
-            ));
-            duration = 0;
-        }
-        spent = usage(spent.cost_micro_usd + cost, spent.duration_ms + duration);
-        if let Some(detail) = failed {
-            return (done(job_failed(job.awaiting, &detail), spent), calls);
-        }
-        appends += 1;
-        if fault == Fault::Append(appends) {
-            return (unavailable(), calls);
-        }
+        (done(delivered("pull-1"), spent), counts)
     }
-    (done(delivered("pull-1"), spent), calls)
 }
 
-/// Every fault point of the model, with the scenario name the fault matrix
-/// must give it.
-fn fault_points() -> Vec<(String, Fault)> {
+fn model(fault: &Fault) -> (Want, (usize, usize, usize)) {
+    Model {
+        fault: Some(fault),
+        calls: Vec::new(),
+    }
+    .run()
+}
+
+/// Every fault point of the delivered run by the model: its call sequence
+/// without a fault, each call with every fault kind, except the first
+/// clock reading. Names as the fault matrix must give them.
+fn delivered_fault_points() -> Vec<(String, Fault)> {
+    let mut clean = Model {
+        fault: None,
+        calls: Vec::new(),
+    };
+    let _ = clean.run();
     let mut points = Vec::new();
-    for op in DELIVERED_RUN.iter().filter_map(|j| j.agent) {
-        points.push((format!("fault-agent-{}-1", kebab(op)), Fault::Agent(op)));
-    }
-    for op in DELIVERED_RUN.iter().filter_map(|j| j.verifier) {
-        points.push((
-            format!("fault-verifier-{}-1", kebab(op)),
-            Fault::Verifier(op),
-        ));
-    }
-    for op in DELIVERED_RUN.iter().filter_map(|j| j.forge) {
-        points.push((format!("fault-forge-{}-1", kebab(op)), Fault::Forge(op)));
-    }
-    let puts = DELIVERED_RUN.iter().filter(|j| j.stores.is_some()).count();
-    for n in 1..=puts {
-        points.push((format!("fault-evidence-put-{n}"), Fault::Put(n)));
-    }
-    let gets: usize = DELIVERED_RUN.iter().map(|j| j.loads.len()).sum();
-    for n in 1..=gets {
-        points.push((format!("fault-evidence-get-{n}"), Fault::Get(n)));
-        points.push((format!("fault-evidence-tamper-{n}"), Fault::Tamper(n)));
-    }
-    points.push((String::from("fault-event-create"), Fault::Create));
-    // TicketReceived, then one event per job.
-    for n in 1..=DELIVERED_RUN.len() + 1 {
-        points.push((format!("fault-event-append-{n}"), Fault::Append(n)));
-    }
-    let measured = DELIVERED_RUN.iter().filter(|j| j.forge.is_none()).count();
-    for job in 1..=measured {
-        points.push((
-            format!("fault-clock-backwards-{job}"),
-            Fault::ClockBackwards(job),
-        ));
+    for (k, &call) in clean.calls.iter().enumerate() {
+        let occurrence = clean.calls[..=k].iter().filter(|c| **c == call).count();
+        if call == Call::Now && occurrence == 1 {
+            continue;
+        }
+        for kind in call.fault_kinds() {
+            let name = format!(
+                "fault-delivered-{}-{occurrence}-{}",
+                call.name(),
+                kind.name()
+            );
+            points.push((
+                name,
+                Fault {
+                    call,
+                    occurrence,
+                    kind,
+                },
+            ));
+        }
     }
     points
 }
 
-fn kebab(operation: &str) -> String {
-    operation.replace('_', "-")
-}
-
 fn fault_expectations() -> Vec<Expectation> {
-    fault_points()
+    delivered_fault_points()
         .into_iter()
         .map(|(name, fault)| {
-            let (want, (agent, verifier, forge)) = model(fault);
+            let (want, (agent, verifier, forge)) = model(&fault);
             Expectation {
                 name,
                 results: vec![want],
@@ -621,18 +632,29 @@ fn fault_expectations() -> Vec<Expectation> {
         .collect()
 }
 
+fn fault(call: Call, occurrence: usize, kind: FaultKind) -> Fault {
+    Fault {
+        call,
+        occurrence,
+        kind,
+    }
+}
+
 /// Spot checks of the model against numbers worked out by hand, so a model
 /// bug cannot silently agree with a `DebugTicket` bug.
 #[test]
 fn fault_model_spot_checks() {
     let failed = |awaiting, detail: &str, spent| done(job_failed(awaiting, detail), spent);
+    let unavailable_evidence = FaultKind::Evidence(EvidenceError::Unavailable {
+        detail: String::from(FAULT),
+    });
     // A failed write_fix charges the 700 µUSD it ran up (review mutant C).
     assert_eq!(
-        model(Fault::Agent("write_fix")),
+        model(&fault(Call::WriteFix, 1, FaultKind::Fails)),
         (
             failed(
                 EventKind::FixWritten,
-                "exit status 2: agent crashed",
+                "exit status 70: injected failure",
                 usage(3_700, 6_000)
             ),
             (4, 2, 0)
@@ -640,17 +662,17 @@ fn fault_model_spot_checks() {
     );
     // A failed verify_fix charges no cost, only its duration.
     assert_eq!(
-        model(Fault::Verifier("verify_fix")).0,
+        model(&fault(Call::VerifyFix, 1, FaultKind::Fails)).0,
         failed(
             EventKind::FixVerified,
-            "exit status 1: runner crashed",
+            "exit status 70: injected failure",
             FULL
         )
     );
     // The 5th load is the diff in VerifyFix (review mutant B), the 7th the
     // diff for the pull request (review mutant A).
     assert_eq!(
-        model(Fault::Get(5)),
+        model(&fault(Call::Get, 5, unavailable_evidence)),
         (
             failed(
                 EventKind::FixVerified,
@@ -661,7 +683,11 @@ fn fault_model_spot_checks() {
         )
     );
     assert_eq!(
-        model(Fault::Tamper(7)),
+        model(&fault(
+            Call::Get,
+            7,
+            FaultKind::Evidence(EvidenceError::Corrupted)
+        )),
         (
             failed(
                 EventKind::PullRequestOpened,
@@ -671,33 +697,187 @@ fn fault_model_spot_checks() {
             (4, 3, 0)
         )
     );
-    // The clock goes back in the 6th measured job, write_fix.
+    // Readings are 1 000, 2 000, ... The 12th is write_fix's second.
     assert_eq!(
-        model(Fault::ClockBackwards(6)).0,
+        model(&fault(Call::Now, 12, FaultKind::Backwards)).0,
         failed(
             EventKind::FixWritten,
-            "the clock went backwards: 20000 ms, then 19999 ms",
+            "the clock went backwards: 11000 ms, then 10999 ms",
             usage(4_000, 5_000)
         )
     );
-    assert_eq!(model(Fault::Append(9)), (unavailable(), (4, 3, 1)));
-    assert_eq!(fault_points().len(), 46);
+    // The 3rd is write_reproduction's first: the job never runs.
+    assert_eq!(
+        model(&fault(Call::Now, 3, FaultKind::Backwards)),
+        (
+            failed(
+                EventKind::ReproductionWritten,
+                "the clock went backwards: 2000 ms, then 1999 ms",
+                usage(1_000, 1_000)
+            ),
+            (1, 0, 0)
+        )
+    );
+    assert_eq!(
+        model(&fault(
+            Call::Append,
+            9,
+            FaultKind::Store(StoreError::InvalidRunId)
+        )),
+        (
+            Err(DebugTicketError::Store(StoreError::InvalidRunId)),
+            (4, 3, 1)
+        )
+    );
 }
 
-/// A store failure leaves the log as the prefix of accepted events: the
-/// n-th append failing leaves n - 1 events, and a failed create none.
+/// The base request a fault hits: the request in which the base scenario
+/// made the faulted call.
+fn faulted_request(base: &Played, fault: &Fault) -> usize {
+    base.calls
+        .iter()
+        .filter(|(_, call)| *call == fault.call)
+        .nth(fault.occurrence - 1)
+        .map(|(request, _)| *request)
+        .expect("the fault hits a call the base made")
+}
+
+fn job_event(call: Call) -> Option<EventKind> {
+    match call {
+        Call::Triage => Some(EventKind::TriageFinished),
+        Call::WriteReproduction => Some(EventKind::ReproductionWritten),
+        Call::AnalyzeRootCause => Some(EventKind::RootCauseProposed),
+        Call::WriteFix => Some(EventKind::FixWritten),
+        Call::CheckReproduction => Some(EventKind::ReproductionChecked),
+        Call::VerifyCitations => Some(EventKind::CitationsChecked),
+        Call::VerifyFix => Some(EventKind::FixVerified),
+        Call::PostQuestions => Some(EventKind::QuestionsPosted),
+        Call::OpenPullRequest => Some(EventKind::PullRequestOpened),
+        Call::Create
+        | Call::Append
+        | Call::Load
+        | Call::Put
+        | Call::Get
+        | Call::Now
+        | Call::RunId => None,
+    }
+}
+
+/// Every fault scenario fails closed at the faulted call: the requests
+/// before it end as in the base scenario, and the faulted request ends with
+/// the outcome or error the fault calls for, never as if the call had
+/// succeeded. A job outcome may instead be `BudgetExceeded` when the
+/// failing job's usage crosses a limit (ADR-002 D1, step 3), or a
+/// backwards clock in the same job.
+#[test]
+fn every_fault_fails_closed() {
+    let scenarios = scenarios();
+    let mut checked = 0;
+    for scenario in scenarios.iter().filter(|s| s.fault.is_some()) {
+        let Some(base_name) = &scenario.base else {
+            continue;
+        };
+        let fault = scenario.fault.as_ref().expect("a fault scenario");
+        let base = scenarios
+            .iter()
+            .find(|s| &s.name == base_name)
+            .expect("the base exists");
+        let (base, got) = (play(base), play(scenario));
+        let k = faulted_request(&base, fault);
+        assert_eq!(got.results[..k], base.results[..k], "{}", scenario.name);
+        let result = &got.results[k];
+        let stage = result.as_ref().map(|report| report.run.stage());
+        // A backwards clock in the same job takes precedence over the job's
+        // own failure (ADR-004, D5); the base `clock-backwards` meets that.
+        let clock = |detail: &str| detail.starts_with("the clock went backwards: ");
+        let job_ended = |check: &dyn Fn(EventKind, &str) -> bool| match &stage {
+            Ok(Stage::Done(Outcome::JobFailed { awaiting, detail })) => {
+                check(*awaiting, detail) || clock(detail)
+            }
+            Ok(Stage::Done(Outcome::BudgetExceeded(_))) => true,
+            _ => false,
+        };
+        let ok = match (&fault.kind, fault.call) {
+            (FaultKind::Fails, call) => job_ended(&|awaiting, detail| {
+                Some(awaiting) == job_event(call) && detail == "exit status 70: injected failure"
+            }),
+            (FaultKind::Evidence(error), Call::Put) => job_ended(&|_, detail| {
+                detail.starts_with("storing the ") && detail.ends_with(&format!(" failed: {error}"))
+            }),
+            (FaultKind::Evidence(error), _) => job_ended(&|_, detail| {
+                detail.starts_with("loading the ") && detail.ends_with(&format!(" failed: {error}"))
+            }),
+            (FaultKind::Store(StoreError::UnknownRun | StoreError::InvalidRunId), Call::Load) => {
+                *result == Err(DebugTicketError::PreviousRun(PreviousRunError::Unknown))
+            }
+            (FaultKind::Store(error), _) => *result == Err(DebugTicketError::Store(error.clone())),
+            (FaultKind::Backwards, _) => job_ended(&|_, detail| clock(detail)),
+        };
+        assert!(ok, "{} ended as {result:?}", scenario.name);
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        scenarios.iter().filter(|s| s.base.is_some()).count()
+    );
+    println!("fault scenarios checked: {checked}");
+}
+
+/// A store failure leaves the log as the prefix of accepted events: when
+/// the faulted request is the scenario's last, the store holds exactly the
+/// runs and events the base had created and appended before the fault.
 #[test]
 fn every_event_store_fault_leaves_the_accepted_prefix() {
-    for scenario in scenarios() {
-        let played = play(&scenario);
-        if scenario.faults.event_create {
-            assert!(played.logs.is_empty(), "{}", scenario.name);
+    let scenarios = scenarios();
+    for scenario in scenarios.iter().filter(|s| s.base.is_some()) {
+        let fault = scenario.fault.as_ref().expect("a fault scenario");
+        if !matches!(fault.call, Call::Create | Call::Append | Call::Load) {
+            continue;
         }
-        if let Some(n) = scenario.faults.event_append {
-            let events = played.logs.first().map_or(0, |(_, log)| log.events.len());
-            assert_eq!(events, n - 1, "{}", scenario.name);
+        let base_scenario = scenarios
+            .iter()
+            .find(|s| Some(&s.name) == scenario.base.as_ref())
+            .expect("the base exists");
+        let base = play(base_scenario);
+        if faulted_request(&base, fault) + 1 != scenario.requests.len() {
+            continue;
         }
+        let position = base
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, call))| *call == fault.call)
+            .nth(fault.occurrence - 1)
+            .map(|(k, _)| k)
+            .expect("the faulted call");
+        let before = &base.calls[..position];
+        let count = |call| before.iter().filter(|(_, c)| *c == call).count();
+        let got = play(scenario);
+        let events: usize = got.logs.iter().map(|(_, log)| log.events.len()).sum();
+        assert_eq!(got.logs.len(), count(Call::Create), "{}", scenario.name);
+        assert_eq!(events, count(Call::Append), "{}", scenario.name);
     }
+}
+
+/// A store failure while loading the previous run fails closed (review
+/// mutant G): no re-run without the previous questions, no new run.
+#[test]
+fn previous_run_load_failure_fails_closed() {
+    let got = played("fault-rerun-after-questions-load-1-unavailable");
+    assert_eq!(got.results.len(), 2);
+    assert_eq!(
+        got.results[1],
+        Err(DebugTicketError::Store(StoreError::Unavailable {
+            detail: String::from(FAULT),
+        }))
+    );
+    assert_eq!(log_ids(&got), ["run-1"]);
+    assert_eq!(got.agent.len(), 1);
+    let unknown = played("fault-rerun-after-questions-load-1-unknown-run");
+    assert_eq!(
+        unknown.results[1],
+        Err(DebugTicketError::PreviousRun(PreviousRunError::Unknown))
+    );
 }
 
 /// Wherever the forge got a pull request, it carries exactly the diff and
@@ -789,10 +969,19 @@ fn delivered_end_to_end() {
 fn scenario_expectations_match() {
     let expectations = expectations();
     for scenario in scenarios() {
-        let want = expectations
-            .iter()
-            .find(|e| e.name == scenario.name)
-            .expect("an expectation per scenario");
+        let Some(want) = expectations.iter().find(|e| e.name == scenario.name) else {
+            // Fault scenarios of other bases are checked by
+            // `every_fault_fails_closed`.
+            assert!(
+                scenario
+                    .base
+                    .as_deref()
+                    .is_some_and(|base| base != "delivered"),
+                "{} has no expectation",
+                scenario.name
+            );
+            continue;
+        };
         let played = play(&scenario);
         let got: Vec<Want> = played
             .results
@@ -835,7 +1024,25 @@ fn expectations_and_scenarios_are_a_bijection() {
     let expected: Vec<&str> = wanted.iter().map(|e| e.name.as_str()).collect();
     let expected_unique: BTreeSet<&str> = expected.iter().copied().collect();
     assert_eq!(expected_unique.len(), expected.len(), "expectations repeat");
-    assert_eq!(unique, expected_unique);
+    // Every hand-written scenario and every fault scenario of the delivered
+    // run has an exact expectation; the other fault scenarios are checked
+    // by property.
+    let exact: BTreeSet<&str> = all
+        .iter()
+        .filter(|s| s.base.as_deref().is_none_or(|base| base == "delivered"))
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(exact, expected_unique);
+    let generated = all.iter().filter(|s| s.base.is_some()).count();
+    let bases: BTreeSet<&str> = all.iter().filter_map(|s| s.base.as_deref()).collect();
+    println!(
+        "app corpus: {} scenarios, {} hand-written, {} bases, {generated} fault scenarios, \
+         {} with exact expectations",
+        all.len(),
+        all.len() - generated,
+        bases.len(),
+        expected.len()
+    );
 }
 
 #[test]

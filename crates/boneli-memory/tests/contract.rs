@@ -4,8 +4,8 @@ use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{RootCauseReport, TriageReport, Written};
 use boneli_domain::{CitationStatus, CommitSha, FixChecks, TriageVerdict};
 use boneli_memory::{
-    AgentScript, ForgeScript, MemoryAgent, MemoryEventStore, MemoryEvidence, MemoryForge,
-    MemoryVerifier, Response, ScriptedFailure, SequentialIds, StepClock, VerifierScript,
+    AgentScript, ForgeScript, MemoryAgent, MemoryEventStore, MemoryForge, MemoryVerifier, Response,
+    ScriptedFailure, SequentialIds, StepClock, VerifierScript,
 };
 
 /// The status the silent-failure fixtures report.
@@ -81,13 +81,9 @@ fn in_memory_event_store_passes_contract() {
     assert_eq!(contract::event_store::run(MemoryEventStore::new), Ok(()));
 }
 
-#[test]
-fn in_memory_evidence_passes_contract() {
-    assert_eq!(
-        contract::evidence::run(MemoryEvidence::new, MemoryEvidence::tamper),
-        Ok(())
-    );
-}
+// The Evidence suite runs in the unit tests of `src/evidence.rs`: its
+// `tampered-content-rejected` clause writes behind the store, which only
+// test code inside the crate may do (ADR-004, D9).
 
 #[test]
 fn in_memory_clock_passes_contract() {
@@ -173,37 +169,4 @@ fn scripts_answer_in_order_then_fail_by_name() {
         checks.map_err(|f| f.detail().to_owned()),
         Err::<FixChecks, _>(String::from("no scripted response for verify_fix"))
     );
-}
-
-/// A blank status in a silent-failure fixture is a violation, not a pass:
-/// every detail contains the empty string.
-#[test]
-fn blank_fixture_status_is_a_violation() {
-    let blank = || ScriptedFailure {
-        status: String::from(" "),
-        ..silent()
-    };
-    let agent = contract::agent::run(|| SilentFailure {
-        status: String::new(),
-        ..silent_agent()
-    });
-    let verifier = contract::verifier::run(answering_verifier, || SilentFailure {
-        status: String::from("\u{200B}"),
-        ..silent_verifier()
-    });
-    let forge = contract::forge::run(MemoryForge::new, || SilentFailure {
-        adapter: MemoryForge::scripted(ForgeScript {
-            post_questions: vec![Response::Fail(blank())],
-            open_pull_request: vec![Response::Fail(blank())],
-        }),
-        status: String::from(" "),
-    });
-    for (port, result) in [("Agent", agent), ("Verifier", verifier), ("Forge", forge)] {
-        let violation = result.expect_err("a blank fixture status must not pass");
-        assert_eq!(
-            (violation.port, violation.clause),
-            (port, "silent-failure-detail")
-        );
-        assert!(violation.detail.contains("is blank"), "{violation:?}");
-    }
 }

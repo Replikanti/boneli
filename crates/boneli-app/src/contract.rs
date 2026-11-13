@@ -528,6 +528,7 @@ pub mod evidence {
         "round-trip",
         "content-addressed",
         "distinct-content",
+        "reference-from-content",
         "unknown-reference",
         "hostile-references",
         "tampered-content-rejected",
@@ -549,16 +550,18 @@ pub mod evidence {
         round_trip(&make())?;
         content_addressed(&make())?;
         distinct_content(&make())?;
+        reference_from_content(&make(), &make())?;
         unknown_reference(&make(), &make())?;
         hostile_references(&make())?;
         tampered_content_rejected(&make(), tamper)
     }
 
-    /// A reference names the bytes put under it: content changed behind the
-    /// store's back is `Corrupted` on `get`, never returned. This is what
-    /// makes the pull request carry the bytes the verifier checked (D9).
-    /// The replacement has the same length, so a length check is not
-    /// enough.
+    /// `get` re-derives the reference from the bytes it read, so content
+    /// changed behind the store's back is `Corrupted`, never returned. This
+    /// is what makes the pull request carry the bytes the verifier checked
+    /// (D9). The replacement has the same length, so a length check is not
+    /// enough. The hook must write only the stored blob, nothing the store
+    /// keeps beside it; the adapter's review checks that.
     fn tampered_content_rejected<E: Evidence>(
         store: &E,
         tamper: impl Fn(&E, &EvidenceRef, &[u8]),
@@ -657,6 +660,32 @@ pub mod evidence {
             })?;
             expect_content(store, clause, &l, left)?;
             expect_content(store, clause, &r, right)?;
+        }
+        Ok(())
+    }
+
+    /// A reference is a function of the bytes alone (ADR-004, D9): two
+    /// fresh stores that get the same blobs in opposite orders issue the
+    /// same reference for each. A counter, a timestamp or any other state
+    /// in the reference fails, so `get` can re-derive the reference from
+    /// the bytes it read, and no side record that a writer could rewrite
+    /// together with the blob decides what is genuine.
+    fn reference_from_content(left: &dyn Evidence, right: &dyn Evidence) -> Result<(), Violation> {
+        let clause = "reference-from-content";
+        let blobs: [&[u8]; 3] = [b"first", b"second", b""];
+        let mut forward = Vec::new();
+        for blob in blobs {
+            forward.push(put(left, clause, blob)?);
+        }
+        let mut backward = Vec::new();
+        for blob in blobs.iter().rev() {
+            backward.push(put(right, clause, blob)?);
+        }
+        backward.reverse();
+        for ((blob, l), r) in blobs.iter().zip(&forward).zip(&backward) {
+            ensure(l == r, PORT, clause, || {
+                format!("{blob:?} got {l:?} in one store and {r:?} in another")
+            })?;
         }
         Ok(())
     }

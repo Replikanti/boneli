@@ -37,10 +37,10 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `..` or a backslash). The scan is a best-effort first layer; the gate for address
    leaks is the two-process replay test in `boneli-replay-check`, which
    folds the domain's scenario corpus (ADR-002) and plays the app corpus,
-   `DebugTicket` on the in-memory adapters with a fault injected at every
-   port call (ADR-004), as decided at STOP 2 of #28. It covers run data;
-   contract-suite output is test output that cannot reach it (ADR-004,
-   D10). Dependency `cfg`s of core crates are also
+   `DebugTicket` on the in-memory adapters with every fault kind injected at
+   every port call (ADR-004), as decided at STOP 2 of #28, and compares
+   the violation of every contract mutant too (ADR-004, D10). Dependency
+   `cfg`s of core crates are also
    evaluated on `x86_64-unknown-none` (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,
    transitive ones included, needs a record with a reason in
@@ -68,7 +68,8 @@ harness. Rust workspace, hexagonal architecture. Public repository
 7. **Ports are synchronous traits** in `boneli-app` (std threads, no async
    runtime). Every port has an in-memory adapter in `boneli-memory` and a
    contract suite in `boneli_app::contract` that the real adapters reuse;
-   every clause has a mutant that fails it (ADR-004).
+   every clause has a mutant in `boneli-replay-check` that fails it
+   (ADR-004).
 
 ## Validation (CI equivalent — run before every commit)
 
