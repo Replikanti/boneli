@@ -135,8 +135,10 @@ pub trait Sandbox {
     ) -> Result<ExecResult, SandboxError>;
 
     /// The content of a file in the sandbox's workspace. The path is a
-    /// [`RelativePath`], so a path that leaves the workspace cannot be
-    /// asked for.
+    /// [`RelativePath`], so it cannot leave the workspace lexically (no
+    /// absolute path, no `..`). The rule does not resolve symlinks: the
+    /// adapter must not follow a symlink planted in the workspace out of
+    /// it (ADR-004, D11).
     fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError>;
 
     /// Destroys the sandbox; its handle is unknown from then on.

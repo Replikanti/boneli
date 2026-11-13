@@ -624,6 +624,65 @@ impl Sandbox for SandboxMutant {
     }
 }
 
+/// Pools workspaces: a destroyed sandbox's workspace goes, unwiped, to the
+/// next `create` under a fresh handle.
+struct PooledSandbox {
+    inner: MemorySandbox,
+    issued: Mutex<u64>,
+    /// Handed-out handles and the inner sandboxes behind them.
+    live: Mutex<Vec<(SandboxId, SandboxId)>>,
+    pool: Mutex<Vec<SandboxId>>,
+}
+
+impl PooledSandbox {
+    fn inner_of(&self, id: &SandboxId) -> Result<SandboxId, SandboxError> {
+        let live = self.live.lock().expect("not poisoned");
+        live.iter()
+            .find(|(outer, _)| outer == id)
+            .map(|(_, inner)| inner.clone())
+            .ok_or(SandboxError::UnknownSandbox)
+    }
+}
+
+impl Sandbox for PooledSandbox {
+    fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError> {
+        let pooled = self.pool.lock().expect("not poisoned").pop();
+        let inner = match pooled {
+            Some(inner) => inner,
+            None => self.inner.create(spec)?,
+        };
+        let mut issued = self.issued.lock().expect("not poisoned");
+        *issued += 1;
+        let outer = SandboxId::new(format!("pooled-{issued}"));
+        let mut live = self.live.lock().expect("not poisoned");
+        live.push((outer.clone(), inner));
+        Ok(outer)
+    }
+
+    fn exec(
+        &self,
+        id: &SandboxId,
+        command: &SandboxCommand,
+        limits: &Limits,
+    ) -> Result<ExecResult, SandboxError> {
+        self.inner.exec(&self.inner_of(id)?, command, limits)
+    }
+
+    fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError> {
+        self.inner.copy_out(&self.inner_of(id)?, path)
+    }
+
+    fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError> {
+        let inner = self.inner_of(id)?;
+        self.live
+            .lock()
+            .expect("not poisoned")
+            .retain(|(outer, _)| outer != id);
+        self.pool.lock().expect("not poisoned").push(inner);
+        Ok(())
+    }
+}
+
 fn sandbox_command(program: &str) -> SandboxCommand {
     SandboxCommand {
         program: String::from(program),
@@ -636,7 +695,8 @@ fn path(text: &str) -> RelativePath {
     RelativePath::parse(text).expect("a valid path")
 }
 
-fn sandbox_workspace(bug: SandboxBug) -> contract::sandbox::Workspace<SandboxMutant> {
+/// The sandbox fixture around `adapter`, built from the scripted programs.
+fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbox::Workspace<S> {
     let done = |code| ExecResult {
         status: ExitStatus::Code(code),
         stdout: vec![],
@@ -655,11 +715,7 @@ fn sandbox_workspace(bug: SandboxBug) -> contract::sandbox::Workspace<SandboxMut
         },
     ]);
     contract::sandbox::Workspace {
-        adapter: SandboxMutant {
-            bug,
-            inner,
-            issued: Mutex::new(Vec::new()),
-        },
+        adapter: make(inner),
         spec: SandboxSpec {
             phase: Phase::Verify,
             rootfs: RootfsRef::new(String::from("rootfs-1")),
@@ -675,6 +731,23 @@ fn sandbox_workspace(bug: SandboxBug) -> contract::sandbox::Workspace<SandboxMut
         exit: sandbox_command("exit-3"),
         status: ExitStatus::Code(3),
     }
+}
+
+fn sandbox_workspace(bug: SandboxBug) -> contract::sandbox::Workspace<SandboxMutant> {
+    sandbox_fixture(|inner| SandboxMutant {
+        bug,
+        inner,
+        issued: Mutex::new(Vec::new()),
+    })
+}
+
+fn pooled_workspace() -> contract::sandbox::Workspace<PooledSandbox> {
+    sandbox_fixture(|inner| PooledSandbox {
+        inner,
+        issued: Mutex::new(0),
+        live: Mutex::new(Vec::new()),
+        pool: Mutex::new(Vec::new()),
+    })
 }
 
 // ---------------------------------------------------------------------- Git
@@ -694,6 +767,14 @@ enum GitBug {
     InPlace,
     /// Every diff starts with a header, even an empty one.
     Header,
+    /// `apply` writes into a per-commit cache, so a later `fetch_base` of
+    /// the same base returns the applied tree.
+    PoisonsBase,
+    /// `diff` drops files the base does not have, as `git diff` does for
+    /// untracked files.
+    DropsNewFiles,
+    /// `diff` drops removed files.
+    DropsRemovals,
 }
 
 const HEADER: &[u8] = b"diff\n";
@@ -703,6 +784,8 @@ struct GitMutant {
     inner: MemoryGit,
     /// Checkouts that now read as another one (`InPlace`).
     moved: Mutex<Vec<(CheckoutId, CheckoutId)>>,
+    /// The last diff applied (`PoisonsBase`).
+    last_diff: Mutex<Option<Vec<u8>>>,
 }
 
 impl GitMutant {
@@ -718,6 +801,14 @@ impl GitMutant {
 
 impl Git for GitMutant {
     fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
+        if let GitBug::PoisonsBase = self.bug {
+            let fetched = self.inner.fetch_base(repo, base)?;
+            let last = self.last_diff.lock().expect("not poisoned").clone();
+            return match last {
+                Some(diff) => self.inner.apply(&fetched, &diff),
+                None => Ok(fetched),
+            };
+        }
         match (self.bug, self.inner.fetch_base(repo, base)) {
             (GitBug::UnknownIsOk, Err(GitError::UnknownCommit)) => {
                 Ok(CheckoutId::new(String::from("checkout-0")))
@@ -747,7 +838,24 @@ impl Git for GitMutant {
     }
 
     fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
-        let diff = self.inner.diff(&self.resolve(checkout), workspace)?;
+        let from = self.resolve(checkout);
+        let base = unpack_tree(&self.inner.snapshot(&from)?).unwrap_or_default();
+        let mut tree = unpack_tree(workspace).unwrap_or_default();
+        match self.bug {
+            GitBug::DropsNewFiles => tree.retain(|path, _| base.contains_key(path)),
+            GitBug::DropsRemovals => {
+                for (path, content) in base {
+                    tree.entry(path).or_insert(content);
+                }
+            }
+            _ => {}
+        }
+        let diff = match self.bug {
+            GitBug::DropsNewFiles | GitBug::DropsRemovals => {
+                self.inner.diff(&from, &pack_tree(&tree))?
+            }
+            _ => self.inner.diff(&from, workspace)?,
+        };
         Ok(match self.bug {
             GitBug::Header => [HEADER, &diff].concat(),
             _ => diff,
@@ -755,6 +863,7 @@ impl Git for GitMutant {
     }
 
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
+        *self.last_diff.lock().expect("not poisoned") = Some(diff.to_vec());
         let from = self.resolve(checkout);
         match self.bug {
             GitBug::IgnoresDiff => self.inner.apply(&from, &[]),
@@ -790,6 +899,7 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
             bug,
             inner,
             moved: Mutex::new(Vec::new()),
+            last_diff: Mutex::new(None),
         },
         repo,
         base,
@@ -801,9 +911,12 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
     }
 }
 
-fn git_edit(workspace: &[u8], file: &RelativePath, content: &[u8]) -> Vec<u8> {
+fn git_edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
     let mut tree = unpack_tree(workspace).unwrap_or_default();
-    tree.insert(file.clone(), content.to_vec());
+    match content {
+        Some(content) => tree.insert(file.clone(), content.to_vec()),
+        None => tree.remove(file),
+    };
     pack_tree(&tree)
 }
 
@@ -816,16 +929,28 @@ enum ImageBug {
     NewRootfsPerPull,
     /// A missing image pulls as an empty root filesystem.
     MissingIsEmpty,
+    /// Images resolve by name alone; digest and platform are ignored.
+    ByName,
+    /// Images resolve by name and digest; the platform is ignored.
+    IgnoresPlatform,
 }
 
 struct ImageMutant {
     bug: ImageBug,
     inner: MemoryImageStore,
     pulls: Mutex<u64>,
+    /// The images the inner store has.
+    known: Vec<ImageRef>,
 }
 
 impl ImageStore for ImageMutant {
     fn pull(&self, image: &ImageRef) -> Result<RootfsRef, ImageError> {
+        let resolved = self.known.iter().find(|k| match self.bug {
+            ImageBug::ByName => k.name == image.name,
+            ImageBug::IgnoresPlatform => k.name == image.name && k.digest == image.digest,
+            _ => *k == image,
+        });
+        let image = resolved.unwrap_or(image);
         match (self.bug, self.inner.pull(image)) {
             (ImageBug::NewRootfsPerPull, Ok(rootfs)) => {
                 let mut pulls = self.pulls.lock().expect("not poisoned");
@@ -840,23 +965,27 @@ impl ImageStore for ImageMutant {
     }
 }
 
-fn image_ref(name: &str) -> ImageRef {
+fn image_ref(name: &str, digest: &str, platform: &str) -> ImageRef {
     ImageRef {
         name: String::from(name),
-        digest: format!("sha256:{name}"),
-        platform: String::from("linux/amd64"),
+        digest: String::from(digest),
+        platform: String::from(platform),
     }
 }
 
 fn images(bug: ImageBug) -> contract::image::Images<ImageMutant> {
+    let present = image_ref("library/postgres", "sha256:aa", "linux/amd64");
     contract::image::Images {
         adapter: ImageMutant {
             bug,
-            inner: MemoryImageStore::new(vec![image_ref("library/postgres")]),
+            inner: MemoryImageStore::new(vec![present.clone()]),
             pulls: Mutex::new(0),
+            known: vec![present.clone()],
         },
-        present: image_ref("library/postgres"),
-        missing: image_ref("library/node"),
+        present,
+        missing: image_ref("library/node", "sha256:aa", "linux/amd64"),
+        other_digest: image_ref("library/postgres", "sha256:bb", "linux/amd64"),
+        other_platform: image_ref("library/postgres", "sha256:aa", "linux/arm64"),
     }
 }
 
@@ -871,12 +1000,17 @@ enum DataBug {
     SharedData,
     /// `remove_copy` does nothing.
     RemoveIgnored,
+    /// A copy is named after the run id's last `/` component, so `../x`
+    /// gets the copy of run `x`.
+    LastComponent,
 }
 
 struct DataMutant {
     bug: DataBug,
     inner: MemoryDataSnapshot,
     first: Mutex<Option<DatabaseCopy>>,
+    /// Copies by the last component of their run id (`LastComponent`).
+    named: Mutex<Vec<(String, DatabaseCopy)>>,
 }
 
 impl DataMutant {
@@ -900,6 +1034,21 @@ impl DataSnapshot for DataMutant {
     }
 
     fn copy(&self, snapshot: &SnapshotId, run: &RunId) -> Result<DatabaseCopy, DataError> {
+        if let DataBug::LastComponent = self.bug {
+            let last = run
+                .as_str()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let mut named = self.named.lock().expect("not poisoned");
+            if let Some((_, copy)) = named.iter().find(|(name, _)| *name == last) {
+                return Ok(copy.clone());
+            }
+            let copy = self.inner.copy(snapshot, run)?;
+            named.push((last, copy.clone()));
+            return Ok(copy);
+        }
         let copy = self.inner.copy(snapshot, run)?;
         let mut first = self.first.lock().expect("not poisoned");
         let first = first.get_or_insert_with(|| copy.clone()).clone();
@@ -943,6 +1092,7 @@ fn database(bug: DataBug) -> contract::data::Database<DataMutant> {
             bug,
             inner: MemoryDataSnapshot::new(vec![(source.clone(), vec![String::from("seed")])]),
             first: Mutex::new(None),
+            named: Mutex::new(Vec::new()),
         },
         sandbox: SandboxId::new(String::from("sandbox-1")),
         source,
@@ -1070,6 +1220,9 @@ pub fn mutants() -> Vec<Mutant> {
         sandbox("copy-out-after-write", SandboxBug::Truncates),
         sandbox("copy-out-missing", SandboxBug::MissingIsEmpty),
         sandbox("isolated", SandboxBug::SharedWorkspace),
+        mutant("Sandbox", "fresh-after-destroy", || {
+            contract::sandbox::run(pooled_workspace)
+        }),
         sandbox("exit-status", SandboxBug::ReportsSuccess),
         sandbox("destroyed-is-unknown", SandboxBug::DestroyIgnored),
         git("read-at-base", GitBug::Truncates),
@@ -1077,12 +1230,18 @@ pub fn mutants() -> Vec<Mutant> {
         git("unknown-commit", GitBug::UnknownIsOk),
         git("apply-then-read", GitBug::IgnoresDiff),
         git("apply-leaves-base", GitBug::InPlace),
+        git("base-refetch-unchanged", GitBug::PoisonsBase),
         git("unchanged-snapshot-empty-diff", GitBug::Header),
+        git("added-file", GitBug::DropsNewFiles),
+        git("removed-file", GitBug::DropsRemovals),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
+        image("digest-pinned", ImageBug::ByName),
+        image("platform-pinned", ImageBug::IgnoresPlatform),
         data("distinct-copies", DataBug::SameCopy),
         data("copies-independent", DataBug::SharedData),
         data("removed-copy-unknown", DataBug::RemoveIgnored),
+        data("hostile-run-ids", DataBug::LastComponent),
     ]);
     for &operation in contract::agent::OPERATIONS {
         all.push(silent_mutant("Agent", operation, move || {

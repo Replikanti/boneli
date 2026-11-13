@@ -249,7 +249,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 | `Broker` | | SQL, Sentry, logs |
 | `Clock`, `Ids` | system | |
 
-The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates. Paths that ports take are `RelativePath`s, which follow the citation path rule of the domain through one shared function (ADR-004, D1, D11).
+The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates. Paths that ports take are `RelativePath`s, which follow the citation path rule of the domain through one shared function (ADR-004, D1, D11). The rule is lexical: refusing symlinks that leave a workspace and paths into `.git` is the real adapters' job, each with its own contract clauses (ADR-004, D11).
 
 **Driving adapters:** CLI, webhooks, control plane connection, bench runner.
 

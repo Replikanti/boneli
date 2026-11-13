@@ -55,8 +55,9 @@ in `boneli-app`, no `Send + Sync` supertraits.
   `boneli_domain::gate::path_problem`, extracted from `citation_problem`
   without a change in behavior (the citation tests and the 63 domain
   scenarios pin it); `boneli_app::RelativePath::parse` delegates to it, and
-  `Sandbox::copy_out` and `Git::read` take a `RelativePath`, so a hostile
-  path is refused by the type before it reaches a port (D11).
+  `Sandbox::copy_out` and `Git::read` take a `RelativePath`, so a path that
+  is hostile as written is refused by the type before it reaches a port.
+  The rule is lexical; what it does not stop is in D11.
 - `Clock::now_ms` returns milliseconds since an origin the adapter chooses
   and never decreases; `Ids::run_id` returns a run id that is not blank and
   never repeats. The type is not called `Instant`, which the core token scan
@@ -113,8 +114,8 @@ in `boneli-app`, no `Send + Sync` supertraits.
   3 verifier and 2 forge operations) has one mutant per operation that
   breaks only that operation, and its violation detail must start with that
   operation's name, so each sub-check is shown to bite, not only the first.
-  `mutant_table_covers_every_clause` prints the counts: 40 clauses, 46
-  mutant cases (part 1: 23 and 29; part 2 adds 17 clauses with one mutant
+  `mutant_table_covers_every_clause` prints the counts: 47 clauses, 53
+  mutant cases (part 1: 23 and 29; part 2 adds 24 clauses with one mutant
   each). Without them a suite could pass every adapter vacuously.
   The table lives in the replay check, not in `boneli-memory`'s tests, so
   the replay binary can render every mutant's violation (D10).
@@ -520,22 +521,42 @@ The clauses:
 
 | Port | Clauses |
 | --- | --- |
-| `Sandbox` | `distinct-ids`, `copy-out-after-write`, `copy-out-missing`, `isolated`, `exit-status`, `destroyed-is-unknown` |
-| `Git` | `read-at-base`, `read-missing`, `unknown-commit`, `apply-then-read`, `apply-leaves-base`, `unchanged-snapshot-empty-diff` |
-| `ImageStore` | `pull-idempotent`, `missing-image` |
-| `DataSnapshot` | `distinct-copies`, `copies-independent`, `removed-copy-unknown` |
+| `Sandbox` | `distinct-ids`, `copy-out-after-write`, `copy-out-missing`, `isolated`, `fresh-after-destroy`, `exit-status`, `destroyed-is-unknown` |
+| `Git` | `read-at-base`, `read-missing`, `unknown-commit`, `apply-then-read`, `apply-leaves-base`, `base-refetch-unchanged`, `unchanged-snapshot-empty-diff`, `added-file`, `removed-file` |
+| `ImageStore` | `pull-idempotent`, `missing-image`, `digest-pinned`, `platform-pinned` |
+| `DataSnapshot` | `distinct-copies`, `copies-independent`, `removed-copy-unknown`, `hostile-run-ids` |
 
 - **`distinct-ids`** creates two sandboxes, destroys the first and creates a
   third, and requires three different handles: a handle issued again after
   a destroy would let a stale handle reach the newer sandbox.
+  **`fresh-after-destroy`**: a sandbox created after another wrote a file
+  and was destroyed does not see that file. A pooled adapter that hands a
+  destroyed workspace on unwiped passed every other clause, and it would
+  carry the agent sandbox's files into the verify sandbox (invariant 6).
 - **`apply-leaves-base`**: the verify sandbox starts from the base SHA and
   the diff only (invariant 6), so applying a diff must not change the base
-  checkout. **`unchanged-snapshot-empty-diff`**: the diff of the
-  checkout's own snapshot is empty, so an unchanged workspace never yields
-  a pull request.
+  checkout. **`base-refetch-unchanged`**: the base fetched again after an
+  apply is still the base; an adapter that cached checkouts per repository
+  and commit and let `apply` write into that cache passed
+  `apply-leaves-base`, which only rereads the old handle.
+  **`unchanged-snapshot-empty-diff`**: the diff of the checkout's own
+  snapshot is empty, so an unchanged workspace never yields a pull request.
+  **`added-file`** and **`removed-file`**: a file the base does not have
+  reaches the diff, and so does a removed one. Reproduction tests are
+  usually new files, and a diff of tracked files only (`git diff` without
+  the untracked files) passed every other clause with a 0-byte diff.
+- **`digest-pinned`** and **`platform-pinned`**: an image that differs from
+  a present one in its digest only, or its platform only, is `NotFound`,
+  also after the present one was pulled. A store that resolved by name
+  alone passed the first two clauses, because the fixture's missing image
+  differed by name.
 - **`copies-independent`** is #31's acceptance as a clause: after a change
   in one copy, neither a second copy nor a copy made after the change shows
   it, so neither the other copy nor the snapshot changed.
+  **`hostile-run-ids`**: #31 turns the run id into a database name, so
+  the hostile names of the `EventStore` clause (D2) each get a copy no
+  other run has, whose change none of the victim copies (`x`, `a`, `b`,
+  `abs`) shows, or are refused with `DataError::InvalidRunId`.
 
 The fixtures carry what only the adapter's own test knows, as in part 1:
 
@@ -547,11 +568,15 @@ The fixtures carry what only the adapter's own test knows, as in part 1:
   code would do; the job fixtures of part 1 use `exit status 3` too.
 - `Git`: a repository with a base commit, a file and its content there, a
   missing path, a commit the repository does not have and new content for
-  the file, plus an `edit` hook that sets a file in a workspace of the
-  adapter's snapshot format. The suite rejects new content equal to the old
-  (an adapter that ignores diffs would pass) and an unknown commit equal to
+  the file, plus an `edit` hook that sets or removes a file in a workspace
+  of the adapter's snapshot format. `added-file` writes the new content to
+  the missing path. The suite rejects new content equal to the old (an
+  adapter that ignores diffs would pass) and an unknown commit equal to
   the base.
-- `ImageStore`: an image the registry has and one it does not.
+- `ImageStore`: an image the registry has, one it does not, and the
+  present image with another digest and with another platform. The suite
+  rejects a variant that differs in more than its one field, which would
+  test the name again.
 - `DataSnapshot`: a sandbox, a source, and a `Probe` that makes a change in
   a copy and looks for it (for Postgres, SQL through the sandbox). The
   suite requires that the probe sees the change in the copy it made it in,
@@ -570,6 +595,29 @@ workspace from a sandbox cannot name a path outside the tree.
 `MemoryImageStore` holds a fixed set of images, and `MemoryDataSnapshot`
 databases as lists of rows, with `insert` and `rows` on a copy for the
 probe.
+
+**What the path rule does not stop.** `RelativePath` is lexical: it
+refuses absolute paths, `..`, backslashes and NUL as written, but it does
+not resolve symlinks, and it accepts `.git/config` or
+`.git/hooks/post-checkout`. A symlink the agent plants in its workspace
+(`out/result.txt` pointing at a host file) or a path into the repository's
+own metadata therefore leaves the tree by a route the citation precheck
+does not see. A core type cannot close this, because only the adapter
+touches a filesystem; the real adapters close it with contract clauses of
+their own, added under the extension rule:
+
+- #8 (`boneli-sandbox-linux`) shows that `copy_out` reads beneath the
+  workspace root and follows no symlink, with a fixture command that plants
+  a symlink escaping the workspace and a clause that requires the copy-out
+  through it to fail.
+- #30 (`boneli-git-cli`) shows that a workspace's `.git` cannot steer the
+  host git: a workspace that carries a `.git/config` or a hook does not
+  change the configuration or run the hook when `diff` reads it.
+
+**What the ports do not carry yet.** `Git::snapshot` produces a workspace
+and `Git::diff` takes one, but the `Sandbox` port has no operation to copy
+a workspace in or export one. #8 adds them under the extension rule, as it
+does the pods and phases of its own scope.
 
 Rejected: moving each port definition into its adapter issue, where a real
 implementation would check its shape. The issue asks for every port, its

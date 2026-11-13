@@ -633,6 +633,7 @@ pub fn render_app_errors() -> String {
     let data = [
         DataError::UnknownSnapshot,
         DataError::UnknownCopy,
+        DataError::InvalidRunId,
         DataError::Failed {
             detail: unavailable(),
         },

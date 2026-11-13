@@ -258,10 +258,13 @@ pub fn repository() -> contract::git::Repository<MemoryGit> {
     }
 }
 
-/// Sets a file in a workspace of `MemoryGit`'s snapshot format.
-pub fn edit(workspace: &[u8], file: &RelativePath, content: &[u8]) -> Vec<u8> {
+/// Sets or removes a file in a workspace of `MemoryGit`'s snapshot format.
+pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
     let mut tree = unpack_tree(workspace).expect("the adapter's own snapshot");
-    tree.insert(file.clone(), content.to_vec());
+    match content {
+        Some(content) => tree.insert(file.clone(), content.to_vec()),
+        None => tree.remove(file),
+    };
     pack_tree(&tree)
 }
 
@@ -270,20 +273,23 @@ fn in_memory_git_passes_contract() {
     assert_eq!(contract::git::run(repository, edit), Ok(()));
 }
 
-fn image(name: &str) -> ImageRef {
+fn image(name: &str, digest: &str, platform: &str) -> ImageRef {
     ImageRef {
         name: String::from(name),
-        digest: format!("sha256:{name}"),
-        platform: String::from("linux/amd64"),
+        digest: String::from(digest),
+        platform: String::from(platform),
     }
 }
 
-/// A store with one image.
+/// A store with one image, and refs that differ from it in one field.
 pub fn images() -> contract::image::Images<MemoryImageStore> {
+    let present = image("library/postgres", "sha256:aa", "linux/amd64");
     contract::image::Images {
-        adapter: MemoryImageStore::new(vec![image("library/postgres")]),
-        present: image("library/postgres"),
-        missing: image("library/node"),
+        adapter: MemoryImageStore::new(vec![present.clone()]),
+        present,
+        missing: image("library/node", "sha256:aa", "linux/amd64"),
+        other_digest: image("library/postgres", "sha256:bb", "linux/amd64"),
+        other_platform: image("library/postgres", "sha256:aa", "linux/arm64"),
     }
 }
 
@@ -360,6 +366,56 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(clause(contract::git::run(own_base, edit)), "unknown-commit");
+    let same_digest = || contract::image::Images {
+        other_digest: images().present,
+        ..images()
+    };
+    assert_eq!(clause(contract::image::run(same_digest)), "digest-pinned");
+    let other_name = || {
+        let i = images();
+        contract::image::Images {
+            other_platform: ImageRef {
+                name: String::from("library/node"),
+                ..i.other_platform.clone()
+            },
+            ..i
+        }
+    };
+    assert_eq!(clause(contract::image::run(other_name)), "platform-pinned");
+}
+
+/// The four infra ports stay object-safe: roots hold them as `&dyn`
+/// (ADR-004, D1), and a generic method would break that only when a
+/// consumer lands.
+#[test]
+fn infra_ports_are_object_safe() {
+    use boneli_app::{DataSnapshot, Git, ImageStore, Sandbox};
+    let sandbox = workspace().adapter;
+    let git = repository().adapter;
+    let images = images().adapter;
+    let data = database().adapter;
+    let ports: (&dyn Sandbox, &dyn Git, &dyn ImageStore, &dyn DataSnapshot) =
+        (&sandbox, &git, &images, &data);
+    let spec = workspace().spec;
+    assert!(ports.0.create(&spec).is_ok());
+    assert_eq!(
+        ports
+            .1
+            .fetch_base(&repository().repo, &repository().unknown),
+        Err(boneli_app::GitError::UnknownCommit)
+    );
+    assert_eq!(
+        ports
+            .2
+            .pull(&image("library/node", "sha256:aa", "linux/amd64")),
+        Err(boneli_app::ImageError::NotFound)
+    );
+    assert_eq!(
+        ports
+            .3
+            .remove_copy(&DatabaseCopy::new(String::from("copy-9"))),
+        Err(boneli_app::DataError::UnknownCopy)
+    );
 }
 
 /// The in-memory sandbox answers an unknown program as a shell does, and a
@@ -390,6 +446,17 @@ fn unknown_program_and_hostile_workspace() {
     }
     assert!(matches!(
         r.adapter.diff(&base, &hostile),
+        Err(boneli_app::GitError::Failed { .. })
+    ));
+    // A path given twice is an error, not a silent overwrite.
+    let mut twice = Vec::new();
+    for field in [&b"src/lib.rs"[..], b"one", b"src/lib.rs", b"two"] {
+        twice.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        twice.extend_from_slice(field);
+    }
+    assert!(unpack_tree(&twice).is_err());
+    assert!(matches!(
+        r.adapter.diff(&base, &twice),
         Err(boneli_app::GitError::Failed { .. })
     ));
     // A length past the end is an error, not a panic.

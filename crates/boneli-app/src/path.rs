@@ -4,7 +4,13 @@
 //! the citation path rule of ADR-002 (D2) through the one shared function,
 //! `boneli_domain::gate::path_problem`. So a sandbox or git path cannot
 //! leave the tree by a route the citation precheck would reject, and a
-//! hostile path is refused by the type before it reaches a port.
+//! path that is hostile as written (absolute, `..`, backslash, NUL) is
+//! refused by the type before it reaches a port.
+//!
+//! The rule is lexical. It does not resolve symlinks, and it accepts
+//! `.git/config`: a symlink planted in a workspace, or a path into the
+//! repository's own metadata, is the real adapter's to refuse (ADR-004,
+//! D11).
 
 use alloc::string::String;
 

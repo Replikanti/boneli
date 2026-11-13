@@ -73,6 +73,9 @@ pub enum DataError {
     UnknownSnapshot,
     /// No copy with this handle exists: never made, or removed.
     UnknownCopy,
+    /// The adapter cannot make a copy for this run id (for example, a
+    /// database name it cannot form from it).
+    InvalidRunId,
     /// Loading, copying or removing failed.
     Failed {
         /// What went wrong, as the adapter reports it.
@@ -85,6 +88,9 @@ impl fmt::Display for DataError {
         match self {
             DataError::UnknownSnapshot => f.write_str("unknown snapshot"),
             DataError::UnknownCopy => f.write_str("unknown database copy"),
+            DataError::InvalidRunId => {
+                f.write_str("the adapter cannot make a copy for this run id")
+            }
             DataError::Failed { detail } => write!(f, "the data snapshot failed: {detail}"),
         }
     }

@@ -1047,6 +1047,7 @@ pub mod sandbox {
         "copy-out-after-write",
         "copy-out-missing",
         "isolated",
+        "fresh-after-destroy",
         "exit-status",
         "destroyed-is-unknown",
     ];
@@ -1082,6 +1083,7 @@ pub mod sandbox {
         copy_out_after_write(&make())?;
         copy_out_missing(&make())?;
         isolated(&make())?;
+        fresh_after_destroy(&make())?;
         exit_status(&make())?;
         destroyed_is_unknown(&make())
     }
@@ -1185,6 +1187,28 @@ pub mod sandbox {
         expect_written(w, clause, &a)
     }
 
+    /// A sandbox created after another was destroyed starts empty: a
+    /// pooled adapter that hands the destroyed workspace on unwiped would
+    /// let the agent's files reach the verify sandbox (invariant 6).
+    fn fresh_after_destroy<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "fresh-after-destroy";
+        let a = create(w, clause)?;
+        exec(w, clause, &a, &w.write)?;
+        expect_written(w, clause, &a)?;
+        w.adapter
+            .destroy(&a)
+            .map_err(|error| violation(PORT, clause, format!("destroy failed: {error:?}")))?;
+        let b = create(w, clause)?;
+        let got = w.adapter.copy_out(&b, &w.path);
+        ensure(got == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} from {b:?}, created after {a:?} wrote it and was destroyed, \
+                 gave {got:?}, expected NotFound",
+                w.path
+            )
+        })
+    }
+
     fn exit_status<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "exit-status";
         if w.status == ExitStatus::Code(0) {
@@ -1247,7 +1271,10 @@ pub mod git {
         "unknown-commit",
         "apply-then-read",
         "apply-leaves-base",
+        "base-refetch-unchanged",
         "unchanged-snapshot-empty-diff",
+        "added-file",
+        "removed-file",
     ];
 
     /// An adapter with a repository whose content at the base commit the
@@ -1278,18 +1305,21 @@ pub mod git {
     ///
     /// `edit` takes a workspace in the adapter's snapshot format, a path
     /// and content, and returns the workspace with that file set to that
-    /// content. The snapshot format belongs to the adapter (#30), so only
-    /// its own test knows how.
+    /// content, or removed for `None`. The snapshot format belongs to the
+    /// adapter (#30), so only its own test knows how.
     pub fn run<G: Git>(
         make: impl Fn() -> Repository<G>,
-        edit: impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+        edit: impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         read_at_base(&make())?;
         read_missing(&make())?;
         unknown_commit(&make())?;
         apply_then_read(&make(), &edit)?;
         apply_leaves_base(&make(), &edit)?;
-        unchanged_snapshot_empty_diff(&make())
+        base_refetch_unchanged(&make(), &edit)?;
+        unchanged_snapshot_empty_diff(&make())?;
+        added_file(&make(), &edit)?;
+        removed_file(&make(), &edit)
     }
 
     fn call<T>(
@@ -1317,12 +1347,27 @@ pub mod git {
         })
     }
 
+    /// Fetches the base, applies `change` to its snapshot, diffs and
+    /// applies the diff; returns the base checkout and the applied one.
+    fn changed<G: Git>(
+        r: &Repository<G>,
+        clause: &'static str,
+        change: impl Fn(&[u8]) -> Vec<u8>,
+    ) -> Result<(CheckoutId, CheckoutId), Violation> {
+        let base = checkout(r, clause)?;
+        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
+        let workspace = change(&snapshot);
+        let diff = call(clause, "diff", r.adapter.diff(&base, &workspace))?;
+        let after = call(clause, "apply", r.adapter.apply(&base, &diff))?;
+        Ok((base, after))
+    }
+
     /// Fetches the base, edits the path in its snapshot, diffs and applies
     /// the diff; returns the base checkout and the applied one.
     fn applied<G: Git>(
         r: &Repository<G>,
         clause: &'static str,
-        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(CheckoutId, CheckoutId), Violation> {
         if r.edited == r.content {
             return Err(violation(
@@ -1334,12 +1379,9 @@ pub mod git {
                 ),
             ));
         }
-        let base = checkout(r, clause)?;
-        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
-        let workspace = edit(&snapshot, &r.path, &r.edited);
-        let diff = call(clause, "diff", r.adapter.diff(&base, &workspace))?;
-        let after = call(clause, "apply", r.adapter.apply(&base, &diff))?;
-        Ok((base, after))
+        changed(r, clause, |snapshot| {
+            edit(snapshot, &r.path, Some(&r.edited))
+        })
     }
 
     fn read_at_base<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
@@ -1375,7 +1417,7 @@ pub mod git {
 
     fn apply_then_read<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "apply-then-read";
         let (_, after) = applied(r, clause, edit)?;
@@ -1386,11 +1428,48 @@ pub mod git {
     /// (invariant 6), so applying a diff must not change the base.
     fn apply_leaves_base<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "apply-leaves-base";
         let (base, _) = applied(r, clause, edit)?;
         expect_read(r, clause, &base, &r.path, Some(&r.content))
+    }
+
+    /// The base fetched again after an apply is still the base: an adapter
+    /// that caches checkouts per repository and commit must not let an
+    /// apply write into the cache.
+    fn base_refetch_unchanged<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "base-refetch-unchanged";
+        applied(r, clause, edit)?;
+        let again = checkout(r, clause)?;
+        expect_read(r, clause, &again, &r.path, Some(&r.content))
+    }
+
+    /// A file the base does not have reaches the diff: reproduction tests
+    /// are usually new files, and a diff of tracked files only would drop
+    /// them.
+    fn added_file<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "added-file";
+        let (_, after) = changed(r, clause, |snapshot| {
+            edit(snapshot, &r.missing, Some(&r.edited))
+        })?;
+        expect_read(r, clause, &after, &r.missing, Some(&r.edited))
+    }
+
+    /// A file removed from the workspace is removed by the diff.
+    fn removed_file<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "removed-file";
+        let (_, after) = changed(r, clause, |snapshot| edit(snapshot, &r.path, None))?;
+        expect_read(r, clause, &after, &r.path, None)
     }
 
     fn unchanged_snapshot_empty_diff<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
@@ -1415,7 +1494,12 @@ pub mod image {
     const PORT: &str = "ImageStore";
 
     /// The clauses, in the order [`run`] checks them.
-    pub const CLAUSES: &[&str] = &["pull-idempotent", "missing-image"];
+    pub const CLAUSES: &[&str] = &[
+        "pull-idempotent",
+        "missing-image",
+        "digest-pinned",
+        "platform-pinned",
+    ];
 
     /// An adapter and the images its own test knows.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1426,12 +1510,69 @@ pub mod image {
         pub present: ImageRef,
         /// An image the registry does not have.
         pub missing: ImageRef,
+        /// [`Images::present`] with a digest the registry does not have.
+        pub other_digest: ImageRef,
+        /// [`Images::present`] with a platform its index does not list.
+        pub other_platform: ImageRef,
     }
 
     /// Checks every clause; each clause gets a fresh adapter from `make`.
     pub fn run<I: ImageStore>(make: impl Fn() -> Images<I>) -> Result<(), Violation> {
         pull_idempotent(&make())?;
-        missing_image(&make())
+        missing_image(&make())?;
+        digest_pinned(&make())?;
+        platform_pinned(&make())
+    }
+
+    /// A pull of `variant`, which differs from the present image in one
+    /// field only, is `NotFound`, even after the present image was pulled.
+    fn pinned<I: ImageStore>(
+        i: &Images<I>,
+        clause: &'static str,
+        variant: &ImageRef,
+        same_but: bool,
+        field: &str,
+    ) -> Result<(), Violation> {
+        if !same_but {
+            return Err(violation(
+                PORT,
+                clause,
+                format!(
+                    "the fixture's {variant:?} must equal the present image in every field but \
+                     the {field}"
+                ),
+            ));
+        }
+        i.adapter.pull(&i.present).map_err(|error| {
+            violation(
+                PORT,
+                clause,
+                format!("pull of {:?} failed: {error:?}", i.present),
+            )
+        })?;
+        let got = i.adapter.pull(variant);
+        ensure(got == Err(ImageError::NotFound), PORT, clause, || {
+            format!(
+                "pull of {variant:?}, which differs from a present image in its {field} only, \
+                 gave {got:?}, expected NotFound"
+            )
+        })
+    }
+
+    /// The digest pins the content: a store that resolves by name alone
+    /// would hand out whatever it pulled under that name.
+    fn digest_pinned<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let p = &i.present;
+        let o = &i.other_digest;
+        let same_but = o.name == p.name && o.platform == p.platform && o.digest != p.digest;
+        pinned(i, "digest-pinned", o, same_but, "digest")
+    }
+
+    fn platform_pinned<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let p = &i.present;
+        let o = &i.other_platform;
+        let same_but = o.name == p.name && o.digest == p.digest && o.platform != p.platform;
+        pinned(i, "platform-pinned", o, same_but, "platform")
     }
 
     fn pull_idempotent<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
@@ -1477,6 +1618,7 @@ pub mod data {
         "distinct-copies",
         "copies-independent",
         "removed-copy-unknown",
+        "hostile-run-ids",
     ];
 
     /// An adapter and a source it can load into a sandbox, which only its
@@ -1509,7 +1651,8 @@ pub mod data {
     ) -> Result<(), Violation> {
         distinct_copies(&make())?;
         copies_independent(&make(), probe)?;
-        removed_copy_unknown(&make())
+        removed_copy_unknown(&make())?;
+        hostile_run_ids(&make(), probe)
     }
 
     fn call<T>(
@@ -1580,6 +1723,67 @@ pub mod data {
         unchanged(&b)?;
         let c = copy(d, clause, &snapshot, "contract-c")?;
         unchanged(&c)
+    }
+
+    /// Victims named after the last components of the hostile names, so an
+    /// adapter that names a copy after the run's last path component hands
+    /// `../x` the copy of run `x`.
+    const VICTIMS: [&str; 4] = ["x", "a", "b", "abs"];
+
+    /// The real adapter turns the run id into a database name (#31). Every
+    /// hostile id of the `EventStore` clause is either refused with
+    /// `InvalidRunId` or gets a copy of its own: a handle no other run has,
+    /// whose change no victim shows.
+    fn hostile_run_ids<D: DataSnapshot>(
+        d: &Database<D>,
+        probe: &impl Probe<D>,
+    ) -> Result<(), Violation> {
+        let clause = "hostile-run-ids";
+        let snapshot = load(d, clause)?;
+        let mut victims = Vec::new();
+        for victim in VICTIMS {
+            victims.push(copy(d, clause, &snapshot, victim)?);
+        }
+        let mut seen: Vec<DatabaseCopy> = victims.clone();
+        for name in hostile_names() {
+            let run = RunId::new(name.clone());
+            match d.adapter.copy(&snapshot, &run) {
+                Ok(hostile) => {
+                    ensure(!seen.contains(&hostile), PORT, clause, || {
+                        format!("run {name:?} got {hostile:?}, which another run already has")
+                    })?;
+                    probe.change(&d.adapter, &hostile).map_err(|error| {
+                        violation(
+                            PORT,
+                            clause,
+                            format!("changing {hostile:?} failed: {error}"),
+                        )
+                    })?;
+                    seen.push(hostile);
+                }
+                Err(DataError::InvalidRunId) => {}
+                Err(error) => {
+                    return Err(violation(
+                        PORT,
+                        clause,
+                        format!(
+                            "copy for run {name:?} gave {error:?}, expected Ok or InvalidRunId"
+                        ),
+                    ));
+                }
+            }
+        }
+        // Checked after every write, so a later copy that lands on a victim
+        // is caught.
+        for victim in &victims {
+            let shown = probe.changed(&d.adapter, victim).map_err(|error| {
+                violation(PORT, clause, format!("probing {victim:?} failed: {error}"))
+            })?;
+            ensure(!shown, PORT, clause, || {
+                format!("{victim:?} shows a change made in a copy for a hostile run id")
+            })?;
+        }
+        Ok(())
     }
 
     fn removed_copy_unknown<D: DataSnapshot>(d: &Database<D>) -> Result<(), Violation> {
