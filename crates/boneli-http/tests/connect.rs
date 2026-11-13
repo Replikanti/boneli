@@ -96,6 +96,7 @@ fn connect_tunnel_relays_and_keeps_early_bytes() {
     drop(upstream_far);
     let mut rest = Vec::new();
     client.read_to_end(&mut rest).expect("tunnel closed");
+    assert!(rest.is_empty(), "nothing after the tunnel: {rest:?}");
     handle.join().expect("no panic").expect("served");
 }
 
@@ -228,6 +229,39 @@ fn client_tunnel_first_request_refuses_early_response() {
         matches!(proxy.read(&mut byte), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
         "the request was not sent"
     );
+}
+
+/// A stream with all input loaded up front cannot tell what arrived after
+/// a response.
+impl IdleCheck for MemStream {
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn client_blind_tunnel_first_request_refuses_early_response() {
+    // The same unsolicited response over a stream that cannot tell: the
+    // tunnel still knows its early bytes, and they are input that arrived.
+    let (stream, written) = MemStream::new(
+        b"HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL",
+        4096,
+    );
+    let mut tunnel = connect_tunnel(stream, "origin.example", 80, &wide()).expect("tunnel");
+    assert_eq!(tunnel.early().len(), 42);
+    assert_eq!(
+        tunnel.get_mut().is_idle().expect("check"),
+        None,
+        "the stream cannot tell"
+    );
+    let sent = written.borrow().len();
+    let mut conn = Connection::new(tunnel, "origin.example", wide()).expect("connection");
+    assert!(matches!(
+        conn.request(&get_root(), RequestBody::None),
+        Err(Error::Malformed(_))
+    ));
+    assert!(!conn.is_reusable());
+    assert_eq!(written.borrow().len(), sent, "the request was not sent");
 }
 
 #[test]

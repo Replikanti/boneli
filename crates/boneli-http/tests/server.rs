@@ -37,10 +37,11 @@ fn read_head(stream: &mut UnixStream) -> String {
     String::from_utf8_lossy(&got).into_owned()
 }
 
-/// Asserts that the peer closes `stream`: end of file, or a reset when
-/// the peer closed with input of ours still unread (a Unix socket reports
-/// that as `ConnectionReset`; the trickle tests race with it).
-fn assert_closed(stream: &mut UnixStream) {
+/// Asserts that the peer writes exactly `expected` more and closes
+/// `stream`: end of file, or a reset when the peer closed with input of
+/// ours still unread (a Unix socket reports that as `ConnectionReset` after
+/// the queued bytes; the trickle tests race with it).
+fn assert_closed(stream: &mut UnixStream, expected: &[u8]) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
@@ -50,6 +51,11 @@ fn assert_closed(stream: &mut UnixStream) {
         Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
         Err(e) => panic!("closed: {e:?}"),
     }
+    assert_eq!(
+        String::from_utf8_lossy(&rest),
+        String::from_utf8_lossy(expected),
+        "bytes before the close"
+    );
 }
 
 fn timeouts(idle: Duration, request: Duration) -> ServerLimits {
@@ -441,7 +447,8 @@ fn handler_panic_releases_slot() {
     first
         .write_all(b"GET /panic HTTP/1.1\r\nHost: a\r\n\r\n")
         .expect("send");
-    assert_closed(&mut first);
+    // A panic is not an answer: the connection closes without a byte.
+    assert_closed(&mut first, b"");
 
     let mut second = UnixStream::connect(&socket.0).expect("connect");
     second
@@ -527,7 +534,7 @@ fn request_timeout_bounds_trickled_head() {
     let elapsed = start.elapsed();
     assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
-    assert_closed(&mut client);
+    assert_closed(&mut client, b"");
     assert!(matches!(
         handle.join().expect("no panic"),
         Err(Error::Timeout)
@@ -554,7 +561,7 @@ fn request_timeout_covers_body() {
     let elapsed = start.elapsed();
     assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
-    assert_closed(&mut client);
+    assert_closed(&mut client, b"");
     assert!(handle.join().expect("no panic").is_err());
 }
 
