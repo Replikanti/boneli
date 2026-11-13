@@ -137,7 +137,9 @@ cargo's target directory; `RUN_USER`, the user who runs the tests;
 1. **AppArmor** (only where `kernel.apparmor_restrict_unprivileged_userns`
    is 1): a profile that allows user namespaces for the two `boneli-sys`
    test binaries only, `boneli_sys-<hash>` and `boneli_sys_tests-<hash>`
-   under `$TARGET_DIR/<profile>/deps/`. Everything else on the host keeps
+   under `$TARGET_DIR/<profile>/deps/` (cargo before 1.100) or
+   `$TARGET_DIR/<profile>/build/boneli-sys/<hash>/out/` (cargo 1.100's
+   build directory layout). Everything else on the host keeps
    the restriction. Undo: `sudo apparmor_parser -R
    /etc/apparmor.d/boneli-sys-tests && sudo rm
    /etc/apparmor.d/boneli-sys-tests`. Builds with `--target <triple>` sit
@@ -182,7 +184,7 @@ if [ "${APPARMOR_USERNS:-$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_u
   sudo tee /etc/apparmor.d/boneli-sys-tests >/dev/null <<EOF
 abi <abi/4.0>,
 include <tunables/global>
-profile boneli-sys-tests $TARGET_DIR/*/deps/boneli_sys{,_tests}-[0-9a-f]* flags=(unconfined) {
+profile boneli-sys-tests $TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out}/boneli_sys{,_tests}-[0-9a-f]* flags=(unconfined) {
   userns,
 }
 EOF

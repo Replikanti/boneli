@@ -139,7 +139,11 @@ writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
 missing feature is reported with a stable id and a message naming its
 cause; a failed user namespace is classified from the errno and the
 sysctls that explain it (`userns-apparmor`, `userns-disabled`,
-`userns-other`). Hosts below the floor are refused: RHEL 9 (5.14) and
+`userns-other`). Under AppArmor's restriction an unconfined process still
+creates the namespace, but without capabilities in it, so opening
+`/proc/self/setgroups` fails with EACCES (measured on both CI runners); a
+confined profile without `userns` fails the clone with EPERM. Both count
+as `userns-apparmor` when the sysctl is 1. Hosts below the floor are refused: RHEL 9 (5.14) and
 Ubuntu 22.04 GA (5.15) are out.
 
 ### D4. Spawn model
@@ -240,9 +244,12 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
 - **AppArmor.** Ubuntu 23.10 and newer restrict unprivileged user
   namespaces through AppArmor. Instead of switching the restriction off
   for the whole host (the sysctl), the host-setup block loads a profile
-  that allows `userns` only for the two test binaries:
-  `$TARGET_DIR/*/deps/boneli_sys{,_tests}-[0-9a-f]*`, unconfined
-  otherwise. `probe::apparmor_profile_is_narrow` proves the rest of the
+  that allows `userns` only for the two test binaries,
+  `$TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out}/boneli_sys{,_tests}-[0-9a-f]*`,
+  unconfined otherwise. The two alternatives are cargo's two layouts:
+  `deps/` before cargo 1.100, and `build/<package>/<hash>/out/` since
+  (measured: the CI runners' cargo 1.100 put the test binaries there,
+  and the first CI run failed on a profile that named only `deps/`). `probe::apparmor_profile_is_narrow` proves the rest of the
   host keeps the restriction: a copy of the test binary outside that path
   must still report `userns-apparmor`. The profile is path-based, and the
   building user can write those paths, so on a shared or desktop host it

@@ -165,7 +165,7 @@ impl Harness {
 
 fn golden_profile(target: &Path) -> String {
     format!(
-        "abi <abi/4.0>,\ninclude <tunables/global>\nprofile boneli-sys-tests {}/*/deps/boneli_sys{{,_tests}}-[0-9a-f]* flags=(unconfined) {{\n  userns,\n}}\n",
+        "abi <abi/4.0>,\ninclude <tunables/global>\nprofile boneli-sys-tests {}/*/{{deps,build/boneli-sys/[0-9a-f]*/out}}/boneli_sys{{,_tests}}-[0-9a-f]* flags=(unconfined) {{\n  userns,\n}}\n",
         target.display()
     )
 }

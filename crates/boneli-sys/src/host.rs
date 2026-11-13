@@ -267,7 +267,11 @@ fn read_number(path: &str) -> Option<u64> {
 }
 
 /// Names the cause of a failed user namespace from the errno and the
-/// sysctls (pure, so every branch has a unit test).
+/// sysctls (pure, so every branch has a unit test). Under AppArmor's
+/// restriction the namespace is created, but it holds no capability, so
+/// opening `/proc/self/setgroups` fails with EACCES (measured on the
+/// Ubuntu CI runners); a confined profile without `userns` fails the clone
+/// with EPERM.
 pub(crate) fn classify_userns(stage: &'static str, errno: i32, sysctls: &UsernsSysctls) -> Missing {
     if errno == libc::EPERM && sysctls.unprivileged_userns_clone == Some(0) {
         Missing::UsernsDisabled {
@@ -277,7 +281,9 @@ pub(crate) fn classify_userns(stage: &'static str, errno: i32, sysctls: &UsernsS
         Missing::UsernsDisabled {
             sysctl: "user.max_user_namespaces",
         }
-    } else if errno == libc::EPERM && sysctls.apparmor_restrict == Some(1) {
+    } else if (errno == libc::EPERM || errno == libc::EACCES)
+        && sysctls.apparmor_restrict == Some(1)
+    {
         Missing::UsernsApparmor
     } else {
         Missing::UsernsOther {
@@ -582,6 +588,16 @@ mod tests {
         assert_eq!(
             classify_userns("clone3", libc::EPERM, &apparmor),
             Missing::UsernsApparmor
+        );
+        // What the Ubuntu CI runners give: the setgroups open fails.
+        assert_eq!(
+            classify_userns("setgroups", libc::EACCES, &apparmor),
+            Missing::UsernsApparmor
+        );
+        let no_apparmor = UsernsSysctls::default();
+        assert_eq!(
+            classify_userns("setgroups", libc::EACCES, &no_apparmor).id(),
+            MissingId::UsernsOther
         );
         let none = UsernsSysctls::default();
         assert_eq!(
