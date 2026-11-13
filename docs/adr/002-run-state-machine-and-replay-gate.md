@@ -78,7 +78,10 @@ analysis, citations, diff, fix checks).
    neither advances nor is charged (the check runs before usage
    accounting). One variant for the three fields, because the event kind
    already names the field. This is validation inside a legal pair, so the
-   pair counts above do not change.
+   pair counts above do not change. Adapter contract: the job adapter (#3)
+   never sends a blank `JobFailed` detail (when the job produced no error
+   output, it fills in, for example, the exit status), because a blank detail
+   is a caller error that leaves the run waiting and uncharged by design.
 3. Usage accounting (D3). A total over a limit ends the run as
    `BudgetExceeded` with no command, whatever the event says, with the one
    exception in D3.
@@ -222,9 +225,11 @@ also when the total saturated at a `u64::MAX` limit).
   (`Run::new` with a zero limit, `CommitSha::parse`, `EvidenceRef::parse`).
   The comparison sees
   only what is printed, so every hand-written formatting impl of the domain
-  is printed (today only `DomainError`'s `Display`); a test lists those impls
-  in the domain sources and fails when one is added that the harness does
-  not render. Its integration test runs the binary twice
+  is printed (today only `DomainError`'s `Display`). A test counts the
+  `fn fmt` definitions in the domain sources (the method name is fixed by
+  the formatting traits, so a renamed trait import cannot hide one), also
+  fails on any `macro_rules!` there, and fails when a definition appears that
+  the harness does not render. Its integration test runs the binary twice
   and fails unless both the heap and the code addresses differ (address
   randomization is on); then both outputs must be equal byte for byte, and
   equal to the test process's own rendering, and the scenario headers must

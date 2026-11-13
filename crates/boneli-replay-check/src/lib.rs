@@ -74,7 +74,7 @@ pub fn parse_probe(line: &str) -> Option<Probe> {
 /// a hand-written formatting impl. Those impls are rendered too, or a leak in
 /// them would pass the comparison: today the only one is `DomainError`'s
 /// `Display`, and `every_hand_written_fmt_impl_is_rendered` fails when the
-/// domain gains another.
+/// domain gains another `fn fmt`.
 pub fn render_scenarios(scenarios: &[Scenario]) -> Result<String, DomainError> {
     let mut out = String::new();
     for scenario in scenarios {
@@ -119,8 +119,9 @@ fn constructor_errors() -> Vec<DomainError> {
 }
 
 /// The hand-written formatting impls of `boneli-domain` that
-/// [`render_scenarios`] renders, as their `impl` lines.
-pub const RENDERED_FMT_IMPLS: &[&str] = &["impl fmt::Display for DomainError {"];
+/// [`render_scenarios`] renders: one entry per `fn fmt` definition, as its
+/// file and the `impl` line above it.
+pub const RENDERED_FMT_IMPLS: &[&str] = &["error.rs: impl fmt::Display for DomainError {"];
 
 /// [`render_scenarios`] over the whole corpus, in [`all`] order.
 pub fn render() -> Result<String, DomainError> {

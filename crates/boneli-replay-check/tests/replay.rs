@@ -93,16 +93,18 @@ fn first_difference_reports_the_line() {
 
 /// Tripwire: every hand-written formatting impl in `boneli-domain` must be
 /// rendered by the harness, because the replay compares only what it prints.
-/// A new `impl ... Display/Debug/...` there fails this test until
-/// `render_scenarios` prints it and `RENDERED_FMT_IMPLS` lists it.
+///
+/// It counts `fn fmt` definitions, not trait names: every formatting trait
+/// names its method `fmt`, so a renamed import (`use core::fmt::Display as
+/// Show;`) cannot hide one. Whitespace is ignored, so `fn` and `fmt` on
+/// separate lines still count, and so does a raw `r#fmt`. A `macro_rules!`
+/// could build the name from a fragment, so any macro definition fails too.
+/// Each definition is listed by file and the `impl` line above it; a new one
+/// fails until `render_scenarios` prints it and `RENDERED_FMT_IMPLS` lists it.
 #[test]
 fn every_hand_written_fmt_impl_is_rendered() {
-    const TRAITS: [&str; 10] = [
-        "fmt::", "Display", "Debug", "Write", "LowerHex", "UpperHex", "Binary", "Octal",
-        "LowerExp", "UpperExp",
-    ];
+    const DEFINITIONS: [&str; 3] = ["fnfmt(", "fnfmt<", "fnr#fmt"];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../boneli-domain/src");
-    let mut found = Vec::new();
     let mut files: Vec<_> = std::fs::read_dir(&src)
         .expect("the domain sources are readable")
         .map(|entry| entry.expect("a directory entry").path())
@@ -113,18 +115,45 @@ fn every_hand_written_fmt_impl_is_rendered() {
         "domain sources not found in {}",
         src.display()
     );
+    let compact = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let mut found = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(&file).expect("a domain source is UTF-8");
+        let name = file
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        let whole = compact(&text);
+        let total: usize = DEFINITIONS.iter().map(|d| whole.matches(d).count()).sum();
+        let mut on_lines = 0;
+        let mut last_impl = "<no impl line above>";
         for line in text.lines() {
-            let line = line.trim();
-            let is_impl = line.starts_with("impl ") || line.starts_with("impl<");
-            if is_impl && TRAITS.iter().any(|t| line.contains(t)) {
-                found.push(line.to_owned());
+            let trimmed = line.trim();
+            if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+                last_impl = trimmed;
             }
+            let line_compact = compact(line);
+            let here: usize = DEFINITIONS
+                .iter()
+                .map(|d| line_compact.matches(d).count())
+                .sum();
+            for _ in 0..here {
+                found.push(format!("{name}: {last_impl}"));
+            }
+            on_lines += here;
+        }
+        // A definition split across lines is seen only in the whole text.
+        for _ in on_lines..total {
+            found.push(format!("{name}: fn fmt split across lines"));
+        }
+        if whole.contains("macro_rules!") {
+            found.push(format!("{name}: macro_rules! (can define fn fmt)"));
         }
     }
     assert_eq!(
         found, RENDERED_FMT_IMPLS,
-        "render these in render_scenarios"
+        "a hand-written formatting impl in boneli-domain is not rendered by the replay \
+         harness: print it in render_scenarios and list it in RENDERED_FMT_IMPLS"
     );
 }
