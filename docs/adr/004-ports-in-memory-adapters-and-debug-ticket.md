@@ -49,9 +49,14 @@ in `boneli-app`, no `Send + Sync` supertraits.
   adapter exists, the shapes of the infra ports and of `Agent` and
   `Verifier` are minimal guesses, and adding a clause only makes the
   contract stricter.
-- **Paths** that ports take (part 2) go through the citation path rule of
-  ADR-002 (D2), through one shared function, so a sandbox or git path
-  cannot leave the tree by a route the citation precheck rejects.
+- **Paths** that ports take go through the citation path rule of ADR-002
+  (D2), through one shared function, so a sandbox or git path cannot leave
+  the tree by a route the citation precheck rejects. The function is
+  `boneli_domain::gate::path_problem`, extracted from `citation_problem`
+  without a change in behavior (the citation tests and the 63 domain
+  scenarios pin it); `boneli_app::RelativePath::parse` delegates to it, and
+  `Sandbox::copy_out` and `Git::read` take a `RelativePath`, so a hostile
+  path is refused by the type before it reaches a port (D11).
 - `Clock::now_ms` returns milliseconds since an origin the adapter chooses
   and never decreases; `Ids::run_id` returns a run id that is not blank and
   never repeats. The type is not called `Instant`, which the core token scan
@@ -108,14 +113,16 @@ in `boneli-app`, no `Send + Sync` supertraits.
   3 verifier and 2 forge operations) has one mutant per operation that
   breaks only that operation, and its violation detail must start with that
   operation's name, so each sub-check is shown to bite, not only the first.
-  `mutant_table_covers_every_clause` prints the counts: 23 clauses, 29
-  mutant cases. Without them a suite could pass every adapter vacuously.
+  `mutant_table_covers_every_clause` prints the counts: 40 clauses, 46
+  mutant cases (part 1: 23 and 29; part 2 adds 17 clauses with one mutant
+  each). Without them a suite could pass every adapter vacuously.
   The table lives in the replay check, not in `boneli-memory`'s tests, so
   the replay binary can render every mutant's violation (D10).
 - **A fixture cannot make a clause vacuous.** `silent-failure-detail`
   checks that the detail contains the fixture's status, and every text
   contains the empty string, so a blank fixture status (by `is_blank`) is
-  itself a violation of the clause.
+  itself a violation of the clause. Part 2 applies the same rule to its
+  fixtures (D11).
 
 The clauses of part 1:
 
@@ -162,7 +169,8 @@ The numbers in the suites:
   so there is none to store.
 
 Over scripted doubles some clauses, such as `one-status-per-citation`, hold
-by construction and only bite on real adapters.
+by construction and only bite on real adapters. The clauses of part 2 are
+in D11.
 
 ### D3. `Verifier`, an 11th port
 
@@ -340,7 +348,8 @@ adapters therefore cannot produce one.
   played result and `display <k>: <error>` for each error; then the
   `Display` and `Debug` of every variant of every `boneli-app` type with a
   hand-written `Display` (`StoreError`, `EvidenceError`,
-  `DebugTicketError`). The fmt-impl tripwire now also scans
+  `DebugTicketError`, and from part 2 `SandboxError`, `GitError`,
+  `ImageError` and `DataError`). The fmt-impl tripwire now also scans
   `crates/boneli-app/src` against `RENDERED_APP_FMT_IMPLS`, and a test fails
   on a subdirectory in either core crate, because the tripwire's `read_dir`
   does not recurse.
@@ -476,12 +485,106 @@ std are the only other macro sources these crates see. It is still a
 tripwire over the token stream, not a parser, and it does not scan real
 adapters or roots, which call the suites from their tests.
 
+### D11. The infra ports (part 2)
+
+`Sandbox`, `Git`, `ImageStore` and `DataSnapshot` are minimal: #3 has no
+consumer for them, and their real adapters (#7 images, #8 sandbox, #30
+git, #31 data, and #17 and #19 on top) extend them under the extension
+rule (D1). Each operation returns a `Result` with an error enum of its
+own (`SandboxError`, `GitError`, `ImageError`, `DataError`) that has a
+`Failed { detail }` variant for whatever the real adapter cannot classify
+yet, and the variants a clause needs. Every handle (`SandboxId`,
+`CheckoutId`, `RootfsRef`, `SnapshotId`, `DatabaseCopy`) is an opaque
+string the adapter issues, like `RunId`.
+
+- **`Sandbox`** follows ARCHITECTURE's sketch: `create(SandboxSpec { phase,
+  rootfs })`, `exec(id, Command { program, args, environment }, Limits {
+  wall_ms, memory_bytes, processes })`, `copy_out(id, RelativePath)` and
+  `destroy`. A command that ran and failed is an `ExecResult` with its
+  `ExitStatus` (`Code` or `Signal`), not an error. #8 and #13 choose the
+  limits.
+- **`Git`**: `fetch_base(RepoUrl, CommitSha)`, `read(checkout, path)` with
+  `None` for a missing file, `snapshot(checkout)`, `diff(checkout,
+  workspace)` and `apply(checkout, diff)`, which returns a new checkout.
+  #30 owns the snapshot and diff formats; #19 adds branch push.
+- **`ImageStore`**: `pull(ImageRef { name, digest, platform })`.
+- **`DataSnapshot`**: `load(sandbox, source)`, `copy(snapshot, run)` and
+  `remove_copy(copy)`.
+- **Names the core scan would trip on.** The command's variables are
+  `environment` and the image's target is `platform`, because the core
+  token scan bans the usual short names (ADR-001). The removal of a copy is
+  `remove_copy`, not the SQL verb: a brace group that holds a `:` and ends
+  in an identifier ending in `p` matches the format-spec scan.
+
+The clauses:
+
+| Port | Clauses |
+| --- | --- |
+| `Sandbox` | `distinct-ids`, `copy-out-after-write`, `copy-out-missing`, `isolated`, `exit-status`, `destroyed-is-unknown` |
+| `Git` | `read-at-base`, `read-missing`, `unknown-commit`, `apply-then-read`, `apply-leaves-base`, `unchanged-snapshot-empty-diff` |
+| `ImageStore` | `pull-idempotent`, `missing-image` |
+| `DataSnapshot` | `distinct-copies`, `copies-independent`, `removed-copy-unknown` |
+
+- **`distinct-ids`** creates two sandboxes, destroys the first and creates a
+  third, and requires three different handles: a handle issued again after
+  a destroy would let a stale handle reach the newer sandbox.
+- **`apply-leaves-base`**: the verify sandbox starts from the base SHA and
+  the diff only (invariant 6), so applying a diff must not change the base
+  checkout. **`unchanged-snapshot-empty-diff`**: the diff of the
+  checkout's own snapshot is empty, so an unchanged workspace never yields
+  a pull request.
+- **`copies-independent`** is #31's acceptance as a clause: after a change
+  in one copy, neither a second copy nor a copy made after the change shows
+  it, so neither the other copy nor the snapshot changed.
+
+The fixtures carry what only the adapter's own test knows, as in part 1:
+
+- `Sandbox`: a spec it can create, a command that writes given content to a
+  given path, and a command with a given exit status. The suite rejects
+  empty content (an adapter that copies out an empty file for every path
+  would pass) and the status `Code(0)` (an adapter that reports success for
+  every command would pass). The fixtures here exit with 3, any non-zero
+  code would do; the job fixtures of part 1 use `exit status 3` too.
+- `Git`: a repository with a base commit, a file and its content there, a
+  missing path, a commit the repository does not have and new content for
+  the file, plus an `edit` hook that sets a file in a workspace of the
+  adapter's snapshot format. The suite rejects new content equal to the old
+  (an adapter that ignores diffs would pass) and an unknown commit equal to
+  the base.
+- `ImageStore`: an image the registry has and one it does not.
+- `DataSnapshot`: a sandbox, a source, and a `Probe` that makes a change in
+  a copy and looks for it (for Postgres, SQL through the sandbox). The
+  suite requires that the probe sees the change in the copy it made it in,
+  or a probe that sees nothing would pass every copy.
+
+The in-memory adapters: `MemorySandbox` runs scripted programs that each
+return a result and write files into that sandbox's own workspace map,
+issues `sandbox-<n>` from a counter that is never reused, and answers a
+program it does not know with code 127 and the error output `program not
+found`, the code POSIX shells use for a command not found, so a test that
+calls a program the script forgot sees the same failure as on a real
+sandbox. `MemoryGit` holds fixed commits and has its own length-prefixed
+snapshot and diff formats; unpacking a workspace checks every length
+against the bytes left and every path with `RelativePath::parse`, so a
+workspace from a sandbox cannot name a path outside the tree.
+`MemoryImageStore` holds a fixed set of images, and `MemoryDataSnapshot`
+databases as lists of rows, with `insert` and `rows` on a copy for the
+probe.
+
+Rejected: moving each port definition into its adapter issue, where a real
+implementation would check its shape. The issue asks for every port, its
+in-memory adapter and its suite in #3, and the extension rule keeps the
+cost of a wrong guess to an added operation or clause (decided at STOP 1
+of #3).
+
 ## Consequences
 
 - The contract suites and their fixtures ship in the `boneli-app` library,
   like the domain's corpus. They are small and pure.
 - The port shapes of `Agent`, `Verifier` and the infra ports are fixed
-  before any real adapter exists. The extension rule (D1), fixture-driven
+  before any real adapter exists; the infra ports have no consumer in #3,
+  and their suites run only on the in-memory adapters and the mutants until
+  #7, #8, #30 and #31 land. The extension rule (D1), fixture-driven
   suites and a minimal part 2 keep the cost of a wrong guess low.
 - `boneli-memory` is a production crate (#32 wires it into the CLI for local
   runs), so it carries no test data; the corpus lives in the replay check.

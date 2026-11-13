@@ -249,7 +249,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 | `Broker` | | SQL, Sentry, logs |
 | `Clock`, `Ids` | system | |
 
-The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates.
+The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates. Paths that ports take are `RelativePath`s, which follow the citation path rule of the domain through one shared function (ADR-004, D1, D11).
 
 **Driving adapters:** CLI, webhooks, control plane connection, bench runner.
 
@@ -258,8 +258,8 @@ The in-memory adapter of every port lives in one adapter crate, `boneli-memory` 
 ```rust
 pub trait Sandbox {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError>;
-    fn exec(&self, id: &SandboxId, cmd: &Command, limits: &Limits) -> Result<ExecResult, SandboxError>;
-    fn copy_out(&self, id: &SandboxId, path: &WorkspacePath) -> Result<Blob, SandboxError>;
+    fn exec(&self, id: &SandboxId, command: &Command, limits: &Limits) -> Result<ExecResult, SandboxError>;
+    fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError>;
     fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError>;
 }
 

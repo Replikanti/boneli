@@ -1031,6 +1031,569 @@ pub mod forge {
     }
 }
 
+/// The `Sandbox` suite.
+pub mod sandbox {
+    use super::*;
+    use crate::path::RelativePath;
+    use crate::sandbox::{
+        Command, ExecResult, ExitStatus, Limits, Sandbox, SandboxError, SandboxId, SandboxSpec,
+    };
+
+    const PORT: &str = "Sandbox";
+
+    /// The clauses, in the order [`run`] checks them.
+    pub const CLAUSES: &[&str] = &[
+        "distinct-ids",
+        "copy-out-after-write",
+        "copy-out-missing",
+        "isolated",
+        "exit-status",
+        "destroyed-is-unknown",
+    ];
+
+    /// An adapter and the commands that drive it, which only the adapter's
+    /// own test knows (for a real sandbox, programs in the image).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Workspace<S> {
+        /// The adapter.
+        pub adapter: S,
+        /// A sandbox the adapter can create.
+        pub spec: SandboxSpec,
+        /// The limits every command runs under.
+        pub limits: Limits,
+        /// A command that writes [`Workspace::content`] to
+        /// [`Workspace::path`] in the workspace.
+        pub write: Command,
+        /// A path the workspace has no file at until `write` runs.
+        pub path: RelativePath,
+        /// What `write` writes; not empty, or an adapter that copies out an
+        /// empty file for every path would pass.
+        pub content: Vec<u8>,
+        /// A command that ends with [`Workspace::status`].
+        pub exit: Command,
+        /// How `exit` ends; not `Code(0)`, or an adapter that reports
+        /// success for every command would pass.
+        pub status: ExitStatus,
+    }
+
+    /// Checks every clause; each clause gets a fresh adapter from `make`.
+    pub fn run<S: Sandbox>(make: impl Fn() -> Workspace<S>) -> Result<(), Violation> {
+        distinct_ids(&make())?;
+        copy_out_after_write(&make())?;
+        copy_out_missing(&make())?;
+        isolated(&make())?;
+        exit_status(&make())?;
+        destroyed_is_unknown(&make())
+    }
+
+    fn create<S: Sandbox>(w: &Workspace<S>, clause: &'static str) -> Result<SandboxId, Violation> {
+        w.adapter
+            .create(&w.spec)
+            .map_err(|error| violation(PORT, clause, format!("create failed: {error:?}")))
+    }
+
+    fn exec<S: Sandbox>(
+        w: &Workspace<S>,
+        clause: &'static str,
+        id: &SandboxId,
+        command: &Command,
+    ) -> Result<ExecResult, Violation> {
+        w.adapter.exec(id, command, &w.limits).map_err(|error| {
+            violation(
+                PORT,
+                clause,
+                format!("exec of {:?} in {id:?} failed: {error:?}", command.program),
+            )
+        })
+    }
+
+    /// `write` ran in `id`, and copying out its path gives its content.
+    fn expect_written<S: Sandbox>(
+        w: &Workspace<S>,
+        clause: &'static str,
+        id: &SandboxId,
+    ) -> Result<(), Violation> {
+        if w.content.is_empty() {
+            return Err(violation(
+                PORT,
+                clause,
+                String::from(
+                    "the fixture's content is empty, so the clause cannot tell a written file \
+                     from an empty one",
+                ),
+            ));
+        }
+        let got = w.adapter.copy_out(id, &w.path);
+        ensure(got.as_ref() == Ok(&w.content), PORT, clause, || {
+            format!(
+                "copy_out of {:?} from {id:?} after write gave {got:?}, expected {} bytes",
+                w.path,
+                w.content.len()
+            )
+        })
+    }
+
+    fn distinct_ids<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "distinct-ids";
+        let a = create(w, clause)?;
+        let b = create(w, clause)?;
+        w.adapter
+            .destroy(&a)
+            .map_err(|error| violation(PORT, clause, format!("destroy failed: {error:?}")))?;
+        // A handle issued again after a destroy would let a stale handle
+        // reach the newer sandbox.
+        let c = create(w, clause)?;
+        let ids = [a, b, c];
+        let distinct: BTreeSet<&SandboxId> = ids.iter().collect();
+        ensure(distinct.len() == ids.len(), PORT, clause, || {
+            format!("handles repeat: {ids:?}")
+        })
+    }
+
+    fn copy_out_after_write<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "copy-out-after-write";
+        let id = create(w, clause)?;
+        exec(w, clause, &id, &w.write)?;
+        expect_written(w, clause, &id)
+    }
+
+    fn copy_out_missing<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "copy-out-missing";
+        let id = create(w, clause)?;
+        let got = w.adapter.copy_out(&id, &w.path);
+        ensure(got == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} before anything wrote it gave {got:?}, expected NotFound",
+                w.path
+            )
+        })
+    }
+
+    fn isolated<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "isolated";
+        let a = create(w, clause)?;
+        let b = create(w, clause)?;
+        exec(w, clause, &a, &w.write)?;
+        let other = w.adapter.copy_out(&b, &w.path);
+        ensure(other == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} from {b:?} after a write in {a:?} gave {other:?}, expected \
+                 NotFound",
+                w.path
+            )
+        })?;
+        expect_written(w, clause, &a)
+    }
+
+    fn exit_status<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "exit-status";
+        if w.status == ExitStatus::Code(0) {
+            return Err(violation(
+                PORT,
+                clause,
+                String::from(
+                    "the fixture's status is Code(0), so the clause cannot tell it from an \
+                     adapter that reports success for every command",
+                ),
+            ));
+        }
+        let id = create(w, clause)?;
+        let result = exec(w, clause, &id, &w.exit)?;
+        ensure(result.status == w.status, PORT, clause, || {
+            format!(
+                "exec of {:?} ended with {:?}, expected {:?}",
+                w.exit.program, result.status, w.status
+            )
+        })
+    }
+
+    fn destroyed_is_unknown<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "destroyed-is-unknown";
+        let id = create(w, clause)?;
+        exec(w, clause, &id, &w.write)?;
+        w.adapter
+            .destroy(&id)
+            .map_err(|error| violation(PORT, clause, format!("destroy failed: {error:?}")))?;
+        let unknown = Err(SandboxError::UnknownSandbox);
+        let ran = w.adapter.exec(&id, &w.write, &w.limits).map(|_| ());
+        let copied = w.adapter.copy_out(&id, &w.path).map(|_| ());
+        let again = w.adapter.destroy(&id);
+        ensure(
+            ran == unknown && copied == unknown && again == unknown,
+            PORT,
+            clause,
+            || {
+                format!(
+                    "after destroy, exec gave {ran:?}, copy_out {copied:?} and destroy {again:?}, \
+                     expected UnknownSandbox"
+                )
+            },
+        )
+    }
+}
+
+/// The `Git` suite.
+pub mod git {
+    use super::*;
+    use crate::git::{CheckoutId, Git, GitError, RepoUrl};
+    use crate::path::RelativePath;
+
+    const PORT: &str = "Git";
+
+    /// The clauses, in the order [`run`] checks them.
+    pub const CLAUSES: &[&str] = &[
+        "read-at-base",
+        "read-missing",
+        "unknown-commit",
+        "apply-then-read",
+        "apply-leaves-base",
+        "unchanged-snapshot-empty-diff",
+    ];
+
+    /// An adapter with a repository whose content at the base commit the
+    /// adapter's own test knows.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Repository<G> {
+        /// The adapter.
+        pub adapter: G,
+        /// The repository.
+        pub repo: RepoUrl,
+        /// A commit the repository has.
+        pub base: CommitSha,
+        /// A file at the base commit.
+        pub path: RelativePath,
+        /// Its content at the base commit.
+        pub content: Vec<u8>,
+        /// A path with no file at the base commit.
+        pub missing: RelativePath,
+        /// A commit the repository does not have.
+        pub unknown: CommitSha,
+        /// The content the suite gives [`Repository::path`] in a workspace;
+        /// not equal to [`Repository::content`], or an adapter that ignores
+        /// diffs would pass.
+        pub edited: Vec<u8>,
+    }
+
+    /// Checks every clause; each clause gets a fresh adapter from `make`.
+    ///
+    /// `edit` takes a workspace in the adapter's snapshot format, a path
+    /// and content, and returns the workspace with that file set to that
+    /// content. The snapshot format belongs to the adapter (#30), so only
+    /// its own test knows how.
+    pub fn run<G: Git>(
+        make: impl Fn() -> Repository<G>,
+        edit: impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        read_at_base(&make())?;
+        read_missing(&make())?;
+        unknown_commit(&make())?;
+        apply_then_read(&make(), &edit)?;
+        apply_leaves_base(&make(), &edit)?;
+        unchanged_snapshot_empty_diff(&make())
+    }
+
+    fn call<T>(
+        clause: &'static str,
+        what: &str,
+        result: Result<T, GitError>,
+    ) -> Result<T, Violation> {
+        result.map_err(|error| violation(PORT, clause, format!("{what} failed: {error:?}")))
+    }
+
+    fn checkout<G: Git>(r: &Repository<G>, clause: &'static str) -> Result<CheckoutId, Violation> {
+        call(clause, "fetch_base", r.adapter.fetch_base(&r.repo, &r.base))
+    }
+
+    fn expect_read<G: Git>(
+        r: &Repository<G>,
+        clause: &'static str,
+        checkout: &CheckoutId,
+        path: &RelativePath,
+        want: Option<&[u8]>,
+    ) -> Result<(), Violation> {
+        let got = call(clause, "read", r.adapter.read(checkout, path))?;
+        ensure(got.as_deref() == want, PORT, clause, || {
+            format!("read of {path:?} in {checkout:?} gave {got:?}, expected {want:?}")
+        })
+    }
+
+    /// Fetches the base, edits the path in its snapshot, diffs and applies
+    /// the diff; returns the base checkout and the applied one.
+    fn applied<G: Git>(
+        r: &Repository<G>,
+        clause: &'static str,
+        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+    ) -> Result<(CheckoutId, CheckoutId), Violation> {
+        if r.edited == r.content {
+            return Err(violation(
+                PORT,
+                clause,
+                String::from(
+                    "the fixture's edited content equals the base content, so the clause \
+                     cannot tell an applied diff from an ignored one",
+                ),
+            ));
+        }
+        let base = checkout(r, clause)?;
+        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
+        let workspace = edit(&snapshot, &r.path, &r.edited);
+        let diff = call(clause, "diff", r.adapter.diff(&base, &workspace))?;
+        let after = call(clause, "apply", r.adapter.apply(&base, &diff))?;
+        Ok((base, after))
+    }
+
+    fn read_at_base<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "read-at-base";
+        let base = checkout(r, clause)?;
+        expect_read(r, clause, &base, &r.path, Some(&r.content))
+    }
+
+    fn read_missing<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "read-missing";
+        let base = checkout(r, clause)?;
+        expect_read(r, clause, &base, &r.missing, None)
+    }
+
+    fn unknown_commit<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "unknown-commit";
+        if r.unknown == r.base {
+            return Err(violation(
+                PORT,
+                clause,
+                String::from("the fixture's unknown commit is its base commit"),
+            ));
+        }
+        let got = r.adapter.fetch_base(&r.repo, &r.unknown);
+        ensure(got == Err(GitError::UnknownCommit), PORT, clause, || {
+            format!(
+                "fetch_base of {:?}, which the repository does not have, gave {got:?}, expected \
+                 UnknownCommit",
+                r.unknown
+            )
+        })
+    }
+
+    fn apply_then_read<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "apply-then-read";
+        let (_, after) = applied(r, clause, edit)?;
+        expect_read(r, clause, &after, &r.path, Some(&r.edited))
+    }
+
+    /// The verify sandbox starts from the base and the diff only
+    /// (invariant 6), so applying a diff must not change the base.
+    fn apply_leaves_base<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, &[u8]) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "apply-leaves-base";
+        let (base, _) = applied(r, clause, edit)?;
+        expect_read(r, clause, &base, &r.path, Some(&r.content))
+    }
+
+    fn unchanged_snapshot_empty_diff<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "unchanged-snapshot-empty-diff";
+        let base = checkout(r, clause)?;
+        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
+        let diff = call(clause, "diff", r.adapter.diff(&base, &snapshot))?;
+        ensure(diff.is_empty(), PORT, clause, || {
+            format!(
+                "the diff of an unchanged snapshot has {} bytes, expected none",
+                diff.len()
+            )
+        })
+    }
+}
+
+/// The `ImageStore` suite.
+pub mod image {
+    use super::*;
+    use crate::image::{ImageError, ImageRef, ImageStore};
+
+    const PORT: &str = "ImageStore";
+
+    /// The clauses, in the order [`run`] checks them.
+    pub const CLAUSES: &[&str] = &["pull-idempotent", "missing-image"];
+
+    /// An adapter and the images its own test knows.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Images<I> {
+        /// The adapter.
+        pub adapter: I,
+        /// An image the registry has.
+        pub present: ImageRef,
+        /// An image the registry does not have.
+        pub missing: ImageRef,
+    }
+
+    /// Checks every clause; each clause gets a fresh adapter from `make`.
+    pub fn run<I: ImageStore>(make: impl Fn() -> Images<I>) -> Result<(), Violation> {
+        pull_idempotent(&make())?;
+        missing_image(&make())
+    }
+
+    fn pull_idempotent<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let clause = "pull-idempotent";
+        let pull = || {
+            i.adapter.pull(&i.present).map_err(|error| {
+                violation(
+                    PORT,
+                    clause,
+                    format!("pull of {:?} failed: {error:?}", i.present),
+                )
+            })
+        };
+        let first = pull()?;
+        let second = pull()?;
+        ensure(first == second, PORT, clause, || {
+            format!("two pulls of the same image gave {first:?} and {second:?}")
+        })
+    }
+
+    fn missing_image<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let clause = "missing-image";
+        let got = i.adapter.pull(&i.missing);
+        ensure(got == Err(ImageError::NotFound), PORT, clause, || {
+            format!(
+                "pull of {:?}, which the registry does not have, gave {got:?}, expected NotFound",
+                i.missing
+            )
+        })
+    }
+}
+
+/// The `DataSnapshot` suite.
+pub mod data {
+    use super::*;
+    use crate::data::{DataError, DataSnapshot, DatabaseCopy, SnapshotId, SnapshotSource};
+    use crate::sandbox::SandboxId;
+
+    const PORT: &str = "DataSnapshot";
+
+    /// The clauses, in the order [`run`] checks them.
+    pub const CLAUSES: &[&str] = &[
+        "distinct-copies",
+        "copies-independent",
+        "removed-copy-unknown",
+    ];
+
+    /// An adapter and a source it can load into a sandbox, which only its
+    /// own test knows.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Database<D> {
+        /// The adapter.
+        pub adapter: D,
+        /// The sandbox whose pod runs the database.
+        pub sandbox: SandboxId,
+        /// A source the adapter can load.
+        pub source: SnapshotSource,
+    }
+
+    /// How the suite changes the data in a copy and looks for the change;
+    /// only the adapter's own test knows how (for Postgres, SQL through the
+    /// sandbox). Errors are reported as the clause's detail.
+    pub trait Probe<D> {
+        /// Makes one change in the copy.
+        fn change(&self, adapter: &D, copy: &DatabaseCopy) -> Result<(), String>;
+
+        /// Whether the copy shows that change.
+        fn changed(&self, adapter: &D, copy: &DatabaseCopy) -> Result<bool, String>;
+    }
+
+    /// Checks every clause; each clause gets a fresh adapter from `make`.
+    pub fn run<D: DataSnapshot>(
+        make: impl Fn() -> Database<D>,
+        probe: &impl Probe<D>,
+    ) -> Result<(), Violation> {
+        distinct_copies(&make())?;
+        copies_independent(&make(), probe)?;
+        removed_copy_unknown(&make())
+    }
+
+    fn call<T>(
+        clause: &'static str,
+        what: &str,
+        result: Result<T, DataError>,
+    ) -> Result<T, Violation> {
+        result.map_err(|error| violation(PORT, clause, format!("{what} failed: {error:?}")))
+    }
+
+    fn load<D: DataSnapshot>(
+        d: &Database<D>,
+        clause: &'static str,
+    ) -> Result<SnapshotId, Violation> {
+        call(clause, "load", d.adapter.load(&d.sandbox, &d.source))
+    }
+
+    fn copy<D: DataSnapshot>(
+        d: &Database<D>,
+        clause: &'static str,
+        snapshot: &SnapshotId,
+        run: &str,
+    ) -> Result<DatabaseCopy, Violation> {
+        let run = RunId::new(String::from(run));
+        call(clause, "copy", d.adapter.copy(snapshot, &run))
+    }
+
+    fn distinct_copies<D: DataSnapshot>(d: &Database<D>) -> Result<(), Violation> {
+        let clause = "distinct-copies";
+        let snapshot = load(d, clause)?;
+        let a = copy(d, clause, &snapshot, "contract-a")?;
+        let b = copy(d, clause, &snapshot, "contract-b")?;
+        ensure(a != b, PORT, clause, || {
+            format!("two runs got the same copy {a:?}")
+        })
+    }
+
+    /// #31's acceptance: a change in one copy is visible in neither another
+    /// copy nor a copy made after it, so the snapshot did not change.
+    fn copies_independent<D: DataSnapshot>(
+        d: &Database<D>,
+        probe: &impl Probe<D>,
+    ) -> Result<(), Violation> {
+        let clause = "copies-independent";
+        let snapshot = load(d, clause)?;
+        let a = copy(d, clause, &snapshot, "contract-a")?;
+        let b = copy(d, clause, &snapshot, "contract-b")?;
+        let probed = |result: Result<bool, String>, copy: &DatabaseCopy| {
+            result.map_err(|error| {
+                violation(PORT, clause, format!("probing {copy:?} failed: {error}"))
+            })
+        };
+        let unchanged = |copy: &DatabaseCopy| -> Result<(), Violation> {
+            let seen = probed(probe.changed(&d.adapter, copy), copy)?;
+            ensure(!seen, PORT, clause, || {
+                format!("{copy:?} shows a change made in {a:?}")
+            })
+        };
+        unchanged(&a)?;
+        probe
+            .change(&d.adapter, &a)
+            .map_err(|error| violation(PORT, clause, format!("changing {a:?} failed: {error}")))?;
+        // Without this the probe could see nothing and every copy pass.
+        let seen = probed(probe.changed(&d.adapter, &a), &a)?;
+        ensure(seen, PORT, clause, || {
+            format!("{a:?} does not show its own change")
+        })?;
+        unchanged(&b)?;
+        let c = copy(d, clause, &snapshot, "contract-c")?;
+        unchanged(&c)
+    }
+
+    fn removed_copy_unknown<D: DataSnapshot>(d: &Database<D>) -> Result<(), Violation> {
+        let clause = "removed-copy-unknown";
+        let snapshot = load(d, clause)?;
+        let a = copy(d, clause, &snapshot, "contract-a")?;
+        call(clause, "remove_copy", d.adapter.remove_copy(&a))?;
+        let again = d.adapter.remove_copy(&a);
+        ensure(again == Err(DataError::UnknownCopy), PORT, clause, || {
+            format!("a second remove_copy of {a:?} gave {again:?}, expected UnknownCopy")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,6 +1618,10 @@ mod tests {
             agent::CLAUSES,
             verifier::CLAUSES,
             forge::CLAUSES,
+            sandbox::CLAUSES,
+            git::CLAUSES,
+            image::CLAUSES,
+            data::CLAUSES,
         ] {
             let unique: BTreeSet<&str> = clauses.iter().copied().collect();
             assert_eq!(unique.len(), clauses.len(), "{clauses:?}");

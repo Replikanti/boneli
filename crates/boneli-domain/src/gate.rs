@@ -177,17 +177,8 @@ pub fn reproduction_gate(status: TestStatus) -> GateOutcome {
 /// and look-alike dots are literal repository paths; verification against
 /// the tree (#17) reports them `Unverifiable` when they are absent.
 pub fn citation_problem(citation: &Citation, base: &CommitSha) -> Option<CitationProblem> {
-    let path = citation.path.as_str();
-    let problem = if is_blank(path) {
-        CitationProblem::BlankPath
-    } else if path.starts_with('/') {
-        CitationProblem::AbsolutePath
-    } else if path.contains('\\') {
-        CitationProblem::Backslash
-    } else if path.contains('\0') {
-        CitationProblem::Nul
-    } else if let Some(component) = path.split('/').find_map(component_problem) {
-        component
+    let problem = if let Some(problem) = path_problem(&citation.path) {
+        problem
     } else if citation.line == 0 {
         CitationProblem::LineZero
     } else if is_blank(&citation.quote) {
@@ -198,6 +189,25 @@ pub fn citation_problem(citation: &Citation, base: &CommitSha) -> Option<Citatio
         return None;
     };
     Some(problem)
+}
+
+/// The first problem of a path inside a repository or a workspace: blank,
+/// absolute, a backslash, NUL, or an empty, `.` or `..` component. The one
+/// path rule of the citation precheck, shared with the paths that ports
+/// take (ADR-004, D1), so a port path cannot leave the tree by a route a
+/// citation could not.
+pub fn path_problem(path: &str) -> Option<CitationProblem> {
+    if is_blank(path) {
+        Some(CitationProblem::BlankPath)
+    } else if path.starts_with('/') {
+        Some(CitationProblem::AbsolutePath)
+    } else if path.contains('\\') {
+        Some(CitationProblem::Backslash)
+    } else if path.contains('\0') {
+        Some(CitationProblem::Nul)
+    } else {
+        path.split('/').find_map(component_problem)
+    }
 }
 
 fn component_problem(component: &str) -> Option<CitationProblem> {

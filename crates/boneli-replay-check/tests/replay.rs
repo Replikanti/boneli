@@ -136,7 +136,7 @@ fn every_hand_written_fmt_impl_is_rendered() {
          harness: print it in render_scenarios and list it in RENDERED_FMT_IMPLS"
     );
     assert_eq!(
-        hand_written_fmt_impls("boneli-app", 11),
+        hand_written_fmt_impls("boneli-app", 16),
         RENDERED_APP_FMT_IMPLS,
         "a hand-written formatting impl in boneli-app is not rendered by the replay \
          harness: print it in app::render_app_errors and list it in RENDERED_APP_FMT_IMPLS"
@@ -166,7 +166,7 @@ fn core_sources(krate: &str, min_files: usize) -> Vec<std::path::PathBuf> {
 /// invisible to the tripwire: the core sources stay flat.
 #[test]
 fn app_sources_are_flat() {
-    for (krate, min_files) in [("boneli-domain", 9), ("boneli-app", 11)] {
+    for (krate, min_files) in [("boneli-domain", 9), ("boneli-app", 16)] {
         for file in core_sources(krate, min_files) {
             assert!(
                 file.is_file(),
@@ -448,5 +448,5 @@ fn contract_suites_stay_out_of_library_code() {
             }
         }
     }
-    assert!(scanned >= 26, "too few sources scanned: {scanned}");
+    assert!(scanned >= 35, "too few sources scanned: {scanned}");
 }

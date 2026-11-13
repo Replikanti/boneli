@@ -65,9 +65,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also covers `boneli-app`.
 - ADR-004: ports, in-memory adapters, contract suites and `DebugTicket`;
   `Verifier` is a port, implemented on `Sandbox` and `Git` in #17.
+- `boneli-app`: the ports `Sandbox`, `Git`, `ImageStore` and
+  `DataSnapshot`, minimal until their real adapters extend them, and
+  `RelativePath`, which ports take for paths and which follows the citation
+  path rule through `boneli_domain::gate::path_problem` (ADR-004, D11).
+- `boneli_app::contract`: suites for the four infra ports, 17 more clauses
+  (40 in total), each with a mutant in `boneli-replay-check` (46 mutant
+  cases); `copies-independent` is the data adapter's acceptance as a
+  clause.
+- `boneli-memory`: `MemorySandbox`, `MemoryGit` with its own snapshot and
+  diff formats, `MemoryImageStore` and `MemoryDataSnapshot`.
 
 ### Changed
 
+- `boneli_domain::gate::citation_problem` checks the path through the new
+  `path_problem`, without a change in behavior (ADR-004, D1).
 - The architecture check is now `tools/check_architecture.py` behind the
   same `tools/check-architecture.sh`. It reads the workspace from
   `cargo metadata`, checks every resolved dependency edge on both Linux
