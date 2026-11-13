@@ -103,6 +103,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `deny.toml`: per-crate license exceptions for ring, untrusted and
   rustls-webpki (ISC), subtle (BSD-3-Clause) and webpki-roots
   (CDLA-Permissive-2.0).
+- `boneli-egress` (ADR-006), the pure policy of the egress proxy: an
+  allowlist of exact canonical `host:port` names, parsed with the CONNECT
+  target grammar (empty lists, IP literals and duplicates are refused);
+  address classes that allow only globally reachable addresses, checked
+  against the IANA special-purpose registries, and that also check the
+  IPv4 address embedded in a NAT64 prefix (RFC 6052 lengths, prefixes from
+  RFC 7050 discovery or the runner; a prefix only adds refusals); the
+  connect order (families
+  alternate, RFC 8305) and the per-attempt share of the connect budget; and
+  the connection log codec, one record per line in a closed alphabet with a
+  strict parser that accepts exactly one spelling of every record.
+- `boneli_http::Target::parse_authority`: the CONNECT target grammar for
+  values outside a request head.
+- ADR-006: the egress proxy, its allowlist, address policy, connect budget,
+  answers, relay, write-ahead connection log and server limits.
 
 ### Changed
 

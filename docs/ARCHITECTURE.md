@@ -101,7 +101,7 @@ The MVP runs on a subscription; customers run on their own API key. We never pay
 
 **Switching without touching the domain:** the `Agent` port has two access configurations, `Subscription` and `ApiKey`. Neither the domain nor the use cases know the difference.
 
-**Egress proxy in the prepare phase** allows CONNECT only to registries (npm, PyPI), without MITM, and logs every connection. github.com is not on the allowlist.
+**Egress proxy in the prepare phase** allows CONNECT only to registries (npm, PyPI), without MITM, and logs every connection. github.com is not on the allowlist. The allowlist holds exact `host:port` pairs; a name that is not on it is refused before it is resolved, and a name that resolves to any address that is not globally reachable (loopback, private, link-local and metadata space, among others) is refused too. Every connection goes to a write-ahead log, written before each effect, which the runner stores as evidence of the run (ADR-006).
 
 ## Debugging line
 
@@ -272,7 +272,7 @@ impl Run {
 
 **Testing:** every port has an in-memory adapter and a set of contract tests that both the real and the in-memory adapter must pass. The domain and use cases are tested without Linux and without a network. In-memory adapters that need `std` (a `Mutex`, for example) live in adapter crates, because the core crates are `no_std` (ADR-001); contract suites, generic functions over a port, can stay in `boneli-app`. They live in `boneli_app::contract`, return the violated clause instead of panicking, and the replay check proves every clause can fail with one mutant adapter per clause (ADR-004).
 
-**Gateway, egress and shim** are separate processes because of the security boundary. The gateway and the egress proxy each have their own small hexagon: a domain (budget, routing, allowlist) and ports (upstream, transcript store).
+**Gateway, egress and shim** are separate processes because of the security boundary. The gateway and the egress proxy each have their own small hexagon: a domain (budget, routing, allowlist) and ports (upstream, transcript store). The egress proxy's is the policy module of `boneli-egress` (allowlist, address classes, connect order, log format) plus two crate-local seams, `Upstream` and `LogSink` (ADR-006).
 
 ## Pure Rust and dependencies
 

@@ -1,0 +1,18 @@
+[package]
+name = "boneli-egress"
+description = "Boneli egress proxy: CONNECT to an exact per-run allowlist of global addresses, with a write-ahead connection log (ADR-006)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Composition root: may depend on any member that is not a root (ADR-001).
+[dependencies]
+# CONNECT parsing and the authority grammar; a support crate. Allowlist
+# entries go through the same parser as CONNECT targets (ADR-006, D2).
+boneli-http.workspace = true

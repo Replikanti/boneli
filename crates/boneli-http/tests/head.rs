@@ -741,3 +741,89 @@ fn response_head_round_trip() {
     ));
     assert!(ResponseHead::parse(&bytes[..bytes.len() - 1], &wide()).is_err());
 }
+
+/// `Target::parse_authority` is the grammar of the CONNECT target, so that
+/// the egress allowlist (ADR-006, D2) canonicalizes its entries exactly as
+/// the server canonicalizes targets: every value is accepted by both, with
+/// the same `Target`, or rejected by both.
+#[test]
+fn target_parse_authority_matches_connect_grammar() {
+    let mut values: Vec<String> = [
+        // The table of the `authority_values` unit test.
+        "Example.COM:443",
+        "[::1]:8443",
+        "[FE80::1]:1",
+        "h:65535",
+        "h:00443",
+        "h:65536",
+        "h:0",
+        "h",
+        "h:",
+        "h:+443",
+        "h:0x1bb",
+        "u@h:443",
+        "h%2e:443",
+        "::1:443",
+        ":443",
+        "[]:443",
+        "[::1]",
+        "[::1]x:443",
+        "[fe80::1%25eth0]:443",
+        "h:443:1",
+        "h:004430",
+        "h :443",
+        "h/x:443",
+        "[1.2.3.4]:443",
+        // What an allowlist entry may look like, and its near misses.
+        "registry.npmjs.org:443",
+        "REGISTRY.NPMJS.ORG:0443",
+        "10.0.0.1:1",
+        "registry.npmjs.org.:443",
+        "*.npmjs.org:443",
+        "_x.example.org:443",
+        "r\u{435}gistry.npmjs.org:443",
+        "registry\u{200b}.npmjs.org:443",
+        "registry.npmjs.org\u{a0}:443",
+        " registry.npmjs.org:443",
+        "registry.npmjs.org:443 ",
+        "registry.npmjs.org:\t443",
+        "registry.npmjs.org:443\n",
+        "registry.npmjs.org:000443",
+        "",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    values.extend(NUMERIC_HOSTS.iter().map(|host| format!("{host}:443")));
+
+    for value in &values {
+        let direct = Target::parse_authority(value);
+        let via_connect = RequestHead::parse(&connect_to(value), &wide()).map(|head| head.target);
+        match (&direct, &via_connect) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{value:?}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("{value:?}: parse_authority {direct:?}, CONNECT {via_connect:?}"),
+        }
+        if let Ok(target) = &direct {
+            assert!(
+                matches!(target, Target::Authority { .. }),
+                "{value:?} is not an authority"
+            );
+        }
+    }
+
+    let ok = |value: &str| Target::parse_authority(value).expect(value);
+    let authority = |host: &str, port| Target::Authority {
+        host: host.into(),
+        port,
+    };
+    assert_eq!(
+        ok("REGISTRY.NPMJS.ORG:0443"),
+        authority("registry.npmjs.org", 443)
+    );
+    assert_eq!(ok("[FE80::1]:1"), authority("fe80::1", 1));
+    assert!(matches!(
+        Target::parse_authority("h"),
+        Err(Error::Malformed(_))
+    ));
+}
