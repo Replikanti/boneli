@@ -9,7 +9,12 @@
 //! builds it for a target without `std`.
 //!
 //! Design: `docs/ARCHITECTURE.md`, sections "Code architecture" and
-//! "Debugging line".
+//! "Debugging line"; the run model, budget units and gates are fixed in
+//! ADR-002 (`docs/adr/002-run-state-machine-and-replay-gate.md`).
+//!
+//! The entry point is [`Run`]: [`Run::handle`] takes a [`RunEvent`] and
+//! returns the next run and its [`RunCommand`]s. [`scenarios`] is the event
+//! corpus the unit tests and the two-process replay gate fold.
 //!
 //! # Doctests in this crate cannot use `unsafe` (ADR-001)
 //!
@@ -23,3 +28,25 @@
 //! ```
 #![no_std]
 #![doc(test(attr(forbid(unsafe_code))))]
+
+extern crate alloc;
+
+pub mod budget;
+pub mod command;
+pub mod error;
+pub mod event;
+pub mod gate;
+pub mod run;
+pub mod scenarios;
+pub mod values;
+
+pub use budget::{Budget, BudgetDimension, Overrun, Usage};
+pub use command::RunCommand;
+pub use error::DomainError;
+pub use event::{EventKind, RunEvent, TriageVerdict};
+pub use gate::{
+    CheckStatus, CitationProblem, CitationStatus, FixCheck, FixChecks, GateFailure, GateOutcome,
+    TestStatus,
+};
+pub use run::{AgentOutputProblem, Outcome, Run, Stage};
+pub use values::{Citation, CommitSha, EvidenceRef, RunId, Ticket, TicketField, TicketSource};
