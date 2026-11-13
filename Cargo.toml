@@ -30,3 +30,4 @@ unwrap_used = "deny"
 boneli-domain = { path = "crates/boneli-domain" }
 boneli-app = { path = "crates/boneli-app" }
 boneli-http = { path = "crates/boneli-http" }
+boneli-memory = { path = "crates/boneli-memory" }
