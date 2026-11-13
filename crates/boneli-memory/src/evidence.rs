@@ -41,6 +41,18 @@ impl MemoryEvidence {
     }
 }
 
+impl MemoryEvidence {
+    /// Replaces what the store holds under `reference` without updating its
+    /// index, the way another process could overwrite a file store's blob.
+    /// For the `tampered-content-rejected` contract clause and the replay
+    /// corpus; an unknown reference is left alone.
+    pub fn tamper(&self, reference: &EvidenceRef, content: &[u8]) {
+        if let Some(stored) = lock(&self.state).by_reference.get_mut(reference) {
+            *stored = content.to_vec();
+        }
+    }
+}
+
 impl Evidence for MemoryEvidence {
     fn put(&self, content: &[u8]) -> Result<EvidenceRef, EvidenceError> {
         let mut state = lock(&self.state);
@@ -61,11 +73,18 @@ impl Evidence for MemoryEvidence {
         Ok(reference)
     }
 
+    /// Checks the content against the reference before returning it, the
+    /// way a file store re-hashes on read (ADR-004, D9): the bytes must be
+    /// the ones that were put under this reference.
     fn get(&self, reference: &EvidenceRef) -> Result<Vec<u8>, EvidenceError> {
-        lock(&self.state)
+        let state = lock(&self.state);
+        let content = state
             .by_reference
             .get(reference)
-            .cloned()
-            .ok_or(EvidenceError::NotFound)
+            .ok_or(EvidenceError::NotFound)?;
+        if state.by_content.get(content) != Some(reference) {
+            return Err(EvidenceError::Corrupted);
+        }
+        Ok(content.clone())
     }
 }

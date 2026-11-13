@@ -184,6 +184,9 @@ enum EvidenceBug {
     UnknownIsEmpty,
     /// A reference is cut to its last `/` component.
     LastComponent,
+    /// `get` returns what is on disk without checking it against the
+    /// reference.
+    SkipsIntegrity,
 }
 
 struct EvidenceMutant {
@@ -191,6 +194,8 @@ struct EvidenceMutant {
     inner: MemoryEvidence,
     by_length: Mutex<Vec<(usize, EvidenceRef)>>,
     puts: Mutex<u64>,
+    /// What `tamper` wrote, for the store that reads it unchecked.
+    on_disk: Mutex<Vec<(EvidenceRef, Vec<u8>)>>,
 }
 
 fn evidence_mutant(bug: EvidenceBug) -> impl Fn() -> EvidenceMutant {
@@ -199,7 +204,24 @@ fn evidence_mutant(bug: EvidenceBug) -> impl Fn() -> EvidenceMutant {
         inner: MemoryEvidence::new(),
         by_length: Mutex::new(Vec::new()),
         puts: Mutex::new(0),
+        on_disk: Mutex::new(Vec::new()),
     }
+}
+
+/// The tamper hook of every evidence mutant.
+fn tamper_mutant(store: &EvidenceMutant, reference: &EvidenceRef, content: &[u8]) {
+    match store.bug {
+        EvidenceBug::SkipsIntegrity => store
+            .on_disk
+            .lock()
+            .expect("not poisoned")
+            .push((reference.clone(), content.to_vec())),
+        _ => store.inner.tamper(reference, content),
+    }
+}
+
+fn evidence_suite(bug: EvidenceBug) -> Result<(), Violation> {
+    contract::evidence::run(evidence_mutant(bug), tamper_mutant)
 }
 
 impl Evidence for EvidenceMutant {
@@ -236,6 +258,13 @@ impl Evidence for EvidenceMutant {
                 match EvidenceRef::parse(last) {
                     Ok(cut) => self.inner.get(&cut),
                     Err(_) => Err(EvidenceError::NotFound),
+                }
+            }
+            EvidenceBug::SkipsIntegrity => {
+                let on_disk = self.on_disk.lock().expect("not poisoned");
+                match on_disk.iter().rev().find(|(r, _)| r == reference) {
+                    Some((_, content)) => Ok(content.clone()),
+                    None => self.inner.get(reference),
                 }
             }
             _ => self.inner.get(reference),
@@ -294,24 +323,41 @@ impl Ids for SixteenBitIds {
 
 // ------------------------------------------------------- Agent, Verifier, Forge
 
-/// Drops the status from every failure.
-struct StatusDroppingAgent(MemoryAgent);
+/// Drops the status from the failures of one operation only, so the
+/// suite's check of that operation is shown to bite.
+struct StatusDroppingAgent(&'static str, MemoryAgent);
+
+impl StatusDroppingAgent {
+    fn failure(&self, operation: &str, failure: JobFailure) -> JobFailure {
+        if self.0 == operation {
+            without_status(failure)
+        } else {
+            failure
+        }
+    }
+}
 
 impl Agent for StatusDroppingAgent {
     fn triage(&self, request: &TriageRequest) -> Result<TriageReport, JobFailure> {
-        self.0.triage(request).map_err(without_status)
+        self.1
+            .triage(request)
+            .map_err(|f| self.failure("triage", f))
     }
     fn write_reproduction(&self, request: &ReproductionRequest) -> Result<Written, JobFailure> {
-        self.0.write_reproduction(request).map_err(without_status)
+        let result = self.1.write_reproduction(request);
+        result.map_err(|f| self.failure("write_reproduction", f))
     }
     fn analyze_root_cause(
         &self,
         request: &RootCauseRequest,
     ) -> Result<RootCauseReport, JobFailure> {
-        self.0.analyze_root_cause(request).map_err(without_status)
+        let result = self.1.analyze_root_cause(request);
+        result.map_err(|f| self.failure("analyze_root_cause", f))
     }
     fn write_fix(&self, request: &FixRequest) -> Result<Written, JobFailure> {
-        self.0.write_fix(request).map_err(without_status)
+        self.1
+            .write_fix(request)
+            .map_err(|f| self.failure("write_fix", f))
     }
 }
 
@@ -328,8 +374,8 @@ fn silent_agent() -> MemoryAgent {
 enum VerifierBug {
     /// Drops the last citation status.
     DropsStatus,
-    /// Drops the status from every failure.
-    DropsFailureStatus,
+    /// Drops the status from the failures of this operation only.
+    DropsFailureStatusOn(&'static str),
 }
 
 struct VerifierMutant(VerifierBug, MemoryVerifier);
@@ -338,7 +384,7 @@ impl Verifier for VerifierMutant {
     fn check_reproduction(&self, base: &CommitSha, test: &[u8]) -> Result<TestStatus, JobFailure> {
         self.1
             .check_reproduction(base, test)
-            .map_err(|f| self.failure(f))
+            .map_err(|f| self.failure("check_reproduction", f))
     }
     fn verify_citations(
         &self,
@@ -348,7 +394,7 @@ impl Verifier for VerifierMutant {
         let mut statuses = self
             .1
             .verify_citations(base, citations)
-            .map_err(|f| self.failure(f))?;
+            .map_err(|f| self.failure("verify_citations", f))?;
         if matches!(self.0, VerifierBug::DropsStatus) {
             statuses.pop();
         }
@@ -362,15 +408,15 @@ impl Verifier for VerifierMutant {
     ) -> Result<FixChecks, JobFailure> {
         self.1
             .verify_fix(base, diff, test)
-            .map_err(|f| self.failure(f))
+            .map_err(|f| self.failure("verify_fix", f))
     }
 }
 
 impl VerifierMutant {
-    fn failure(&self, failure: JobFailure) -> JobFailure {
+    fn failure(&self, operation: &str, failure: JobFailure) -> JobFailure {
         match self.0 {
-            VerifierBug::DropsFailureStatus => without_status(failure),
-            VerifierBug::DropsStatus => failure,
+            VerifierBug::DropsFailureStatusOn(op) if op == operation => without_status(failure),
+            _ => failure,
         }
     }
 }
@@ -413,19 +459,24 @@ fn verifier_fixtures(
 enum ForgeBug {
     /// Every call returns the same reference.
     SameReference,
-    /// Drops the status from every failure.
-    DropsFailureStatus,
+    /// Drops the status from the failures of this operation only.
+    DropsFailureStatusOn(&'static str),
 }
 
 struct ForgeMutant(ForgeBug, MemoryForge);
 
 impl ForgeMutant {
-    fn answer(&self, result: Result<ForgeRef, JobFailure>) -> Result<ForgeRef, JobFailure> {
+    fn answer(
+        &self,
+        operation: &str,
+        result: Result<ForgeRef, JobFailure>,
+    ) -> Result<ForgeRef, JobFailure> {
         match self.0 {
             ForgeBug::SameReference => {
                 result.map(|_| ForgeRef::parse("pull-1").expect("not blank"))
             }
-            ForgeBug::DropsFailureStatus => result.map_err(without_status),
+            ForgeBug::DropsFailureStatusOn(op) if op == operation => result.map_err(without_status),
+            ForgeBug::DropsFailureStatusOn(_) => result,
         }
     }
 }
@@ -436,10 +487,10 @@ impl Forge for ForgeMutant {
         ticket: &Ticket,
         questions: &[String],
     ) -> Result<ForgeRef, JobFailure> {
-        self.answer(self.1.post_questions(ticket, questions))
+        self.answer("post_questions", self.1.post_questions(ticket, questions))
     }
     fn open_pull_request(&self, request: &PullRequest) -> Result<ForgeRef, JobFailure> {
-        self.answer(self.1.open_pull_request(request))
+        self.answer("open_pull_request", self.1.open_pull_request(request))
     }
 }
 
@@ -452,83 +503,85 @@ fn silent_forge() -> MemoryForge {
 
 // --------------------------------------------------------------------- Table
 
-/// One mutant: the suite it runs against, the clause it breaks, and the
-/// suite's result on it.
-type Mutant = (&'static str, &'static str, fn() -> Result<(), Violation>);
+/// One mutant: the port and clause it breaks, the operation whose check it
+/// targets (empty for clauses without operations), and the suite's result.
+struct Mutant {
+    port: &'static str,
+    clause: &'static str,
+    operation: &'static str,
+    run: Box<dyn Fn() -> Result<(), Violation>>,
+}
+
+fn mutant(
+    port: &'static str,
+    clause: &'static str,
+    run: impl Fn() -> Result<(), Violation> + 'static,
+) -> Mutant {
+    Mutant {
+        port,
+        clause,
+        operation: "",
+        run: Box::new(run),
+    }
+}
+
+fn silent_mutant(
+    port: &'static str,
+    operation: &'static str,
+    run: impl Fn() -> Result<(), Violation> + 'static,
+) -> Mutant {
+    Mutant {
+        port,
+        clause: "silent-failure-detail",
+        operation,
+        run: Box::new(run),
+    }
+}
 
 fn mutants() -> Vec<Mutant> {
-    vec![
-        ("EventStore", "create-then-load", || {
-            contract::event_store::run(store_mutant(StoreBug::LazyCreate))
-        }),
-        ("EventStore", "append-order", || {
-            contract::event_store::run(store_mutant(StoreBug::Reversed))
-        }),
-        ("EventStore", "duplicates-kept", || {
-            contract::event_store::run(store_mutant(StoreBug::DropsDuplicates))
-        }),
-        ("EventStore", "runs-isolated", || {
-            contract::event_store::run(store_mutant(StoreBug::SharedLog))
-        }),
-        ("EventStore", "unknown-run", || {
-            contract::event_store::run(store_mutant(StoreBug::UnknownIsEmpty))
-        }),
-        ("EventStore", "create-twice", || {
-            contract::event_store::run(store_mutant(StoreBug::CreateTwiceOk))
-        }),
-        ("EventStore", "round-trip", || {
-            contract::event_store::run(store_mutant(StoreBug::StripsNul))
-        }),
-        ("EventStore", "hostile-run-ids", || {
-            contract::event_store::run(store_mutant(StoreBug::LastComponent))
-        }),
-        ("Evidence", "round-trip", || {
-            contract::evidence::run(evidence_mutant(EvidenceBug::Truncates))
-        }),
-        ("Evidence", "content-addressed", || {
-            contract::evidence::run(evidence_mutant(EvidenceBug::NoDedup))
-        }),
-        ("Evidence", "distinct-content", || {
-            contract::evidence::run(evidence_mutant(EvidenceBug::KeyedByLength))
-        }),
-        ("Evidence", "unknown-reference", || {
-            contract::evidence::run(evidence_mutant(EvidenceBug::UnknownIsEmpty))
-        }),
-        ("Evidence", "hostile-references", || {
-            contract::evidence::run(evidence_mutant(EvidenceBug::LastComponent))
-        }),
-        ("Clock", "non-decreasing", || {
+    let store = |clause, bug| {
+        mutant("EventStore", clause, move || {
+            contract::event_store::run(store_mutant(bug))
+        })
+    };
+    let evidence = |clause, bug| mutant("Evidence", clause, move || evidence_suite(bug));
+    let mut all = vec![
+        store("create-then-load", StoreBug::LazyCreate),
+        store("append-order", StoreBug::Reversed),
+        store("duplicates-kept", StoreBug::DropsDuplicates),
+        store("runs-isolated", StoreBug::SharedLog),
+        store("unknown-run", StoreBug::UnknownIsEmpty),
+        store("create-twice", StoreBug::CreateTwiceOk),
+        store("round-trip", StoreBug::StripsNul),
+        store("hostile-run-ids", StoreBug::LastComponent),
+        evidence("round-trip", EvidenceBug::Truncates),
+        evidence("content-addressed", EvidenceBug::NoDedup),
+        evidence("distinct-content", EvidenceBug::KeyedByLength),
+        evidence("unknown-reference", EvidenceBug::UnknownIsEmpty),
+        evidence("hostile-references", EvidenceBug::LastComponent),
+        evidence("tampered-content-rejected", EvidenceBug::SkipsIntegrity),
+        mutant("Clock", "non-decreasing", || {
             contract::clock::run(&BackwardsClock {
                 inner: StepClock::new(5_000, 1),
                 readings: Mutex::new(0),
             })
         }),
-        ("Ids", "not-blank", || {
+        mutant("Ids", "not-blank", || {
             contract::ids::run(&BlankOnceIds {
                 inner: SequentialIds::new(),
                 issued: Mutex::new(0),
             })
         }),
-        ("Ids", "distinct", || {
+        mutant("Ids", "distinct", || {
             contract::ids::run(&SixteenBitIds {
                 next: Mutex::new(0),
             })
         }),
-        ("Agent", "silent-failure-detail", || {
-            contract::agent::run(|| SilentFailure {
-                adapter: StatusDroppingAgent(silent_agent()),
-                status: String::from(STATUS),
-            })
-        }),
-        ("Verifier", "one-status-per-citation", || {
+        mutant("Verifier", "one-status-per-citation", || {
             let (answering, silent) = verifier_fixtures(VerifierBug::DropsStatus);
             contract::verifier::run(answering, silent)
         }),
-        ("Verifier", "silent-failure-detail", || {
-            let (answering, silent) = verifier_fixtures(VerifierBug::DropsFailureStatus);
-            contract::verifier::run(answering, silent)
-        }),
-        ("Forge", "distinct-references", || {
+        mutant("Forge", "distinct-references", || {
             contract::forge::run(
                 || ForgeMutant(ForgeBug::SameReference, MemoryForge::new()),
                 || SilentFailure {
@@ -537,56 +590,103 @@ fn mutants() -> Vec<Mutant> {
                 },
             )
         }),
-        ("Forge", "silent-failure-detail", || {
+    ];
+    for &operation in contract::agent::OPERATIONS {
+        all.push(silent_mutant("Agent", operation, move || {
+            contract::agent::run(|| SilentFailure {
+                adapter: StatusDroppingAgent(operation, silent_agent()),
+                status: String::from(STATUS),
+            })
+        }));
+    }
+    for &operation in contract::verifier::OPERATIONS {
+        all.push(silent_mutant("Verifier", operation, move || {
+            let bug = VerifierBug::DropsFailureStatusOn(operation);
+            let (answering, silent) = verifier_fixtures(bug);
+            contract::verifier::run(answering, silent)
+        }));
+    }
+    for &operation in contract::forge::OPERATIONS {
+        all.push(silent_mutant("Forge", operation, move || {
+            let bug = ForgeBug::DropsFailureStatusOn(operation);
             contract::forge::run(
-                || ForgeMutant(ForgeBug::DropsFailureStatus, MemoryForge::new()),
-                || SilentFailure {
-                    adapter: ForgeMutant(ForgeBug::DropsFailureStatus, silent_forge()),
+                move || ForgeMutant(bug, MemoryForge::new()),
+                move || SilentFailure {
+                    adapter: ForgeMutant(bug, silent_forge()),
                     status: String::from(STATUS),
                 },
             )
-        }),
-    ]
+        }));
+    }
+    all
 }
 
 #[test]
 fn every_clause_is_killed() {
-    for (port, clause, run) in mutants() {
-        match run() {
-            Ok(()) => panic!("the {port} mutant for {clause} passed its suite"),
+    for m in mutants() {
+        let (port, clause, operation) = (m.port, m.clause, m.operation);
+        match (m.run)() {
+            Ok(()) => panic!("the {port} mutant for {clause} {operation} passed its suite"),
             Err(violation) => {
                 assert_eq!(
                     (violation.port, violation.clause),
                     (port, clause),
-                    "the {port} mutant for {clause} broke another clause first: {violation:?}"
+                    "the {port} mutant for {clause} {operation} broke another clause first: \
+                     {violation:?}"
+                );
+                // A per-operation mutant must be caught by that operation's
+                // check, not an earlier one.
+                assert!(
+                    violation.detail.starts_with(&format!("{operation}:")) || operation.is_empty(),
+                    "the {port} mutant for {operation} was caught elsewhere: {violation:?}"
                 );
             }
         }
     }
 }
 
+/// Every clause has a mutant, and `silent-failure-detail` has one per
+/// operation of its port.
 #[test]
 fn mutant_table_covers_every_clause() {
-    let suites: [(&str, &[&str]); 7] = [
-        ("EventStore", contract::event_store::CLAUSES),
-        ("Evidence", contract::evidence::CLAUSES),
-        ("Clock", contract::clock::CLAUSES),
-        ("Ids", contract::ids::CLAUSES),
-        ("Agent", contract::agent::CLAUSES),
-        ("Verifier", contract::verifier::CLAUSES),
-        ("Forge", contract::forge::CLAUSES),
+    let suites: [(&str, &[&str], &[&str]); 7] = [
+        ("EventStore", contract::event_store::CLAUSES, &[]),
+        ("Evidence", contract::evidence::CLAUSES, &[]),
+        ("Clock", contract::clock::CLAUSES, &[]),
+        ("Ids", contract::ids::CLAUSES, &[]),
+        (
+            "Agent",
+            contract::agent::CLAUSES,
+            contract::agent::OPERATIONS,
+        ),
+        (
+            "Verifier",
+            contract::verifier::CLAUSES,
+            contract::verifier::OPERATIONS,
+        ),
+        (
+            "Forge",
+            contract::forge::CLAUSES,
+            contract::forge::OPERATIONS,
+        ),
     ];
-    let clauses: Vec<(&str, &str)> = suites
+    let mut wanted = BTreeSet::new();
+    for (port, clauses, operations) in suites {
+        for &clause in clauses {
+            if clause == "silent-failure-detail" {
+                for &operation in operations {
+                    wanted.insert((port, clause, operation));
+                }
+            } else {
+                wanted.insert((port, clause, ""));
+            }
+        }
+    }
+    let table = mutants();
+    let have: BTreeSet<(&str, &str, &str)> = table
         .iter()
-        .flat_map(|(port, clauses)| clauses.iter().map(move |clause| (*port, *clause)))
+        .map(|m| (m.port, m.clause, m.operation))
         .collect();
-    let killed: Vec<(&str, &str)> = mutants().iter().map(|(p, c, _)| (*p, *c)).collect();
-    let unique: BTreeSet<(&str, &str)> = killed.iter().copied().collect();
-    assert_eq!(unique.len(), killed.len(), "a clause has two mutants");
-    assert_eq!(
-        unique,
-        clauses.iter().copied().collect::<BTreeSet<_>>(),
-        "mutants and clauses are not a bijection"
-    );
-    assert_eq!(killed.len(), clauses.len());
+    assert_eq!(have.len(), table.len(), "a case has two mutants");
+    assert_eq!(have, wanted, "mutants and clause cases are not a bijection");
 }

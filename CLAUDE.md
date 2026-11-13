@@ -37,8 +37,10 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `..` or a backslash). The scan is a best-effort first layer; the gate for address
    leaks is the two-process replay test in `boneli-replay-check`, which
    folds the domain's scenario corpus (ADR-002) and plays the app corpus,
-   `DebugTicket` on the in-memory adapters (ADR-004), as decided at STOP 2
-   of #28. Dependency `cfg`s of core crates are also
+   `DebugTicket` on the in-memory adapters with a fault injected at every
+   port call (ADR-004), as decided at STOP 2 of #28. It covers run data;
+   contract-suite output is test output that cannot reach it (ADR-004,
+   D10). Dependency `cfg`s of core crates are also
    evaluated on `x86_64-unknown-none` (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,
    transitive ones included, needs a record with a reason in

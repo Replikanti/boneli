@@ -18,6 +18,9 @@ pub enum EvidenceError {
     NotFound,
     /// The reference has a form this store never issues.
     InvalidReference,
+    /// What the store holds under the reference is not what was put under
+    /// it (ADR-004, D9).
+    Corrupted,
     /// The store could not be reached or written.
     Unavailable {
         /// What went wrong, as the store reports it.
@@ -32,6 +35,9 @@ impl fmt::Display for EvidenceError {
             EvidenceError::InvalidReference => {
                 f.write_str("the reference has a form this store never issues")
             }
+            EvidenceError::Corrupted => {
+                f.write_str("the stored content does not match its reference")
+            }
             EvidenceError::Unavailable { detail } => {
                 write!(f, "the evidence store is unavailable: {detail}")
             }
@@ -41,12 +47,15 @@ impl fmt::Display for EvidenceError {
 
 impl core::error::Error for EvidenceError {}
 
-/// Content-addressed storage: the same bytes give the same reference, and
-/// different bytes give different references.
+/// Content-addressed storage: the same bytes give the same reference,
+/// different bytes give different references, and a reference only ever
+/// reads back the bytes put under it.
 pub trait Evidence {
     /// Stores the bytes and returns their reference.
     fn put(&self, content: &[u8]) -> Result<EvidenceRef, EvidenceError>;
 
-    /// The bytes stored under the reference, exactly as put.
+    /// The bytes stored under the reference, exactly as put. Content that
+    /// changed after it was put is [`EvidenceError::Corrupted`], never
+    /// returned (ADR-004, D9).
     fn get(&self, reference: &EvidenceRef) -> Result<Vec<u8>, EvidenceError>;
 }

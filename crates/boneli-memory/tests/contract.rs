@@ -83,7 +83,10 @@ fn in_memory_event_store_passes_contract() {
 
 #[test]
 fn in_memory_evidence_passes_contract() {
-    assert_eq!(contract::evidence::run(MemoryEvidence::new), Ok(()));
+    assert_eq!(
+        contract::evidence::run(MemoryEvidence::new, MemoryEvidence::tamper),
+        Ok(())
+    );
 }
 
 #[test]
@@ -170,4 +173,37 @@ fn scripts_answer_in_order_then_fail_by_name() {
         checks.map_err(|f| f.detail().to_owned()),
         Err::<FixChecks, _>(String::from("no scripted response for verify_fix"))
     );
+}
+
+/// A blank status in a silent-failure fixture is a violation, not a pass:
+/// every detail contains the empty string.
+#[test]
+fn blank_fixture_status_is_a_violation() {
+    let blank = || ScriptedFailure {
+        status: String::from(" "),
+        ..silent()
+    };
+    let agent = contract::agent::run(|| SilentFailure {
+        status: String::new(),
+        ..silent_agent()
+    });
+    let verifier = contract::verifier::run(answering_verifier, || SilentFailure {
+        status: String::from("\u{200B}"),
+        ..silent_verifier()
+    });
+    let forge = contract::forge::run(MemoryForge::new, || SilentFailure {
+        adapter: MemoryForge::scripted(ForgeScript {
+            post_questions: vec![Response::Fail(blank())],
+            open_pull_request: vec![Response::Fail(blank())],
+        }),
+        status: String::from(" "),
+    });
+    for (port, result) in [("Agent", agent), ("Verifier", verifier), ("Forge", forge)] {
+        let violation = result.expect_err("a blank fixture status must not pass");
+        assert_eq!(
+            (violation.port, violation.clause),
+            (port, "silent-failure-detail")
+        );
+        assert!(violation.detail.contains("is blank"), "{violation:?}");
+    }
 }

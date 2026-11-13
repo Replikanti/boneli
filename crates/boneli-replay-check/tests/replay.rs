@@ -55,7 +55,8 @@ fn two_processes_produce_identical_debug_output() {
         .lines()
         .filter_map(|line| line.strip_prefix("app-scenario "))
         .collect();
-    let app_names: Vec<&str> = app::scenarios().iter().map(|s| s.name).collect();
+    let app_scenarios = app::scenarios();
+    let app_names: Vec<&str> = app_scenarios.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         app_headers, app_names,
         "the harness skipped or reordered app scenarios"
@@ -206,4 +207,53 @@ fn hand_written_fmt_impls(krate: &str, min_files: usize) -> Vec<String> {
         }
     }
     found
+}
+
+/// Contract-suite output never reaches run data (ADR-004, D10). Only
+/// `contract.rs` builds a `Violation`, and nothing else in `boneli-app`
+/// names the `contract` module or the type, so no use case, and with it no
+/// event, evidence or forge request, can carry violation text. Nothing in
+/// `boneli-memory`'s library or the replay check's library names them
+/// either; their tests do. The replay gate therefore covers the core's run
+/// data without playing the suites.
+#[test]
+fn contract_output_never_reaches_run_data() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let named = |text: &str| -> bool {
+        let code: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("contract::")
+            || compact.contains("Violation")
+            || compact.contains("modcontract")
+            || compact.contains("usecrate::contract")
+            || compact.contains("usesuper::contract")
+    };
+    let mut scanned = 0;
+    for krate in ["boneli-app", "boneli-memory", "boneli-replay-check"] {
+        for file in std::fs::read_dir(root.join(krate).join("src")).expect("sources") {
+            let path = file.expect("a directory entry").path();
+            let name = path.file_name().expect("a file name").to_string_lossy();
+            let text = std::fs::read_to_string(&path).expect("UTF-8 source");
+            scanned += 1;
+            if krate == "boneli-app" && name == "contract.rs" {
+                continue;
+            }
+            if krate == "boneli-app" && name == "lib.rs" {
+                // The only mention outside the module: its declaration.
+                let code: Vec<&str> = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .filter(|line| line.contains("contract"))
+                    .collect();
+                assert_eq!(code, ["pub mod contract;"], "{krate}/{name}");
+                continue;
+            }
+            assert!(!named(&text), "{krate}/{name} names the contract suites");
+        }
+    }
+    assert!(scanned >= 20, "too few sources scanned: {scanned}");
 }

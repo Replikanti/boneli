@@ -81,7 +81,9 @@ fn fixed<T>(
 }
 
 /// `silent-failure-detail` for one operation: it failed, and its detail is
-/// not blank and contains the status.
+/// not blank and contains the status. A blank fixture status is itself a
+/// violation: every detail contains the empty string, so the clause would
+/// check nothing. Every violation detail starts with the operation's name.
 fn silent_detail<T: core::fmt::Debug>(
     port: &'static str,
     operation: &str,
@@ -89,11 +91,21 @@ fn silent_detail<T: core::fmt::Debug>(
     status: &str,
 ) -> Result<(), Violation> {
     let clause = "silent-failure-detail";
+    if is_blank(status) {
+        return Err(violation(
+            port,
+            clause,
+            format!(
+                "{operation}: the fixture's status {status:?} is blank, so the clause cannot \
+                 check that the detail names it"
+            ),
+        ));
+    }
     match result {
         Ok(value) => Err(violation(
             port,
             clause,
-            format!("{operation} succeeded with {value:?} instead of failing"),
+            format!("{operation}: succeeded with {value:?} instead of failing"),
         )),
         Err(failure) => ensure(
             !is_blank(failure.detail()) && failure.detail().contains(status),
@@ -101,7 +113,7 @@ fn silent_detail<T: core::fmt::Debug>(
             clause,
             || {
                 format!(
-                    "{operation} failed with detail {:?}, which does not name the status {status:?}",
+                    "{operation}: failed with detail {:?}, which does not name the status {status:?}",
                     failure.detail()
                 )
             },
@@ -518,6 +530,7 @@ pub mod evidence {
         "distinct-content",
         "unknown-reference",
         "hostile-references",
+        "tampered-content-rejected",
     ];
 
     /// 1 MiB: above the 8 KiB `BufReader` default and the 64 KiB Linux pipe
@@ -525,12 +538,38 @@ pub mod evidence {
     pub const LARGE_BLOB: usize = 1 << 20;
 
     /// Checks every clause; each clause gets a fresh store from `make`.
-    pub fn run<E: Evidence>(make: impl Fn() -> E) -> Result<(), Violation> {
+    ///
+    /// `tamper` overwrites what the store holds under a reference behind
+    /// its back, the way another process with write access to a file store's
+    /// directory could (ADR-004, D9). Only the adapter's own test knows how.
+    pub fn run<E: Evidence>(
+        make: impl Fn() -> E,
+        tamper: impl Fn(&E, &EvidenceRef, &[u8]),
+    ) -> Result<(), Violation> {
         round_trip(&make())?;
         content_addressed(&make())?;
         distinct_content(&make())?;
         unknown_reference(&make(), &make())?;
-        hostile_references(&make())
+        hostile_references(&make())?;
+        tampered_content_rejected(&make(), tamper)
+    }
+
+    /// A reference names the bytes put under it: content changed behind the
+    /// store's back is `Corrupted` on `get`, never returned. This is what
+    /// makes the pull request carry the bytes the verifier checked (D9).
+    /// The replacement has the same length, so a length check is not
+    /// enough.
+    fn tampered_content_rejected<E: Evidence>(
+        store: &E,
+        tamper: impl Fn(&E, &EvidenceRef, &[u8]),
+    ) -> Result<(), Violation> {
+        let clause = "tampered-content-rejected";
+        let reference = put(store, clause, b"original")?;
+        tamper(store, &reference, b"tampered");
+        let got = store.get(&reference);
+        ensure(got == Err(EvidenceError::Corrupted), PORT, clause, || {
+            format!("get {reference:?} after its content changed gave {got:?}, expected Corrupted")
+        })
     }
 
     fn put(
@@ -743,6 +782,15 @@ pub mod agent {
     /// The clauses, in the order [`run`] checks them.
     pub const CLAUSES: &[&str] = &["silent-failure-detail"];
 
+    /// The operations `silent-failure-detail` checks, in order; a violation
+    /// detail starts with one of them.
+    pub const OPERATIONS: &[&str] = &[
+        "triage",
+        "write_reproduction",
+        "analyze_root_cause",
+        "write_fix",
+    ];
+
     /// Checks every clause. `silent` gives a fresh adapter for each of the
     /// four operations.
     pub fn run<A: Agent>(silent: impl Fn() -> SilentFailure<A>) -> Result<(), Violation> {
@@ -800,6 +848,10 @@ pub mod verifier {
 
     /// The clauses, in the order [`run`] checks them.
     pub const CLAUSES: &[&str] = &["one-status-per-citation", "silent-failure-detail"];
+
+    /// The operations `silent-failure-detail` checks, in order; a violation
+    /// detail starts with one of them.
+    pub const OPERATIONS: &[&str] = &["check_reproduction", "verify_citations", "verify_fix"];
 
     /// A verifier set up to answer `verify_citations` for these citations
     /// at this base.
@@ -877,6 +929,10 @@ pub mod forge {
 
     /// The clauses, in the order [`run`] checks them.
     pub const CLAUSES: &[&str] = &["distinct-references", "silent-failure-detail"];
+
+    /// The operations `silent-failure-detail` checks, in order; a violation
+    /// detail starts with one of them.
+    pub const OPERATIONS: &[&str] = &["post_questions", "open_pull_request"];
 
     fn sample_request(clause: &'static str) -> Result<PullRequest, Violation> {
         let attached = |reference: &str, content: &[u8]| {
