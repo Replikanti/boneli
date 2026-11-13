@@ -21,7 +21,8 @@ harness. Rust workspace, hexagonal architecture. Public repository
    adapters → domain, app and support crates; support crates (`boneli-sys`,
    `boneli-http`, `boneli-https`, ...) stay generic; composition roots
    (`boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`,
-   `boneli-cli`) wire adapters and nothing depends on them.
+   `boneli-cli`) wire adapters and nothing depends on them. The test-only
+   root `boneli-replay-check` (ADR-002) is a leaf too.
    `tools/check-architecture.sh` enforces it.
 2. **Core purity** (domain, app): no external dependencies, no wall clock,
    filesystem, network, environment, threads, processes, async or
@@ -34,7 +35,8 @@ harness. Rust workspace, hexagonal architecture. Public repository
    built from macro metavariables, `core::task` and its wakers, `{` or `}`
    in core file paths, `include_str!` paths that are absolute or contain
    `..` or a backslash). The scan is a best-effort first layer; the gate for address
-   leaks is the two-process replay tests of #2 (domain) and #3 (app),
+   leaks is the two-process replay test in `boneli-replay-check`, which
+   folds the domain's scenario corpus (ADR-002) and gets an app mode in #3,
    decided at STOP 2 of #28. Dependency `cfg`s of core crates are also
    evaluated on `x86_64-unknown-none` (ADR-001).
 3. **Pure Rust, minimal dependencies:** every edge into an external crate,

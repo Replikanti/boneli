@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "boneli-domain"
 version = "0.0.0"
+
+[[package]]
+name = "boneli-replay-check"
+version = "0.0.0"
+dependencies = [
+ "boneli-domain",
+]

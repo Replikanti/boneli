@@ -19,7 +19,11 @@ core = ["boneli-domain", "boneli-app"]
 # Generic plumbing without domain knowledge.
 support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-toml"]
 # Composition roots: wire adapters, nothing depends on them.
-roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli"]
+# boneli-replay-check is the test-only root of ADR-002: the two-process
+# replay gate for address leaks. As a root it is a leaf, so no production
+# crate can depend on it, and it may later depend on the in-memory adapters
+# that the application replay (#3) needs.
+roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check"]
 # The only crates that may contain `unsafe`.
 unsafe = ["boneli-sys"]
 # The only crates that may have a build script (and with it a `links` key,

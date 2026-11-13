@@ -115,6 +115,8 @@ The line is a state machine. Every step is a job in a sandbox and every gate is 
 6. **Pull request** with the root cause, reproduction test, before and after results, cost and a link to the transcript. A human always merges.
 7. **Golden cases.** A human picks closed bugs as golden cases, and the line is regression-tested against them before every change of model, prompts or configuration. Review comments are only candidates; we do not generate rules from them automatically.
 
+The states, events, commands and terminal outcomes of the run, the budget units and the gate rules are fixed in ADR-002. A run whose verify job crossed the budget still opens the pull request and states the overrun.
+
 **Patch policy** checks diff size, forbidden paths (CI, Dockerfile, CODEOWNERS), binaries, symlinks pointing outside and disabled tests.
 
 **Customer standards** (a hypothesis to validate in customer interviews):
@@ -229,6 +231,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 - **Adapters** (`boneli-<port>-<impl>`): port implementations, each in its own crate on top of `boneli-app`.
 - **Support crates** (`boneli-sys`, `boneli-http`, `boneli-https`, ...): generic plumbing that adapters use, without any knowledge of the domain. `boneli-https` is the only place for TLS.
 - **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
+- **Replay check** (`boneli-replay-check`, test only): a composition root that nothing depends on. It folds the domain's scenario corpus in two child processes and in its own and compares the `Debug` output byte for byte, the gate for address leaks from the core (ADR-001, ADR-002).
 
 **Use cases** cover every part on top of one core: `BuildEnvironment`, `OnboardRepo`, `DebugTicket`, `BuildCase`, `RunBench`.
 
