@@ -462,14 +462,20 @@ data. So every violation that a mutant produces is gated, wherever
 violations flow. A violation site that no mutant reaches is not: each
 clause case is reached once, by its mutant, and a clause with several
 `ensure` sites has the others unplayed. A cheap tripwire,
-`contract_suites_stay_out_of_library_code`, parses the identifiers and
-`use` trees of every library source of `boneli-app` (outside the module)
-and `boneli-memory` (outside `#[cfg(test)]`). It fails if any of them names
-the `contract` module or `Violation`, so a use case cannot turn violation
-text into run data without a visible change. It does not scan real
+`contract_suites_stay_out_of_library_code`, tokenizes every library source
+of `boneli-domain`, `boneli-app` (outside the module) and `boneli-memory`
+with comments and literals removed, drops only the items under a real `#[cfg(test)]`
+attribute, and fails if the identifier `contract` or `Violation` is left
+anywhere: in a `use` tree, a path, a rename, a raw identifier or a macro
+argument. So a use case cannot turn violation text into run data without a
+visible change; `tripwire_tokens_are_not_fooled` pins the bypasses review
+found (a renamed brace import, the attribute text in a comment) and the
+literal forms around them. The domain is in the scan because a
+`macro_rules!` there could emit the path inside a use case; core, alloc and
+std are the only other macro sources these crates see. It is still a
+tripwire over the token stream, not a parser, and it does not scan real
 adapters or roots, which call the suites from their tests.
 
-## Consequences
 ## Consequences
 
 - The contract suites and their fixtures ship in the `boneli-app` library,

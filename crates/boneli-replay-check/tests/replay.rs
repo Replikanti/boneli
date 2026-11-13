@@ -221,30 +221,50 @@ fn hand_written_fmt_impls(krate: &str, min_files: usize) -> Vec<String> {
     found
 }
 
-/// The identifiers of Rust source, with comments, string and character
-/// literals removed: enough to see paths and `use` trees.
-fn identifiers(code: &str) -> Vec<String> {
+/// The tokens of Rust source that the tripwire needs: identifiers and the
+/// punctuation `; { } : # [ ] ( )`. Comments (nested block comments too),
+/// string, byte-string, raw-string and character literals are removed, so
+/// text inside them can neither hide code nor end the scan early.
+fn tokens(code: &str) -> Vec<String> {
     let chars: Vec<char> = code.chars().collect();
     let mut out = Vec::new();
     let mut k = 0;
     while k < chars.len() {
         let c = chars[k];
-        if c == '/' && chars.get(k + 1) == Some(&'/') {
+        let next = chars.get(k + 1).copied();
+        if c == '/' && next == Some('/') {
             while k < chars.len() && chars[k] != '\n' {
                 k += 1;
             }
-        } else if c == '/' && chars.get(k + 1) == Some(&'*') {
-            k += 2;
-            while k + 1 < chars.len() && !(chars[k] == '*' && chars[k + 1] == '/') {
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while k < chars.len() {
+                if chars[k] == '/' && chars.get(k + 1) == Some(&'*') {
+                    depth += 1;
+                    k += 2;
+                } else if chars[k] == '*' && chars.get(k + 1) == Some(&'/') {
+                    depth -= 1;
+                    k += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    k += 1;
+                }
+            }
+        } else if let Some(end) = raw_string_end(&chars, k) {
+            k = end;
+        } else if c == '"' {
+            k = quoted_end(&chars, k, '"');
+        } else if c == '\'' {
+            // A character literal, or the quote of a lifetime or label.
+            if next == Some('\\') {
+                k = quoted_end(&chars, k, '\'');
+            } else if chars.get(k + 2) == Some(&'\'') {
+                k += 3;
+            } else {
                 k += 1;
             }
-            k += 2;
-        } else if c == '"' {
-            k += 1;
-            while k < chars.len() && chars[k] != '"' {
-                k += if chars[k] == '\\' { 2 } else { 1 };
-            }
-            k += 1;
         } else if c.is_alphabetic() || c == '_' {
             let start = k;
             while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
@@ -252,7 +272,7 @@ fn identifiers(code: &str) -> Vec<String> {
             }
             out.push(chars[start..k].iter().collect());
         } else {
-            if matches!(c, ';' | '{' | '}' | ':') {
+            if matches!(c, ';' | '{' | '}' | ':' | '#' | '[' | ']' | '(' | ')') {
                 out.push(c.to_string());
             }
             k += 1;
@@ -261,17 +281,145 @@ fn identifiers(code: &str) -> Vec<String> {
     out
 }
 
+/// The end of the quoted literal that opens at `k`, honouring escapes.
+fn quoted_end(chars: &[char], k: usize, quote: char) -> usize {
+    let mut j = k + 1;
+    while j < chars.len() && chars[j] != quote {
+        j += if chars[j] == '\\' { 2 } else { 1 };
+    }
+    j + 1
+}
+
+/// The end of the raw string literal (`r"…"`, `r#"…"#`, `br#"…"#`) that
+/// opens at `k`, if one opens there. `r#name` is a raw identifier, not a
+/// literal, and yields `None`.
+fn raw_string_end(chars: &[char], k: usize) -> Option<usize> {
+    let mut j = k;
+    if chars.get(j) == Some(&'b') {
+        j += 1;
+    }
+    if chars.get(j) != Some(&'r') {
+        return None;
+    }
+    j += 1;
+    let hashes = chars[j..].iter().take_while(|c| **c == '#').count();
+    j += hashes;
+    if chars.get(j) != Some(&'"') {
+        return None;
+    }
+    j += 1;
+    while j < chars.len() {
+        let closes = chars[j] == '"'
+            && chars
+                .get(j + 1..j + 1 + hashes)
+                .is_some_and(|tail| tail.iter().all(|c| *c == '#'));
+        if closes {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(chars.len())
+}
+
+/// The tokens with every item under a `#[cfg(test)]` attribute removed: the
+/// attribute, then the item through its first `;` or its first balanced
+/// `{ … }` block, whichever comes first. A skip never runs past the item it
+/// belongs to, so library code after a test module is still scanned; a
+/// skip that stops early only scans more.
+fn without_test_items(tokens: &[String]) -> Vec<String> {
+    const ATTRIBUTE: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+    let mut kept = Vec::new();
+    let mut k = 0;
+    while k < tokens.len() {
+        let attribute = tokens
+            .get(k..k + ATTRIBUTE.len())
+            .is_some_and(|window| window.iter().zip(ATTRIBUTE).all(|(t, a)| t == a));
+        if !attribute {
+            kept.push(tokens[k].clone());
+            k += 1;
+            continue;
+        }
+        k += ATTRIBUTE.len();
+        while k < tokens.len() && tokens[k] != ";" && tokens[k] != "{" {
+            k += 1;
+        }
+        if tokens.get(k).map(String::as_str) == Some("{") {
+            let mut depth = 0usize;
+            while k < tokens.len() {
+                match tokens[k].as_str() {
+                    "{" => depth += 1,
+                    "}" => depth -= 1,
+                    _ => {}
+                }
+                k += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        } else {
+            k += 1;
+        }
+    }
+    kept
+}
+
+/// The tripwire must see through comments, literals and renames, and must
+/// not stop at text that only looks like a test attribute.
+#[test]
+fn tripwire_tokens_are_not_fooled() {
+    let flagged = |code: &str| {
+        without_test_items(&tokens(code))
+            .iter()
+            .any(|t| t == "contract" || t == "Violation")
+    };
+    let bypasses = [
+        // Review round 3 (N4): the attribute text inside a comment.
+        "// #[cfg(test)]\nuse crate::{contract as suites};",
+        "/* #[cfg(test)] */ use crate::{contract as suites};",
+        "/* /* nested */ #[cfg(test)] */ use crate::contract;",
+        // Review round 2: a brace group with a rename.
+        "use crate::{contract as suites};",
+        // A quote in a character literal must not open a string.
+        "const Q: char = '\"'; use crate::contract; const E: &str = \"\";",
+        // Raw strings that contain quotes or the attribute text.
+        "const R: &str = r#\"\" #[cfg(test)]\"#; use crate::contract;",
+        "const B: &[u8] = br\"#[cfg(test)]\"; use crate::contract;",
+        // A raw identifier and a macro argument.
+        "use crate::r#contract;",
+        "m!(contract);",
+        // Library code after a test module is still library code.
+        "#[cfg(test)] mod t { use crate::contract; }\nfn f() -> Violation { todo!() }",
+        "#[cfg(test)] use x::{y};\nuse crate::contract;",
+    ];
+    for code in bypasses {
+        assert!(flagged(code), "not flagged: {code}");
+    }
+    let clean = [
+        "#[cfg(test)] mod tests { use boneli_app::contract; }",
+        "#[cfg(test)] use crate::contract;",
+        "/// Runs the contract suites.\nfn f<'a>(x: &'a str) -> char { 'c' }",
+        "const S: &str = \"contract Violation\";",
+    ];
+    for code in clean {
+        assert!(!flagged(code), "flagged: {code}");
+    }
+}
+
 /// Tripwire behind ADR-004 D10: outside the `contract` module and outside
-/// `#[cfg(test)]` code, no source of `boneli-app` or `boneli-memory` names
-/// the contract suites. Every `use` tree is parsed, so a brace group or a
-/// rename (`use crate::{contract as suites};`) is caught, and so is any
-/// `contract::` path or the `Violation` type. The gate for what violation
+/// items under `#[cfg(test)]`, no source of `boneli-domain`, `boneli-app`
+/// or `boneli-memory` has the identifier `contract` or `Violation` anywhere: not in a `use`
+/// tree, a path, a rename, a raw identifier or a macro argument. Comments
+/// and literals are removed first (`tokens`), and only a real attribute
+/// removes test code (`without_test_items`). The gate for what violation
 /// text holds is the replay of every mutant's violation, not this scan.
 #[test]
 fn contract_suites_stay_out_of_library_code() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut scanned = 0;
-    for krate in ["boneli-app", "boneli-memory"] {
+    // The domain is scanned too: a `macro_rules!` there could emit the
+    // path in a use case, and core, alloc and std are the only other
+    // macro sources these crates see.
+    for krate in ["boneli-domain", "boneli-app", "boneli-memory"] {
         for file in std::fs::read_dir(root.join(krate).join("src")).expect("sources") {
             let path = file.expect("a directory entry").path();
             let name = path
@@ -283,19 +431,10 @@ fn contract_suites_stay_out_of_library_code() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("UTF-8 source");
-            // Unit tests sit at the end of a file, after `#[cfg(test)]`.
-            let library = text.split("#[cfg(test)]").next().unwrap_or_default();
-            let words = identifiers(library);
+            let words = without_test_items(&tokens(&text));
             scanned += 1;
-            let mut in_use = false;
             for (k, word) in words.iter().enumerate() {
-                match word.as_str() {
-                    "use" => in_use = true,
-                    ";" => in_use = false,
-                    _ => {}
-                }
-                let next_is_path = words.get(k + 1).map(String::as_str) == Some(":");
-                let named = word == "Violation" || (word == "contract" && (in_use || next_is_path));
+                let named = word == "Violation" || word == "contract";
                 let declaration = krate == "boneli-app"
                     && name == "lib.rs"
                     && word == "contract"
@@ -309,5 +448,5 @@ fn contract_suites_stay_out_of_library_code() {
             }
         }
     }
-    assert!(scanned >= 17, "too few sources scanned: {scanned}");
+    assert!(scanned >= 26, "too few sources scanned: {scanned}");
 }
