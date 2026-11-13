@@ -56,6 +56,20 @@ pub enum Target {
     },
 }
 
+impl Target {
+    /// Parses an authority-form value, `host:port` or `[ipv6]:port`, with
+    /// exactly the grammar of a CONNECT target (ADR-003, item 3): the same
+    /// function decides both, so a value accepted here canonicalizes to the
+    /// `Target` the server would hand to a handler for `CONNECT value`, and
+    /// a value rejected here is rejected there. The egress proxy parses its
+    /// allowlist entries with it (ADR-006, D2). Nothing is trimmed or
+    /// repaired; anything else is `Error::Malformed`.
+    pub fn parse_authority(value: &str) -> Result<Target> {
+        let (host, port) = parse_authority(value)?;
+        Ok(Target::Authority { host, port })
+    }
+}
+
 /// Header fields in the order received, duplicates kept. Names compare
 /// case-insensitively.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

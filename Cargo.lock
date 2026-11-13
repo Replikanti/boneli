@@ -14,6 +14,13 @@ name = "boneli-domain"
 version = "0.0.0"
 
 [[package]]
+name = "boneli-egress"
+version = "0.0.0"
+dependencies = [
+ "boneli-http",
+]
+
+[[package]]
 name = "boneli-http"
 version = "0.0.0"
 dependencies = [
