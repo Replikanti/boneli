@@ -1,0 +1,3 @@
+# an ADR that names buildy but was rejected approves nothing
+policy-format
+dep-build-script

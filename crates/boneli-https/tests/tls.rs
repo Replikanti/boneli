@@ -3,6 +3,7 @@
 //! roots, the idle check of a reused connection, and HTTPS through a
 //! CONNECT tunnel of `boneli-http`.
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -47,7 +48,7 @@ fn config(roots: Roots) -> TlsConfig {
 }
 
 fn options() -> ConnectOptions {
-    ConnectOptions::new(GUARD, GUARD).expect("valid options")
+    ConnectOptions::new(GUARD, GUARD, GUARD).expect("valid options")
 }
 
 fn wide() -> Limits {
@@ -187,27 +188,46 @@ fn certificate_error(err: Error) -> CertificateError {
     }
 }
 
-/// A stream that counts every read and write and has no data.
+/// A stream that counts every read, write and timeout change and has no
+/// data.
 #[derive(Default)]
 struct Untouched {
-    calls: usize,
+    calls: Cell<usize>,
+}
+
+impl Untouched {
+    fn call(&self) {
+        self.calls.set(self.calls.get() + 1);
+    }
 }
 
 impl Read for Untouched {
     fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        self.calls += 1;
+        self.call();
         Ok(0)
     }
 }
 
 impl Write for Untouched {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.calls += 1;
+        self.call();
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.calls += 1;
+        self.call();
+        Ok(())
+    }
+}
+
+impl Transport for &mut Untouched {
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        self.call();
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        self.call();
         Ok(())
     }
 }
@@ -260,7 +280,7 @@ fn wrong_name_rejected() {
     let (addr, _server) = http_server(default_server());
     let tcp = TcpStream::connect(addr).expect("tcp");
     tcp.set_read_timeout(Some(GUARD)).expect("timeout");
-    let err = connect_over(tcp, "other.test", &config(test_roots()))
+    let err = connect_over(tcp, "other.test", &config(test_roots()), &options())
         .expect_err("a name the certificate does not carry");
     let cert = certificate_error(err);
     assert!(
@@ -287,9 +307,14 @@ fn invalid_server_names_rejected() {
         "10.1",
     ] {
         let mut stream = Untouched::default();
-        let err = connect_over(&mut stream, name, &config(test_roots())).expect_err("invalid name");
+        let err = connect_over(&mut stream, name, &config(test_roots()), &options())
+            .expect_err("invalid name");
         assert!(matches!(err, Error::InvalidServerName), "{name:?}: {err:?}");
-        assert_eq!(stream.calls, 0, "{name:?}: no I/O before the name check");
+        assert_eq!(
+            stream.calls.get(),
+            0,
+            "{name:?}: no I/O before the name check"
+        );
 
         // `connect` refuses before it resolves or dials.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -439,7 +464,7 @@ fn handshake_timeout() {
     let port = listener.local_addr().expect("addr").port();
     let silent = thread::spawn(move || listener.accept().map(|(stream, _)| stream));
     let io_timeout = Duration::from_millis(200);
-    let options = ConnectOptions::new(GUARD, io_timeout).expect("options");
+    let options = ConnectOptions::new(GUARD, GUARD, io_timeout).expect("options");
     let start = Instant::now();
     let err =
         connect("127.0.0.1", port, &config(test_roots()), &options).expect_err("no ServerHello");
@@ -452,6 +477,138 @@ fn handshake_timeout() {
     // 25 times the timeout: room for a loaded CI runner.
     assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     drop(silent.join().expect("silent thread"));
+}
+
+/// A server that reads the ClientHello and then sends its first flight
+/// one byte every 150 ms, which would take minutes, until the client goes
+/// away.
+fn trickle_server() -> (SocketAddr, thread::JoinHandle<io::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = thread::spawn(move || -> io::Result<()> {
+        let (mut tcp, _) = listener.accept()?;
+        tcp.set_read_timeout(Some(GUARD))?;
+        let mut conn = ServerConnection::new(default_server()).map_err(io::Error::other)?;
+        while !conn.wants_write() {
+            conn.read_tls(&mut tcp)?;
+            conn.process_new_packets().map_err(io::Error::other)?;
+        }
+        let mut flight = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut flight)?;
+        }
+        assert!(flight.len() > 500, "{} bytes", flight.len());
+        for byte in flight {
+            if tcp.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        Ok(())
+    });
+    (addr, handle)
+}
+
+/// Runs `handshake` on a thread and asserts that it fails with the
+/// handshake deadline's `TimedOut` after `handshake_timeout` and well
+/// before the trickle would end.
+fn assert_deadline<T: Send + 'static>(
+    handshake_timeout: Duration,
+    handshake: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let start = Instant::now();
+        let result = handshake().map(|_| ());
+        let _ = tx.send((start.elapsed(), result));
+    });
+    // 25 times the deadline: room for a loaded CI runner.
+    let (elapsed, result) = rx
+        .recv_timeout(handshake_timeout * 25)
+        .expect("the handshake ended at its deadline");
+    let err = result.expect_err("a trickled handshake times out");
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut),
+        "{err:?}"
+    );
+    assert!(elapsed >= handshake_timeout, "{elapsed:?}");
+}
+
+#[test]
+fn handshake_deadline_bounds_trickled_connect() {
+    // Review of PR B, finding 3: each byte arrives within `io_timeout`, so
+    // only the total deadline ends the handshake.
+    let (addr, _server) = trickle_server();
+    let handshake_timeout = Duration::from_millis(800);
+    let options =
+        ConnectOptions::new(GUARD, handshake_timeout, Duration::from_millis(200)).expect("options");
+    assert_deadline(handshake_timeout, move || {
+        connect("localhost", addr.port(), &config(test_roots()), &options)
+    });
+}
+
+#[test]
+fn handshake_deadline_bounds_trickled_connect_over() {
+    let (addr, _server) = trickle_server();
+    let handshake_timeout = Duration::from_millis(800);
+    let options =
+        ConnectOptions::new(GUARD, handshake_timeout, Duration::from_millis(200)).expect("options");
+    assert_deadline(handshake_timeout, move || {
+        let tcp = TcpStream::connect(addr).map_err(Error::Io)?;
+        connect_over(tcp, "localhost", &config(test_roots()), &options)
+    });
+}
+
+#[test]
+fn handshake_deadline_shortens_a_read() {
+    // A silent server and an `io_timeout` far beyond the deadline: the
+    // read waits only for what is left of the deadline.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let silent = thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+    let handshake_timeout = Duration::from_millis(300);
+    let options = ConnectOptions::new(GUARD, handshake_timeout, GUARD).expect("options");
+    let start = Instant::now();
+    let err =
+        connect("127.0.0.1", port, &config(test_roots()), &options).expect_err("no ServerHello");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut),
+        "{err:?}"
+    );
+    assert!(elapsed >= handshake_timeout, "{elapsed:?}");
+    assert!(elapsed < GUARD / 2, "{elapsed:?}");
+    drop(silent.join().expect("silent thread"));
+}
+
+#[test]
+fn handshake_sets_io_timeout_after_deadline() {
+    // During the handshake the timeouts follow the deadline (here below
+    // `io_timeout`); afterwards both are `io_timeout`.
+    let io_timeout = Duration::from_secs(9);
+    let options = ConnectOptions::new(GUARD, Duration::from_secs(8), io_timeout).expect("options");
+    let (addr, _server) = http_server(default_server());
+    let tls = connect("localhost", addr.port(), &config(test_roots()), &options).expect("tls");
+    assert_eq!(
+        tls.get_ref().read_timeout().expect("read"),
+        Some(io_timeout)
+    );
+    assert_eq!(
+        tls.get_ref().write_timeout().expect("write"),
+        Some(io_timeout)
+    );
+
+    let (addr, _server) = http_server(default_server());
+    let tcp = TcpStream::connect(addr).expect("tcp");
+    let tls = connect_over(tcp, "localhost", &config(test_roots()), &options).expect("tls");
+    assert_eq!(
+        tls.get_ref().read_timeout().expect("read"),
+        Some(io_timeout)
+    );
+    assert_eq!(
+        tls.get_ref().write_timeout().expect("write"),
+        Some(io_timeout)
+    );
 }
 
 // ---------------------------------------------------- configuration
@@ -509,8 +666,12 @@ fn empty_roots_rejected() {
 #[test]
 fn zero_options_rejected() {
     let one = Duration::from_secs(1);
-    for (connect_timeout, io_timeout) in [(Duration::ZERO, one), (one, Duration::ZERO)] {
-        let err = ConnectOptions::new(connect_timeout, io_timeout).expect_err("zero timeout");
+    let zero = Duration::ZERO;
+    for (connect_timeout, handshake_timeout, io_timeout) in
+        [(zero, one, one), (one, zero, one), (one, one, zero)]
+    {
+        let err = ConnectOptions::new(connect_timeout, handshake_timeout, io_timeout)
+            .expect_err("zero timeout");
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
     let err = connect("localhost", 0, &config(test_roots()), &options()).expect_err("port zero");
@@ -696,6 +857,223 @@ fn peer_close_while_idle_fails_next_request() {
     assert!(matches!(err, boneli_http::Error::Malformed(_)), "{err:?}");
 }
 
+/// Encrypts `plaintext` on the server as TLS records, without sending
+/// them: the bytes go to the caller, who decides what reaches the wire.
+fn encrypt(stream: &mut StreamOwned<ServerConnection, TcpStream>, plaintext: &[u8]) -> Vec<u8> {
+    stream
+        .conn
+        .writer()
+        .write_all(plaintext)
+        .expect("plaintext");
+    let mut raw = Vec::new();
+    while stream.conn.wants_write() {
+        stream.conn.write_tls(&mut raw).expect("records");
+    }
+    raw
+}
+
+/// What the client sent until it went away; the client drops connections
+/// without `close_notify`.
+fn read_rest(stream: &mut StreamOwned<ServerConnection, TcpStream>) -> io::Result<Vec<u8>> {
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => Ok(rest),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(rest),
+        Err(e) => Err(e),
+    }
+}
+
+#[test]
+fn partial_record_while_idle_is_not_idle() {
+    // Review of PR B, finding 1: all but the last byte of an application
+    // data record have arrived. rustls has no complete record and so no
+    // plaintext, but the bytes are input that arrived.
+    let (to_server, from_client) = mpsc::channel::<()>();
+    let (to_client, from_server) = mpsc::channel::<()>();
+    let (addr, server) = tls_server(default_server(), move |mut stream| -> io::Result<()> {
+        let raw = encrypt(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL",
+        );
+        stream.sock.write_all(&raw[..raw.len() - 1])?;
+        to_client.send(()).map_err(io::Error::other)?;
+        from_client.recv().map_err(io::Error::other)?;
+        Ok(())
+    });
+    let mut tls =
+        connect("localhost", addr.port(), &config(test_roots()), &options()).expect("tls");
+    from_server
+        .recv_timeout(GUARD)
+        .expect("partial record sent");
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        tls.is_idle().expect("check"),
+        Some(false),
+        "a record that has partly arrived is input"
+    );
+    assert_eq!(tls.is_idle().expect("check"), Some(false), "still partial");
+    to_server.send(()).expect("done");
+    server
+        .join()
+        .expect("server thread")
+        .expect("server")
+        .expect("served");
+}
+
+#[test]
+fn partial_unsolicited_response_fails_next_request() {
+    // Review of PR B, finding 1: only the first 20 bytes of an unsolicited
+    // response's record arrive before the next request. Sending the
+    // request would make the rest of that record its answer.
+    let (to_server, from_client) = mpsc::channel::<()>();
+    let (to_client, from_server) = mpsc::channel::<()>();
+    let (addr, server) = tls_server(default_server(), move |mut stream| -> io::Result<Vec<u8>> {
+        read_request_head(&mut stream);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")?;
+        stream.flush()?;
+        from_client.recv().map_err(io::Error::other)?;
+        let raw = encrypt(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL",
+        );
+        stream.sock.write_all(&raw[..20])?;
+        to_client.send(()).map_err(io::Error::other)?;
+        read_rest(&mut stream)
+    });
+    let tls = connect("localhost", addr.port(), &config(test_roots()), &options()).expect("tls");
+    let mut conn = Connection::new(tls, "localhost", wide()).expect("connection");
+    assert_eq!(get(&mut conn), (200, b"ok".to_vec()));
+    to_server.send(()).expect("go");
+    from_server
+        .recv_timeout(GUARD)
+        .expect("partial record sent");
+    thread::sleep(Duration::from_millis(50));
+
+    let err = conn
+        .request(&get_root(), RequestBody::None)
+        .map(|response| response.head.status)
+        .expect_err("part of a record had arrived before the request");
+    assert!(matches!(err, boneli_http::Error::Malformed(_)), "{err:?}");
+    assert!(!conn.is_reusable());
+    drop(conn);
+    let rest = server
+        .join()
+        .expect("server thread")
+        .expect("server")
+        .expect("read");
+    assert!(
+        rest.is_empty(),
+        "no request sent: {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+#[test]
+fn partial_record_after_response_fails_next_request() {
+    // Review of PR B, finding 1: the head of an unsolicited record arrives
+    // in the same segment as the end of a response, so rustls takes it in
+    // while the client reads that response, before any idle check.
+    let (addr, server) = tls_server(default_server(), move |mut stream| -> io::Result<Vec<u8>> {
+        read_request_head(&mut stream);
+        let mut raw = encrypt(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let evil = encrypt(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL",
+        );
+        raw.extend_from_slice(&evil[..20]);
+        stream.sock.write_all(&raw)?;
+        read_rest(&mut stream)
+    });
+    let tls = connect("localhost", addr.port(), &config(test_roots()), &options()).expect("tls");
+    let mut conn = Connection::new(tls, "localhost", wide()).expect("connection");
+    assert_eq!(get(&mut conn), (200, b"ok".to_vec()));
+    thread::sleep(Duration::from_millis(50));
+
+    let err = conn
+        .request(&get_root(), RequestBody::None)
+        .map(|response| response.head.status)
+        .expect_err("part of a record had arrived before the request");
+    assert!(matches!(err, boneli_http::Error::Malformed(_)), "{err:?}");
+    drop(conn);
+    let rest = server
+        .join()
+        .expect("server thread")
+        .expect("server")
+        .expect("read");
+    assert!(
+        rest.is_empty(),
+        "no request sent: {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+#[test]
+fn session_ticket_split_across_reads_stays_idle() {
+    // The TLS 1.3 session tickets reach the client in three pieces: the
+    // first ends inside a record header, the second inside a record body.
+    // While a ticket record is incomplete the check fails closed; once it
+    // is complete the connection is idle again and serves a request.
+    let (to_server, from_client) = mpsc::channel::<()>();
+    let (to_client, from_server) = mpsc::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut tcp, _) = listener.accept()?;
+        tcp.set_read_timeout(Some(GUARD))?;
+        tcp.set_write_timeout(Some(GUARD))?;
+        let mut conn = ServerConnection::new(default_server()).map_err(io::Error::other)?;
+        while conn.is_handshaking() {
+            if conn.wants_write() {
+                conn.write_tls(&mut tcp)?;
+            } else {
+                conn.read_tls(&mut tcp)?;
+                conn.process_new_packets().map_err(io::Error::other)?;
+            }
+        }
+        // The handshake is over and the tickets are still queued.
+        let mut tickets = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut tickets)?;
+        }
+        assert!(tickets.len() > 5, "a TLS 1.3 server sends tickets");
+        let body_split = 5
+            + (tickets.len() - 5).min(usize::from(u16::from_be_bytes([tickets[3], tickets[4]])))
+                / 2;
+        for piece in [
+            &tickets[..3],
+            &tickets[3..body_split],
+            &tickets[body_split..],
+        ] {
+            tcp.write_all(piece)?;
+            to_client.send(()).map_err(io::Error::other)?;
+            from_client.recv().map_err(io::Error::other)?;
+        }
+        let five = Duration::from_secs(5);
+        let limits = ServerLimits::new(wide(), 4, five, five, five).expect("server limits");
+        let _ =
+            boneli_http::serve_connection(ServerTls(StreamOwned::new(conn, tcp)), &limits, &hello);
+        Ok(())
+    });
+    let mut tls = connect("localhost", port, &config(test_roots()), &options()).expect("tls");
+    assert_eq!(
+        tls.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+    for (piece, idle) in [("header", false), ("body", false), ("rest", true)] {
+        from_server.recv_timeout(GUARD).expect(piece);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(tls.is_idle().expect("check"), Some(idle), "after {piece}");
+        to_server.send(()).expect("next");
+    }
+    let mut conn = Connection::new(tls, "localhost", wide()).expect("connection");
+    assert_eq!(get(&mut conn), (200, b"hello".to_vec()));
+    drop(conn);
+    server.join().expect("server thread").expect("server");
+}
+
 // --------------------------------------------------- CONNECT tunnels
 
 /// Copies `from` into `to` until the end of the stream, then shuts down
@@ -742,8 +1120,8 @@ fn https_through_connect_tunnel() {
 
     let tunnel =
         connect_tunnel(client_side, "localhost", tls_addr.port(), &wide()).expect("tunnel");
-    let tls =
-        connect_over(tunnel, "localhost", &config(test_roots())).expect("TLS over the tunnel");
+    let tls = connect_over(tunnel, "localhost", &config(test_roots()), &options())
+        .expect("TLS over the tunnel");
     let mut conn = Connection::new(tls, "localhost", wide()).expect("connection");
     assert_eq!(get(&mut conn), (200, b"hello".to_vec()));
     assert_eq!(

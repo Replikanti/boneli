@@ -1,1 +1,1 @@
-# build scripts with a build-script key that resolves pass, renamed ones too
+# build scripts approved by an accepted ADR that names each crate pass, renamed ones too, and the phrase may wrap

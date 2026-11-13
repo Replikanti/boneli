@@ -621,6 +621,21 @@ def strip_html_comments(text):
     return text if cut < 0 else text[:cut]
 
 
+def adr_accepted(text):
+    """True when the first status line of an ADR (comments stripped) is accepted."""
+    status = next((ln for ln in text.split("\n") if ln.startswith("- Status:")), None)
+    return status is not None and status.rstrip("\r") == "- Status: accepted"
+
+
+def names_build_script(text, crate):
+    """True when an ADR (comments stripped) says `<crate>'s build script is
+    approved`, with the crate name not glued to a longer name and line
+    breaks inside the phrase read as spaces."""
+    flat = " ".join(text.split())
+    pattern = r"(?<![A-Za-z0-9_-])" + re.escape(crate) + r"'s build script is approved"
+    return re.search(pattern, flat) is not None
+
+
 class Policy:
     pass
 
@@ -743,14 +758,26 @@ def check_policy(data, root, rep):
             elif not resolves(marker):
                 bad("%s: strict %s does not resolve to exactly one docs/adr/NNN-*.md" % (where, marker))
         if "build-script" in table:
-            # Only a well-formed key that resolves approves the build script.
+            # Only a well-formed key citing an accepted ADR that names the
+            # crate approves the build script, as for strict edges.
             ref = table["build-script"]
             if not isinstance(ref, str) or not ADR_REF.fullmatch(ref):
                 bad("%s: build-script must be \"ADR-NNN\"" % where)
             elif not resolves(ref):
                 bad("%s: build-script %s does not resolve to exactly one docs/adr/NNN-*.md" % (where, ref))
             else:
-                pol.build_scripts[crate] = ref
+                adr = resolved[ref][0]
+                text = strip_html_comments(read_text(adr, root))
+                approved = True
+                if not adr_accepted(text):
+                    rep.fail("policy-format", rel(root, adr), "%s is not accepted (cited by %s build-script)" % (ref, where))
+                    approved = False
+                if not names_build_script(text, crate):
+                    rep.fail("policy-format", rel(root, adr), "%s does not say \"%s's build script is approved\" (cited by %s build-script)"
+                             % (ref, crate, where))
+                    approved = False
+                if approved:
+                    pol.build_scripts[crate] = ref
         parents = table.get("pulled-by")
         if not isinstance(parents, dict) or not parents:
             bad("%s: no edge record [external.%s.pulled-by.<parent>]" % (where, show(crate)))
@@ -790,8 +817,7 @@ def check_policy(data, root, rep):
                 continue
             adr = resolved[ref][0]
             text = strip_html_comments(read_text(adr, root))
-            status = next((ln for ln in text.split("\n") if ln.startswith("- Status:")), None)
-            if status is None or status.rstrip("\r") != "- Status: accepted":
+            if not adr_accepted(text):
                 rep.fail("policy-strict", rel(root, adr), "%s is not accepted (cited by %s)" % (ref, ewhere))
             if edge not in text:
                 rep.fail("policy-strict", rel(root, adr), "%s does not name the edge %s (cited by %s)" % (ref, edge, ewhere))
@@ -1084,7 +1110,7 @@ def check(root):
         pkg = packages[pid]
         scripts = [t for t in pkg["targets"] if "custom-build" in t["kind"]]
         if scripts and pkg["name"] not in pol.build_scripts:
-            rep.fail("dep-build-script", POLICY, "%s %s has a build script (%s): no build-script = \"ADR-NNN\" in [external.%s]"
+            rep.fail("dep-build-script", POLICY, "%s %s has a build script (%s): no build-script = \"ADR-NNN\" in [external.%s] that approves it"
                      % (pkg["name"], pkg["version"], Path(scripts[0]["src_path"]).name, pkg["name"]))
 
     # The core must build for a target without std.

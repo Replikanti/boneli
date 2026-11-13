@@ -9,11 +9,15 @@
 //! `UnexpectedEof` error, never a clean end of the stream. No 0-RTT data
 //! is sent, and no key log is written (`SSLKEYLOGFILE` is never read).
 //!
+//! The handshake has a total deadline, `ConnectOptions::handshake_timeout`,
+//! on top of the timeout of each read and write, so a peer that sends a
+//! byte now and then cannot hold `connect` open.
+//!
 //! `TlsStream` is a `boneli_http::Transport` when its stream is one, and an
 //! `IdleCheck` that counts what rustls already holds: plaintext it has
-//! decrypted and records that have arrived. A response that arrives inside
-//! TLS while a connection is idle therefore ends that connection, as on a
-//! plain socket (ADR-003, item 12).
+//! decrypted, records that have arrived, and the part of a record that has
+//! arrived. A response that arrives inside TLS while a connection is idle
+//! therefore ends that connection, as on a plain socket (ADR-003, item 12).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 use std::fmt;
@@ -21,7 +25,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boneli_http::{IdleCheck, Transport, Tunnel};
 use rustls::pki_types::pem::{self, PemObject};
@@ -188,24 +192,35 @@ impl TlsConfig {
     }
 }
 
-/// Timeouts for `connect`. No defaults: the right values depend on the
-/// peer, as for `boneli_http::Limits` (ADR-003, item 7).
+/// Timeouts for `connect` and `connect_over`. No defaults: the right
+/// values depend on the peer, as for `boneli_http::Limits` (ADR-003, item
+/// 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
     connect_timeout: Duration,
+    handshake_timeout: Duration,
     io_timeout: Duration,
 }
 
 impl ConnectOptions {
-    /// `connect_timeout` bounds each TCP connection attempt; `io_timeout`
-    /// becomes the socket's read and write timeout, for the handshake and
-    /// after it. A zero value is an error: std rejects a zero timeout.
-    pub fn new(connect_timeout: Duration, io_timeout: Duration) -> Result<ConnectOptions> {
-        if connect_timeout.is_zero() || io_timeout.is_zero() {
+    /// `connect_timeout` bounds each TCP connection attempt of `connect`;
+    /// `connect_over` gets a stream that is already connected and does not
+    /// use it. `handshake_timeout` bounds the whole TLS handshake, however
+    /// the peer spreads its bytes. `io_timeout` bounds each read and write,
+    /// during the handshake and after it, when it becomes the stream's
+    /// read and write timeout. A zero value is an error: std rejects a zero
+    /// timeout.
+    pub fn new(
+        connect_timeout: Duration,
+        handshake_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<ConnectOptions> {
+        if connect_timeout.is_zero() || handshake_timeout.is_zero() || io_timeout.is_zero() {
             return Err(Error::InvalidInput("a timeout is zero"));
         }
         Ok(ConnectOptions {
             connect_timeout,
+            handshake_timeout,
             io_timeout,
         })
     }
@@ -213,6 +228,11 @@ impl ConnectOptions {
     /// The timeout of each TCP connection attempt.
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
+    }
+
+    /// The total time the TLS handshake may take.
+    pub fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
     }
 
     /// The read and write timeout of the socket.
@@ -230,9 +250,10 @@ fn server_name(name: &str) -> Result<ServerName<'static>> {
 }
 
 /// Resolves `host` with std, connects to each address in turn with
-/// `connect_timeout`, sets `io_timeout` on the socket, and completes the
-/// TLS handshake with `host` as the server name. A handshake failure is
-/// returned at once, without trying further addresses.
+/// `connect_timeout`, and completes the TLS handshake with `host` as the
+/// server name within `handshake_timeout`; then `io_timeout` is the
+/// socket's read and write timeout. A handshake failure is returned at
+/// once, without trying further addresses.
 pub fn connect(
     host: &str,
     port: u16,
@@ -246,11 +267,7 @@ pub fn connect(
     let mut last = None;
     for addr in (host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, options.connect_timeout) {
-            Ok(tcp) => {
-                tcp.set_read_timeout(Some(options.io_timeout))?;
-                tcp.set_write_timeout(Some(options.io_timeout))?;
-                return handshake(tcp, name, config);
-            }
+            Ok(tcp) => return handshake(tcp, name, config, options),
             Err(e) => last = Some(e),
         }
     }
@@ -260,32 +277,180 @@ pub fn connect(
 }
 
 /// Completes a TLS handshake over `transport`, for example a CONNECT
-/// tunnel (`boneli_http::connect_tunnel`) through a proxy. The caller sets
-/// the transport's timeouts.
-pub fn connect_over<S: Read + Write>(
+/// tunnel (`boneli_http::connect_tunnel`) through a proxy, within
+/// `handshake_timeout`; then `io_timeout` is the transport's read and
+/// write timeout. `connect_timeout` does not apply: the caller connected.
+pub fn connect_over<S: Transport>(
     transport: S,
     name: &str,
     config: &TlsConfig,
+    options: &ConnectOptions,
 ) -> Result<TlsStream<S>> {
     let name = server_name(name)?;
-    handshake(transport, name, config)
+    handshake(transport, name, config, options)
 }
 
-fn handshake<S: Read + Write>(
-    mut transport: S,
+fn handshake<S: Transport>(
+    transport: S,
     name: ServerName<'static>,
     config: &TlsConfig,
+    options: &ConnectOptions,
 ) -> Result<TlsStream<S>> {
     let mut conn = ClientConnection::new(Arc::clone(&config.client), name).map_err(Error::Tls)?;
-    while conn.is_handshaking() {
-        let (read, written) = conn.complete_io(&mut transport)?;
-        if read == 0 && written == 0 && conn.is_handshaking() {
-            return Err(Error::Io(io::ErrorKind::UnexpectedEof.into()));
+    let deadline = Instant::now()
+        .checked_add(options.handshake_timeout)
+        .ok_or(Error::InvalidInput("the handshake timeout is too large"))?;
+    let mut framed = Framed::new(transport);
+    {
+        let mut io = Deadline {
+            stream: &mut framed,
+            deadline,
+            io_timeout: options.io_timeout,
+        };
+        while conn.is_handshaking() {
+            let (read, written) = conn.complete_io(&mut io)?;
+            if read == 0 && written == 0 && conn.is_handshaking() {
+                return Err(Error::Io(io::ErrorKind::UnexpectedEof.into()));
+            }
         }
     }
+    framed.inner.set_read_timeout(Some(options.io_timeout))?;
+    framed.inner.set_write_timeout(Some(options.io_timeout))?;
     Ok(TlsStream {
-        stream: StreamOwned::new(conn, transport),
+        stream: StreamOwned::new(conn, framed),
     })
+}
+
+/// The stream during the handshake: before each read and write it sets
+/// the stream's timeout to what is left of the handshake deadline, at most
+/// `io_timeout`, so the deadline holds however the peer spreads its bytes
+/// (as the server's deadlines of ADR-003, item 8). rustls' `complete_io`
+/// reads more than once per call, so the deadline lives here and not in
+/// the loop around it.
+struct Deadline<'a, S> {
+    stream: &'a mut Framed<S>,
+    deadline: Instant,
+    io_timeout: Duration,
+}
+
+impl<S: Transport> Deadline<'_, S> {
+    /// The timeout for the next read or write, or a `TimedOut` error when
+    /// the deadline has passed.
+    fn timeout(&self) -> io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(handshake_timed_out());
+        }
+        Ok(left.min(self.io_timeout))
+    }
+
+    /// A read or write that timed out at the deadline is the deadline's
+    /// error, whatever error kind the platform reports for a timeout.
+    fn check(&self, e: io::Error) -> io::Error {
+        let timed_out = matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        );
+        if timed_out && Instant::now() >= self.deadline {
+            return handshake_timed_out();
+        }
+        e
+    }
+}
+
+fn handshake_timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the TLS handshake did not finish in time",
+    )
+}
+
+impl<S: Transport> Read for Deadline<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = self.timeout()?;
+        self.stream.inner.set_read_timeout(Some(timeout))?;
+        self.stream.read(buf).map_err(|e| self.check(e))
+    }
+}
+
+impl<S: Transport> Write for Deadline<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let timeout = self.timeout()?;
+        self.stream.inner.set_write_timeout(Some(timeout))?;
+        self.stream.write(buf).map_err(|e| self.check(e))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let timeout = self.timeout()?;
+        self.stream.inner.set_write_timeout(Some(timeout))?;
+        self.stream.flush().map_err(|e| self.check(e))
+    }
+}
+
+/// The stream under TLS, following the record framing of every byte read
+/// from it. All of them go to rustls, so when a record is incomplete here,
+/// rustls holds part of a record it cannot decrypt yet. Every record,
+/// from the first byte the server sends, starts with a five-byte header
+/// whose last two bytes are the length of the body.
+struct Framed<S> {
+    inner: S,
+    /// The header bytes of the current record read so far.
+    header: [u8; 5],
+    header_len: usize,
+    /// The body bytes of the current record not read yet.
+    body_left: usize,
+}
+
+impl<S> Framed<S> {
+    fn new(inner: S) -> Framed<S> {
+        Framed {
+            inner,
+            header: [0; 5],
+            header_len: 0,
+            body_left: 0,
+        }
+    }
+
+    fn track(&mut self, mut bytes: &[u8]) {
+        while let Some((&first, rest)) = bytes.split_first() {
+            if self.body_left > 0 {
+                let take = self.body_left.min(bytes.len());
+                self.body_left -= take;
+                bytes = &bytes[take..];
+                continue;
+            }
+            self.header[self.header_len] = first;
+            self.header_len += 1;
+            bytes = rest;
+            if self.header_len == self.header.len() {
+                self.body_left = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                self.header_len = 0;
+            }
+        }
+    }
+
+    /// Whether the bytes read so far end inside a record.
+    fn mid_record(&self) -> bool {
+        self.header_len > 0 || self.body_left > 0
+    }
+}
+
+impl<S: Read> Read for Framed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.track(&buf[..n]);
+        Ok(n)
+    }
+}
+
+impl<S: Write> Write for Framed<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A stream whose reads can be switched to non-blocking, so that the idle
@@ -318,7 +483,7 @@ impl<S: Nonblocking> Nonblocking for Tunnel<S> {
 
 /// A client TLS connection over `S`, after its handshake.
 pub struct TlsStream<S: Read + Write> {
-    stream: StreamOwned<ClientConnection, S>,
+    stream: StreamOwned<ClientConnection, Framed<S>>,
 }
 
 impl<S: Read + Write> TlsStream<S> {
@@ -341,7 +506,7 @@ impl<S: Read + Write> TlsStream<S> {
 
     /// The stream under TLS, for example to set timeouts.
     pub fn get_ref(&self) -> &S {
-        &self.stream.sock
+        &self.stream.sock.inner
     }
 
     /// Whether rustls holds plaintext not read yet, or has seen
@@ -356,8 +521,9 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     /// Takes in the records that have arrived on a non-blocking stream:
-    /// `true` when the stream would block with no input, `false` on
-    /// plaintext, `close_notify` or the end of the stream.
+    /// `true` when the stream would block with no input and rustls holds
+    /// no part of a record, `false` on plaintext, `close_notify`, the end
+    /// of the stream or an incomplete record.
     fn take_arrived(&mut self) -> io::Result<bool> {
         loop {
             match self.stream.conn.read_tls(&mut self.stream.sock) {
@@ -367,7 +533,9 @@ impl<S: Read + Write> TlsStream<S> {
                         return Ok(false);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(!self.stream.sock.mid_record());
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -403,29 +571,33 @@ impl<S: Read + Write> Write for TlsStream<S> {
 
 impl<S: Transport> Transport for TlsStream<S> {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.sock.set_read_timeout(timeout)
+        self.stream.sock.inner.set_read_timeout(timeout)
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.sock.set_write_timeout(timeout)
+        self.stream.sock.inner.set_write_timeout(timeout)
     }
 }
 
 impl<S: Read + Write + Nonblocking> IdleCheck for TlsStream<S> {
     /// Input is what rustls already holds (decrypted plaintext not read
     /// yet, or `close_notify`) and what has arrived on the stream. Records
-    /// that arrive are taken into rustls, not dropped, so post-handshake
-    /// messages such as TLS 1.3 session tickets leave the stream idle,
-    /// while application data or the end of the stream does not. Asking
-    /// only the stream under TLS would miss plaintext rustls has buffered,
-    /// and would count a session ticket as input.
+    /// that arrive are taken into rustls, not dropped, so complete
+    /// post-handshake messages such as TLS 1.3 session tickets leave the
+    /// stream idle, while application data or the end of the stream does
+    /// not. Part of a record is input too: rustls cannot tell what it is
+    /// until the rest arrives, and the rest could be a response. So a
+    /// ticket that has partly arrived ends the connection, which costs a
+    /// reconnect and fails closed. Asking only the stream under TLS would
+    /// miss what rustls has buffered, and would count a session ticket as
+    /// input.
     fn is_idle(&mut self) -> io::Result<Option<bool>> {
         if self.has_input()? {
             return Ok(Some(false));
         }
-        self.stream.sock.set_nonblocking(true)?;
+        self.stream.sock.inner.set_nonblocking(true)?;
         let idle = self.take_arrived();
-        self.stream.sock.set_nonblocking(false)?;
+        self.stream.sock.inner.set_nonblocking(false)?;
         idle.map(Some)
     }
 }

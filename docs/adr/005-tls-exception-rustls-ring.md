@@ -122,23 +122,31 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
    compile and link native code that no scan of ours reads. ADR-001 limits
    build scripts of members; this decision extends the rule to
    dependencies. `[external.<crate>]` in `tools/architecture.toml` takes
-   an optional key `build-script = "ADR-NNN"`, which must name an ADR that
-   resolves to exactly one file; any other value is a `policy-format`
-   failure and approves nothing. The rule `dep-build-script` of
-   `tools/check-architecture.sh` fails on every reachable external crate
-   with a build script and without the key. It reads the `custom-build`
-   target from cargo metadata, not file names, so a script renamed with
-   `build = "gen.rs"` counts and `build = false` does not, and it covers
-   crates reached only through a build-dependency. Rejected: a list of
-   approved build scripts in ARCHITECTURE, which no check reads. The
-   approved scripts:
+   an optional key `build-script = "ADR-NNN"`. As for an edge into a
+   strict crate, the ADR must resolve to exactly one file, be accepted,
+   and name the crate, here in the sentence `<crate>'s build script is
+   approved` (outside HTML comments, the crate name not part of a longer
+   name, line breaks read as spaces). ADR-003 item 17 already says it for
+   httparse, in that form. Anything else is a `policy-format` failure and
+   approves nothing, so an ADR about another crate, or one that was
+   proposed or rejected, approves no build script. The rule
+   `dep-build-script` of `tools/check-architecture.sh` fails on every
+   reachable external crate with a build script and without a key that
+   approves it. It reads the `custom-build` target from cargo metadata,
+   not file names, so a script renamed with `build = "gen.rs"` counts and
+   `build = false` does not, and it covers crates reached only through a
+   build-dependency. Rejected: a list of approved build scripts in
+   ARCHITECTURE, which no check reads. The approved scripts:
    - `httparse` (ADR-003, item 17): runs `$RUSTC --version` and prints
      SIMD cfgs.
-   - `libc`: runs `$RUSTC --version` and prints cfgs for the target and
-     the compiler version; it compiles and links nothing.
-   - `rustls`: prints the `read_buf` cfg on a nightly compiler with the
-     `read_buf` feature, which we do not enable; otherwise it is empty.
-   - `ring`: compiles and links C and assembly (item 5).
+   - libc's build script is approved. It runs `$RUSTC --version` and
+     prints cfgs for the target and the compiler version; it compiles
+     and links nothing.
+   - rustls's build script is approved. It prints the `read_buf` cfg on a
+     nightly compiler with the `read_buf` feature, which we do not enable;
+     otherwise it is empty.
+   - ring's build script is approved. It compiles and links C and
+     assembly (item 5).
 
    The weak spot: the approval is per crate, not per version. A version
    update that changes what a build script does passes the check, and only
@@ -173,6 +181,21 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
      never read.
    - `ConnectOptions` has no defaults, for the reason of ADR-003 item 7:
      the right timeouts depend on the peer.
+   - The handshake has a total deadline, `handshake_timeout`, on top of
+     `io_timeout` for each read and write. Before every read and write
+     during the handshake the stream's timeout is set to what is left of
+     the deadline, at most `io_timeout`; when it runs out, the handshake
+     fails with `TimedOut`. Afterwards both timeouts are `io_timeout`. It
+     is the client's side of ADR-003 item 8: without it a peer that sends
+     one byte just inside `io_timeout` holds `connect` for as long as it
+     likes (759 bytes at 150 ms each take about two minutes, and with a
+     30 s `io_timeout` hours). `connect_over` takes the same options and
+     sets the same timeouts, so a tunnel through a proxy is bounded too;
+     there `connect_timeout` does not apply, because the caller
+     connected. A separate field and not the connect timeout for both:
+     a TCP connection attempt and a handshake that crosses the network
+     several times are different budgets, and the connect timeout applies
+     to each address in turn.
 9. **The idle check over TLS.** ADR-003 item 12 lets a client connection be
    reused only while nothing arrives between responses, asked through
    `IdleCheck` before every request. Over TLS the answer cannot come from
@@ -186,8 +209,20 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
    has arrived into rustls, until the socket would block. Plaintext,
    `close_notify` or the end of the stream is input that has arrived;
    records without application data leave the connection idle. Nothing
-   read is dropped. The socket must be able to switch modes (`Nonblocking`,
-   implemented for `TcpStream`, `UnixStream` and a `Tunnel` over either).
+   read is dropped. Part of a record is input too: rustls keeps it
+   without a sign until the rest arrives, and the rest may be a response.
+   If the head of an unsolicited response's record counted as idle, the
+   next request would get that response as its answer. A 16 KiB record
+   spans many TCP segments, and rustls can take the head of the next
+   record in the same read as the end of a response, so this happens
+   without a crafted peer. The stream under rustls therefore follows the
+   record framing (a five-byte header whose last two bytes are the body
+   length) of every byte it reads, from the first byte of the handshake
+   on, and the connection is idle only when those bytes end at a record
+   boundary. A session ticket that has partly arrived then ends the
+   connection too; that fails closed and costs one reconnect. The socket
+   must be able to switch modes (`Nonblocking`, implemented for
+   `TcpStream`, `UnixStream` and a `Tunnel` over either).
    Rejected: answering "cannot tell", which would allow one request per
    TLS connection.
 

@@ -13,8 +13,9 @@
 #   - every edge into a strict crate (`strict = "ADR-NNN"`) cites its own
 #     accepted ADR, and that ADR names the edge as `<parent> -> <crate>`;
 #   - every reachable external crate with a build script carries
-#     `build-script = "ADR-NNN"`, the ADR that approves that script
-#     (ADR-005). The approval is per crate, not per version.
+#     `build-script = "ADR-NNN"`, an accepted ADR that approves that script
+#     as `<crate>'s build script is approved` (ADR-005). The approval is
+#     per crate, not per version.
 
 [roles]
 # Pure core: #![no_std] with alloc, no dependencies, token scan.

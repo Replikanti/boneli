@@ -69,10 +69,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   TLS 1.3 and 1.2, ALPN `http/1.1`, Mozilla's roots from `webpki-roots`
   plus roots the caller adds, the handshake inside `connect` and
   `connect_over` (for CONNECT tunnels), no way to turn verification off,
-  no 0-RTT and no key log. A close without `close_notify` is an error. Its
-  idle check counts plaintext and records rustls holds, so a response
-  that arrives inside TLS while a connection is idle ends it, and session
-  tickets do not.
+  no 0-RTT and no key log. A close without `close_notify` is an error.
+  `ConnectOptions` has a total handshake deadline next to the connect and
+  I/O timeouts, for `connect` and `connect_over` alike. Its idle check
+  counts plaintext and records rustls holds and follows the record framing
+  of every byte read, so a response that arrives inside TLS while a
+  connection is idle ends it, even when only part of its record has
+  arrived, and complete session tickets do not.
+- `boneli-http`: `Tunnel` is a `Transport` when its stream is one.
 - ADR-005: the TLS exception to pure Rust: the 15 crates of the stack and
   their edges, the edges `getrandom -> libc` and `ring -> libc`, ring's C
   and assembly build, the approved build scripts of external crates, and
@@ -81,9 +85,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `build-script = "ADR-NNN"` on every external crate with a build script
   (`httparse`, `libc`, `ring`, `rustls`).
 - The architecture rule `dep-build-script`: every reachable external crate
-  with a build script needs an ADR that approves it; with fixtures for
-  renamed scripts, `build = false`, build-dependencies, Windows-only
-  dependencies and malformed keys.
+  with a build script needs an accepted ADR that says `<crate>'s build
+  script is approved`; with fixtures for renamed scripts, `build = false`,
+  build-dependencies, Windows-only dependencies, malformed keys, an ADR
+  about another crate, a rejected ADR, and names hidden in comments or
+  glued to longer names.
 - `deny.toml`: per-crate license exceptions for ring, untrusted and
   rustls-webpki (ISC), subtle (BSD-3-Clause) and webpki-roots
   (CDLA-Permissive-2.0).

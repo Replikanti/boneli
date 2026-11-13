@@ -1,7 +1,7 @@
 [external.wrapper]
 reason = "fixture crate"
 decision = "ADR-005"
-build-script = "ADR-005"
+build-script = "ADR-900"
 
 [external.wrapper.pulled-by.boneli-http]
 reason = "fixture edge"
