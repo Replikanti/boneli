@@ -276,13 +276,13 @@ impl Run {
 
 ## Pure Rust and dependencies
 
-All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl; for the core crates also the no-std build target); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts of workspace members, and with them native `links` (cargo accepts `links` only with a build script), are allowed only for members listed in `roles.build-script` of that file, each with its own ADR; the list is empty. A build script in a dependency needs an ADR that approves it for that crate (`httparse`: ADR-003); the check that enforces this comes with part 2 of #5.
+All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl; for the core crates also the no-std build target); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts of workspace members, and with them native `links` (cargo accepts `links` only with a build script), are allowed only for members listed in `roles.build-script` of that file, each with its own ADR; the list is empty. A build script in a dependency needs an accepted ADR that approves it for that crate in the sentence `<crate>'s build script is approved`, recorded as `build-script = "ADR-NNN"` on the crate's record; the check fails on every reachable external crate with a build script and without that key (`httparse`: ADR-003; `libc`, `ring`, `rustls`: ADR-005). The approval is per crate, not per version, so a changed build script in an update is caught by reviewing `Cargo.lock`, not by the check (ADR-005).
 
 | Crate | Why | Where it may appear |
 | --- | --- | --- |
-| `libc` | syscall declarations (namespaces, mount, seccomp, Landlock) | only `boneli-sys`; each further edge needs its own ADR (ADR-001) |
+| `libc` | syscall declarations (namespaces, mount, seccomp, Landlock) | `boneli-sys`; inside the TLS stack `getrandom` and `ring` (ADR-005); every further edge needs its own ADR (ADR-001) |
 | `httparse` | HTTP/1.x parsing without further dependencies | `boneli-http` |
-| `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries | only `boneli-https` |
+| `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries | only `boneli-https`; their transitive crates (`rustls-webpki`, `rustls-pki-types`, `untrusted`, `subtle`, `zeroize`, `once_cell`, `getrandom`, `cfg-if`, and `cc`, `shlex`, `find-msvc-tools` for ring's build) are listed in ADR-005 |
 | `sha2` | content addressing, evidence | `boneli-store-fs` |
 | `miniz_oxide`, `ruzstd` | unpacking OCI image layers | `boneli-oci` |
 
@@ -296,7 +296,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 
 **Exceptions where pure Rust is not possible:**
 
-- **TLS:** there is no production-ready cryptographic backend in pure Rust, and `ring` contains assembly and C. We isolate it in a single adapter.
+- **TLS:** there is no production-ready cryptographic backend in pure Rust, and `ring` contains assembly and C. We isolate it in a single support crate, `boneli-https` (ADR-005).
 - **Git:** in the MVP we call `git` as an external binary through an adapter. A native implementation (smart HTTP, packfiles) can come later behind the same port.
 - **Agent:** Claude Code is a Node binary inside the sandbox, not part of our code. Our own harness in Rust will come as another adapter.
 - **Control plane:** multi-tenant Postgres and many connections. We will choose the async runtime and the Postgres client when we get there.

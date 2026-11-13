@@ -1,0 +1,7 @@
+[external.buildy]
+reason = "fixture crate"
+decision = "ADR-005"
+
+[external.buildy.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"

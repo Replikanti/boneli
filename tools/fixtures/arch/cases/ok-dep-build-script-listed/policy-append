@@ -1,0 +1,17 @@
+[external.buildy]
+reason = "fixture crate"
+decision = "ADR-005"
+build-script = "ADR-900"
+
+[external.buildy.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"
+
+[external.renamed]
+reason = "fixture crate"
+decision = "ADR-005"
+build-script = "ADR-900"
+
+[external.renamed.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"

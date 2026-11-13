@@ -1,0 +1,3 @@
+# build-script = "ADR-1": ADR numbers have three digits; it approves nothing
+policy-format
+dep-build-script

@@ -1,0 +1,2 @@
+# a build script under another name (build = "gen.rs") is still one: the rule reads cargo metadata, not file names
+dep-build-script

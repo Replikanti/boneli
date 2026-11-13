@@ -159,3 +159,15 @@ impl<S: Write> Write for Tunnel<S> {
         self.stream.flush()
     }
 }
+
+impl<S: Transport> Transport for Tunnel<S> {
+    /// Sets the timeout of the stream under the tunnel.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /// Sets the timeout of the stream under the tunnel.
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
+}

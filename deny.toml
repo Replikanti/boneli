@@ -26,10 +26,22 @@ allow = [
     "Apache-2.0",
 ]
 # Per-crate exceptions, each with the dependency path that pulls it in.
-# Expected with boneli-https (rustls with the ring provider): ISC for ring,
-# untrusted and rustls-webpki, BSD-3-Clause for subtle. Add them with the
-# PR that introduces boneli-https.
-exceptions = []
+# The TLS stack of boneli-https (ADR-005). Exceptions are by crate name, not
+# version: a license that changes in an update still fails unless it is
+# listed here. ISC, BSD-3-Clause and CDLA-Permissive-2.0 are permissive and
+# compatible with Apache-2.0; binary releases ship their notices (#22).
+exceptions = [
+    # boneli-https -> rustls -> ring: Apache-2.0 AND ISC (BoringSSL code).
+    { crate = "ring", allow = ["ISC"] },
+    # boneli-https -> rustls -> ring -> untrusted, and via rustls-webpki.
+    { crate = "untrusted", allow = ["ISC"] },
+    # boneli-https -> rustls -> rustls-webpki.
+    { crate = "rustls-webpki", allow = ["ISC"] },
+    # boneli-https -> rustls -> subtle.
+    { crate = "subtle", allow = ["BSD-3-Clause"] },
+    # boneli-https -> webpki-roots: Mozilla's root list as data.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"

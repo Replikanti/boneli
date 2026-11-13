@@ -1,0 +1,7 @@
+[external.renamed]
+reason = "fixture crate"
+decision = "ADR-005"
+
+[external.renamed.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"

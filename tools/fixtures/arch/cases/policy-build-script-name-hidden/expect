@@ -1,0 +1,3 @@
+# an accepted ADR that names buildy only inside HTML comments approves nothing
+policy-format
+dep-build-script
