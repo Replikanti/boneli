@@ -118,6 +118,38 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   values outside a request head.
 - ADR-006: the egress proxy, its allowlist, address policy, connect budget,
   answers, relay, write-ahead connection log and server limits.
+- `boneli-sys` (ADR-007, part 1 of #6): the sandbox runtime's first
+  layer on `libc`. `spawn` starts a program in a new user namespace
+  through a raw `clone3` with a pidfd; the child maps one id inside to the
+  caller's uid and gid (`Ids`, single id mapping, `setgroups` denied),
+  starts a new session, resets every signal disposition and the signal
+  mask, keeps only the three stdio descriptors and the given environment,
+  and execs, without allocating. A failed step comes back as
+  `Error::Setup` with the step, item and errno over a close-on-exec pipe;
+  a setup timeout or a malformed report kills and reaps the child. Callers
+  running as root or setuid are refused. `Features::probe` tries every
+  host feature the runtime needs (user namespaces with the map writes,
+  `clone3`, `close_range`, `SECCOMP_RET_KILL_PROCESS`, Landlock ABI 2,
+  cgroup v2 and delegation of the caller's cgroup) and names each missing
+  one with a stable id and its cause, AppArmor's user-namespace
+  restriction included.
+- ADR-007 (proposed): the single id mapping, the seccomp policy table,
+  the kernel floor (Linux 5.19), the spawn model, the host tests and CI,
+  and the lints of the unsafe crate.
+- The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
+  its own `[lints]` table with every workspace lint but `unsafe_code` at
+  the same or a stricter level, the lints of the new
+  `[check] unsafe-lints` array at deny or forbid, and nothing else below
+  deny; with fixtures.
+- CI: the `sandbox` job on x86_64 and arm64 runners, which asserts what a
+  stock runner lacks, prepares the host with the host-setup block from
+  `CLAUDE.md` and runs the `boneli-sys` host tests; `check` also checks
+  `boneli-sys` for `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl`.
+- `CLAUDE.md`: how to run the host tests, and the host-setup block (an
+  AppArmor profile limited to the two `boneli-sys` test binaries, cgroup
+  delegation of cpu, io, memory and pids, linger on headless hosts), the
+  one source for users and CI.
 
 ### Changed
 

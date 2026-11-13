@@ -12,8 +12,10 @@ publish = false
 
 # Unsafe code lives only in boneli-sys, which opts out of these lints
 # explicitly (docs/ARCHITECTURE.md, "Pure Rust and dependencies").
-# tools/check-architecture.sh asserts that unsafe_code stays "forbid" and
-# that every other crate inherits this table unchanged (ADR-001).
+# tools/check-architecture.sh asserts that unsafe_code stays "forbid",
+# that every other crate inherits this table unchanged (ADR-001), and that
+# boneli-sys keeps every other lint here at least as strict in its own table
+# (rule sys-lints, ADR-007).
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
@@ -32,3 +34,4 @@ boneli-app = { path = "crates/boneli-app" }
 boneli-http = { path = "crates/boneli-http" }
 boneli-memory = { path = "crates/boneli-memory" }
 boneli-https = { path = "crates/boneli-https" }
+boneli-sys = { path = "crates/boneli-sys" }

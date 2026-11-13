@@ -1,0 +1,2 @@
+# an allowed group with a higher priority would override the required lints
+sys-lints

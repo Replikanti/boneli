@@ -35,6 +35,7 @@ build-script = ["boneli-store-mem"]
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # A target without std: the core crates must build for it.
 no-std-target = "x86_64-unknown-none"
+unsafe-lints = ["rust.unsafe_op_in_unsafe_fn", "clippy.undocumented_unsafe_blocks", "clippy.multiple_unsafe_ops_per_block"]
 
 [external.libc]
 reason = "syscall declarations (namespaces, mount, seccomp, Landlock)"

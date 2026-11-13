@@ -54,7 +54,12 @@ harness. Rust workspace, hexagonal architecture. Public repository
 4. **Unsafe only in `boneli-sys`.** Every other crate inherits the workspace
    lints, which forbid it; the check also scans every other crate for the
    `unsafe` token and requires the doctest attribute
-   `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. No
+   `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. `boneli-sys`
+   has its own `[lints]` table instead (rule `sys-lints`): every workspace
+   lint except `unsafe_code` at the same or a stricter level, the lints of
+   `[check] unsafe-lints` (`unsafe_op_in_unsafe_fn`,
+   `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`) at `deny`
+   or `forbid`, and nothing else below `deny` (ADR-007, D6). No
    `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
    `#[path]`, `include!` or target source outside `.rs`; no build script in
    a member outside `roles.build-script` in `tools/architecture.toml` (empty;
@@ -90,6 +95,113 @@ tools/check-architecture.sh
 tools/check-architecture.sh --fixtures
 cargo deny check
 ```
+
+CI also runs `cargo check -p boneli-sys --all-targets --target <t>` for
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (once per
+machine: `rustup target add` both).
+
+### Host tests (boneli-sys)
+
+`boneli-sys` creates user namespaces, so its host tests are
+`#[ignore = "host: ..."]` and need a prepared host: unprivileged user
+namespaces (on Ubuntu 23.10+ an AppArmor profile that allows them), a
+cgroup v2 hierarchy whose cgroup the tests run in is delegated to the user
+with the cpu, io, memory and pids controllers, Landlock ABI 2 and Linux
+5.19 (ADR-007, D3 and D5). They never need root and never call `sudo`; a
+missing feature fails them with the probe's message instead of skipping
+them. Run them in a delegated scope:
+
+```sh
+systemd-run --user --scope -q -p Delegate=yes \
+  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS= \
+  cargo test -p boneli-sys -- --ignored
+```
+
+- `BONELI_SYS_EXPECT_MISSING`: unset or empty, the probe test requires
+  that the host lacks nothing; set to a comma-separated list of probe ids
+  (`userns-apparmor`, `cgroup-not-delegated`, ...), it requires exactly
+  that set. CI uses it to prove the error a stock runner gives.
+- `BONELI_SYS_HOST_GAPS`: kernel rows of the seccomp policy this host
+  cannot observe, by id. Exact: an unknown id fails, and so will a listed
+  row that turns out observable. Empty until the seccomp rows exist.
+- `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
+  so the harness may reorganize its own cgroup. Never set it in a terminal
+  whose cgroup holds other processes.
+
+**Preparing a host** takes the block below, run once with root through
+`sudo`. CI runs exactly this block (it extracts it between the markers),
+so a user and CI prepare a host the same way. Inputs: `TARGET_DIR`,
+cargo's target directory; `RUN_USER`, the user who runs the tests;
+`ENABLE_LINGER=1` on hosts without a login session.
+
+1. **AppArmor** (only where `kernel.apparmor_restrict_unprivileged_userns`
+   is 1): a profile that allows user namespaces for the two `boneli-sys`
+   test binaries only, `boneli_sys-<hash>` and `boneli_sys_tests-<hash>`
+   under `$TARGET_DIR/<profile>/deps/`. Everything else on the host keeps
+   the restriction. Undo: `sudo apparmor_parser -R
+   /etc/apparmor.d/boneli-sys-tests && sudo rm
+   /etc/apparmor.d/boneli-sys-tests`. Builds with `--target <triple>` sit
+   one directory deeper and are not matched. **The profile grants user
+   namespaces to whatever sits at those paths, and the building user can
+   write them**: on a shared or desktop host that lifts the restriction
+   for that user. A production runner needs a root-owned binary path
+   (#8).
+2. **cgroup delegation**: user managers get the cpu, io, memory and pids
+   controllers (systemd delegates only some by default; io is the one
+   usually missing). Undo: remove the drop-in and `sudo systemctl
+   daemon-reload`. A desktop session needs a re-login before it applies.
+3. **Linger** (`ENABLE_LINGER=1`): a user manager without a login, which
+   `systemd-run --user` needs on CI and servers; it is restarted so the
+   delegation applies, and the block waits for its bus (30 s is a hang
+   bound, not a target). Undo: `sudo loginctl disable-linger "$RUN_USER"`.
+
+The checks on `TARGET_DIR` keep AppArmor glob and quoting characters out
+of the profile (the path must match `[A-Za-z0-9._/-]`, before and after
+it is resolved) and refuse `/`, which would turn the glob into one over
+the whole filesystem; `realpath` because AppArmor matches the resolved
+exec path. `crates/boneli-sys/tests/boneli_sys_tests/host_setup.rs` runs
+the block against a fake `sudo`.
+
+<!-- host-setup:begin -->
+```sh
+# Inputs: TARGET_DIR (cargo's target dir), RUN_USER (who runs the tests),
+# ENABLE_LINGER=1 on hosts without a login session (CI, servers);
+# APPARMOR_USERNS=1 or 0 overrides the sysctl check of step 1.
+set -eu
+export LC_ALL=C
+check_target_dir() {
+  case $1 in
+    / | *[!A-Za-z0-9._/-]*) echo "host-setup: TARGET_DIR must not be / and must match [A-Za-z0-9._/-]" >&2; exit 2 ;;
+  esac
+}
+check_target_dir "$TARGET_DIR"
+TARGET_DIR=$(realpath -e -- "$TARGET_DIR")
+check_target_dir "$TARGET_DIR"
+# 1. AppArmor (Ubuntu 23.10+): allow user namespaces for the boneli-sys test binaries only.
+if [ "${APPARMOR_USERNS:-$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)}" = 1 ]; then
+  sudo tee /etc/apparmor.d/boneli-sys-tests >/dev/null <<EOF
+abi <abi/4.0>,
+include <tunables/global>
+profile boneli-sys-tests $TARGET_DIR/*/deps/boneli_sys{,_tests}-[0-9a-f]* flags=(unconfined) {
+  userns,
+}
+EOF
+  sudo apparmor_parser -r /etc/apparmor.d/boneli-sys-tests
+fi
+# 2. cgroup v2: delegate cpu, io, memory and pids to user managers.
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/boneli-delegate.conf >/dev/null
+sudo systemctl daemon-reload
+# 3. Headless hosts: a user manager without a login, restarted so the delegation applies.
+if [ "${ENABLE_LINGER:-0}" = 1 ]; then
+  sudo loginctl enable-linger "$RUN_USER"
+  sudo systemctl restart "user@$(id -u "$RUN_USER").service"
+  i=0; until [ -S "/run/user/$(id -u "$RUN_USER")/bus" ]; do
+    i=$((i + 1)); [ "$i" -le 30 ] || { echo "host-setup: no user bus after 30 s" >&2; exit 1; }; sleep 1
+  done
+fi
+```
+<!-- host-setup:end -->
 
 ## Conventions
 

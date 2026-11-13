@@ -1,0 +1,2 @@
+# the own table keeps unwrap_used, but at warn instead of deny
+sys-lints

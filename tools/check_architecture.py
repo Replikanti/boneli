@@ -54,6 +54,7 @@ RULES = [
     "graph-root-leaf",
     "lints-inherit",
     "lints-unsafe",
+    "sys-lints",
     "cargo-config",
     "clippy-config",
     "toolchain-file",
@@ -128,6 +129,9 @@ INNER_ATTR_START = re.compile("#" + WS + "*!" + WS + r"*\[")
 MEMBER_NAME = re.compile(r"boneli-[a-z0-9]+(?:-[a-z0-9]+)*")
 POLICY_NAME = re.compile(r"[A-Za-z0-9_-]+")
 ADR_REF = re.compile(r"ADR-([0-9]{3})")
+LINT_NAME = re.compile(r"(rust|clippy)\.([a-z0-9_]+)")
+# Lint levels in cargo's [lints] tables, weakest first.
+LEVELS = {"allow": 0, "warn": 1, "deny": 2, "forbid": 3}
 LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 
 
@@ -702,7 +706,7 @@ def check_policy(data, root, rep):
         usable = False
     else:
         for key in check:
-            if key not in ("platforms", "no-std-target"):
+            if key not in ("platforms", "no-std-target", "unsafe-lints"):
                 bad("unknown key check.%s" % show(key))
         platforms = check.get("platforms")
         target = check.get("no-std-target")
@@ -713,6 +717,17 @@ def check_policy(data, root, rep):
             bad("check.no-std-target must be a string")
             usable = False
         pol.platforms, pol.no_std_target = platforms, target
+        # Required, so that deleting the line cannot switch the unsafe
+        # lints of rule sys-lints off (ADR-007, D6). A malformed array
+        # leaves the rule without its list; policy-format fails the run.
+        pol.unsafe_lints = None
+        lints = check.get("unsafe-lints")
+        if not isinstance(lints, list) or not lints or not all(isinstance(x, str) and LINT_NAME.fullmatch(x) for x in lints):
+            bad("check.unsafe-lints must be a non-empty array of \"rust.<lint>\" or \"clippy.<lint>\" strings")
+        elif len(set(lints)) != len(lints):
+            bad("check.unsafe-lints names a lint twice")
+        else:
+            pol.unsafe_lints = [tuple(x.split(".", 1)) for x in lints]
     if not usable:
         return None
 
@@ -824,6 +839,55 @@ def check_policy(data, root, rep):
     return pol
 
 
+def lint_level(value):
+    """The level of a [lints] entry, string or `level` form; None if none."""
+    if isinstance(value, dict):
+        value = value.get("level")
+    return value if isinstance(value, str) and value in LEVELS else None
+
+
+def sys_lints(lints, ws_lints, unsafe_lints):
+    """Problems with the own [lints] table of a crate in roles.unsafe."""
+    if not isinstance(lints, dict) or not lints:
+        return ["needs its own [lints] table (ADR-007, D6)"]
+    if "workspace" in lints:
+        return ["[lints] must not be `workspace = true`: the unsafe crate keeps its own copy (ADR-007, D6)"]
+    required = {}
+    if isinstance(ws_lints, dict):
+        for tool, table in ws_lints.items():
+            if not isinstance(table, dict):
+                continue
+            for name, value in table.items():
+                if (tool, name) == ("rust", "unsafe_code"):
+                    continue
+                required[(tool, name)] = lint_level(value) or "forbid"
+    for key in unsafe_lints:
+        if LEVELS[required.get(key, "allow")] < LEVELS["deny"]:
+            required[key] = "deny"
+    problems = []
+    for (tool, name), need in sorted(required.items()):
+        value = dig(lints, tool, name)
+        have = lint_level(value)
+        if value is None:
+            problems.append("%s.%s is missing (needs %s or stricter)" % (tool, name, need))
+        elif have is None or LEVELS[have] < LEVELS[need]:
+            problems.append("%s.%s is %s, needs %s or stricter" % (tool, name, show(str(have or value)), need))
+    # Anything else must not be weaker than deny: an allowed group with a
+    # higher priority would override a required lint.
+    for tool, table in lints.items():
+        if not isinstance(table, dict):
+            problems.append("[lints.%s] must be a table" % show(str(tool)))
+            continue
+        for name, value in table.items():
+            if (tool, name) in required or (tool, name) == ("rust", "unsafe_code"):
+                continue
+            have = lint_level(value)
+            if have is None or LEVELS[have] < LEVELS["deny"]:
+                problems.append("%s.%s is %s: a lint outside the required set must be deny or forbid"
+                                % (show(str(tool)), show(str(name)), show(str(have or value))))
+    return problems
+
+
 def cargo_metadata(root):
     # No --filter-platform: cargo evaluates cfg() without the flags a real
     # build uses (crt-static, custom --cfg), so edges are filtered here.
@@ -930,6 +994,9 @@ def check(root):
         member_manifest = load_toml(Path(pkg["manifest_path"]), root)
         if not is_unsafe and member_manifest.get("lints") != {"workspace": True}:
             rep.fail("lints-inherit", mpath(pkg), "%s: [lints] must be exactly `workspace = true`" % name)
+        if is_unsafe and pol.unsafe_lints is not None:
+            for problem in sys_lints(member_manifest.get("lints"), dig(manifest, "workspace", "lints"), pol.unsafe_lints):
+                rep.fail("sys-lints", mpath(pkg), "%s: %s" % (name, problem))
 
         files, others, links = walk_package(pkg_dir)
         for link in links:

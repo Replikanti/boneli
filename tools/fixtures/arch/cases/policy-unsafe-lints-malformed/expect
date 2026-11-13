@@ -1,0 +1,2 @@
+# check.unsafe-lints is a string, not an array
+policy-format

@@ -54,6 +54,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
