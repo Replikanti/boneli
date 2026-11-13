@@ -115,7 +115,7 @@ The line is a state machine. Every step is a job in a sandbox and every gate is 
 6. **Pull request** with the root cause, reproduction test, before and after results, cost and a link to the transcript. A human always merges.
 7. **Golden cases.** A human picks closed bugs as golden cases, and the line is regression-tested against them before every change of model, prompts or configuration. Review comments are only candidates; we do not generate rules from them automatically.
 
-The states, events, commands and terminal outcomes of the run, the budget units and the gate rules are fixed in ADR-002. A run whose verify job crossed the budget still opens the pull request and states the overrun.
+The states, events, commands and terminal outcomes of the run, the budget units and the gate rules are fixed in ADR-002. A run whose verify job crossed the budget still opens the pull request and states the overrun; the forge adapter renders the pull request and that statement, because the body format depends on the forge (ADR-004). The `DebugTicket` use case executes the run's commands one at a time through the ports (ADR-004). A run that ends with triage questions is followed, once the reporter answers, by a new run that names it as `previous`: that run's triage gets the previous run's questions comment and questions, so it does not start from scratch.
 
 **Patch policy** checks diff size, forbidden paths (CI, Dockerfile, CODEOWNERS), binaries, symlinks pointing outside and disabled tests.
 
@@ -231,7 +231,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 - **Adapters** (`boneli-<port>-<impl>`): port implementations, each in its own crate on top of `boneli-app`.
 - **Support crates** (`boneli-sys`, `boneli-http`, `boneli-https`, ...): generic plumbing that adapters use, without any knowledge of the domain. `boneli-https` is the only place for TLS.
 - **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
-- **Replay check** (`boneli-replay-check`, test only): a composition root that nothing depends on. It folds the domain's scenario corpus in two child processes and in its own and compares the `Debug` output byte for byte, the gate for address leaks from the core (ADR-001, ADR-002).
+- **Replay check** (`boneli-replay-check`, test only): a composition root that nothing depends on. It folds the domain's scenario corpus and plays its own app corpus (`DebugTicket` end to end on the in-memory adapters) in two child processes and in its own and compares the `Debug` output byte for byte, the gate for address leaks from the core (ADR-001, ADR-002, ADR-004).
 
 **Use cases** cover every part on top of one core: `BuildEnvironment`, `OnboardRepo`, `DebugTicket`, `BuildCase`, `RunBench`.
 
@@ -241,12 +241,15 @@ Arrows show the direction of dependencies between crates. The domain and the app
 | `Agent` | `boneli-agent-claude-code` | own harness in Rust, Codex |
 | `Forge` | `boneli-forge-github` | GitLab |
 | `Git` | `boneli-git-cli` | native implementation |
+| `Verifier` | on `Sandbox` and `Git`, per-stack test classification (#17) | |
 | `EventStore`, `Evidence` | `boneli-store-fs`, append-only log and content-addressed storage | Postgres in the control plane |
 | `ImageStore` | `boneli-oci` | |
 | `DataSnapshot` | `boneli-data-postgres`, commands through the `Sandbox` port | MySQL |
 | `Standards` | repository files, web pages through a broker | Confluence, Notion |
 | `Broker` | | SQL, Sentry, logs |
 | `Clock`, `Ids` | system | |
+
+The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates.
 
 **Driving adapters:** CLI, webhooks, control plane connection, bench runner.
 
@@ -267,7 +270,7 @@ impl Run {
 
 **Ports are synchronous.** The runner runs on `std` threads, without an async runtime. That is enough for dozens of runs per runner and saves the largest dependency.
 
-**Testing:** every port has an in-memory adapter and a set of contract tests that both the real and the in-memory adapter must pass. The domain and use cases are tested without Linux and without a network. In-memory adapters that need `std` (a `Mutex`, for example) live in adapter crates, because the core crates are `no_std` (ADR-001); contract suites, generic functions over a port, can stay in `boneli-app`.
+**Testing:** every port has an in-memory adapter and a set of contract tests that both the real and the in-memory adapter must pass. The domain and use cases are tested without Linux and without a network. In-memory adapters that need `std` (a `Mutex`, for example) live in adapter crates, because the core crates are `no_std` (ADR-001); contract suites, generic functions over a port, can stay in `boneli-app`. They live in `boneli_app::contract`, return the violated clause instead of panicking, and `boneli-memory` proves every clause can fail with one mutant adapter per clause (ADR-004).
 
 **Gateway, egress and shim** are separate processes because of the security boundary. The gateway and the egress proxy each have their own small hexagon: a domain (budget, routing, allowlist) and ports (upstream, transcript store).
 

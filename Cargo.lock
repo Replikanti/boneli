@@ -14,8 +14,18 @@ name = "boneli-domain"
 version = "0.0.0"
 
 [[package]]
+name = "boneli-memory"
+version = "0.0.0"
+dependencies = [
+ "boneli-app",
+ "boneli-domain",
+]
+
+[[package]]
 name = "boneli-replay-check"
 version = "0.0.0"
 dependencies = [
+ "boneli-app",
  "boneli-domain",
+ "boneli-memory",
 ]

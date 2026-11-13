@@ -32,6 +32,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte; the gate for address leaks
   from the domain (ADR-001, ADR-002).
 - ADR-002: run state machine, budget units, gates and the replay gate.
+- `boneli-app`: the ports `Agent`, `Verifier`, `Forge`, `EventStore`,
+  `Evidence`, `Clock` and `Ids` as synchronous, object-safe traits;
+  `JobFailure`, whose detail is never blank; `ForgeRef`, never blank; and
+  `replay` of a stored run log (ADR-004).
+- `boneli-app`: the `DebugTicket` use case, which drives a run through the
+  ports one command at a time, appends only accepted events, and hands a
+  re-run after triage questions the previous run's questions (ADR-004).
+- `boneli_app::contract`: contract suites for the seven ports, which return
+  the violated clause instead of panicking and which real adapters reuse.
+- `boneli-memory`: the in-memory adapters of the seven ports, with their
+  contract tests and one mutant per contract clause.
+- `boneli-replay-check`: an app corpus of 31 `DebugTicket` scenarios, played
+  in the two-process replay gate, which now also covers `boneli-app`.
+- ADR-004: ports, in-memory adapters, contract suites and `DebugTicket`;
+  `Verifier` is a port, implemented on `Sandbox` and `Git` in #17.
 
 ### Changed
 

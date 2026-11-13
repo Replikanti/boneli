@@ -1,13 +1,18 @@
-//! Two-process replay gate for the domain (ADR-002; ADR-001, decision D1).
+//! Two-process replay gate for the core (ADR-002, ADR-004; ADR-001,
+//! decision D1).
 //!
 //! The binary prints a probe line with a heap and a code address, then the
 //! pretty `Debug` output of every domain scenario folded through
-//! [`boneli_domain::scenarios::fold`]. The integration test runs the binary
+//! [`boneli_domain::scenarios::fold`], then of every app scenario played
+//! through `DebugTicket` on in-memory adapters ([`app`]), then the
+//! `Display` and `Debug` of every `boneli-app` error variant. The domain and
+//! the application link statically into this one position-independent
+//! binary, so one probe covers both. The integration test runs the binary
 //! twice, checks that the two probes differ (address randomization is on, so
 //! a leaked address would differ too), and compares the rest of both outputs
 //! byte for byte with each other and with the test process's own rendering.
-//! Equal output across three processes means the domain's output holds no
-//! heap or code address.
+//! Equal output across three processes means the output of the domain and
+//! the application holds no heap or code address.
 //!
 //! The harness cannot live in `boneli-domain`: the core token scan covers
 //! every file of a core package, tests included, and bans `std`. It is a
@@ -15,6 +20,8 @@
 #![doc(test(attr(forbid(unsafe_code))))]
 
 use std::fmt::Write as _;
+
+pub mod app;
 
 use boneli_domain::scenarios::{Scenario, all, fold};
 use boneli_domain::{
@@ -123,9 +130,23 @@ fn constructor_errors() -> Vec<DomainError> {
 /// file and the `impl` line above it.
 pub const RENDERED_FMT_IMPLS: &[&str] = &["error.rs: impl fmt::Display for DomainError {"];
 
-/// [`render_scenarios`] over the whole corpus, in [`all`] order.
+/// The hand-written formatting impls of `boneli-app` that
+/// [`app::render_app_errors`] renders, in the same form as
+/// [`RENDERED_FMT_IMPLS`].
+pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
+    "debug_ticket.rs: impl fmt::Display for DebugTicketError {",
+    "evidence.rs: impl fmt::Display for EvidenceError {",
+    "store.rs: impl fmt::Display for StoreError {",
+];
+
+/// The domain section ([`render_scenarios`] over the whole corpus, in
+/// [`all`] order), then the app section ([`app::render_app`] over
+/// [`app::scenarios`]), then [`app::render_app_errors`].
 pub fn render() -> Result<String, DomainError> {
-    render_scenarios(&all())
+    let mut out = render_scenarios(&all())?;
+    out.push_str(&app::render_app(&app::scenarios()));
+    out.push_str(&app::render_app_errors());
+    Ok(out)
 }
 
 /// The first line where `a` and `b` differ: its 1-based number and both

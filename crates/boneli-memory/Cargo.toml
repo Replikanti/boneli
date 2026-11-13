@@ -1,0 +1,20 @@
+[package]
+name = "boneli-memory"
+description = "In-memory adapters of the Boneli ports, for tests and local runs (ADR-004)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Adapter crate: the domain and the application only (ADR-004, D2).
+[dependencies]
+# The values the adapters store and return: run ids, events, evidence
+# references, test and citation statuses.
+boneli-domain.workspace = true
+# The ports the adapters implement and the contract suites their tests run.
+boneli-app.workspace = true

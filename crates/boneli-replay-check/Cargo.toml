@@ -1,6 +1,6 @@
 [package]
 name = "boneli-replay-check"
-description = "Test-only harness: folds the domain scenarios in separate processes and compares their Debug output (ADR-002)."
+description = "Test-only harness: plays the domain and app scenarios in separate processes and compares their Debug output (ADR-002, ADR-004)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,3 +15,8 @@ workspace = true
 [dependencies]
 # The code under test: the harness folds the domain's scenario corpus.
 boneli-domain.workspace = true
+# The code under test in app mode: DebugTicket and the ports (ADR-004).
+boneli-app.workspace = true
+# The in-memory adapters the app scenarios run on (ADR-004); only roots may
+# depend on an adapter crate.
+boneli-memory.workspace = true

@@ -1,9 +1,12 @@
-//! The address-leak gate for `boneli-domain` (ADR-001 decision D1, ADR-002).
+//! The address-leak gate for `boneli-domain` and `boneli-app` (ADR-001
+//! decision D1, ADR-002, ADR-004).
 
 use std::process::Command;
 
 use boneli_domain::scenarios::all;
-use boneli_replay_check::{Probe, RENDERED_FMT_IMPLS, first_difference, parse_probe, render};
+use boneli_replay_check::{
+    Probe, RENDERED_APP_FMT_IMPLS, RENDERED_FMT_IMPLS, app, first_difference, parse_probe, render,
+};
 
 /// Runs the harness binary and returns its probe and the rest of its output.
 fn run_child() -> (Probe, String) {
@@ -48,6 +51,15 @@ fn two_processes_produce_identical_debug_output() {
         .collect();
     let names: Vec<&str> = all().iter().map(|s| s.name).collect();
     assert_eq!(headers, names, "the harness skipped or reordered scenarios");
+    let app_headers: Vec<&str> = out_a
+        .lines()
+        .filter_map(|line| line.strip_prefix("app-scenario "))
+        .collect();
+    let app_names: Vec<&str> = app::scenarios().iter().map(|s| s.name).collect();
+    assert_eq!(
+        app_headers, app_names,
+        "the harness skipped or reordered app scenarios"
+    );
 }
 
 #[test]
@@ -91,8 +103,8 @@ fn first_difference_reports_the_line() {
     assert_eq!(first_difference("a", "a\n"), Some((2, None, None)));
 }
 
-/// Tripwire: every hand-written formatting impl in `boneli-domain` must be
-/// rendered by the harness, because the replay compares only what it prints.
+/// Tripwire: every hand-written formatting impl in `boneli-domain` and
+/// `boneli-app` must be rendered by the harness, because the replay compares only what it prints.
 ///
 /// It counts `fn fmt` definitions, not trait names: every formatting trait
 /// names its method `fmt`, so a renamed import (`use core::fmt::Display as
@@ -100,25 +112,67 @@ fn first_difference_reports_the_line() {
 /// separate lines still count, and so does a raw `r#fmt`. A `macro_rules!`
 /// could build the name from a fragment, so any macro definition fails too.
 /// Each definition is listed by file and the `impl` line above it; a new one
-/// fails until `render_scenarios` prints it and `RENDERED_FMT_IMPLS` lists it.
+/// fails until the harness prints it and `RENDERED_FMT_IMPLS` (domain) or
+/// `RENDERED_APP_FMT_IMPLS` (app) lists it.
 #[test]
 fn every_hand_written_fmt_impl_is_rendered() {
-    const DEFINITIONS: [&str; 3] = ["fnfmt(", "fnfmt<", "fnr#fmt"];
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../boneli-domain/src");
+    assert_eq!(
+        hand_written_fmt_impls("boneli-domain", 9),
+        RENDERED_FMT_IMPLS,
+        "a hand-written formatting impl in boneli-domain is not rendered by the replay \
+         harness: print it in render_scenarios and list it in RENDERED_FMT_IMPLS"
+    );
+    assert_eq!(
+        hand_written_fmt_impls("boneli-app", 11),
+        RENDERED_APP_FMT_IMPLS,
+        "a hand-written formatting impl in boneli-app is not rendered by the replay \
+         harness: print it in app::render_app_errors and list it in RENDERED_APP_FMT_IMPLS"
+    );
+}
+
+/// The core sources the tripwire reads, sorted; at least `min_files`.
+fn core_sources(krate: &str, min_files: usize) -> Vec<std::path::PathBuf> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(krate)
+        .join("src");
     let mut files: Vec<_> = std::fs::read_dir(&src)
-        .expect("the domain sources are readable")
+        .expect("the core sources are readable")
         .map(|entry| entry.expect("a directory entry").path())
         .collect();
     files.sort();
     assert!(
-        files.len() >= 9,
-        "domain sources not found in {}",
+        files.len() >= min_files,
+        "{krate} sources not found in {}",
         src.display()
     );
+    files
+}
+
+/// `read_dir` does not recurse, so a module in a subdirectory would be
+/// invisible to the tripwire: the core sources stay flat.
+#[test]
+fn app_sources_are_flat() {
+    for (krate, min_files) in [("boneli-domain", 9), ("boneli-app", 11)] {
+        for file in core_sources(krate, min_files) {
+            assert!(
+                file.is_file(),
+                "{} is not a plain file; the replay tripwire reads only the top level",
+                file.display()
+            );
+        }
+    }
+}
+
+/// Every `fn fmt` definition in a core crate, as its file and the `impl`
+/// line above it.
+fn hand_written_fmt_impls(krate: &str, min_files: usize) -> Vec<String> {
+    const DEFINITIONS: [&str; 3] = ["fnfmt(", "fnfmt<", "fnr#fmt"];
+    let files = core_sources(krate, min_files);
     let compact = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
     let mut found = Vec::new();
     for file in files {
-        let text = std::fs::read_to_string(&file).expect("a domain source is UTF-8");
+        let text = std::fs::read_to_string(&file).expect("a core source is UTF-8");
         let name = file
             .file_name()
             .expect("a file name")
@@ -151,9 +205,5 @@ fn every_hand_written_fmt_impl_is_rendered() {
             found.push(format!("{name}: macro_rules! (can define fn fmt)"));
         }
     }
-    assert_eq!(
-        found, RENDERED_FMT_IMPLS,
-        "a hand-written formatting impl in boneli-domain is not rendered by the replay \
-         harness: print it in render_scenarios and list it in RENDERED_FMT_IMPLS"
-    );
+    found
 }
