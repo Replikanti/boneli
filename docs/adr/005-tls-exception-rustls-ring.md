@@ -154,6 +154,17 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
    per-version or per-hash approval would make every patch release of
    these four crates a policy change; the lockfile review already sees the
    update.
+
+   A second weak spot: the check matches the sentence, not what it means.
+   A sentence that denies the approval ("we do not think libc's build
+   script is approved") or quotes it in a code block still approves the
+   crate. The check of a strict edge (ADR-001) has the same property: it
+   looks for the edge's name in the ADR's text. Both checks catch an
+   approval that was forgotten, not an ADR written to sneak one in. Such an
+   ADR has to pass review before it is accepted, and a change that passes
+   review could just as well edit the check. Refusing negations or code
+   blocks would cover two wordings and leave every other one, so the check
+   stays a plain match and the review of an accepted ADR is the gate.
 7. **License exceptions.** `deny.toml` allows per crate: ISC for `ring`,
    `untrusted` and `rustls-webpki`, BSD-3-Clause for `subtle`, and
    CDLA-Permissive-2.0 for `webpki-roots`. All three licenses are
