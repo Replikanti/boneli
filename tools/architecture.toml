@@ -51,6 +51,9 @@ strict = "ADR-001"
 reason = "boneli-sys is the one place for syscalls and unsafe code"
 decision = "ADR-001"
 
+# httparse has a build script (it runs `rustc --version` and prints SIMD
+# cfgs), approved in ADR-003. The `build-script` key that records this, and
+# the check that requires it, come with part 2 of #5.
 [external.httparse]
 reason = "HTTP/1.x parsing without further dependencies"
 decision = "ARCHITECTURE"

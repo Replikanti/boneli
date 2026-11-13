@@ -53,9 +53,11 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `unsafe` token and requires the doctest attribute
    `#![doc(test(attr(forbid(unsafe_code))))]` in its lib root. No
    `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
-   `#[path]`, `include!` or target source outside `.rs`; no build script
-   outside `roles.build-script` in `tools/architecture.toml` (empty; adding
-   a crate needs an ADR) (ADR-001).
+   `#[path]`, `include!` or target source outside `.rs`; no build script in
+   a member outside `roles.build-script` in `tools/architecture.toml` (empty;
+   adding a crate needs an ADR) (ADR-001). A build script in an external
+   dependency needs an ADR that approves it for that crate (`httparse`:
+   ADR-003); the check that enforces this comes with part 2 of #5.
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.

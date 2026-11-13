@@ -32,6 +32,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte; the gate for address leaks
   from the domain (ADR-001, ADR-002).
 - ADR-002: run state machine, budget units, gates and the replay gate.
+- `boneli-http` (ADR-003): a strict HTTP/1.1 subset on `httparse`, with a
+  Unix-socket server (one thread per connection, connection cap, idle,
+  request and write timeouts), a client over any stream, Content-Length,
+  chunked and close-delimited bodies, CONNECT on both sides, and
+  unbuffered pass-through for server-sent events. Hosts are a canonical
+  IPv4 address, a bracketed IPv6 address or an LDH name whose last label
+  is not a number; `Host` is validated and must name a CONNECT's target
+  (its port may be left out). The client sends no request on a stream
+  where input has already arrived, the first request included, and reuses
+  a connection only while the peer stays quiet (`IdleCheck`). ADR-003
+  approves httparse's build script.
 
 ### Changed
 
