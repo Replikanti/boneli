@@ -198,8 +198,12 @@ fn needs(questions: Vec<String>, usage: Usage) -> RunEvent {
 }
 
 fn posted() -> RunEvent {
+    posted_as(COMMENT)
+}
+
+fn posted_as(reference: &str) -> RunEvent {
     RunEvent::QuestionsPosted {
-        reference: String::from(COMMENT),
+        reference: String::from(reference),
     }
 }
 
@@ -238,8 +242,12 @@ fn verified(checks: FixChecks, usage: Usage) -> RunEvent {
 }
 
 fn opened() -> RunEvent {
+    opened_as(PULL_REQUEST)
+}
+
+fn opened_as(reference: &str) -> RunEvent {
     RunEvent::PullRequestOpened {
-        reference: String::from(PULL_REQUEST),
+        reference: String::from(reference),
     }
 }
 
@@ -478,6 +486,18 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "ticket-blank-key",
             vec![received_with("", "Invoice total"), received()],
+        ),
+        // Forge validation: a blank reference is rejected, then accepted.
+        scenario(
+            "reference-blank-questions",
+            with(
+                after_triage(),
+                vec![posted_as(""), posted_as("\u{200B}"), posted()],
+            ),
+        ),
+        scenario(
+            "reference-blank-pull-request",
+            with(head(8), vec![opened_as(""), opened_as(" \t"), opened()]),
         ),
         // Reproduction gate.
         scenario(
@@ -730,6 +750,26 @@ pub fn all() -> Vec<Scenario> {
                 ],
             ),
         ),
+        // The verify job overflows a u64::MAX cost limit: the saturated total
+        // equals the limit, and the crossing must still stick.
+        limited(
+            "budget-overflow-fix-then-forge-fails",
+            Budget {
+                cost_micro_usd: u64::MAX,
+                duration_ms: 1_000_000,
+            },
+            vec![
+                received(),
+                ready(usage(u64::MAX - 1, 1)),
+                written(usage(0, 1)),
+                checked(TestStatus::FailedOnAssertion, usage(0, 1)),
+                proposed(citations(), usage(0, 1)),
+                cited(vec![Verified, Verified], usage(0, 1)),
+                fixed(usage(0, 1)),
+                verified(passing_checks(), usage(2, 1)),
+                failed(usage(0, 0)),
+            ],
+        ),
     ]
 }
 
@@ -956,6 +996,14 @@ mod tests {
             usage(60_000, 10_001),
             EXCEPTION_BUDGET,
         );
+        let saturated = over(
+            BudgetDimension::Cost,
+            usage(u64::MAX, 7),
+            Budget {
+                cost_micro_usd: u64::MAX,
+                duration_ms: 1_000_000,
+            },
+        );
         let fix_fails = |check| {
             join(
                 head_wants(7),
@@ -1176,6 +1224,46 @@ mod tests {
                     ok(vec![c_triage()], Stage::Triage),
                 ],
                 j(0),
+            ),
+            x(
+                "reference-blank-questions",
+                join(
+                    asked(),
+                    vec![
+                        refused(
+                            DomainError::BlankForgeReference(K::QuestionsPosted),
+                            Stage::Triage,
+                        ),
+                        refused(
+                            DomainError::BlankForgeReference(K::QuestionsPosted),
+                            Stage::Triage,
+                        ),
+                        ends(Outcome::NeedsInformation {
+                            comment: String::from(COMMENT),
+                        }),
+                    ],
+                ),
+                j(1),
+            ),
+            x(
+                "reference-blank-pull-request",
+                join(
+                    head_wants(8),
+                    join(
+                        vec![
+                            refused(
+                                DomainError::BlankForgeReference(K::PullRequestOpened),
+                                Stage::Deliver,
+                            ),
+                            refused(
+                                DomainError::BlankForgeReference(K::PullRequestOpened),
+                                Stage::Deliver,
+                            ),
+                        ],
+                        head_wants(9).split_off(8),
+                    ),
+                ),
+                j(7),
             ),
             x(
                 "reproduction-passes-on-base",
@@ -1410,6 +1498,24 @@ mod tests {
                 ),
                 usage(60_000, 10_001),
             ),
+            x(
+                "budget-overflow-fix-then-forge-fails",
+                join(
+                    head_wants(7),
+                    vec![
+                        ok(
+                            vec![c_open(
+                                passing_checks(),
+                                usage(u64::MAX, 7),
+                                Some(saturated),
+                            )],
+                            Stage::Deliver,
+                        ),
+                        budget_ends(saturated),
+                    ],
+                ),
+                usage(u64::MAX, 7),
+            ),
         ]
     }
 
@@ -1454,11 +1560,11 @@ mod tests {
     fn expectations_and_scenarios_are_a_bijection() {
         let scenarios: Vec<&str> = all().iter().map(|s| s.name).collect();
         let expected: Vec<&str> = expectations().iter().map(|e| e.name).collect();
-        assert_eq!(scenarios.len(), 59);
+        assert_eq!(scenarios.len(), 62);
         assert_eq!(scenarios.len(), expected.len());
         let a: BTreeSet<&str> = scenarios.into_iter().collect();
         let b: BTreeSet<&str> = expected.into_iter().collect();
-        assert_eq!(a.len(), 59, "scenario names are unique");
+        assert_eq!(a.len(), 62, "scenario names are unique");
         assert_eq!(a, b);
     }
 
@@ -1633,6 +1739,42 @@ mod tests {
             .expect("scenario exists");
         let trace = fold(&scenario).expect("valid budget");
         trace.run.record().expect("the run is past intake")
+    }
+
+    fn scenario_named(name: &str) -> Scenario {
+        all()
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("scenario exists")
+    }
+
+    #[test]
+    fn blank_forge_references_leave_the_run_unchanged() {
+        // Folding the events up to the first blank reference and folding the
+        // same events plus the two rejected ones must give the same run:
+        // nothing advances and nothing is charged.
+        for name in ["reference-blank-questions", "reference-blank-pull-request"] {
+            let full = scenario_named(name);
+            let n = full.events.len();
+            let before = Scenario {
+                events: full.events[..n - 3].to_vec(),
+                ..full.clone()
+            };
+            let rejected = Scenario {
+                events: full.events[..n - 1].to_vec(),
+                ..full.clone()
+            };
+            let a = fold(&before).expect("valid budget");
+            let b = fold(&rejected).expect("valid budget");
+            assert_eq!(a.run, b.run, "{name}");
+            for entry in &b.entries[n - 3..] {
+                assert_eq!(
+                    entry.result,
+                    Err(DomainError::BlankForgeReference(entry.got)),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

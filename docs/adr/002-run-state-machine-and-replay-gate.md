@@ -51,7 +51,8 @@ and a table this small is checked exhaustively by the tests.
 
 **Errors and outcomes.** A `DomainError` means the caller sent something the
 run cannot accept: a wrong sequence, a ticket with a blank key or title, a
-zero budget limit, or a malformed SHA. The run does not advance, and since
+blank forge reference on `QuestionsPosted` or `PullRequestOpened`
+(`BlankForgeReference`), a zero budget limit, or a malformed SHA. The run does not advance, and since
 `handle` consumes the run, a caller that goes on keeps a clone. Agent
 output is untrusted content, not a caller error: a bad result ends the run
 with an outcome (fail closed, invariant 6), so a run never stalls on it.
@@ -64,9 +65,15 @@ analysis, citations, diff, fix checks).
 **Order inside `handle`**, which decides the ties:
 
 1. The state and kind check. A rejected event is never charged.
-2. Ticket validation on `TicketReceived`: a blank key or title is
-   `InvalidTicket`, and the run stays in Intake, because the ticket comes
-   from an intake adapter before any work and the caller can fix it.
+2. Caller input inside a legal pair. On `TicketReceived` a blank key or
+   title is `InvalidTicket`, and the run stays in Intake, because the ticket
+   comes from an intake adapter before any work and the caller can fix it.
+   On `QuestionsPosted` and `PullRequestOpened` a blank reference is
+   `BlankForgeReference`: the reference comes from our own forge adapter, and
+   a finished run that points at no comment or pull request has lost its
+   evidence. The same blank rule applies, and the run neither advances nor
+   is charged (forge results carry no usage). This is validation inside a
+   legal pair, so the pair counts above do not change.
 3. Usage accounting (D3). A total over a limit ends the run as
    `BudgetExceeded` with no command, whatever the event says, with the one
    exception in D3.
@@ -147,6 +154,11 @@ a zero is a missing value, not a budget.
   1.8e13 USD, so overflow is out of reach in practice. It is handled anyway:
   sums use `checked_add`, an overflow counts as exceeded even against a
   `u64::MAX` limit, and the reported total saturates at `u64::MAX`.
+- **A crossing is sticky:** the run keeps the first exceeded dimension, and
+  every later charge reports it as exceeded, with the new total. Why: a
+  saturated total equals a `u64::MAX` limit, so re-deriving "exceeded" from
+  the total alone would read an overflowed run as within its limit again.
+  Only a run that delivers over budget (below) charges after a crossing.
 - **Limits are inclusive:** a limit is exceeded when the total is greater
   than it. With a limit of 100, spending 60 and then 40 continues; one more
   µUSD ends the run.
@@ -178,12 +190,13 @@ rule applies, and the failing checks stay in the run's record. Every other
 event that leaves the total over a limit ends `BudgetExceeded`, including a
 passing gate on `ReproductionChecked`, `RootCauseProposed` or
 `CitationsChecked`, and a `JobFailed`, also a `JobFailed` in Deliver after an
-overrun (the total is still over the limit after charging zero usage).
+overrun (the crossing is sticky, so charging zero usage still reports it,
+also when the total saturated at a `u64::MAX` limit).
 
 ### D4. The replay gate: `boneli-replay-check`
 
 - **Corpus:** `boneli_domain::scenarios` holds the event sequences as data:
-  `all()` returns 59 named scenarios in a fixed order, and `fold` runs one
+  `all()` returns 62 named scenarios in a fixed order, and `fold` runs one
   through `Run::handle`. It ships in the library because core crates may
   not declare features (ADR-001). The domain's unit tests fold only through
   `fold` and compare each trace with a test-only table of expected results,
@@ -193,8 +206,14 @@ overrun (the total is still over the limit after charging zero usage).
   only exercised paths (ADR-001 residual risk).
 - **Harness:** a test-only crate `crates/boneli-replay-check` that depends on
   the domain only. Its binary prints a probe line, the address of a fresh
-  `Box<u64>` and of `Run::handle`, then `scenario <name>` and the pretty
-  `Debug` output of each trace. Its integration test runs the binary twice
+  `Box<u64>` and of `Run::handle`, then `scenario <name>`, the pretty
+  `Debug` output of each trace and the `Display` of every error in it, and
+  finally the `Display` and `Debug` of the errors only constructors return
+  (`Run::new` with a zero limit, `CommitSha::parse`). The comparison sees
+  only what is printed, so every hand-written formatting impl of the domain
+  is printed (today only `DomainError`'s `Display`); a test lists those impls
+  in the domain sources and fails when one is added that the harness does
+  not render. Its integration test runs the binary twice
   and fails unless both the heap and the code addresses differ (address
   randomization is on); then both outputs must be equal byte for byte, and
   equal to the test process's own rendering, and the scenario headers must

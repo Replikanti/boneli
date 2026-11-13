@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 
 use boneli_domain::scenarios::{Scenario, all, fold};
-use boneli_domain::{DomainError, Run, RunCommand, RunEvent};
+use boneli_domain::{Budget, CommitSha, DomainError, Run, RunCommand, RunEvent, RunId};
 
 /// The first line of the binary's output.
 pub const PROBE_PREFIX: &str = "probe ";
@@ -64,16 +64,59 @@ pub fn parse_probe(line: &str) -> Option<Probe> {
     Some(Probe { heap, code })
 }
 
-/// `scenario <name>\n{trace:#?}\n` for each scenario, in the given order.
+/// For each scenario, in the given order: `scenario <name>`, the trace's
+/// pretty `Debug`, then `display <k>: <error>` for every entry `k` whose
+/// result is an error.
+///
+/// `Debug` is derived everywhere in `boneli-domain` except where a type has
+/// a hand-written formatting impl. Those impls are rendered too, or a leak in
+/// them would pass the comparison: today the only one is `DomainError`'s
+/// `Display`, and `every_hand_written_fmt_impl_is_rendered` fails when the
+/// domain gains another.
 pub fn render_scenarios(scenarios: &[Scenario]) -> Result<String, DomainError> {
     let mut out = String::new();
     for scenario in scenarios {
         let trace = fold(scenario)?;
         // Writing to a String cannot fail.
         let _ = write!(out, "scenario {}\n{trace:#?}\n", scenario.name);
+        for (k, entry) in trace.entries.iter().enumerate() {
+            if let Err(error) = &entry.result {
+                let _ = writeln!(out, "display {k}: {error}");
+            }
+        }
+    }
+    // The errors no trace can hold, from the real constructors.
+    for error in constructor_errors() {
+        let _ = writeln!(out, "display constructor: {error}\n{error:?}");
     }
     Ok(out)
 }
+
+/// The `DomainError` variants that only constructors return:
+/// `Run::new` with a zero limit and `CommitSha::parse` of a malformed name.
+fn constructor_errors() -> Vec<DomainError> {
+    let id = || RunId::new(String::from("replay-check"));
+    let zero_cost = Budget {
+        cost_micro_usd: 0,
+        duration_ms: 1,
+    };
+    let zero_duration = Budget {
+        cost_micro_usd: 1,
+        duration_ms: 0,
+    };
+    [
+        Run::new(id(), zero_cost).err(),
+        Run::new(id(), zero_duration).err(),
+        CommitSha::parse("not a sha").err(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The hand-written formatting impls of `boneli-domain` that
+/// [`render_scenarios`] renders, as their `impl` lines.
+pub const RENDERED_FMT_IMPLS: &[&str] = &["impl fmt::Display for DomainError {"];
 
 /// [`render_scenarios`] over the whole corpus, in [`all`] order.
 pub fn render() -> Result<String, DomainError> {

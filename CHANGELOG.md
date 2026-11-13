@@ -22,11 +22,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-domain`: the run state machine (`Run::handle`), its events,
   commands and outcomes, the reproduction, citation, root-cause and fix
   gates, and budget accounting in micro-USD and milliseconds (ADR-002).
-- `boneli_domain::scenarios`: 59 event sequences that the domain's unit
+- `boneli_domain::scenarios`: 62 event sequences that the domain's unit
   tests and the replay gate fold.
 - `boneli-replay-check`: a test-only root that folds the scenarios in two
   child processes and in its own, checks that address randomization is on,
-  and compares the `Debug` output byte for byte; the gate for address leaks
+  and compares the `Debug` output and the `Display` of every error byte for
+  byte; the gate for address leaks
   from the domain (ADR-001, ADR-002).
 - ADR-002: run state machine, budget units, gates and the replay gate.
 

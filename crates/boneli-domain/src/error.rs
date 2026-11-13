@@ -1,7 +1,8 @@
 //! Errors: input the run cannot accept (ADR-002).
 //!
 //! A [`DomainError`] means the caller sent something wrong: an event out of
-//! sequence, invalid intake input, an invalid budget or a malformed SHA. The
+//! sequence, invalid intake input, a blank forge reference, an invalid budget
+//! or a malformed SHA. The
 //! run does not advance. Bad agent output is not an error; it ends the run
 //! with an outcome (fail closed, `docs/ARCHITECTURE.md`, "Debugging line").
 
@@ -23,6 +24,10 @@ pub enum DomainError {
     },
     /// A required ticket field is blank.
     InvalidTicket(TicketField),
+    /// A forge result carries a blank reference (see
+    /// [`crate::values::is_blank`]), so a finished run would point at no
+    /// comment or pull request.
+    BlankForgeReference(EventKind),
     /// A budget limit is zero.
     InvalidBudget(BudgetDimension),
     /// Not a full lowercase SHA-1 or SHA-256 object name.
@@ -44,6 +49,9 @@ impl fmt::Display for DomainError {
                 got,
             } => write!(f, "unexpected event {got:?}, the run is done"),
             DomainError::InvalidTicket(field) => write!(f, "ticket field {field:?} is blank"),
+            DomainError::BlankForgeReference(kind) => {
+                write!(f, "{kind:?} carries a blank forge reference")
+            }
             DomainError::InvalidBudget(dimension) => {
                 write!(f, "budget limit {dimension:?} is zero")
             }

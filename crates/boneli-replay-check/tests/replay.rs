@@ -3,7 +3,7 @@
 use std::process::Command;
 
 use boneli_domain::scenarios::all;
-use boneli_replay_check::{Probe, first_difference, parse_probe, render};
+use boneli_replay_check::{Probe, RENDERED_FMT_IMPLS, first_difference, parse_probe, render};
 
 /// Runs the harness binary and returns its probe and the rest of its output.
 fn run_child() -> (Probe, String) {
@@ -89,4 +89,42 @@ fn first_difference_reports_the_line() {
         Some((2, None, Some("b")))
     );
     assert_eq!(first_difference("a", "a\n"), Some((2, None, None)));
+}
+
+/// Tripwire: every hand-written formatting impl in `boneli-domain` must be
+/// rendered by the harness, because the replay compares only what it prints.
+/// A new `impl ... Display/Debug/...` there fails this test until
+/// `render_scenarios` prints it and `RENDERED_FMT_IMPLS` lists it.
+#[test]
+fn every_hand_written_fmt_impl_is_rendered() {
+    const TRAITS: [&str; 10] = [
+        "fmt::", "Display", "Debug", "Write", "LowerHex", "UpperHex", "Binary", "Octal",
+        "LowerExp", "UpperExp",
+    ];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../boneli-domain/src");
+    let mut found = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(&src)
+        .expect("the domain sources are readable")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 9,
+        "domain sources not found in {}",
+        src.display()
+    );
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("a domain source is UTF-8");
+        for line in text.lines() {
+            let line = line.trim();
+            let is_impl = line.starts_with("impl ") || line.starts_with("impl<");
+            if is_impl && TRAITS.iter().any(|t| line.contains(t)) {
+                found.push(line.to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        found, RENDERED_FMT_IMPLS,
+        "render these in render_scenarios"
+    );
 }

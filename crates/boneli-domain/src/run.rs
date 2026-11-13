@@ -210,6 +210,9 @@ pub struct Run {
     id: RunId,
     budget: Budget,
     spent: Usage,
+    /// The first dimension a charge exceeded; sticky (ADR-002). Only a run
+    /// that carries an overrun past the fix gate keeps waiting with it set.
+    crossed: Option<BudgetDimension>,
     state: State,
 }
 
@@ -227,6 +230,7 @@ impl Run {
             id,
             budget,
             spent: Usage::default(),
+            crossed: None,
             state: State::Intake,
         })
     }
@@ -280,9 +284,13 @@ impl Run {
     /// The order decides the ties (ADR-002):
     /// 1. An event the state does not accept is an
     ///    [`DomainError::UnexpectedEvent`], and it is never charged.
-    /// 2. A ticket with a blank key or title is a
-    ///    [`DomainError::InvalidTicket`]; the run stays in intake.
-    /// 3. The event's usage is charged. A total over a limit ends the run as
+    /// 2. Caller input inside a legal pair: a ticket with a blank key or
+    ///    title is a [`DomainError::InvalidTicket`] (the run stays in
+    ///    intake), and a blank forge reference on `QuestionsPosted` or
+    ///    `PullRequestOpened` is a [`DomainError::BlankForgeReference`].
+    ///    Neither is charged.
+    /// 3. The event's usage is charged; a crossed limit stays crossed. A
+    ///    total over a limit ends the run as
     ///    [`Outcome::BudgetExceeded`] with no command, whatever the event
     ///    says, with one exception: a `FixVerified` whose fix gate passes
     ///    goes on and carries the overrun into `OpenPullRequest` and
@@ -293,6 +301,7 @@ impl Run {
             id,
             budget,
             spent,
+            crossed,
             state,
         } = self;
         let (waiting, event) = match (state, event) {
@@ -308,6 +317,7 @@ impl Run {
                     id,
                     budget,
                     spent,
+                    crossed,
                     state: State::Waiting(Waiting::Triage(Opened { ticket, base })),
                 };
                 return Ok((run, vec![command]));
@@ -318,6 +328,7 @@ impl Run {
                     id,
                     budget,
                     spent,
+                    crossed,
                     state,
                 }
                 .expects();
@@ -327,16 +338,29 @@ impl Run {
                 });
             }
         };
+        let reference = match &event {
+            RunEvent::QuestionsPosted { reference } | RunEvent::PullRequestOpened { reference } => {
+                Some(reference.as_str())
+            }
+            _ => None,
+        };
+        if reference.is_some_and(is_blank) {
+            return Err(DomainError::BlankForgeReference(event.kind()));
+        }
 
         let fix = match &event {
             RunEvent::FixVerified { checks, .. } => Some(fix_gate(checks)),
             _ => None,
         };
-        let (spent, overrun) = match event.usage().map(|usage| charge(spent, usage, &budget)) {
+        let charged = event
+            .usage()
+            .map(|usage| charge(spent, usage, &budget, crossed));
+        let (spent, overrun) = match charged {
             None => (spent, None),
             Some(Ok(total)) => (total, None),
             Some(Err(overrun)) => (overrun.spent, Some(overrun)),
         };
+        let crossed = crossed.or(overrun.map(|o| o.dimension));
         // The one budget exception (ADR-002): a FixVerified whose fix gate
         // passes goes on with the overrun. Every other crossing ends the run.
         let exception = matches!(fix, Some(GateOutcome::Pass));
@@ -364,6 +388,7 @@ impl Run {
             id,
             budget,
             spent,
+            crossed,
             state,
         };
         Ok((run, commands))
