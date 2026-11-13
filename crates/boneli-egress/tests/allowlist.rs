@@ -213,3 +213,55 @@ fn errors_name_the_index_and_never_echo_the_entry() {
     assert!(text.contains('1'), "{text}");
     assert!(!text.contains("s3cr3t"), "{text}");
 }
+
+/// `Target::Authority` has public fields, so a target can be built by hand
+/// without the parser. `Endpoint::from_target` takes only a target whose
+/// host and port are exactly what the CONNECT grammar would produce, so an
+/// `Endpoint` (and with it every log record) holds a closed-alphabet host
+/// and a port from 1 to 65535 by construction (ADR-006, D8).
+#[test]
+fn endpoint_from_target_revalidates_hand_built_targets() {
+    for (host, port) in [
+        // The review's forgery: a line break and a second record.
+        ("x.example port=1\nallowed t=0 id=99 host=evil.example", 443),
+        ("registry.npmjs.org", 0),
+        ("registry.npmjs.org\n", 443),
+        ("registry.npmjs.org\r", 443),
+        ("registry npmjs.org", 443),
+        ("registry.npmjs.org,a.example", 443),
+        ("host=registry.npmjs.org", 443),
+        ("Registry.npmjs.org", 443),
+        ("REGISTRY.NPMJS.ORG", 443),
+        ("registry.npmjs.org.", 443),
+        ("[::1]", 443),
+        ("::1]:443,[::1", 443),
+        ("FE80::1", 443),
+        ("127.1", 443),
+        ("r\u{435}gistry.npmjs.org", 443),
+        ("", 443),
+    ] {
+        let target = target(host, port);
+        assert_eq!(Endpoint::from_target(&target), None, "{host:?}:{port}");
+    }
+    // A hand-built target that names an entry in another spelling is not
+    // allowed either: matching is on the canonical form only.
+    let allowlist = list(&["registry.npmjs.org:443"]);
+    for host in ["REGISTRY.npmjs.org", "registry.npmjs.org\n"] {
+        assert_eq!(
+            allowlist.decide(&target(host, 443)),
+            Decision::NotAllowed,
+            "{host:?}"
+        );
+    }
+    // Canonical hand-built targets still work.
+    for (host, port) in [
+        ("registry.npmjs.org", 443),
+        ("a", 1),
+        ("104.16.0.34", 65535),
+        ("2606:4700::6810:22", 443),
+        ("fe80::1", 1),
+    ] {
+        let endpoint = Endpoint::from_target(&target(host, port)).expect(host);
+        assert_eq!((endpoint.host(), endpoint.port()), (host, port));
+    }
+}

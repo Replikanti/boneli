@@ -1,13 +1,20 @@
 //! The connection log codec: one record per line, fixed field order, a
 //! closed alphabet and a strict parser (ADR-006, D8).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
+
+use boneli_egress::address::Nat64Prefix;
 
 use boneli_egress::log::{End, FailReason, Record, RejectedStatus, parse_log};
 use boneli_egress::{Allowlist, Endpoint};
 
 fn endpoint(authority: &str) -> Endpoint {
     Endpoint::parse(authority).expect(authority)
+}
+
+fn prefix(s: &str) -> Nat64Prefix {
+    Nat64Prefix::parse(s).expect(s)
 }
 
 fn sock(s: &str) -> SocketAddr {
@@ -32,6 +39,7 @@ fn samples() -> Vec<Record> {
             t: 0,
             unix_ms: 0,
             allow: Allowlist::parse(&["registry.npmjs.org:443"]).expect("list"),
+            nat64: BTreeSet::new(),
         },
         Record::Start {
             t: max,
@@ -43,6 +51,13 @@ fn samples() -> Vec<Record> {
                 "pypi.org:1",
             ])
             .expect("list"),
+            nat64: [
+                prefix("64:ff9b::/96"),
+                prefix("2a00:1234::/32"),
+                prefix("2a00:1234:5678:9abc::/96"),
+                prefix("2a00:1234:5678:9abc::/64"),
+            ]
+            .into(),
         },
         Record::Allowed {
             t: 0,
@@ -210,10 +225,11 @@ fn exact_renderings() {
         t: 0,
         unix_ms: 1_763_049_600_000,
         allow: Allowlist::parse(&["registry.npmjs.org:443", "PyPI.org:443"]).expect("list"),
+        nat64: BTreeSet::new(),
     };
     assert_eq!(
         start.render(),
-        "start t=0 v=1 unix_ms=1763049600000 allow=pypi.org:443,registry.npmjs.org:443\n"
+        "start t=0 v=1 unix_ms=1763049600000 allow=pypi.org:443,registry.npmjs.org:443 nat64=-\n"
     );
     let failed = Record::Failed {
         t: 12,
@@ -281,9 +297,9 @@ fn parse_rejects_noncanonical_numbers() {
         "allowed t=1 id=1 host=a port=0443",
         "close t=1 id=1 up=01 down=0 end=eof",
         "close t=1 id=1 up=0 down=+0 end=eof",
-        "start t=0 v=01 unix_ms=0 allow=a:443",
+        "start t=0 v=01 unix_ms=0 allow=a:443 nat64=-",
         "rejected t=1 id=1 status=0400",
-        "start t=0 v=1 unix_ms=0 allow=a:0443",
+        "start t=0 v=1 unix_ms=0 allow=a:0443 nat64=-",
         "open t=1 id=1 addr=104.16.0.034:443",
         "open t=1 id=1 addr=104.16.0.34:0443",
         "open t=1 id=1 addr=[2606:4700:0::6810:22]:443",
@@ -297,7 +313,7 @@ fn parse_rejects_noncanonical_numbers() {
 #[test]
 fn parse_rejects_malformed_lines() {
     let good = [
-        "start t=0 v=1 unix_ms=5 allow=pypi.org:443,registry.npmjs.org:443",
+        "start t=0 v=1 unix_ms=5 allow=pypi.org:443,registry.npmjs.org:443 nat64=-",
         "allowed t=1 id=1 host=registry.npmjs.org port=443",
         "refused t=1 id=1 host=2606:4700::6810:22 port=443",
         "open t=1 id=1 addr=[2606:4700::6810:22]:443",
@@ -330,11 +346,11 @@ fn parse_rejects_malformed_lines() {
         "allowed t=1 id=1 port=443 host=a",
         "close t=1 id=1 down=6 up=5 end=idle",
         "failed t=1 id=1 reason=resolve",
-        "start t=0 unix_ms=5 v=1 allow=a:443",
-        "start t=0 v=1 unix_ms=5",
+        "start t=0 unix_ms=5 v=1 allow=a:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 nat64=-",
         // Versions.
-        "start t=0 v=2 unix_ms=5 allow=a:443",
-        "start t=0 v=0 unix_ms=5 allow=a:443",
+        "start t=0 v=2 unix_ms=5 allow=a:443 nat64=-",
+        "start t=0 v=0 unix_ms=5 allow=a:443 nat64=-",
         // Spacing and line ends.
         "method  t=1 id=1",
         "method t=1  id=1",
@@ -376,22 +392,22 @@ fn parse_rejects_malformed_lines() {
         "open t=1 id=1 addr=2606:4700::6810:22:443",
         "open t=1 id=1 addr=registry.npmjs.org:443",
         // The allow list: canonical, sorted, unique, names only.
-        "start t=0 v=1 unix_ms=5 allow=",
-        "start t=0 v=1 unix_ms=5 allow=registry.npmjs.org:443,pypi.org:443",
-        "start t=0 v=1 unix_ms=5 allow=pypi.org:443,pypi.org:443",
-        "start t=0 v=1 unix_ms=5 allow=PyPI.org:443",
-        "start t=0 v=1 unix_ms=5 allow=pypi.org:443,",
-        "start t=0 v=1 unix_ms=5 allow=,pypi.org:443",
-        "start t=0 v=1 unix_ms=5 allow=pypi.org:443;a:1",
-        "start t=0 v=1 unix_ms=5 allow=1.2.3.4:443",
-        "start t=0 v=1 unix_ms=5 allow=[::1]:443",
-        "start t=0 v=1 unix_ms=5 allow=pypi.org",
+        "start t=0 v=1 unix_ms=5 allow= nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=registry.npmjs.org:443,pypi.org:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=pypi.org:443,pypi.org:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=PyPI.org:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=pypi.org:443, nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=,pypi.org:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=pypi.org:443;a:1 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=1.2.3.4:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=[::1]:443 nat64=-",
+        "start t=0 v=1 unix_ms=5 allow=pypi.org nat64=-",
         // Ports sort numerically, not as text.
-        "start t=0 v=1 unix_ms=5 allow=a:10,a:9",
+        "start t=0 v=1 unix_ms=5 allow=a:10,a:9 nat64=-",
     ] {
         assert!(Record::parse(line).is_err(), "{line:?}");
     }
-    assert!(Record::parse("start t=0 v=1 unix_ms=5 allow=a:9,a:10").is_ok());
+    assert!(Record::parse("start t=0 v=1 unix_ms=5 allow=a:9,a:10 nat64=-").is_ok());
 }
 
 #[test]
@@ -447,6 +463,7 @@ fn terminal_records_are_the_seven_of_adr_006() {
             t: 0,
             unix_ms: 0,
             allow: Allowlist::parse(&["a:1"]).expect("list"),
+            nat64: BTreeSet::new(),
         },
         Record::Allowed {
             t: 0,
@@ -496,5 +513,76 @@ fn terminal_records_are_the_seven_of_adr_006() {
     );
     for status in [0, 200, 403, 404, 405, 500, 502, 504, 999, u16::MAX] {
         assert!(RejectedStatus::from_status(status).is_none(), "{status}");
+    }
+}
+
+/// The review's forgery: a hand-built target with a line break in its host
+/// would render as two records. No `Endpoint`, and so no record, can be
+/// built from it.
+#[test]
+fn hand_built_targets_cannot_forge_records() {
+    let forged = boneli_http::Target::Authority {
+        host: "x.example port=1\nallowed t=0 id=99 host=evil.example".into(),
+        port: 443,
+    };
+    assert_eq!(Endpoint::from_target(&forged), None);
+    let zero = boneli_http::Target::Authority {
+        host: "x.example".into(),
+        port: 0,
+    };
+    assert_eq!(Endpoint::from_target(&zero), None);
+    // What can be built renders a line the parser takes back.
+    let ok = boneli_http::Target::Authority {
+        host: "x.example".into(),
+        port: 443,
+    };
+    let endpoint = Endpoint::from_target(&ok).expect("canonical");
+    let line = Record::Refused {
+        t: 1,
+        id: 1,
+        endpoint,
+    }
+    .render();
+    assert_eq!(parse_log(&line).expect("one record").len(), 1);
+}
+
+/// The `start` record names the NAT64 prefixes the address check used
+/// (ADR-006, D4), `-` for none, in canonical order.
+#[test]
+fn start_records_the_nat64_prefixes() {
+    let start = Record::Start {
+        t: 0,
+        unix_ms: 5,
+        allow: Allowlist::parse(&["a:1"]).expect("list"),
+        nat64: [prefix("2a00:1234:5678:9abc::/96"), prefix("2a00:1234::/32")].into(),
+    };
+    assert_eq!(
+        start.render(),
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/32,2a00:1234:5678:9abc::/96\n"
+    );
+    assert_eq!(
+        Record::parse(
+            "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/32,2a00:1234:5678:9abc::/96"
+        ),
+        Ok(start)
+    );
+    for line in [
+        "start t=0 v=1 unix_ms=5 allow=a:1",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=-,-",
+        "start t=0 v=1 unix_ms=5 nat64=- allow=a:1",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234:5678:9abc::/96,2a00:1234::/32",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/32,2a00:1234::/32",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/32,-",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/33",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::1/32",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2A00:1234::/32",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234:0::/32",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::/032",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=2a00:1234::",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=10.0.0.0/8",
+        "start t=0 v=1 unix_ms=5 allow=a:1 nat64=- x=1",
+    ] {
+        assert!(Record::parse(line).is_err(), "{line:?}");
     }
 }

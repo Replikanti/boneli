@@ -10,7 +10,7 @@
 //!
 //! | kind | fields, in this order |
 //! |---|---|
-//! | `start` | `t v=1 unix_ms allow=<host:port>(,<host:port>)*` |
+//! | `start` | `t v=1 unix_ms allow=<host:port>(,<host:port>)* nat64=<-\|<prefix/len>(,<prefix/len>)*>` |
 //! | `allowed` | `t id host port` |
 //! | `refused` | `t id host port` |
 //! | `open` | `t id addr` |
@@ -28,9 +28,11 @@
 //! id only appears on link-local addresses, which the egress never
 //! connects to (D4).
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::SocketAddr;
 
+use crate::address::Nat64Prefix;
 use crate::allowlist::{Allowlist, Endpoint};
 
 /// The version written in every `start` record.
@@ -159,6 +161,9 @@ pub enum Record {
         unix_ms: u64,
         /// The allowlist, in canonical order.
         allow: Allowlist,
+        /// The NAT64 prefixes the address check uses (ADR-006, D4), in
+        /// canonical order; `nat64=-` when there are none.
+        nat64: BTreeSet<Nat64Prefix>,
     },
     /// The target is on the list; written before any DNS query.
     Allowed {
@@ -356,10 +361,21 @@ impl Record {
         let kind = self.kind();
         let t = self.t();
         let mut line = match self {
-            Record::Start { unix_ms, allow, .. } => {
+            Record::Start {
+                unix_ms,
+                allow,
+                nat64,
+                ..
+            } => {
                 let list: Vec<String> = allow.entries().map(Endpoint::to_string).collect();
+                let prefixes: Vec<String> = nat64.iter().map(Nat64Prefix::to_string).collect();
+                let prefixes = if prefixes.is_empty() {
+                    "-".to_owned()
+                } else {
+                    prefixes.join(",")
+                };
                 format!(
-                    "{kind} t={t} v={VERSION} unix_ms={unix_ms} allow={}",
+                    "{kind} t={t} v={VERSION} unix_ms={unix_ms} allow={} nat64={prefixes}",
                     list.join(",")
                 )
             }
@@ -417,7 +433,21 @@ impl Record {
                 let entries: Vec<&str> = fields.take("allow")?.split(',').collect();
                 let allow = Allowlist::parse(&entries)
                     .map_err(|_| LogParseError::new("invalid allow list"))?;
-                Record::Start { t, unix_ms, allow }
+                let nat64 = match fields.take("nat64")? {
+                    "-" => BTreeSet::new(),
+                    list => list
+                        .split(',')
+                        .map(|p| {
+                            Nat64Prefix::parse(p).ok_or(LogParseError::new("invalid NAT64 prefix"))
+                        })
+                        .collect::<Result<BTreeSet<_>, _>>()?,
+                };
+                Record::Start {
+                    t,
+                    unix_ms,
+                    allow,
+                    nat64,
+                }
             }
             "allowed" | "refused" => {
                 let t = number(fields.take("t")?)?;

@@ -22,14 +22,29 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// The endpoint of an authority-form target; `None` for origin form.
+    /// The endpoint of an authority-form target, or `None` for origin form
+    /// and for any host and port that the CONNECT grammar would not have
+    /// produced. `Target::Authority` has public fields, so a target need not
+    /// come from the parser; this re-parses its authority and takes it only
+    /// if the result is the same target. An `Endpoint` therefore always
+    /// holds a canonical host in the grammar's closed alphabet and a port
+    /// from 1 to 65535, which is what keeps the connection log free of
+    /// escaping (ADR-006, D8).
     pub fn from_target(target: &Target) -> Option<Endpoint> {
-        match target {
-            Target::Authority { host, port } => Some(Endpoint {
+        let Target::Authority { host, port } = target else {
+            return None;
+        };
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        match Target::parse_authority(&authority) {
+            Ok(parsed) if parsed == *target => Some(Endpoint {
                 host: host.clone(),
                 port: *port,
             }),
-            Target::Origin(_) => None,
+            _ => None,
         }
     }
 

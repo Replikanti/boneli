@@ -9,8 +9,9 @@
 //!   CONNECT target grammar of `boneli-http`, so that an entry and a target
 //!   canonicalize identically (ADR-006, D2). A refused name is never
 //!   resolved (D3).
-//! - [`address`]: only globally reachable addresses (D4), the order of
-//!   connect attempts and the connect budget (D5).
+//! - [`address`]: only globally reachable addresses, including the IPv4
+//!   address inside a NAT64 prefix (D4), the order of connect attempts and
+//!   the connect budget (D5).
 //! - [`log`]: the connection log, one line per record in a closed alphabet,
 //!   with a strict parser (D8).
 //!

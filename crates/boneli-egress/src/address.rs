@@ -8,7 +8,16 @@
 //! special-purpose blocks inside it that are not globally reachable. Both
 //! tables were checked against the IANA registries, retrieved 2026-11-13
 //! (ADR-006, D4).
+//!
+//! Behind DNS64 and NAT64 with a network-specific prefix, a synthesized
+//! address is global unicast whatever IPv4 address it carries, so the
+//! IPv6 table alone would let an A answer of `169.254.169.254` through as
+//! `<prefix>::a9fe:a9fe`. The classification therefore takes the NAT64
+//! prefixes in effect ([`Nat64Prefix`]) and also checks the IPv4 address
+//! embedded in any address inside one of them. A prefix only ever adds
+//! refusals: it never makes an address allowed that the tables forbid.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -81,24 +90,167 @@ fn in_v6(ip: Ipv6Addr, (net, prefix): (Ipv6Addr, u8)) -> bool {
     u128::from(ip) & mask == u128::from(net) & mask
 }
 
-/// Whether the egress refuses to connect to `ip` (ADR-006, D4). IPv4-mapped
-/// IPv6 addresses are forbidden outright, never classified by the IPv4
-/// address inside.
-pub fn forbidden(ip: IpAddr) -> bool {
+/// The prefix lengths RFC 6052 (section 2.2) allows for a NAT64 prefix.
+const NAT64_LENGTHS: [u8; 6] = [32, 40, 48, 56, 64, 96];
+
+/// The two well-known IPv4 addresses of `ipv4only.arpa` (RFC 7050,
+/// section 2.2), which reveal a NAT64 prefix in a DNS64 answer.
+const WELL_KNOWN_IPV4: [Ipv4Addr; 2] =
+    [Ipv4Addr::new(192, 0, 0, 170), Ipv4Addr::new(192, 0, 0, 171)];
+
+/// A NAT64 prefix (`Pref64::/n`, RFC 6052): the well-known `64:ff9b::/96`
+/// or a network-specific prefix of 32, 40, 48, 56, 64 or 96 bits. Ordered
+/// by address, then length. Its text form is `<ipv6>/<len>` with the
+/// address in `Ipv6Addr` display (ADR-006, D4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Nat64Prefix {
+    prefix: Ipv6Addr,
+    len: u8,
+}
+
+/// Where RFC 6052 puts an embedded IPv4 address for a prefix length: its
+/// four octets follow the prefix and skip octet 8, the "u" octet (bits 64
+/// to 71), which must be zero. The octets after them are the suffix, which
+/// RFC 6052 reserves and sets to zero.
+fn ipv4_octets(len: u8) -> [usize; 4] {
+    let mut out = [0; 4];
+    let mut at = usize::from(len / 8);
+    for slot in &mut out {
+        if at == 8 {
+            at += 1;
+        }
+        *slot = at;
+        at += 1;
+    }
+    out
+}
+
+/// The IPv4 address embedded in `ip` at the RFC 6052 position for `len`,
+/// or `None` when the u octet or the suffix is not zero (not the canonical
+/// form of a synthesized address). Does not check the prefix.
+fn embedded_at(ip: Ipv6Addr, len: u8) -> Option<Ipv4Addr> {
+    let bytes = ip.octets();
+    let at = ipv4_octets(len);
+    let after = at[3] + 1;
+    if len <= 64 && bytes[8] != 0 {
+        return None;
+    }
+    if bytes[after..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        bytes[at[0]],
+        bytes[at[1]],
+        bytes[at[2]],
+        bytes[at[3]],
+    ))
+}
+
+impl Nat64Prefix {
+    /// A prefix of an RFC 6052 length with no bits set after it; a /96 must
+    /// also leave the u octet zero (RFC 6052, section 2.2). `None`
+    /// otherwise.
+    pub fn new(prefix: Ipv6Addr, len: u8) -> Option<Nat64Prefix> {
+        if !NAT64_LENGTHS.contains(&len) {
+            return None;
+        }
+        let host_bits = u128::MAX >> len;
+        if u128::from(prefix) & host_bits != 0 {
+            return None;
+        }
+        if len == 96 && prefix.octets()[8] != 0 {
+            return None;
+        }
+        Some(Nat64Prefix { prefix, len })
+    }
+
+    /// Parses exactly the text form, `<ipv6>/<len>`, as `Display` writes
+    /// it; anything else is `None`.
+    pub fn parse(text: &str) -> Option<Nat64Prefix> {
+        let (prefix, len) = text.split_once('/')?;
+        let prefix: Ipv6Addr = prefix.parse().ok()?;
+        let len: u8 = len.parse().ok()?;
+        let out = Nat64Prefix::new(prefix, len)?;
+        (out.to_string() == text).then_some(out)
+    }
+
+    /// The prefixes revealed by the AAAA answer for `ipv4only.arpa` (RFC
+    /// 7050, section 3): for every address and every RFC 6052 length at
+    /// which a well-known IPv4 address sits in canonical form, the prefix
+    /// before it. Sorted, without duplicates. An address that matches at
+    /// more than one length gives every match: RFC 7050 resolves that case
+    /// by retrying with the other well-known address, but here a surplus
+    /// prefix only adds refusals, so keeping all of them fails closed.
+    pub fn discover(aaaa: &[Ipv6Addr]) -> Vec<Nat64Prefix> {
+        let mut out = Vec::new();
+        for &ip in aaaa {
+            for len in NAT64_LENGTHS {
+                if embedded_at(ip, len).is_some_and(|v4| WELL_KNOWN_IPV4.contains(&v4)) {
+                    let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+                    let prefix = Ipv6Addr::from(u128::from(ip) & mask);
+                    out.extend(Nat64Prefix::new(prefix, len));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The network address.
+    pub fn prefix(&self) -> Ipv6Addr {
+        self.prefix
+    }
+
+    /// The prefix length in bits.
+    pub fn prefix_len(&self) -> u8 {
+        self.len
+    }
+
+    fn contains(&self, ip: Ipv6Addr) -> bool {
+        in_v6(ip, (self.prefix, self.len))
+    }
+}
+
+impl fmt::Display for Nat64Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.prefix, self.len)
+    }
+}
+
+/// Whether the egress refuses to connect to `ip` (ADR-006, D4), given the
+/// NAT64 prefixes in effect. IPv4-mapped IPv6 addresses are forbidden
+/// outright, never classified by the IPv4 address inside. An IPv6 address
+/// inside one of `nat64` is also forbidden when the IPv4 address it embeds
+/// is forbidden, or when it is not in the canonical form of a synthesized
+/// address (u octet or suffix not zero). The prefixes only add refusals.
+pub fn forbidden(ip: IpAddr, nat64: &[Nat64Prefix]) -> bool {
     match ip {
-        IpAddr::V4(ip) => IPV4_FORBIDDEN.iter().any(|&block| in_v4(ip, block)),
+        IpAddr::V4(ip) => forbidden_v4(ip),
         IpAddr::V6(ip) => {
-            !in_v6(ip, IPV6_GLOBAL_UNICAST) || IPV6_FORBIDDEN.iter().any(|&block| in_v6(ip, block))
+            !in_v6(ip, IPV6_GLOBAL_UNICAST)
+                || IPV6_FORBIDDEN.iter().any(|&block| in_v6(ip, block))
+                || nat64
+                    .iter()
+                    .any(|p| p.contains(ip) && embedded_at(ip, p.len).is_none_or(forbidden_v4))
         }
     }
 }
 
+fn forbidden_v4(ip: Ipv4Addr) -> bool {
+    IPV4_FORBIDDEN.iter().any(|&block| in_v4(ip, block))
+}
+
 /// The first forbidden address in resolver order, or `None` when every
-/// address may be used. One forbidden address refuses the whole name
-/// (ADR-006, D4): a resolver that returns loopback or metadata space for a
-/// public name is not trusted for the rest of its answer either.
-pub fn first_forbidden(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    addrs.iter().copied().find(|addr| forbidden(addr.ip()))
+/// address may be used, given the NAT64 prefixes in effect. One forbidden
+/// address refuses the whole name (ADR-006, D4): a resolver that returns
+/// loopback or metadata space for a public name is not trusted for the
+/// rest of its answer either.
+pub fn first_forbidden(addrs: &[SocketAddr], nat64: &[Nat64Prefix]) -> Option<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| forbidden(addr.ip(), nat64))
 }
 
 /// The order of connect attempts (ADR-006, D5; RFC 8305, section 4):

@@ -107,7 +107,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allowlist of exact canonical `host:port` names, parsed with the CONNECT
   target grammar (empty lists, IP literals and duplicates are refused);
   address classes that allow only globally reachable addresses, checked
-  against the IANA special-purpose registries; the connect order (families
+  against the IANA special-purpose registries, and that also check the
+  IPv4 address embedded in a NAT64 prefix (RFC 6052 lengths, prefixes from
+  RFC 7050 discovery or the runner; a prefix only adds refusals); the
+  connect order (families
   alternate, RFC 8305) and the per-attempt share of the connect budget; and
   the connection log codec, one record per line in a closed alphabet with a
   strict parser that accepts exactly one spelling of every record.

@@ -4,7 +4,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use boneli_egress::address::{attempt_timeout, connect_order, first_forbidden, forbidden};
+use boneli_egress::address::{
+    Nat64Prefix, attempt_timeout, connect_order, first_forbidden, forbidden,
+};
 
 fn v4(s: &str) -> IpAddr {
     IpAddr::V4(s.parse::<Ipv4Addr>().expect(s))
@@ -20,13 +22,13 @@ fn sock(s: &str) -> SocketAddr {
 
 fn assert_allowed(ips: &[IpAddr]) {
     for ip in ips {
-        assert!(!forbidden(*ip), "{ip} must be allowed");
+        assert!(!forbidden(*ip, &[]), "{ip} must be allowed");
     }
 }
 
 fn assert_forbidden(ips: &[IpAddr]) {
     for ip in ips {
-        assert!(forbidden(*ip), "{ip} must be forbidden");
+        assert!(forbidden(*ip, &[]), "{ip} must be forbidden");
     }
 }
 
@@ -216,12 +218,12 @@ fn any_forbidden_address_refuses_the_name() {
         sock("127.0.0.1:443"),
         sock("10.0.0.1:443"),
     ];
-    assert_eq!(first_forbidden(&addrs), Some(sock("127.0.0.1:443")));
+    assert_eq!(first_forbidden(&addrs, &[]), Some(sock("127.0.0.1:443")));
     let mixed = [sock("[2606:4700::6810:22]:443"), sock("[::1]:443")];
-    assert_eq!(first_forbidden(&mixed), Some(sock("[::1]:443")));
+    assert_eq!(first_forbidden(&mixed, &[]), Some(sock("[::1]:443")));
     let global = [sock("104.16.0.34:443"), sock("[2606:4700::6810:22]:443")];
-    assert_eq!(first_forbidden(&global), None);
-    assert_eq!(first_forbidden(&[]), None);
+    assert_eq!(first_forbidden(&global, &[]), None);
+    assert_eq!(first_forbidden(&[], &[]), None);
 }
 
 #[test]
@@ -278,5 +280,218 @@ fn attempt_budget_arithmetic() {
     assert_eq!(
         attempt_timeout(Duration::from_nanos(1), ten),
         Some(Duration::from_nanos(1))
+    );
+}
+
+fn v6addr(s: &str) -> Ipv6Addr {
+    s.parse().expect(s)
+}
+
+fn nat64(prefix: &str, len: u8) -> Nat64Prefix {
+    Nat64Prefix::new(v6addr(prefix), len).expect(prefix)
+}
+
+/// `v4` embedded into `prefix/len` at the RFC 6052 (section 2.2) position
+/// for that length, with the u octet and the suffix zero.
+fn embed(prefix: &str, len: u8, v4: Ipv4Addr) -> Ipv6Addr {
+    let mut bytes = v6addr(prefix).octets();
+    let positions: Vec<usize> = (usize::from(len / 8)..16)
+        .filter(|&i| i != 8)
+        .take(4)
+        .collect();
+    for (i, b) in positions.into_iter().zip(v4.octets()) {
+        bytes[i] = b;
+    }
+    Ipv6Addr::from(bytes)
+}
+
+/// The network-specific prefixes of the tests, one per RFC 6052 length,
+/// all inside global unicast space.
+const NSPS: [(&str, u8); 6] = [
+    ("2a00:1234::", 32),
+    ("2a00:1234:5600::", 40),
+    ("2a00:1234:5678::", 48),
+    ("2a00:1234:5678:9a00::", 56),
+    ("2a00:1234:5678:9abc::", 64),
+    ("2a00:1234:5678:9abc::", 96),
+];
+
+#[test]
+fn nat64_network_specific_prefix_classifies_the_embedded_ipv4() {
+    for (prefix, len) in NSPS {
+        let prefixes = [nat64(prefix, len)];
+        for bad in [
+            "169.254.169.254",
+            "10.0.0.5",
+            "127.0.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            let ip = IpAddr::V6(embed(prefix, len, bad.parse().expect(bad)));
+            assert!(forbidden(ip, &prefixes), "{ip} ({bad} in {prefix}/{len})");
+            // Without the prefix the address looks global: this is the
+            // hole the prefix list closes (ADR-006, D4).
+            assert!(!forbidden(ip, &[]), "{ip} without the prefix");
+        }
+        for good in ["104.16.0.34", "151.101.0.223", "160.79.104.10", "1.1.1.1"] {
+            let ip = IpAddr::V6(embed(prefix, len, good.parse().expect(good)));
+            assert!(!forbidden(ip, &prefixes), "{ip} ({good} in {prefix}/{len})");
+        }
+        // first_forbidden sees through the prefix too.
+        let metadata = SocketAddr::new(
+            IpAddr::V6(embed(prefix, len, Ipv4Addr::new(169, 254, 169, 254))),
+            443,
+        );
+        let global = sock("[2606:4700::6810:22]:443");
+        assert_eq!(
+            first_forbidden(&[global, metadata], &prefixes),
+            Some(metadata)
+        );
+    }
+}
+
+#[test]
+fn nat64_u_octet_and_suffix_must_be_zero() {
+    let good = Ipv4Addr::new(104, 16, 0, 34);
+    for (prefix, len) in NSPS {
+        let prefixes = [nat64(prefix, len)];
+        let clean = embed(prefix, len, good);
+        assert!(!forbidden(IpAddr::V6(clean), &prefixes), "{clean}");
+        let mut bytes = clean.octets();
+        if len <= 64 {
+            // The u octet (bits 64 to 71) set.
+            let mut u = bytes;
+            u[8] = 1;
+            let ip = IpAddr::V6(Ipv6Addr::from(u));
+            assert!(forbidden(ip, &prefixes), "{ip} u octet");
+            // The last suffix byte set.
+            bytes[15] = 1;
+            let ip = IpAddr::V6(Ipv6Addr::from(bytes));
+            assert!(forbidden(ip, &prefixes), "{ip} suffix");
+        }
+    }
+    // Outside the prefix, the address is classified as plain IPv6.
+    let prefixes = [nat64("2a00:1234:5678:9abc::", 96)];
+    assert!(!forbidden(v6("2a00:1234:5678:9abd::a9fe:a9fe"), &prefixes));
+}
+
+#[test]
+fn nat64_prefixes_only_narrow() {
+    // Prefixes outside global space, including the well-known one, never
+    // make a forbidden address allowed.
+    let prefixes = [
+        nat64("64:ff9b::", 96),
+        nat64("fc00::", 96),
+        nat64("fe80::", 64),
+        nat64("2001:db8::", 32),
+        nat64("2a00:1234:5678:9abc::", 96),
+    ];
+    let samples = [
+        "64:ff9b::808:808",
+        "64:ff9b::a9fe:a9fe",
+        "fc00::808:808",
+        "fe80::8:808:800:0",
+        "2001:db8:808:808::",
+        "::1",
+        "::ffff:8.8.8.8",
+        "2a00:1234:5678:9abc::808:808",
+        "2a00:1234:5678:9abc::a00:5",
+        "2606:4700::6810:22",
+        "2a00:1234:5678:9abc:1::808:808",
+    ];
+    for s in samples {
+        let ip = v6(s);
+        if forbidden(ip, &[]) {
+            assert!(forbidden(ip, &prefixes), "{s} became allowed");
+        }
+    }
+    // The well-known prefix stays forbidden even for a global IPv4.
+    assert!(forbidden(v6("64:ff9b::808:808"), &prefixes));
+}
+
+#[test]
+fn nat64_prefix_validation() {
+    for len in [32, 40, 48, 56, 64, 96] {
+        assert!(
+            Nat64Prefix::new(v6addr("2a00:1234::"), len).is_some(),
+            "/{len}"
+        );
+    }
+    for len in [0, 1, 31, 33, 72, 80, 95, 97, 128, 255] {
+        assert!(
+            Nat64Prefix::new(v6addr("2a00:1234::"), len).is_none(),
+            "/{len}"
+        );
+    }
+    // Bits after the prefix must be zero.
+    assert!(Nat64Prefix::new(v6addr("2a00:1234::1"), 32).is_none());
+    assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:1::"), 64).is_none());
+    // A /96 must leave the u octet (bits 64 to 71) zero (RFC 6052).
+    assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:100::"), 96).is_none());
+    assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:ff:ffff::"), 96).is_some());
+    // The text form is `<prefix>/<len>`, in `Ipv6Addr` display.
+    let p = nat64("2a00:1234:5678:9abc::", 96);
+    assert_eq!(p.to_string(), "2a00:1234:5678:9abc::/96");
+    assert_eq!(Nat64Prefix::parse("2a00:1234:5678:9abc::/96"), Some(p));
+    for bad in [
+        "2a00:1234:5678:9abc::",
+        "2a00:1234:5678:9abc::/",
+        "2a00:1234:5678:9abc::/096",
+        "2a00:1234:5678:9abc::/+96",
+        "2A00:1234:5678:9abc::/96",
+        "2a00:1234:5678:9abc:0:0::/96",
+        "[2a00:1234:5678:9abc::]/96",
+        "2a00:1234:5678:9abc::/96 ",
+        "2a00:1234:5678:9abc::/97",
+        "10.0.0.0/8",
+        "",
+    ] {
+        assert_eq!(Nat64Prefix::parse(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn nat64_discovery_from_ipv4only_arpa() {
+    let wka = [Ipv4Addr::new(192, 0, 0, 170), Ipv4Addr::new(192, 0, 0, 171)];
+    for (prefix, len) in NSPS {
+        for known in wka {
+            let answer = [embed(prefix, len, known)];
+            assert_eq!(
+                Nat64Prefix::discover(&answer),
+                [nat64(prefix, len)],
+                "{prefix}/{len} via {known}"
+            );
+        }
+    }
+    // The well-known prefix, both answers, duplicates removed.
+    let wkp = [
+        v6addr("64:ff9b::c000:aa"),
+        v6addr("64:ff9b::c000:ab"),
+        v6addr("64:ff9b::c000:aa"),
+    ];
+    assert_eq!(Nat64Prefix::discover(&wkp), [nat64("64:ff9b::", 96)]);
+    // Two prefixes in one answer are both kept, in canonical order.
+    let two = [
+        embed("2a00:1234:5678:9abc::", 96, wka[0]),
+        embed("2a00:1234::", 32, wka[1]),
+    ];
+    assert_eq!(
+        Nat64Prefix::discover(&two),
+        [nat64("2a00:1234::", 32), nat64("2a00:1234:5678:9abc::", 96)]
+    );
+    // No answer, an answer without a well-known address, and one with the
+    // u octet or the suffix set are no NAT64.
+    assert_eq!(Nat64Prefix::discover(&[]), []);
+    assert_eq!(Nat64Prefix::discover(&[v6addr("2606:4700::6810:22")]), []);
+    let mut u = embed("2a00:1234::", 32, wka[0]).octets();
+    u[8] = 1;
+    let mut suffix = embed("2a00:1234::", 32, wka[0]).octets();
+    suffix[15] = 1;
+    assert_eq!(
+        Nat64Prefix::discover(&[Ipv6Addr::from(u), Ipv6Addr::from(suffix)]),
+        []
     );
 }

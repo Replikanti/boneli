@@ -52,14 +52,19 @@ where hangs and leaks hide.
 ### D1. One process per run phase
 
 - Invocation: `boneli-egress --socket <path> --allow <host:port>
-  [--allow <host:port> ...]`. Only the `--flag value` form is accepted:
-  `--flag=value`, an unknown flag, a repeated `--socket`, a missing value
-  and a `--allow` value that is not UTF-8 are usage errors. The socket path
-  is used as given, with no `~` expansion.
+  [--allow <host:port> ...] [--nat64-prefix <ipv6>/<len> ...]`. Only the
+  `--flag value` form is accepted: `--flag=value`, an unknown flag, a
+  repeated `--socket`, a missing value and a `--allow` value that is not
+  UTF-8 are usage errors. The socket path is used as given, with no `~`
+  expansion. `--nat64-prefix` takes a prefix in exactly the form the
+  `start` record writes (`Nat64Prefix::parse`, D4); an invalid or
+  repeated one is a usage error.
 - Exit codes: 2 for a usage error, including an allowlist that does not
-  parse (D2); 1 when binding or accepting fails (message on stderr); 3
-  when the log cannot be written (D8).
-- Startup order: bind, write the `start` record, accept. The egress never
+  parse (D2); 1 when binding or accepting fails, or when NAT64 discovery
+  gets no answer at all (D4; message on stderr); 3 when the log cannot be
+  written (D8).
+- Startup order: bind, discover the NAT64 prefixes (D4), write the `start`
+  record, accept. The egress never
   unlinks or replaces an existing path: binding fails on an existing file
   and on a symlink (`EADDRINUSE`), and that is exit 1. A proxy that
   removed what it found at its path could be pointed at any file the
@@ -172,10 +177,71 @@ even though the CONNECT is refused.
   - IPv4-mapped addresses are refused outright instead of classifying the
     embedded IPv4 address. No registry publishes them, and they are the
     usual AAAA bypass of an IPv4 check.
+- **NAT64 prefixes.** Behind DNS64 and NAT64 (RFC 6146, RFC 6147), the
+  resolver synthesizes an AAAA record from an A record by embedding the
+  IPv4 address into a NAT64 prefix (RFC 6052), and the translator connects
+  to that IPv4 address. With the well-known prefix `64:ff9b::/96` the
+  tables above already refuse every synthesized address (it lies outside
+  `2000::/3`). With a network-specific prefix, which the operator picks
+  inside global unicast space at any of the RFC 6052 lengths (32, 40, 48,
+  56, 64 or 96 bits), a synthesized address looks global whatever it
+  carries: an A answer of `169.254.169.254` for an allowed name becomes
+  `<prefix>::a9fe:a9fe` and would reach metadata space through the
+  translator. So:
+  - The classification (`forbidden`, `first_forbidden`) takes the list of
+    NAT64 prefixes in effect. An IPv6 address inside one of them is also
+    forbidden when the IPv4 address at the RFC 6052 position for that
+    length is forbidden by the IPv4 table, or when the address is not in
+    the canonical form of a synthesized address: the "u" octet (bits 64 to
+    71) and the suffix must be zero (RFC 6052, section 2.2, where the u
+    octet "MUST" be zero and the suffix is reserved). A translator's
+    handling of a non-canonical address is not specified, so the egress
+    refuses it rather than guess.
+  - **A prefix only adds refusals.** The tables decide first, and a prefix
+    can only forbid more. A wrong prefix, or one an attacker supplied,
+    can therefore refuse legitimate addresses (fail closed, and visible in
+    the `start` record) but can never make an address allowed. This is
+    also why the well-known prefix stays forbidden when it is listed:
+    allowing translated addresses would be the one place a prefix widens
+    the policy.
+  - **How the egress learns the prefixes: both RFC 7050 discovery at
+    startup and `--nat64-prefix` from the runner, merged.** At startup the
+    egress resolves `ipv4only.arpa` once, through the same resolver as its
+    connections, and keeps every prefix at which an AAAA answer embeds
+    `192.0.0.170` or `192.0.0.171` in canonical form
+    (`Nat64Prefix::discover`). RFC 7050 resolves an address that matches
+    at more than one length by retrying with the other well-known address;
+    the egress keeps every match instead, because a surplus prefix only
+    adds refusals. The name always has A records, so an answer with no
+    address at all means the resolver is broken, and startup fails (exit
+    1). The prefixes in effect go into the `start` record (D8).
+  - Why discovery: it needs no configuration, so the default deployment is
+    covered. It closes the realistic case, a hostile or broken
+    authoritative answer for an allowed name behind an honest DNS64
+    resolver, which is the threat D4 is about. The query is for a fixed
+    name, made before the egress accepts, so it carries nothing from the
+    sandbox (D3).
+  - Why the flag as well: a lying local resolver can strip the AAAA
+    records of `ipv4only.arpa` and hide its prefix. It cannot widen the
+    policy, because a prefix only adds refusals, but with the prefix
+    hidden it could answer an allowed name with `<prefix>::a00:5` and
+    reach a private IPv4 address through the translator. The runner, or
+    the operator through it, knows the network's prefix and passes it
+    with `--nat64-prefix`, which the resolver cannot touch. Rejected:
+    discovery alone, for that reason; the flag alone, because a runner
+    that does not pass it leaves the hole open by default.
+  - Discovery runs once per process. A prefix that changes during a phase
+    is not seen until the next phase starts a new egress; RFC 7050's
+    re-validation by the record's TTL is not done.
 - Consequences: private and shared ranges have no override, so a private
   or customer-network registry cannot be reached (an opt-in needs a later
-  ADR; decided at STOP 1 of #10). IPv6-only hosts behind NAT64 cannot
-  connect.
+  ADR; decided at STOP 1 of #10). IPv6-only hosts behind NAT64 with the
+  well-known prefix (`64:ff9b::/96`, or the local-use `64:ff9b:1::/48`)
+  cannot connect. Behind a network-specific prefix that the egress knows,
+  they connect only to addresses whose embedded IPv4 address is global.
+  Behind a network-specific prefix that the egress does not know (hidden
+  from discovery and not passed by the runner), synthesized addresses are
+  checked as plain IPv6 only.
 
 ### D5. Connect order and budget
 
@@ -268,7 +334,7 @@ even though the CONNECT is refused.
 
   | kind | fields, in this order |
   |---|---|
-  | `start` | `t=<u64> v=1 unix_ms=<u64> allow=<host:port>(,<host:port>)*` (canonical, sorted) |
+  | `start` | `t=<u64> v=1 unix_ms=<u64> allow=<host:port>(,<host:port>)* nat64=<-\|<ipv6>/<len>(,<ipv6>/<len>)*>` (both lists canonical and sorted; `-` for no prefix) |
   | `allowed` | `t=<u64> id=<u64> host=<host> port=<1..65535>` |
   | `refused` | `t=<u64> id=<u64> host=<host> port=<1..65535>` (403) |
   | `open` | `t=<u64> id=<u64> addr=<socket-addr>` |
@@ -409,7 +475,9 @@ ADR-003 (item 7) makes each consumer justify its own limits.
   registry mirror is the later fix, required before hosted runners run
   untrusted code against private repositories (decided at STOP 1 of #10).
 - No private or customer-network registries (D4), and no IPv6-only hosts
-  behind NAT64.
+  behind NAT64 with the well-known prefix. Behind a network-specific
+  prefix that a lying local resolver hides from discovery, the embedded
+  IPv4 check holds only if the runner passes the prefix (D4).
 - The egress enforces only the list it is given. The rule that github.com
   is never on a list is enforced where the per-phase lists are built
   (#32), with a test there.
