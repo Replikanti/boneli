@@ -51,8 +51,10 @@ and a table this small is checked exhaustively by the tests.
 
 **Errors and outcomes.** A `DomainError` means the caller sent something the
 run cannot accept: a wrong sequence, a ticket with a blank key or title, a
-blank forge reference on `QuestionsPosted` or `PullRequestOpened`
-(`BlankForgeReference`), a zero budget limit, or a malformed SHA. The run does not advance, and since
+blank forge reference on `QuestionsPosted` or `PullRequestOpened` or a blank
+`JobFailed` detail (`BlankEventField`), a blank evidence reference
+(`BlankEvidenceRef`), a zero budget limit, or a malformed SHA. The run does
+not advance, and since
 `handle` consumes the run, a caller that goes on keeps a clone. Agent
 output is untrusted content, not a caller error: a bad result ends the run
 with an outcome (fail closed, invariant 6), so a run never stalls on it.
@@ -68,18 +70,26 @@ analysis, citations, diff, fix checks).
 2. Caller input inside a legal pair. On `TicketReceived` a blank key or
    title is `InvalidTicket`, and the run stays in Intake, because the ticket
    comes from an intake adapter before any work and the caller can fix it.
-   On `QuestionsPosted` and `PullRequestOpened` a blank reference is
-   `BlankForgeReference`: the reference comes from our own forge adapter, and
-   a finished run that points at no comment or pull request has lost its
-   evidence. The same blank rule applies, and the run neither advances nor
-   is charged (forge results carry no usage). This is validation inside a
-   legal pair, so the pair counts above do not change.
+   On `QuestionsPosted` and `PullRequestOpened` a blank reference, and on
+   `JobFailed` a blank detail, is `BlankEventField(kind)`: the reference
+   comes from our own forge adapter and the detail from our own job runner,
+   and a finished run that points at no comment, pull request or failure
+   reason has lost its evidence. The same blank rule applies, and the run
+   neither advances nor is charged (the check runs before usage
+   accounting). One variant for the three fields, because the event kind
+   already names the field. This is validation inside a legal pair, so the
+   pair counts above do not change.
 3. Usage accounting (D3). A total over a limit ends the run as
    `BudgetExceeded` with no command, whatever the event says, with the one
    exception in D3.
 4. The event's own rule: gate, validation, transition.
 
-`CommitSha` accepts exactly 40 or 64 lowercase hex digits (SHA-1 and SHA-256
+`EvidenceRef::parse` rejects a blank reference (`BlankEvidenceRef`), so
+a blank one cannot be represented and no event needs its own check: the
+reference is issued by our own evidence store (#4), so a blank one is
+caller input, not agent output. It is a separate variant from
+`BlankEventField` because it is rejected at construction, before any event
+exists. `CommitSha` accepts exactly 40 or 64 lowercase hex digits (SHA-1 and SHA-256
 object names). No abbreviations, because an abbreviated name can become
 ambiguous as the repository grows; no uppercase or trimming, because the
 domain compares SHAs as strings. "Blank" means every character is
@@ -196,7 +206,7 @@ also when the total saturated at a `u64::MAX` limit).
 ### D4. The replay gate: `boneli-replay-check`
 
 - **Corpus:** `boneli_domain::scenarios` holds the event sequences as data:
-  `all()` returns 62 named scenarios in a fixed order, and `fold` runs one
+  `all()` returns 63 named scenarios in a fixed order, and `fold` runs one
   through `Run::handle`. It ships in the library because core crates may
   not declare features (ADR-001). The domain's unit tests fold only through
   `fold` and compare each trace with a test-only table of expected results,
@@ -209,7 +219,8 @@ also when the total saturated at a `u64::MAX` limit).
   `Box<u64>` and of `Run::handle`, then `scenario <name>`, the pretty
   `Debug` output of each trace and the `Display` of every error in it, and
   finally the `Display` and `Debug` of the errors only constructors return
-  (`Run::new` with a zero limit, `CommitSha::parse`). The comparison sees
+  (`Run::new` with a zero limit, `CommitSha::parse`, `EvidenceRef::parse`).
+  The comparison sees
   only what is printed, so every hand-written formatting impl of the domain
   is printed (today only `DomainError`'s `Display`); a test lists those impls
   in the domain sources and fails when one is added that the harness does

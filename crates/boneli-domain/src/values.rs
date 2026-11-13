@@ -55,13 +55,25 @@ impl CommitSha {
 
 /// A reference to stored evidence: a reproduction test, an analysis or a
 /// diff. Opaque here; the event log and evidence store (#4) own its format.
+/// Never blank (ADR-002): a finished run must point at its evidence.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EvidenceRef(String);
 
 impl EvidenceRef {
-    /// Wraps a reference issued by the evidence store.
-    pub fn new(reference: String) -> EvidenceRef {
-        EvidenceRef(reference)
+    /// Accepts a reference issued by the evidence store; a blank one (see
+    /// [`is_blank`]) is rejected.
+    pub fn parse(reference: &str) -> Result<EvidenceRef, DomainError> {
+        if is_blank(reference) {
+            Err(DomainError::BlankEvidenceRef)
+        } else {
+            Ok(EvidenceRef(String::from(reference)))
+        }
+    }
+
+    /// For the scenario corpus only: its references are fixed literals, and
+    /// a unit test parses each of them.
+    pub(crate) fn from_corpus(reference: &'static str) -> EvidenceRef {
+        EvidenceRef(String::from(reference))
     }
 
     /// The reference as issued.
@@ -242,6 +254,24 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn evidence_ref_parse_rejects_blank() {
+        for blank in ["", " ", "\t\n", "\u{200B}", "\u{FEFF}", "\u{3164}"] {
+            assert_eq!(
+                EvidenceRef::parse(blank),
+                Err(DomainError::BlankEvidenceRef),
+                "{blank:?}"
+            );
+        }
+        let parsed = EvidenceRef::parse("evidence/fix-diff").expect("not blank");
+        assert_eq!(parsed.as_str(), "evidence/fix-diff");
+        // Not trimmed: the store's reference is kept as issued.
+        assert_eq!(
+            EvidenceRef::parse(" a ").map(|r| String::from(r.as_str())),
+            Ok(String::from(" a "))
+        );
     }
 
     #[test]

@@ -287,8 +287,8 @@ impl Run {
     /// 2. Caller input inside a legal pair: a ticket with a blank key or
     ///    title is a [`DomainError::InvalidTicket`] (the run stays in
     ///    intake), and a blank forge reference on `QuestionsPosted` or
-    ///    `PullRequestOpened` is a [`DomainError::BlankForgeReference`].
-    ///    Neither is charged.
+    ///    `PullRequestOpened` or a blank `JobFailed` detail is a
+    ///    [`DomainError::BlankEventField`]. None of them is charged.
     /// 3. The event's usage is charged; a crossed limit stays crossed. A
     ///    total over a limit ends the run as
     ///    [`Outcome::BudgetExceeded`] with no command, whatever the event
@@ -338,14 +338,15 @@ impl Run {
                 });
             }
         };
-        let reference = match &event {
+        let text = match &event {
             RunEvent::QuestionsPosted { reference } | RunEvent::PullRequestOpened { reference } => {
                 Some(reference.as_str())
             }
+            RunEvent::JobFailed { detail, .. } => Some(detail.as_str()),
             _ => None,
         };
-        if reference.is_some_and(is_blank) {
-            return Err(DomainError::BlankForgeReference(event.kind()));
+        if text.is_some_and(is_blank) {
+            return Err(DomainError::BlankEventField(event.kind()));
         }
 
         let fix = match &event {

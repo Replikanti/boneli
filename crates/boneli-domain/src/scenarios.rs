@@ -121,15 +121,15 @@ pub(crate) fn ticket() -> Ticket {
 }
 
 pub(crate) fn test_ref() -> EvidenceRef {
-    EvidenceRef::new(String::from("evidence/reproduction-test"))
+    EvidenceRef::from_corpus("evidence/reproduction-test")
 }
 
 pub(crate) fn analysis_ref() -> EvidenceRef {
-    EvidenceRef::new(String::from("evidence/analysis"))
+    EvidenceRef::from_corpus("evidence/analysis")
 }
 
 pub(crate) fn diff_ref() -> EvidenceRef {
-    EvidenceRef::new(String::from("evidence/fix-diff"))
+    EvidenceRef::from_corpus("evidence/fix-diff")
 }
 
 pub(crate) fn citation(path: &str, line: u32) -> Citation {
@@ -252,8 +252,12 @@ fn opened_as(reference: &str) -> RunEvent {
 }
 
 fn failed(usage: Usage) -> RunEvent {
+    failed_with(FAILURE, usage)
+}
+
+fn failed_with(detail: &str, usage: Usage) -> RunEvent {
     RunEvent::JobFailed {
-        detail: String::from(FAILURE),
+        detail: String::from(detail),
         usage,
     }
 }
@@ -498,6 +502,17 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "reference-blank-pull-request",
             with(head(8), vec![opened_as(""), opened_as(" \t"), opened()]),
+        ),
+        scenario(
+            "job-failed-blank-detail",
+            with(
+                head(3),
+                vec![
+                    failed_with("", JOB),
+                    failed_with("\u{3000}", JOB),
+                    failed(JOB),
+                ],
+            ),
         ),
         // Reproduction gate.
         scenario(
@@ -1231,11 +1246,11 @@ mod tests {
                     asked(),
                     vec![
                         refused(
-                            DomainError::BlankForgeReference(K::QuestionsPosted),
+                            DomainError::BlankEventField(K::QuestionsPosted),
                             Stage::Triage,
                         ),
                         refused(
-                            DomainError::BlankForgeReference(K::QuestionsPosted),
+                            DomainError::BlankEventField(K::QuestionsPosted),
                             Stage::Triage,
                         ),
                         ends(Outcome::NeedsInformation {
@@ -1252,11 +1267,11 @@ mod tests {
                     join(
                         vec![
                             refused(
-                                DomainError::BlankForgeReference(K::PullRequestOpened),
+                                DomainError::BlankEventField(K::PullRequestOpened),
                                 Stage::Deliver,
                             ),
                             refused(
-                                DomainError::BlankForgeReference(K::PullRequestOpened),
+                                DomainError::BlankEventField(K::PullRequestOpened),
                                 Stage::Deliver,
                             ),
                         ],
@@ -1264,6 +1279,18 @@ mod tests {
                     ),
                 ),
                 j(7),
+            ),
+            x(
+                "job-failed-blank-detail",
+                join(
+                    head_wants(3),
+                    vec![
+                        refused(DomainError::BlankEventField(K::JobFailed), Stage::Reproduce),
+                        refused(DomainError::BlankEventField(K::JobFailed), Stage::Reproduce),
+                        job_failed(K::ReproductionChecked),
+                    ],
+                ),
+                j(3),
             ),
             x(
                 "reproduction-passes-on-base",
@@ -1560,11 +1587,11 @@ mod tests {
     fn expectations_and_scenarios_are_a_bijection() {
         let scenarios: Vec<&str> = all().iter().map(|s| s.name).collect();
         let expected: Vec<&str> = expectations().iter().map(|e| e.name).collect();
-        assert_eq!(scenarios.len(), 62);
+        assert_eq!(scenarios.len(), 63);
         assert_eq!(scenarios.len(), expected.len());
         let a: BTreeSet<&str> = scenarios.into_iter().collect();
         let b: BTreeSet<&str> = expected.into_iter().collect();
-        assert_eq!(a.len(), 62, "scenario names are unique");
+        assert_eq!(a.len(), 63, "scenario names are unique");
         assert_eq!(a, b);
     }
 
@@ -1581,6 +1608,13 @@ mod tests {
                 s.name
             );
             assert!(names.insert(s.name), "duplicate {}", s.name);
+        }
+    }
+
+    #[test]
+    fn corpus_evidence_refs_parse() {
+        for r in [test_ref(), analysis_ref(), diff_ref()] {
+            assert_eq!(EvidenceRef::parse(r.as_str()), Ok(r.clone()));
         }
     }
 
@@ -1749,11 +1783,16 @@ mod tests {
     }
 
     #[test]
-    fn blank_forge_references_leave_the_run_unchanged() {
-        // Folding the events up to the first blank reference and folding the
-        // same events plus the two rejected ones must give the same run:
-        // nothing advances and nothing is charged.
-        for name in ["reference-blank-questions", "reference-blank-pull-request"] {
+    fn blank_event_fields_leave_the_run_unchanged() {
+        // Folding the events up to the first blank text and folding the same
+        // events plus the two rejected ones must give the same run: nothing
+        // advances and nothing is charged (the rejected JobFailed events
+        // carry usage).
+        for name in [
+            "reference-blank-questions",
+            "reference-blank-pull-request",
+            "job-failed-blank-detail",
+        ] {
             let full = scenario_named(name);
             let n = full.events.len();
             let before = Scenario {
@@ -1770,7 +1809,7 @@ mod tests {
             for entry in &b.entries[n - 3..] {
                 assert_eq!(
                     entry.result,
-                    Err(DomainError::BlankForgeReference(entry.got)),
+                    Err(DomainError::BlankEventField(entry.got)),
                     "{name}"
                 );
             }

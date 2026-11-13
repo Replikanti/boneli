@@ -42,7 +42,7 @@ pub enum RunEvent {
     },
     /// The forge posted the triage questions.
     QuestionsPosted {
-        /// The forge's reference to the comment.
+        /// The forge's reference to the comment; must not be blank.
         reference: String,
     },
     /// The agent wrote a reproduction test.
@@ -91,12 +91,13 @@ pub enum RunEvent {
     },
     /// The forge opened the pull request.
     PullRequestOpened {
-        /// The forge's reference to the pull request.
+        /// The forge's reference to the pull request; must not be blank.
         reference: String,
     },
     /// The job or forge call the run waits for failed.
     JobFailed {
-        /// What went wrong, as reported.
+        /// What went wrong, as reported; must not be blank, because it is
+        /// the only evidence of why the run ended.
         detail: String,
         /// What the job consumed before it failed.
         usage: Usage,

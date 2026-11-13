@@ -17,7 +17,9 @@
 use std::fmt::Write as _;
 
 use boneli_domain::scenarios::{Scenario, all, fold};
-use boneli_domain::{Budget, CommitSha, DomainError, Run, RunCommand, RunEvent, RunId};
+use boneli_domain::{
+    Budget, CommitSha, DomainError, EvidenceRef, Run, RunCommand, RunEvent, RunId,
+};
 
 /// The first line of the binary's output.
 pub const PROBE_PREFIX: &str = "probe ";
@@ -93,7 +95,8 @@ pub fn render_scenarios(scenarios: &[Scenario]) -> Result<String, DomainError> {
 }
 
 /// The `DomainError` variants that only constructors return:
-/// `Run::new` with a zero limit and `CommitSha::parse` of a malformed name.
+/// `Run::new` with a zero limit, `CommitSha::parse` of a malformed name and
+/// `EvidenceRef::parse` of a blank reference.
 fn constructor_errors() -> Vec<DomainError> {
     let id = || RunId::new(String::from("replay-check"));
     let zero_cost = Budget {
@@ -108,6 +111,7 @@ fn constructor_errors() -> Vec<DomainError> {
         Run::new(id(), zero_cost).err(),
         Run::new(id(), zero_duration).err(),
         CommitSha::parse("not a sha").err(),
+        EvidenceRef::parse("\u{200B}").err(),
     ]
     .into_iter()
     .flatten()
