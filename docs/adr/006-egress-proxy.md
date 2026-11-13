@@ -192,11 +192,23 @@ even though the CONNECT is refused.
     NAT64 prefixes in effect. An IPv6 address inside one of them is also
     forbidden when the IPv4 address at the RFC 6052 position for that
     length is forbidden by the IPv4 table, or when the address is not in
-    the canonical form of a synthesized address: the "u" octet (bits 64 to
-    71) and the suffix must be zero (RFC 6052, section 2.2, where the u
-    octet "MUST" be zero and the suffix is reserved). A translator's
-    handling of a non-canonical address is not specified, so the egress
-    refuses it rather than guess.
+    the canonical form of a synthesized address: for lengths up to 64 the
+    "u" octet (bits 64 to 71), which decides where the IPv4 bits sit, and
+    the suffix must be zero (RFC 6052, section 2.2, where the u octet
+    "MUST" be zero and the suffix is reserved). A translator's handling of
+    a non-canonical address is not specified, so the egress refuses it
+    rather than guess. A /96 has no u octet or suffix after the prefix:
+    its IPv4 address is bits 96 to 127.
+  - **Prefixes that break RFC 6052 are kept, not dropped.** RFC 6052 also
+    wants a /96 network-specific prefix to leave bits 64 to 71 zero. A /96
+    that does not is still accepted, from discovery and from
+    `--nat64-prefix`, because a translator that reads the low 32 bits
+    serves it anyway; dropping it would send that network's synthesized
+    addresses back to the plain IPv6 check, which is the hole this
+    classification closes. For the same reason discovery does not require
+    the u octet or the suffix of an `ipv4only.arpa` answer to be zero: the
+    prefix before a well-known address is kept, and the network's
+    non-canonical addresses are then refused.
   - **A prefix only adds refusals.** The tables decide first, and a prefix
     can only forbid more. A wrong prefix, or one an attacker supplied,
     can therefore refuse legitimate addresses (fail closed, and visible in
@@ -208,13 +220,21 @@ even though the CONNECT is refused.
     startup and `--nat64-prefix` from the runner, merged.** At startup the
     egress resolves `ipv4only.arpa` once, through the same resolver as its
     connections, and keeps every prefix at which an AAAA answer embeds
-    `192.0.0.170` or `192.0.0.171` in canonical form
-    (`Nat64Prefix::discover`). RFC 7050 resolves an address that matches
+    `192.0.0.170` or `192.0.0.171` (`Nat64Prefix::discover`). RFC 7050 resolves an address that matches
     at more than one length by retrying with the other well-known address;
     the egress keeps every match instead, because a surplus prefix only
     adds refusals. The name always has A records, so an answer with no
     address at all means the resolver is broken, and startup fails (exit
-    1). The prefixes in effect go into the `start` record (D8).
+    1). An answer with A records and no AAAA record is an ordinary network
+    without DNS64: the egress starts with no prefix. The prefixes in
+    effect go into the `start` record (D8).
+  - **Part 2 must test both startup cases**, because the exit decision is
+    not in part 1 (`discover` sees only the AAAA records): an
+    `ipv4only.arpa` answer with only A records starts the egress with
+    `nat64=-`, and an empty answer or a resolution error exits with 1
+    before the socket accepts. A third test passes `--nat64-prefix` with a
+    discovery answer that hides the prefix and checks that the `start`
+    record names the passed prefix.
   - Why discovery: it needs no configuration, so the default deployment is
     covered. It closes the realistic case, a hostile or broken
     authoritative answer for an allowed name behind an honest DNS64

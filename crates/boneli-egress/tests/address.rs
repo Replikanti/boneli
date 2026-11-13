@@ -429,8 +429,10 @@ fn nat64_prefix_validation() {
     // Bits after the prefix must be zero.
     assert!(Nat64Prefix::new(v6addr("2a00:1234::1"), 32).is_none());
     assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:1::"), 64).is_none());
-    // A /96 must leave the u octet (bits 64 to 71) zero (RFC 6052).
-    assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:100::"), 96).is_none());
+    // RFC 6052 wants a /96 to leave the u octet (bits 64 to 71) zero, but a
+    // /96 that does not is still accepted: its IPv4 bits sit at 96 to 127
+    // either way, and a prefix only adds refusals (ADR-006, D4).
+    assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:100::"), 96).is_some());
     assert!(Nat64Prefix::new(v6addr("2a00:1234:5678:9abc:ff:ffff::"), 96).is_some());
     // The text form is `<prefix>/<len>`, in `Ipv6Addr` display.
     let p = nat64("2a00:1234:5678:9abc::", 96);
@@ -483,7 +485,10 @@ fn nat64_discovery_from_ipv4only_arpa() {
         [nat64("2a00:1234::", 32), nat64("2a00:1234:5678:9abc::", 96)]
     );
     // No answer, an answer without a well-known address, and one with the
-    // u octet or the suffix set are no NAT64.
+    // A well-known address is still found when the u octet or the suffix is
+    // set (not RFC 6052's canonical form): keeping the prefix only adds
+    // refusals, while dropping it would check the network's synthesized
+    // addresses as plain IPv6 (ADR-006, D4).
     assert_eq!(Nat64Prefix::discover(&[]), []);
     assert_eq!(Nat64Prefix::discover(&[v6addr("2606:4700::6810:22")]), []);
     let mut u = embed("2a00:1234::", 32, wka[0]).octets();
@@ -492,6 +497,25 @@ fn nat64_discovery_from_ipv4only_arpa() {
     suffix[15] = 1;
     assert_eq!(
         Nat64Prefix::discover(&[Ipv6Addr::from(u), Ipv6Addr::from(suffix)]),
-        []
+        [nat64("2a00:1234::", 32)]
     );
+}
+
+/// The delta review's input: a /96 network-specific prefix whose bits 64 to
+/// 71 are not zero (an RFC 6052 violation that translators reading the low
+/// 32 bits still serve). It must be discovered, accepted from the runner,
+/// and must refuse a synthesized metadata address.
+#[test]
+fn nat64_noncanonical_96_prefix_still_refuses() {
+    let prefix = Nat64Prefix::new(v6addr("2a00:1:2:3:6400::"), 96).expect("accepted");
+    assert_eq!(
+        Nat64Prefix::discover(&[v6addr("2a00:1:2:3:6400::c000:aa")]),
+        [prefix]
+    );
+    assert_eq!(Nat64Prefix::parse("2a00:1:2:3:6400::/96"), Some(prefix));
+    let metadata = v6("2a00:1:2:3:6400::a9fe:a9fe");
+    assert!(!forbidden(metadata, &[]), "the hole without the prefix");
+    assert!(forbidden(metadata, &[prefix]));
+    assert!(forbidden(v6("2a00:1:2:3:6400::a00:5"), &[prefix]));
+    assert!(!forbidden(v6("2a00:1:2:3:6400::808:808"), &[prefix]));
 }

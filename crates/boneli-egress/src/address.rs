@@ -125,40 +125,46 @@ fn ipv4_octets(len: u8) -> [usize; 4] {
     out
 }
 
-/// The IPv4 address embedded in `ip` at the RFC 6052 position for `len`,
-/// or `None` when the u octet or the suffix is not zero (not the canonical
-/// form of a synthesized address). Does not check the prefix.
-fn embedded_at(ip: Ipv6Addr, len: u8) -> Option<Ipv4Addr> {
+/// The four octets at the RFC 6052 IPv4 position for `len`, whatever the
+/// u octet and the suffix hold. Does not check the prefix.
+fn ipv4_at(ip: Ipv6Addr, len: u8) -> Ipv4Addr {
     let bytes = ip.octets();
     let at = ipv4_octets(len);
-    let after = at[3] + 1;
+    Ipv4Addr::new(bytes[at[0]], bytes[at[1]], bytes[at[2]], bytes[at[3]])
+}
+
+/// The IPv4 address embedded in `ip` at the RFC 6052 position for `len`,
+/// or `None` when the address is not the canonical form of a synthesized
+/// one: for lengths up to 64 the u octet, which decides where the IPv4
+/// bits sit, must be zero, and so must the suffix. A /96 has neither; its
+/// IPv4 bits are 96 to 127 whatever its prefix holds in bits 64 to 71.
+/// Does not check the prefix.
+fn embedded_at(ip: Ipv6Addr, len: u8) -> Option<Ipv4Addr> {
+    let bytes = ip.octets();
+    let after = ipv4_octets(len)[3] + 1;
     if len <= 64 && bytes[8] != 0 {
         return None;
     }
     if bytes[after..].iter().any(|&b| b != 0) {
         return None;
     }
-    Some(Ipv4Addr::new(
-        bytes[at[0]],
-        bytes[at[1]],
-        bytes[at[2]],
-        bytes[at[3]],
-    ))
+    Some(ipv4_at(ip, len))
 }
 
 impl Nat64Prefix {
-    /// A prefix of an RFC 6052 length with no bits set after it; a /96 must
-    /// also leave the u octet zero (RFC 6052, section 2.2). `None`
-    /// otherwise.
+    /// A prefix of an RFC 6052 length with no bits set after it; `None`
+    /// otherwise. RFC 6052 (section 2.2) also wants a /96 to leave the u
+    /// octet (bits 64 to 71) zero, but a /96 that does not is accepted: a
+    /// translator still takes the IPv4 address from bits 96 to 127, and a
+    /// prefix only adds refusals, so rejecting it would only send that
+    /// network's synthesized addresses back to the plain IPv6 check
+    /// (ADR-006, D4).
     pub fn new(prefix: Ipv6Addr, len: u8) -> Option<Nat64Prefix> {
         if !NAT64_LENGTHS.contains(&len) {
             return None;
         }
         let host_bits = u128::MAX >> len;
         if u128::from(prefix) & host_bits != 0 {
-            return None;
-        }
-        if len == 96 && prefix.octets()[8] != 0 {
             return None;
         }
         Some(Nat64Prefix { prefix, len })
@@ -176,16 +182,18 @@ impl Nat64Prefix {
 
     /// The prefixes revealed by the AAAA answer for `ipv4only.arpa` (RFC
     /// 7050, section 3): for every address and every RFC 6052 length at
-    /// which a well-known IPv4 address sits in canonical form, the prefix
-    /// before it. Sorted, without duplicates. An address that matches at
-    /// more than one length gives every match: RFC 7050 resolves that case
-    /// by retrying with the other well-known address, but here a surplus
-    /// prefix only adds refusals, so keeping all of them fails closed.
+    /// which a well-known IPv4 address sits, the prefix before it. Sorted,
+    /// without duplicates. The u octet and the suffix are not checked here:
+    /// a network that sets them still has that prefix, and a surplus prefix
+    /// only adds refusals, so keeping it fails closed (its non-canonical
+    /// addresses are then all refused). For the same reason an address that
+    /// matches at more than one length gives every match, where RFC 7050
+    /// retries with the other well-known address.
     pub fn discover(aaaa: &[Ipv6Addr]) -> Vec<Nat64Prefix> {
         let mut out = Vec::new();
         for &ip in aaaa {
             for len in NAT64_LENGTHS {
-                if embedded_at(ip, len).is_some_and(|v4| WELL_KNOWN_IPV4.contains(&v4)) {
+                if WELL_KNOWN_IPV4.contains(&ipv4_at(ip, len)) {
                     let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
                     let prefix = Ipv6Addr::from(u128::from(ip) & mask);
                     out.extend(Nat64Prefix::new(prefix, len));
