@@ -1,0 +1,1 @@
+# a build script behind a dependency that never builds on a checked target needs no key (and no edge record)

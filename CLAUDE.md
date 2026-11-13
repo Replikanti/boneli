@@ -59,8 +59,11 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `#[path]`, `include!` or target source outside `.rs`; no build script in
    a member outside `roles.build-script` in `tools/architecture.toml` (empty;
    adding a crate needs an ADR) (ADR-001). A build script in an external
-   dependency needs an ADR that approves it for that crate (`httparse`:
-   ADR-003); the check that enforces this comes with part 2 of #5.
+   dependency needs an ADR that approves it for that crate: the key
+   `build-script = "ADR-NNN"` on its `[external.<crate>]` record, required
+   by the check for every reachable external crate whose cargo metadata
+   has a build script (`httparse`: ADR-003; `libc`, `ring`, `rustls`:
+   ADR-005). The approval is per crate, not per version (ADR-005).
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.

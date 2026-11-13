@@ -1,0 +1,2 @@
+# buildy is reached only through wrapper's build-dependencies; wrapper's own script is listed
+dep-build-script

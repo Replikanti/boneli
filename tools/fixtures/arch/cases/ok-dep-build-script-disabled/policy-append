@@ -1,0 +1,7 @@
+[external.nobuild]
+reason = "fixture crate"
+decision = "ADR-005"
+
+[external.nobuild.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"

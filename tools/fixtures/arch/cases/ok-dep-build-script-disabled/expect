@@ -1,0 +1,1 @@
+# build = false: cargo runs no build script, so build.rs in the package needs no key

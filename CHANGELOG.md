@@ -65,6 +65,28 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also covers `boneli-app`.
 - ADR-004: ports, in-memory adapters, contract suites and `DebugTicket`;
   `Verifier` is a port, implemented on `Sandbox` and `Git` in #17.
+- `boneli-https` (ADR-005): a TLS client on rustls with the ring provider,
+  TLS 1.3 and 1.2, ALPN `http/1.1`, Mozilla's roots from `webpki-roots`
+  plus roots the caller adds, the handshake inside `connect` and
+  `connect_over` (for CONNECT tunnels), no way to turn verification off,
+  no 0-RTT and no key log. A close without `close_notify` is an error. Its
+  idle check counts plaintext and records rustls holds, so a response
+  that arrives inside TLS while a connection is idle ends it, and session
+  tickets do not.
+- ADR-005: the TLS exception to pure Rust: the 15 crates of the stack and
+  their edges, the edges `getrandom -> libc` and `ring -> libc`, ring's C
+  and assembly build, the approved build scripts of external crates, and
+  the license exceptions.
+- `tools/architecture.toml`: records for the TLS stack, and
+  `build-script = "ADR-NNN"` on every external crate with a build script
+  (`httparse`, `libc`, `ring`, `rustls`).
+- The architecture rule `dep-build-script`: every reachable external crate
+  with a build script needs an ADR that approves it; with fixtures for
+  renamed scripts, `build = false`, build-dependencies, Windows-only
+  dependencies and malformed keys.
+- `deny.toml`: per-crate license exceptions for ring, untrusted and
+  rustls-webpki (ISC), subtle (BSD-3-Clause) and webpki-roots
+  (CDLA-Permissive-2.0).
 
 ### Changed
 

@@ -1,0 +1,29 @@
+[package]
+name = "boneli-https"
+description = "Boneli support crate: a TLS client on rustls with the ring provider, for boneli-http."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The HTTP/1.1 layer that runs over the TLS stream; a support crate, so the
+# edge stays inside the generic plumbing (docs/ARCHITECTURE.md).
+boneli-http.workspace = true
+# TLS 1.3 and 1.2 in Rust, the stack docs/ARCHITECTURE.md approves for
+# boneli-https and ADR-005 records with its transitive crates.
+# - `ring`: the crypto provider. Not `aws_lc_rs`, because `aws-lc-sys` is
+#   banned in deny.toml (a CMake C build).
+# - `std`: blocking `Read`/`Write` streams over std sockets.
+# - `tls12`: self-hosted forges and registries in customer networks may not
+#   speak TLS 1.3. It adds no crate.
+# - No `logging`: it would pull `log`; Boneli writes its own structured logs.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# Mozilla's root certificates, compiled in, so trust does not depend on the
+# host's CA bundle (ADR-005).
+webpki-roots = "1.0.12"

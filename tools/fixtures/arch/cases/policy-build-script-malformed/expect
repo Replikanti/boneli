@@ -1,0 +1,3 @@
+# build-script = "yes" is not an ADR reference, and approves nothing
+policy-format
+dep-build-script

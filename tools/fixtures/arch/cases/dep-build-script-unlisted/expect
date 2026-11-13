@@ -1,0 +1,2 @@
+# a registry crate with build.rs and no build-script key
+dep-build-script

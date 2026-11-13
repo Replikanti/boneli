@@ -1,0 +1,16 @@
+[external.wrapper]
+reason = "fixture crate"
+decision = "ADR-005"
+build-script = "ADR-005"
+
+[external.wrapper.pulled-by.boneli-http]
+reason = "fixture edge"
+decision = "ADR-005"
+
+[external.buildy]
+reason = "fixture crate"
+decision = "ADR-005"
+
+[external.buildy.pulled-by.wrapper]
+reason = "fixture edge"
+decision = "ADR-005"
