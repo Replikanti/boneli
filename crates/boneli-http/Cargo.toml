@@ -1,0 +1,19 @@
+[package]
+name = "boneli-http"
+description = "Boneli support crate: a strict HTTP/1.1 subset, server over Unix sockets and client over any stream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# HTTP/1.x head parsing without further dependencies: listed in
+# docs/ARCHITECTURE.md ("Pure Rust and dependencies") and recorded as
+# `httparse <- boneli-http` in tools/architecture.toml. The default `std`
+# feature only enables runtime SIMD detection and adds no crate (ADR-003).
+httparse = "1.10"

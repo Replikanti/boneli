@@ -283,7 +283,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 | `sha2` | content addressing, evidence | `boneli-store-fs` |
 | `miniz_oxide`, `ruzstd` | unpacking OCI image layers | `boneli-oci` |
 
-**We write ourselves:** an HTTP/1.1 server over a Unix socket and a client over TLS, a JSON parser and serializer without derive, a parser for a TOML subset for configuration, tar reading, argument parsing, structured logging, error types, RFC 3339 and ID generation.
+**We write ourselves:** an HTTP/1.1 server over a Unix socket and a client over TLS (ADR-003), a JSON parser and serializer without derive, a parser for a TOML subset for configuration, tar reading, argument parsing, structured logging, error types, RFC 3339 and ID generation.
 
 **We do not use:** tokio, serde, clap, tracing, anyhow, rusqlite.
 
