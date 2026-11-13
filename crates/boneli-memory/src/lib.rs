@@ -5,7 +5,11 @@
 //! would protect, and every consumer needs several. The job adapters
 //! ([`MemoryAgent`], [`MemoryVerifier`], [`MemoryForge`]) answer from a
 //! script of plain data and record every request; the stores keep their
-//! data in a `BTreeMap`. Each adapter passes its port's contract suite in
+//! data in a `BTreeMap`. [`MemorySandbox`] runs scripted [`Program`]s in a
+//! workspace map per sandbox, [`MemoryGit`] holds fixed commits and has its
+//! own snapshot and diff formats ([`pack_tree`]), [`MemoryImageStore`] a
+//! fixed set of images, and [`MemoryDataSnapshot`] databases as lists of
+//! rows. Each adapter passes its port's contract suite in
 //! `boneli_app::contract` (`tests/contract.rs`; the `Evidence` suite in the
 //! unit tests of `src/evidence.rs`), and the mutant table of
 //! `boneli-replay-check` shows that every clause of those suites can fail.
@@ -18,8 +22,12 @@
 
 mod agent;
 mod clock;
+mod data;
 mod evidence;
 mod forge;
+mod git;
+mod image;
+mod sandbox;
 mod store;
 mod verifier;
 
@@ -29,8 +37,12 @@ use boneli_app::JobFailure;
 
 pub use agent::{AgentRequest, AgentScript, MemoryAgent};
 pub use clock::{SequentialIds, StepClock};
+pub use data::MemoryDataSnapshot;
 pub use evidence::MemoryEvidence;
 pub use forge::{ForgeRequest, ForgeScript, MemoryForge};
+pub use git::{GitCommit, MemoryGit, Tree, pack_tree, unpack_tree};
+pub use image::MemoryImageStore;
+pub use sandbox::{MemorySandbox, Program};
 pub use store::MemoryEventStore;
 pub use verifier::{MemoryVerifier, VerifierRequest, VerifierScript};
 

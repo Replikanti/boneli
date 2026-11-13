@@ -33,7 +33,7 @@ fn every_clause_is_killed() {
 /// operation of its port.
 #[test]
 fn mutant_table_covers_every_clause() {
-    let suites: [(&str, &[&str], &[&str]); 7] = [
+    let suites: [(&str, &[&str], &[&str]); 11] = [
         ("EventStore", contract::event_store::CLAUSES, &[]),
         ("Evidence", contract::evidence::CLAUSES, &[]),
         ("Clock", contract::clock::CLAUSES, &[]),
@@ -53,6 +53,10 @@ fn mutant_table_covers_every_clause() {
             contract::forge::CLAUSES,
             contract::forge::OPERATIONS,
         ),
+        ("Sandbox", contract::sandbox::CLAUSES, &[]),
+        ("Git", contract::git::CLAUSES, &[]),
+        ("ImageStore", contract::image::CLAUSES, &[]),
+        ("DataSnapshot", contract::data::CLAUSES, &[]),
     ];
     let mut wanted = BTreeSet::new();
     let mut clauses = 0;

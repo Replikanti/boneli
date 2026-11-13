@@ -136,8 +136,12 @@ pub const RENDERED_FMT_IMPLS: &[&str] = &["error.rs: impl fmt::Display for Domai
 /// [`app::render_app_errors`] renders, in the same form as
 /// [`RENDERED_FMT_IMPLS`].
 pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
+    "data.rs: impl fmt::Display for DataError {",
     "debug_ticket.rs: impl fmt::Display for DebugTicketError {",
     "evidence.rs: impl fmt::Display for EvidenceError {",
+    "git.rs: impl fmt::Display for GitError {",
+    "image.rs: impl fmt::Display for ImageError {",
+    "sandbox.rs: impl fmt::Display for SandboxError {",
     "store.rs: impl fmt::Display for StoreError {",
 ];
 

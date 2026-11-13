@@ -17,10 +17,10 @@ use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
 use boneli_app::{
-    Agent, Clock, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore, Evidence,
-    EvidenceError, FixRequest, Forge, ForgeRef, Ids, JobFailure, PreviousRunError, PullRequest,
-    ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog, RunStart, StoreError,
-    TriageReport, TriageRequest, Verifier, Written,
+    Agent, Clock, DataError, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore,
+    Evidence, EvidenceError, FixRequest, Forge, ForgeRef, GitError, Ids, ImageError, JobFailure,
+    PreviousRunError, PullRequest, ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog,
+    RunStart, SandboxError, StoreError, TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, CheckStatus, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef,
@@ -610,6 +610,34 @@ pub fn render_app_errors() -> String {
         DebugTicketError::Store(StoreError::UnknownRun),
         DebugTicketError::Stalled(EventKind::FixVerified),
     ];
+    let sandbox = [
+        SandboxError::UnknownSandbox,
+        SandboxError::NotFound,
+        SandboxError::Failed {
+            detail: unavailable(),
+        },
+    ];
+    let git = [
+        GitError::UnknownCommit,
+        GitError::UnknownCheckout,
+        GitError::Failed {
+            detail: unavailable(),
+        },
+    ];
+    let image = [
+        ImageError::NotFound,
+        ImageError::Failed {
+            detail: unavailable(),
+        },
+    ];
+    let data = [
+        DataError::UnknownSnapshot,
+        DataError::UnknownCopy,
+        DataError::InvalidRunId,
+        DataError::Failed {
+            detail: unavailable(),
+        },
+    ];
     let mut out = String::new();
     for error in store {
         let _ = writeln!(out, "display app: {error}\n{error:?}");
@@ -618,6 +646,18 @@ pub fn render_app_errors() -> String {
         let _ = writeln!(out, "display app: {error}\n{error:?}");
     }
     for error in debug_ticket {
+        let _ = writeln!(out, "display app: {error}\n{error:?}");
+    }
+    for error in sandbox {
+        let _ = writeln!(out, "display app: {error}\n{error:?}");
+    }
+    for error in git {
+        let _ = writeln!(out, "display app: {error}\n{error:?}");
+    }
+    for error in image {
+        let _ = writeln!(out, "display app: {error}\n{error:?}");
+    }
+    for error in data {
         let _ = writeln!(out, "display app: {error}\n{error:?}");
     }
     out
