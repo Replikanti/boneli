@@ -54,26 +54,38 @@ fn apparmor_profile_is_narrow() {
         );
         return;
     }
-    // This binary sits under the profile's path: no AppArmor restriction.
+    // This binary sits under the profile's path: the profile is attached
+    // and lifts the restriction.
+    let label = support::probe::apparmor_label();
+    assert!(
+        label.starts_with("boneli-sys-tests"),
+        "the test binary runs as {label:?}, not under the host-setup profile: is it loaded?"
+    );
     if let Err(missing) = Features::probe() {
         assert!(
             !missing.iter().any(|m| m.id() == MissingId::UsernsApparmor),
-            "the test binary itself is restricted: is the host-setup profile loaded? {missing:?}"
+            "the test binary itself is restricted: {missing:?}"
         );
     }
-    // A copy outside the profile's glob keeps the restriction.
+    // A copy outside the profile's glob keeps the restriction. It must not
+    // be started from here: a program this profile execs stays in it (a
+    // copy started directly was not restricted on the CI runners), so the
+    // user manager, which is unconfined, starts it, and AppArmor finds a
+    // profile for it by its path alone.
     let dir = TempDir::new("narrow");
     let copy = dir.path().join("probe-copy");
     std::fs::copy(std::env::current_exe().expect("current_exe"), &copy)
         .expect("copy the test binary");
     std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))
         .expect("chmod the copy");
-    let out = Command::new(&copy)
+    let out = Command::new("systemd-run")
+        .args(["--user", "--wait", "--pipe", "--quiet", "--collect"])
+        .arg(format!("--setenv={}=features", support::probe::ACTION_VAR))
+        .arg(&copy)
         .args(["--exact", "probe", "--nocapture", "--quiet"])
-        .env_clear()
-        .env(support::probe::ACTION_VAR, "features")
+        .stdin(std::process::Stdio::null())
         .output()
-        .expect("run the copy");
+        .expect("run the copy through systemd-run --user");
     let p = parse_probe(Output {
         status: match out.status.code() {
             Some(code) => boneli_sys::ExitStatus::Exited(code),
@@ -85,6 +97,11 @@ fn apparmor_profile_is_narrow() {
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     });
     p.assert_ok();
+    assert!(
+        !p.get("label").starts_with("boneli-sys-tests"),
+        "the copy runs under the test profile, so the profile is too wide: {}",
+        p.raw
+    );
     let ids: Vec<&str> = p.get("missing").split(',').collect();
     assert!(
         ids.contains(&"userns-apparmor"),

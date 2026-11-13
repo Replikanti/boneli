@@ -249,9 +249,15 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   unconfined otherwise. The two alternatives are cargo's two layouts:
   `deps/` before cargo 1.100, and `build/<package>/<hash>/out/` since
   (measured: the CI runners' cargo 1.100 put the test binaries there,
-  and the first CI run failed on a profile that named only `deps/`). `probe::apparmor_profile_is_narrow` proves the rest of the
-  host keeps the restriction: a copy of the test binary outside that path
-  must still report `userns-apparmor`. The profile is path-based, and the
+  and the first CI run failed on a profile that named only `deps/`).
+  `probe::apparmor_profile_is_narrow` proves the rest of the host keeps
+  the restriction: a copy of the test binary outside that path must still
+  report `userns-apparmor`. A program the profile execs stays in the
+  profile (a copy the test binary started itself was not restricted on
+  the CI runners), so the test has the user manager start the copy
+  (`systemd-run --user`) and checks both labels: the test binary runs as
+  `boneli-sys-tests`, the copy does not. The same inheritance means that
+  everything a test sandbox runs is under the profile too. The profile is path-based, and the
   building user can write those paths, so on a shared or desktop host it
   lifts the restriction for that user; CI runners are ephemeral and
   single-purpose, and a production runner needs a root-owned binary path
@@ -283,7 +289,26 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   `BONELI_SYS_HOST_GAPS`, and the timing-sensitive cgroup tests run on a
   second machine; each PR of #6 carries the dev-host summary.
 
-CI measurements (first run of PR 1): to be filled in from the run.
+**CI measurements** (first runs of PR 1, 2026-11-13; the "Host
+features" step prints them on every run):
+
+| | `ubuntu-latest` | `ubuntu-24.04-arm` |
+|---|---|---|
+| kernel | 7.0.0-1019-azure x86_64 | 7.0.0-1017-azure aarch64 |
+| LSMs | lockdown, capability, landlock, yama, apparmor, bpf, ima, evm | lockdown, capability, landlock, yama, apparmor, ima, evm |
+| `kernel.apparmor_restrict_unprivileged_userns` | 1 | 1 |
+| `kernel.dmesg_restrict` / `perf_event_paranoid` / `unprivileged_bpf_disabled` | 1 / 4 / 2 | 1 / 4 / 2 |
+| the job's cgroup | `system.slice/hosted-compute-agent.service`, owned by root, controllers cpuset cpu io memory pids | the same |
+| stock runner lacks (step 3) | exactly `userns-apparmor`, `cgroup-not-delegated` | the same |
+| host-setup block (linger, restart, bus wait) | 1 s | 1 s |
+| after the block, in a `Delegate=yes` scope | nothing missing (io included) | the same |
+
+Every assumption above held but one: the AppArmor restriction shows as
+EACCES at the setgroups open, not EPERM (D3). The runner user has
+supplementary groups (`adm`, `docker`, `systemd-journal`), which stay
+effective inside the sandbox (D1); on CI that is accepted, a production
+runner must not have them. The 30 s bound of the bus wait is 30 times the
+measured start.
 
 ### D6. Lints of the unsafe crate
 

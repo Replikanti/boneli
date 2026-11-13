@@ -140,7 +140,7 @@ cargo's target directory; `RUN_USER`, the user who runs the tests;
    under `$TARGET_DIR/<profile>/deps/` (cargo before 1.100) or
    `$TARGET_DIR/<profile>/build/boneli-sys/<hash>/out/` (cargo 1.100's
    build directory layout). Everything else on the host keeps
-   the restriction. Undo: `sudo apparmor_parser -R
+   the restriction; what the test binaries exec inherits the profile. Undo: `sudo apparmor_parser -R
    /etc/apparmor.d/boneli-sys-tests && sudo rm
    /etc/apparmor.d/boneli-sys-tests`. Builds with `--target <triple>` sit
    one directory deeper and are not matched. **The profile grants user

@@ -178,7 +178,23 @@ fn session() {
     }
 }
 
+/// This process's AppArmor label, or `none` where AppArmor is absent.
+pub fn apparmor_label() -> String {
+    [
+        "/proc/self/attr/apparmor/current",
+        "/proc/self/attr/current",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+    .map(|l| {
+        l.trim_matches(|c: char| c.is_whitespace() || c == '\0')
+            .to_string()
+    })
+    .unwrap_or_else(|| "none".to_string())
+}
+
 fn features() {
+    put("label", &apparmor_label());
     let ids = match boneli_sys::Features::probe() {
         Ok(()) => String::new(),
         Err(missing) => missing
