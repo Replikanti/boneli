@@ -38,6 +38,13 @@ pub fn split_at(data: &[u8], offsets: &[usize]) -> Pieces {
     Pieces { chunks }
 }
 
+impl Pieces {
+    /// Whether every piece has been read.
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(Vec::is_empty)
+    }
+}
+
 impl Read for Pieces {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while let Some(front) = self.chunks.front_mut() {

@@ -30,4 +30,4 @@ pub use error::{Error, Result};
 pub use head::{Headers, Method, RequestHead, ResponseHead, Target};
 pub use limits::{Limits, ServerLimits};
 pub use server::{Exchange, serve, serve_connection};
-pub use transport::{Transport, Tunnel};
+pub use transport::{IdleCheck, Transport, Tunnel};

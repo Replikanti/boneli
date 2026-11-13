@@ -273,7 +273,7 @@ impl Run {
 
 ## Pure Rust and dependencies
 
-All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl; for the core crates also the no-std build target); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts, and with them native `links` (cargo accepts `links` only with a build script), are allowed only for crates listed in `roles.build-script` of that file, each with its own ADR; the list is empty.
+All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/architecture.toml`: every edge into an external crate in the resolved graph, transitive ones included, needs a record that names its parent, and `tools/check-architecture.sh` fails in CI on any edge without one (ADR-001). An edge counts unless its `cfg` is false on every target we ship (x86_64 and aarch64 Linux, glibc and musl; for the core crates also the no-std build target); conditions that depend on build flags, such as `crt-static`, count as true. Build scripts of workspace members, and with them native `links` (cargo accepts `links` only with a build script), are allowed only for members listed in `roles.build-script` of that file, each with its own ADR; the list is empty. A build script in a dependency needs an ADR that approves it for that crate (`httparse`: ADR-003); the check that enforces this comes with part 2 of #5.
 
 | Crate | Why | Where it may appear |
 | --- | --- | --- |

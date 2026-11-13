@@ -64,14 +64,19 @@ fn response_header_injection_rejected() {
         for propagate in [false, true] {
             let mut headers = Headers::new();
             headers.append(name, value);
+            // Nothing of the response is written. A handler that returns
+            // the error closes without an answer (no explicit status); one
+            // that returns `Ok` gets the server's 500.
+            let expected: &[u8] = if propagate { b"" } else { INTERNAL_ERROR };
             let (written, _) = serve_mem(GET, |ex| {
                 let result = ex.respond(200, &headers, b"body");
                 assert!(matches!(result, Err(Error::InvalidInput(_))), "{name:?}");
                 if propagate { result } else { Ok(()) }
             });
-            assert!(
-                written.is_empty(),
-                "{name:?}: nothing written, got {:?}",
+            assert_eq!(
+                written,
+                expected,
+                "{name:?}: got {:?}",
                 String::from_utf8_lossy(&written)
             );
 
@@ -80,12 +85,9 @@ fn response_header_injection_rejected() {
             let (written, _) = serve_mem(GET, |ex| {
                 let result = ex.respond_streaming(200, &headers).map(drop);
                 assert!(result.is_err(), "{name:?}");
-                Ok(())
+                if propagate { result } else { Ok(()) }
             });
-            assert!(
-                written.is_empty(),
-                "{name:?}: nothing written when streaming"
-            );
+            assert_eq!(written, expected, "{name:?}: streaming");
         }
     }
 }
@@ -120,12 +122,12 @@ fn server_bodyless_statuses() {
             ));
             Ok(())
         });
-        assert!(written.is_empty());
+        assert_eq!(written, INTERNAL_ERROR);
         let (written, _) = serve_mem(GET, |ex| {
             assert!(ex.respond_streaming(status, &Headers::new()).is_err());
             Ok(())
         });
-        assert!(written.is_empty());
+        assert_eq!(written, INTERNAL_ERROR);
         let (written, result) = serve_mem(GET, |ex| ex.respond(status, &Headers::new(), b""));
         result.expect("served");
         let text = String::from_utf8_lossy(&written).into_owned();
@@ -143,8 +145,227 @@ fn server_bodyless_statuses() {
             );
             Ok(())
         });
+        assert_eq!(written, INTERNAL_ERROR, "status {status}");
+    }
+}
+
+/// The answer to a handler that returned `Ok` without a byte of a
+/// response on the wire (ADR-003, item 11).
+const INTERNAL_ERROR: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Serves `input` (read in one piece) and counts the handler's calls.
+fn serve_counted<H>(input: &[u8], handler: H) -> (Vec<u8>, Result<(), Error>, usize)
+where
+    H: Fn(Exchange<'_, MemStream>) -> Result<(), Error>,
+{
+    let calls = std::cell::Cell::new(0);
+    let (written, result) = serve_mem(input, |ex| {
+        calls.set(calls.get() + 1);
+        handler(ex)
+    });
+    (written, result, calls.get())
+}
+
+#[test]
+fn handler_without_answer_gets_500() {
+    let (written, result, calls) = serve_counted(&GET.repeat(2), |_| Ok(()));
+    result.expect("served");
+    assert_eq!(
+        written,
+        INTERNAL_ERROR,
+        "{:?}",
+        String::from_utf8_lossy(&written)
+    );
+    assert_eq!(calls, 1, "the connection closes after the 500");
+}
+
+#[test]
+fn failed_respond_validation_gets_500() {
+    // A gateway forwards an upstream value with CR in it, ignores the error
+    // and returns `Ok`: nothing reached the wire, so the client gets 500
+    // instead of a silent close.
+    let mut headers = Headers::new();
+    headers.append("X-Up", "a\r\nb");
+    let (written, result, calls) = serve_counted(&GET.repeat(2), |ex| {
+        assert!(ex.respond(200, &headers, b"").is_err());
+        Ok(())
+    });
+    result.expect("served");
+    assert_eq!(written, INTERNAL_ERROR);
+    assert_eq!(calls, 1);
+
+    // The same for `accept_tunnel` on a request that is not CONNECT.
+    let (written, _, calls) = serve_counted(&GET.repeat(2), |ex| {
+        assert!(ex.accept_tunnel().is_err());
+        Ok(())
+    });
+    assert_eq!(written, INTERNAL_ERROR);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn unfinished_stream_closes_connection() {
+    let (written, result, calls) = serve_counted(&GET.repeat(2), |ex| {
+        let mut writer = ex.respond_streaming(200, &Headers::new())?;
+        writer.write_all(b"abc")?;
+        Ok(())
+    });
+    result.expect("served");
+    assert_eq!(
+        written, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+        "no last chunk and no 500 after bytes reached the wire"
+    );
+    assert_eq!(calls, 1, "the connection closes");
+}
+
+/// A stream that reads its input and accepts `room` bytes of writes, then
+/// fails every write: a response that reached the wire in part.
+struct ShortWrites {
+    input: common::Pieces,
+    written: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    room: usize,
+}
+
+impl Read for ShortWrites {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.input.read(buf)
+    }
+}
+
+impl Write for ShortWrites {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut written = self.written.borrow_mut();
+        let n = buf.len().min(self.room - written.len());
+        if n == 0 {
+            return Err(ErrorKind::BrokenPipe.into());
+        }
+        written.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl boneli_http::Transport for ShortWrites {
+    fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn failed_respond_write_closes_connection() {
+    let written = std::rc::Rc::default();
+    let stream = ShortWrites {
+        input: common::pieces(&GET.repeat(2), 4096),
+        written: std::rc::Rc::clone(&written),
+        room: 5,
+    };
+    let calls = std::cell::Cell::new(0);
+    let result =
+        boneli_http::serve_connection(stream, &common::server_limits(wide()), &|ex: Exchange<
+            '_,
+            ShortWrites,
+        >| {
+            calls.set(calls.get() + 1);
+            assert!(ex.respond(200, &Headers::new(), b"").is_err());
+            Ok(())
+        });
+    result.expect("served");
+    assert_eq!(
+        &written.borrow()[..],
+        b"HTTP/",
+        "no 500 after a partial response"
+    );
+    assert_eq!(calls.get(), 1, "the connection closes");
+}
+
+#[test]
+fn returned_tunnel_closes_connection() {
+    let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+    let mut input = connect.to_vec();
+    input.extend_from_slice(GET);
+    // The CONNECT arrives alone, so the request after it is still unread
+    // when the tunnel is accepted.
+    let (stream, output) = MemStream::from_pieces(common::split_at(&input, &[connect.len()]));
+    let calls = std::cell::Cell::new(0);
+    let result =
+        boneli_http::serve_connection(stream, &common::server_limits(wide()), &|ex: Exchange<
+            '_,
+            MemStream,
+        >| {
+            calls.set(calls.get() + 1);
+            drop(ex.accept_tunnel()?);
+            Ok(())
+        });
+    result.expect("served");
+    assert_eq!(&output.borrow()[..], b"HTTP/1.1 200 OK\r\n\r\n");
+    assert_eq!(calls.get(), 1, "the connection closes with the tunnel");
+}
+
+#[test]
+fn handler_error_without_status_closes() {
+    // Errors a handler returns get a status only through `Error::Status`:
+    // an upstream timeout or malformed upstream answer is not the client's
+    // fault, so it is not answered with 408, 400 or 413.
+    for error in [
+        || Error::Timeout,
+        || Error::Malformed("upstream"),
+        || Error::BodyTooLarge,
+        || Error::HeadTooLarge,
+        || Error::UnsupportedVersion,
+        || Error::UnexpectedEof,
+        || Error::Io(ErrorKind::ConnectionReset.into()),
+    ] {
+        let (written, result, calls) = serve_counted(&GET.repeat(2), |_| Err(error()));
+        assert!(
+            written.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&written)
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+}
+
+#[test]
+fn handler_error_status_answered() {
+    for status in [400u16, 403, 502, 504, 599] {
+        let (written, result, calls) =
+            serve_counted(&GET.repeat(2), |_| Err(Error::Status(status)));
+        assert!(matches!(result, Err(Error::Status(s)) if s == status));
+        assert_eq!(common::statuses(&written), vec![status]);
+        assert!(String::from_utf8_lossy(&written).contains("Connection: close"));
+        assert_eq!(calls, 1);
+    }
+    // Only final error statuses: anything else closes without an answer.
+    for status in [0u16, 101, 200, 302, 399, 600, 1000] {
+        let (written, _, _) = serve_counted(GET, |_| Err(Error::Status(status)));
         assert!(written.is_empty(), "status {status}");
     }
+}
+
+#[test]
+fn body_error_status_survives_handler_error() {
+    // The server's own reading of the body failed (413); the handler then
+    // returns some other error. The client still learns why.
+    let input = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n";
+    let (stream, output) = MemStream::new(input, 4096);
+    let limits = common::server_limits(common::limits(1024, 8, 10));
+    let result =
+        boneli_http::serve_connection(stream, &limits, &|mut ex: Exchange<'_, MemStream>| {
+            let mut body = Vec::new();
+            assert!(ex.body().read_to_end(&mut body).is_err());
+            Err(Error::UnexpectedEof)
+        });
+    assert!(result.is_err());
+    assert_eq!(common::statuses(&output.borrow()), vec![413]);
 }
 
 #[test]

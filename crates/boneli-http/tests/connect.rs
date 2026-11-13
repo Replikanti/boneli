@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
-use boneli_http::{Error, Exchange, Headers, Target, connect_tunnel};
+use boneli_http::{Error, Exchange, Headers, IdleCheck, Target, connect_tunnel};
 use common::{MemStream, wide};
 
 /// Copies `from` into `to` until end of file, then shuts down `to` for
@@ -124,6 +124,8 @@ fn client_tunnel_keeps_bytes_after_head() {
         ("h", 0),
         ("", 443),
         ("h:1", 443),
+        ("a_b", 443),
+        ("[::1]", 443),
     ] {
         let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 64);
         assert!(
@@ -132,6 +134,54 @@ fn client_tunnel_keeps_bytes_after_head() {
         );
         assert!(written.borrow().is_empty());
     }
+}
+
+#[test]
+fn client_tunnel_rejects_numeric_hosts() {
+    // inet_aton forms that are not canonical IPv4 addresses (ADR-003):
+    // nothing is sent for them.
+    for host in [
+        "0xa9fea9fe",
+        "2130706433",
+        "127.1",
+        "0177.0.0.1",
+        "10.1",
+        "1.0x1",
+    ] {
+        let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 64);
+        assert!(
+            matches!(
+                connect_tunnel(stream, host, 80, &wide()),
+                Err(Error::InvalidInput(_))
+            ),
+            "{host}"
+        );
+        assert!(written.borrow().is_empty(), "{host}");
+    }
+    let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 64);
+    connect_tunnel(stream, "169.254.169.254", 80, &wide()).expect("canonical IPv4");
+    assert!(
+        written
+            .borrow()
+            .starts_with(b"CONNECT 169.254.169.254:80 HTTP/1.1\r\n")
+    );
+}
+
+#[test]
+fn tunnel_idle_check() {
+    // HTTP over a tunnel reuses connections too: early bytes not read yet
+    // count as input that arrived.
+    let (client, mut server) = UnixStream::pair().expect("pair");
+    server
+        .write_all(b"HTTP/1.1 200 OK\r\n\r\nX")
+        .expect("answer");
+    let mut tunnel = connect_tunnel(client, "example.com", 443, &wide()).expect("tunnel");
+    assert!(!tunnel.is_idle().expect("check"));
+    let mut byte = [0u8; 1];
+    tunnel.read_exact(&mut byte).expect("early byte");
+    assert!(tunnel.is_idle().expect("check"));
+    server.write_all(b"Y").expect("unsolicited");
+    assert!(!tunnel.is_idle().expect("check"));
 }
 
 #[test]
@@ -144,8 +194,7 @@ fn client_tunnel_refused() {
 
     // The server side: a handler that refuses answers with its status, and
     // the connection closes (bytes after a refused CONNECT are not a request).
-    let input =
-        b"CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    let input = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n";
     let (stream, output) = MemStream::new(input, 4096);
     let limits = common::server_limits(wide());
     boneli_http::serve_connection(stream, &limits, &|ex: Exchange<'_, MemStream>| {
@@ -155,6 +204,9 @@ fn client_tunnel_refused() {
     .expect("served");
     assert_eq!(common::statuses(&output.borrow()), vec![403]);
 
+    // A 2xx through `respond` is refused before any byte is written; the
+    // handler that then returns `Ok` has not answered, so the server sends
+    // 500 and closes (ADR-003, item 11).
     let (stream, output) = MemStream::new(input, 4096);
     boneli_http::serve_connection(stream, &limits, &|ex: Exchange<'_, MemStream>| {
         assert!(matches!(
@@ -164,5 +216,6 @@ fn client_tunnel_refused() {
         Ok(())
     })
     .expect("served");
-    assert!(output.borrow().is_empty());
+    assert_eq!(common::statuses(&output.borrow()), vec![500]);
+    assert!(String::from_utf8_lossy(&output.borrow()).contains("Connection: close"));
 }

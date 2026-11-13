@@ -177,7 +177,10 @@ fn non_ascii_target_rejected() {
     // Cyrillic a (U+0430) in place of the Latin one; httparse accepts it.
     assert_rejected(
         &request(
-            &["CONNECT \u{430}pi.example.com:443 HTTP/1.1", "Host: x"],
+            &[
+                "CONNECT \u{430}pi.example.com:443 HTTP/1.1",
+                "Host: \u{430}pi.example.com:443",
+            ],
             b"",
         ),
         400,
@@ -187,8 +190,16 @@ fn non_ascii_target_rejected() {
 
 #[test]
 fn connect_authority_forms() {
-    let connect =
-        |authority: &str| request(&[&format!("CONNECT {authority} HTTP/1.1"), "Host: x"], b"");
+    // `Host` names the target, so that only the target decides.
+    let connect = |authority: &str| {
+        request(
+            &[
+                &format!("CONNECT {authority} HTTP/1.1"),
+                &format!("Host: {authority}"),
+            ],
+            b"",
+        )
+    };
     let authority = |host: &str, port| Target::Authority {
         host: host.into(),
         port,
@@ -228,6 +239,138 @@ fn connect_authority_forms() {
     ] {
         assert_rejected(&connect(bad), 400);
     }
+}
+
+/// Hosts that getaddrinfo (inet_aton) resolves as IPv4 addresses although
+/// `Ipv4Addr::from_str` rejects them: the last label "ends in a number"
+/// (WHATWG URL), so they are neither a canonical address nor a name.
+const NUMERIC_HOSTS: [&str; 10] = [
+    "0xa9fea9fe",
+    "2130706433",
+    "127.1",
+    "0177.0.0.1",
+    "10.1",
+    "1.0x1",
+    "0x",
+    "0X7F.1",
+    "1.2.3.4.5",
+    "example.123",
+];
+
+/// A CONNECT to `authority` whose `Host` names the same authority.
+fn connect_to(authority: &str) -> Vec<u8> {
+    request(
+        &[
+            &format!("CONNECT {authority} HTTP/1.1"),
+            &format!("Host: {authority}"),
+        ],
+        b"",
+    )
+}
+
+#[test]
+fn connect_numeric_hosts_rejected() {
+    for host in NUMERIC_HOSTS {
+        assert_rejected(&connect_to(&format!("{host}:80")), 400);
+    }
+    // Names whose last label is not a number, and canonical addresses, pass.
+    for (host, want) in [
+        ("1.2.3.4", "1.2.3.4"),
+        ("0xg.example", "0xg.example"),
+        ("123abc", "123abc"),
+        ("a-1.Example", "a-1.example"),
+        ("example.com1", "example.com1"),
+    ] {
+        let head = accepted(&connect_to(&format!("{host}:80")));
+        assert_eq!(
+            head.target,
+            Target::Authority {
+                host: want.into(),
+                port: 80
+            }
+        );
+    }
+}
+
+#[test]
+fn host_value_validated() {
+    for value in [
+        "",
+        "a b",
+        "a/b",
+        "u@h",
+        "h:0",
+        "h:x",
+        "h:",
+        "[::1",
+        "::1",
+        "a_b",
+        "-a",
+        "a..b",
+        "a.",
+        "\u{430}pi",
+        "%61",
+    ]
+    .into_iter()
+    .chain(NUMERIC_HOSTS)
+    {
+        assert_rejected(
+            &request(&["GET / HTTP/1.1", &format!("Host: {value}")], b""),
+            400,
+        );
+    }
+    for value in [
+        "a",
+        "example.com",
+        "Example.COM:8080",
+        "[::1]",
+        "[::1]:80",
+        "10.0.0.1",
+        "10.0.0.1:80",
+    ] {
+        accepted(&request(
+            &["GET / HTTP/1.1", &format!("Host: {value}")],
+            b"",
+        ));
+    }
+}
+
+#[test]
+fn connect_host_must_match_target() {
+    let connect = |host: &str| {
+        request(
+            &[
+                "CONNECT allowed.example:443 HTTP/1.1",
+                &format!("Host: {host}"),
+            ],
+            b"",
+        )
+    };
+    for host in [
+        "169.254.169.254:80",
+        "allowed.example",
+        "allowed.example:444",
+        "other.example:443",
+        "[::1]:443",
+    ] {
+        assert_rejected(&connect(host), 400);
+    }
+    let head = accepted(&connect("ALLOWED.example:443"));
+    assert_eq!(
+        head.target,
+        Target::Authority {
+            host: "allowed.example".into(),
+            port: 443
+        }
+    );
+    let head = accepted(&connect_to("[::1]:443"));
+    assert_eq!(
+        head.target,
+        Target::Authority {
+            host: "::1".into(),
+            port: 443
+        }
+    );
 }
 
 #[test]
@@ -488,16 +631,19 @@ fn connect_with_body_framing_rejected() {
 
 #[test]
 fn request_head_round_trip() {
-    let mut headers = Headers::new();
-    headers.append("Host", "example.test");
-    headers.append("X-Dup", "1");
-    headers.append("x-dup", "2");
-    headers.append("Accept", "*/*");
+    let headers = |host: &str| {
+        let mut headers = Headers::new();
+        headers.append("Host", host);
+        headers.append("X-Dup", "1");
+        headers.append("x-dup", "2");
+        headers.append("Accept", "*/*");
+        headers
+    };
     let heads = [
         RequestHead {
             method: Method::new("POST").expect("method"),
             target: Target::Origin("/a/b?c=d&e=%20".into()),
-            headers: headers.clone(),
+            headers: headers("example.test"),
         },
         RequestHead {
             method: Method::new("CONNECT").expect("method"),
@@ -505,7 +651,7 @@ fn request_head_round_trip() {
                 host: "::1".into(),
                 port: 8443,
             },
-            headers: headers.clone(),
+            headers: headers("[::1]:8443"),
         },
     ];
     for head in heads {

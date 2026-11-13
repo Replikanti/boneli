@@ -2,7 +2,7 @@
 //! the checks httparse leaves out, and serialization that validates every
 //! byte before it writes one (ADR-003).
 
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::{Error, Result};
 use crate::limits::Limits;
@@ -46,8 +46,10 @@ pub enum Target {
     Origin(String),
     /// Authority form, for CONNECT only.
     Authority {
-        /// The host in lowercase ASCII (RFC 4343), without userinfo or `%`;
-        /// an IPv6 address without its brackets.
+        /// A canonical dotted-decimal IPv4 address, an IPv6 address without
+        /// its brackets, or a name of LDH labels whose last label is not a
+        /// number; in lowercase (RFC 4343). Never a numeric form that only
+        /// `inet_aton` reads as an address, such as `127.1` (ADR-003).
         host: String,
         /// The port, 1 to 65535.
         port: u16,
@@ -146,7 +148,8 @@ impl RequestHead {
     }
 
     /// Parses exactly one head with every check the server applies: the
-    /// version, the target form, one `Host` and the framing fields.
+    /// version, the target form, one valid `Host` that names the target of
+    /// a CONNECT, and the framing fields.
     pub fn parse(bytes: &[u8], limits: &Limits) -> Result<RequestHead> {
         let content = whole_head(bytes, limits)?;
         Ok(parse_request(&bytes[content..], limits)?.head)
@@ -280,6 +283,20 @@ pub(crate) fn parse_request(bytes: &[u8], limits: &Limits) -> Result<ParsedReque
     if headers.get_all("host").count() != 1 {
         return Err(Error::Malformed("not exactly one Host field"));
     }
+    let (host, port) = headers
+        .get("host")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .ok_or(Error::Malformed("invalid host"))
+        .and_then(parse_host_port)?;
+    if let Target::Authority {
+        host: target_host,
+        port: target_port,
+    } = &target
+    {
+        if host != *target_host || port != Some(*target_port) {
+            return Err(Error::Malformed("Host does not name the CONNECT target"));
+        }
+    }
     let framing = request_framing(&headers)?;
     if method.is_connect() && headers.has_any(&["content-length", "transfer-encoding"]) {
         return Err(Error::Malformed("CONNECT with body framing"));
@@ -401,42 +418,90 @@ fn parse_origin(target: &str) -> Result<String> {
 /// An authority-form target: `host:port` or `[ipv6]:port`. The host is
 /// returned in lowercase and an IPv6 address without brackets.
 pub(crate) fn parse_authority(authority: &str) -> Result<(String, u16)> {
-    let bad = Error::Malformed("invalid authority");
-    if !authority.bytes().all(|b| b.is_ascii_graphic()) || authority.contains(['@', '%']) {
-        return Err(bad);
+    match parse_host_port(authority)? {
+        (host, Some(port)) => Ok((host, port)),
+        (_, None) => Err(Error::Malformed("authority without a port")),
     }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let (inner, after) = rest
-            .split_once(']')
-            .ok_or(Error::Malformed("invalid authority"))?;
-        let port = after
-            .strip_prefix(':')
-            .ok_or(Error::Malformed("invalid authority"))?;
-        if inner.parse::<Ipv6Addr>().is_err() {
-            return Err(bad);
-        }
-        (inner.to_ascii_lowercase(), port)
-    } else {
-        let (host, port) = authority
-            .split_once(':')
-            .ok_or(Error::Malformed("invalid authority"))?;
-        (check_reg_name(host)?, port)
-    };
-    Ok((host, parse_port(port)?))
 }
 
-/// A host name or IPv4 address: letters, digits, `-`, `.` and `_`;
-/// returned in lowercase.
-fn check_reg_name(host: &str) -> Result<String> {
-    let ok = !host.is_empty()
-        && host.len() <= 255
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'));
-    if ok {
-        Ok(host.to_ascii_lowercase())
+/// `host [":" port]`, where the host is `[ipv6]` or passes `check_host`
+/// (the `Host` field, RFC 9110 §7.2, and the authority form). The host is
+/// returned in lowercase and an IPv6 address without brackets.
+fn parse_host_port(value: &str) -> Result<(String, Option<u16>)> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (inner, after) = rest
+            .split_once(']')
+            .ok_or(Error::Malformed("invalid host"))?;
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return Err(Error::Malformed("invalid host"));
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or(Error::Malformed("invalid host"))?,
+            ),
+        };
+        (inner.to_ascii_lowercase(), port)
     } else {
-        Err(Error::Malformed("invalid host"))
+        match value.split_once(':') {
+            Some((host, port)) => (check_host(host)?, Some(port)),
+            None => (check_host(value)?, None),
+        }
+    };
+    Ok((host, port.map(parse_port).transpose()?))
+}
+
+/// A host that is not IPv6 (ADR-003, item 3): a canonical dotted-decimal
+/// IPv4 address (`Ipv4Addr::from_str`), or a name of LDH labels (RFC 5890:
+/// letters, digits and `-`, not at either end of a label), each 1 to 63
+/// bytes and 253 bytes in total, whose last label is not a number. Returned
+/// in lowercase.
+///
+/// `getaddrinfo` reads `127.1`, `2130706433`, `0x7f.1` or `0177.0.0.1` as
+/// IPv4 addresses (`inet_aton`), while `Ipv4Addr::from_str` rejects them.
+/// Passed on as names, they would reach addresses that a check on the
+/// parsed host does not see. The WHATWG URL standard's "ends in a number"
+/// rule tells these forms apart from names, so they are rejected.
+fn check_host(host: &str) -> Result<String> {
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(host.to_owned());
+    }
+    let bad = Error::Malformed("invalid host");
+    if host.is_empty() || host.len() > 253 {
+        return Err(bad);
+    }
+    let mut last = "";
+    for label in host.split('.') {
+        let bytes = label.as_bytes();
+        let ldh = (1..=63).contains(&bytes.len())
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            && bytes.first() != Some(&b'-')
+            && bytes.last() != Some(&b'-');
+        if !ldh {
+            return Err(bad);
+        }
+        last = label;
+    }
+    if is_number(last) {
+        return Err(bad);
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+/// The WHATWG URL standard's test for a label that "ends in a number":
+/// decimal digits only, or `0x` or `0X` followed by hex digits only (none
+/// at all counts too). `inet_aton` reads such a label as a number.
+fn is_number(label: &str) -> bool {
+    match label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    {
+        Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()),
     }
 }
 
@@ -450,8 +515,8 @@ fn parse_port(port: &str) -> Result<u16> {
 }
 
 /// A host for the caller's side (client `Host`, CONNECT destination): a
-/// name, an IPv4 address or an IPv6 address without brackets. Returned as
-/// written in an authority, lowercase, IPv6 in brackets.
+/// host that passes `check_host`, or an IPv6 address without brackets.
+/// Returned as written in an authority, lowercase, IPv6 in brackets.
 pub(crate) fn authority_host(host: &str) -> Result<String> {
     if host.contains(':') {
         return match host.parse::<Ipv6Addr>() {
@@ -465,31 +530,26 @@ pub(crate) fn authority_host(host: &str) -> Result<String> {
             _ => Err(Error::InvalidInput("invalid host")),
         };
     }
-    check_reg_name(host).map_err(|_| Error::InvalidInput("invalid host"))
+    check_host(host).map_err(|_| Error::InvalidInput("invalid host"))
 }
 
-/// A `Host` value for the client: a host with an optional port.
+/// A `Host` value for the client: a host with an optional port, with the
+/// grammar the server applies (`parse_host_port`), or a bare IPv6 address.
 pub(crate) fn host_field(value: &str) -> Result<String> {
-    let invalid = Error::InvalidInput("invalid host");
-    if value.starts_with('[') {
-        return match parse_authority(value) {
-            Ok((host, port)) => Ok(format!("[{host}]:{port}")),
-            Err(_) => match value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-                Some(inner) => authority_host(inner),
-                None => Err(invalid),
-            },
-        };
+    // Two or more colons without brackets: a bare IPv6 address.
+    if !value.starts_with('[') && value.matches(':').count() > 1 {
+        return authority_host(value);
     }
-    match value.split_once(':') {
-        // Two or more colons: a bare IPv6 address.
-        Some((_, rest)) if rest.contains(':') => authority_host(value),
-        Some((host, port)) => {
-            let host = check_reg_name(host).map_err(|_| Error::InvalidInput("invalid host"))?;
-            let port = parse_port(port).map_err(|_| Error::InvalidInput("invalid port"))?;
-            Ok(format!("{host}:{port}"))
-        }
-        None => authority_host(value),
-    }
+    let (host, port) = parse_host_port(value).map_err(|_| Error::InvalidInput("invalid host"))?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
 }
 
 /// RFC 9110 `tchar`.
@@ -677,6 +737,80 @@ mod tests {
             "[1.2.3.4]:443",
         ] {
             assert!(parse_authority(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_grammar() {
+        let label63 = "a".repeat(63);
+        // 4 labels of 63 bytes and 3 dots are 255 bytes; trim to 253.
+        let long = [label63.as_str(); 4].join(".");
+        let max = &long[..253];
+        assert!(!max.ends_with('.'));
+        for ok in [
+            "a",
+            "a-b",
+            "a1",
+            "1a",
+            "xn--80ak6aa92e.com",
+            label63.as_str(),
+            max,
+            "1.2.3.4",
+            "255.255.255.255",
+            "0.0.0.0",
+            "0xg",
+            "0x1g",
+            "a.0b",
+        ] {
+            assert!(check_host(ok).is_ok(), "{ok}");
+        }
+        let label64 = "a".repeat(64);
+        let over = &long[..254];
+        for bad in [
+            "",
+            ".",
+            "a.",
+            ".a",
+            "a..b",
+            "-a",
+            "a-",
+            "a.-b",
+            "a_b",
+            "a b",
+            "a*b",
+            label64.as_str(),
+            over,
+            "1",
+            "0x",
+            "0X",
+            "0xff",
+            "0XfF",
+            "a.1",
+            "a.0x1",
+            "256.1.1.1",
+            "01.1.1.1",
+            "1.2.3",
+            "1.2.3.4.5",
+            "1.2.3.04",
+        ] {
+            assert!(check_host(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(check_host("A.Example").expect("name"), "a.example");
+    }
+
+    #[test]
+    fn host_port_values() {
+        let ok = |s: &str| parse_host_port(s).expect(s);
+        assert_eq!(ok("a"), ("a".into(), None));
+        assert_eq!(ok("A:80"), ("a".into(), Some(80)));
+        assert_eq!(ok("[::1]"), ("::1".into(), None));
+        assert_eq!(ok("[::1]:80"), ("::1".into(), Some(80)));
+        assert_eq!(ok("1.2.3.4:1"), ("1.2.3.4".into(), Some(1)));
+        for bad in [
+            "", ":80", "a:", "a:0", "a:x", "a:80:1", "[::1]80", "[::1]:", "::1", "[a]", "a b",
+            "127.1", "127.1:80",
+        ] {
+            assert!(parse_host_port(bad).is_err(), "{bad:?}");
         }
     }
 

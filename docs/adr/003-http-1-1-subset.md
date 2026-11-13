@@ -58,17 +58,44 @@ else. It never repairs a message.
    after every read would make a head trickled one byte per read cost time
    quadratic in its length: with a 64 KiB limit that is about 2^31 byte
    comparisons for one request.
-3. **Targets.** Origin form (`/` followed by visible ASCII) for every
-   method except `CONNECT`, which takes exactly the authority form
+3. **Targets and hosts.** Origin form (`/` followed by visible ASCII) for
+   every method except `CONNECT`, which takes exactly the authority form
    `host:port` or `[ipv6]:port`. The method compares case-sensitively
-   (RFC 9110 §9.1), so `connect` is not CONNECT. The host is ASCII and
-   lowercased (RFC 4343), with no userinfo and no `%`. IPv6 is accepted only
-   in brackets, and the port is 1 to 65535 in at most five decimal digits.
-   Absolute and asterisk forms are rejected. No planned client sends them
-   to an origin server or a CONNECT proxy, and an absolute form makes the
-   target's host disagree with `Host`. Rejected: accepting the absolute
-   form as RFC 9112 requires of servers.
-4. **Framing without the lenient options.** Exactly one `Host`. At most one
+   (RFC 9110 §9.1), so `connect` is not CONNECT. The port is 1 to 65535 in
+   at most five decimal digits. Absolute and asterisk forms are rejected.
+   No planned client sends them to an origin server or a CONNECT proxy, and
+   an absolute form makes the target's host disagree with `Host`. Rejected:
+   accepting the absolute form as RFC 9112 requires of servers.
+
+   A host is one of three forms, and nothing else (`400`):
+   - a canonical dotted-decimal IPv4 address, as `Ipv4Addr::from_str`
+     reads it (four decimal octets, no leading zeros);
+   - an IPv6 address in brackets (`Ipv6Addr::from_str`, so no zone);
+   - a name of LDH labels (letters, digits and `-`, not at either end of a
+     label, RFC 5890), each 1 to 63 bytes and 253 bytes in total, whose
+     last label does not "end in a number" in the sense of the WHATWG URL
+     standard: decimal digits only, or `0x`/`0X` followed by hex digits
+     only.
+
+   Names are lowercased (RFC 4343). The rule exists because `getaddrinfo`
+   resolves `0xa9fea9fe`, `2130706433`, `127.1`, `0177.0.0.1` and `10.1`
+   to IPv4 addresses (`inet_aton`), while `Ipv4Addr::from_str` rejects
+   them. Accepted as names, they would reach `169.254.169.254`,
+   `127.0.0.1` or `10.0.0.1` past any check that classifies the parsed
+   host, and the egress proxy (#10) decides on the parsed form: it must be
+   canonical, so that "an IP literal" and "a name" cannot be confused. The
+   same grammar applies wherever the crate parses or builds an authority:
+   the CONNECT target, the `Host` field, the client's `Host` and the
+   client's CONNECT destination. Rejected: returning such forms as names
+   and leaving the check to consumers, and `_` in names (not LDH; no
+   planned peer needs it).
+4. **Framing without the lenient options.** Exactly one `Host`, whose
+   value is `host [":" port]` with the grammar of item 3 (an empty value is
+   rejected; RFC 9112 §3.2 allows it only for a target without a host, and
+   our clients always send one). For CONNECT, `Host` must name the same
+   host (case-insensitively) and port as the target, or the answer is
+   `400`, so that a consumer that routes or logs by `Host` sees the
+   destination the tunnel uses. At most one
    `Content-Length`, at most one `Transfer-Encoding`, and never both (`400`).
    The transfer coding must be exactly `chunked`, ASCII case-insensitive
    with optional whitespace around it, or the answer is `501`.
@@ -139,11 +166,28 @@ else. It never repairs a message.
       over the stream with the bytes already read first. A CONNECT that is
       not tunnelled closes the connection, because the bytes after it are
       not a request.
-    - A handler error before the response is answered with the error's
-      status, or the connection closes without an answer when the error
-      has no status (the peer is gone). After a response has started, the
-      error closes the connection. A handler that returns without
-      answering gets `500`.
+    - Before any byte of a response is written, a handler error is
+      answered only when it is `Error::Status(code)` with a code from 400
+      to 599; a gateway that wants `502` or `504` for an upstream failure
+      returns it. The one other answered case is a failure of the server's
+      own reading of the request body (`Exchange::body`): its status
+      (`400`, `408`, `413` or `431`) is sent even if the handler
+      returns a different error. Every other handler error closes the
+      connection without an answer. The mapping from error kinds to
+      statuses belongs to reading the request only: an upstream timeout or
+      malformed upstream answer that a handler passes on with `?` must not
+      tell the client that its own request was late or bad. A client error
+      that a handler passes on with `?` is `Error::Status` too, so a
+      refused upstream CONNECT answers with the upstream's status; a
+      handler that does not want this maps the error itself.
+    - A handler that returns `Ok` while no byte of a response has been
+      written gets `500` and the connection closes. This includes a
+      `respond` that was refused for an invalid status or field: nothing
+      was written, so the client gets an answer instead of a silent close,
+      which a client would retry. Once bytes of a response were written,
+      an incomplete one (a failed write, a stream without its last chunk)
+      closes the connection without any further byte, and so does a
+      returned tunnel.
 12. **Client behaviour.** One request at a time. Responses are framed per
     RFC 9112 §6.3: `HEAD`, `1xx`, `204` and `304` have no body, and a body
     with neither framing field is read until close. `101` is an error,
@@ -152,7 +196,19 @@ else. It never repairs a message.
     cookies and reads no proxy environment variables. The caller decides
     each of these, for example whether credentials may follow a redirect
     to another host. A connection is reusable only after the body was
-    read to its end and neither side asked to close.
+    read to its end, no byte beyond the response has been read, and
+    neither side asked to close. Bytes that arrive while a connection is
+    idle answered no request; read as the next response, a peer could
+    answer a request it has not seen yet. So before a request on a
+    connection used before, the client asks the stream whether it is
+    still idle (`IdleCheck`): `UnixStream` and `TcpStream` read one byte in
+    non-blocking mode, and any byte or the end of the stream ends the
+    connection with nothing written. A stream that cannot tell (an
+    in-memory stream, a wrapper without a hook) returns "not idle", and a
+    connection over it serves one request. `Tunnel` counts its unread early
+    bytes as input. Rejected: no reuse at all, which costs a connection per
+    request for the forge and registry clients; and the check for Unix
+    sockets only, which would leave other streams reusing without it.
 13. **Truncation stays visible.** The end of the stream inside a
     `Content-Length` body or before the last chunk is an error, never a
     short complete body. `pass_through` writes and flushes after every
@@ -169,19 +225,47 @@ else. It never repairs a message.
     It gets `min(max_headers, max_head_bytes / 4 + 1)` slots, because the
     shortest field line (`a:` and CRLF) is four bytes. A huge `max_headers`
     therefore costs no memory beyond what the byte limit allows.
-16. **No fuzzer in the build.** `cargo-fuzz` needs `libfuzzer-sys`, which
-    compiles C++ in a build script. That is outside the dependency policy
-    of ADR-001, which allows no build script. Deterministic sweeps replace
-    it, and they run in every `cargo test`:
+16. **No fuzzer in the build.** `cargo-fuzz` needs `libfuzzer-sys`, whose
+    build script compiles and links libFuzzer's C++ sources, native code
+    that no check of ADR-001 sees, and it needs a nightly toolchain for
+    `-Zsanitizer`, while CI builds with stable. httparse's build script
+    (item 17) does neither. Deterministic sweeps replace the fuzzer, and
+    they run in every `cargo test`:
     - every byte of a 150-byte chunked request replaced by each of seven
       framing-relevant bytes (`00 0a 0d 20 3a 3b ff`), 1,050 inputs;
     - every prefix of that request;
     - every split offset of a head.
 
     Rejected: cargo-fuzz.
+17. **httparse's build script is approved.** `httparse` 1.10.1 has a
+    `build.rs` (cargo metadata lists a `custom-build` target), the first
+    build script in the resolved graph. It runs `$RUSTC --version` and,
+    from the version, the `std` feature and `CARGO_CFG_TARGET_FEATURE`,
+    prints `rustc-cfg` lines that switch on its SIMD code paths
+    (`httparse_simd`, `httparse_simd_neon_intrinsics` and the SSE4.2 and
+    AVX2 compile-time variants), unless one of its two opt-out cfgs is
+    set. Apart from spawning `$RUSTC` and reading cargo's environment
+    variables it does nothing: it compiles no native code, links nothing,
+    and touches no file or network. This ADR approves it.
+
+    The approval is per crate, not per version: a new httparse version
+    with a changed build script is caught only by reviewing `Cargo.lock`
+    and the crate's diff. The rule of ADR-001 (`roles.build-script`)
+    covers workspace members only, so today no check notices a build
+    script in a dependency. Part 2 of #5 (the `boneli-https` PR) adds
+    the check, as decided at STOP 1 of #5: a `build-script = "ADR-NNN"`
+    key on `[external.<crate>]` in `tools/architecture.toml` and a
+    `dep-build-script` rule that fails on any reachable external crate
+    with a build script and without the key. httparse's record then
+    cites this ADR. Until then, `tools/architecture.toml` notes the
+    approval in a comment on `[external.httparse]`, because the current
+    checker rejects unknown keys. Rejected: changing the checker in this
+    PR, which would put a second security surface into the parser's
+    review.
 
 `boneli-http` depends on `httparse` only, with its default `std` feature.
-That feature enables runtime SIMD detection and adds no crate. The edge
+That feature enables runtime SIMD detection and adds no crate; the build
+script of item 17 comes with the crate itself. The edge
 `boneli-http -> httparse` already has its record in
 `tools/architecture.toml`.
 
@@ -201,9 +285,15 @@ That feature enables runtime SIMD detection and adds no crate. The edge
 - `serve` returns when `accept` or a thread spawn fails, for example with
   too many open files, instead of retrying in a loop. The composition
   root decides whether to restart.
-- Errors without a status (the peer went away) close the connection
-  without an answer. The crate does no logging; the composition root logs
-  what `serve_connection` returns.
+- Handler errors other than `Error::Status` close the connection without
+  an answer. The crate does no logging; the composition root logs what
+  `serve_connection` returns.
+- A pooled client connection costs one non-blocking read and two `fcntl`
+  calls per reused request. Non-blocking mode belongs to the open socket,
+  so a clone of the stream used on another thread at that moment sees it
+  too; the client does not clone its stream.
+- Hosts with `_` and numeric names such as `example.123` are refused. A
+  peer that needs them needs a new ADR.
 
 ## Alternatives considered
 

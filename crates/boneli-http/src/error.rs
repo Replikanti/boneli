@@ -34,12 +34,20 @@ pub enum Error {
     InvalidInput(&'static str),
     /// The peer answered with a status the operation cannot continue
     /// from, such as a refused CONNECT or `101 Switching Protocols`.
+    ///
+    /// A handler returns it to have the server answer with that status
+    /// (400 to 599, for example `502` or `504` for an upstream failure);
+    /// it is the only handler error the server answers (ADR-003, item 11).
+    /// A handler that passes on a client error with `?` therefore answers
+    /// with the upstream's status.
     Status(u16),
 }
 
 impl Error {
-    /// The status the server answers with before it closes the connection,
-    /// or `None` when it closes without an answer.
+    /// The status the server answers with when its own reading of a request
+    /// (head or body) fails with this error, or `None` when it closes
+    /// without an answer. A handler's own errors are not mapped this way:
+    /// the server answers them only when they are `Error::Status`.
     pub fn status(&self) -> Option<u16> {
         match self {
             Error::Malformed(_) => Some(400),

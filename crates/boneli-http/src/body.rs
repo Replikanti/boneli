@@ -15,8 +15,10 @@ use crate::wire::{HeadScan, READ_CHUNK, Wire};
 pub(crate) enum BodyState {
     /// The body has been read to its end (or there is none).
     Done,
-    /// A body read failed; the connection cannot be reused.
-    Failed,
+    /// A body read failed; the connection cannot be reused. Holds the
+    /// status of the first error (`Error::status`), which the server
+    /// answers with when the handler returns an error without answering.
+    Failed(Option<u16>),
     /// Content-Length body: bytes left.
     Length(u64),
     /// Chunked body, expecting a chunk-size line; `received` data bytes so far.
@@ -89,7 +91,7 @@ impl<'a, S: Read> BodyReader<'a, S> {
         loop {
             match *self.state {
                 BodyState::Done => return Ok(0),
-                BodyState::Failed => return Err(Error::Malformed("the body failed earlier")),
+                BodyState::Failed(_) => return Err(Error::Malformed("the body failed earlier")),
                 BodyState::Length(left) => {
                     let n = self.take(buf, left)?;
                     let left = left - n as u64;
@@ -204,7 +206,9 @@ impl<S: Read> Read for BodyReader<'_, S> {
         match self.step(buf) {
             Ok(n) => Ok(n),
             Err(e) => {
-                *self.state = BodyState::Failed;
+                if !matches!(*self.state, BodyState::Failed(_)) {
+                    *self.state = BodyState::Failed(e.status());
+                }
                 Err(e.into())
             }
         }

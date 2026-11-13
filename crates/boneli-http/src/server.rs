@@ -96,7 +96,8 @@ impl Drop for Slot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reply {
-    /// Nothing sent yet.
+    /// No byte of a response has been written, also when an answer was
+    /// refused before writing (an invalid status or field).
     None,
     /// A complete response was sent.
     Done,
@@ -104,10 +105,15 @@ enum Reply {
     Streaming,
     /// The stream was handed over by `accept_tunnel`.
     Tunnel,
-    /// A response could not be sent; the connection closes without any
-    /// further byte.
+    /// Writing a response failed, so part of it may have reached the wire;
+    /// the connection closes without any further byte.
     Poisoned,
 }
+
+/// The answer to a handler that returns `Ok` without a byte of a response
+/// on the wire.
+const INTERNAL_ERROR: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// One connection's state between requests.
 struct Conn<T> {
@@ -122,11 +128,11 @@ struct Conn<T> {
 }
 
 impl<T: Transport> Conn<T> {
-    /// Answers a rejected request with the error's status and asks the
-    /// client to close. Write errors are ignored: the connection closes
-    /// either way.
-    fn reject(&mut self, e: &Error) {
-        if let Some(status) = e.status() {
+    /// Answers a rejected request with `status` and asks the client to
+    /// close; without a status nothing is written. Write errors are
+    /// ignored: the connection closes either way.
+    fn reject(&mut self, status: Option<u16>) {
+        if let Some(status) = status {
             let reply = format!(
                 "HTTP/1.1 {status} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 reason_phrase(status)
@@ -215,11 +221,11 @@ impl<'a, T: Transport> Exchange<'a, T> {
 
     /// Sends a complete response with `Content-Length`. For a HEAD request
     /// the body bytes are left out; 204 and 304 carry no body. On an
-    /// invalid status or field nothing is written and the connection
-    /// closes.
+    /// invalid status or field nothing is written: a handler that then
+    /// returns `Ok` gets the server's `500`. If writing fails, the
+    /// connection closes.
     pub fn respond(self, status: u16, headers: &Headers, body: &[u8]) -> Result<()> {
         let conn = self.conn;
-        conn.reply = Reply::Poisoned;
         let bodyless = status == 204 || status == 304;
         if bodyless && !body.is_empty() {
             return Err(Error::InvalidInput("204 and 304 carry no body"));
@@ -233,6 +239,7 @@ impl<'a, T: Transport> Exchange<'a, T> {
         if !conn.is_head {
             out.extend_from_slice(body);
         }
+        conn.reply = Reply::Poisoned;
         conn.send(&out)?;
         conn.reply = Reply::Done;
         Ok(())
@@ -248,11 +255,11 @@ impl<'a, T: Transport> Exchange<'a, T> {
         headers: &Headers,
     ) -> Result<BodyWriter<'a, &'a mut T>> {
         let conn = self.conn;
-        conn.reply = Reply::Poisoned;
         if status == 204 || status == 304 {
             return Err(Error::InvalidInput("204 and 304 carry no body"));
         }
         let out = conn.response_head(status, headers, Some(Framing::Chunked))?;
+        conn.reply = Reply::Poisoned;
         conn.send(&out)?;
         conn.reply = Reply::Streaming;
         let Conn {
@@ -275,10 +282,10 @@ impl<'a, T: Transport> Exchange<'a, T> {
     /// closes when the handler returns.
     pub fn accept_tunnel(self) -> Result<Tunnel<&'a mut T>> {
         let conn = self.conn;
-        conn.reply = Reply::Poisoned;
         if !conn.is_connect {
             return Err(Error::InvalidInput("accept_tunnel answers CONNECT only"));
         }
+        conn.reply = Reply::Poisoned;
         conn.send(b"HTTP/1.1 200 OK\r\n\r\n")?;
         conn.wire.stream.set_read_timeout(None)?;
         conn.reply = Reply::Tunnel;
@@ -300,10 +307,15 @@ impl<'a, T: Transport> Exchange<'a, T> {
 ///   connection closes.
 /// - `Expect: 100-continue` on a request with a body gets `100 Continue`
 ///   before the handler runs.
-/// - A handler error before any response is answered with the error's
-///   status, or closes without an answer when it has none; after a
-///   response started it closes the connection. A handler that returns
-///   without answering gets `500`.
+/// - A handler error before any byte of a response is answered with
+///   `Error::Status` (400 to 599). Any other handler error closes without
+///   an answer, unless the server's own reading of the request body
+///   failed: then the answer is that failure's status (400, 408, 413 or
+///   431).
+/// - A handler that returns `Ok` without a byte of a response on the wire
+///   (also after `respond` refused an invalid field) gets `500`.
+/// - Once bytes of a response were written, an incomplete one (a failed
+///   write, an unfinished stream) or a tunnel closes the connection.
 ///
 /// Returns the error that ended the connection, if any.
 pub fn serve_connection<T, H>(stream: T, limits: &ServerLimits, handler: &H) -> Result<()>
@@ -340,7 +352,7 @@ where
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(e) => {
-                conn.reject(&e);
+                conn.reject(e.status());
                 return Err(e);
             }
         };
@@ -361,13 +373,20 @@ where
         conn.wire.deadline = None;
         match (result, conn.reply) {
             (Err(e), Reply::None) => {
-                conn.reject(&e);
+                // Only the server's own reading of the request maps an
+                // error kind to a status; an upstream timeout returned by
+                // the handler is not the client's 408 (ADR-003, item 11).
+                let status = match (&e, conn.body) {
+                    (Error::Status(status), _) if (400..=599).contains(status) => Some(*status),
+                    (_, BodyState::Failed(status)) => status,
+                    _ => None,
+                };
+                conn.reject(status);
                 return Err(e);
             }
             (Err(e), _) => return Err(e),
             (Ok(()), Reply::None) => {
-                let reply = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = conn.send(reply);
+                let _ = conn.send(INTERNAL_ERROR);
                 return Ok(());
             }
             (Ok(()), Reply::Done) => {}

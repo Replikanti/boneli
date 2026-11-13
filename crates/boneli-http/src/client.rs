@@ -15,7 +15,7 @@ use crate::head::{
     response_framing,
 };
 use crate::limits::Limits;
-use crate::transport::Tunnel;
+use crate::transport::{IdleCheck, Tunnel};
 use crate::wire::Wire;
 
 /// Header fields the client writes itself. A caller that sets one gets an
@@ -38,12 +38,16 @@ pub enum RequestBody<'a> {
     },
 }
 
-/// A client connection that sends one request at a time and keeps bytes
-/// read past a response for the next one.
+/// A client connection that sends one request at a time. It is reused only
+/// while the peer stays quiet between responses: bytes beyond a response,
+/// or bytes and the end of the stream that arrive while it is idle, end it
+/// (ADR-003, item 12).
 pub struct Connection<S> {
     wire: Wire<S>,
     body: BodyState,
     close: bool,
+    /// A request has been sent before.
+    used: bool,
     host: String,
     limits: Limits,
 }
@@ -57,26 +61,35 @@ impl<S: Read + Write> Connection<S> {
             wire: Wire::new(stream, None),
             body: BodyState::Done,
             close: false,
+            used: false,
             host: host_field(host)?,
             limits,
         })
     }
 
     /// Whether another request may be sent: the last response body was read
-    /// to its end and neither side asked to close.
+    /// to its end, no byte beyond it has been read, and neither side asked
+    /// to close. `request` also checks that nothing arrived since
+    /// (`IdleCheck`).
     pub fn is_reusable(&self) -> bool {
-        self.body == BodyState::Done && !self.close
+        self.body == BodyState::Done && !self.close && self.wire.available().is_empty()
     }
 
     /// The stream, for example to set timeouts.
     pub fn get_ref(&self) -> &S {
         &self.wire.stream
     }
+}
 
+impl<S: Read + Write + IdleCheck> Connection<S> {
     /// Sends one request and reads the head of its response. The head must
     /// have an origin-form target and must not set `Host`,
     /// `Content-Length`, `Transfer-Encoding` or `Connection`; CONNECT goes
     /// through `connect_tunnel`. On an invalid head nothing is written.
+    ///
+    /// On a connection used before, the stream must be idle
+    /// (`IdleCheck::is_idle`); otherwise nothing is written, the
+    /// connection is no longer reusable, and the caller opens a new one.
     pub fn request(
         &mut self,
         head: &RequestHead,
@@ -120,8 +133,27 @@ impl<S: Read + Write> Connection<S> {
         }
         out.extend_from_slice(&encoded[line_end..]);
 
+        // Bytes that arrived while the connection was idle answered no
+        // request; read as the next response they would answer this one.
+        if self.used {
+            match self.wire.stream.is_idle() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.close = true;
+                    return Err(Error::Malformed(
+                        "bytes or the end of the stream arrived while the connection was idle",
+                    ));
+                }
+                Err(e) => {
+                    self.close = true;
+                    return Err(e.into());
+                }
+            }
+        }
+
         // From here on a failure leaves the stream in an unknown state.
         self.close = true;
+        self.used = true;
         let stream = &mut self.wire.stream;
         match body {
             RequestBody::None => stream.write_all(&out)?,

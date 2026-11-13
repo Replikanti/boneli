@@ -3,10 +3,76 @@
 
 mod common;
 
-use std::io::Read;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::rc::Rc;
+use std::thread;
+use std::time::Duration;
 
-use boneli_http::{Connection, Error, Headers, Method, RequestBody, RequestHead, Target};
-use common::{MemStream, limits, wide};
+use boneli_http::{
+    Connection, Error, Headers, IdleCheck, Method, RequestBody, RequestHead, Target,
+};
+use common::{MemStream, Pieces, limits, pieces, wide};
+
+/// A stream with all input loaded up front cannot tell what arrived after
+/// a response, so a connection over it serves one request.
+impl IdleCheck for MemStream {
+    fn is_idle(&mut self) -> io::Result<bool> {
+        Ok(false)
+    }
+}
+
+/// A peer that answers each request with the next queued response: the
+/// response becomes readable when the client flushes its request.
+struct Replies {
+    queue: VecDeque<Vec<u8>>,
+    current: Pieces,
+    output: Rc<RefCell<Vec<u8>>>,
+}
+
+impl Read for Replies {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.current.read(buf)
+    }
+}
+
+impl Write for Replies {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.current.is_empty() {
+            if let Some(next) = self.queue.pop_front() {
+                self.current = pieces(&next, 7);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IdleCheck for Replies {
+    fn is_idle(&mut self) -> io::Result<bool> {
+        Ok(self.current.is_empty())
+    }
+}
+
+/// A connection whose peer answers request N with `responses[N]`.
+fn replies(responses: &[&[u8]]) -> (Connection<Replies>, Rc<RefCell<Vec<u8>>>) {
+    let output = Rc::new(RefCell::new(Vec::new()));
+    let stream = Replies {
+        queue: responses.iter().map(|r| r.to_vec()).collect(),
+        current: pieces(b"", 1),
+        output: Rc::clone(&output),
+    };
+    (
+        Connection::new(stream, "example.test", wide()).expect("connection"),
+        output,
+    )
+}
 
 fn get(path: &str) -> RequestHead {
     RequestHead::new(
@@ -47,7 +113,10 @@ fn connection_with(
 }
 
 /// Sends `head` without a body and reads the whole response body.
-fn fetch(conn: &mut Connection<MemStream>, head: &RequestHead) -> Result<(u16, Vec<u8>), Error> {
+fn fetch<S: Read + Write + IdleCheck>(
+    conn: &mut Connection<S>,
+    head: &RequestHead,
+) -> Result<(u16, Vec<u8>), Error> {
     let mut response = conn.request(head, RequestBody::None)?;
     let mut body = Vec::new();
     response.read_to_end(&mut body)?;
@@ -56,11 +125,8 @@ fn fetch(conn: &mut Connection<MemStream>, head: &RequestHead) -> Result<(u16, V
 
 #[test]
 fn client_writes_request_and_framing() {
-    let (mut conn, written) = connection(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-            .repeat(3)
-            .as_slice(),
-    );
+    let ok: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    let (mut conn, written) = replies(&[ok, ok, ok]);
     let mut head = get("/p?q=1");
     head.headers.append("X-Test", "1");
     fetch(&mut conn, &head).expect("get");
@@ -96,9 +162,10 @@ fn client_writes_request_and_framing() {
 
 #[test]
 fn head_response_has_no_body() {
-    let (mut conn, _) = connection(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
-    );
+    let (mut conn, _) = replies(&[
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+    ]);
     let (status, body) = fetch(&mut conn, &with_method("HEAD", "/")).expect("head");
     assert_eq!((status, body), (200, Vec::new()));
     assert!(conn.is_reusable());
@@ -118,10 +185,10 @@ fn interim_responses_skipped_and_bounded() {
     );
 
     for status in ["204 No Content", "304 Not Modified"] {
-        let (mut conn, _) = connection(
-            format!("HTTP/1.1 {status}\r\nContent-Length: 5\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
-                .as_bytes(),
-        );
+        let (mut conn, _) = replies(&[
+            format!("HTTP/1.1 {status}\r\nContent-Length: 5\r\n\r\n").as_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        ]);
         assert_eq!(
             fetch(&mut conn, &get("/")).expect("bodyless").1,
             Vec::<u8>::new()
@@ -249,6 +316,146 @@ fn partially_read_response_not_reusable() {
         Err(Error::BodyTooLarge)
     ));
     assert!(!conn.is_reusable());
+}
+
+#[test]
+fn client_rejects_numeric_hosts() {
+    for host in [
+        "0xa9fea9fe",
+        "2130706433",
+        "127.1",
+        "0177.0.0.1",
+        "10.1",
+        "1.0x1",
+        "127.1:80",
+        "0x7f000001:8080",
+        "a_b",
+        "-a.example",
+        "a..b",
+    ] {
+        assert!(
+            matches!(
+                Connection::new(MemStream::new(b"", 1).0, host, wide()),
+                Err(Error::InvalidInput(_))
+            ),
+            "{host}"
+        );
+    }
+    for host in ["127.0.0.1", "127.0.0.1:80", "a-1.example", "[::1]:80"] {
+        Connection::new(MemStream::new(b"", 1).0, host, wide()).expect(host);
+    }
+}
+
+#[test]
+fn client_not_reused_with_buffered_bytes() {
+    // An unsolicited second response arrives in the same read as the first:
+    // it must not become the answer to the next request.
+    let input =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL";
+    let (stream, written) = MemStream::new(input, 4096);
+    let mut conn = Connection::new(stream, "example.test", wide()).expect("connection");
+    assert_eq!(fetch(&mut conn, &get("/")).expect("first").0, 200);
+    assert!(!conn.is_reusable());
+    let sent = written.borrow().len();
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert_eq!(written.borrow().len(), sent, "nothing more written");
+}
+
+/// A client over a Unix socket, and the server end the test drives.
+fn unix_pair() -> (Connection<UnixStream>, UnixStream) {
+    let (client, server) = UnixStream::pair().expect("pair");
+    for end in [&client, &server] {
+        end.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+    }
+    (
+        Connection::new(client, "example.test", wide()).expect("connection"),
+        server,
+    )
+}
+
+/// Reads one request head (these requests have no body).
+fn read_request(server: &mut UnixStream) -> Vec<u8> {
+    let mut got = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        assert_eq!(server.read(&mut byte).expect("read request"), 1);
+        got.push(byte[0]);
+    }
+    got
+}
+
+/// Whether bytes are waiting on `server`, without blocking.
+fn pending(server: &mut UnixStream) -> bool {
+    server.set_nonblocking(true).expect("nonblocking");
+    let mut byte = [0u8; 1];
+    let read = server.read(&mut byte);
+    server.set_nonblocking(false).expect("blocking");
+    match read {
+        Ok(n) => n > 0,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+const EMPTY_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+#[test]
+fn client_reuses_quiet_unix_connection() {
+    let (mut conn, mut server) = unix_pair();
+    let peer = thread::spawn(move || {
+        for _ in 0..3 {
+            read_request(&mut server);
+            server.write_all(EMPTY_OK).expect("answer");
+        }
+        server
+    });
+    for _ in 0..3 {
+        assert_eq!(fetch(&mut conn, &get("/")).expect("fetch").0, 200);
+        assert!(conn.is_reusable());
+    }
+    peer.join().expect("peer");
+}
+
+#[test]
+fn client_discards_connection_with_unsolicited_bytes() {
+    let (mut conn, mut server) = unix_pair();
+    server.write_all(EMPTY_OK).expect("first answer");
+    assert_eq!(fetch(&mut conn, &get("/")).expect("first").0, 200);
+    read_request(&mut server);
+    // The peer sends a response nobody asked for while the connection is
+    // idle; the next request must not be answered by it.
+    server
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL")
+        .expect("unsolicited");
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert!(!conn.is_reusable());
+    assert!(!pending(&mut server), "the request was not sent");
+}
+
+#[test]
+fn client_discards_connection_after_peer_close() {
+    let (mut conn, mut server) = unix_pair();
+    server.write_all(EMPTY_OK).expect("first answer");
+    assert_eq!(fetch(&mut conn, &get("/")).expect("first").0, 200);
+    read_request(&mut server);
+    server
+        .shutdown(std::net::Shutdown::Write)
+        .expect("peer closes");
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert!(!conn.is_reusable());
+    assert!(!pending(&mut server), "the request was not sent");
+}
+
+#[test]
+fn client_over_memstream_serves_one_request() {
+    // A stream that cannot tell whether bytes arrived while idle is never
+    // reused.
+    let (mut conn, written) = connection(EMPTY_OK);
+    fetch(&mut conn, &get("/")).expect("first");
+    let sent = written.borrow().len();
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert_eq!(written.borrow().len(), sent);
 }
 
 #[test]
