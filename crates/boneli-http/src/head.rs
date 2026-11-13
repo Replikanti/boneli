@@ -293,7 +293,9 @@ pub(crate) fn parse_request(bytes: &[u8], limits: &Limits) -> Result<ParsedReque
         port: target_port,
     } = &target
     {
-        if host != *target_host || port != Some(*target_port) {
+        // The tunnel's port comes only from the target, so a `Host` without
+        // a port (undici sends one) names the same destination.
+        if host != *target_host || port.is_some_and(|port| port != *target_port) {
             return Err(Error::Malformed("Host does not name the CONNECT target"));
         }
     }

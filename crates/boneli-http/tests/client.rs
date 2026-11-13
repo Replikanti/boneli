@@ -19,8 +19,8 @@ use common::{MemStream, Pieces, limits, pieces, wide};
 /// A stream with all input loaded up front cannot tell what arrived after
 /// a response, so a connection over it serves one request.
 impl IdleCheck for MemStream {
-    fn is_idle(&mut self) -> io::Result<bool> {
-        Ok(false)
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
+        Ok(None)
     }
 }
 
@@ -55,8 +55,8 @@ impl Write for Replies {
 }
 
 impl IdleCheck for Replies {
-    fn is_idle(&mut self) -> io::Result<bool> {
-        Ok(self.current.is_empty())
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
+        Ok(Some(self.current.is_empty()))
     }
 }
 
@@ -400,6 +400,41 @@ fn pending(server: &mut UnixStream) -> bool {
 
 const EMPTY_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 
+/// One request answered by a peer that reads it first, as a server does.
+fn first_exchange(conn: &mut Connection<UnixStream>, server: &UnixStream) {
+    let mut peer = server.try_clone().expect("clone");
+    let answer = thread::spawn(move || {
+        read_request(&mut peer);
+        peer.write_all(EMPTY_OK).expect("answer");
+    });
+    assert_eq!(fetch(conn, &get("/")).expect("first").0, 200);
+    answer.join().expect("peer");
+}
+
+#[test]
+fn client_first_request_refuses_unsolicited_bytes() {
+    // A response that is already there before the first request answered
+    // no request; it must not become the answer to the first one either.
+    let (mut conn, mut server) = unix_pair();
+    server
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL")
+        .expect("unsolicited");
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert!(!conn.is_reusable());
+    assert!(!pending(&mut server), "the request was not sent");
+}
+
+#[test]
+fn client_first_request_refuses_closed_peer() {
+    let (mut conn, mut server) = unix_pair();
+    server
+        .shutdown(std::net::Shutdown::Write)
+        .expect("peer closes");
+    assert!(conn.request(&get("/"), RequestBody::None).is_err());
+    assert!(!conn.is_reusable());
+    assert!(!pending(&mut server), "the request was not sent");
+}
+
 #[test]
 fn client_reuses_quiet_unix_connection() {
     let (mut conn, mut server) = unix_pair();
@@ -420,9 +455,7 @@ fn client_reuses_quiet_unix_connection() {
 #[test]
 fn client_discards_connection_with_unsolicited_bytes() {
     let (mut conn, mut server) = unix_pair();
-    server.write_all(EMPTY_OK).expect("first answer");
-    assert_eq!(fetch(&mut conn, &get("/")).expect("first").0, 200);
-    read_request(&mut server);
+    first_exchange(&mut conn, &server);
     // The peer sends a response nobody asked for while the connection is
     // idle; the next request must not be answered by it.
     server
@@ -436,9 +469,7 @@ fn client_discards_connection_with_unsolicited_bytes() {
 #[test]
 fn client_discards_connection_after_peer_close() {
     let (mut conn, mut server) = unix_pair();
-    server.write_all(EMPTY_OK).expect("first answer");
-    assert_eq!(fetch(&mut conn, &get("/")).expect("first").0, 200);
-    read_request(&mut server);
+    first_exchange(&mut conn, &server);
     server
         .shutdown(std::net::Shutdown::Write)
         .expect("peer closes");

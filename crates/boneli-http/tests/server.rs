@@ -37,13 +37,19 @@ fn read_head(stream: &mut UnixStream) -> String {
     String::from_utf8_lossy(&got).into_owned()
 }
 
-/// Asserts that the peer closes `stream` (reads end of file).
+/// Asserts that the peer closes `stream`: end of file, or a reset when
+/// the peer closed with input of ours still unread (a Unix socket reports
+/// that as `ConnectionReset`; the trickle tests race with it).
 fn assert_closed(stream: &mut UnixStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     let mut rest = Vec::new();
-    stream.read_to_end(&mut rest).expect("closed");
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("closed: {e:?}"),
+    }
 }
 
 fn timeouts(idle: Duration, request: Duration) -> ServerLimits {

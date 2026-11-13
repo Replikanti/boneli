@@ -93,9 +93,15 @@ else. It never repairs a message.
    value is `host [":" port]` with the grammar of item 3 (an empty value is
    rejected; RFC 9112 §3.2 allows it only for a target without a host, and
    our clients always send one). For CONNECT, `Host` must name the same
-   host (case-insensitively) and port as the target, or the answer is
-   `400`, so that a consumer that routes or logs by `Host` sees the
-   destination the tunnel uses. At most one
+   host as the target (case-insensitively), and its port must be the
+   target's port or absent; a different host or a different explicit port
+   is `400`, so that a consumer that routes or logs by `Host` sees the
+   destination the tunnel uses. The port may be absent because the
+   tunnel's port comes only from the target, and undici's `ProxyAgent`
+   (Node `fetch` through a proxy) sends `Host` without it: requiring the
+   port would refuse every HTTPS request from undici-based tools at the
+   egress (#10). https-proxy-agent sends the port; both forms are pinned
+   by tests. Rejected: requiring the port, for that reason. At most one
    `Content-Length`, at most one `Transfer-Encoding`, and never both (`400`).
    The transfer coding must be exactly `chunked`, ASCII case-insensitive
    with optional whitespace around it, or the answer is `501`.
@@ -197,18 +203,26 @@ else. It never repairs a message.
     each of these, for example whether credentials may follow a redirect
     to another host. A connection is reusable only after the body was
     read to its end, no byte beyond the response has been read, and
-    neither side asked to close. Bytes that arrive while a connection is
-    idle answered no request; read as the next response, a peer could
-    answer a request it has not seen yet. So before a request on a
-    connection used before, the client asks the stream whether it is
-    still idle (`IdleCheck`): `UnixStream` and `TcpStream` read one byte in
+    neither side asked to close. Bytes that arrive before a request
+    answered no request; read as its response, a peer could answer a
+    request it has not seen yet. So before every request, the first one
+    included, the client asks the stream whether input has arrived
+    (`IdleCheck`): `UnixStream` and `TcpStream` read one byte in
     non-blocking mode, and any byte or the end of the stream ends the
     connection with nothing written. A stream that cannot tell (an
-    in-memory stream, a wrapper without a hook) returns "not idle", and a
-    connection over it serves one request. `Tunnel` counts its unread early
-    bytes as input. Rejected: no reuse at all, which costs a connection per
-    request for the forge and registry clients; and the check for Unix
-    sockets only, which would leave other streams reusing without it.
+    in-memory stream, a wrapper without a hook) answers "cannot tell", and
+    a connection over it serves one request. `Tunnel` counts its unread
+    early bytes as input that has arrived, over any stream. The first
+    request is checked too because over a tunnel its early bytes come
+    from the proxy, not from the origin: a proxy that writes its `200` and
+    a response in one write would otherwise answer the first request
+    itself. `connect_tunnel` still keeps early bytes, because a protocol
+    in which the server speaks first (an SSH or SMTP banner) is valid
+    over a tunnel; only HTTP over it refuses them. Rejected: no reuse at
+    all, which costs a connection per request for the forge and registry
+    clients; the check for Unix sockets only, which would leave other
+    streams reusing without it; and failing `connect_tunnel` on early
+    bytes, which would break those protocols.
 13. **Truncation stays visible.** The end of the stream inside a
     `Content-Length` body or before the last chunk is an error, never a
     short complete body. `pass_through` writes and flushes after every
@@ -288,8 +302,8 @@ script of item 17 comes with the crate itself. The edge
 - Handler errors other than `Error::Status` close the connection without
   an answer. The crate does no logging; the composition root logs what
   `serve_connection` returns.
-- A pooled client connection costs one non-blocking read and two `fcntl`
-  calls per reused request. Non-blocking mode belongs to the open socket,
+- A client connection costs one non-blocking read and two `fcntl` calls
+  per request, the first one included. Non-blocking mode belongs to the open socket,
   so a clone of the stream used on another thread at that moment sees it
   too; the client does not clone its stream.
 - Hosts with `_` and numeric names such as `example.123` are refused. A

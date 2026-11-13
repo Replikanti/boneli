@@ -9,7 +9,10 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
-use boneli_http::{Error, Exchange, Headers, IdleCheck, Target, connect_tunnel};
+use boneli_http::{
+    Connection, Error, Exchange, Headers, IdleCheck, Method, RequestBody, RequestHead, Target,
+    connect_tunnel,
+};
 use common::{MemStream, wide};
 
 /// Copies `from` into `to` until end of file, then shuts down `to` for
@@ -176,12 +179,83 @@ fn tunnel_idle_check() {
         .write_all(b"HTTP/1.1 200 OK\r\n\r\nX")
         .expect("answer");
     let mut tunnel = connect_tunnel(client, "example.com", 443, &wide()).expect("tunnel");
-    assert!(!tunnel.is_idle().expect("check"));
+    assert_eq!(tunnel.is_idle().expect("check"), Some(false));
     let mut byte = [0u8; 1];
     tunnel.read_exact(&mut byte).expect("early byte");
-    assert!(tunnel.is_idle().expect("check"));
+    assert_eq!(tunnel.is_idle().expect("check"), Some(true));
     server.write_all(b"Y").expect("unsolicited");
-    assert!(!tunnel.is_idle().expect("check"));
+    assert_eq!(tunnel.is_idle().expect("check"), Some(false));
+}
+
+/// Reads one head (these requests have no body) from `stream`.
+fn read_head(stream: &mut UnixStream) -> Vec<u8> {
+    let mut got = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        assert_eq!(stream.read(&mut byte).expect("read head"), 1);
+        got.push(byte[0]);
+    }
+    got
+}
+
+fn get_root() -> RequestHead {
+    RequestHead::new(
+        Method::new("GET").expect("method"),
+        Target::Origin("/".into()),
+    )
+}
+
+#[test]
+fn client_tunnel_first_request_refuses_early_response() {
+    // The proxy answers the CONNECT and, in the same write, a response the
+    // origin never sent. The first request over the tunnel must not get it.
+    let (client, mut proxy) = UnixStream::pair().expect("pair");
+    proxy
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    proxy
+        .write_all(b"HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL")
+        .expect("answer");
+    let tunnel = connect_tunnel(client, "origin.example", 80, &wide()).expect("tunnel");
+    assert_eq!(tunnel.early().len(), 42);
+    read_head(&mut proxy);
+    let mut conn = Connection::new(tunnel, "origin.example", wide()).expect("connection");
+    assert!(conn.request(&get_root(), RequestBody::None).is_err());
+    assert!(!conn.is_reusable());
+    proxy.set_nonblocking(true).expect("nonblocking");
+    let mut byte = [0u8; 1];
+    assert!(
+        matches!(proxy.read(&mut byte), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "the request was not sent"
+    );
+}
+
+#[test]
+fn client_tunnel_first_request_without_early_bytes() {
+    // A quiet tunnel serves its first request and stays reusable.
+    let (client, mut proxy) = UnixStream::pair().expect("pair");
+    proxy
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    proxy.write_all(b"HTTP/1.1 200 OK\r\n\r\n").expect("answer");
+    let tunnel = connect_tunnel(client, "origin.example", 80, &wide()).expect("tunnel");
+    assert!(tunnel.early().is_empty());
+    read_head(&mut proxy);
+    let origin = thread::spawn(move || {
+        let request = read_head(&mut proxy);
+        proxy
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .expect("response");
+        request
+    });
+    let mut conn = Connection::new(tunnel, "origin.example", wide()).expect("connection");
+    let mut response = conn.request(&get_root(), RequestBody::None).expect("first");
+    let mut body = Vec::new();
+    response.read_to_end(&mut body).expect("body");
+    assert_eq!((response.head.status, &body[..]), (200, &b"ok"[..]));
+    assert!(conn.is_reusable());
+    let request = origin.join().expect("origin");
+    assert!(request.starts_with(b"GET / HTTP/1.1\r\nHost: origin.example\r\n"));
 }
 
 #[test]

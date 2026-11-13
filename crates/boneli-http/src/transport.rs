@@ -36,38 +36,38 @@ impl Transport for TcpStream {
     }
 }
 
-/// A stream the client can check before it sends a request on a connection
-/// it has used before (ADR-003, item 12): bytes that arrive while the
-/// connection is idle answered no request, and must not become the answer
-/// to the next one.
+/// A stream the client checks before it sends a request (ADR-003, item
+/// 12): bytes that arrived before the request answered no request, and
+/// must not become its answer.
 pub trait IdleCheck {
-    /// Whether nothing has arrived and the peer has not closed: `true` only
-    /// when a read would block. Must not block. A byte the check reads is
-    /// lost, so after `false` the stream is not used again. A stream that
-    /// cannot tell returns `false`, and a connection over it then serves
-    /// one request.
-    fn is_idle(&mut self) -> io::Result<bool>;
+    /// `Some(true)` when nothing has arrived and the peer has not closed (a
+    /// read would block), `Some(false)` when bytes or the end of the stream
+    /// arrived, `None` when the stream cannot tell. Must not block. A byte
+    /// the check reads is lost, so after `Some(false)` the stream is not
+    /// used again. The client sends no request after `Some(false)`, and a
+    /// connection over a stream that answers `None` serves one request.
+    fn is_idle(&mut self) -> io::Result<Option<bool>>;
 }
 
 impl IdleCheck for UnixStream {
     /// Reads one byte in non-blocking mode. The mode belongs to the open
     /// socket, so a clone of this stream used on another thread at the same
     /// moment would see it too.
-    fn is_idle(&mut self) -> io::Result<bool> {
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
         self.set_nonblocking(true)?;
         let idle = read_would_block(self);
         self.set_nonblocking(false)?;
-        idle
+        idle.map(Some)
     }
 }
 
 impl IdleCheck for TcpStream {
     /// As for `UnixStream`.
-    fn is_idle(&mut self) -> io::Result<bool> {
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
         self.set_nonblocking(true)?;
         let idle = read_would_block(self);
         self.set_nonblocking(false)?;
-        idle
+        idle.map(Some)
     }
 }
 
@@ -140,10 +140,11 @@ impl<S: Read> Read for Tunnel<S> {
 }
 
 impl<S: IdleCheck> IdleCheck for Tunnel<S> {
-    /// Early bytes not read yet are input that has arrived.
-    fn is_idle(&mut self) -> io::Result<bool> {
+    /// Early bytes not read yet are input that has arrived, even over a
+    /// stream that cannot tell.
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
         if self.pos < self.early.len() {
-            return Ok(false);
+            return Ok(Some(false));
         }
         self.stream.is_idle()
     }

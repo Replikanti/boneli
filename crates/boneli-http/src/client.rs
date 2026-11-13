@@ -40,8 +40,8 @@ pub enum RequestBody<'a> {
 
 /// A client connection that sends one request at a time. It is reused only
 /// while the peer stays quiet between responses: bytes beyond a response,
-/// or bytes and the end of the stream that arrive while it is idle, end it
-/// (ADR-003, item 12).
+/// or bytes and the end of the stream that arrive before a request,
+/// including the first, end it (ADR-003, item 12).
 pub struct Connection<S> {
     wire: Wire<S>,
     body: BodyState,
@@ -87,8 +87,9 @@ impl<S: Read + Write + IdleCheck> Connection<S> {
     /// `Content-Length`, `Transfer-Encoding` or `Connection`; CONNECT goes
     /// through `connect_tunnel`. On an invalid head nothing is written.
     ///
-    /// On a connection used before, the stream must be idle
-    /// (`IdleCheck::is_idle`); otherwise nothing is written, the
+    /// Before every request, the first included, the stream must not
+    /// report input (`IdleCheck::is_idle`), and on a connection used before
+    /// it must report that it is idle; otherwise nothing is written, the
     /// connection is no longer reusable, and the caller opens a new one.
     pub fn request(
         &mut self,
@@ -133,21 +134,28 @@ impl<S: Read + Write + IdleCheck> Connection<S> {
         }
         out.extend_from_slice(&encoded[line_end..]);
 
-        // Bytes that arrived while the connection was idle answered no
-        // request; read as the next response they would answer this one.
-        if self.used {
-            match self.wire.stream.is_idle() {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.close = true;
-                    return Err(Error::Malformed(
-                        "bytes or the end of the stream arrived while the connection was idle",
-                    ));
-                }
-                Err(e) => {
-                    self.close = true;
-                    return Err(e.into());
-                }
+        // Bytes that arrived before the request answered no request; read
+        // as the response they would answer this one. That holds for the
+        // first request too: a tunnel's early bytes come from the proxy, not
+        // from the origin. A stream that cannot tell serves one request.
+        match self.wire.stream.is_idle() {
+            Ok(Some(true)) => {}
+            Ok(None) if !self.used => {}
+            Ok(None) => {
+                self.close = true;
+                return Err(Error::InvalidInput(
+                    "the stream cannot tell whether bytes arrived while it was idle",
+                ));
+            }
+            Ok(Some(false)) => {
+                self.close = true;
+                return Err(Error::Malformed(
+                    "bytes or the end of the stream arrived before the request",
+                ));
+            }
+            Err(e) => {
+                self.close = true;
+                return Err(e.into());
             }
         }
 

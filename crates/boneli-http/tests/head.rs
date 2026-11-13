@@ -346,31 +346,82 @@ fn connect_host_must_match_target() {
             b"",
         )
     };
+    // A different host, or a different explicit port, is refused; so is
+    // a different host without a port.
     for host in [
         "169.254.169.254:80",
-        "allowed.example",
+        "169.254.169.254",
         "allowed.example:444",
+        "allowed.example:80",
         "other.example:443",
+        "other.example",
         "[::1]:443",
+        "[::1]",
     ] {
         assert_rejected(&connect(host), 400);
     }
-    let head = accepted(&connect("ALLOWED.example:443"));
+    // The same host, with the target's port or without a port.
+    for host in ["ALLOWED.example:443", "allowed.example", "Allowed.Example"] {
+        let head = accepted(&connect(host));
+        assert_eq!(
+            head.target,
+            Target::Authority {
+                host: "allowed.example".into(),
+                port: 443
+            },
+            "Host: {host}"
+        );
+    }
+    for host in ["[::1]:443", "[::1]"] {
+        let head = accepted(&request(
+            &["CONNECT [::1]:443 HTTP/1.1", &format!("Host: {host}")],
+            b"",
+        ));
+        assert_eq!(
+            head.target,
+            Target::Authority {
+                host: "::1".into(),
+                port: 443
+            },
+            "Host: {host}"
+        );
+    }
+}
+
+/// The CONNECT that undici 7.19.2 `ProxyAgent` sends (Node `fetch` through
+/// a proxy), byte for byte: `Host` carries no port.
+const UNDICI_CONNECT: &[u8] = b"CONNECT api.example.com:443 HTTP/1.1\r\nhost: api.example.com\r\nconnection: close\r\nproxy-connection: keep-alive\r\n\r\n";
+
+#[test]
+fn connect_undici_host_without_port_accepted() {
+    let want = Target::Authority {
+        host: "api.example.com".into(),
+        port: 443,
+    };
+    let head = RequestHead::parse(UNDICI_CONNECT, &wide()).expect("undici CONNECT");
+    assert_eq!(head.target, want);
+    assert_eq!(accepted(UNDICI_CONNECT).target, want);
+}
+
+#[test]
+fn connect_host_with_port_accepted() {
+    // The form https-proxy-agent sends: `Host` repeats the target's port.
+    let input = b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\nProxy-Connection: close\r\n\r\n";
+    let head = RequestHead::parse(input, &wide()).expect("CONNECT with port");
     assert_eq!(
         head.target,
         Target::Authority {
-            host: "allowed.example".into(),
+            host: "api.example.com".into(),
             port: 443
         }
     );
-    let head = accepted(&connect_to("[::1]:443"));
-    assert_eq!(
-        head.target,
-        Target::Authority {
-            host: "::1".into(),
-            port: 443
-        }
-    );
+    // The undici bytes with any other port in `Host` stay refused.
+    let other = b"CONNECT api.example.com:443 HTTP/1.1\r\nhost: api.example.com:8443\r\nconnection: close\r\nproxy-connection: keep-alive\r\n\r\n";
+    assert!(matches!(
+        RequestHead::parse(other, &wide()),
+        Err(Error::Malformed(_))
+    ));
+    assert_rejected(other, 400);
 }
 
 #[test]
