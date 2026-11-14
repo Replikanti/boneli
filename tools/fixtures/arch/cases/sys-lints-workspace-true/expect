@@ -1,0 +1,2 @@
+# the unsafe crate inherits the workspace lints instead of its own copy
+sys-lints

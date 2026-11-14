@@ -48,17 +48,100 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          # The core crates must build for a target without std (ADR-001).
-          targets: x86_64-unknown-none
+          # The core crates must build for a target without std (ADR-001);
+          # boneli-sys is checked for both musl targets (ADR-007, D5).
+          targets: x86_64-unknown-none, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      # The shim (#9) ships as a static musl binary, and libc's constants
+      # differ per target; aarch64 is otherwise only compiled on the arm
+      # leg of `sandbox` (ADR-007, D5).
+      - name: boneli-sys on musl
+        run: |
+          cargo check -p boneli-sys --all-targets --target x86_64-unknown-linux-musl
+          cargo check -p boneli-sys --all-targets --target aarch64-unknown-linux-musl
       - name: Architecture rules
         run: ./tools/check-architecture.sh
       # Every rule has fail cases; a weakened rule turns this step red.
       - name: Architecture rule fixtures
         run: ./tools/check-architecture.sh --fixtures
+
+  # The boneli-sys host tests create user namespaces, so they need a
+  # prepared host (ADR-007, D5). The job proves what a stock runner lacks,
+  # prepares the runner with the host-setup block from CLAUDE.md (the same
+  # block users run; this workflow has no privileged step of its own) and
+  # runs every host test. Matrix values are literals; no step interpolates
+  # untrusted input. The job names are load-bearing (required checks).
+  sandbox:
+    name: sandbox (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            # The probe ids a stock runner lacks (BONELI_SYS_EXPECT_MISSING).
+            expect-missing: userns-apparmor,cgroup-not-delegated
+            # Seccomp rows this kernel cannot observe (BONELI_SYS_HOST_GAPS).
+            host-gaps: ""
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            expect-missing: userns-apparmor,cgroup-not-delegated
+            host-gaps: ""
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Host features
+        run: |
+          uname -srm
+          echo "lsm: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)"
+          for k in kernel/apparmor_restrict_unprivileged_userns user/max_user_namespaces \
+                   kernel/unprivileged_userns_clone kernel/perf_event_paranoid dev/tty/legacy_tiocsti \
+                   kernel/dmesg_restrict kernel/kptr_restrict kernel/yama/ptrace_scope \
+                   kernel/io_uring_disabled kernel/unprivileged_bpf_disabled kernel/cap_last_cap; do
+            echo "$k = $(cat "/proc/sys/$k" 2>/dev/null || echo absent)"
+          done
+          cg=$(sed -n 's/^0:://p' /proc/self/cgroup)
+          echo "cgroup: $cg"
+          stat -c 'cgroup owner: %U (%u)' "/sys/fs/cgroup$cg"
+          echo "controllers: $(cat "/sys/fs/cgroup$cg/cgroup.controllers")"
+          echo "user: $(id)"
+      - name: Build
+        run: cargo test -p boneli-sys --no-run
+      # The error a user gets on an unprepared host, asserted exactly.
+      - name: Unprepared runner
+        env:
+          BONELI_SYS_EXPECT_MISSING: ${{ matrix.expect-missing }}
+        run: cargo test -p boneli-sys --test boneli_sys_tests -- --ignored --exact probe::reports_expected_missing
+      - name: Prepare the runner host
+        run: |
+          awk '/^<!-- host-setup:begin -->$/ { m = 1; next }
+               /^<!-- host-setup:end -->$/ { m = 0 }
+               m && /^```$/ { c = 0 }
+               m && c { print }
+               m && /^```sh$/ { c = 1 }' CLAUDE.md > "$RUNNER_TEMP/host-setup.sh"
+          if [ ! -s "$RUNNER_TEMP/host-setup.sh" ]; then
+            echo "the host-setup block in CLAUDE.md is empty or missing"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/host-setup.sh"
+          start=$(date +%s)
+          TARGET_DIR="$GITHUB_WORKSPACE/target" RUN_USER="$USER" ENABLE_LINGER=1 sh -eu "$RUNNER_TEMP/host-setup.sh"
+          echo "host-setup took $(( $(date +%s) - start )) s"
+      - name: Host tests
+        env:
+          BONELI_SYS_HOST_GAPS: ${{ matrix.host-gaps }}
+        run: |
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
+            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS="$BONELI_SYS_HOST_GAPS" \
+            cargo test -p boneli-sys -- --ignored
 
   audit:
     runs-on: ubuntu-latest

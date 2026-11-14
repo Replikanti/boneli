@@ -1,0 +1,2 @@
+# the own table lacks clippy.undocumented_unsafe_blocks from [check] unsafe-lints
+sys-lints

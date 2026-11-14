@@ -1,0 +1,3 @@
+# review of PR 46, finding 2: the unsafe lints at deny plus an inner #![allow] in lib.rs passed clippy and this check;
+# at forbid the allow is error E0453, so only forbid passes the rule
+sys-lints

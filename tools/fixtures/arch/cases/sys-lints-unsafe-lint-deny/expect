@@ -1,0 +1,2 @@
+# a lint of [check] unsafe-lints at deny: an inner #![allow] in the source would override it
+sys-lints

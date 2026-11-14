@@ -1,0 +1,260 @@
+# Architecture and dependency policy, read by tools/check_architecture.py.
+# Why each part exists: docs/adr/001-core-purity-and-dependency-allowlist.md.
+#
+# Format: only [table] headers, bare keys, basic strings and arrays of
+# strings, so that the workspace's own TOML subset parser can read it later.
+#
+# Changing this file is a design change and gets the same review as the
+# checker:
+#   - a new external crate name needs an ADR or a row in the table of
+#     docs/ARCHITECTURE.md ("Pure Rust and dependencies");
+#   - a new edge between crates already listed needs its own record with a
+#     reason and the decision that approved the parent's stack;
+#   - every edge into a strict crate (`strict = "ADR-NNN"`) cites its own
+#     accepted ADR, and that ADR names the edge as `<parent> -> <crate>`;
+#   - every reachable external crate with a build script carries
+#     `build-script = "ADR-NNN"`, an accepted ADR that approves that script
+#     as `<crate>'s build script is approved` (ADR-005). The approval is
+#     per crate, not per version.
+
+[roles]
+# Pure core: #![no_std] with alloc, no dependencies, token scan.
+core = ["boneli-domain", "boneli-app"]
+# Generic plumbing without domain knowledge.
+support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-toml"]
+# Composition roots: wire adapters, nothing depends on them.
+# boneli-replay-check is the test-only root of ADR-002: the two-process
+# replay gate for address leaks. As a root it is a leaf, so no production
+# crate can depend on it, and it may later depend on the in-memory adapters
+# that the application replay (#3) needs.
+roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check"]
+# The only crates that may contain `unsafe`.
+unsafe = ["boneli-sys"]
+# The only crates that may have a build script (and with it a `links` key,
+# which cargo allows only with a build script): a build script can compile
+# and link native code that no scan sees. Empty today; adding a crate needs
+# an ADR that names it, and core crates cannot be listed (ADR-001).
+build-script = []
+
+[check]
+# The runner is Linux-only. Both architectures it ships for, with glibc and
+# with musl (static binaries such as the shim may ship on musl). Dependency
+# targets are evaluated against these; flag-dependent cfgs count as true.
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# A target without std: the core crates must build for it.
+no-std-target = "x86_64-unknown-none"
+# Lints the unsafe crates (roles.unsafe) set to forbid in their own [lints]
+# table, next to every workspace lint except unsafe_code (rule sys-lints,
+# ADR-007 D6): each unsafe operation in its own block, also in an unsafe
+# fn, each block with a `// SAFETY:` comment, and no unwrap (a panic in the
+# cloned child aborts it mid-setup). forbid, because an inner #![allow]
+# in the source overrides deny.
+unsafe-lints = "x"
+
+[external.libc]
+reason = "syscall declarations (namespaces, mount, seccomp, Landlock)"
+decision = "ARCHITECTURE"
+# The only approved crate with raw syscall access: every edge into it is a
+# new path to the kernel and needs its own accepted ADR that names it.
+strict = "ADR-001"
+# Probes the rustc version and prints cfgs.
+build-script = "ADR-005"
+
+[external.libc.pulled-by.boneli-sys]
+reason = "boneli-sys is the one place for syscalls and unsafe code"
+decision = "ADR-001"
+
+[external.httparse]
+reason = "HTTP/1.x parsing without further dependencies"
+decision = "ARCHITECTURE"
+# Runs `rustc --version` and prints SIMD cfgs.
+build-script = "ADR-003"
+
+[external.httparse.pulled-by.boneli-http]
+reason = "the own HTTP/1.1 server and client parse with it"
+decision = "ARCHITECTURE"
+
+[external.rustls]
+reason = "TLS to LLM providers, forges and registries"
+decision = "ARCHITECTURE"
+# Prints the `read_buf` cfg on nightly with that feature, nothing otherwise.
+build-script = "ADR-005"
+
+[external.rustls.pulled-by.boneli-https]
+reason = "boneli-https is the only place for TLS"
+decision = "ARCHITECTURE"
+
+[external.webpki-roots]
+reason = "root certificates for rustls"
+decision = "ARCHITECTURE"
+
+[external.webpki-roots.pulled-by.boneli-https]
+reason = "boneli-https is the only place for TLS"
+decision = "ARCHITECTURE"
+
+[external.ring]
+reason = "cryptographic provider for rustls"
+decision = "ARCHITECTURE"
+# Compiles ring's C and assembly with `cc` and links it (`links`): the one
+# exception to pure Rust (ADR-005).
+build-script = "ADR-005"
+
+[external.ring.pulled-by.boneli-https]
+reason = "boneli-https is the only place for TLS"
+decision = "ARCHITECTURE"
+
+[external.sha2]
+reason = "content addressing and evidence"
+decision = "ARCHITECTURE"
+
+[external.sha2.pulled-by.boneli-store-fs]
+reason = "the content-addressed store hashes blobs"
+decision = "ARCHITECTURE"
+
+[external.miniz_oxide]
+reason = "unpacking gzip OCI image layers"
+decision = "ARCHITECTURE"
+
+[external.miniz_oxide.pulled-by.boneli-oci]
+reason = "the OCI image store unpacks layers"
+decision = "ARCHITECTURE"
+
+[external.ruzstd]
+reason = "unpacking zstd OCI image layers"
+decision = "ARCHITECTURE"
+
+[external.ruzstd.pulled-by.boneli-oci]
+reason = "the OCI image store unpacks layers"
+decision = "ARCHITECTURE"
+
+# ---- The TLS stack of boneli-https (ADR-005) -------------------------------
+# rustls with the ring provider and webpki-roots, as resolved for #5. The
+# crates above (rustls, webpki-roots, ring, libc) are ARCHITECTURE rows;
+# these are their transitive crates and the edges between them. Each edge
+# record cites ADR-005, which lists every crate with its version, license
+# and role; the two edges into libc are named there literally.
+
+
+[external.cc]
+reason = "C compiler driver for ring's build script (build-dependency only)"
+decision = "ADR-005"
+
+[external.cfg-if]
+reason = "cfg branching macro for getrandom and ring"
+decision = "ADR-005"
+
+[external.find-msvc-tools]
+reason = "MSVC lookup inside cc; does nothing on Linux"
+decision = "ADR-005"
+
+[external.getrandom]
+reason = "OS random numbers for ring"
+decision = "ADR-005"
+
+[external.once_cell]
+reason = "lazy statics in rustls"
+decision = "ADR-005"
+
+[external.rustls-pki-types]
+reason = "certificate, key and server name types shared by rustls and webpki"
+decision = "ADR-005"
+
+[external.rustls-webpki]
+reason = "certificate path validation for rustls"
+decision = "ADR-005"
+
+[external.shlex]
+reason = "shell-word splitting of compiler flags inside cc"
+decision = "ADR-005"
+
+[external.subtle]
+reason = "constant-time comparisons in rustls"
+decision = "ADR-005"
+
+[external.untrusted]
+reason = "panic-free input parsing in ring and webpki"
+decision = "ADR-005"
+
+[external.zeroize]
+reason = "wiping secrets from memory in rustls and pki-types"
+decision = "ADR-005"
+
+[external.find-msvc-tools.pulled-by.cc]
+reason = "cc looks up MSVC tools with it; unused when building for Linux"
+decision = "ADR-005"
+
+[external.shlex.pulled-by.cc]
+reason = "cc splits compiler flags from the environment"
+decision = "ADR-005"
+
+[external.cfg-if.pulled-by.getrandom]
+reason = "getrandom picks its OS backend"
+decision = "ADR-005"
+
+[external.libc.pulled-by.getrandom]
+reason = "getrandom calls the getrandom syscall, with a /dev/urandom fallback (ADR-005 names this edge)"
+decision = "ADR-005"
+
+[external.cc.pulled-by.ring]
+reason = "ring's build script compiles its C and assembly"
+decision = "ADR-005"
+
+[external.cfg-if.pulled-by.ring]
+reason = "ring picks CPU-specific code"
+decision = "ADR-005"
+
+[external.getrandom.pulled-by.ring]
+reason = "ring's SystemRandom draws from the OS"
+decision = "ADR-005"
+
+[external.libc.pulled-by.ring]
+reason = "ring reads CPU features with getauxval on aarch64 and arm Linux (ADR-005 names this edge)"
+decision = "ADR-005"
+
+[external.untrusted.pulled-by.ring]
+reason = "ring parses keys and signatures without panics"
+decision = "ADR-005"
+
+[external.zeroize.pulled-by.rustls-pki-types]
+reason = "pki-types wipes private keys on drop"
+decision = "ADR-005"
+
+[external.ring.pulled-by.rustls-webpki]
+reason = "webpki verifies signatures with ring"
+decision = "ADR-005"
+
+[external.rustls-pki-types.pulled-by.rustls-webpki]
+reason = "webpki takes certificates and names as pki-types"
+decision = "ADR-005"
+
+[external.untrusted.pulled-by.rustls-webpki]
+reason = "webpki parses DER without panics"
+decision = "ADR-005"
+
+[external.once_cell.pulled-by.rustls]
+reason = "rustls initializes its process-wide provider lazily"
+decision = "ADR-005"
+
+[external.ring.pulled-by.rustls]
+reason = "rustls' ring provider: key exchange, AEAD, signatures"
+decision = "ADR-005"
+
+[external.rustls-pki-types.pulled-by.rustls]
+reason = "rustls' certificate and key types"
+decision = "ADR-005"
+
+[external.rustls-webpki.pulled-by.rustls]
+reason = "rustls verifies server certificates with webpki"
+decision = "ADR-005"
+
+[external.subtle.pulled-by.rustls]
+reason = "rustls compares secrets in constant time"
+decision = "ADR-005"
+
+[external.zeroize.pulled-by.rustls]
+reason = "rustls wipes key material"
+decision = "ADR-005"
+
+[external.rustls-pki-types.pulled-by.webpki-roots]
+reason = "the roots are pki-types trust anchors"
+decision = "ADR-005"
