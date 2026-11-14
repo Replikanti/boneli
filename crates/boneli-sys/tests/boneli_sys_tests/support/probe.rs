@@ -77,6 +77,10 @@ pub fn main(action: &str) -> ! {
         "connect-abstract" => connect_abstract(),
         "dev" => dev(),
         "write" => write(),
+        "oom" => oom(),
+        "pids" => pids(),
+        "spin" => spin(),
+        "io-write" => io_write(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     std::process::exit(0)
@@ -248,6 +252,7 @@ fn closed_stdio_spawn() {
         // else in this process uses them from here on.
         unsafe { libc::close(fd) };
     }
+    let cg = crate::support::cgroup::sandbox("closed-stdio");
     let spec = boneli_sys::Spec {
         program: "/nonexistent/boneli-sys-probe".into(),
         args: Vec::new(),
@@ -263,6 +268,7 @@ fn closed_stdio_spawn() {
                 .unwrap_or_else(|e| fail(3, &e.to_string())),
             cwd: boneli_sys::InsidePath::root(),
         },
+        cgroup: &cg,
     };
     let result = boneli_sys::spawn(&spec);
     let ok = matches!(
@@ -517,4 +523,210 @@ fn write() {
             &code(&std::fs::write(path, content)),
         );
     }
+}
+
+/// PID 1 forks a child that touches `BONELI_PROBE_SIZE` bytes of anonymous
+/// memory one byte per page, then waits for it. Under `memory.oom.group`
+/// the OOM kill takes this process too; otherwise it prints how the child
+/// ended and exits 0.
+fn oom() {
+    let size: usize = input("BONELI_PROBE_SIZE")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_SIZE is not a number"));
+    // SAFETY: sysconf takes a plain name.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    // SAFETY: fork has no memory arguments; the child below only maps,
+    // writes and exits, which needs no lock another thread could hold.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail(3, &format!("fork: errno {}", errno()));
+    }
+    if pid == 0 {
+        // SAFETY: an anonymous private mapping with no address hint.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            // SAFETY: _exit ends the forked child without running anything.
+            unsafe { libc::_exit(4) };
+        }
+        let base = p.cast::<u8>();
+        let mut at = 0;
+        while at < size {
+            // SAFETY: at < size, so the pointer is inside the mapping.
+            let byte = unsafe { base.add(at) };
+            // SAFETY: byte points into the writable mapping created above.
+            unsafe { byte.write_volatile(1) };
+            at += page;
+        }
+        // SAFETY: as above.
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    // SAFETY: status is valid storage; pid is this process's child.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        fail(3, &format!("waitpid: errno {}", errno()));
+    }
+    put("child_status", &status.to_string());
+}
+
+/// The thread count T of this process (from `/proc/self/status`), then
+/// forks sleepers until `fork` fails, prints how many it got and the
+/// errno, and kills and reaps them.
+fn pids() {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_else(|e| fail(3, &format!("read status: {e}")));
+    let threads = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .map(str::trim)
+        .unwrap_or_else(|| fail(3, "no Threads line"))
+        .to_string();
+    let mut children = Vec::new();
+    let fork_errno = loop {
+        // SAFETY: the child only waits for a signal, which takes no lock.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            break errno();
+        }
+        if pid == 0 {
+            loop {
+                // SAFETY: pause only waits for a signal.
+                unsafe { libc::pause() };
+            }
+        }
+        children.push(pid);
+        if children.len() > 1000 {
+            break 0;
+        }
+    };
+    put("threads", &threads);
+    put("children", &children.len().to_string());
+    put("fork_errno", &fork_errno.to_string());
+    for &pid in &children {
+        // SAFETY: kill and waitpid take plain integers and valid storage;
+        // each pid is this process's child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let mut st = 0;
+        // SAFETY: as above.
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+    }
+}
+
+/// `usage_usec` and `nr_throttled` of the sandbox's own `cpu.stat`.
+fn cpu_stat() -> (u64, u64) {
+    let text = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat")
+        .unwrap_or_else(|e| fail(3, &format!("read cpu.stat: {e}")));
+    let get = |key: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(' '))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| fail(3, &format!("no {key} in cpu.stat")))
+    };
+    (get("usage_usec"), get("nr_throttled"))
+}
+
+/// Spins on `BONELI_PROBE_THREADS` threads for `BONELI_PROBE_MS` of wall
+/// time and prints the cpu.stat deltas over the spin.
+fn spin() {
+    let ms: u64 = input("BONELI_PROBE_MS")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_MS is not a number"));
+    let threads: usize = input("BONELI_PROBE_THREADS")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_THREADS is not a number"));
+    let (usage0, throttled0) = cpu_stat();
+    let start = std::time::Instant::now();
+    let until = std::time::Duration::from_millis(ms);
+    let spinners: Vec<_> = (0..threads)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while start.elapsed() < until {
+                    n = std::hint::black_box(n.wrapping_add(1));
+                }
+                n
+            })
+        })
+        .collect();
+    for s in spinners {
+        let _ = s.join();
+    }
+    let (usage1, throttled1) = cpu_stat();
+    put("usage_usec", &(usage1 - usage0).to_string());
+    put("nr_throttled", &(throttled1 - throttled0).to_string());
+}
+
+/// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` in 1 MiB
+/// writes, with `O_DIRECT` where the file system takes it (else
+/// `fdatasync` after every write), and prints the elapsed time.
+fn io_write() {
+    use std::os::unix::fs::OpenOptionsExt;
+    const CHUNK: usize = 1 << 20;
+    let path = input("BONELI_PROBE_FILE");
+    let size: usize = input("BONELI_PROBE_SIZE")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_SIZE is not a number"));
+    let open = |extra: i32| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(extra)
+            .open(&path)
+    };
+    let (mut file, direct) = match open(libc::O_DIRECT) {
+        Ok(f) => (f, true),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (
+            open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
+            false,
+        ),
+        Err(e) => fail(3, &format!("open {path} with O_DIRECT: {e}")),
+    };
+    // O_DIRECT needs an aligned buffer; 4096 covers the logical block size
+    // of every device the tests run on.
+    let layout = std::alloc::Layout::from_size_align(CHUNK, 4096)
+        .unwrap_or_else(|_| fail(3, "buffer layout"));
+    // SAFETY: the layout has a non-zero size.
+    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
+    if buf.is_null() {
+        fail(3, "allocate the write buffer");
+    }
+    // SAFETY: buf is CHUNK bytes, zeroed, owned by this function, and
+    // nothing else refers to it.
+    let chunk = unsafe { std::slice::from_raw_parts_mut(buf, CHUNK) };
+    // Incompressible bytes (xorshift64): a compressing file system (btrfs
+    // with compress=zstd, the dev host's) would write zeros as a few
+    // hundred KiB and never reach the limit (measured).
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for word in chunk.chunks_exact_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        word.copy_from_slice(&x.to_ne_bytes());
+    }
+    let start = std::time::Instant::now();
+    let mut written = 0;
+    while written < size {
+        file.write_all(chunk)
+            .unwrap_or_else(|e| fail(3, &format!("write {path}: {e}")));
+        if !direct {
+            file.sync_data()
+                .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
+        }
+        written += CHUNK;
+    }
+    file.sync_data()
+        .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
+    put("elapsed_ms", &start.elapsed().as_millis().to_string());
+    put("direct", &direct.to_string());
+    // SAFETY: buf was allocated above with this layout.
+    unsafe { std::alloc::dealloc(buf, layout) };
 }

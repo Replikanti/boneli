@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use boneli_sys::{Error, ExitStatus, Spec, Stdio, Step, spawn};
+use boneli_sys::{Cgroup, Error, ExitStatus, Spec, Stdio, Step, spawn};
 
 use crate::support::rootfs::Fixture;
 use crate::support::{self, dev_null, ids, run, run_probe, wait_bounded};
 
-/// A spec on `fixture`'s default root.
-fn spec(fixture: &Fixture, program: &str, args: &[&str]) -> Spec {
+/// A spec on `fixture`'s default root in `cgroup`.
+fn spec<'a>(fixture: &Fixture, cgroup: &'a Cgroup, program: &str, args: &[&str]) -> Spec<'a> {
     Spec {
         program: PathBuf::from(program),
         args: args.iter().map(OsString::from).collect(),
@@ -27,6 +27,7 @@ fn spec(fixture: &Fixture, program: &str, args: &[&str]) -> Spec {
         ids: ids(0, 0),
         setup_timeout: support::SETUP_TIMEOUT,
         root: fixture.root(),
+        cgroup,
     }
 }
 
@@ -170,7 +171,8 @@ fn new_session_without_terminal() {
 #[ignore = "host: unprivileged user namespaces"]
 fn exec_errors() {
     let fixture = Fixture::new("exec-errors");
-    match spawn(&spec(&fixture, "/nonexistent/boneli-sys-probe", &[])) {
+    let cg = support::cgroup::sandbox("exec-errors");
+    match spawn(&spec(&fixture, &cg, "/nonexistent/boneli-sys-probe", &[])) {
         Err(Error::Setup {
             step: Step::Exec,
             errno,
@@ -179,7 +181,7 @@ fn exec_errors() {
         other => panic!("missing program: {other:?}"),
     }
     // Rejected while preparing, before any clone.
-    match spawn(&spec(&fixture, "bin/true", &[])) {
+    match spawn(&spec(&fixture, &cg, "bin/true", &[])) {
         Err(Error::RelativeProgram(p)) => assert_eq!(p, PathBuf::from("bin/true")),
         other => panic!("relative program: {other:?}"),
     }
@@ -190,6 +192,8 @@ fn exec_errors() {
 fn concurrent_spawns_from_threads() {
     // Hang bound per spawn and wait: /bin/true takes milliseconds.
     const BOUND: Duration = Duration::from_secs(10);
+    // The churn thread loads the host: keep the timing tests out.
+    let _runs = support::shared();
     let stop = Arc::new(AtomicBool::new(false));
     let churn = {
         let stop = Arc::clone(&stop);
@@ -208,10 +212,13 @@ fn concurrent_spawns_from_threads() {
             let fixture = Arc::clone(&fixture);
             std::thread::spawn(move || {
                 for _ in 0..8 {
-                    let mut s = spec(&fixture, "/bin/true", &[]);
+                    let cg = support::cgroup::sandbox("concurrent");
+                    let mut s = spec(&fixture, &cg, "/bin/true", &[]);
                     s.setup_timeout = BOUND;
                     let mut child = spawn(&s).expect("spawn /bin/true");
                     assert_eq!(wait_bounded(&mut child, BOUND), ExitStatus::Exited(0));
+                    drop(s);
+                    cg.destroy().expect("destroy");
                 }
             })
         })
@@ -228,7 +235,8 @@ fn concurrent_spawns_from_threads() {
 #[ignore = "host: unprivileged user namespaces"]
 fn wait_and_kill_by_pidfd() {
     let fixture = Fixture::new("kill");
-    let mut child = spawn(&spec(&fixture, "/bin/sleep", &["30"])).expect("spawn sleep");
+    let cg = support::cgroup::sandbox("kill");
+    let mut child = spawn(&spec(&fixture, &cg, "/bin/sleep", &["30"])).expect("spawn sleep");
     child.kill().expect("kill through the pidfd");
     assert_eq!(
         wait_bounded(&mut child, Duration::from_secs(10)),

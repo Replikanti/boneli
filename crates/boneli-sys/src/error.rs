@@ -97,6 +97,38 @@ pub enum Error {
         /// Their length with the NUL.
         len: usize,
     },
+    /// The path is not a directory of a cgroup v2 hierarchy (ADR-007, D8).
+    NotCgroup2(PathBuf),
+    /// A cgroup parent lacks one of the cpu, io, memory and pids
+    /// controllers for its children; the first one missing in that order
+    /// (ADR-007, D8).
+    ControllerMissing(&'static str),
+    /// The limits are outside the kernel's bounds or cannot be meant
+    /// (ADR-007, D8).
+    InvalidLimits(&'static str),
+    /// A cgroup name is not 1-255 bytes of `[A-Za-z0-9_-]` (ADR-007, D8).
+    InvalidCgroupName(String),
+    /// A file of a cgroup could not be opened, read or written.
+    CgroupFile {
+        /// The file, relative to its cgroup.
+        file: &'static str,
+        /// The `errno`.
+        errno: i32,
+    },
+    /// A limit read back other than it was written (ADR-007, D8).
+    CgroupReadBack {
+        /// The file.
+        file: &'static str,
+        /// What the limit should read as.
+        expected: String,
+        /// What it read as.
+        found: String,
+    },
+    /// A cgroup still held processes this long after `cgroup.kill`.
+    CgroupKillTimeout(Duration),
+    /// The path's file system has no block device to limit with `io.max`
+    /// (tmpfs, overlay).
+    NoBlockDevice(PathBuf),
 }
 
 impl Error {
@@ -167,6 +199,39 @@ impl fmt::Display for Error {
                 f,
                 "overlay options take {len} bytes with the NUL, more than one page (4096)"
             ),
+            Error::NotCgroup2(p) => write!(f, "{} is not on a cgroup v2 hierarchy", p.display()),
+            Error::ControllerMissing(c) => write!(
+                f,
+                "the cgroup parent does not enable the {c} controller for its children (cgroup.subtree_control)"
+            ),
+            Error::InvalidLimits(reason) => write!(f, "invalid cgroup limits: {reason}"),
+            Error::InvalidCgroupName(name) => {
+                write!(
+                    f,
+                    "cgroup name {name:?} is not 1-255 bytes of [A-Za-z0-9_-]"
+                )
+            }
+            Error::CgroupFile { file, errno } => {
+                write!(f, "cgroup file {file}: {}", strerror(*errno))
+            }
+            Error::CgroupReadBack {
+                file,
+                expected,
+                found,
+            } => write!(
+                f,
+                "cgroup file {file} reads {found:?} after writing, expected {expected:?}"
+            ),
+            Error::CgroupKillTimeout(t) => {
+                write!(f, "the cgroup still had processes {t:?} after cgroup.kill")
+            }
+            Error::NoBlockDevice(p) => {
+                write!(
+                    f,
+                    "no block device holds {} (io.max needs one)",
+                    p.display()
+                )
+            }
         }
     }
 }

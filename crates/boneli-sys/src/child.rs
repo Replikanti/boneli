@@ -74,11 +74,14 @@ pub enum Step {
     Hostname = 20,
     /// `lo` up in the new network namespace.
     Loopback = 21,
+    /// A read-only cgroup2 mount of the sandbox's own cgroup; the item is
+    /// the mount's index.
+    Cgroup2 = 22,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 21] = [
+    pub const ALL: [Step; 22] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -100,12 +103,13 @@ impl Step {
         Step::Pivot,
         Step::Hostname,
         Step::Loopback,
+        Step::Cgroup2,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
     /// [`Step::MountTarget`] precedes each mount; [`Step::Seccomp`] is the
     /// probe's only (see there).
-    pub const SEQUENCE: [Step; 20] = [
+    pub const SEQUENCE: [Step; 21] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -118,6 +122,7 @@ impl Step {
         Step::Overlay,
         Step::Proc,
         Step::Dev,
+        Step::Cgroup2,
         Step::Pivot,
         Step::Hostname,
         Step::Loopback,
@@ -162,6 +167,7 @@ impl Step {
             Step::Pivot => "pivot",
             Step::Hostname => "hostname",
             Step::Loopback => "loopback",
+            Step::Cgroup2 => "cgroup2",
         }
     }
 }
@@ -178,6 +184,9 @@ pub(crate) struct ExecPlan<'a> {
     pub stdio: [c_int; 3],
     /// The root, mounts, hostname and loopback (ADR-007, D7).
     pub ops: &'a [Op],
+    /// The directory descriptor of the cgroup `clone3` places the child in
+    /// (`CLONE_INTO_CGROUP`, ADR-007 D8).
+    pub cgroup: c_int,
 }
 
 /// What the child does.
@@ -374,10 +383,11 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Ok(());
     };
 
-    // The cgroup namespace is created here, not by clone3: copy_process
-    // creates namespaces before it moves the child into its target cgroup,
-    // so a namespace from clone3 would be rooted at the parent's cgroup
-    // (ADR-007, D7).
+    // The cgroup namespace is created here, by a process CLONE_INTO_CGROUP
+    // has already placed in its sandbox cgroup, so it is rooted there on
+    // any kernel. copy_process creates clone3's namespaces before the move;
+    // the dev host's kernel re-roots such a namespace at the target cgroup
+    // anyway (measured), but nothing here relies on that (ADR-007, D7, D8).
     inject(fault, Step::CgroupNs)?;
     // SAFETY: unshare takes plain flags.
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } < 0 {

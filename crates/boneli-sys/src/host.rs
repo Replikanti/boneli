@@ -18,8 +18,7 @@ pub const LANDLOCK_ABI_REQUIRED: u32 = 2;
 /// `/proc` files and exits: it takes milliseconds.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The controllers every sandbox cgroup is limited by (ADR-007).
-const CONTROLLERS: [&str; 4] = ["cpu", "io", "memory", "pids"];
+use crate::cgroup::CONTROLLERS;
 
 /// The stable id of a [`Missing`] feature, as `BONELI_SYS_EXPECT_MISSING`
 /// and CI name it.

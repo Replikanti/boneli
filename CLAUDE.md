@@ -126,8 +126,10 @@ systemd-run --user --scope -q -p Delegate=yes \
   cannot observe, by id. Exact: an unknown id fails, and so will a listed
   row that turns out observable. Empty until the seccomp rows exist.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
-  so the harness may reorganize its own cgroup. Never set it in a terminal
-  whose cgroup holds other processes.
+  so the harness may reorganize its own cgroup: it moves the run's
+  processes into `leaf/` and creates every sandbox's cgroup next to it
+  (ADR-007, D8). Without it every host test that starts a sandbox
+  fails. Never set it in a terminal whose cgroup holds other processes.
 
 **Preparing a host** takes the block below, run once with root through
 `sudo`. CI runs exactly this block (it extracts it between the markers),

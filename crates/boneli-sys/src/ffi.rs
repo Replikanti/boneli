@@ -82,3 +82,10 @@ pub(crate) struct OpenHow {
 const _: () = assert!(core::mem::size_of::<MountAttr>() == MOUNT_ATTR_SIZE_VER0);
 const _: () = assert!(core::mem::size_of::<OpenHow>() == core::mem::size_of::<libc::open_how>());
 const _: () = assert!(core::mem::size_of::<OpenHow>() == 24);
+
+/// `CLONE_INTO_CGROUP`, `include/uapi/linux/sched.h`
+/// (`0x200000000ULL`): `clone3` places the child in the cgroup whose
+/// directory descriptor is `clone_args.cgroup`. libc 0.2.191 has it only
+/// for glibc and as a `c_int`, which cannot hold it (deprecated there as
+/// overflowing).
+pub(crate) const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;

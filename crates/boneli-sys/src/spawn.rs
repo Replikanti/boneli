@@ -8,8 +8,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::cgroup::Cgroup;
 use crate::child::{self, Action, ChildPlan, ExecPlan, Fault};
 use crate::error::{Error, Result, errno};
+use crate::ffi;
 use crate::ids::Ids;
 use crate::mount::{self, Op, Root};
 use crate::report;
@@ -30,7 +32,7 @@ pub struct Stdio {
 
 /// What to run and how.
 #[derive(Debug)]
-pub struct Spec {
+pub struct Spec<'a> {
     /// Absolute path of the program inside the sandbox, resolved after
     /// `pivot_root`; there is no `PATH` search.
     pub program: PathBuf,
@@ -44,6 +46,9 @@ pub struct Spec {
     pub ids: Ids,
     /// The root, mounts, hostname and working directory (ADR-007, D7).
     pub root: Root,
+    /// The cgroup the child is placed in at the clone, so it never runs
+    /// outside its limits (ADR-007, D8).
+    pub cgroup: &'a Cgroup,
     /// How long the child may take from the clone to the exec before it is
     /// killed. No default: the caller sizes it, and zero is rejected.
     pub setup_timeout: Duration,
@@ -218,7 +223,7 @@ struct Prepared {
     ops: Vec<Op>,
 }
 
-fn prepare(spec: &Spec) -> Result<Prepared> {
+fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
     if spec.setup_timeout.is_zero() {
         return Err(Error::ZeroSetupTimeout);
     }
@@ -320,7 +325,8 @@ fn set_signal_mask(mask: u64) -> Result<u64> {
 
 /// The namespaces `clone3` creates for `spawn`: user, mount, PID, network,
 /// IPC and UTS. The cgroup namespace comes later, from the child itself
-/// (`Step::CgroupNs`, ADR-007 D7).
+/// (`Step::CgroupNs`), once `CLONE_INTO_CGROUP` has placed it in its
+/// cgroup, so the namespace is rooted there (ADR-007, D7 and D8).
 pub(crate) const SPAWN_NAMESPACES: u64 = (libc::CLONE_NEWUSER
     | libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
@@ -334,13 +340,19 @@ pub(crate) const SPAWN_NAMESPACES: u64 = (libc::CLONE_NEWUSER
 /// parent only; the child never returns from here.
 pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
     let mut pidfd: c_int = -1;
+    let (flags, cgroup) = match &plan.action {
+        // The probe's filter child must not depend on user namespaces.
+        Action::ProbeFilter => (libc::CLONE_PIDFD as u64, 0),
+        Action::ProbeIds => ((libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64, 0),
+        // Into its cgroup at the clone: the child never runs outside its
+        // limits, not even for its setup (ADR-007, D8).
+        Action::Exec(exec) => (
+            SPAWN_NAMESPACES | libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP,
+            exec.cgroup as u64,
+        ),
+    };
     let args = libc::clone_args {
-        flags: match plan.action {
-            // The probe's filter child must not depend on user namespaces.
-            Action::ProbeFilter => libc::CLONE_PIDFD as u64,
-            Action::ProbeIds => (libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64,
-            Action::Exec(_) => SPAWN_NAMESPACES | libc::CLONE_PIDFD as u64,
-        },
+        flags,
         pidfd: &mut pidfd as *mut c_int as u64,
         child_tid: 0,
         parent_tid: 0,
@@ -351,7 +363,7 @@ pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
         tls: 0,
         set_tid: 0,
         set_tid_size: 0,
-        cgroup: 0,
+        cgroup,
     };
     // Every signal stays blocked from the clone until the child has reset
     // its dispositions (Step::Signals), so no handler of this process runs
@@ -461,8 +473,9 @@ pub(crate) fn await_report(read: &OwnedFd, launched: &Launched, timeout: Duratio
     }
 }
 
-/// Starts `spec.program` in new user, mount, PID, network, IPC, UTS and
-/// cgroup namespaces with the single id mapping of `spec.ids` (ADR-007,
+/// Starts `spec.program` in `spec.cgroup` (placed there at the clone,
+/// ADR-007 D8) and in new user, mount, PID, network, IPC, UTS and cgroup
+/// namespaces with the single id mapping of `spec.ids` (ADR-007,
 /// D1), the read-only root and mounts of `spec.root`, its hostname and `lo`
 /// up (ADR-007, D7), a new session, default signal dispositions, an empty
 /// signal mask and only descriptors 0-2 (ADR-007, D4). Returns once the
@@ -476,14 +489,14 @@ pub(crate) fn await_report(read: &OwnedFd, launched: &Launched, timeout: Duratio
 /// After it: [`Error::Setup`] with the failed step, or
 /// [`Error::SetupTimeout`] and [`Error::Protocol`], after which the child
 /// was killed; in every error case it was reaped.
-pub fn spawn(spec: &Spec) -> Result<Child> {
+pub fn spawn(spec: &Spec<'_>) -> Result<Child> {
     let mut pid = 0;
     spawn_inner(spec, Fault::None, &mut pid)
 }
 
 /// [`spawn`] with a fault for the unit tests; `pid` receives the cloned
 /// child's pid, so tests can check that it was reaped.
-pub(crate) fn spawn_inner(spec: &Spec, fault: Fault, pid: &mut libc::pid_t) -> Result<Child> {
+pub(crate) fn spawn_inner(spec: &Spec<'_>, fault: Fault, pid: &mut libc::pid_t) -> Result<Child> {
     let prepared = prepare(spec)?;
     let (read, write) = report_pipe()?;
     let stdio: [RawFd; 3] = [
@@ -500,6 +513,7 @@ pub(crate) fn spawn_inner(spec: &Spec, fault: Fault, pid: &mut libc::pid_t) -> R
             envp: &prepared.envp,
             stdio,
             ops: &prepared.ops,
+            cgroup: spec.cgroup.dir_fd(),
         }),
         report_fd: write.as_raw_fd(),
         fault,
@@ -527,8 +541,14 @@ mod tests {
             .into()
     }
 
-    /// A spec on `root`; the pure tests pass a root that is never mounted.
-    fn spec_on(program: &str, timeout: Duration, root: &crate::Root) -> Spec {
+    /// A spec on `root` in `cgroup`; the pure tests pass a root that is
+    /// never mounted and a cgroup that never was one.
+    fn spec_on<'a>(
+        program: &str,
+        timeout: Duration,
+        root: &crate::Root,
+        cgroup: &'a Cgroup,
+    ) -> Spec<'a> {
         Spec {
             program: PathBuf::from(program),
             args: Vec::new(),
@@ -541,6 +561,7 @@ mod tests {
             ids: Ids::new(0, 0).expect("valid ids"),
             setup_timeout: timeout,
             root: root.clone(),
+            cgroup,
         }
     }
 
@@ -554,8 +575,8 @@ mod tests {
         }
     }
 
-    fn spec(program: &str, timeout: Duration) -> Spec {
-        spec_on(program, timeout, &unmounted_root())
+    fn spec<'a>(program: &str, timeout: Duration, cgroup: &'a Cgroup) -> Spec<'a> {
+        spec_on(program, timeout, &unmounted_root(), cgroup)
     }
 
     fn open_fds() -> usize {
@@ -598,20 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn spawn_clone_flags() {
+        // The cgroup namespace is the child's own step, after
+        // CLONE_INTO_CGROUP placed it (ADR-007, D8).
+        assert_eq!(SPAWN_NAMESPACES & libc::CLONE_NEWCGROUP as u64, 0);
+        assert_eq!(ffi::CLONE_INTO_CGROUP, 1 << 33);
+    }
+
+    #[test]
     fn zero_setup_timeout_rejected() {
+        let cg = Cgroup::unplaced();
         assert!(matches!(
-            spawn(&spec("/bin/true", Duration::ZERO)),
+            spawn(&spec("/bin/true", Duration::ZERO, &cg)),
             Err(Error::ZeroSetupTimeout)
         ));
     }
 
     #[test]
     fn nul_and_env_names_rejected() {
-        let mut s = spec("/bin/true", Duration::from_secs(1));
+        let cg = Cgroup::unplaced();
+        let mut s = spec("/bin/true", Duration::from_secs(1), &cg);
         s.args.push(OsString::from_vec(b"a\0b".to_vec()));
         assert!(matches!(spawn(&s), Err(Error::Nul("an argument"))));
         for name in ["", "A=B"] {
-            let mut s = spec("/bin/true", Duration::from_secs(1));
+            let mut s = spec("/bin/true", Duration::from_secs(1), &cg);
             s.env.push((OsString::from(name), OsString::from("v")));
             assert!(
                 matches!(spawn(&s), Err(Error::InvalidEnvName(_))),
@@ -631,7 +662,8 @@ mod tests {
         for step in Step::SEQUENCE {
             let before = open_fds();
             let mut pid = 0;
-            let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root);
+            let cg = crate::test_guard::sandbox_cgroup("every-step");
+            let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root, &cg);
             match spawn_inner(&s, Fault::Fail(step), &mut pid) {
                 Err(Error::Setup {
                     step: got,
@@ -644,6 +676,7 @@ mod tests {
                 other => panic!("{step:?}: {other:?}"),
             }
             drop(s);
+            cg.destroy().expect("destroy the cgroup");
             assert!(pid > 0 && reaped(pid), "{step:?}: child {pid} reaped");
             assert_eq!(open_fds(), before, "{step:?}: no descriptor leaked");
         }
@@ -654,8 +687,9 @@ mod tests {
     fn setup_timeout_kills_hung_child() {
         let _host = crate::test_guard::host_lock();
         let unit = crate::test_guard::UnitRoot::new();
+        let cg = crate::test_guard::sandbox_cgroup("timeout");
         let before = open_fds();
-        let s = spec_on("/bin/true", Duration::from_millis(200), &unit.root);
+        let s = spec_on("/bin/true", Duration::from_millis(200), &unit.root, &cg);
         let mut pid = 0;
         let start = Instant::now();
         let result = spawn_inner(&s, Fault::Hang(Step::Setsid), &mut pid);
@@ -679,7 +713,8 @@ mod tests {
     fn allocation_guard_catches_child_allocation() {
         let _host = crate::test_guard::host_lock();
         let unit = crate::test_guard::UnitRoot::new();
-        let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root);
+        let cg = crate::test_guard::sandbox_cgroup("alloc");
+        let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root, &cg);
         let mut pid = 0;
         // The guard ends the child before it reaches exec or writes a
         // report; the parent cannot tell that EOF from an exec, so the
@@ -727,7 +762,8 @@ mod tests {
         let unit = crate::test_guard::UnitRoot::new();
         let root = unit.root.clone();
         let worker = std::thread::spawn(move || {
-            let s = spec_on("/bin/true", Duration::from_millis(1500), &root);
+            let cg = crate::test_guard::sandbox_cgroup("handlers");
+            let s = spec_on("/bin/true", Duration::from_millis(1500), &root, &cg);
             let mut pid = 0;
             let result = spawn_inner(&s, Fault::Hang(Step::Setsid), &mut pid);
             (result.map(|_| ()), pid)
