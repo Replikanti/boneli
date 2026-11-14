@@ -355,6 +355,17 @@ even though the CONNECT is refused.
   reads all of it, while `ECONNRESET` means the stream was cut. Treating a
   reset as a gone peer would let a sandbox that writes at the right moment
   turn a cut download into `end=eof`.
+- `ETIMEDOUT` (TCP gave up retransmitting) is an error too. Only `EAGAIN`,
+  what Linux returns when a socket timeout set by the relay runs out,
+  counts against the idle window; swallowing `ETIMEDOUT` as a timeout would
+  let the next read return 0 and log a dead connection as `end=eof`.
+- After the sandbox stops reading (`shutdown(Read)` on its socket), the
+  download direction stops at its next write and nothing reads the
+  upstream any more, so a reset the origin sends later goes unseen and the
+  tunnel can end `eof`. This is by design: the cut is the sandbox's own
+  doing and only affects its own data, `down` stays the exact count of
+  bytes delivered, and reading on just to classify the end would move
+  bytes nobody takes.
 - **Buffer: 16 KiB**, the largest TLS plaintext fragment, 2^14 bytes (RFC
   8446, section 5.1). On the wire a protected record carries up to 2^14 +
   256 bytes, so a full record takes two reads and a typical one takes one;

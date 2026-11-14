@@ -8,6 +8,8 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -284,4 +286,68 @@ fn tcp_reset_mid_download_ends_error() {
     let outcome = join(relay);
     assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
     assert_eq!((outcome.up, outcome.down, outcome.end), (1, 7, End::Error));
+}
+
+/// A stream whose first read, over all its clones, fails with `TimedOut`.
+struct TimedOutOnce(UnixStream, Arc<AtomicBool>);
+
+impl std::io::Read for TimedOutOnce {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.1.swap(false, Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.0.read(buf)
+    }
+}
+
+impl Write for TimedOutOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl RelayStream for TimedOutOnce {
+    fn try_clone_box(&self) -> std::io::Result<Box<dyn RelayStream>> {
+        Ok(Box::new(TimedOutOnce(
+            self.0.try_clone()?,
+            Arc::clone(&self.1),
+        )))
+    }
+
+    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        self.0.shutdown(how)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.0.set_write_timeout(timeout)
+    }
+}
+
+/// `ETIMEDOUT` (TCP gave up retransmitting) is a dead connection, not the
+/// idle window running out: the download that meets it ends the tunnel as
+/// `error`, although the next read would see a clean end of stream.
+#[test]
+fn tcp_timeout_ends_error() {
+    let (sandbox, client) = UnixStream::pair().expect("pair");
+    let (upstream, origin) = UnixStream::pair().expect("pair");
+    client.shutdown(Shutdown::Write).expect("half-close");
+    origin.shutdown(Shutdown::Write).expect("half-close");
+    let settings = settings(Duration::from_secs(60));
+    let start = Instant::now();
+    let outcome = boneli_egress::relay(
+        Box::new(sandbox),
+        Vec::new(),
+        Box::new(TimedOutOnce(upstream, Arc::new(AtomicBool::new(true)))),
+        &settings,
+    );
+    assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+    assert_eq!((outcome.up, outcome.down, outcome.end), (0, 0, End::Error));
 }

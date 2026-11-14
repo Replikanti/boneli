@@ -227,10 +227,12 @@ fn direction(from: &mut dyn RelayStream, to: &mut dyn RelayStream, shared: &Shar
     moved
 }
 
-/// A socket timeout: `WouldBlock` is how std reports `EAGAIN` from a
-/// socket with a timeout set, `TimedOut` covers platforms that differ.
+/// A socket timeout ran out: Linux returns `EAGAIN` (`WouldBlock`) when
+/// one set with `set_read_timeout` or `set_write_timeout` expires.
+/// `ETIMEDOUT` (`TimedOut`) is not one: TCP gave up retransmitting and the
+/// connection is dead, so it ends the tunnel as an error (ADR-006, D7).
 fn timed_out(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    e.kind() == ErrorKind::WouldBlock
 }
 
 /// The peer of the socket written to is gone after the end of its stream,
