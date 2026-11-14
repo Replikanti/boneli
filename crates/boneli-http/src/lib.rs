@@ -29,5 +29,5 @@ pub use client::{Connection, RequestBody, Response, connect_tunnel};
 pub use error::{Error, Result};
 pub use head::{Headers, Method, RequestHead, ResponseHead, Target};
 pub use limits::{Limits, ServerLimits};
-pub use server::{Exchange, serve, serve_connection};
+pub use server::{Exchange, accept_loop, serve, serve_connection};
 pub use transport::{IdleCheck, Transport, Tunnel};

@@ -62,9 +62,15 @@ where hangs and leaks hide.
 - Exit codes: 2 for a usage error, including an allowlist that does not
   parse (D2); 1 when binding or accepting fails, or when NAT64 discovery
   gets no answer at all (D4; message on stderr); 3 when the log cannot be
-  written (D8).
+  written (D8). A panic aborts the process (a panic hook in the binary):
+  a thread that died mid-tunnel would otherwise leave an `open` without a
+  `close` while the egress goes on serving, and D8 reads that gap as "the
+  process was killed", which an abort makes true.
 - Startup order: bind, discover the NAT64 prefixes (D4), write the `start`
-  record, accept. The egress never
+  record, accept. Everything after the bind is the library function
+  `launch`, which takes the `Upstream` seam (D11), so the startup cases of
+  D4 are tested with a scripted resolver and the binary only adds the real
+  one. The egress never
   unlinks or replaces an existing path: binding fails on an existing file
   and on a symlink (`EADDRINUSE`), and that is exit 1. A proxy that
   removed what it found at its path could be pointed at any file the
@@ -73,7 +79,10 @@ where hangs and leaks hide.
   phase. The MVP lists, as guidance for the runner (#32):
   - prepare: `registry.npmjs.org:443`, `pypi.org:443`,
     `files.pythonhosted.org:443`;
-  - MVP agent phase: `api.anthropic.com:443`.
+  - MVP agent phase: `api.anthropic.com:443`. Measured on 2026-11-14:
+    `claude -p` through the egress with only this entry finished its
+    streamed answer; it also tried `mcp-proxy.anthropic.com:443` 17 times,
+    and the egress refused each one without affecting the answer.
 - **Why one process per phase:** a crash or fd exhaustion hits one run, and
   `serve` has no shutdown API (ADR-003, Consequences), so the runner ends a
   phase by ending the process. Rejected: one process for many runs, which
@@ -228,13 +237,15 @@ even though the CONNECT is refused.
     1). An answer with A records and no AAAA record is an ordinary network
     without DNS64: the egress starts with no prefix. The prefixes in
     effect go into the `start` record (D8).
-  - **Part 2 must test both startup cases**, because the exit decision is
-    not in part 1 (`discover` sees only the AAAA records): an
-    `ipv4only.arpa` answer with only A records starts the egress with
+  - **Both startup cases are tested** (`tests/startup.rs`), because the
+    exit decision is not in `discover`, which sees only the AAAA records:
+    an `ipv4only.arpa` answer with only A records starts the egress with
     `nat64=-`, and an empty answer or a resolution error exits with 1
-    before the socket accepts. A third test passes `--nat64-prefix` with a
-    discovery answer that hides the prefix and checks that the `start`
-    record names the passed prefix.
+    before the socket accepts (a client already waiting in the backlog is
+    never answered). A third test passes `--nat64-prefix` with a discovery
+    answer that hides the prefix and checks that the `start` record names
+    the passed prefix, and a fourth that discovered and passed prefixes
+    merge.
   - Why discovery: it needs no configuration, so the default deployment is
     covered. It closes the realistic case, a hostile or broken
     authoritative answer for an allowed name behind an honest DNS64
@@ -289,7 +300,10 @@ even though the CONNECT is refused.
     covers a dead family plus one more failure. Without a total, npm's 24
     addresses at 10 s each would hold the connection for 240 s.
 - Outcome: 504 (`failed reason=connect-timeout`) when the budget ran out
-  on a timeout, otherwise 502 (`failed reason=connect`).
+  on a timeout, that is, the last attempt timed out and no budget is left
+  for another; otherwise 502 (`failed reason=connect`), also when every
+  address timed out within the budget. The budget is wall time from the
+  first attempt, so the last attempt gets what is left of it.
 - `TCP_NODELAY` is set on the upstream socket. The relay forwards whole
   reads already, and Nagle together with delayed ACKs can add tens of ms
   to every small server-sent event.
@@ -314,6 +328,10 @@ even though the CONNECT is refused.
   upstream first and count as upload.
 - Two directions, one extra thread (`thread::Builder::spawn_scoped`). A
   failed spawn ends the tunnel with `end=error`, without a panic.
+- A direction that fails or idles out shuts both sockets down in both
+  directions, so the other direction's blocked read or write returns at
+  once and the tunnel never waits out the idle timeout a second time. The
+  first end other than `eof` decides the `close` record.
 - Half-close: the end of one side's stream becomes `shutdown(Write)` on the
   other, and the tunnel ends when both directions are done.
 - **Buffer: 16 KiB**, the largest TLS plaintext fragment, 2^14 bytes (RFC
@@ -342,8 +360,13 @@ even though the CONNECT is refused.
     process ends with the phase anyway.
   - Claude Code's timeout does not cover a streaming response once its
     headers have arrived. A stream that is silent for 660 s is cut with
-    `end=idle`; how often the API sends keep-alive events in a stream is
-    not documented, so this is a residual, not a verified bound.
+    `end=idle`. Measured on 2026-11-14 through the egress: a `claude -p`
+    answer of about 650 words, streamed over one tunnel for 66 s, had its
+    largest silence between two downstream reads at 1.9 s, the wait for
+    the first token included; 660 s is 350 times that. How often the API
+    sends keep-alive events during a long silent phase is not documented,
+    so a stream that stays silent longer than any measured one remains a
+    residual; one measurement does not bound it.
 - No byte cap. An npm install moves hundreds of MB. Both directions'
   byte counts are logged (`up`, `down`).
 
@@ -368,8 +391,10 @@ even though the CONNECT is refused.
   - `addr` of `failed` is the first forbidden address, or the last address
     tried, or `-` after a failed resolution.
   - `t` is milliseconds from the `Clock` port, a monotonic origin at
-    egress start; `start` anchors it to `unix_ms`. Records with the same
-    `t` keep their line order; a reader never sorts by `t`.
+    egress start; `start` anchors it to `unix_ms`. The egress takes the
+    reading and appends the line under one lock, so `t` never decreases
+    from one line to the next. Records with the same `t` keep their line
+    order; a reader never sorts by `t`.
   - `id` is a per-process counter from 1.
   - Numbers are decimal, with no sign and no leading zero. `host` is the
     target's host as the CONNECT grammar canonicalizes it, IPv6 without
@@ -433,12 +458,18 @@ ADR-003 (item 7) makes each consumer justify its own limits.
 - `max_connections = 64`.
   - npm opens at most `maxsockets` connections per origin, 15 by default
     (npm CLI v11 config reference, retrieved 2026-11-13). Two npm origins
-    at once take 30, and 34 remain for pip and other tools. The share of
-    pip and other tools is an estimate, not a measurement.
-  - Each tunnel costs 2 threads and 4 fds (both sockets and a clone of
-    each). 64 × 4 = 256 fds, a quarter of the default soft
-    `RLIMIT_NOFILE` of 1024 (the kernel's `INR_OPEN_CUR`, and systemd's
-    `DefaultLimitNOFILE` soft value).
+    at once take 30, and 34 remain for pip and other tools.
+  - Measured on 2026-11-14 through the egress (cold caches): `npm install`
+    of `typescript eslint jest webpack webpack-cli` (npm 10.9.7, 404
+    packages, 54 MB down) peaked at 15 concurrent tunnels, its
+    `maxsockets`, and used 15 in total; `pip install` of `requests flask
+    django pytest numpy pandas` (pip 26.0.1, 23 packages, 43 MB down)
+    peaked at 2. Both at once would hold 17 of the 64 slots.
+  - Each tunnel costs 2 threads and 5 fds: the sandbox stream the server
+    holds, the relay's two handles of it (one per direction) and the
+    upstream socket and its clone. 64 × 5 = 320 fds, under a third of the
+    default soft `RLIMIT_NOFILE` of 1024 (the kernel's `INR_OPEN_CUR`, and
+    systemd's `DefaultLimitNOFILE` soft value).
   - Fewer connections make npm wait in the listen backlog: slower, not
     failing. More press against the fd limit.
 - `idle_timeout = 10 s`, `request_timeout = 10 s`. A proxy client writes
@@ -502,11 +533,17 @@ ADR-003 (item 7) makes each consumer justify its own limits.
   is never on a list is enforced where the per-phase lists are built
   (#32), with a test there.
 - Resolution is a blocking `getaddrinfo` without a timeout of our own. With
-  glibc's defaults (`timeout:5`, `attempts:2`, up to 3 name servers,
-  resolv.conf(5)) a dead resolver can hold a connection's slot for about
-  30 s; this is an estimate from the defaults, not a measurement, and the
-  man page says one call may take longer than one timeout. It only blocks
-  the run that asked.
+  glibc's defaults (`timeout:5`, `attempts:2`, at most 3 name servers,
+  resolv.conf(5)) a dead resolver holds a connection's slot for the whole
+  wait. Measured on 2026-11-14 on the development host (glibc 2.43, Linux
+  7.2), `getent ahosts` against name servers that receive every query and
+  never answer, in an unprivileged user, mount and network namespace with
+  `hosts: files dns`: 10.0 s with one server and 28.0 s with three, the
+  most glibc uses. Hosts that resolve through `systemd-resolved` (`hosts:
+  ... resolve` in nsswitch.conf, as on the development host) wait on its
+  timeouts instead, which this does not measure. It only blocks the run
+  that asked; a sandbox that keeps 64 such connections open stalls only
+  its own phase.
 - An `open` without a `close` in a stored log means the process was
   killed mid-tunnel; the log cannot say more.
 - The log lives on stdout until the runner stores it (#32). A runner that
