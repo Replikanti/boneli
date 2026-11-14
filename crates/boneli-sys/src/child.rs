@@ -74,11 +74,19 @@ pub enum Step {
     Hostname = 20,
     /// `lo` up in the new network namespace.
     Loopback = 21,
+    /// A read-only cgroup2 mount of the sandbox's own cgroup; the item is
+    /// the mount's index.
+    Cgroup2 = 22,
+    /// `/proc/self/oom_score_adj` raised to 0 if the inherited value is
+    /// negative, never lowered: a runner at `-1000` would otherwise make
+    /// every sandbox task unkillable by the OOM killer and void
+    /// `memory.oom.group` (ADR-007, D8).
+    OomScoreAdj = 23,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 21] = [
+    pub const ALL: [Step; 23] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -100,15 +108,18 @@ impl Step {
         Step::Pivot,
         Step::Hostname,
         Step::Loopback,
+        Step::Cgroup2,
+        Step::OomScoreAdj,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
     /// [`Step::MountTarget`] precedes each mount; [`Step::Seccomp`] is the
     /// probe's only (see there).
-    pub const SEQUENCE: [Step; 20] = [
+    pub const SEQUENCE: [Step; 22] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
+        Step::OomScoreAdj,
         Step::CgroupNs,
         Step::MakePrivate,
         Step::Root,
@@ -118,6 +129,7 @@ impl Step {
         Step::Overlay,
         Step::Proc,
         Step::Dev,
+        Step::Cgroup2,
         Step::Pivot,
         Step::Hostname,
         Step::Loopback,
@@ -162,6 +174,8 @@ impl Step {
             Step::Pivot => "pivot",
             Step::Hostname => "hostname",
             Step::Loopback => "loopback",
+            Step::Cgroup2 => "cgroup2",
+            Step::OomScoreAdj => "oom-score-adj",
         }
     }
 }
@@ -178,6 +192,9 @@ pub(crate) struct ExecPlan<'a> {
     pub stdio: [c_int; 3],
     /// The root, mounts, hostname and loopback (ADR-007, D7).
     pub ops: &'a [Op],
+    /// The directory descriptor of the cgroup `clone3` places the child in
+    /// (`CLONE_INTO_CGROUP`, ADR-007 D8).
+    pub cgroup: c_int,
 }
 
 /// What the child does.
@@ -353,6 +370,77 @@ fn allow_all_filter() -> Result<(), Failure> {
     Ok(())
 }
 
+/// Parses an `oom_score_adj` value as the kernel prints it: an optional
+/// `-`, decimal digits, an optional newline. No allocation.
+pub(crate) fn parse_oom_score_adj(bytes: &[u8]) -> Option<i32> {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let (negative, digits) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let mut n: i32 = 0;
+    for &d in digits {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + i32::from(d - b'0');
+    }
+    Some(if negative { -n } else { n })
+}
+
+/// What to write to `oom_score_adj` for an inherited value: `0` when it
+/// is negative, nothing otherwise, so the value is raised to at least 0
+/// and never lowered (raising needs no privilege, lowering does).
+pub(crate) fn oom_score_adj_raise(current: i32) -> Option<&'static [u8]> {
+    if current < 0 { Some(b"0") } else { None }
+}
+
+/// The step [`Step::OomScoreAdj`]: reads the inherited value into a stack
+/// buffer and raises it to 0 if it is negative.
+fn raise_oom_score_adj() -> Result<(), Failure> {
+    let step = Step::OomScoreAdj;
+    // SAFETY: the path is NUL-terminated.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(fail(step, 0, errno()));
+    }
+    let mut buf = [0u8; 16];
+    // SAFETY: buf is valid writable memory of the length passed.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    let result = if n < 0 {
+        Err(fail(step, 1, errno()))
+    } else {
+        match parse_oom_score_adj(&buf[..n as usize]) {
+            None => Err(fail(step, 1, libc::EINVAL)),
+            Some(current) => match oom_score_adj_raise(current) {
+                None => Ok(()),
+                Some(value) => {
+                    // SAFETY: value is valid for its length; fd is open.
+                    let w = unsafe { libc::pwrite(fd, value.as_ptr().cast(), value.len(), 0) };
+                    if w < 0 {
+                        Err(fail(step, 2, errno()))
+                    } else if w as usize != value.len() {
+                        Err(fail(step, 2, libc::EIO))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        }
+    };
+    // SAFETY: fd is open and owned by this function.
+    unsafe { libc::close(fd) };
+    result
+}
+
 fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     let fault = plan.fault;
 
@@ -374,10 +462,17 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Ok(());
     };
 
-    // The cgroup namespace is created here, not by clone3: copy_process
-    // creates namespaces before it moves the child into its target cgroup,
-    // so a namespace from clone3 would be rooted at the parent's cgroup
-    // (ADR-007, D7).
+    inject(fault, Step::OomScoreAdj)?;
+    raise_oom_score_adj()?;
+
+    // The cgroup namespace is created here, by a process CLONE_INTO_CGROUP
+    // has already placed in its sandbox cgroup, so it is rooted there.
+    // copy_process creates clone3's namespaces before the move, but since
+    // Linux 5.7 (commit ef2c41cf38a7, which added CLONE_INTO_CGROUP)
+    // cgroup_post_fork() re-roots a new cgroup namespace at the target
+    // css_set, so CLONE_NEWCGROUP in clone3 would be equivalent on every
+    // kernel above the 5.19 floor; the step is kept as the simpler reading
+    // (ADR-007, D7 and D8).
     inject(fault, Step::CgroupNs)?;
     // SAFETY: unshare takes plain flags.
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } < 0 {
@@ -483,6 +578,37 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oom_score_adj_raised_never_lowered() {
+        for (text, value) in [
+            (&b"0\n"[..], 0),
+            (b"200\n", 200),
+            (b"1000", 1000),
+            (b"-1\n", -1),
+            (b"-1000\n", -1000),
+        ] {
+            assert_eq!(parse_oom_score_adj(text), Some(value), "{text:?}");
+        }
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"-",
+            b"1a",
+            b"+5",
+            b" 5",
+            b"10000",
+            b"-10000",
+        ] {
+            assert_eq!(parse_oom_score_adj(bad), None, "{bad:?}");
+        }
+        // Negative values are raised to 0; 0 and above stay as they are.
+        assert_eq!(oom_score_adj_raise(-1000), Some(&b"0"[..]));
+        assert_eq!(oom_score_adj_raise(-1), Some(&b"0"[..]));
+        assert_eq!(oom_score_adj_raise(0), None);
+        assert_eq!(oom_score_adj_raise(200), None);
+        assert_eq!(oom_score_adj_raise(1000), None);
+    }
 
     #[test]
     fn step_codes_round_trip() {

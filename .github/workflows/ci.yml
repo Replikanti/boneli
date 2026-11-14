@@ -112,6 +112,7 @@ jobs:
           echo "cgroup: $cg"
           stat -c 'cgroup owner: %U (%u)' "/sys/fs/cgroup$cg"
           echo "controllers: $(cat "/sys/fs/cgroup$cg/cgroup.controllers")"
+          echo "cgroup2 mount: $(awk '$5 == "/sys/fs/cgroup" { for (i = 7; $i != "-"; i++); print $(i + 1), $(i + 3) }' /proc/self/mountinfo)"
           echo "user: $(id)"
       - name: Build
         run: cargo test -p boneli-sys --no-run

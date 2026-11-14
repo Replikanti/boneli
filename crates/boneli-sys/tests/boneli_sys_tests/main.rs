@@ -14,6 +14,7 @@
 //! `BONELI_SYS_PROBE=<action>`, and it prints `BONELI_PROBE key=value`
 //! lines. Without that variable it does nothing.
 
+mod cgroups;
 mod host_setup;
 mod mounts;
 mod namespaces;

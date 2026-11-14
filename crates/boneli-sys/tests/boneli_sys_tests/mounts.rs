@@ -53,6 +53,7 @@ fn host_mountinfo() -> String {
 /// Spawns `/bin/true` on `root` and returns the spawn error, failing the
 /// test when it succeeds.
 fn spawn_error(root: Root) -> Error {
+    let cg = support::cgroup::sandbox("spawn-error");
     let spec = Spec {
         program: PathBuf::from("/bin/true"),
         args: Vec::new(),
@@ -65,6 +66,7 @@ fn spawn_error(root: Root) -> Error {
         ids: ids(0, 0),
         setup_timeout: support::SETUP_TIMEOUT,
         root,
+        cgroup: &cg,
     };
     match spawn(&spec) {
         Ok(mut child) => panic!("spawn succeeded; the child ended with {:?}", child.wait()),
@@ -631,6 +633,7 @@ fn program_resolves_inside_the_root() {
     let exe: OsString = std::env::current_exe()
         .expect("current_exe")
         .into_os_string();
+    let cg = support::cgroup::sandbox("program-path");
     let spec = Spec {
         program: PathBuf::from(exe),
         args: Vec::new(),
@@ -643,6 +646,7 @@ fn program_resolves_inside_the_root() {
         ids: ids(0, 0),
         setup_timeout: support::SETUP_TIMEOUT,
         root: fixture.root(),
+        cgroup: &cg,
     };
     match spawn(&spec) {
         Err(Error::Setup {
@@ -763,6 +767,9 @@ fn overlay_upper_swap_race_never_escapes() {
     // symlink to `elsewhere` while sandboxes start. Because the child opens
     // upper without symlinks and mounts the descriptor, a write must land
     // in the real upper (or the spawn fails closed), never in `elsewhere`.
+    // The swap thread loads the host between runs: hold the runs lock for
+    // the whole test, so the timing tests do not run beside it.
+    let _runs = support::shared();
     let fixture = Fixture::new("upper-swap");
     let lower = fixture.tree().dir("rv/lower");
     let work = fixture.tree().dir("rv/work");
@@ -813,6 +820,8 @@ fn root_layer_swap_race_never_escapes() {
     // holding a secret. The child opens each layer without symlinks and
     // mounts the descriptors, so the secret is never exposed; a swapped
     // layer at open time fails the spawn closed.
+    // As above: the swap thread runs between the runs.
+    let _runs = support::shared();
     let fixture = Fixture::new("layer-swap");
     let host = fixture.tree().dir("rv/hostdir");
     std::fs::write(host.join("secret"), b"HOSTSECRET").expect("secret");

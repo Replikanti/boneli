@@ -2,6 +2,7 @@
 //! bounded waits and the probe runner (ADR-007, D5).
 
 pub mod alloc_guard;
+pub mod cgroup;
 pub mod probe;
 pub mod rootfs;
 
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use boneli_sys::{Child, ExitStatus, Ids, Root, Spec, Stdio, spawn};
+use boneli_sys::{Cgroup, Child, ExitStatus, Ids, Root, Spec, Stdio, spawn};
 
 /// Hang bound of one probe run. A probe is this test binary started inside
 /// the sandbox; on a loaded CI host it starts in well under a second, so
@@ -132,8 +133,76 @@ pub fn run(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)]) -> Out
     run_on(program, args, ids, env, fixture.root())
 }
 
-/// [`run`] on the given root.
+/// [`run`] on the given root, in a cgroup with the harness's default
+/// limits ([`cgroup::default_limits`]) that is removed afterwards.
 pub fn run_on(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)], root: Root) -> Output {
+    let cg = cgroup::sandbox("run");
+    let out = run_in(program, args, ids, env, root, &cg);
+    cg.destroy().expect("destroy the run's cgroup");
+    out
+}
+
+/// Every sandbox run takes this lock shared, and so do the tests that
+/// load the host between runs (a swap thread, a churn thread); the timing
+/// tests take it exclusively ([`exclusive`]), so their limits are measured
+/// without the rest of this binary competing for the CPU and the disk.
+static RUNS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+std::thread_local! {
+    /// Whether this thread holds [`RUNS`], shared or exclusively, so its
+    /// own runs do not take it again (a second read lock behind a waiting
+    /// writer would deadlock).
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds [`RUNS`] until dropped.
+pub struct RunsGuard {
+    _shared: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _exclusive: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+}
+
+impl Drop for RunsGuard {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(false));
+    }
+}
+
+/// Waits until no other sandbox run of this binary is in progress and
+/// keeps new ones out until the guard drops; this thread's own runs go
+/// ahead.
+pub fn exclusive() -> RunsGuard {
+    let guard = RUNS.write().unwrap_or_else(|p| p.into_inner());
+    HELD.with(|h| h.set(true));
+    RunsGuard {
+        _shared: None,
+        _exclusive: Some(guard),
+    }
+}
+
+/// Holds [`RUNS`] shared for a whole test that loads the host between its
+/// runs; `None` if this thread holds it already.
+pub fn shared() -> Option<RunsGuard> {
+    if HELD.with(std::cell::Cell::get) {
+        return None;
+    }
+    let guard = RUNS.read().unwrap_or_else(|p| p.into_inner());
+    HELD.with(|h| h.set(true));
+    Some(RunsGuard {
+        _shared: Some(guard),
+        _exclusive: None,
+    })
+}
+
+/// [`run_on`] in the given cgroup, which stays.
+pub fn run_in(
+    program: &Path,
+    args: &[&str],
+    ids: Ids,
+    env: &[(&str, &str)],
+    root: Root,
+    cgroup: &Cgroup,
+) -> Output {
+    let _runs = shared();
     let (out_r, out_w) = pipe();
     let (err_r, err_w) = pipe();
     let spec = Spec {
@@ -151,6 +220,7 @@ pub fn run_on(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)], roo
         ids,
         setup_timeout: SETUP_TIMEOUT,
         root,
+        cgroup,
     };
     let mut child = spawn(&spec).unwrap_or_else(|e| panic!("spawn {}: {e}", program.display()));
     // The write ends live in the spec; dropping it leaves the child as the
@@ -218,14 +288,29 @@ pub fn run_probe(action: &str, ids: Ids, env: &[(&str, &str)]) -> Probe {
 /// [`run_probe`] on the given root, which must bind this test binary at
 /// [`rootfs::PROBE`] (as [`rootfs::Fixture::mounts`] does).
 pub fn run_probe_on(action: &str, ids: Ids, env: &[(&str, &str)], root: Root) -> Probe {
+    let cg = cgroup::sandbox("probe");
+    let p = run_probe_in(action, ids, env, root, &cg);
+    cg.destroy().expect("destroy the probe's cgroup");
+    p
+}
+
+/// [`run_probe_on`] in the given cgroup, which stays.
+pub fn run_probe_in(
+    action: &str,
+    ids: Ids,
+    env: &[(&str, &str)],
+    root: Root,
+    cgroup: &Cgroup,
+) -> Probe {
     let mut full = vec![(probe::ACTION_VAR, action)];
     full.extend_from_slice(env);
-    let out = run_on(
+    let out = run_in(
         Path::new(rootfs::PROBE),
         &["--exact", "probe", "--nocapture", "--quiet"],
         ids,
         &full,
         root,
+        cgroup,
     );
     parse_probe(out)
 }

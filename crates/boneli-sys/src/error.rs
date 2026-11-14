@@ -97,6 +97,61 @@ pub enum Error {
         /// Their length with the NUL.
         len: usize,
     },
+    /// The path is not a directory of a cgroup v2 hierarchy (ADR-007, D8).
+    NotCgroup2(PathBuf),
+    /// A cgroup parent lacks one of the cpu, io, memory and pids
+    /// controllers for its children; the first one missing in that order
+    /// (ADR-007, D8).
+    ControllerMissing(&'static str),
+    /// The limits are outside the kernel's bounds or cannot be meant
+    /// (ADR-007, D8).
+    InvalidLimits(&'static str),
+    /// A cgroup name is not 1-255 bytes of `[A-Za-z0-9_-]` (ADR-007, D8).
+    InvalidCgroupName(String),
+    /// A file of a cgroup could not be opened, read or written.
+    CgroupFile {
+        /// The file, relative to its cgroup.
+        file: &'static str,
+        /// The `errno`.
+        errno: i32,
+    },
+    /// A limit read back other than it was written (ADR-007, D8).
+    CgroupReadBack {
+        /// The file.
+        file: &'static str,
+        /// What the limit should read as.
+        expected: String,
+        /// What it read as.
+        found: String,
+    },
+    /// A cgroup still held processes this long after `cgroup.kill`.
+    CgroupKillTimeout(Duration),
+    /// Tearing a sandbox cgroup down failed in at least one step; every
+    /// step was still tried (ADR-007, D8).
+    CgroupTeardown {
+        /// The cgroup.
+        path: PathBuf,
+        /// Whether its directory is gone; if not, it is also listed by
+        /// [`crate::leaked_cgroups`].
+        removed: bool,
+        /// Every failure, in order.
+        errors: Vec<Error>,
+    },
+    /// The cgroup2 hierarchy is mounted without `nsdelegate`, so a sandbox
+    /// could raise its own limits (ADR-007, D8); the mount's super options,
+    /// or why they are unknown.
+    NsdelegateMissing(String),
+    /// The path's file system has no block device to limit with `io.max`
+    /// (tmpfs, overlay).
+    NoBlockDevice(PathBuf),
+    /// The path's file system spans several devices (multi-device btrfs),
+    /// so one `io.max` line would limit only one of them (ADR-007, D8).
+    MultiDeviceFilesystem {
+        /// The path.
+        path: PathBuf,
+        /// The number of devices, 0 if it could not be read.
+        devices: u64,
+    },
 }
 
 impl Error {
@@ -166,6 +221,70 @@ impl fmt::Display for Error {
             Error::MountOptionsTooLong { len } => write!(
                 f,
                 "overlay options take {len} bytes with the NUL, more than one page (4096)"
+            ),
+            Error::NotCgroup2(p) => write!(f, "{} is not on a cgroup v2 hierarchy", p.display()),
+            Error::ControllerMissing(c) => write!(
+                f,
+                "the cgroup parent does not enable the {c} controller for its children (cgroup.subtree_control)"
+            ),
+            Error::InvalidLimits(reason) => write!(f, "invalid cgroup limits: {reason}"),
+            Error::InvalidCgroupName(name) => {
+                write!(
+                    f,
+                    "cgroup name {name:?} is not 1-255 bytes of [A-Za-z0-9_-]"
+                )
+            }
+            Error::CgroupFile { file, errno } => {
+                write!(f, "cgroup file {file}: {}", strerror(*errno))
+            }
+            Error::CgroupReadBack {
+                file,
+                expected,
+                found,
+            } => write!(
+                f,
+                "cgroup file {file} reads {found:?} after writing, expected {expected:?}"
+            ),
+            Error::CgroupKillTimeout(t) => {
+                write!(f, "the cgroup still had processes {t:?} after cgroup.kill")
+            }
+            Error::CgroupTeardown {
+                path,
+                removed,
+                errors,
+            } => {
+                let what = if *removed {
+                    "was removed, with errors"
+                } else {
+                    "was not removed"
+                };
+                write!(f, "the sandbox cgroup {} {what}:", path.display())?;
+                for err in errors {
+                    write!(f, " {err};")?;
+                }
+                Ok(())
+            }
+            Error::NsdelegateMissing(options) => write!(
+                f,
+                "the cgroup v2 hierarchy is mounted without nsdelegate ({options}); \
+                 refusing a cgroup parent, since a sandbox could raise its own limits"
+            ),
+            Error::NoBlockDevice(p) => {
+                write!(
+                    f,
+                    "no block device holds {} (io.max needs one)",
+                    p.display()
+                )
+            }
+            Error::MultiDeviceFilesystem { path, devices: 0 } => write!(
+                f,
+                "the btrfs file system of {} has an unreadable device count; io.max needs exactly one device",
+                path.display()
+            ),
+            Error::MultiDeviceFilesystem { path, devices } => write!(
+                f,
+                "the file system of {} spans {devices} devices; io.max would limit only one",
+                path.display()
             ),
         }
     }
