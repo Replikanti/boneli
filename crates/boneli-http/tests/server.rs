@@ -5,6 +5,7 @@ mod common;
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -489,6 +490,81 @@ fn connection_cap_backpressure() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     assert!(read_head(&mut second).starts_with("HTTP/1.1 200 "));
+}
+
+/// `accept_loop` (ADR-006, D10): every accepted stream reaches the
+/// callback, the cap holds the next client in the backlog until a slot is
+/// freed, and a panicking callback frees its slot.
+#[test]
+fn accept_loop_holds_the_cap_and_frees_on_panic() {
+    let path = common::socket_path();
+    let socket = SocketFile(path.clone());
+    let listener = UnixListener::bind(&path).expect("bind");
+    let five = Duration::from_secs(5);
+    let limits = ServerLimits::new(wide(), 1, five, five, five).expect("limits");
+    let (handed, received) = mpsc::channel::<UnixStream>();
+    let handed = Mutex::new(handed);
+    thread::spawn(move || {
+        boneli_http::accept_loop(listener, &limits, move |mut stream: UnixStream| {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).expect("first byte");
+            if byte[0] == b'p' {
+                panic!("callback panic on purpose");
+            }
+            let clone = stream.try_clone().expect("clone");
+            handed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send(clone)
+                .expect("test alive");
+            // Hold the slot until the client closes.
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+        })
+    });
+
+    let connect = |first: &[u8]| {
+        let mut client = UnixStream::connect(&socket.0).expect("connect");
+        client.write_all(first).expect("send");
+        client
+    };
+    // The stream the callback got is the client's: a byte written to it
+    // arrives at the client.
+    let check = |client: &mut UnixStream, mut handed: UnixStream| {
+        handed.write_all(b"x").expect("write to the handed stream");
+        client.set_read_timeout(Some(five)).expect("timeout");
+        let mut byte = [0u8; 1];
+        client
+            .read_exact(&mut byte)
+            .expect("byte from the callback");
+        assert_eq!(&byte, b"x");
+    };
+
+    let mut first = connect(b"h");
+    let stream = received
+        .recv_timeout(five)
+        .expect("first stream handed over");
+    check(&mut first, stream);
+
+    let mut second = connect(b"h");
+    assert!(
+        received.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the second client waits while the only slot is held"
+    );
+    drop(first);
+    let stream = received
+        .recv_timeout(five)
+        .expect("second stream after the slot is freed");
+    check(&mut second, stream);
+
+    drop(second);
+    let panicking = connect(b"p");
+    let mut fourth = connect(b"h");
+    let stream = received
+        .recv_timeout(five)
+        .expect("a panicking callback frees its slot");
+    check(&mut fourth, stream);
+    drop(panicking);
 }
 
 /// Runs `serve_connection` on one end of a socket pair in a thread.

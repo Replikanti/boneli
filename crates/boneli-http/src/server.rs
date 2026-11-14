@@ -34,7 +34,31 @@ pub fn serve<H>(listener: UnixListener, limits: ServerLimits, handler: H) -> io:
 where
     H: Fn(Exchange<'_, UnixStream>) -> Result<()> + Send + Sync + 'static,
 {
-    let handler = Arc::new(handler);
+    accept_loop(listener, &limits, move |stream| {
+        // The error ends this connection only; the handler has seen what it
+        // needs, and logging is the caller's.
+        let _ = serve_connection(stream, &limits, &handler);
+    })
+}
+
+/// The accept loop and connection cap of `serve`, with the connection left
+/// to `per_connection` (ADR-006, D10): each accepted stream is handed to it
+/// on its own thread, so a caller that needs the result of
+/// `serve_connection`, for example to log it, calls that itself. Blocks the
+/// calling thread until accepting fails. At `max_connections` it stops
+/// accepting and new clients wait in the kernel backlog; a slot is freed
+/// when `per_connection` returns or panics. Only `max_connections` of
+/// `limits` is used here.
+pub fn accept_loop<F>(
+    listener: UnixListener,
+    limits: &ServerLimits,
+    per_connection: F,
+) -> io::Result<()>
+where
+    F: Fn(UnixStream) + Send + Sync + 'static,
+{
+    let per_connection = Arc::new(per_connection);
+    let max_connections = limits.max_connections();
     let slots = Arc::new(Slots {
         used: Mutex::new(0),
         freed: Condvar::new(),
@@ -42,7 +66,7 @@ where
     loop {
         {
             let mut used = slots.used.lock().unwrap_or_else(PoisonError::into_inner);
-            while *used >= limits.max_connections() {
+            while *used >= max_connections {
                 used = slots
                     .freed
                     .wait(used)
@@ -65,14 +89,12 @@ where
             }
             Err(e) => return Err(e),
         };
-        let handler = Arc::clone(&handler);
+        let per_connection = Arc::clone(&per_connection);
         thread::Builder::new()
             .name("boneli-http".into())
             .spawn(move || {
                 let _slot = slot;
-                // The error ends this connection only; the handler has seen
-                // what it needs, and logging is the caller's.
-                let _ = serve_connection(stream, &limits, &*handler);
+                per_connection(stream);
             })
             .map(drop)?;
     }

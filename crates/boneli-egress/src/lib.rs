@@ -15,12 +15,36 @@
 //! - [`log`]: the connection log, one line per record in a closed alphabet,
 //!   with a strict parser (D8).
 //!
-//! The I/O around it (the relay, the server and the binary) and its seams,
-//! `Upstream` and `LogSink`, come with the second part of issue #10.
+//! Around it, the I/O:
+//!
+//! - [`proxy`]: the server on `boneli_http::accept_loop`, the handler that
+//!   applies the policy in its order with a log record before every
+//!   effect, and [`launch`], the startup order of the binary (D1, D4, D6,
+//!   D8, D10).
+//! - [`relay`]: the bytes of an open tunnel, half-close and the shared idle
+//!   timeout (D7).
+//! - The seams (D11): [`Upstream`] (resolve and connect; [`TcpUpstream`])
+//!   and [`LogSink`] ([`StdoutSink`]), and the [`MonotonicClock`] adapter
+//!   of the `Clock` port.
+//! - [`Settings`] (D5, D7, D9) and [`Args`], the command line (D1).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 pub mod address;
 pub mod allowlist;
+pub mod args;
+pub mod clock;
 pub mod log;
+pub mod proxy;
+pub mod relay;
+pub mod settings;
+pub mod sink;
+pub mod upstream;
 
 pub use allowlist::{Allowlist, AllowlistError, Decision, Endpoint};
+pub use args::{Args, USAGE, UsageError};
+pub use clock::MonotonicClock;
+pub use proxy::{Config, DISCOVERY_NAME, Egress, LaunchError, launch};
+pub use relay::{RelayOutcome, relay};
+pub use settings::{Settings, SettingsError};
+pub use sink::{LogSink, StdoutSink};
+pub use upstream::{RelayStream, TcpUpstream, Upstream};

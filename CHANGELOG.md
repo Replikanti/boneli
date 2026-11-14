@@ -118,6 +118,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   values outside a request head.
 - ADR-006: the egress proxy, its allowlist, address policy, connect budget,
   answers, relay, write-ahead connection log and server limits.
+- The `boneli-egress` binary (ADR-006, part 2 of #10): `--socket <path>
+  --allow <host:port> ... [--nat64-prefix <ipv6>/<len> ...]`; binds without
+  replacing what is at the path, discovers the NAT64 prefixes through
+  `ipv4only.arpa`, writes the `start` record and serves CONNECT. A name off
+  the list is refused (403) and never resolved; an allowed name is
+  resolved once and refused (403) if any address is not global; connects
+  follow the family order within a 10 s per attempt and 30 s total budget
+  (502, 504); other methods get 405 with `Allow: CONNECT`. Open tunnels
+  relay bytes in both directions with half-close, a shared 660 s idle
+  timeout and byte counts. Every connection gets exactly one terminal log
+  record on stdout, each decision is logged before its effect, and a log
+  that cannot be written stops the connection and exits with 3. Exit codes
+  2 (usage), 1 (bind, discovery, accept), 3 (log); a panic aborts. The
+  `Upstream` and `LogSink` seams, `MonotonicClock` for the `Clock` port,
+  and `launch` with the startup order. ADR-006 now records measured peak
+  connections of npm and pip installs, the getaddrinfo wait on dead name
+  servers and the silences of a streamed API response.
+- `boneli_http::accept_loop`: the accept loop and connection cap of
+  `serve`, with each accepted stream handed to a callback, so a caller can
+  log what `serve_connection` returns; `serve` is now built on it.
 - `boneli-sys` (ADR-007, part 1 of #6): the sandbox runtime's first
   layer on `libc`. `spawn` starts a program in a new user namespace
   through a raw `clone3` with a pidfd; the child maps one id inside to the
