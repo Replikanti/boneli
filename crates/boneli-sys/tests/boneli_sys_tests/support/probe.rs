@@ -81,6 +81,8 @@ pub fn main(action: &str) -> ! {
         "pids" => pids(),
         "spin" => spin(),
         "io-write" => io_write(),
+        "cgroup-mkdir" => cgroup_mkdir(),
+        "oom-adj-spawn" => oom_adj_spawn(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     std::process::exit(0)
@@ -729,4 +731,56 @@ fn io_write() {
     put("direct", &direct.to_string());
     // SAFETY: buf was allocated above with this layout.
     unsafe { std::alloc::dealloc(buf, layout) };
+}
+
+/// Mounts a cgroup2 of the sandbox's own cgroup namespace at `/tmp/cg`
+/// (inside id 0 still has the capability before PR 4 of #6), then tries
+/// to create a sub-cgroup and to raise `cgroup.max.descendants`.
+fn cgroup_mkdir() {
+    if let Err(e) = std::fs::create_dir_all("/tmp/cg") {
+        fail(3, &format!("mkdir /tmp/cg: {e}"));
+    }
+    // SAFETY: every string is NUL-terminated; no data is passed.
+    let rc = unsafe {
+        libc::mount(
+            c"cgroup2".as_ptr(),
+            c"/tmp/cg".as_ptr(),
+            c"cgroup2".as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    put(
+        "mount_errno",
+        &if rc == 0 { 0 } else { errno() }.to_string(),
+    );
+    put("mkdir_errno", &code(&std::fs::create_dir("/tmp/cg/sub")));
+    put(
+        "raise_errno",
+        &code(&std::fs::write("/tmp/cg/cgroup.max.descendants", b"100")),
+    );
+}
+
+/// Not sandboxed: raises this process's own `oom_score_adj` to
+/// `BONELI_PROBE_VALUE`, then starts a probe sandbox that reads its own
+/// value, and prints it as `inside`.
+fn oom_adj_spawn() {
+    let value = input("BONELI_PROBE_VALUE");
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", &value) {
+        fail(3, &format!("raise oom_score_adj to {value}: {e}"));
+    }
+    let p = crate::support::run_probe(
+        "read",
+        boneli_sys::Ids::new(0, 0).unwrap_or_else(|e| fail(3, &e.to_string())),
+        &[("BONELI_PROBE_FILES", "/proc/self/oom_score_adj")],
+    );
+    if p.status != boneli_sys::ExitStatus::Exited(0) {
+        fail(3, &format!("inner probe failed: {}", p.raw));
+    }
+    put(
+        "inside",
+        p.values
+            .get("file:/proc/self/oom_score_adj")
+            .map_or("missing", |v| v.trim()),
+    );
 }

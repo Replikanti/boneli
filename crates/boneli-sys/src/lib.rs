@@ -32,7 +32,9 @@ mod mount;
 mod report;
 mod spawn;
 
-pub use cgroup::{Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of};
+pub use cgroup::{
+    Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
+};
 pub use child::Step;
 pub use error::{Error, ProtocolError, Result};
 pub use host::{Features, Missing, MissingId};

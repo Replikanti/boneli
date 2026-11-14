@@ -120,6 +120,8 @@ fn limits_written_before_entry() {
         (1u64 << 20).to_string()
     );
     assert_eq!(read(&cg, "memory.oom.group").trim(), "1");
+    assert_eq!(read(&cg, "cgroup.max.descendants").trim(), "0");
+    assert_eq!(read(&cg, "cgroup.max.depth").trim(), "0");
     assert_eq!(read(&cg, "pids.max").trim(), "17");
     assert_eq!(read(&cg, "cpu.max").trim(), "30000 60000");
     assert_eq!(
@@ -204,44 +206,103 @@ fn pids_limit_exact() {
 #[test]
 #[ignore = "host: cgroup v2 delegation (cpu), user namespaces; timing"]
 fn cpu_limit_throttles() {
-    // Half a CPU. The probe spins on two threads for 1.0 s of wall time
-    // and reads its own cpu.stat before and after; two threads demand two
+    // Half a CPU. The probe spins on four threads for 1.0 s of wall time
+    // and reads its own cpu.stat before and after. 650,000 = 500,000
+    // (0.5 x 1 s) + 100,000 (the window can straddle one period refill) +
+    // 50,000 accounting slack. The quota caps the whole cgroup, so the
+    // bound does not depend on the thread count; four threads demand four
     // CPUs, so a loaded host that gives the probe less than a whole one
-    // still lets it hit the quota (one thread got 0.3 CPU on the loaded
-    // dev host and was never throttled, measured). The quota caps the
-    // whole cgroup, so the bound does not depend on the thread count:
-    // 650,000 = 500,000 (0.5 x 1 s) + 100,000 (the window can straddle one
-    // period refill) + 50,000 accounting slack; no lower bound, a loaded
-    // CI host may give less. The run excludes the other sandbox runs of
-    // this binary.
+    // still lets it reach the quota (one thread got 0.3 CPU on the loaded
+    // dev host, two threads 0.27-0.40 CPU under other sessions' load,
+    // measured). A run with nr_throttled 0 and usage below 500,000 never
+    // reached the quota: the host starved it, which proves nothing either
+    // way, so it is retried, up to 3 attempts in all; three starved
+    // attempts fail with that reason, never pass. Any other run decides.
+    // The run excludes the other sandbox runs of this binary.
     let _alone = support::exclusive();
     let cg = cgroup::create(
         "cpu",
         &limits(256 << 20, 16, (50_000, 100_000), IoLimits::none()),
     );
     let fixture = Fixture::new("cpu");
-    let p = run_probe_in(
-        "spin",
-        ids(0, 0),
-        &[("BONELI_PROBE_MS", "1000"), ("BONELI_PROBE_THREADS", "2")],
-        root_with_cgroup(&fixture),
-        &cg,
+    let mut starved = Vec::new();
+    for attempt in 1..=CPU_ATTEMPTS {
+        let p = run_probe_in(
+            "spin",
+            ids(0, 0),
+            &[("BONELI_PROBE_MS", "1000"), ("BONELI_PROBE_THREADS", "4")],
+            root_with_cgroup(&fixture),
+            &cg,
+        );
+        p.assert_ok();
+        let usage: u64 = p.get("usage_usec").parse().expect("usage_usec");
+        let throttled: u64 = p.get("nr_throttled").parse().expect("nr_throttled");
+        report(&format!(
+            "cpu_limit_throttles: attempt {attempt}: usage_usec {usage} (bound 650000, margin {}), nr_throttled {throttled}",
+            650_000i64 - usage as i64
+        ));
+        match cpu_verdict(usage, throttled) {
+            CpuVerdict::Starved => starved.push(usage),
+            CpuVerdict::Held => {
+                cg.destroy().expect("destroy");
+                return;
+            }
+            CpuVerdict::Exceeded => panic!(
+                "the probe used {usage} us of CPU in 1 s, over the 650,000 bound: {}",
+                p.raw
+            ),
+            CpuVerdict::NotThrottled => panic!(
+                "the probe used {usage} us, at least the quota, and was never throttled: {}",
+                p.raw
+            ),
+        }
+    }
+    panic!(
+        "host starved the probe: {CPU_ATTEMPTS} attempts never reached the 0.5 CPU quota \
+         (usage_usec {starved:?}, nr_throttled 0 each), so the limit was not tested; \
+         rerun on a host with half a CPU to spare"
     );
-    p.assert_ok();
-    let usage: u64 = p.get("usage_usec").parse().expect("usage_usec");
-    let throttled: u64 = p.get("nr_throttled").parse().expect("nr_throttled");
-    report(&format!(
-        "cpu_limit_throttles: usage_usec {usage} (bound 650000, margin {}), nr_throttled {throttled}",
-        650_000i64 - usage as i64
-    ));
-    assert!(usage <= 650_000, "{}", p.raw);
-    assert!(
-        throttled >= 1,
-        "never throttled: the probe got {usage} us of CPU in 1 s, under the 0.5 CPU quota, \
-         so the host gave it less than the limit (other load in the same slice?): {}",
-        p.raw
-    );
-    cg.destroy().expect("destroy");
+}
+
+/// Attempts of `cpu_limit_throttles` before a starved host fails it.
+const CPU_ATTEMPTS: usize = 3;
+
+/// What one `cpu_limit_throttles` run shows.
+#[derive(Debug, PartialEq, Eq)]
+enum CpuVerdict {
+    /// Throttled, within the bound: the limit holds.
+    Held,
+    /// Over the bound: the limit does not hold.
+    Exceeded,
+    /// At least the quota used and never throttled: the limit does not hold.
+    NotThrottled,
+    /// Never throttled and under the quota: the host gave the probe less
+    /// than the limit, so the run says nothing.
+    Starved,
+}
+
+fn cpu_verdict(usage_usec: u64, nr_throttled: u64) -> CpuVerdict {
+    if usage_usec > 650_000 {
+        CpuVerdict::Exceeded
+    } else if nr_throttled >= 1 {
+        CpuVerdict::Held
+    } else if usage_usec < 500_000 {
+        CpuVerdict::Starved
+    } else {
+        CpuVerdict::NotThrottled
+    }
+}
+
+#[test]
+fn cpu_verdicts() {
+    assert_eq!(cpu_verdict(521_330, 10), CpuVerdict::Held);
+    assert_eq!(cpu_verdict(650_000, 1), CpuVerdict::Held);
+    assert_eq!(cpu_verdict(650_001, 10), CpuVerdict::Exceeded);
+    assert_eq!(cpu_verdict(1_000_000, 0), CpuVerdict::Exceeded);
+    assert_eq!(cpu_verdict(368_488, 0), CpuVerdict::Starved);
+    assert_eq!(cpu_verdict(499_999, 0), CpuVerdict::Starved);
+    assert_eq!(cpu_verdict(500_000, 0), CpuVerdict::NotThrottled);
+    assert_eq!(cpu_verdict(600_000, 0), CpuVerdict::NotThrottled);
 }
 
 #[test]
@@ -540,4 +601,194 @@ fn failed_spawn_leaves_no_cgroup_process() {
         cg.destroy().expect("destroy");
         assert!(!path.exists(), "{}", path.display());
     }
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (io), a block device behind the target dir"]
+fn destroy_lifts_io_throttle() {
+    // Review of PR 3: a task in one large O_DIRECT write at wbps 1 MiB/s
+    // waits uninterruptibly for its queued bios, so cgroup.kill cannot end
+    // it before they drain at the throttled rate (40 MiB: about 40 s, past
+    // the 10 s bound). destroy lifts io.max after the kill, so the bios
+    // drain at once (the reviewer measured 97 ms with the lift).
+    let _alone = support::exclusive();
+    let fixture = Fixture::new("io-kill");
+    let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
+    let io = IoLimits::new(vec![IoMax {
+        dev,
+        rbps: None,
+        wbps: Some(1 << 20),
+        riops: None,
+        wiops: None,
+    }])
+    .expect("one device");
+    let cg = cgroup::create("io-kill", &limits(256 << 20, 16, (100_000, 100_000), io));
+    let mut child = spawn(&spec(
+        fixture.root(),
+        &cg,
+        "/usr/bin/dd",
+        &[
+            "if=/dev/urandom",
+            "of=/workspace/big",
+            "bs=40M",
+            "count=1",
+            "iflag=fullblock",
+            "oflag=direct",
+        ],
+    ))
+    .expect("spawn dd");
+    // Let dd fill its buffer and block in the throttled write.
+    std::thread::sleep(Duration::from_secs(2));
+    let path = cg.path().to_path_buf();
+    let start = Instant::now();
+    let result = cg.destroy();
+    let took = start.elapsed();
+    report(&format!(
+        "destroy_lifts_io_throttle: destroy took {took:?}: {result:?}"
+    ));
+    let status = wait_bounded(&mut child, Duration::from_secs(120));
+    if path.exists() {
+        // Leave nothing behind when the assertion below fails.
+        let _ = std::fs::write(path.join("cgroup.kill"), "1");
+        let _ = std::fs::remove_dir(&path);
+    }
+    assert!(result.is_ok(), "{result:?} after {took:?}");
+    assert!(took < Duration::from_secs(5), "destroy took {took:?}");
+    assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (cpu), user namespaces"]
+fn destroy_lifts_cpu_throttle() {
+    // A quota of 1 ms per 1 s period with four spinning threads keeps the
+    // group throttled most of the time; destroy must not wait for the next
+    // period refill to let the killed tasks exit.
+    let _alone = support::exclusive();
+    let cg = cgroup::create(
+        "cpu-kill",
+        &limits(256 << 20, 16, (1000, 1_000_000), IoLimits::none()),
+    );
+    let fixture = Fixture::new("cpu-kill");
+    let (out_r, out_w) = support::pipe();
+    let mut s = spec(
+        root_with_cgroup(&fixture),
+        &cg,
+        crate::support::rootfs::PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+    );
+    s.env = [
+        (support::probe::ACTION_VAR, "spin"),
+        ("BONELI_PROBE_MS", "30000"),
+        ("BONELI_PROBE_THREADS", "4"),
+    ]
+    .iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    s.stdio.stdout = out_w;
+    let mut child = spawn(&s).expect("spawn the spinner");
+    drop(s);
+    drop(out_r);
+    std::thread::sleep(Duration::from_millis(1500));
+    let throttled = keyed(&read(&cg, "cpu.stat"), "nr_throttled");
+    let start = Instant::now();
+    let result = cg.destroy();
+    let took = start.elapsed();
+    report(&format!(
+        "destroy_lifts_cpu_throttle: {throttled} throttled periods before, destroy took {took:?}: {result:?}"
+    ));
+    let status = wait_bounded(&mut child, Duration::from_secs(30));
+    assert!(throttled >= 1, "the spinner was never throttled");
+    assert!(result.is_ok(), "{result:?}");
+    // Without the lift the kill waited for the next refill: about 500 ms
+    // here (measured three times); with it, milliseconds.
+    assert!(took < Duration::from_millis(200), "destroy took {took:?}");
+    assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation with nsdelegate, user namespaces"]
+fn sandbox_cannot_create_sub_cgroups() {
+    // Review of PR 3: inside id 0 can mount a cgroup2 of its own (until
+    // PR 4 of #6 drops the capability) and create a sub-cgroup, which
+    // would make destroy fail with EBUSY. cgroup.max.descendants and
+    // cgroup.max.depth are 0, and nsdelegate keeps the sandbox from
+    // raising them again.
+    let cg = cgroup::sandbox("no-sub");
+    assert_eq!(read(&cg, "cgroup.max.descendants").trim(), "0");
+    assert_eq!(read(&cg, "cgroup.max.depth").trim(), "0");
+    let fixture = Fixture::new("no-sub");
+    let p = run_probe_in("cgroup-mkdir", ids(0, 0), &[], fixture.root(), &cg);
+    p.assert_ok();
+    assert_eq!(p.get("mount_errno"), "0", "{}", p.raw);
+    assert_eq!(
+        p.get("mkdir_errno"),
+        libc::EAGAIN.to_string(),
+        "a sub-cgroup was created: {}",
+        p.raw
+    );
+    assert_eq!(p.get("raise_errno"), libc::EPERM.to_string(), "{}", p.raw);
+    assert_eq!(read(&cg, "cgroup.max.descendants").trim(), "0");
+    let path = cg.path().to_path_buf();
+    cg.destroy().expect("destroy");
+    assert!(!path.exists());
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation, user namespaces"]
+fn oom_score_adj_never_lowered() {
+    // The step raises a negative inherited value to 0 and leaves 0 and
+    // above alone. Lowering needs CAP_SYS_RESOURCE, so the negative case
+    // is the pure test's (`oom_score_adj_raised_never_lowered`); here the
+    // runner raises itself to 500, and the sandbox must keep 500.
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "probe", "--nocapture", "--quiet"])
+        .env(support::probe::ACTION_VAR, "oom-adj-spawn")
+        .env("BONELI_PROBE_VALUE", "500")
+        .output()
+        .expect("run the probe");
+    let p = support::parse_probe(support::Output {
+        status: match out.status.code() {
+            Some(c) => ExitStatus::Exited(c),
+            None => ExitStatus::Signaled(-1),
+        },
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    });
+    p.assert_ok();
+    assert_eq!(p.get("inside"), "500", "{}", p.raw);
+    // And from this process, whatever it inherited (never below 0 inside).
+    let own: i32 = std::fs::read_to_string("/proc/self/oom_score_adj")
+        .expect("read own oom_score_adj")
+        .trim()
+        .parse()
+        .expect("a number");
+    let p = crate::support::run_probe(
+        "read",
+        ids(999, 999),
+        &[("BONELI_PROBE_FILES", "/proc/self/oom_score_adj")],
+    );
+    p.assert_ok();
+    assert_eq!(
+        p.get("file:/proc/self/oom_score_adj").trim(),
+        own.max(0).to_string(),
+        "{}",
+        p.raw
+    );
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation"]
+fn drop_reports_a_cgroup_it_cannot_remove() {
+    // A sub-cgroup the host made (the sandbox cannot) keeps the rmdir
+    // failing; the drop must leave a trace, not swallow it.
+    let cg = cgroup::sandbox("leak");
+    let path = cg.path().to_path_buf();
+    std::fs::write(path.join("cgroup.max.descendants"), "1").expect("raise from the host");
+    std::fs::write(path.join("cgroup.max.depth"), "1").expect("raise from the host");
+    std::fs::create_dir(path.join("sub")).expect("a sub-cgroup");
+    drop(cg);
+    let leaked = boneli_sys::leaked_cgroups();
+    let _ = std::fs::remove_dir(path.join("sub"));
+    let _ = std::fs::remove_dir(&path);
+    assert!(leaked.contains(&path), "{leaked:?}");
 }

@@ -36,6 +36,8 @@ pub enum MissingId {
     CgroupControllerMissing,
     /// `cgroup2-missing`
     Cgroup2Missing,
+    /// `cgroup-nsdelegate`
+    CgroupNsdelegate,
     /// `clone3`
     Clone3,
     /// `close-range`
@@ -54,13 +56,14 @@ pub enum MissingId {
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 13] = [
+    pub const ALL: [MissingId; 14] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
         MissingId::CgroupNotDelegated,
         MissingId::CgroupControllerMissing,
         MissingId::Cgroup2Missing,
+        MissingId::CgroupNsdelegate,
         MissingId::Clone3,
         MissingId::CloseRange,
         MissingId::SeccompKillProcess,
@@ -79,6 +82,7 @@ impl MissingId {
             MissingId::CgroupNotDelegated => "cgroup-not-delegated",
             MissingId::CgroupControllerMissing => "cgroup-controller-missing",
             MissingId::Cgroup2Missing => "cgroup2-missing",
+            MissingId::CgroupNsdelegate => "cgroup-nsdelegate",
             MissingId::Clone3 => "clone3",
             MissingId::CloseRange => "close-range",
             MissingId::SeccompKillProcess => "seccomp-kill-process",
@@ -131,6 +135,14 @@ pub enum Missing {
     },
     /// No cgroup v2 hierarchy at `/sys/fs/cgroup`.
     Cgroup2Missing,
+    /// The cgroup v2 hierarchy at `/sys/fs/cgroup` is mounted without
+    /// `nsdelegate`, the only kernel check that refuses a sandbox's write to
+    /// its own limit files through a cgroup2 mount of its own: the files
+    /// belong to the host user the inside id maps to (ADR-007, D8).
+    CgroupNsdelegate {
+        /// The super options of the mount, or why they are unknown.
+        options: String,
+    },
     /// `clone3` (Linux 5.3) is not available.
     Clone3 {
         /// The errno of the attempt.
@@ -191,6 +203,7 @@ impl Missing {
             Missing::CgroupNotDelegated { .. } => MissingId::CgroupNotDelegated,
             Missing::CgroupControllerMissing { .. } => MissingId::CgroupControllerMissing,
             Missing::Cgroup2Missing => MissingId::Cgroup2Missing,
+            Missing::CgroupNsdelegate { .. } => MissingId::CgroupNsdelegate,
             Missing::Clone3 { .. } => MissingId::Clone3,
             Missing::CloseRange { .. } => MissingId::CloseRange,
             Missing::SeccompKillProcess { .. } => MissingId::SeccompKillProcess,
@@ -236,6 +249,11 @@ impl fmt::Display for Missing {
             Missing::Cgroup2Missing => {
                 write!(f, "no cgroup v2 hierarchy is mounted at /sys/fs/cgroup")
             }
+            Missing::CgroupNsdelegate { options } => write!(
+                f,
+                "the cgroup v2 hierarchy at /sys/fs/cgroup is mounted without nsdelegate ({options}); \
+                 a sandbox could raise its own limits (remount with nsdelegate as root)"
+            ),
             Missing::Clone3 { errno } => write!(
                 f,
                 "clone3 is not available: {} (boneli needs Linux 5.19 or newer)",
@@ -599,6 +617,14 @@ fn probe_cgroup() -> Vec<Missing> {
     if rc < 0 || st.f_type as u64 != libc::CGROUP2_SUPER_MAGIC as u64 {
         return vec![Missing::Cgroup2Missing];
     }
+    let mut missing = Vec::new();
+    let nsdelegate = match std::fs::read("/proc/self/mountinfo") {
+        Ok(text) => crate::cgroup::cgroup2_nsdelegate(&text),
+        Err(e) => Err(format!("/proc/self/mountinfo unreadable: {e}")),
+    };
+    if let Err(options) = nsdelegate {
+        missing.push(Missing::CgroupNsdelegate { options });
+    }
     let own = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .and_then(|text| {
@@ -606,7 +632,8 @@ fn probe_cgroup() -> Vec<Missing> {
                 .find_map(|l| l.strip_prefix("0::").map(str::to_string))
         });
     let Some(own) = own else {
-        return vec![Missing::Cgroup2Missing];
+        missing.push(Missing::Cgroup2Missing);
+        return missing;
     };
     let dir = format!("/sys/fs/cgroup{}", own.trim_end_matches('/'));
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -624,24 +651,27 @@ fn probe_cgroup() -> Vec<Missing> {
         });
         if !writable {
             // Not delegated: its controllers cannot be used either way.
-            return vec![Missing::CgroupNotDelegated {
+            missing.push(Missing::CgroupNotDelegated {
                 path: dir,
                 file: path,
                 uid,
-            }];
+            });
+            return missing;
         }
     }
     let available =
         std::fs::read_to_string(format!("{dir}/cgroup.controllers")).unwrap_or_default();
     let available: Vec<&str> = available.split_whitespace().collect();
-    CONTROLLERS
-        .into_iter()
-        .filter(|c| !available.contains(c))
-        .map(|controller| Missing::CgroupControllerMissing {
-            path: dir.clone(),
-            controller,
-        })
-        .collect()
+    missing.extend(
+        CONTROLLERS
+            .into_iter()
+            .filter(|c| !available.contains(c))
+            .map(|controller| Missing::CgroupControllerMissing {
+                path: dir.clone(),
+                controller,
+            }),
+    );
+    missing
 }
 
 #[cfg(test)]
@@ -668,6 +698,9 @@ mod tests {
                 controller: "io",
             },
             MissingId::Cgroup2Missing => Missing::Cgroup2Missing,
+            MissingId::CgroupNsdelegate => Missing::CgroupNsdelegate {
+                options: "rw,seclabel".into(),
+            },
             MissingId::Clone3 => Missing::Clone3 {
                 errno: libc::ENOSYS,
             },
@@ -707,6 +740,9 @@ mod tests {
             "the cgroup /sys/fs/cgroup/a is not delegated to uid 1001: /sys/fs/cgroup/a/cgroup.procs is not writable".to_string(),
             "the cgroup /sys/fs/cgroup/a lacks the io controller (not in cgroup.controllers)".to_string(),
             "no cgroup v2 hierarchy is mounted at /sys/fs/cgroup".to_string(),
+            "the cgroup v2 hierarchy at /sys/fs/cgroup is mounted without nsdelegate (rw,seclabel); \
+             a sandbox could raise its own limits (remount with nsdelegate as root)"
+                .to_string(),
             format!("clone3 is not available: {} (boneli needs Linux 5.19 or newer)", e(libc::ENOSYS)),
             format!("close_range with CLOSE_RANGE_CLOEXEC is not available: {} (boneli needs Linux 5.19 or newer)", e(libc::EINVAL)),
             format!(
@@ -731,6 +767,7 @@ mod tests {
             "cgroup-not-delegated",
             "cgroup-controller-missing",
             "cgroup2-missing",
+            "cgroup-nsdelegate",
             "clone3",
             "close-range",
             "seccomp-kill-process",

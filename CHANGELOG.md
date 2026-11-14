@@ -173,8 +173,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLONE_INTO_CGROUP`, before the child creates its cgroup namespace.
   Every directory and file is reached through descriptors opened once.
   `Mount::Cgroup2` shows the sandbox's own cgroup read-only.
-  `block_device_of` finds the disk behind a path for `io.max`. Every host
-  test runs in a cgroup with small limits.
+  `block_device_of` finds the disk behind a path for `io.max` and refuses
+  a multi-device btrfs. Every host test runs in a cgroup with small
+  limits. Review fixes: `destroy` lifts `io.max` and `cpu.max` after the
+  kill, so a task in throttled IO cannot outlast the kill bound; a failed
+  drop is reported on stderr and in `leaked_cgroups()`; every cgroup has
+  `cgroup.max.descendants` and `cgroup.max.depth` 0; `Features::probe`
+  requires `nsdelegate` (`cgroup-nsdelegate`); the child raises a
+  negative inherited `oom_score_adj` to 0 (`Step::OomScoreAdj`).
 - `Features::probe`: a probe whose own machinery fails — a failed
   `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
   killed by a signal or ended before it could report, or a `clone3`

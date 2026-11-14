@@ -459,17 +459,34 @@ pub struct Cgroup {
     parent: OwnedFd,
     name: CString,
     path: PathBuf,
+    /// The devices with an `io.max` line, lifted again at the kill.
+    io_devices: Vec<DeviceNumber>,
+    /// The CPU period, for lifting the quota at the kill.
+    cpu_period_us: u64,
     live: bool,
+}
+
+/// The cgroups a [`Cgroup`] drop could not remove, for the runner (#8) to
+/// report; #33's sweep removes leftovers after a crash.
+static LEAKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The paths of the sandbox cgroups that a [`Cgroup`] dropped without
+/// [`Cgroup::destroy`] could not remove, in this process so far. Each one
+/// was also reported on stderr when it happened (ADR-007, D8).
+pub fn leaked_cgroups() -> Vec<PathBuf> {
+    LEAKED.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 impl Cgroup {
     /// Creates the cgroup `name` under `parent` and writes every limit,
     /// then reads each back (memory rounded down to a page) before any
     /// process can enter: `memory.oom.group` 1, `memory.swap.max`,
-    /// `memory.max`, `pids.max`, `cpu.max` and one `io.max` line per
-    /// device. `memory.oom.group` is always 1, because a partial OOM kill
-    /// leaves a half-dead pod whose test results mislead (ADR-007, D8).
-    /// On any error the directory is removed again.
+    /// `memory.max`, `pids.max`, `cpu.max`, one `io.max` line per device,
+    /// and `cgroup.max.descendants` and `cgroup.max.depth` 0.
+    /// `memory.oom.group` is always 1, because a partial OOM kill leaves a
+    /// half-dead pod whose test results mislead; the sandbox may create no
+    /// cgroup below its own, because one would keep `destroy` from removing
+    /// it (ADR-007, D8). On any error the directory is removed again.
     pub fn create(parent: &Parent, name: &str, limits: &Limits) -> Result<Cgroup> {
         limits.validate()?;
         check_name(name)?;
@@ -507,6 +524,8 @@ impl Cgroup {
             parent: parent_fd,
             name: cname,
             path: parent.path.join(name),
+            io_devices: limits.io.entries().iter().map(|e| e.dev).collect(),
+            cpu_period_us: limits.cpu.period_us,
             live: true,
         };
         check_cgroup2(&cg.dir, &cg.path)?;
@@ -516,6 +535,8 @@ impl Cgroup {
     }
 
     fn write_limits(&self, l: &Limits) -> Result<()> {
+        write_file(&self.dir, "cgroup.max.descendants", b"0")?;
+        write_file(&self.dir, "cgroup.max.depth", b"0")?;
         write_file(&self.dir, "memory.oom.group", b"1")?;
         write_file(
             &self.dir,
@@ -549,6 +570,8 @@ impl Cgroup {
                 })
             }
         };
+        expect("cgroup.max.descendants", "0".to_string())?;
+        expect("cgroup.max.depth", "0".to_string())?;
         expect("memory.oom.group", "1".to_string())?;
         expect(
             "memory.swap.max",
@@ -585,9 +608,12 @@ impl Cgroup {
         &self.path
     }
 
-    /// Kills every process in the cgroup (`cgroup.kill`), waits until it is
-    /// empty (`populated 0` in `cgroup.events`, at most 10 s), and removes
-    /// it. A killed child that was not reaped yet does not keep it
+    /// Kills every process in the cgroup (`cgroup.kill`), lifts the IO and
+    /// CPU limits so that killed tasks are not held back while they exit
+    /// (a task waiting for throttled IO cannot die before its queued bios
+    /// drain, review of PR 3), waits until the cgroup is empty
+    /// (`populated 0` in `cgroup.events`, at most 10 s), and removes it.
+    /// Every failure is returned. A killed child that was not reaped yet does not keep it
     /// populated (measured); its [`crate::Child`] still reaps it.
     pub fn destroy(mut self) -> Result<()> {
         self.live = false;
@@ -596,6 +622,9 @@ impl Cgroup {
 
     fn kill_and_remove(&self) -> Result<()> {
         write_file(&self.dir, "cgroup.kill", b"1")?;
+        // Killed: no task returns to user space, so none can start new IO
+        // or use the CPU it gets now; what is left is in the kernel.
+        self.lift_throttles()?;
         let events = open_file(&self.dir, "cgroup.events", libc::O_RDONLY)?;
         let deadline = Instant::now() + KILL_BOUND;
         loop {
@@ -632,6 +661,20 @@ impl Cgroup {
         Ok(())
     }
 
+    /// Lifts every limit that can hold back a killed task: each `io.max`
+    /// line and the CPU quota.
+    fn lift_throttles(&self) -> Result<()> {
+        for d in &self.io_devices {
+            let line = format!(
+                "{}:{} rbps=max wbps=max riops=max wiops=max",
+                d.major, d.minor
+            );
+            write_file(&self.dir, "io.max", line.as_bytes())?;
+        }
+        let cpu = format!("max {}", self.cpu_period_us);
+        write_file(&self.dir, "cpu.max", cpu.as_bytes())
+    }
+
     /// A value that never was a cgroup, for the unit tests that fail before
     /// the clone; nothing is removed on drop.
     #[cfg(test)]
@@ -643,15 +686,36 @@ impl Cgroup {
             parent,
             name: c"unplaced".to_owned(),
             path: PathBuf::from("/"),
+            io_devices: Vec::new(),
+            cpu_period_us: 100_000,
             live: false,
         }
     }
 }
 
 impl Drop for Cgroup {
+    /// Kills and removes the cgroup like [`Cgroup::destroy`]. A drop cannot
+    /// return the error, and a panic here would abort a process that is
+    /// already unwinding, so a failure is written to stderr (the runner's
+    /// journal; the crate has no logger) and recorded for
+    /// [`leaked_cgroups`] (ADR-007, D8).
     fn drop(&mut self) {
-        if self.live {
-            let _ = self.kill_and_remove();
+        if !self.live {
+            return;
+        }
+        if let Err(e) = self.kill_and_remove() {
+            let mut err = std::io::stderr();
+            let _ = std::io::Write::write_fmt(
+                &mut err,
+                format_args!(
+                    "boneli-sys: the sandbox cgroup {} was not removed: {e}\n",
+                    self.path.display()
+                ),
+            );
+            LEAKED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(self.path.clone());
         }
     }
 }
@@ -663,8 +727,10 @@ impl Drop for Cgroup {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MountEntry {
     pub mount_id: u64,
+    pub mount_point: Vec<u8>,
     pub fstype: Vec<u8>,
     pub source: Vec<u8>,
+    pub super_options: Vec<u8>,
 }
 
 /// Decodes the kernel's `\ooo` escapes of mountinfo (space `\040`, tab
@@ -707,18 +773,57 @@ pub(crate) fn parse_mountinfo(text: &[u8]) -> Vec<MountEntry> {
             .first()
             .and_then(|f| std::str::from_utf8(f).ok())
             .and_then(|f| f.parse().ok());
-        let (Some(id), Some(fstype), Some(source)) =
-            (id, fields.get(dash + 1), fields.get(dash + 2))
-        else {
+        let (Some(id), Some(point), Some(fstype), Some(source)) = (
+            id,
+            fields.get(4),
+            fields.get(dash + 1),
+            fields.get(dash + 2),
+        ) else {
             continue;
         };
         out.push(MountEntry {
             mount_id: id,
+            mount_point: unescape(point),
             fstype: unescape(fstype),
             source: unescape(source),
+            super_options: fields
+                .get(dash + 3)
+                .map(|o| unescape(o))
+                .unwrap_or_default(),
         });
     }
     out
+}
+
+/// `Ok(())` when the last cgroup2 mount at `/sys/fs/cgroup` in a mountinfo
+/// text has `nsdelegate` among its super options, else `Err` with the
+/// options found (or why there are none). The last line wins because a
+/// later mount on the same point hides the earlier ones.
+pub(crate) fn cgroup2_nsdelegate(mountinfo: &[u8]) -> std::result::Result<(), String> {
+    let entries = parse_mountinfo(mountinfo);
+    let Some(entry) = entries
+        .iter()
+        .rev()
+        .find(|e| e.mount_point == b"/sys/fs/cgroup")
+    else {
+        return Err("no mount at /sys/fs/cgroup in mountinfo".to_string());
+    };
+    let options = String::from_utf8_lossy(&entry.super_options).into_owned();
+    if entry.fstype != b"cgroup2" {
+        return Err(format!(
+            "/sys/fs/cgroup is {}",
+            String::from_utf8_lossy(&entry.fstype)
+        ));
+    }
+    if entry
+        .super_options
+        .split(|&b| b == b',')
+        .any(|o| o == b"nsdelegate")
+    {
+        Ok(())
+    } else {
+        Err(options)
+    }
 }
 
 /// What [`resolve_device`] asks the host, so the mapping is testable on
@@ -731,35 +836,80 @@ pub(crate) trait BlockLookup {
     fn disk_of(&self, d: DeviceNumber) -> Option<DeviceNumber>;
     /// The device number of a block device node at an absolute path.
     fn node(&self, source: &[u8]) -> Option<DeviceNumber>;
+    /// How many devices the btrfs file system of the path spans
+    /// (`BTRFS_IOC_FS_INFO` `num_devices`); `None` if that cannot be read.
+    fn btrfs_devices(&self) -> Option<u64>;
+}
+
+/// Why [`resolve_device`] found no disk to limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    /// No block device holds the file system (tmpfs, overlay), or the
+    /// mount was not found.
+    NoDevice,
+    /// The file system spans this many devices (0: the count could not be
+    /// read); one `io.max` line would limit only one of them.
+    MultiDevice(u64),
 }
 
 /// The disk behind a file with `st_dev` on the mount `mount_id`: `st_dev`
 /// itself if it is a block device, else (an anonymous device, as btrfs
 /// gives) the mount's source node from mountinfo; either mapped from a
-/// partition to its disk. `None` when there is none (tmpfs, overlay).
+/// partition to its disk. A btrfs file system that spans more than one
+/// device fails closed: its mountinfo source names one member only, and a
+/// limit on it would leave writes to the others unthrottled.
 pub(crate) fn resolve_device(
     st_dev: DeviceNumber,
     mount_id: u64,
     mountinfo: &[u8],
     sys: &dyn BlockLookup,
-) -> Option<DeviceNumber> {
-    if sys.is_block(st_dev) {
-        return sys.disk_of(st_dev);
-    }
+) -> std::result::Result<DeviceNumber, Unresolved> {
     let entries = parse_mountinfo(mountinfo);
-    let entry = entries.iter().find(|e| e.mount_id == mount_id)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.mount_id == mount_id)
+        .ok_or(Unresolved::NoDevice)?;
+    if entry.fstype == b"btrfs" {
+        match sys.btrfs_devices() {
+            Some(1) => {}
+            Some(n) => return Err(Unresolved::MultiDevice(n)),
+            None => return Err(Unresolved::MultiDevice(0)),
+        }
+    }
+    if sys.is_block(st_dev) {
+        return sys.disk_of(st_dev).ok_or(Unresolved::NoDevice);
+    }
     if entry.source.first() != Some(&b'/') {
-        return None;
+        return Err(Unresolved::NoDevice);
     }
-    let node = sys.node(&entry.source)?;
+    let node = sys.node(&entry.source).ok_or(Unresolved::NoDevice)?;
     if !sys.is_block(node) {
-        return None;
+        return Err(Unresolved::NoDevice);
     }
-    sys.disk_of(node)
+    sys.disk_of(node).ok_or(Unresolved::NoDevice)
 }
 
-/// The host's sysfs and `/dev`.
-struct HostBlocks;
+/// The host's sysfs and `/dev`, for the file at `path`.
+struct HostBlocks<'a> {
+    path: &'a CStr,
+}
+
+/// `struct btrfs_ioctl_fs_info_args`, `include/uapi/linux/btrfs.h`: 1024
+/// bytes; `num_devices` is the second `__u64`.
+#[repr(C)]
+struct BtrfsFsInfo {
+    max_id: u64,
+    num_devices: u64,
+    rest: [u8; 1008],
+}
+
+const _: () = assert!(std::mem::size_of::<BtrfsFsInfo>() == 1024);
+
+/// `BTRFS_IOC_FS_INFO`, `include/uapi/linux/btrfs.h`:
+/// `_IOR(BTRFS_IOCTL_MAGIC 0x94, 31, struct btrfs_ioctl_fs_info_args)`, the
+/// generic ioctl encoding on x86_64 and arm64: read (2 << 30), size 1024
+/// << 16, type 0x94 << 8, number 31.
+const BTRFS_IOC_FS_INFO: u64 = (2 << 30) | (1024 << 16) | (0x94 << 8) | 31;
 
 fn sys_path(d: DeviceNumber) -> PathBuf {
     PathBuf::from(format!("/sys/dev/block/{}:{}", d.major, d.minor))
@@ -773,7 +923,7 @@ fn parse_dev(text: &str) -> Option<DeviceNumber> {
     })
 }
 
-impl BlockLookup for HostBlocks {
+impl BlockLookup for HostBlocks<'_> {
     fn is_block(&self, d: DeviceNumber) -> bool {
         sys_path(d).exists()
     }
@@ -803,6 +953,35 @@ impl BlockLookup for HostBlocks {
             major: libc::major(st.st_rdev),
             minor: libc::minor(st.st_rdev),
         })
+    }
+
+    fn btrfs_devices(&self) -> Option<u64> {
+        // SAFETY: path is NUL-terminated; the descriptor is closed below.
+        let fd = unsafe {
+            libc::open(
+                self.path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: open returned a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut info = BtrfsFsInfo {
+            max_id: 0,
+            num_devices: 0,
+            rest: [0; 1008],
+        };
+        // SAFETY: info is valid storage of the 1024 bytes the request names.
+        let rc = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                BTRFS_IOC_FS_INFO as _,
+                &mut info as *mut BtrfsFsInfo,
+            )
+        };
+        if rc < 0 { None } else { Some(info.num_devices) }
     }
 }
 
@@ -836,8 +1015,14 @@ pub fn block_device_of(path: &Path) -> Result<DeviceNumber> {
         major: stx.stx_dev_major,
         minor: stx.stx_dev_minor,
     };
-    resolve_device(st_dev, stx.stx_mnt_id, &mountinfo, &HostBlocks)
-        .ok_or_else(|| Error::NoBlockDevice(path.to_path_buf()))
+    let sys = HostBlocks { path: &c };
+    resolve_device(st_dev, stx.stx_mnt_id, &mountinfo, &sys).map_err(|u| match u {
+        Unresolved::NoDevice => Error::NoBlockDevice(path.to_path_buf()),
+        Unresolved::MultiDevice(devices) => Error::MultiDeviceFilesystem {
+            path: path.to_path_buf(),
+            devices,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1006,6 +1191,7 @@ mod tests {
         block: Vec<DeviceNumber>,
         partitions: Vec<(DeviceNumber, DeviceNumber)>,
         nodes: Vec<(Vec<u8>, DeviceNumber)>,
+        btrfs_devices: Option<u64>,
     }
 
     impl BlockLookup for FakeSys {
@@ -1025,6 +1211,9 @@ mod tests {
                 .iter()
                 .find(|(s, _)| s == source)
                 .map(|(_, d)| *d)
+        }
+        fn btrfs_devices(&self) -> Option<u64> {
+            self.btrfs_devices
         }
     }
 
@@ -1069,27 +1258,99 @@ mod tests {
                 (b"/dev/mapper/luks disk\\x".to_vec(), dev(252, 0)),
                 (b"/dev/sda1".to_vec(), dev(8, 1)),
             ],
+            btrfs_devices: Some(1),
         };
         // ext4 on a partition: st_dev is the partition, mapped to its disk.
         assert_eq!(
             resolve_device(dev(8, 1), 25, MOUNTINFO, &sys),
-            Some(dev(8, 0))
+            Ok(dev(8, 0))
         );
         // btrfs: an anonymous st_dev; the mount's source node is the device.
         assert_eq!(
             resolve_device(dev(0, 43), 40, MOUNTINFO, &sys),
-            Some(dev(252, 0))
+            Ok(dev(252, 0))
         );
         // A nested btrfs subvolume has an st_dev no line carries; the mount
         // id still finds the mount.
         assert_eq!(
             resolve_device(dev(0, 77), 40, MOUNTINFO, &sys),
-            Some(dev(252, 0))
+            Ok(dev(252, 0))
         );
         // tmpfs: no block device.
-        assert_eq!(resolve_device(dev(0, 44), 41, MOUNTINFO, &sys), None);
+        let none = Err(Unresolved::NoDevice);
+        assert_eq!(resolve_device(dev(0, 44), 41, MOUNTINFO, &sys), none);
         // A source without a device node, and an unknown mount.
-        assert_eq!(resolve_device(dev(0, 45), 42, MOUNTINFO, &sys), None);
-        assert_eq!(resolve_device(dev(0, 99), 99, MOUNTINFO, &sys), None);
+        assert_eq!(resolve_device(dev(0, 45), 42, MOUNTINFO, &sys), none);
+        assert_eq!(resolve_device(dev(0, 99), 99, MOUNTINFO, &sys), none);
+    }
+
+    #[test]
+    fn multi_device_btrfs_rejected() {
+        // The mountinfo source of a multi-device btrfs names one member
+        // only, so the mapping fails closed instead of limiting that one.
+        let sys = |btrfs_devices| FakeSys {
+            block: vec![dev(252, 0)],
+            partitions: vec![],
+            nodes: vec![(b"/dev/mapper/luks disk\\x".to_vec(), dev(252, 0))],
+            btrfs_devices,
+        };
+        assert_eq!(
+            resolve_device(dev(0, 43), 40, MOUNTINFO, &sys(Some(1))),
+            Ok(dev(252, 0))
+        );
+        for n in [2, 4] {
+            assert_eq!(
+                resolve_device(dev(0, 43), 40, MOUNTINFO, &sys(Some(n))),
+                Err(Unresolved::MultiDevice(n))
+            );
+        }
+        // An unreadable count fails closed too.
+        assert_eq!(
+            resolve_device(dev(0, 43), 40, MOUNTINFO, &sys(None)),
+            Err(Unresolved::MultiDevice(0))
+        );
+        // Not btrfs: the count is not asked.
+        let ext4 = FakeSys {
+            block: vec![dev(8, 0), dev(8, 1)],
+            partitions: vec![(dev(8, 1), dev(8, 0))],
+            nodes: vec![],
+            btrfs_devices: Some(3),
+        };
+        assert_eq!(
+            resolve_device(dev(8, 1), 25, MOUNTINFO, &ext4),
+            Ok(dev(8, 0))
+        );
+    }
+
+    #[test]
+    fn cgroup2_nsdelegate_detected() {
+        let with: &[u8] = b"30 1 0:26 / /sys/fs/cgroup rw,nosuid,relatime shared:4 - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot\n";
+        assert_eq!(cgroup2_nsdelegate(with), Ok(()));
+        let without: &[u8] = b"30 1 0:26 / /sys/fs/cgroup rw,relatime shared:4 - cgroup2 cgroup2 rw,seclabel,memory_recursiveprot\n";
+        assert_eq!(
+            cgroup2_nsdelegate(without),
+            Err("rw,seclabel,memory_recursiveprot".to_string())
+        );
+        // A longer option that starts with the name is not the option.
+        assert!(
+            cgroup2_nsdelegate(b"30 1 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegatex\n")
+                .is_err()
+        );
+        // The last mount on the point wins: a later one without nsdelegate
+        // hides the earlier one.
+        let mut both = with.to_vec();
+        both.extend_from_slice(b"31 30 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n");
+        assert!(cgroup2_nsdelegate(&both).is_err());
+        // Not cgroup2, or nothing at the point.
+        assert!(
+            cgroup2_nsdelegate(b"30 1 0:26 / /sys/fs/cgroup rw - tmpfs tmpfs rw,nsdelegate\n")
+                .is_err()
+        );
+        assert!(cgroup2_nsdelegate(b"30 1 0:26 / /sys rw - sysfs sysfs rw\n").is_err());
+        // The option among the per-mount options does not count.
+        assert!(
+            cgroup2_nsdelegate(b"30 1 0:26 / /sys/fs/cgroup rw,nsdelegate - cgroup2 cgroup2 rw\n")
+                .is_err()
+        );
     }
 }

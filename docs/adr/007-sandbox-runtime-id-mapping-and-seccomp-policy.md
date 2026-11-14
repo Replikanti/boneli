@@ -141,7 +141,8 @@ child's own filter step fails or its install hangs; it runs as
 `Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so that a
 host lacking both filters and user namespaces is told about both: the
 probe reports the exact missing set), the Landlock ABI, cgroup
-v2 at `/sys/fs/cgroup`, and delegation of the caller's own cgroup (the
+v2 at `/sys/fs/cgroup` mounted with `nsdelegate` (since PR 3,
+`cgroup-nsdelegate`, D8), and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
 writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
 missing feature is reported with a stable id and a message naming its
@@ -345,6 +346,7 @@ features" step prints them on every run):
 | stock runner lacks (step 3) | exactly `userns-apparmor`, `cgroup-not-delegated` | the same |
 | host-setup block (linger, restart, bus wait) | 1 s | 1 s |
 | after the block, in a `Delegate=yes` scope | nothing missing (io included) | the same |
+| cgroup2 super options (since PR 3) | `nsdelegate` present | the same |
 
 Every assumption above held but one: the AppArmor restriction shows as
 EACCES at the setgroups open, not EPERM (D3). The runner user has
@@ -403,9 +405,10 @@ its own PID namespace from its first instruction; `unshare(CLONE_NEWPID)`
 after a fork would only affect later children (D4). The cgroup namespace
 is the exception: `copy_process` creates namespaces before it moves the
 child into its target cgroup, so a cgroup namespace from `clone3` would
-be rooted at the parent's cgroup (from the kernel source, not measured;
-PR 3 measured that with `CLONE_INTO_CGROUP` the kernel roots it at the
-target cgroup anyway, D8).
+be rooted at the parent's cgroup (from the kernel source, not measured).
+That reading missed `cgroup_post_fork()`, which re-roots a new cgroup
+namespace at the `CLONE_INTO_CGROUP` target since Linux 5.7 (D8), so with
+placement at the clone both orders are equivalent.
 The child creates it with `unshare(CLONE_NEWCGROUP)` right after the id
 maps (`Step::CgroupNs`); since PR 3 `clone3` has put the child into its
 cgroup with `CLONE_INTO_CGROUP` before this step, and
@@ -667,6 +670,22 @@ of D7):
   and `oom_kill` ≥ 2. PID 1 waits and the child touches (the plan had it
   the other way round), because when PID 1 dies the kernel kills the
   whole PID namespace anyway, which would hide a missing group kill.
+- **`oom_score_adj` at least 0** (`Step::OomScoreAdj`, code 23, right
+  after the id maps; review of PR 3). The value is inherited across
+  `clone`, and the OOM killer skips tasks at `-1000`
+  (`oom_kill_memcg_member` and `oom_badness`), so under a runner started
+  with `OOMScoreAdjust=-1000` a memcg OOM in the sandbox would kill
+  nothing: `memory.max` still holds, but the sandbox stalls in reclaim
+  instead of dying as one group, the half-dead pod above. The child reads
+  the inherited value into a stack buffer and writes `0` if it is
+  negative, never lowering it: raising needs no capability, lowering
+  needs `CAP_SYS_RESOURCE`, so the workload cannot go below what it got
+  either. 0 rather than a higher value: it removes the exemption without
+  ranking the sandbox before the host's own processes. The decision is
+  pinned by `oom_score_adj_raised_never_lowered` (pure; a negative value
+  cannot be set without `CAP_SYS_RESOURCE` on a test host), and
+  `oom_score_adj_never_lowered` checks on the host that a runner at 500
+  keeps 500 inside and that this process's own value is kept.
 
 **Ordering.** `Cgroup::create(&Parent, name, &Limits)` validates the
 limits and the name (1–255 bytes, `NAME_MAX`, of `[A-Za-z0-9_-]`: every
@@ -691,21 +710,28 @@ mount shows the sandbox's own limits
 (`cgroup_namespace_root_is_sandbox_cgroup`; without `CLONE_INTO_CGROUP`
 the child stays in the runner's cgroup and both differ, measured with a
 mutant that drops it).
-**Measured against the plan:** D7 assumed, from the kernel source and
-unmeasured, that a cgroup namespace created by `clone3` itself would be
-rooted at the runner's cgroup, because `copy_process` creates namespaces
-before the move into the target cgroup. With `CLONE_INTO_CGROUP` that is
-not what the kernel does: the plan's mutant M13 (`CLONE_NEWCGROUP` in the
+**Measured against the plan, and the kernel code behind it:** D7 assumed
+that a cgroup namespace created by `clone3` itself would be rooted at the
+runner's cgroup, because `copy_process` creates namespaces before the move
+into the target cgroup. The plan's mutant M13 (`CLONE_NEWCGROUP` in the
 `clone3` flags, the `unshare` step removed) left the namespace rooted at
 the sandbox's cgroup, and `cgroup_namespace_root_is_sandbox_cgroup` stayed
-green on the dev host (Linux 7.2.10). The kernel evidently re-roots a new
-cgroup namespace at the target cgroup when it places the child; which
-code does it, and since which release, is not verified here, so the
-runtime does not rely on it. The separate step stays, because it is
-correct on any kernel: the namespace is created by a process that is
-already in its cgroup. M13 is therefore not observable on this kernel,
-and only the pure `spawn_clone_flags` pins that `clone3` does not create
-the cgroup namespace.
+green (Linux 7.2.10). The reason is in `cgroup_post_fork()`
+(`kernel/cgroup/cgroup.c`): when `CLONE_NEWCGROUP` comes with the clone,
+it makes the target css_set (`kargs->cset`, the `CLONE_INTO_CGROUP`
+cgroup chosen in `cgroup_css_set_fork`) the `root_cset` of the new
+namespace before the child first runs. The block came with commit
+ef2c41cf38a7 ("clone3: allow spawning processes into cgroups"), the
+commit that introduced `CLONE_INTO_CGROUP`, in Linux 5.7; it is absent in
+5.6 and present in 5.7, 5.19 and 7.0 (review of PR 3, from the kernel
+sources). On every kernel the runtime accepts (5.19 floor), M13 is
+therefore an **equivalent mutant**: no test can tell the two orders apart,
+because they behave the same. The separate `unshare` step stays (one
+syscall, the simpler reading). What matters is covered: a child that is
+not placed at the clone (mutant C1) and limits written after entry (M12)
+both fail tests, and `spawn_clone_flags` checks the exact flags that
+`launch` passes to `clone3`, computed in one function (`clone_flags`), so
+a flag added there fails it.
 
 **`Mount::Cgroup2 { target }`**, always read-only, `nosuid,nodev,noexec`
 (`Step::Cgroup2`): a cgroup2 mount in the sandbox's cgroup namespace,
@@ -715,25 +741,69 @@ would let the sandbox raise its own limits; through the read-only mount,
 writing `memory.max`, `pids.max` or `cgroup.kill` gives EROFS for inside
 ids 0 and 999 (`sandbox_cannot_touch_own_limits`). A read-only cgroup2
 mount works in a user namespace (measured). Until PR 4 drops the
-capabilities (D9), inside id 0 could mount a writable cgroup2 of its own;
-on hosts whose cgroup2 has `nsdelegate` (systemd sets it; the dev host
-has it, measured; not checked on the CI runners) the kernel still refuses writes to the
-namespace root's limit files from inside (EPERM through a writable mount,
-measured), and creating a sub-cgroup there works but cannot raise the
-parent's limits. A sub-cgroup the sandbox created would make
-`destroy`'s `rmdir` fail with EBUSY, so the error shows it; PR 4's
-capability drop removes the mount.
+capabilities (D9), inside id 0 can mount a writable cgroup2 of its own,
+and can remount the `Mount::Cgroup2` view read-write (it lives in the
+sandbox's own mount namespace, so no flag is locked; review of PR 3,
+measured). Two kernel-enforced layers sit under the read-only view, both
+added in the review round of PR 3:
+
+- **`nsdelegate` is required** (`Features::probe`, id
+  `cgroup-nsdelegate`, failing closed like every other host gap). The
+  sandbox's limit files belong to the host user the inside id maps to,
+  so file permissions admit a write; the only kernel check that refuses
+  it is `cgroup_file_write()`'s refusal of non-delegatable files at a
+  cgroup namespace root, which applies only when the hierarchy is mounted
+  with `nsdelegate` (EPERM through a writable mount, measured on the dev
+  host). `nsdelegate` is a superblock option only the initial namespace
+  can set; systemd sets it. Without it a sandbox that regains
+  `CAP_SYS_ADMIN` in any user namespace could raise its own
+  `memory.max`, `pids.max` and `cpu.max`. Both CI runners mount cgroup2 with `nsdelegate`
+  (printed by the "Host features" step, and the probe passes in the
+  delegated scope), so the stock-runner expectation and the host-setup
+  block stay as they are; a host without it is refused with
+  `cgroup-nsdelegate`, and only root can fix it (remount with
+  `nsdelegate`).
+- **No sub-cgroups:** `Cgroup::create` writes `cgroup.max.descendants`
+  and `cgroup.max.depth` 0 and reads them back. `nsdelegate` does not stop
+  `mkdir` (delegation is its purpose), and a sub-cgroup the sandbox made
+  kept `destroy` from removing the cgroup (EBUSY, review of PR 3). With
+  both at 0, `mkdir` inside fails with EAGAIN, and raising
+  `cgroup.max.descendants` from inside fails with EPERM, because it is not
+  a delegatable file (`sandbox_cannot_create_sub_cgroups`, measured).
+
+PR 4's capability drop then removes the mount and the remount
+themselves.
 
 **Destroying.** `Cgroup::destroy` writes `cgroup.kill` (Linux 5.14,
-below the floor of D3), waits until `cgroup.events` says `populated 0`,
-and removes the directory. The wait polls `cgroup.events` for `POLLPRI`
+below the floor of D3), then lifts the throttles that can hold a killed
+task back, then waits until `cgroup.events` says `populated 0`, and
+removes the directory. The lift (review of PR 3): a task in one large
+`O_DIRECT` write waits uninterruptibly for its queued bios, so
+`cgroup.kill` cannot end it before they drain at the throttled rate. With
+`wbps` 1 MiB/s and a 40 MiB write that is about 40 s, past the 10 s
+bound, so `destroy` failed and left the cgroup; the workload picks that
+time (size ÷ rate). After the kill, every configured `io.max` device is
+written back to `max` (`destroy_lifts_io_throttle`: 89 ms on the dev
+host; the reviewer measured 97 ms). A small CPU quota also holds killed
+tasks back until the next period refill: with `cpu.max` `1000 1000000`
+and four spinners, `destroy` took 496–506 ms without a lift (measured
+three times), so `cpu.max` is written to `max <period>` as well
+(`destroy_lifts_cpu_throttle`: 4 ms). Lifting after the kill is safe: a
+killed task never returns to user space, so it can only finish what is
+already in the kernel. Memory and task limits do not delay an exit. The wait polls `cgroup.events` for `POLLPRI`
 and re-reads it at least every 100 ms in case a notification is missed;
 10 s is a hang bound, not a target (`destroy_kills_all_and_removes`
 measured about 3 ms for three sleepers). A killed child that its `Child`
 has not reaped yet does not keep the cgroup populated, and the directory
-can be removed before the reap (measured). Dropping a `Cgroup` without
-`destroy` does the same and ignores errors, so a test failure or an early
-return leaves nothing behind; a spawn that fails at a step leaves an empty,
+can be removed before the reap (measured). `destroy` returns every
+failure. Dropping a `Cgroup` without `destroy` does the same work, but a
+drop cannot return an error, and a panic there would abort a process that
+is already unwinding; so a failed drop writes one line to stderr (the
+runner's journal; the crate has no logger, and `tracing` is on the
+do-not-use list) and records the path for `leaked_cgroups()`, which the
+runner (#8) can report and #33's sweep cleans up
+(`drop_reports_a_cgroup_it_cannot_remove`). A test failure or an early
+return therefore leaves nothing behind unnoticed; a spawn that fails at a step leaves an empty,
 removable cgroup (`failed_spawn_leaves_no_cgroup_process`, for an exec and
 a mount failure). Cleanup after a runner crash is #33.
 
@@ -746,7 +816,16 @@ host's target directory has `0:43`) the source of the path's mount in
 any byte but NUL, and its `st_rdev` if it is a block device node. A
 partition maps to its disk through sysfs (its `partition` file, then the
 parent's `dev`). Anything else, tmpfs or overlay, is
-`Error::NoBlockDevice`. The mount is found by its id (`statx` with
+`Error::NoBlockDevice`. A btrfs file system that spans more than one
+device fails closed with `Error::MultiDeviceFilesystem` (review of PR 3):
+its mountinfo source names one member only (`btrfs_show_devname` prints
+the latest device), so one `io.max` line would leave writes to the other
+members unthrottled. The count comes from `BTRFS_IOC_FS_INFO`
+(`num_devices`); an unreadable count fails closed too
+(`multi_device_btrfs_rejected`, on fixture data; no multi-device btrfs
+was available to measure). Other multi-device file systems do not reach
+here: a ZFS or bcachefs source is not a device node, so they are
+`NoBlockDevice`. The mount is found by its id (`statx` with
 `STATX_MNT_ID`, Linux 5.8), not by `st_dev`, because a nested btrfs
 subvolume has an `st_dev` that no mountinfo line carries. On the dev host
 the target directory maps to `252:0` (the dm-crypt device), on which
@@ -763,12 +842,22 @@ tmpfs, on fixture text.
   the cgroup2 mount before and after: `usage_usec` ≤ 650,000 and
   `nr_throttled` ≥ 1. 650,000 = 500,000 (0.5 × 1 s) + 100,000 (the window
   can straddle one period refill) + 50,000 accounting slack; there is no
-  lower bound, because a loaded host may give less. It spins on two
+  lower bound, because a loaded host may give less. It spins on four
   threads, not one (the plan had one): on the loaded dev host a single
   spinner got 0.3 CPU, stayed under the quota and was never throttled
-  (`usage_usec` 301,331, `nr_throttled` 0, measured); two threads demand
-  two CPUs, and the quota caps the whole cgroup, so the bound holds for
-  any thread count. Dev host: `usage_usec` 511,325, `nr_throttled` 9.
+  (`usage_usec` 301,331, `nr_throttled` 0, measured), and QA saw two
+  threads starve in 2 of 5 runs under other sessions' load
+  (`usage_usec` 393,561 and 402,326, `nr_throttled` 0). More threads
+  demand more CPUs, and the quota caps the whole cgroup, so the bound
+  holds for any thread count. A run with `nr_throttled` 0 and
+  `usage_usec` below 500,000 never reached the quota, so it says nothing
+  about the limit: it is retried, up to 3 attempts, and three starved
+  attempts fail with "host starved the probe", never pass. Any other run
+  decides (`cpu_verdicts`: over 650,000 fails, at least the quota without
+  a throttle fails). Under load on the dev host (three checksum loops in
+  the same 300 % scope) 10 runs of 10 passed, two of them after one
+  starved attempt (`usage_usec` 317,147 and 349,708, then 405,012 and
+  475,653); passing values 372,160–508,292, `nr_throttled` 1–10.
 - `io_limit_throttles_writes`: `io.max` `wbps=4194304` on the device
   behind the sandbox's `/workspace`; the probe writes 8 MiB with
   `O_DIRECT` (else `fdatasync` after every MiB): elapsed ≥ 1.5 s and
@@ -790,9 +879,9 @@ probes fork, small enough that a runaway probe cannot hurt the host, and
 no swap so it cannot push the host into swapping.
 
 **Where PR 3 departs from the plan of #6**, each for the reason given
-above: `cpu_limit_throttles` spins on two threads (one spinner got 0.3
-CPU on the loaded dev host and was never throttled, measured) and the two
-timing tests run alone; the IO probe writes incompressible data (zeros
+above: `cpu_limit_throttles` spins on four threads and retries a run
+the host starved (one spinner got 0.3 CPU on the loaded dev host and was
+never throttled, measured), and the timing tests run alone; the IO probe writes incompressible data (zeros
 reached the compressing btrfs as 299,008 of 8,388,608 bytes, measured); in
 `memory_limit_kills_whole_group` PID 1 waits and its child touches (a dying
 PID 1 takes its whole PID namespace with it); mutant M13 is not observable

@@ -334,13 +334,10 @@ pub(crate) const SPAWN_NAMESPACES: u64 = (libc::CLONE_NEWUSER
     | libc::CLONE_NEWIPC
     | libc::CLONE_NEWUTS) as u64;
 
-/// Clones a child that runs `plan`: in the namespaces of
-/// [`SPAWN_NAMESPACES`] for `spawn`, in a new user namespace only for the
-/// probe's id child, and in none for its filter child. Returns in the
-/// parent only; the child never returns from here.
-pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
-    let mut pidfd: c_int = -1;
-    let (flags, cgroup) = match &plan.action {
+/// The `clone3` flags and `clone_args.cgroup` for a child's action; the
+/// only source of both, so a test of this function covers every clone.
+pub(crate) fn clone_flags(action: &Action<'_>) -> (u64, u64) {
+    match action {
         // The probe's filter child must not depend on user namespaces.
         Action::ProbeFilter => (libc::CLONE_PIDFD as u64, 0),
         Action::ProbeIds => ((libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64, 0),
@@ -350,7 +347,16 @@ pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
             SPAWN_NAMESPACES | libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP,
             exec.cgroup as u64,
         ),
-    };
+    }
+}
+
+/// Clones a child that runs `plan`: in the namespaces of
+/// [`SPAWN_NAMESPACES`] for `spawn`, in a new user namespace only for the
+/// probe's id child, and in none for its filter child. Returns in the
+/// parent only; the child never returns from here.
+pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
+    let mut pidfd: c_int = -1;
+    let (flags, cgroup) = clone_flags(&plan.action);
     let args = libc::clone_args {
         flags,
         pidfd: &mut pidfd as *mut c_int as u64,
@@ -620,10 +626,46 @@ mod tests {
 
     #[test]
     fn spawn_clone_flags() {
-        // The cgroup namespace is the child's own step, after
-        // CLONE_INTO_CGROUP placed it (ADR-007, D8).
-        assert_eq!(SPAWN_NAMESPACES & libc::CLONE_NEWCGROUP as u64, 0);
+        // The flags launch passes to clone3, from the one function that
+        // computes them. The cgroup namespace is the child's own step,
+        // after CLONE_INTO_CGROUP placed it (ADR-007, D8).
         assert_eq!(ffi::CLONE_INTO_CGROUP, 1 << 33);
+        let program = c"/bin/true";
+        let argv = [std::ptr::null()];
+        let envp = [std::ptr::null()];
+        let exec = Action::Exec(ExecPlan {
+            program,
+            argv: &argv,
+            envp: &envp,
+            stdio: [3, 4, 5],
+            ops: &[],
+            cgroup: 42,
+        });
+        let (flags, cgroup) = clone_flags(&exec);
+        assert_eq!(
+            flags,
+            (libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNS
+                | libc::CLONE_NEWPID
+                | libc::CLONE_NEWNET
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_PIDFD) as u64
+                | ffi::CLONE_INTO_CGROUP,
+            "exactly these flags, no CLONE_NEWCGROUP"
+        );
+        assert_eq!(flags & libc::CLONE_NEWCGROUP as u64, 0);
+        assert_eq!(cgroup, 42, "the cgroup's descriptor");
+        // The probe's children: no cgroup placement, no namespace but the
+        // user namespace of the id child.
+        assert_eq!(
+            clone_flags(&Action::ProbeIds),
+            ((libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64, 0)
+        );
+        assert_eq!(
+            clone_flags(&Action::ProbeFilter),
+            (libc::CLONE_PIDFD as u64, 0)
+        );
     }
 
     #[test]
@@ -659,6 +701,9 @@ mod tests {
         // runs it; host::tests covers it there). The root has a mount of
         // every kind, so every mount step is reached.
         let unit = crate::test_guard::UnitRoot::new();
+        // The parent cgroup holds a descriptor for the rest of the run;
+        // open it before the first count.
+        crate::test_guard::cgroup_parent();
         for step in Step::SEQUENCE {
             let before = open_fds();
             let mut pid = 0;

@@ -106,8 +106,9 @@ machine: `rustup target add` both).
 `boneli-sys` creates user namespaces, so its host tests are
 `#[ignore = "host: ..."]` and need a prepared host: unprivileged user
 namespaces (on Ubuntu 23.10+ an AppArmor profile that allows them), a
-cgroup v2 hierarchy whose cgroup the tests run in is delegated to the user
-with the cpu, io, memory and pids controllers, Landlock ABI 2 and Linux
+cgroup v2 hierarchy mounted with `nsdelegate` whose cgroup the tests run in
+is delegated to the user with the cpu, io, memory and pids controllers,
+Landlock ABI 2 and Linux
 5.19 (ADR-007, D3 and D5). They never need root and never call `sudo`; a
 missing feature fails them with the probe's message instead of skipping
 them. Run them in a delegated scope:

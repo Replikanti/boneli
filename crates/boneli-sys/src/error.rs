@@ -129,6 +129,14 @@ pub enum Error {
     /// The path's file system has no block device to limit with `io.max`
     /// (tmpfs, overlay).
     NoBlockDevice(PathBuf),
+    /// The path's file system spans several devices (multi-device btrfs),
+    /// so one `io.max` line would limit only one of them (ADR-007, D8).
+    MultiDeviceFilesystem {
+        /// The path.
+        path: PathBuf,
+        /// The number of devices, 0 if it could not be read.
+        devices: u64,
+    },
 }
 
 impl Error {
@@ -232,6 +240,16 @@ impl fmt::Display for Error {
                     p.display()
                 )
             }
+            Error::MultiDeviceFilesystem { path, devices: 0 } => write!(
+                f,
+                "the btrfs file system of {} has an unreadable device count; io.max needs exactly one device",
+                path.display()
+            ),
+            Error::MultiDeviceFilesystem { path, devices } => write!(
+                f,
+                "the file system of {} spans {devices} devices; io.max would limit only one",
+                path.display()
+            ),
         }
     }
 }
