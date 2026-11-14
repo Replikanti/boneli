@@ -187,6 +187,14 @@ pub enum Mount {
         /// The size limit of `shm`; no default, zero is refused.
         shm_size_bytes: u64,
     },
+    /// The sandbox's own cgroup (the root of its cgroup namespace),
+    /// always read-only, `nosuid,nodev,noexec`: its files belong to the
+    /// host user the inside id maps to, so a writable view would let the
+    /// sandbox raise its own limits (ADR-007, D8).
+    Cgroup2 {
+        /// Where it appears, normally `/sys/fs/cgroup`.
+        target: InsidePath,
+    },
 }
 
 impl Mount {
@@ -197,7 +205,8 @@ impl Mount {
             | Mount::Tmpfs { target, .. }
             | Mount::Overlay { target, .. }
             | Mount::Proc { target }
-            | Mount::Dev { target, .. } => target,
+            | Mount::Dev { target, .. }
+            | Mount::Cgroup2 { target } => target,
         }
     }
 }
@@ -270,6 +279,8 @@ pub(crate) enum Op {
         target: CString,
         shm_data: CString,
     },
+    /// See [`Mount::Cgroup2`].
+    Cgroup2 { index: u32, target: CString },
     /// `pivot_root` onto the new root, then `cwd`.
     Pivot { cwd: CString },
     /// `sethostname`.
@@ -398,7 +409,7 @@ fn validate_root(root: &Root) -> Result<()> {
                     }
                 }
             }
-            Mount::Proc { .. } => {}
+            Mount::Proc { .. } | Mount::Cgroup2 { .. } => {}
             Mount::Dev { shm_size_bytes, .. } => {
                 if *shm_size_bytes == 0 {
                     return Err(bad("shm size 0 means unlimited; give a size"));
@@ -485,6 +496,7 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
                 work: c_string(&path_bytes(work), mount_nul("an overlay path contains NUL"))?,
             },
             Mount::Proc { .. } => Op::Proc { index, target },
+            Mount::Cgroup2 { .. } => Op::Cgroup2 { index, target },
             Mount::Dev { shm_size_bytes, .. } => Op::Dev {
                 index,
                 target,
@@ -1170,6 +1182,28 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                         target: rel,
                         shm_data,
                     } => dev(new_root, *index, rel, shm_data, fault)?,
+                    Op::Cgroup2 { index, target: rel } => {
+                        // The cgroup namespace (Step::CgroupNs) roots this
+                        // mount at the sandbox's own cgroup. Read-only: its
+                        // files belong to the host user the inside id maps
+                        // to (ADR-007, D8).
+                        let at = target(new_root, rel, *index, fault)?;
+                        inject(fault, Step::Cgroup2)?;
+                        step(
+                            mount_on(
+                                &at,
+                                c"cgroup2",
+                                c"cgroup2",
+                                libc::MS_RDONLY
+                                    | libc::MS_NOSUID
+                                    | libc::MS_NODEV
+                                    | libc::MS_NOEXEC,
+                                None,
+                            ),
+                            Step::Cgroup2,
+                            *index,
+                        )?;
+                    }
                     Op::Pivot { cwd } => pivot(new_root, cwd, fault)?,
                     Op::Hostname { name } => {
                         inject(fault, Step::Hostname)?;
@@ -1451,6 +1485,9 @@ mod tests {
                     target: p("/dev"),
                     shm_size_bytes: 1 << 20,
                 },
+                Mount::Cgroup2 {
+                    target: p("/sys/fs/cgroup"),
+                },
             ],
         );
         let ops = plan(&root).expect("plan");
@@ -1466,9 +1503,10 @@ mod tests {
             .expect("a proc");
         assert!(proc < pivot, "proc before pivot_root");
         assert!(
-            ops[2..pivot]
-                .iter()
-                .all(|o| matches!(o, Op::Bind { .. } | Op::Proc { .. } | Op::Dev { .. })),
+            ops[2..pivot].iter().all(|o| matches!(
+                o,
+                Op::Bind { .. } | Op::Proc { .. } | Op::Dev { .. } | Op::Cgroup2 { .. }
+            )),
             "only the spec's mounts between the root and the pivot"
         );
         assert!(matches!(ops[pivot + 1], Op::Hostname { .. }));

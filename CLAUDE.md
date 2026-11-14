@@ -106,8 +106,9 @@ machine: `rustup target add` both).
 `boneli-sys` creates user namespaces, so its host tests are
 `#[ignore = "host: ..."]` and need a prepared host: unprivileged user
 namespaces (on Ubuntu 23.10+ an AppArmor profile that allows them), a
-cgroup v2 hierarchy whose cgroup the tests run in is delegated to the user
-with the cpu, io, memory and pids controllers, Landlock ABI 2 and Linux
+cgroup v2 hierarchy mounted with `nsdelegate` whose cgroup the tests run in
+is delegated to the user with the cpu, io, memory and pids controllers,
+Landlock ABI 2 and Linux
 5.19 (ADR-007, D3 and D5). They never need root and never call `sudo`; a
 missing feature fails them with the probe's message instead of skipping
 them. Run them in a delegated scope:
@@ -126,8 +127,10 @@ systemd-run --user --scope -q -p Delegate=yes \
   cannot observe, by id. Exact: an unknown id fails, and so will a listed
   row that turns out observable. Empty until the seccomp rows exist.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
-  so the harness may reorganize its own cgroup. Never set it in a terminal
-  whose cgroup holds other processes.
+  so the harness may reorganize its own cgroup: it moves the run's
+  processes into `leaf/` and creates every sandbox's cgroup next to it
+  (ADR-007, D8). Without it every host test that starts a sandbox
+  fails. Never set it in a terminal whose cgroup holds other processes.
 
 **Preparing a host** takes the block below, run once with root through
 `sudo`. CI runs exactly this block (it extracts it between the markers),
