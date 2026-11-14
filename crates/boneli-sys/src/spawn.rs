@@ -7,7 +7,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::child::{self, ChildPlan, ExecPlan, Fault};
+use crate::child::{self, Action, ChildPlan, ExecPlan, Fault};
 use crate::error::{Error, Result, errno};
 use crate::ids::Ids;
 use crate::report;
@@ -310,12 +310,17 @@ fn set_signal_mask(mask: u64) -> Result<u64> {
     }
 }
 
-/// Clones a child into a new user namespace that runs `plan`. Returns in
+/// Clones a child that runs `plan`, in a new user namespace unless it is the
+/// probe's filter child. Returns in
 /// the parent only; the child never returns from here.
 pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
     let mut pidfd: c_int = -1;
     let args = libc::clone_args {
-        flags: (libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64,
+        flags: match plan.action {
+            // The probe's filter child must not depend on user namespaces.
+            Action::ProbeFilter => libc::CLONE_PIDFD as u64,
+            _ => (libc::CLONE_NEWUSER | libc::CLONE_PIDFD) as u64,
+        },
         pidfd: &mut pidfd as *mut c_int as u64,
         child_tid: 0,
         parent_tid: 0,
@@ -465,7 +470,7 @@ pub(crate) fn spawn_inner(spec: &Spec, fault: Fault, pid: &mut libc::pid_t) -> R
     let plan = ChildPlan {
         gid_line: &prepared.gid_line,
         uid_line: &prepared.uid_line,
-        exec: Some(ExecPlan {
+        action: Action::Exec(ExecPlan {
             program: &prepared.program,
             argv: &prepared.argv,
             envp: &prepared.envp,

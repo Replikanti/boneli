@@ -38,10 +38,10 @@ pub enum Step {
     CloseFds = 7,
     /// `execve` of the program.
     Exec = 8,
-    /// `PR_SET_NO_NEW_PRIVS` and a seccomp filter. Only the host probe runs
-    /// it so far, first and with an allow-all filter, to prove the kernel
-    /// installs filters at all (ADR-007, D3); `spawn` gets it before `Exec`
-    /// with the policy of ADR-007 D2 in a later part of #6.
+    /// `PR_SET_NO_NEW_PRIVS` and a seccomp filter. Only the host probe's
+    /// filter child runs it so far, with an allow-all filter, to prove the
+    /// kernel installs filters at all (ADR-007, D3); `spawn` gets it before
+    /// `Exec` with the policy of ADR-007 D2 in a later part of #6.
     Seccomp = 9,
 }
 
@@ -97,13 +97,23 @@ pub(crate) struct ExecPlan<'a> {
     pub stdio: [c_int; 3],
 }
 
+/// What the child does.
+pub(crate) enum Action<'a> {
+    /// The id maps and the whole sequence, then `execve` (`spawn`).
+    Exec(ExecPlan<'a>),
+    /// The host probe's user-namespace child: the id maps, then exit 0.
+    ProbeIds,
+    /// The host probe's filter child, cloned without a new user namespace
+    /// so that it does not depend on one: an allow-all seccomp filter, then
+    /// exit 0. A separate child, so that a host lacking both reports both.
+    ProbeFilter,
+}
+
 /// The child's whole input.
 pub(crate) struct ChildPlan<'a> {
     pub gid_line: &'a [u8],
     pub uid_line: &'a [u8],
-    /// None: the host probe, which installs an allow-all seccomp filter,
-    /// writes the id maps and exits 0.
-    pub exec: Option<ExecPlan<'a>>,
+    pub action: Action<'a>,
     /// The write end of the report pipe (close-on-exec).
     pub report_fd: c_int,
     pub fault: Fault,
@@ -166,7 +176,7 @@ fn inject(_fault: Fault, _step: Step) -> Result<(), Failure> {
 }
 
 /// Runs the setup sequence and execs, or reports the failed step and exits
-/// 127. In probe mode (no exec plan) it exits 0 after the id maps.
+/// 127. The probe's children exit 0 after their part (see [`Action`]).
 ///
 /// # Safety
 ///
@@ -263,9 +273,11 @@ fn allow_all_filter() -> Result<(), Failure> {
 fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     let fault = plan.fault;
 
-    if plan.exec.is_none() {
-        inject(fault, Step::Seccomp)?;
+    if let Action::ProbeFilter = plan.action {
         allow_all_filter()?;
+        // After the install, so that a test hanging here sees the filter.
+        inject(fault, Step::Seccomp)?;
+        return Ok(());
     }
 
     inject(fault, Step::SetGroups)?;
@@ -275,7 +287,7 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     inject(fault, Step::UidMap)?;
     write_proc(c"/proc/self/uid_map", plan.uid_line, Step::UidMap)?;
 
-    let Some(exec) = &plan.exec else {
+    let Action::Exec(exec) = &plan.action else {
         return Ok(());
     };
 

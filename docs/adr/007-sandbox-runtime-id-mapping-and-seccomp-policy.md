@@ -133,11 +133,13 @@ under ABI 1 every rename or link into another directory is denied
 `uname`, because distributions backport: a user namespace including the
 single id map writes, `clone3`, `close_range` with `CLOSE_RANGE_CLOEXEC`,
 `kill_process` through `SECCOMP_GET_ACTION_AVAIL`, an allow-all seccomp
-filter that the probe's child installs (with `PR_SET_NO_NEW_PRIVS`, before
-its map writes: `SECCOMP_GET_ACTION_AVAIL` alone also succeeds on a kernel
-with `CONFIG_SECCOMP` but without `CONFIG_SECCOMP_FILTER`, review of PR 1;
-the child's status must show filter mode, `seccomp-filter` otherwise;
-this runs as `Step::Seccomp`, which `spawn` gets in PR 4), the Landlock ABI, cgroup
+filter with `PR_SET_NO_NEW_PRIVS`, installed by a probe child of its own
+that is cloned without a new user namespace (`SECCOMP_GET_ACTION_AVAIL`
+alone also succeeds on a kernel with `CONFIG_SECCOMP` but without
+`CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` otherwise; it
+runs as `Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so
+that a host lacking both filters and user namespaces is told about both:
+the probe reports the exact missing set), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup`, and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
 writable, and cpu, io, memory and pids in `cgroup.controllers`). Every

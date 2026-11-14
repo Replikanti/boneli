@@ -5,7 +5,7 @@ use std::fmt;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use crate::child::{ChildPlan, Fault, Step};
+use crate::child::{Action, ChildPlan, Fault};
 use crate::error::{Error, Result, errno};
 use crate::ffi;
 use crate::spawn::{ExitStatus, await_report, launch, report_pipe};
@@ -323,9 +323,7 @@ impl Features {
     /// namespace is not tried.
     pub fn probe() -> std::result::Result<(), Vec<Missing>> {
         let mut missing = Vec::new();
-        if let Some(m) = probe_userns() {
-            missing.push(m);
-        }
+        missing.extend(probe_children(Fault::None, Fault::None, PROBE_TIMEOUT));
         missing.extend(probe_close_range());
         missing.extend(probe_seccomp());
         missing.extend(probe_landlock());
@@ -343,67 +341,112 @@ impl Features {
     }
 }
 
-fn probe_userns() -> Option<Missing> {
-    probe_child(Fault::None, PROBE_TIMEOUT)
+/// Both probe children, each on its own so that one missing feature does
+/// not hide another: the user namespace with the id maps, and the seccomp
+/// filter (which needs no user namespace).
+pub(crate) fn probe_children(
+    ids_fault: Fault,
+    filter_fault: Fault,
+    timeout: std::time::Duration,
+) -> Vec<Missing> {
+    let mut missing = Vec::new();
+    missing.extend(probe_ids_child(ids_fault, timeout));
+    missing.extend(probe_filter_child(filter_fault, timeout));
+    missing
 }
 
-/// The probe's child: an allow-all seccomp filter, then the single id map
-/// writes in a new user namespace (child::Step::Seccomp, then the maps).
-pub(crate) fn probe_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
+/// How a probe child failed.
+enum ProbeFailure {
+    /// A step of the parent or a report from the child, with where.
+    Error { stage: &'static str, error: Error },
+    /// It ran to its end but did not exit 0.
+    Exit(ExitStatus),
+}
+
+/// Runs one probe child to its end: `Ok` when it exited 0.
+fn run_probe_child(
+    action: Action<'_>,
+    fault: Fault,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), ProbeFailure> {
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     // SAFETY: as above.
     let egid = unsafe { libc::getegid() };
     let uid_line = format!("0 {euid} 1\n").into_bytes();
     let gid_line = format!("0 {egid} 1\n").into_bytes();
-    let other = |stage: &'static str, e: &Error| Missing::UsernsOther {
-        stage,
-        detail: e.to_string(),
-    };
-    let (read, write) = match report_pipe() {
-        Ok(p) => p,
-        Err(e) => return Some(other("pipe2", &e)),
-    };
+    let failed = |stage: &'static str| move |error: Error| ProbeFailure::Error { stage, error };
+    let (read, write) = report_pipe().map_err(failed("pipe2"))?;
     let plan = ChildPlan {
         gid_line: &gid_line,
         uid_line: &uid_line,
-        exec: None,
+        action,
         report_fd: write.as_raw_fd(),
         fault,
     };
-    let launched = match launch(&plan) {
-        Ok(l) => l,
-        Err(Error::Sys { errno, .. }) if errno == libc::ENOSYS => {
-            return Some(Missing::Clone3 { errno });
-        }
-        Err(Error::Sys { errno, .. }) => {
-            return Some(classify_userns("clone3", errno, &UsernsSysctls::read()));
-        }
-        Err(e) => return Some(other("clone3", &e)),
-    };
+    let launched = launch(&plan).map_err(failed("clone3"))?;
     drop(write);
-    match await_report(&read, &launched, timeout) {
-        Ok(()) => {
-            let mut child = crate::spawn::Child::from_launched(launched);
-            match child.wait() {
-                Ok(ExitStatus::Exited(0)) => None,
-                Ok(status) => Some(Missing::UsernsOther {
-                    stage: "exit",
-                    detail: format!("the probe child ended with {status:?}"),
-                }),
-                Err(e) => Some(other("waitid", &e)),
-            }
-        }
-        Err(Error::Setup {
-            step: Step::Seccomp,
-            errno,
-            ..
-        }) => Some(Missing::SeccompFilter { errno }),
-        Err(Error::Setup { step, errno, .. }) => {
-            Some(classify_userns(step.name(), errno, &UsernsSysctls::read()))
-        }
-        Err(e) => Some(other("report", &e)),
+    await_report(&read, &launched, timeout).map_err(failed("report"))?;
+    let mut child = crate::spawn::Child::from_launched(launched);
+    match child.wait().map_err(failed("waitid"))? {
+        ExitStatus::Exited(0) => Ok(()),
+        status => Err(ProbeFailure::Exit(status)),
     }
+}
+
+/// The user-namespace child: the single id map writes.
+pub(crate) fn probe_ids_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
+    let (stage, error) = match run_probe_child(Action::ProbeIds, fault, timeout).err()? {
+        ProbeFailure::Exit(status) => {
+            return Some(Missing::UsernsOther {
+                stage: "exit",
+                detail: format!("the probe child ended with {status:?}"),
+            });
+        }
+        ProbeFailure::Error { stage, error } => (stage, error),
+    };
+    Some(match error {
+        Error::Sys { errno, .. } if stage == "clone3" && errno == libc::ENOSYS => {
+            Missing::Clone3 { errno }
+        }
+        Error::Sys { errno, .. } if stage == "clone3" => {
+            classify_userns("clone3", errno, &UsernsSysctls::read())
+        }
+        Error::Setup { step, errno, .. } => {
+            classify_userns(step.name(), errno, &UsernsSysctls::read())
+        }
+        error => Missing::UsernsOther {
+            stage,
+            detail: error.to_string(),
+        },
+    })
+}
+
+/// The filter child: `PR_SET_NO_NEW_PRIVS` and an allow-all filter, without
+/// a new user namespace. `SECCOMP_GET_ACTION_AVAIL` alone also succeeds on a
+/// kernel with `CONFIG_SECCOMP` but without `CONFIG_SECCOMP_FILTER`.
+pub(crate) fn probe_filter_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
+    let (stage, error) = match run_probe_child(Action::ProbeFilter, fault, timeout).err()? {
+        // A filter child that ran to its end without exiting 0 (the
+        // allocation guard's 97, a signal) proves nothing about filters.
+        ProbeFailure::Exit(_) => {
+            return Some(Missing::SeccompFilter {
+                errno: libc::EPROTO,
+            });
+        }
+        ProbeFailure::Error { stage, error } => (stage, error),
+    };
+    Some(match error {
+        // Without clone3 the user-namespace child already says so.
+        Error::Sys { errno, .. } if stage == "clone3" && errno == libc::ENOSYS => return None,
+        Error::Setup { errno, .. } | Error::Sys { errno, .. } => Missing::SeccompFilter { errno },
+        Error::SetupTimeout(_) => Missing::SeccompFilter {
+            errno: libc::ETIMEDOUT,
+        },
+        _ => Missing::SeccompFilter {
+            errno: libc::EPROTO,
+        },
+    })
 }
 
 fn probe_close_range() -> Option<Missing> {
@@ -513,6 +556,7 @@ fn probe_cgroup() -> Vec<Missing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::child::Step;
 
     fn sample(id: MissingId) -> Missing {
         match id {
@@ -692,15 +736,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "host: unprivileged user namespaces, seccomp filters"]
-    fn probe_child_installs_a_seccomp_filter() {
+    #[ignore = "host: seccomp filters"]
+    fn probe_filter_child_installs_a_filter() {
         let _host = crate::test_guard::host_lock();
-        // The probe child hangs right after its filter step; its status
-        // must then show filter mode (2), not only that the kernel knows
-        // the action values (SECCOMP_GET_ACTION_AVAIL).
+        // The filter child hangs right after its install; its status must
+        // then show filter mode (2), not only that the kernel knows the
+        // action values (SECCOMP_GET_ACTION_AVAIL).
         let worker = std::thread::spawn(|| {
-            probe_child(
-                Fault::Hang(Step::SetGroups),
+            probe_filter_child(
+                Fault::Hang(Step::Seccomp),
                 std::time::Duration::from_millis(1500),
             )
         });
@@ -721,27 +765,58 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let result = worker.join().expect("probe thread");
-        assert_eq!(mode, "2", "the probe child's seccomp mode");
-        assert!(
-            matches!(
-                &result,
-                Some(Missing::UsernsOther {
-                    stage: "report",
-                    ..
-                })
-            ),
-            "the hung child timed out: {result:?}"
+        assert_eq!(mode, "2", "the filter child's seccomp mode");
+        assert_eq!(
+            result,
+            Some(Missing::SeccompFilter {
+                errno: libc::ETIMEDOUT
+            }),
+            "the hung child timed out"
         );
     }
 
     #[test]
-    #[ignore = "host: unprivileged user namespaces"]
-    fn probe_child_reports_filter_failure() {
+    #[ignore = "host: seccomp filters"]
+    fn probe_filter_child_reports_failure() {
         let _host = crate::test_guard::host_lock();
-        let result = probe_child(
+        let result = probe_filter_child(
             Fault::Fail(Step::Seccomp),
             std::time::Duration::from_secs(10),
         );
         assert_eq!(result, Some(Missing::SeccompFilter { errno: libc::EIO }));
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces, seccomp filters"]
+    fn filter_failure_does_not_hide_userns_failure() {
+        let _host = crate::test_guard::host_lock();
+        // A host lacking both reports both (the exact missing set).
+        let missing = probe_children(
+            Fault::Fail(Step::SetGroups),
+            Fault::Fail(Step::Seccomp),
+            std::time::Duration::from_secs(10),
+        );
+        let ids: Vec<MissingId> = missing.iter().map(Missing::id).collect();
+        assert_eq!(
+            ids,
+            [MissingId::UsernsOther, MissingId::SeccompFilter],
+            "{missing:?}"
+        );
+        assert!(
+            matches!(
+                missing[0],
+                Missing::UsernsOther {
+                    stage: "setgroups",
+                    ..
+                }
+            ),
+            "{missing:?}"
+        );
+        assert_eq!(missing[1], Missing::SeccompFilter { errno: libc::EIO });
+        // And neither probe reports anything when nothing fails.
+        assert_eq!(
+            probe_children(Fault::None, Fault::None, std::time::Duration::from_secs(10)),
+            []
+        );
     }
 }
