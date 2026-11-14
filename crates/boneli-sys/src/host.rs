@@ -5,7 +5,7 @@ use std::fmt;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use crate::child::{Action, ChildPlan, Fault};
+use crate::child::{Action, ChildPlan, Fault, Step};
 use crate::error::{Error, Result, errno};
 use crate::ffi;
 use crate::spawn::{ExitStatus, await_report, launch, report_pipe};
@@ -49,11 +49,13 @@ pub enum MissingId {
     LandlockUnavailable,
     /// `landlock-abi`
     LandlockAbi,
+    /// `probe-failed`
+    ProbeFailed,
 }
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 12] = [
+    pub const ALL: [MissingId; 13] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
@@ -66,6 +68,7 @@ impl MissingId {
         MissingId::SeccompFilter,
         MissingId::LandlockUnavailable,
         MissingId::LandlockAbi,
+        MissingId::ProbeFailed,
     ];
 
     /// The id's stable name.
@@ -83,6 +86,7 @@ impl MissingId {
             MissingId::SeccompFilter => "seccomp-filter",
             MissingId::LandlockUnavailable => "landlock-unavailable",
             MissingId::LandlockAbi => "landlock-abi",
+            MissingId::ProbeFailed => "probe-failed",
         }
     }
 
@@ -162,6 +166,18 @@ pub enum Missing {
         /// The ABI the runtime needs.
         required: u32,
     },
+    /// A probe could not run its test, for a reason that says nothing
+    /// about the feature (a resource limit, a failed pipe), so the feature
+    /// is neither present nor missing; the probe fails closed with the real
+    /// cause instead of naming a feature the host may have.
+    ProbeFailed {
+        /// The feature the probe tests (a [`MissingId`] name).
+        probe: &'static str,
+        /// The call that failed.
+        stage: &'static str,
+        /// Its errno.
+        errno: i32,
+    },
 }
 
 impl Missing {
@@ -180,6 +196,7 @@ impl Missing {
             Missing::SeccompFilter { .. } => MissingId::SeccompFilter,
             Missing::LandlockUnavailable { .. } => MissingId::LandlockUnavailable,
             Missing::LandlockAbi { .. } => MissingId::LandlockAbi,
+            Missing::ProbeFailed { .. } => MissingId::ProbeFailed,
         }
     }
 }
@@ -251,6 +268,15 @@ impl fmt::Display for Missing {
                     "Landlock ABI {found} found, {required} or newer required (Linux 5.19)"
                 )
             }
+            Missing::ProbeFailed {
+                probe,
+                stage,
+                errno,
+            } => write!(
+                f,
+                "the {probe} probe could not run: {stage} failed: {} (says nothing about {probe}; retry once the cause is gone)",
+                os(*errno)
+            ),
         }
     }
 }
@@ -436,10 +462,29 @@ pub(crate) fn probe_filter_child(fault: Fault, timeout: std::time::Duration) -> 
         }
         ProbeFailure::Error { stage, error } => (stage, error),
     };
+    classify_filter_failure(stage, &error)
+}
+
+/// Names what a failed filter child says (pure, so every branch has a unit
+/// test). Only a failure of the child's own filter step is a missing
+/// filter; a failed `clone3`, pipe or wait in the parent (EAGAIN from a
+/// process limit, ENOMEM) says nothing about seccomp, so it is reported
+/// with its call and errno as `probe-failed` (review of PR 1 of #6).
+pub(crate) fn classify_filter_failure(stage: &'static str, error: &Error) -> Option<Missing> {
+    const PROBE: &str = "seccomp-filter";
     Some(match error {
         // Without clone3 the user-namespace child already says so.
-        Error::Sys { errno, .. } if stage == "clone3" && errno == libc::ENOSYS => return None,
-        Error::Setup { errno, .. } | Error::Sys { errno, .. } => Missing::SeccompFilter { errno },
+        Error::Sys { errno, .. } if stage == "clone3" && *errno == libc::ENOSYS => return None,
+        Error::Setup {
+            step: Step::Seccomp,
+            errno,
+            ..
+        } => Missing::SeccompFilter { errno: *errno },
+        Error::Sys { call, errno } => Missing::ProbeFailed {
+            probe: PROBE,
+            stage: call,
+            errno: *errno,
+        },
         Error::SetupTimeout(_) => Missing::SeccompFilter {
             errno: libc::ETIMEDOUT,
         },
@@ -556,7 +601,6 @@ fn probe_cgroup() -> Vec<Missing> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::child::Step;
 
     fn sample(id: MissingId) -> Missing {
         match id {
@@ -597,6 +641,11 @@ mod tests {
                 found: 1,
                 required: 2,
             },
+            MissingId::ProbeFailed => Missing::ProbeFailed {
+                probe: "seccomp-filter",
+                stage: "clone3",
+                errno: libc::EAGAIN,
+            },
         }
     }
 
@@ -624,6 +673,10 @@ mod tests {
             ),
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
             "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
+            format!(
+                "the seccomp-filter probe could not run: clone3 failed: {} (says nothing about seccomp-filter; retry once the cause is gone)",
+                e(libc::EAGAIN)
+            ),
         ];
         let names = [
             "userns-apparmor",
@@ -638,6 +691,7 @@ mod tests {
             "seccomp-filter",
             "landlock-unavailable",
             "landlock-abi",
+            "probe-failed",
         ];
         for (i, id) in MissingId::ALL.into_iter().enumerate() {
             let m = sample(id);
@@ -733,6 +787,75 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn filter_failure_classification() {
+        // A clone3 that fails for a resource limit is not a missing filter:
+        // the real call and errno are reported.
+        for errno in [libc::EAGAIN, libc::ENOMEM, libc::EPERM] {
+            assert_eq!(
+                classify_filter_failure(
+                    "clone3",
+                    &Error::Sys {
+                        call: "clone3",
+                        errno
+                    }
+                ),
+                Some(Missing::ProbeFailed {
+                    probe: "seccomp-filter",
+                    stage: "clone3",
+                    errno
+                }),
+                "clone3 errno {errno}"
+            );
+        }
+        assert_eq!(
+            classify_filter_failure(
+                "pipe2",
+                &Error::Sys {
+                    call: "pipe2",
+                    errno: libc::EMFILE
+                }
+            ),
+            Some(Missing::ProbeFailed {
+                probe: "seccomp-filter",
+                stage: "pipe2",
+                errno: libc::EMFILE
+            })
+        );
+        // Without clone3 the id child reports it; the filter child adds
+        // nothing.
+        assert_eq!(
+            classify_filter_failure(
+                "clone3",
+                &Error::Sys {
+                    call: "clone3",
+                    errno: libc::ENOSYS
+                }
+            ),
+            None
+        );
+        // The child's own filter step is what a missing filter looks like.
+        assert_eq!(
+            classify_filter_failure(
+                "report",
+                &Error::Setup {
+                    step: Step::Seccomp,
+                    index: 1,
+                    errno: libc::EINVAL
+                }
+            ),
+            Some(Missing::SeccompFilter {
+                errno: libc::EINVAL
+            })
+        );
+        assert_eq!(
+            classify_filter_failure("report", &Error::SetupTimeout(Duration::from_secs(1))),
+            Some(Missing::SeccompFilter {
+                errno: libc::ETIMEDOUT
+            })
+        );
     }
 
     #[test]

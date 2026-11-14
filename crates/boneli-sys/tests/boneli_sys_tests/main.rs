@@ -15,6 +15,8 @@
 //! lines. Without that variable it does nothing.
 
 mod host_setup;
+mod mounts;
+mod namespaces;
 mod probe;
 mod spawn;
 mod support;

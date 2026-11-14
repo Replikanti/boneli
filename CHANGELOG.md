@@ -140,6 +140,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-007 (proposed): the single id mapping, the seccomp policy table,
   the kernel floor (Linux 5.19), the spawn model, the host tests and CI,
   and the lints of the unsafe crate.
+- `boneli-sys` (ADR-007 D7, part 2 of #6): `spawn` takes a required
+  `Root` and starts the program in new user, mount, PID, network, IPC,
+  UTS and cgroup namespaces (the cgroup namespace created by the child).
+  The root is a read-only bind of one layer or a read-only overlay of
+  several (`userxattr`, options within one page), on a staging directory,
+  followed by `Mount::Bind` (same kind as the target, flags only added),
+  `Tmpfs`, `Overlay`, `Proc` and `Dev` (a read-only 64 KiB tmpfs with six
+  host device nodes, a private `devpts`, `shm` and the standard
+  symlinks), `pivot_root` with the old root detached, the hostname and
+  `lo` up. Mount targets are resolved beneath the new root without
+  following any symlink, and host paths without following symlinks.
+  `InsidePath`, `Hostname` and the mount rules (no hidden or duplicate
+  targets, no size 0) are checked before the clone. Every host test runs
+  on a fixture root.
+- `Features::probe`: a seccomp probe child that cannot be started (a
+  failed `clone3`, pipe or wait) is reported as `probe-failed` with the
+  call and errno instead of as a missing seccomp filter.
 - The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
   its own `[lints]` table with every workspace lint but `unsafe_code` at
   the same or a stricter level, the lints of the new

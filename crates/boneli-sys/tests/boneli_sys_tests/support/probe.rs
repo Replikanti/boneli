@@ -64,6 +64,19 @@ pub fn main(action: &str) -> ! {
         "session" => session(),
         "features" => features(),
         "closed-stdio-spawn" => closed_stdio_spawn(),
+        "pid" => pid(),
+        "net" => net(),
+        "shm" => shm(),
+        "uname" => uname(),
+        "cgroup" => cgroup(),
+        "mounts" => mounts(),
+        "writes" => writes(),
+        "read" => read(),
+        "fill" => fill(),
+        "connect" => connect(),
+        "connect-abstract" => connect_abstract(),
+        "dev" => dev(),
+        "write" => write(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     std::process::exit(0)
@@ -101,7 +114,8 @@ fn chown() {
 fn create_file() {
     let file = input("BONELI_PROBE_FILE");
     std::fs::write(&file, b"probe").unwrap_or_else(|e| fail(3, &format!("create {file}: {e}")));
-    let root = std::fs::metadata("/").unwrap_or_else(|e| fail(3, &format!("stat /: {e}")));
+    let stat = input("BONELI_PROBE_STAT");
+    let root = std::fs::metadata(&stat).unwrap_or_else(|e| fail(3, &format!("stat {stat}: {e}")));
     use std::os::unix::fs::MetadataExt;
     put("root_uid", &root.uid().to_string());
     put("root_gid", &root.gid().to_string());
@@ -241,6 +255,14 @@ fn closed_stdio_spawn() {
         stdio,
         ids: boneli_sys::Ids::new(0, 0).unwrap_or_else(|e| fail(3, &e.to_string())),
         setup_timeout: std::time::Duration::from_secs(10),
+        root: boneli_sys::Root {
+            layers: vec![input("BONELI_PROBE_LAYER").into()],
+            staging: input("BONELI_PROBE_STAGING").into(),
+            mounts: Vec::new(),
+            hostname: boneli_sys::Hostname::new("closed-stdio")
+                .unwrap_or_else(|e| fail(3, &e.to_string())),
+            cwd: boneli_sys::InsidePath::root(),
+        },
     };
     let result = boneli_sys::spawn(&spec);
     let ok = matches!(
@@ -258,5 +280,241 @@ fn closed_stdio_spawn() {
         };
         let _ = std::fs::write(&out, got);
         std::process::exit(3);
+    }
+}
+
+/// The errno of an I/O result: 0 on success.
+fn code<T>(r: &std::io::Result<T>) -> String {
+    match r {
+        Ok(_) => "0".to_string(),
+        Err(e) => e.raw_os_error().unwrap_or(-1).to_string(),
+    }
+}
+
+fn pid() {
+    put("pid", &std::process::id().to_string());
+    let mut pids: Vec<u32> = std::fs::read_dir("/proc")
+        .unwrap_or_else(|e| fail(3, &format!("list /proc: {e}")))
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+        .collect();
+    pids.sort_unstable();
+    let shown: Vec<String> = pids.iter().map(u32::to_string).collect();
+    put("proc_pids", &shown.join(","));
+}
+
+fn net() {
+    // /proc/net/dev lists the interfaces of the reader's network namespace.
+    let dev = std::fs::read_to_string("/proc/net/dev")
+        .unwrap_or_else(|e| fail(3, &format!("read /proc/net/dev: {e}")));
+    let names: Vec<&str> = dev
+        .lines()
+        .skip(2)
+        .filter_map(|l| l.split(':').next())
+        .map(str::trim)
+        .collect();
+    put("interfaces", &names.join(","));
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        fail(3, "socket");
+    }
+    // SAFETY: an all-zero ifreq is valid storage.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    ifr.ifr_name[0] = b'l' as libc::c_char;
+    ifr.ifr_name[1] = b'o' as libc::c_char;
+    // SAFETY: ifr is a valid ifreq naming "lo".
+    if unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr) } < 0 {
+        fail(3, "SIOCGIFFLAGS");
+    }
+    // SAFETY: SIOCGIFFLAGS filled the flags member.
+    let flags = unsafe { ifr.ifr_ifru.ifru_flags } as i32;
+    put("lo_up", &((flags & libc::IFF_UP) != 0).to_string());
+    // SAFETY: fd was opened above.
+    unsafe { libc::close(fd) };
+    let tcp = (|| -> std::io::Result<u8> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let mut client = std::net::TcpStream::connect(addr)?;
+        let (mut server, _) = listener.accept()?;
+        use std::io::Read;
+        server.write_all(b"k")?;
+        let mut b = [0u8; 1];
+        client.read_exact(&mut b)?;
+        Ok(b[0])
+    })();
+    put("tcp_loopback", &code(&tcp));
+    let out = std::net::TcpStream::connect_timeout(
+        &"192.0.2.1:80"
+            .parse()
+            .unwrap_or_else(|_| fail(2, "address")),
+        std::time::Duration::from_secs(5),
+    );
+    put("test_net_errno", &code(&out));
+}
+
+fn shm() {
+    let key: i32 = input("BONELI_PROBE_KEY")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_KEY is not a number"));
+    // SAFETY: shmget takes plain integers; size 0 and no flags only look up.
+    let rc = unsafe { libc::shmget(key, 0, 0) };
+    put("errno", &if rc >= 0 { 0 } else { errno() }.to_string());
+}
+
+fn uname() {
+    // SAFETY: an all-zero utsname is valid storage for uname.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: u is valid storage.
+    if unsafe { libc::uname(&mut u) } < 0 {
+        fail(3, "uname");
+    }
+    let name: Vec<u8> = u
+        .nodename
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    put("nodename", &String::from_utf8_lossy(&name));
+}
+
+fn cgroup() {
+    let text = std::fs::read_to_string("/proc/self/cgroup")
+        .unwrap_or_else(|e| fail(3, &format!("read /proc/self/cgroup: {e}")));
+    put("cgroup", &text.trim().replace('\n', ";"));
+}
+
+/// Mount point, per-mount options and file system type of every line of
+/// `/proc/self/mountinfo`, as `mount=<point> <options> <fstype>`.
+fn mounts() {
+    let text = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_else(|e| fail(3, &format!("read mountinfo: {e}")));
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let Some(dash) = fields.iter().position(|f| *f == "-") else {
+            fail(3, &format!("mountinfo line without separator: {line}"));
+        };
+        if fields.len() < 6 || dash + 1 >= fields.len() {
+            fail(3, &format!("short mountinfo line: {line}"));
+        }
+        put(
+            "mount",
+            &format!("{} {} {}", fields[4], fields[5], fields[dash + 1]),
+        );
+    }
+    let root = std::fs::read_link("/proc/1/root")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("error {e}"));
+    put("proc1_root", &root);
+    if let Ok(marker) = std::env::var("BONELI_PROBE_MARKER") {
+        put("marker_errno", &code(&std::fs::metadata(&marker)));
+        let up = format!("/..{marker}");
+        put("marker_up_errno", &code(&std::fs::metadata(up)));
+    }
+}
+
+fn writes() {
+    put("etc_errno", &code(&std::fs::write("/etc/x", b"x")));
+    put("mkdir_errno", &code(&std::fs::create_dir("/new")));
+    put(
+        "workspace_errno",
+        &code(&std::fs::write("/workspace/w", b"x")),
+    );
+    put("tmp_errno", &code(&std::fs::write("/tmp/w", b"x")));
+}
+
+fn read() {
+    for path in input("BONELI_PROBE_FILES").split(',') {
+        let value = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => format!("errno={}", e.raw_os_error().unwrap_or(-1)),
+        };
+        put(&format!("file:{path}"), &value);
+    }
+}
+
+fn fill() {
+    let path = input("BONELI_PROBE_FILE");
+    let size: usize = input("BONELI_PROBE_SIZE")
+        .parse()
+        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_SIZE is not a number"));
+    let first = std::fs::write(&path, vec![b'x'; size]);
+    put("fill_errno", &code(&first));
+    let more = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            f.write_all(b"y")?;
+            f.sync_all()
+        });
+    put("more_errno", &code(&more));
+}
+
+fn connect() {
+    use std::io::Read;
+    let path = input("BONELI_PROBE_SOCKET");
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(mut s) => {
+            put("connect_errno", "0");
+            let mut b = [0u8; 1];
+            put("read_errno", &code(&s.read_exact(&mut b)));
+            put("byte", &(b[0] as char).to_string());
+        }
+        Err(e) => put("connect_errno", &e.raw_os_error().unwrap_or(-1).to_string()),
+    }
+}
+
+fn connect_abstract() {
+    use std::os::linux::net::SocketAddrExt;
+    let name = input("BONELI_PROBE_NAME");
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .unwrap_or_else(|e| fail(2, &format!("abstract name: {e}")));
+    let r = std::os::unix::net::UnixStream::connect_addr(&addr);
+    put("connect_errno", &code(&r));
+}
+
+fn dev() {
+    let mut names: Vec<String> = std::fs::read_dir("/dev")
+        .unwrap_or_else(|e| fail(3, &format!("list /dev: {e}")))
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    put("entries", &names.join(","));
+    // SAFETY: an all-zero statvfs is valid storage for statvfs to fill.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is NUL-terminated and st is valid storage.
+    if unsafe { libc::statvfs(c"/dev".as_ptr(), &mut st) } == 0 {
+        let used = (st.f_blocks - st.f_bfree) as u64 * st.f_frsize as u64;
+        put("used_bytes", &used.to_string());
+    }
+    let null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .and_then(|mut f| f.write_all(b"discarded"));
+    put("null_errno", &code(&null));
+    put("create_errno", &code(&std::fs::write("/dev/x", b"x")));
+    // SAFETY: posix_openpt takes flags; the descriptor is closed below.
+    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if fd >= 0 {
+        // SAFETY: fd was just opened.
+        unsafe { libc::close(fd) };
+        put("openpt_errno", "0");
+    } else {
+        put("openpt_errno", &errno().to_string());
+    }
+}
+
+/// Writes each `path=content` of `BONELI_PROBE_WRITES` (comma-separated)
+/// and prints `errno:<path>`.
+fn write() {
+    for item in input("BONELI_PROBE_WRITES").split(',') {
+        let (path, content) = item
+            .split_once('=')
+            .unwrap_or_else(|| fail(2, "BONELI_PROBE_WRITES item without '='"));
+        put(
+            &format!("errno:{path}"),
+            &code(&std::fs::write(path, content)),
+        );
     }
 }
