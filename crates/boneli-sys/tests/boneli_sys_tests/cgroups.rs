@@ -669,7 +669,8 @@ fn destroy_lifts_cpu_throttle() {
         &limits(256 << 20, 16, (1000, 1_000_000), IoLimits::none()),
     );
     let fixture = Fixture::new("cpu-kill");
-    let (out_r, out_w) = support::pipe();
+    // stdout stays /dev/null: a closed pipe there made libtest in the probe
+    // panic (exit 101) on its first line, before the spin (CI, measured).
     let mut s = spec(
         root_with_cgroup(&fixture),
         &cg,
@@ -684,12 +685,15 @@ fn destroy_lifts_cpu_throttle() {
     .iter()
     .map(|(k, v)| (OsString::from(k), OsString::from(v)))
     .collect();
-    s.stdio.stdout = out_w;
     let mut child = spawn(&s).expect("spawn the spinner");
     drop(s);
-    drop(out_r);
     std::thread::sleep(Duration::from_millis(1500));
     let throttled = keyed(&read(&cg, "cpu.stat"), "nr_throttled");
+    assert_eq!(
+        populated(&cg),
+        1,
+        "the spinner still runs when destroy starts"
+    );
     let start = Instant::now();
     let result = cg.destroy();
     let took = start.elapsed();
