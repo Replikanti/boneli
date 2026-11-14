@@ -152,18 +152,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `lo` up. Mount targets are resolved beneath the new root without
   following any symlink; every host path the child mounts — bind sources,
   the staging directory, the overlay root's layers and `Mount::Overlay`'s
-  `lower`, `upper` and `work` — is opened without following any symlink
-  first, so a symlinked layer or overlay directory fails closed (ELOOP)
-  instead of resolving to the symlink's target. Overlay directory paths
-  must be UTF-8, like the root layers, so the mount options never render
-  a different path. `InsidePath`, `Hostname` and the mount rules (no
-  hidden or duplicate targets, no size 0) are checked before the clone.
-  Every host test runs on a fixture root.
+  `lower`, `upper` and `work` — is opened without following any symlink,
+  so a symlinked layer or overlay directory fails closed (ELOOP). The
+  overlay mounts name the opened descriptors (`/proc/self/fd/<n>`) and
+  hold them across the mount, so a host thread swapping a path for a
+  symlink cannot redirect a layer or directory; the root overlay is
+  capped at 163 layers by the one-page option limit. `InsidePath`,
+  `Hostname` and the mount rules (no hidden or duplicate targets, no size
+  0) are checked before the clone. Every host test runs on a fixture
+  root.
 - `Features::probe`: a probe whose own machinery fails — a failed
-  `pipe2`, `poll`, `read` or `waitid`, a malformed report, or a probe
-  child killed by a signal or ended before it could report — is reported
-  as `probe-failed` with the stage and cause, for both the user-namespace
-  and the seccomp-filter probe, instead of as a missing feature.
+  `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
+  killed by a signal or ended before it could report, or a `clone3`
+  resource error (`EAGAIN` from `RLIMIT_NPROC` or `pids.max`, `ENOMEM`) —
+  is reported as `probe-failed` with the stage and cause, for both the
+  user-namespace and the seccomp-filter probe, instead of as a missing
+  feature.
 - The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
   its own `[lints]` table with every workspace lint but `unsafe_code` at
   the same or a stricter level, the lints of the new

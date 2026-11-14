@@ -242,43 +242,10 @@ fn single_layer_root_is_bind() {
     assert!(has(opts, &["ro", "nosuid", "nodev"]), "{opts:?}");
 }
 
-#[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
-fn overlay_option_page_limit() {
-    let fixture = Fixture::new("page-limit");
-    let p = run_probe_on(
-        "pid",
-        ids(0, 0),
-        &[],
-        fixture.root_with(page_layers(&fixture, 4095), fixture.mounts()),
-    );
-    p.assert_ok();
-    // One byte more is refused before any syscall.
-    let fixture = Fixture::new("page-limit-over");
-    assert!(matches!(
-        spawn_error(fixture.root_with(page_layers(&fixture, 4096), fixture.mounts())),
-        Error::MountOptionsTooLong { len: 4097 }
-    ));
-}
-
-/// Layers whose root overlay options are exactly `total` bytes without the
-/// NUL: "lowerdir=" (9), the names top first joined by ':', ",userxattr"
-/// (10), with the fixture's "base" layer at the bottom.
-fn page_layers(fixture: &Fixture, total: usize) -> Vec<PathBuf> {
-    let mut layers = vec![fixture.layer.clone()];
-    let mut len = 9 + "base".len() + 10;
-    let mut i = 0;
-    while len < total {
-        let take = (total - len - 1).min(200);
-        assert!(take >= 4, "test layout: {take}");
-        let name = format!("{i:03}{}", "x".repeat(take - 3));
-        layers.push(fixture.tree().dir(&format!("layers/{name}")));
-        len += take + 1;
-        i += 1;
-    }
-    assert_eq!(len, total, "test layout");
-    layers
-}
+// The root overlay option-length gate is now count-based (fd-path options,
+// ADR-007 D7 / review 1b) and lives in `plan()`; it is covered by the pure
+// unit test `mount::tests::overlay_option_page_limit`, so there is no host
+// test for it here.
 
 #[test]
 #[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
@@ -754,4 +721,156 @@ fn root_layer_symlink_rejected() {
         } => assert_eq!(errno, libc::ELOOP, "a symlinked layer must be rejected"),
         other => panic!("{other:?}"),
     }
+}
+
+/// A host thread that exchanges `a` and `b` with `renameat2(RENAME_EXCHANGE)`
+/// in a tight loop until stopped; returns the stop flag and the handle.
+fn swap_loop(
+    a: &Path,
+    b: &Path,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<u64>,
+) {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes()).expect("a");
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes()).expect("b");
+    let handle = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: both paths are NUL-terminated for the call's duration.
+            unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    a.as_ptr(),
+                    libc::AT_FDCWD,
+                    b.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                );
+            }
+            n += 1;
+        }
+        n
+    });
+    (stop, handle)
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+fn overlay_upper_swap_race_never_escapes() {
+    // `upper` is a real directory; a host thread exchanges it with a
+    // symlink to `elsewhere` while sandboxes start. Because the child opens
+    // upper without symlinks and mounts the descriptor, a write must land
+    // in the real upper (or the spawn fails closed), never in `elsewhere`.
+    let fixture = Fixture::new("upper-swap");
+    let lower = fixture.tree().dir("rv/lower");
+    let work = fixture.tree().dir("rv/work");
+    let elsewhere = fixture.tree().dir("rv/elsewhere");
+    let upper = fixture.tree().dir("rv/upper");
+    let alt = fixture.tree().path().join("rv/upper-alt");
+    std::os::unix::fs::symlink(&elsewhere, &alt).expect("symlink");
+    let (stop, swapper) = swap_loop(&upper, &alt);
+    let mut spawned = 0;
+    for i in 0..120 {
+        let mut mounts = fixture.mounts();
+        mounts.push(Mount::Overlay {
+            lower: lower.clone(),
+            upper: upper.clone(),
+            work: work.clone(),
+            target: inside("/work2"),
+        });
+        let name = format!("esc-{i}");
+        // The spawn may fail closed when upper is the symlink at open time;
+        // only a leak into `elsewhere` is a failure.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_probe_on(
+                "write",
+                ids(0, 0),
+                &[("BONELI_PROBE_WRITES", &format!("/work2/{name}=x"))],
+                fixture.root_with(vec![fixture.layer.clone()], mounts),
+            )
+        }));
+        if r.is_ok() {
+            spawned += 1;
+        }
+        assert!(
+            !elsewhere.join(&name).exists(),
+            "a write escaped into the swapped symlink target on try {i}"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let swaps = swapper.join().expect("swapper");
+    report(&format!(
+        "overlay_upper_swap_race_never_escapes: {spawned}/120 spawned, {swaps} swaps, no escape"
+    ));
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+fn root_layer_swap_race_never_escapes() {
+    // The top root layer is exchanged with a symlink to a host directory
+    // holding a secret. The child opens each layer without symlinks and
+    // mounts the descriptors, so the secret is never exposed; a swapped
+    // layer at open time fails the spawn closed.
+    let fixture = Fixture::new("layer-swap");
+    let host = fixture.tree().dir("rv/hostdir");
+    std::fs::write(host.join("secret"), b"HOSTSECRET").expect("secret");
+    let top = fixture.tree().dir("rv/top");
+    std::fs::write(top.join("marker"), b"TOP").expect("marker");
+    let alt = fixture.tree().path().join("rv/top-alt");
+    std::os::unix::fs::symlink(&host, &alt).expect("symlink");
+    let (stop, swapper) = swap_loop(&top, &alt);
+    let mut spawned = 0;
+    for _ in 0..120 {
+        let root = fixture.root_with(vec![fixture.layer.clone(), top.clone()], fixture.mounts());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_probe_on(
+                "read",
+                ids(0, 0),
+                &[("BONELI_PROBE_FILES", "/secret")],
+                root,
+            )
+        }));
+        if let Ok(p) = r {
+            spawned += 1;
+            assert_eq!(
+                p.get("file:/secret"),
+                &format!("errno={}", libc::ENOENT),
+                "the host secret became readable: {}",
+                p.raw
+            );
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let swaps = swapper.join().expect("swapper");
+    report(&format!(
+        "root_layer_swap_race_never_escapes: {spawned}/120 spawned, {swaps} swaps, no secret read"
+    ));
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+fn fd_based_multi_layer_root_mounts() {
+    // Three fd-named lower layers stack correctly: the top file wins and a
+    // bottom-only file is still visible. Proves the fd-path option form
+    // mounts a real multi-layer overlay.
+    let fixture = Fixture::new("multi-layer");
+    let bottom = &fixture.layer;
+    std::fs::write(bottom.join("shared"), b"bottom").expect("w");
+    std::fs::write(bottom.join("bottom-only"), b"b").expect("w");
+    let mid = fixture.tree().dir("layers/mid");
+    std::fs::write(mid.join("shared"), b"mid").expect("w");
+    let top = fixture.tree().dir("layers/top");
+    std::fs::write(top.join("shared"), b"top").expect("w");
+    let root = fixture.root_with(vec![bottom.clone(), mid, top], fixture.mounts());
+    let p = run_probe_on(
+        "read",
+        ids(0, 0),
+        &[("BONELI_PROBE_FILES", "/shared,/bottom-only")],
+        root,
+    );
+    p.assert_ok();
+    assert_eq!(p.get("file:/shared"), "top", "{}", p.raw);
+    assert_eq!(p.get("file:/bottom-only"), "b", "{}", p.raw);
 }

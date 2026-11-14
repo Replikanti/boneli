@@ -228,16 +228,14 @@ pub(crate) enum Op {
     MakePrivate,
     /// The one layer, bound read-only onto `staging`.
     RootBind { layer: CString, staging: CString },
-    /// The layers as a read-only overlay onto `staging`; `options` names
-    /// them relative to `parent`, the working directory while mounting.
-    /// `layers` holds the same directories as absolute paths, which the
-    /// child opens without following any symlink before it mounts, so a
-    /// symlinked layer fails closed like a bind source (ELOOP), not
-    /// silently resolves (ADR-007, D7).
+    /// The layers as a read-only overlay onto `staging`. `layers` holds the
+    /// absolute layer paths, top first. The child opens each without
+    /// following any symlink, keeps the descriptors open across the mount,
+    /// and names them in the options as `/proc/self/fd/<n>`, so the kernel
+    /// mounts exactly the directories that were checked and a swap of the
+    /// path for a symlink cannot redirect a layer (ADR-007, D7; 1b).
     RootOverlay {
-        parent: CString,
         layers: Vec<CString>,
-        options: CString,
         staging: CString,
     },
     /// See [`Mount::Bind`].
@@ -254,16 +252,15 @@ pub(crate) enum Op {
         data: CString,
     },
     /// See [`Mount::Overlay`]. The child opens `lower`, `upper` and `work`
-    /// without following any symlink before it mounts, so a symlinked
-    /// overlay directory fails closed like a bind source (ELOOP), not
-    /// silently resolves (ADR-007, D7).
+    /// without following any symlink, keeps the descriptors open across the
+    /// mount, and names them as `/proc/self/fd/<n>`, so a swap of a path for
+    /// a symlink cannot redirect a directory (ADR-007, D7; 1b).
     Overlay {
         index: u32,
         target: CString,
         lower: CString,
         upper: CString,
         work: CString,
-        data: CString,
     },
     /// See [`Mount::Proc`].
     Proc { index: u32, target: CString },
@@ -299,54 +296,29 @@ fn overlay_safe(path: &Path) -> bool {
         .any(|b| matches!(b, b',' | b':' | b'\\'))
 }
 
-fn check_options(options: &str) -> Result<()> {
-    let len = options.len() + 1;
+/// The longest a `/proc/self/fd/<n>` path can be: the prefix (14) plus the
+/// ten decimal digits of an `i32`. The root overlay names each layer by
+/// such a path (D7, 1b), so the worst-case option length, and the layer
+/// count, follow from it.
+pub(crate) const FD_PATH_MAX: usize = 14 + 10;
+
+/// The worst-case length, with the terminating NUL, of the root overlay's
+/// fd-path options for `n` lower layers:
+/// `lowerdir=<fd>:...:<fd>,userxattr`. `lowerdir=` is 9, each layer is at
+/// most [`FD_PATH_MAX`] with a `:` separator between them, `,userxattr` is
+/// 10, and one NUL. The one-page gate ([`OPTIONS_MAX`]) over this caps the
+/// layers at 163, which also bounds the descriptors the child holds open.
+pub(crate) fn root_overlay_options_len(n: usize) -> usize {
+    9 + n * FD_PATH_MAX + n.saturating_sub(1) + ",".len() + "userxattr".len() + 1
+}
+
+/// Checks the root overlay's options fit one page (`OPTIONS_MAX`, D7).
+fn check_root_overlay(n: usize) -> Result<()> {
+    let len = root_overlay_options_len(n);
     if len > OPTIONS_MAX {
         return Err(Error::MountOptionsTooLong { len });
     }
     Ok(())
-}
-
-/// The longest common ancestor of the layers' parent directories.
-fn common_parent(layers: &[PathBuf]) -> PathBuf {
-    let mut common: Vec<Component<'_>> = layers[0]
-        .parent()
-        .map(|p| p.components().collect())
-        .unwrap_or_default();
-    for layer in &layers[1..] {
-        let parent: Vec<Component<'_>> = layer
-            .parent()
-            .map(|p| p.components().collect())
-            .unwrap_or_default();
-        let same = common
-            .iter()
-            .zip(&parent)
-            .take_while(|(a, b)| a == b)
-            .count();
-        common.truncate(same);
-    }
-    common.iter().collect()
-}
-
-/// The options of the read-only root overlay and the directory they are
-/// relative to: `lowerdir=<top>:...:<bottom>,userxattr`. `userxattr`
-/// because an unprivileged layer unpacker can only write `user.*` xattrs
-/// (#7); the names are relative so that more layers fit one page.
-pub(crate) fn root_overlay_options(layers: &[PathBuf]) -> Result<(PathBuf, String)> {
-    let parent = common_parent(layers);
-    let mut names = Vec::with_capacity(layers.len());
-    for layer in layers.iter().rev() {
-        let rel = layer
-            .strip_prefix(&parent)
-            .map_err(|_| Error::InvalidRoot("a layer is not beneath the layers' common parent"))?;
-        let rel = rel
-            .to_str()
-            .ok_or(Error::InvalidRoot("a layer path is not UTF-8"))?;
-        names.push(rel);
-    }
-    let options = format!("lowerdir={},userxattr", names.join(":"));
-    check_options(&options)?;
-    Ok((parent, options))
 }
 
 fn validate_root(root: &Root) -> Result<()> {
@@ -455,20 +427,16 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
             staging,
         });
     } else {
-        let (parent, options) = root_overlay_options(&root.layers)?;
+        check_root_overlay(root.layers.len())?;
+        // lowerdir lists the top layer first; root.layers is bottom first.
         let mut layers = Vec::with_capacity(root.layers.len());
-        for layer in &root.layers {
+        for layer in root.layers.iter().rev() {
             layers.push(c_string(
                 &path_bytes(layer),
                 nul("a layer path contains NUL"),
             )?);
         }
-        ops.push(Op::RootOverlay {
-            parent: c_string(&path_bytes(&parent), nul("a layer path contains NUL"))?,
-            layers,
-            options: c_string(options.as_bytes(), nul("a layer path contains NUL"))?,
-            staging,
-        });
+        ops.push(Op::RootOverlay { layers, staging });
     }
     for (i, mount) in root.mounts.iter().enumerate() {
         let index = u32::try_from(i).map_err(|_| Error::InvalidMount {
@@ -503,31 +471,19 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
             },
             Mount::Overlay {
                 lower, upper, work, ..
-            } => {
-                // validate_root rejects non-UTF-8 and the splitting
-                // characters, so the paths go into the options exactly.
-                let data = format!(
-                    "lowerdir={},upperdir={},workdir={},userxattr",
-                    lower.display(),
-                    upper.display(),
-                    work.display()
-                );
-                check_options(&data)?;
-                Op::Overlay {
-                    index,
-                    target,
-                    lower: c_string(
-                        &path_bytes(lower),
-                        mount_nul("an overlay path contains NUL"),
-                    )?,
-                    upper: c_string(
-                        &path_bytes(upper),
-                        mount_nul("an overlay path contains NUL"),
-                    )?,
-                    work: c_string(&path_bytes(work), mount_nul("an overlay path contains NUL"))?,
-                    data: c_string(data.as_bytes(), mount_nul("an overlay path contains NUL"))?,
-                }
-            }
+            } => Op::Overlay {
+                index,
+                target,
+                lower: c_string(
+                    &path_bytes(lower),
+                    mount_nul("an overlay path contains NUL"),
+                )?,
+                upper: c_string(
+                    &path_bytes(upper),
+                    mount_nul("an overlay path contains NUL"),
+                )?,
+                work: c_string(&path_bytes(work), mount_nul("an overlay path contains NUL"))?,
+            },
             Mount::Proc { .. } => Op::Proc { index, target },
             Mount::Dev { shm_size_bytes, .. } => Op::Dev {
                 index,
@@ -594,6 +550,140 @@ impl Drop for Fd {
         // SAFETY: the descriptor was opened by this child and is closed once.
         unsafe { libc::close(self.0) };
     }
+}
+
+/// The most overlay directories the child holds open while it mounts an
+/// overlay. The root overlay's layer count is capped at 163 by the
+/// one-page option gate ([`check_root_overlay`]), and a writable overlay
+/// uses three (`lower`, `upper`, `work`); 163 covers both.
+const OVERLAY_FD_CAP: usize = 163;
+
+/// Descriptors the child opens symlink-free and keeps open across one
+/// overlay mount, so the kernel resolves `/proc/self/fd/<n>` to exactly the
+/// directory that was checked, not a path it would re-resolve with
+/// `LOOKUP_FOLLOW` (ADR-007, D7; review 1b). Fixed capacity, closed on
+/// drop; the child allocates nothing.
+struct OpenDirs {
+    fds: [c_int; OVERLAY_FD_CAP],
+    len: usize,
+}
+
+impl OpenDirs {
+    fn new() -> OpenDirs {
+        OpenDirs {
+            fds: [-1; OVERLAY_FD_CAP],
+            len: 0,
+        }
+    }
+
+    /// Opens `path` without following any symlink (ELOOP on a symlink) and
+    /// keeps the descriptor; returns its number. `EMFILE` if the fixed
+    /// capacity is exceeded, which the parent's gate prevents.
+    fn open(&mut self, path: &CStr) -> std::result::Result<c_int, i32> {
+        if self.len >= self.fds.len() {
+            return Err(libc::EMFILE);
+        }
+        let fd = open_host(path)?;
+        let raw = fd.0;
+        // The descriptor is now owned by this set, closed in its Drop.
+        std::mem::forget(fd);
+        self.fds[self.len] = raw;
+        self.len += 1;
+        Ok(raw)
+    }
+
+    /// The open descriptors, in the order they were opened.
+    fn fds(&self) -> &[c_int] {
+        &self.fds[..self.len]
+    }
+}
+
+impl Drop for OpenDirs {
+    fn drop(&mut self) {
+        for &fd in &self.fds[..self.len] {
+            // SAFETY: each fd was opened by this child and is closed once.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// A bounded byte writer over a stack buffer, for building overlay options
+/// in the child without allocating.
+struct OptionBuf {
+    buf: [u8; OPTIONS_MAX],
+    at: usize,
+}
+
+impl OptionBuf {
+    fn new() -> OptionBuf {
+        OptionBuf {
+            buf: [0; OPTIONS_MAX],
+            at: 0,
+        }
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> std::result::Result<(), i32> {
+        let end = self.at.checked_add(bytes.len()).ok_or(libc::ENAMETOOLONG)?;
+        if end > self.buf.len() {
+            return Err(libc::ENAMETOOLONG);
+        }
+        self.buf[self.at..end].copy_from_slice(bytes);
+        self.at = end;
+        Ok(())
+    }
+
+    /// Appends `/proc/self/fd/<fd>` (without its NUL).
+    fn put_fd(&mut self, fd: c_int) -> std::result::Result<(), i32> {
+        let mut path = [0u8; FD_PATH_LEN];
+        let with_nul = fd_path(fd, &mut path);
+        self.put(&with_nul[..with_nul.len() - 1])
+    }
+
+    /// Appends the terminating NUL; call once, last.
+    fn finish(&mut self) -> std::result::Result<(), i32> {
+        self.put(&[0])
+    }
+
+    /// The options as a `CStr` (valid only after [`OptionBuf::finish`]).
+    fn as_c_str(&self) -> std::result::Result<&CStr, i32> {
+        CStr::from_bytes_with_nul(&self.buf[..self.at]).map_err(|_| libc::EINVAL)
+    }
+}
+
+/// The options of the read-only root overlay, `lowerdir=<fd>:...,userxattr`,
+/// over the open layer descriptors (top first). `userxattr` because an
+/// unprivileged layer unpacker can write only `user.*` xattrs (#7).
+fn root_overlay_options(fds: &[c_int]) -> std::result::Result<OptionBuf, i32> {
+    let mut o = OptionBuf::new();
+    o.put(b"lowerdir=")?;
+    for (i, &fd) in fds.iter().enumerate() {
+        if i > 0 {
+            o.put(b":")?;
+        }
+        o.put_fd(fd)?;
+    }
+    o.put(b",userxattr")?;
+    o.finish()?;
+    Ok(o)
+}
+
+/// The options of a writable overlay mount over the open `lower`, `upper`
+/// and `work` descriptors.
+fn writable_overlay_options(
+    lower: c_int,
+    upper: c_int,
+    work: c_int,
+) -> std::result::Result<OptionBuf, i32> {
+    let mut o = OptionBuf::new();
+    o.put(b"lowerdir=")?;
+    o.put_fd(lower)?;
+    o.put(b",upperdir=")?;
+    o.put_fd(upper)?;
+    o.put(b",workdir=")?;
+    o.put_fd(work)?;
+    o.put(b",userxattr")?;
+    o.finish()?;
+    Ok(o)
 }
 
 fn openat2(dirfd: c_int, path: &CStr, flags: c_int, resolve: u64) -> std::result::Result<Fd, i32> {
@@ -949,39 +1039,34 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                 step(bind(&layer, &at, ROOT_ATTRS), Step::Root, 0)?;
                 root = Some(step(open_host(staging), Step::Root, 0)?);
             }
-            Op::RootOverlay {
-                parent,
-                layers,
-                options,
-                staging,
-            } => {
+            Op::RootOverlay { layers, staging } => {
                 inject(fault, Step::Root)?;
-                let dir = step(open_host(parent), Step::Root, 0)?;
-                // overlayfs resolves the relative layer names below with
-                // LOOKUP_FOLLOW, so a symlinked layer would be followed.
-                // Open every layer first without following any symlink
-                // (as bind sources are), so a symlink fails closed (ELOOP)
-                // before the mount; the opened descriptors drop at once.
-                for layer in layers {
-                    drop(step(open_host(layer), Step::Root, 0)?);
-                }
-                // Overlay resolves the relative layer names from here.
-                // SAFETY: fchdir takes a descriptor.
-                if unsafe { libc::fchdir(dir.0) } < 0 {
-                    return Err(fail(Step::Root, 0, errno()));
-                }
                 let at = step(open_host(staging), Step::Root, 0)?;
+                // overlayfs would resolve a path argument with LOOKUP_FOLLOW.
+                // Open every layer (top first) without following any symlink
+                // and keep the descriptors open across the mount, then name
+                // them as /proc/self/fd/<n>, so the kernel mounts exactly the
+                // directories that were checked and a swap of a layer path
+                // for a symlink cannot redirect it (review 1b).
+                let mut dirs = OpenDirs::new();
+                for layer in layers {
+                    step(dirs.open(layer), Step::Root, 0)?;
+                }
+                let options = step(root_overlay_options(dirs.fds()), Step::Root, 0)?;
+                let data = step(options.as_c_str(), Step::Root, 0)?;
                 step(
                     mount_on(
                         &at,
                         c"overlay",
                         c"overlay",
                         libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
-                        Some(options),
+                        Some(data),
                     ),
                     Step::Root,
                     0,
                 )?;
+                // The kernel has pinned the layers; the descriptors may go.
+                drop(dirs);
                 root = Some(step(open_host(staging), Step::Root, 0)?);
             }
             op => {
@@ -1034,17 +1119,22 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                         lower,
                         upper,
                         work,
-                        data,
                     } => {
                         let at = target(new_root, rel, *index, fault)?;
                         inject(fault, Step::Overlay)?;
-                        // overlayfs resolves lower, upper and work with
-                        // LOOKUP_FOLLOW; open each first without following
-                        // any symlink (as bind sources are), so a symlink
-                        // fails closed (ELOOP) before the mount.
-                        for dir in [lower, upper, work] {
-                            drop(step(open_host(dir), Step::Overlay, *index)?);
-                        }
+                        // overlayfs would resolve lower, upper and work with
+                        // LOOKUP_FOLLOW. Open each without following any
+                        // symlink, keep the descriptors across the mount, and
+                        // name them as /proc/self/fd/<n>, so a swap of a path
+                        // for a symlink cannot redirect a directory (1b).
+                        let mut dirs = OpenDirs::new();
+                        let i = *index;
+                        let lfd = step(dirs.open(lower), Step::Overlay, i)?;
+                        let ufd = step(dirs.open(upper), Step::Overlay, i)?;
+                        let wfd = step(dirs.open(work), Step::Overlay, i)?;
+                        let options =
+                            step(writable_overlay_options(lfd, ufd, wfd), Step::Overlay, i)?;
+                        let data = step(options.as_c_str(), Step::Overlay, i)?;
                         step(
                             mount_on(
                                 &at,
@@ -1054,8 +1144,9 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                                 Some(data),
                             ),
                             Step::Overlay,
-                            *index,
+                            i,
                         )?;
+                        drop(dirs);
                     }
                     Op::Proc { index, target: rel } => {
                         // Before pivot_root: a new procfs needs a fully
@@ -1306,69 +1397,43 @@ mod tests {
             work: PathBuf::from("/o/w"),
             target: p("/a"),
         };
-        let ops = plan(&root_with(&["/l/a"], vec![ok])).expect("valid overlay");
-        let data = ops
-            .iter()
-            .find_map(|o| match o {
-                Op::Overlay { data, .. } => Some(data.to_bytes().to_vec()),
-                _ => None,
-            })
-            .expect("an overlay op");
-        assert!(
-            !data.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
-            "the options hold a U+FFFD, so a path was rendered lossily: {data:?}"
-        );
-        assert_eq!(data, b"lowerdir=/o/l,upperdir=/o/u,workdir=/o/w,userxattr");
+        // The overlay still plans: the mount names the opened descriptors,
+        // not the path, so a non-UTF-8 path could never be rendered lossily
+        // anyway. The validation above is input hygiene, kept for both
+        // overlays alike.
+        plan(&root_with(&["/l/a"], vec![ok])).expect("valid overlay");
+    }
+
+    #[test]
+    fn root_layers_top_first() {
+        // lowerdir lists the top layer first; root.layers is bottom first.
+        let ops = plan(&root_with(&["/l/bottom", "/l/mid", "/l/top"], vec![])).expect("plan");
+        match &ops[1] {
+            Op::RootOverlay { layers, .. } => {
+                let names: Vec<&str> = layers.iter().map(|c| c.to_str().expect("utf-8")).collect();
+                assert_eq!(names, ["/l/top", "/l/mid", "/l/bottom"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn overlay_option_page_limit() {
-        // "lowerdir=" (9) + names joined by ':' + ",userxattr" (10) + NUL.
-        let layers_for = |total: usize| -> Vec<PathBuf> {
-            let mut names = vec!["b".to_string()];
-            let mut len = 9 + 1 + 10;
-            while len < total {
-                let take = (total - len - 1).min(200);
-                names.push("x".repeat(take.max(1)));
-                len += take.max(1) + 1;
-            }
-            assert_eq!(len, total, "test layout");
-            names
-                .iter()
-                .map(|n| PathBuf::from("/layers").join(n))
-                .collect()
-        };
-        let fits = layers_for(4095);
-        let (parent, options) = root_overlay_options(&fits).expect("4095 bytes fit");
-        assert_eq!(parent, PathBuf::from("/layers"));
-        assert_eq!(options.len(), 4095);
-        assert!(options.ends_with(":b,userxattr"), "bottom layer last");
-        let mut long = fits.clone();
-        let last = long.len() - 1;
-        long[last] = PathBuf::from(format!("{}x", long[last].display()));
+        // The options are `lowerdir=/proc/self/fd/<n>:...,userxattr`, built
+        // in the child from the open descriptors. The gate is the worst
+        // case (each fd path at its longest), which caps the layers at 163
+        // for one page. plan() does not open anything, so dummy paths do.
+        let layers = |n: usize| -> Vec<&'static str> { vec!["/l/x"; n] };
+        assert_eq!(root_overlay_options_len(163), 4094);
+        assert_eq!(root_overlay_options_len(164), 4119);
+        assert!(
+            plan(&root_with(&layers(163), vec![])).is_ok(),
+            "163 layers fit"
+        );
         assert!(matches!(
-            root_overlay_options(&long),
-            Err(Error::MountOptionsTooLong { len: 4097 })
+            plan(&root_with(&layers(164), vec![])),
+            Err(Error::MountOptionsTooLong { len: 4119 })
         ));
-        assert!(matches!(
-            plan(&root_with(
-                &long
-                    .iter()
-                    .map(|p| p.to_str().expect("utf-8"))
-                    .collect::<Vec<_>>(),
-                vec![]
-            )),
-            Err(Error::MountOptionsTooLong { .. })
-        ));
-        // Layers in different directories are named from their common
-        // parent, top first.
-        let (parent, options) = root_overlay_options(&[
-            PathBuf::from("/v/img/a/base"),
-            PathBuf::from("/v/img/b/top"),
-        ])
-        .expect("short");
-        assert_eq!(parent, PathBuf::from("/v/img"));
-        assert_eq!(options, "lowerdir=b/top:a/base,userxattr");
     }
 
     #[test]

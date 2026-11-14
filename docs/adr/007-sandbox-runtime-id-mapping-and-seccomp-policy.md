@@ -148,13 +148,16 @@ missing feature is reported with a stable id and a message naming its
 cause; a failed user namespace is classified from the errno and the
 sysctls that explain it (`userns-apparmor`, `userns-disabled`,
 `userns-other`). A failure of a probe's own machinery, not the feature it
-tests — a failed `pipe2`, `clone3` that is not ENOSYS at the wrong stage,
-`poll`, `read` or `waitid`, a malformed report, or a probe child killed
-by a signal or ended by the test allocation guard — is reported as
-`probe-failed` with the stage and the cause, never as the feature itself,
-so a host near `RLIMIT_NOFILE` is not told its user namespaces or seccomp
-are broken (review of PR 1 and PR 2; `classify_ids_failure`,
-`classify_filter_failure`). Under AppArmor's restriction an unconfined process still
+tests — a failed `pipe2`, `poll`, `read` or `waitid`, a malformed report,
+a probe child killed by a signal or ended by the test allocation guard,
+or a `clone3` that fails for a resource (`EAGAIN` from `RLIMIT_NPROC` or
+the scope's `pids.max`, `ENOMEM`) rather than for a reason that says
+something about user namespaces (`EPERM`, `EACCES`, `ENOSPC`, `EINVAL`) —
+is reported as `probe-failed` with the stage and the cause, never as the
+feature itself, so a host near `RLIMIT_NOFILE` or `RLIMIT_NPROC` is not
+told its user namespaces or seccomp are broken, and both children
+classify the same resource error the same way (review of PR 1 and PR 2;
+`classify_ids_failure`, `classify_filter_failure`). Under AppArmor's restriction an unconfined process still
 creates the namespace, but without capabilities in it, so opening
 `/proc/self/setgroups` fails with EACCES (measured on both CI runners); a
 confined profile without `userns` fails the clone with EPERM. Both count
@@ -421,9 +424,9 @@ its own report code, the item being the mount's index in `Root::mounts`
    recursive, then `mount_setattr`, then `move_mount`), because overlayfs
    refuses a single `lowerdir` without an `upperdir` (EINVAL, measured at
    planning). Several layers become an overlay with `userxattr`, because
-   an unprivileged unpacker (#7) can write only `user.*` xattrs; the layer
-   names in `lowerdir` are relative to the layers' common parent, the
-   working directory while mounting, so that more layers fit the options.
+   an unprivileged unpacker (#7) can write only `user.*` xattrs; each
+   layer is opened symlink-free and named in `lowerdir` by its descriptor
+   (`/proc/self/fd/<n>`, see Path resolution), top layer first.
 4. `MountTarget` and the mount, for every entry of `Root::mounts` in
    order (below).
 5. `Pivot`: `fchdir` to the new root, `pivot_root(".", ".")`, `umount2(".",
@@ -483,16 +486,21 @@ unlimited; #8 sets the values, as with ADR-003's limits. A tmpfs of
 gives ENOSPC (measured, `tmpfs_size_inclusive`): the kernel charges whole
 pages of data, nothing for the inode.
 
-**Mount options fit one page**, 4096 bytes with the NUL: `mount(2)`
-copies its data argument as one page, and 4096 is the x86_64 page and the
+**Mount options fit one page**, 4096 bytes with the NUL: `mount(2)` copies
+its data argument as one page, and 4096 is the x86_64 page and the
 smallest arm64 page, so a longer string would work on some hosts and not
-others. Longer options are `Error::MountOptionsTooLong` before the clone
-(measured: 4095 bytes plus the NUL mount, `overlay_option_page_limit`).
-Layer and overlay paths may not contain `,`, `:` or `\`, which overlay's
-option parser splits on or unescapes, and must be UTF-8: the options are
-built as text, and a lossy render of a non-UTF-8 path would mount a
-different directory than the spec names, so both the root layers and
-`Mount::Overlay`'s directories reject a non-UTF-8 path
+others. The overlay options name the opened descriptors (below), so each
+layer renders as `/proc/self/fd/<n>`, at most 24 bytes (the 14-byte prefix
+plus the ten decimal digits of an `i32`), with a `:` between layers. With
+`lowerdir=` (9) and `,userxattr` (10) and the NUL, `9 + 25·N + 11 ≤ 4096`
+caps the root overlay at **163 lower layers**, checked in the parent
+(`Error::MountOptionsTooLong` before the clone;
+`overlay_option_page_limit` pins 163 fitting and 164 not). That cap also
+bounds the descriptors the child holds open at once. A writable
+`Mount::Overlay` names three descriptors and always fits. The layer and
+overlay directory paths are still required to be UTF-8 and free of `,`,
+`:` and `\` as input hygiene matching the rest of the path validation,
+though with fd-path options they no longer reach overlay's option parser
 (`overlay_non_utf8_path_rejected`).
 
 **Path resolution.** Targets are opened with `openat2(root,
@@ -508,22 +516,27 @@ openat2(2) documents), and the mount would then land on the symlink's
 inode. Every host path the child hands to the kernel is opened in the
 child with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` first, so a
 symlink in it fails with ELOOP and callers pass canonical paths: bind
-sources (`bind_source_symlink_rejected`), the staging directory, the
-overlay root's common parent and every layer below it
-(`root_layer_symlink_rejected`), and `Mount::Overlay`'s `lower`, `upper`
-and `work` (`overlay_dir_symlink_rejected`). overlayfs and `mount(2)`
-resolve a path argument with `LOOKUP_FOLLOW`, so without this a symlinked
-layer or overlay directory would be followed where a bind of the same
-path fails closed — the same swap class, and the one the review of PR 2
-found. For a bind the opened descriptor is what the mount uses
-(`open_tree` on the fd); for the overlay the opened descriptor only
-verifies the path is symlink-free and drops, and the mount then names the
-path (or, for the root, the layer name relative to the opened parent), so
-a symlink at rest is rejected before the mount. The plan opened bind
-sources in the parent; that cannot work: `open_tree(OPEN_TREE_CLONE)` on
-a descriptor opened in the parent's mount namespace fails with EINVAL in
-the child's new one (measured), so the child opens them from the prepared
-path.
+sources (`bind_source_symlink_rejected`), the staging directory, every
+root overlay layer (`root_layer_symlink_rejected`), and `Mount::Overlay`'s
+`lower`, `upper` and `work` (`overlay_dir_symlink_rejected`). overlayfs
+and `mount(2)` resolve a path argument with `LOOKUP_FOLLOW`, so a path
+that is only checked and then mounted by name is a check-then-use race: a
+host thread swapping the path for a symlink between the two wins (review
+of PR 2, round 2, measured: a writable overlay's `upper` and a root layer
+both escaped). So the opened descriptor must be what the mount uses, not a
+re-resolved path. For a bind that is `open_tree` on the fd. For an overlay
+the child keeps every opened descriptor open across the mount and names it
+in the options as `/proc/self/fd/<n>`; the kernel follows that `/proc`
+link to the exact inode that was opened symlink-free, so the swap cannot
+redirect a layer or directory (overlay accepts fd-path options in a user
+namespace, measured; `overlay_upper_swap_race_never_escapes`,
+`root_layer_swap_race_never_escapes` win zero of 120 spawns each while a
+thread swaps). The descriptors are CLOEXEC, held in a fixed-size set, and
+the child allocates nothing; once `mount(2)` returns the kernel has pinned
+the inodes and they are closed. The plan opened bind sources in the
+parent; that cannot work: `open_tree(OPEN_TREE_CLONE)` on a descriptor
+opened in the parent's mount namespace fails with EINVAL in the child's
+new one (measured), so the child opens them from the prepared path.
 
 **The root is read-only** (`root_is_read_only`: `/etc/x` and `mkdir /new`
 give EROFS, `/workspace` and `/tmp` are writable); a writable root for a

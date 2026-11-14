@@ -473,11 +473,33 @@ pub(crate) fn classify_ids_failure(
         Error::Sys { errno, .. } if stage == "clone3" && *errno == libc::ENOSYS => {
             Missing::Clone3 { errno: *errno }
         }
-        Error::Sys { errno, .. } if stage == "clone3" => classify_userns("clone3", *errno, sysctls),
+        // Only an errno that says something about user namespaces is a
+        // user-namespace gap. A resource errno (EAGAIN from RLIMIT_NPROC or
+        // the scope's pids.max, ENOMEM) is the probe's own machinery, like
+        // the filter child's clone3 EAGAIN, so both children agree: it is
+        // probe-failed, not a false host gap (review 3b).
+        Error::Sys { errno, .. } if stage == "clone3" && is_userns_errno(*errno) => {
+            classify_userns("clone3", *errno, sysctls)
+        }
+        Error::Sys { errno, .. } if stage == "clone3" => {
+            probe_failed(PROBE, "clone3", os(*errno).to_string())
+        }
         Error::Setup { step, errno, .. } => classify_userns(step.name(), *errno, sysctls),
         Error::Sys { call, errno } => probe_failed(PROBE, call, os(*errno).to_string()),
         other => probe_failed(PROBE, stage, other.to_string()),
     }
+}
+
+/// Whether a `clone3` errno says something about user namespaces rather
+/// than about resources or the call itself: `EPERM` and `EACCES` (a
+/// policy, AppArmor or a sysctl), `ENOSPC` (`user.max_user_namespaces`),
+/// `EINVAL` (a rejected flag or map). `EAGAIN`, `ENOMEM` and the rest are
+/// resource limits and are reported as `probe-failed` (review 3b).
+fn is_userns_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::EPERM | libc::EACCES | libc::ENOSPC | libc::EINVAL
+    )
 }
 
 /// The filter child: `PR_SET_NO_NEW_PRIVS` and an allow-all filter, without
@@ -988,6 +1010,59 @@ mod tests {
                 detail: proto.to_string(),
             }
         );
+        // A clone3 resource errno (RLIMIT_NPROC, pids.max) is probe-failed,
+        // not a user-namespace gap, so it matches the filter child, which
+        // reports the same errno as probe-failed (review 3b).
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            assert_eq!(
+                classify_ids_failure(
+                    "clone3",
+                    &Error::Sys {
+                        call: "clone3",
+                        errno
+                    },
+                    &apparmor
+                ),
+                Missing::ProbeFailed {
+                    probe: "user-namespace",
+                    stage: "clone3",
+                    detail: errno_detail(errno),
+                },
+                "clone3 resource errno {errno} must be probe-failed even under AppArmor"
+            );
+        }
+        // An errno that does say something about user namespaces stays a
+        // user-namespace gap, never probe-failed. EPERM/EACCES under the
+        // AppArmor sysctl are specifically that cause.
+        for errno in [libc::EPERM, libc::EACCES] {
+            assert_eq!(
+                classify_ids_failure(
+                    "clone3",
+                    &Error::Sys {
+                        call: "clone3",
+                        errno
+                    },
+                    &apparmor
+                ),
+                Missing::UsernsApparmor,
+                "clone3 errno {errno} under AppArmor"
+            );
+        }
+        for errno in [libc::ENOSPC, libc::EINVAL] {
+            assert_ne!(
+                classify_ids_failure(
+                    "clone3",
+                    &Error::Sys {
+                        call: "clone3",
+                        errno
+                    },
+                    &none
+                )
+                .id(),
+                MissingId::ProbeFailed,
+                "clone3 errno {errno} is a user-namespace gap, not probe-failed"
+            );
+        }
     }
 
     #[test]
