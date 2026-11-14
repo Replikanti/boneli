@@ -82,6 +82,7 @@ pub fn main(action: &str) -> ! {
         "spin" => spin(),
         "io-write" => io_write(),
         "cgroup-mkdir" => cgroup_mkdir(),
+        "chmod-kill" => chmod_kill(),
         "oom-adj-spawn" => oom_adj_spawn(),
         _ => fail(1, &format!("unknown action {action}")),
     }
@@ -783,4 +784,36 @@ fn oom_adj_spawn() {
             .get("file:/proc/self/oom_score_adj")
             .map_or("missing", |v| v.trim()),
     );
+}
+
+/// Inside id 0 (which still has the capability before PR 4 of #6) mounts
+/// a cgroup2 of its own cgroup at `/tmp/cg` and makes its `cgroup.kill`
+/// read-only (mode 0444), writes what it did to `BONELI_PROBE_FILE`, then
+/// waits to be killed.
+fn chmod_kill() {
+    let out = input("BONELI_PROBE_FILE");
+    if let Err(e) = std::fs::create_dir_all("/tmp/cg") {
+        fail(3, &format!("mkdir /tmp/cg: {e}"));
+    }
+    // SAFETY: every string is NUL-terminated; no data is passed.
+    let rc = unsafe {
+        libc::mount(
+            c"cgroup2".as_ptr(),
+            c"/tmp/cg".as_ptr(),
+            c"cgroup2".as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    let mount = if rc == 0 { 0 } else { errno() };
+    use std::os::unix::fs::PermissionsExt;
+    let chmod = code(&std::fs::set_permissions(
+        "/tmp/cg/cgroup.kill",
+        std::fs::Permissions::from_mode(0o444),
+    ));
+    let _ = std::fs::write(&out, format!("mount={mount} chmod={chmod} done\n"));
+    loop {
+        // SAFETY: pause only waits for a signal.
+        unsafe { libc::pause() };
+    }
 }

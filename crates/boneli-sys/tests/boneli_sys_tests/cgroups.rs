@@ -876,3 +876,72 @@ fn destroy_failure_is_recorded_with_path() {
     }
     assert!(leaked.contains(&path), "{leaked:?}");
 }
+
+#[test]
+#[ignore = "host: cgroup v2 delegation, user namespaces"]
+fn kill_survives_chmod_from_inside() {
+    // Review round 3 of PR 3: inside id 0 mounts its own cgroup2 and makes
+    // cgroup.kill read-only. The kill goes through the descriptor create
+    // held open, so destroy still kills the workload and removes the
+    // cgroup.
+    let cg = cgroup::sandbox("chmod-kill");
+    let fixture = Fixture::new("chmod-kill");
+    let mut s = spec(
+        fixture.root(),
+        &cg,
+        crate::support::rootfs::PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+    );
+    s.env = [
+        (support::probe::ACTION_VAR, "chmod-kill"),
+        ("BONELI_PROBE_FILE", "/workspace/out"),
+    ]
+    .iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    let mut child = spawn(&s).expect("spawn the probe");
+    drop(s);
+    let out_file = fixture.workspace.join("out");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let out = loop {
+        let text = std::fs::read_to_string(&out_file).unwrap_or_default();
+        if text.contains("done") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        out.trim(),
+        "mount=0 chmod=0 done",
+        "the probe did not chmod"
+    );
+    let path = cg.path().to_path_buf();
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path.join("cgroup.kill"))
+            .expect("stat cgroup.kill")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode, 0o444, "cgroup.kill is read-only now");
+    let result = cg.destroy();
+    let left = path.exists();
+    if left {
+        // Clean up before waiting, so a failure here leaves nothing running.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            path.join("cgroup.kill"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+        let _ = std::fs::write(path.join("cgroup.kill"), "1");
+    }
+    let status = wait_bounded(&mut child, Duration::from_secs(10));
+    if left {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = std::fs::remove_dir(&path);
+    }
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
+    assert!(!left, "{} left behind", path.display());
+}

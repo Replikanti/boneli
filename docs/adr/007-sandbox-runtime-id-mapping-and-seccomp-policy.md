@@ -798,7 +798,23 @@ and four spinners, `destroy` took 496–506 ms without a lift (measured
 three times), so `cpu.max` is written to `max <period>` as well
 (`destroy_lifts_cpu_throttle`: 4 ms). Lifting after the kill is safe: a
 killed task never returns to user space, so it can only finish what is
-already in the kernel. Memory and task limits do not delay an exit. The wait polls `cgroup.events` for `POLLPRI`
+already in the kernel. Memory and task limits do not delay an exit.
+**The limits are lifted only after the kill succeeded** (review round 3
+of PR 3). Before, a failed `cgroup.kill` write was followed by the lift
+anyway, so the surviving workload ran without its CPU limit (about
+995,499 µs of CPU per second, the reviewer measured) in a cgroup that was
+then left behind. Now a failed kill keeps every limit, skips the wait
+(nothing would empty the cgroup), still tries the removal, and returns
+`CgroupTeardown` with the cgroup recorded as left behind
+(`failed_kill_keeps_limits`). **The kill cannot be blocked from inside:**
+until PR 4 drops the capabilities, inside id 0 can mount a cgroup2 of its
+own and `chmod 444` its `cgroup.kill`, and a write that opens the file by
+name then fails with EACCES (measured). `create` therefore opens
+`cgroup.kill` (write) and `cgroup.events` (read) once the limits are in
+place and before any task can enter, and teardown uses those descriptors:
+cgroupfs checks permission at open, not at each write, so a write through
+the held descriptor still kills after the mode change (measured;
+`kill_survives_chmod_from_inside`), and no `fchmodat` back is needed. The wait polls `cgroup.events` for `POLLPRI`
 and re-reads it at least every 100 ms in case a notification is missed;
 10 s is a hang bound, not a target (`destroy_kills_all_and_removes`
 measured about 3 ms for three sleepers). A killed child that its `Child`

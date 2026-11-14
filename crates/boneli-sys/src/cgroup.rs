@@ -476,6 +476,15 @@ pub struct Cgroup {
     io_devices: Vec<DeviceNumber>,
     /// The CPU period, for lifting the quota at the kill.
     cpu_period_us: u64,
+    /// `cgroup.kill` (write) and `cgroup.events` (read), opened by
+    /// `create` once the limits are in place and before any task can
+    /// enter. Teardown uses these descriptors, so a workload that changes
+    /// the files' modes through a cgroup2 mount of its own cannot stop the
+    /// kill: permission is checked at open, not at each write (measured,
+    /// review round 3 of PR 3). `None` only while `create` is still writing
+    /// the limits, when no task can have entered yet.
+    kill: Option<OwnedFd>,
+    events: Option<OwnedFd>,
     live: bool,
 }
 
@@ -541,12 +550,16 @@ impl Cgroup {
             // teardown never rewrites a line the kernel refused.
             io_devices: Vec::new(),
             cpu_period_us: limits.cpu.period_us,
+            kill: None,
+            events: None,
             live: true,
         };
         let mut cg = cg;
         check_cgroup2(&cg.dir, &cg.path)?;
         cg.write_limits(limits)?;
         cg.check_limits(limits)?;
+        cg.kill = Some(open_file(&cg.dir, "cgroup.kill", libc::O_WRONLY)?);
+        cg.events = Some(open_file(&cg.dir, "cgroup.events", libc::O_RDONLY)?);
         Ok(cg)
     }
 
@@ -634,8 +647,12 @@ impl Cgroup {
     /// A killed child that was not reaped yet does not keep it populated
     /// (measured); its [`crate::Child`] still reaps it.
     ///
-    /// Every step runs even when an earlier one failed, so a failed lift
-    /// never skips the wait or the removal. Any failure is returned as
+    /// The kill goes through the `cgroup.kill` descriptor `create` held
+    /// open, so the workload cannot block it by changing the file's mode.
+    /// The limits are lifted only after the kill succeeded; if it failed,
+    /// they stay, there is no wait (nothing would empty the cgroup), and
+    /// the removal is still tried. A failed lift never skips the wait or
+    /// the removal. Any failure is returned as
     /// [`Error::CgroupTeardown`] with the path, whether the directory is
     /// gone and every error in order; a cgroup left behind is also
     /// recorded for [`leaked_cgroups`] (ADR-007, D8).
@@ -652,17 +669,25 @@ impl Cgroup {
     /// attempted, every error is collected.
     fn kill_and_remove(&self) -> Result<()> {
         let mut errors = Vec::new();
-        if let Err(e) = write_file(&self.dir, "cgroup.kill", b"1") {
-            errors.push(e);
+        match self.write_kill() {
+            Ok(()) => {
+                // Killed: no task returns to user space, so none can start
+                // new IO or use the CPU it gets now; what is left is in the
+                // kernel. Only now are the limits lifted.
+                self.lift_throttles(&mut errors);
+                if let Err(e) = self.wait_unpopulated() {
+                    errors.push(e);
+                }
+            }
+            Err(e) => {
+                // Not killed: the limits stay, so a workload that survives
+                // keeps running inside them, and there is no wait, because
+                // nothing will empty the cgroup (review round 3 of PR 3).
+                errors.push(e);
+            }
         }
-        // Killed: no task returns to user space, so none can start new IO
-        // or use the CPU it gets now; what is left is in the kernel.
-        self.lift_throttles(&mut errors);
-        if let Err(e) = self.wait_unpopulated() {
-            errors.push(e);
-        }
-        // Tried even after a failed wait: a cgroup that did empty in the
-        // meantime is still removed, and one that did not fails with EBUSY.
+        // Tried in every case: a cgroup that is empty is removed, and one
+        // that is not fails with EBUSY and is reported as left behind.
         // SAFETY: the name is NUL-terminated; the parent is an open directory.
         let rc = unsafe {
             libc::unlinkat(
@@ -697,13 +722,40 @@ impl Cgroup {
         }
     }
 
+    /// Writes `1` to `cgroup.kill` through the descriptor `create` held
+    /// open, or, while `create` has not opened it yet (no task can have
+    /// entered), through a fresh one.
+    fn write_kill(&self) -> Result<()> {
+        let Some(fd) = &self.kill else {
+            return write_file(&self.dir, "cgroup.kill", b"1");
+        };
+        // SAFETY: the byte is valid for its length; fd is open for writing.
+        let n = unsafe { libc::pwrite(fd.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) };
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(Error::CgroupFile {
+                file: "cgroup.kill",
+                errno: if n < 0 { errno() } else { libc::EIO },
+            })
+        }
+    }
+
     /// Waits until `cgroup.events` says `populated 0`, at most
-    /// [`KILL_BOUND`].
+    /// [`KILL_BOUND`], through the held descriptor (or a fresh one while
+    /// `create` has not opened it yet).
     fn wait_unpopulated(&self) -> Result<()> {
-        let events = open_file(&self.dir, "cgroup.events", libc::O_RDONLY)?;
+        let fresh;
+        let events = match &self.events {
+            Some(fd) => fd,
+            None => {
+                fresh = open_file(&self.dir, "cgroup.events", libc::O_RDONLY)?;
+                &fresh
+            }
+        };
         let deadline = Instant::now() + KILL_BOUND;
         loop {
-            let text = read_fd(&events, "cgroup.events")?;
+            let text = read_fd(events, "cgroup.events")?;
             if text.lines().any(|l| l.trim() == "populated 0") {
                 return Ok(());
             }
@@ -756,6 +808,8 @@ impl Cgroup {
             path: PathBuf::from("/"),
             io_devices: Vec::new(),
             cpu_period_us: 100_000,
+            kill: None,
+            events: None,
             live: false,
         }
     }
@@ -1179,6 +1233,64 @@ mod tests {
         }
         assert!(!exists, "{} left behind", path.display());
         assert!(!leaked_cgroups().contains(&path));
+    }
+
+    #[test]
+    #[ignore = "host: cgroup v2 delegation"]
+    fn failed_kill_keeps_limits() {
+        // Review round 3 of PR 3: when cgroup.kill cannot be written, the
+        // limits must stay (a surviving workload keeps running inside
+        // them), there is no 10 s wait, and the removal is still tried.
+        // The kill failure is injected through a descriptor that cannot be
+        // written; a host-made sub-cgroup keeps the cgroup in place so its
+        // cpu.max can be read afterwards.
+        let _host = crate::test_guard::host_lock();
+        let mut cg = crate::test_guard::sandbox_cgroup("failed-kill");
+        let path = cg.path().to_path_buf();
+        std::fs::write(path.join("cgroup.max.descendants"), "1").expect("raise from the host");
+        std::fs::write(path.join("cgroup.max.depth"), "1").expect("raise from the host");
+        std::fs::create_dir(path.join("sub")).expect("a sub-cgroup");
+        cg.kill = Some(
+            std::fs::File::open("/dev/null")
+                .expect("open /dev/null read-only")
+                .into(),
+        );
+        let start = Instant::now();
+        let result = cg.destroy();
+        let took = start.elapsed();
+        let cpu = std::fs::read_to_string(path.join("cpu.max")).unwrap_or_default();
+        let leaked = leaked_cgroups();
+        let _ = std::fs::remove_dir(path.join("sub"));
+        let _ = std::fs::remove_dir(&path);
+        match result {
+            Err(Error::CgroupTeardown {
+                path: p,
+                removed: false,
+                errors,
+            }) => {
+                assert_eq!(p, path);
+                assert!(
+                    matches!(
+                        errors.as_slice(),
+                        [
+                            Error::CgroupFile {
+                                file: "cgroup.kill",
+                                errno: libc::EBADF
+                            },
+                            Error::Sys {
+                                call: "unlinkat(cgroup)",
+                                errno: libc::EBUSY
+                            }
+                        ]
+                    ),
+                    "{errors:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(cpu.trim(), "100000 100000", "the CPU limit was lifted");
+        assert!(took < Duration::from_secs(1), "waited {took:?}");
+        assert!(leaked.contains(&path), "{leaked:?}");
     }
 
     #[test]
