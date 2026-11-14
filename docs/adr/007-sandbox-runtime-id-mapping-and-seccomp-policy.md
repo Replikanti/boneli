@@ -136,20 +136,25 @@ single id map writes, `clone3`, `close_range` with `CLOSE_RANGE_CLOEXEC`,
 filter with `PR_SET_NO_NEW_PRIVS`, installed by a probe child of its own
 that is cloned without a new user namespace (`SECCOMP_GET_ACTION_AVAIL`
 alone also succeeds on a kernel with `CONFIG_SECCOMP` but without
-`CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` when the
-child's filter step fails; a failed `clone3`, pipe or wait around it (EAGAIN
-from a process limit, say) says nothing about seccomp and is reported as
-`probe-failed` with its call and errno, review of PR 1; it
-runs as `Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so
-that a host lacking both filters and user namespaces is told about both:
-the probe reports the exact missing set), the Landlock ABI, cgroup
+`CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` only when the
+child's own filter step fails or its install hangs; it runs as
+`Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so that a
+host lacking both filters and user namespaces is told about both: the
+probe reports the exact missing set), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup`, and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
 writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
 missing feature is reported with a stable id and a message naming its
 cause; a failed user namespace is classified from the errno and the
 sysctls that explain it (`userns-apparmor`, `userns-disabled`,
-`userns-other`). Under AppArmor's restriction an unconfined process still
+`userns-other`). A failure of a probe's own machinery, not the feature it
+tests — a failed `pipe2`, `clone3` that is not ENOSYS at the wrong stage,
+`poll`, `read` or `waitid`, a malformed report, or a probe child killed
+by a signal or ended by the test allocation guard — is reported as
+`probe-failed` with the stage and the cause, never as the feature itself,
+so a host near `RLIMIT_NOFILE` is not told its user namespaces or seccomp
+are broken (review of PR 1 and PR 2; `classify_ids_failure`,
+`classify_filter_failure`). Under AppArmor's restriction an unconfined process still
 creates the namespace, but without capabilities in it, so opening
 `/proc/self/setgroups` fails with EACCES (measured on both CI runners); a
 confined profile without `userns` fails the clone with EPERM. Both count
@@ -484,7 +489,11 @@ smallest arm64 page, so a longer string would work on some hosts and not
 others. Longer options are `Error::MountOptionsTooLong` before the clone
 (measured: 4095 bytes plus the NUL mount, `overlay_option_page_limit`).
 Layer and overlay paths may not contain `,`, `:` or `\`, which overlay's
-option parser splits on or unescapes.
+option parser splits on or unescapes, and must be UTF-8: the options are
+built as text, and a lossy render of a non-UTF-8 path would mount a
+different directory than the spec names, so both the root layers and
+`Mount::Overlay`'s directories reject a non-UTF-8 path
+(`overlay_non_utf8_path_rejected`).
 
 **Path resolution.** Targets are opened with `openat2(root,
 <target>, O_PATH, RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS |
@@ -496,13 +505,25 @@ fails with ELOOP (`mount_target_symlink_rejected`). The plan had
 `O_NOFOLLOW` too; it is left out because with it `openat2` returns a
 descriptor of a trailing symlink itself instead of failing (measured, as
 openat2(2) documents), and the mount would then land on the symlink's
-inode. Host paths (bind sources, layers, the staging directory) are
-opened in the child with `RESOLVE_NO_SYMLINKS`, so a symlink in a source
-fails with ELOOP (`bind_source_symlink_rejected`) and callers pass
-canonical paths. The plan opened bind sources in the parent; that cannot
-work: `open_tree(OPEN_TREE_CLONE)` on a descriptor opened in the parent's
-mount namespace fails with EINVAL in the child's new one (measured), so
-the child opens them from the prepared path.
+inode. Every host path the child hands to the kernel is opened in the
+child with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` first, so a
+symlink in it fails with ELOOP and callers pass canonical paths: bind
+sources (`bind_source_symlink_rejected`), the staging directory, the
+overlay root's common parent and every layer below it
+(`root_layer_symlink_rejected`), and `Mount::Overlay`'s `lower`, `upper`
+and `work` (`overlay_dir_symlink_rejected`). overlayfs and `mount(2)`
+resolve a path argument with `LOOKUP_FOLLOW`, so without this a symlinked
+layer or overlay directory would be followed where a bind of the same
+path fails closed — the same swap class, and the one the review of PR 2
+found. For a bind the opened descriptor is what the mount uses
+(`open_tree` on the fd); for the overlay the opened descriptor only
+verifies the path is symlink-free and drops, and the mount then names the
+path (or, for the root, the layer name relative to the opened parent), so
+a symlink at rest is rejected before the mount. The plan opened bind
+sources in the parent; that cannot work: `open_tree(OPEN_TREE_CLONE)` on
+a descriptor opened in the parent's mount namespace fails with EINVAL in
+the child's new one (measured), so the child opens them from the prepared
+path.
 
 **The root is read-only** (`root_is_read_only`: `/etc/x` and `mkdir /new`
 give EROFS, `/workspace` and `/tmp` are writable); a writable root for a
@@ -540,7 +561,8 @@ the 0:0 whiteout (allowed, measured; Linux 5.8 lifted `CAP_MKNOD` for it).
   AppArmor profile, and RHEL 9 and Ubuntu 22.04 GA are out.
 - Every sandbox has a read-only root and the mounts its spec names, and
   nothing else of the host; callers pass canonical host paths, because
-  bind sources are resolved without following symlinks (D7).
+  every host path the child mounts — bind sources, layers and overlay
+  directories — is resolved without following symlinks (D7).
 - One id inside: images that switch users fail, and the runner must be a
   dedicated user without privileged supplementary groups.
 - The host-setup block runs with root, on CI and on user hosts. It is

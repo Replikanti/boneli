@@ -150,13 +150,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host device nodes, a private `devpts`, `shm` and the standard
   symlinks), `pivot_root` with the old root detached, the hostname and
   `lo` up. Mount targets are resolved beneath the new root without
-  following any symlink, and host paths without following symlinks.
-  `InsidePath`, `Hostname` and the mount rules (no hidden or duplicate
-  targets, no size 0) are checked before the clone. Every host test runs
-  on a fixture root.
-- `Features::probe`: a seccomp probe child that cannot be started (a
-  failed `clone3`, pipe or wait) is reported as `probe-failed` with the
-  call and errno instead of as a missing seccomp filter.
+  following any symlink; every host path the child mounts — bind sources,
+  the staging directory, the overlay root's layers and `Mount::Overlay`'s
+  `lower`, `upper` and `work` — is opened without following any symlink
+  first, so a symlinked layer or overlay directory fails closed (ELOOP)
+  instead of resolving to the symlink's target. Overlay directory paths
+  must be UTF-8, like the root layers, so the mount options never render
+  a different path. `InsidePath`, `Hostname` and the mount rules (no
+  hidden or duplicate targets, no size 0) are checked before the clone.
+  Every host test runs on a fixture root.
+- `Features::probe`: a probe whose own machinery fails — a failed
+  `pipe2`, `poll`, `read` or `waitid`, a malformed report, or a probe
+  child killed by a signal or ended before it could report — is reported
+  as `probe-failed` with the stage and cause, for both the user-namespace
+  and the seccomp-filter probe, instead of as a missing feature.
 - The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
   its own `[lints]` table with every workspace lint but `unsafe_code` at
   the same or a stricter level, the lints of the new

@@ -167,16 +167,18 @@ pub enum Missing {
         required: u32,
     },
     /// A probe could not run its test, for a reason that says nothing
-    /// about the feature (a resource limit, a failed pipe), so the feature
-    /// is neither present nor missing; the probe fails closed with the real
-    /// cause instead of naming a feature the host may have.
+    /// about the feature (a resource limit, a failed pipe, a killed or
+    /// mis-reporting probe child), so the feature is neither present nor
+    /// missing; the probe fails closed with the real cause instead of
+    /// naming a feature the host may have (ADR-007, D3; review of PR 1 and
+    /// PR 2 of #6).
     ProbeFailed {
-        /// The feature the probe tests (a [`MissingId`] name).
+        /// The feature the probe tests.
         probe: &'static str,
-        /// The call that failed.
+        /// Where it failed: a syscall, a setup stage, or how the child ended.
         stage: &'static str,
-        /// Its errno.
-        errno: i32,
+        /// The cause: an errno, or a description of how the child ended.
+        detail: String,
     },
 }
 
@@ -271,11 +273,10 @@ impl fmt::Display for Missing {
             Missing::ProbeFailed {
                 probe,
                 stage,
-                errno,
+                detail,
             } => write!(
                 f,
-                "the {probe} probe could not run: {stage} failed: {} (says nothing about {probe}; retry once the cause is gone)",
-                os(*errno)
+                "the {probe} probe could not run: {stage}: {detail} (says nothing about {probe}; retry once the cause is gone)"
             ),
         }
     }
@@ -420,56 +421,85 @@ fn run_probe_child(
     }
 }
 
-/// The user-namespace child: the single id map writes.
+/// A `probe-failed`: the probe's own machinery broke, so it names neither
+/// present nor missing (review of PR 1 and PR 2 of #6).
+fn probe_failed(probe: &'static str, stage: &'static str, detail: String) -> Missing {
+    Missing::ProbeFailed {
+        probe,
+        stage,
+        detail,
+    }
+}
+
+/// How a probe child that ran to its end but did not exit 0 is described:
+/// the allocation guard's 97, another exit code, or a signal (an outside
+/// kill, OOM, `pids.max`). None of these say anything about the feature.
+fn exit_detail(status: ExitStatus) -> String {
+    match status {
+        ExitStatus::Exited(code) => format!("the probe child exited with code {code}"),
+        ExitStatus::Signaled(sig) => format!("the probe child was killed by signal {sig}"),
+    }
+}
+
+/// The user-namespace child: the single id map writes. Only a failed
+/// `clone3` or a failed id-map step is a user-namespace signal; the probe's
+/// own machinery breaking (a failed pipe, poll, read or wait, or a child
+/// killed before it could report) is `probe-failed`, so a host near
+/// `RLIMIT_NOFILE` is not told its user namespaces are broken (review of
+/// PR 2 of #6).
 pub(crate) fn probe_ids_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
-    let (stage, error) = match run_probe_child(Action::ProbeIds, fault, timeout).err()? {
-        ProbeFailure::Exit(status) => {
-            return Some(Missing::UsernsOther {
-                stage: "exit",
-                detail: format!("the probe child ended with {status:?}"),
-            });
+    const PROBE: &str = "user-namespace";
+    match run_probe_child(Action::ProbeIds, fault, timeout).err()? {
+        ProbeFailure::Exit(status) => Some(probe_failed(PROBE, "exit", exit_detail(status))),
+        ProbeFailure::Error { stage, error } => {
+            Some(classify_ids_failure(stage, &error, &UsernsSysctls::read()))
         }
-        ProbeFailure::Error { stage, error } => (stage, error),
-    };
-    Some(match error {
-        Error::Sys { errno, .. } if stage == "clone3" && errno == libc::ENOSYS => {
-            Missing::Clone3 { errno }
+    }
+}
+
+/// Names what a failed user-namespace child says (pure, so every branch has
+/// a unit test). `clone3` or an id-map step failing is a real signal about
+/// user namespaces, classified from the errno and the sysctls; anything
+/// else (a failed pipe, poll, read or wait, a malformed report) is the
+/// probe's own machinery, which says nothing about the feature, so it is
+/// `probe-failed` with its stage and cause (review of PR 2 of #6).
+pub(crate) fn classify_ids_failure(
+    stage: &'static str,
+    error: &Error,
+    sysctls: &UsernsSysctls,
+) -> Missing {
+    const PROBE: &str = "user-namespace";
+    match error {
+        Error::Sys { errno, .. } if stage == "clone3" && *errno == libc::ENOSYS => {
+            Missing::Clone3 { errno: *errno }
         }
-        Error::Sys { errno, .. } if stage == "clone3" => {
-            classify_userns("clone3", errno, &UsernsSysctls::read())
-        }
-        Error::Setup { step, errno, .. } => {
-            classify_userns(step.name(), errno, &UsernsSysctls::read())
-        }
-        error => Missing::UsernsOther {
-            stage,
-            detail: error.to_string(),
-        },
-    })
+        Error::Sys { errno, .. } if stage == "clone3" => classify_userns("clone3", *errno, sysctls),
+        Error::Setup { step, errno, .. } => classify_userns(step.name(), *errno, sysctls),
+        Error::Sys { call, errno } => probe_failed(PROBE, call, os(*errno).to_string()),
+        other => probe_failed(PROBE, stage, other.to_string()),
+    }
 }
 
 /// The filter child: `PR_SET_NO_NEW_PRIVS` and an allow-all filter, without
 /// a new user namespace. `SECCOMP_GET_ACTION_AVAIL` alone also succeeds on a
 /// kernel with `CONFIG_SECCOMP` but without `CONFIG_SECCOMP_FILTER`.
 pub(crate) fn probe_filter_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
-    let (stage, error) = match run_probe_child(Action::ProbeFilter, fault, timeout).err()? {
-        // A filter child that ran to its end without exiting 0 (the
-        // allocation guard's 97, a signal) proves nothing about filters.
-        ProbeFailure::Exit(_) => {
-            return Some(Missing::SeccompFilter {
-                errno: libc::EPROTO,
-            });
-        }
-        ProbeFailure::Error { stage, error } => (stage, error),
-    };
-    classify_filter_failure(stage, &error)
+    const PROBE: &str = "seccomp-filter";
+    match run_probe_child(Action::ProbeFilter, fault, timeout).err()? {
+        // A filter child that reached its end but did not exit 0 (the
+        // allocation guard's 97, or a signal) proves nothing about filters.
+        ProbeFailure::Exit(status) => Some(probe_failed(PROBE, "exit", exit_detail(status))),
+        ProbeFailure::Error { stage, error } => classify_filter_failure(stage, &error),
+    }
 }
 
 /// Names what a failed filter child says (pure, so every branch has a unit
-/// test). Only a failure of the child's own filter step is a missing
-/// filter; a failed `clone3`, pipe or wait in the parent (EAGAIN from a
-/// process limit, ENOMEM) says nothing about seccomp, so it is reported
-/// with its call and errno as `probe-failed` (review of PR 1 of #6).
+/// test). Only a failure of the child's own filter step (`Step::Seccomp`)
+/// is a missing filter; the hung-install timeout is still read as a missing
+/// filter, because the install is what hung. Every other failure is the
+/// probe's own machinery (a failed `clone3`, pipe, poll, read or wait, a
+/// malformed report), which says nothing about seccomp, so it is
+/// `probe-failed` with its stage and cause (review of PR 1 and PR 2 of #6).
 pub(crate) fn classify_filter_failure(stage: &'static str, error: &Error) -> Option<Missing> {
     const PROBE: &str = "seccomp-filter";
     Some(match error {
@@ -480,17 +510,12 @@ pub(crate) fn classify_filter_failure(stage: &'static str, error: &Error) -> Opt
             errno,
             ..
         } => Missing::SeccompFilter { errno: *errno },
-        Error::Sys { call, errno } => Missing::ProbeFailed {
-            probe: PROBE,
-            stage: call,
-            errno: *errno,
-        },
+        // The install step hung: the filter itself is what did not finish.
         Error::SetupTimeout(_) => Missing::SeccompFilter {
             errno: libc::ETIMEDOUT,
         },
-        _ => Missing::SeccompFilter {
-            errno: libc::EPROTO,
-        },
+        Error::Sys { call, errno } => probe_failed(PROBE, call, os(*errno).to_string()),
+        other => probe_failed(PROBE, stage, other.to_string()),
     })
 }
 
@@ -644,7 +669,7 @@ mod tests {
             MissingId::ProbeFailed => Missing::ProbeFailed {
                 probe: "seccomp-filter",
                 stage: "clone3",
-                errno: libc::EAGAIN,
+                detail: std::io::Error::from_raw_os_error(libc::EAGAIN).to_string(),
             },
         }
     }
@@ -674,7 +699,7 @@ mod tests {
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
             "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
             format!(
-                "the seccomp-filter probe could not run: clone3 failed: {} (says nothing about seccomp-filter; retry once the cause is gone)",
+                "the seccomp-filter probe could not run: clone3: {} (says nothing about seccomp-filter; retry once the cause is gone)",
                 e(libc::EAGAIN)
             ),
         ];
@@ -789,10 +814,14 @@ mod tests {
         }
     }
 
+    fn errno_detail(errno: i32) -> String {
+        std::io::Error::from_raw_os_error(errno).to_string()
+    }
+
     #[test]
     fn filter_failure_classification() {
         // A clone3 that fails for a resource limit is not a missing filter:
-        // the real call and errno are reported.
+        // the real call and cause are reported.
         for errno in [libc::EAGAIN, libc::ENOMEM, libc::EPERM] {
             assert_eq!(
                 classify_filter_failure(
@@ -805,7 +834,7 @@ mod tests {
                 Some(Missing::ProbeFailed {
                     probe: "seccomp-filter",
                     stage: "clone3",
-                    errno
+                    detail: errno_detail(errno),
                 }),
                 "clone3 errno {errno}"
             );
@@ -821,7 +850,18 @@ mod tests {
             Some(Missing::ProbeFailed {
                 probe: "seccomp-filter",
                 stage: "pipe2",
-                errno: libc::EMFILE
+                detail: errno_detail(libc::EMFILE),
+            })
+        );
+        // A malformed report (Protocol) is the probe's machinery, not a
+        // missing filter.
+        let proto = Error::Protocol(crate::error::ProtocolError::Length(3));
+        assert_eq!(
+            classify_filter_failure("report", &proto),
+            Some(Missing::ProbeFailed {
+                probe: "seccomp-filter",
+                stage: "report",
+                detail: proto.to_string(),
             })
         );
         // Without clone3 the id child reports it; the filter child adds
@@ -850,12 +890,131 @@ mod tests {
                 errno: libc::EINVAL
             })
         );
+        // The install hung: still a missing filter, because the install is
+        // what did not finish.
         assert_eq!(
             classify_filter_failure("report", &Error::SetupTimeout(Duration::from_secs(1))),
             Some(Missing::SeccompFilter {
                 errno: libc::ETIMEDOUT
             })
         );
+    }
+
+    #[test]
+    fn exit_status_is_probe_failed_not_a_feature() {
+        // A probe child killed by a signal or ending with the allocation
+        // guard's 97 says nothing about its feature; both children report
+        // probe-failed, never a host gap (review of PR 2 of #6).
+        assert_eq!(
+            exit_detail(ExitStatus::Signaled(libc::SIGKILL)),
+            "the probe child was killed by signal 9"
+        );
+        assert_eq!(
+            exit_detail(ExitStatus::Exited(crate::test_guard::EXIT_ALLOCATED)),
+            "the probe child exited with code 97"
+        );
+    }
+
+    #[test]
+    fn ids_failure_classification() {
+        let none = UsernsSysctls::default();
+        // clone3 ENOSYS is "no clone3"; another clone3 errno is a real
+        // user-namespace signal classified from the sysctls.
+        assert_eq!(
+            classify_ids_failure(
+                "clone3",
+                &Error::Sys {
+                    call: "clone3",
+                    errno: libc::ENOSYS
+                },
+                &none
+            ),
+            Missing::Clone3 {
+                errno: libc::ENOSYS
+            }
+        );
+        let apparmor = UsernsSysctls {
+            apparmor_restrict: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_ids_failure(
+                "clone3",
+                &Error::Sys {
+                    call: "clone3",
+                    errno: libc::EPERM
+                },
+                &apparmor
+            ),
+            Missing::UsernsApparmor
+        );
+        // A failed id-map step is a real signal too.
+        assert_eq!(
+            classify_ids_failure(
+                "report",
+                &Error::Setup {
+                    step: Step::SetGroups,
+                    index: 0,
+                    errno: libc::EACCES
+                },
+                &apparmor
+            ),
+            Missing::UsernsApparmor
+        );
+        // The probe's own machinery (a Sys error at pipe2/waitid, or a
+        // malformed report) is probe-failed, not a user-namespace gap: a
+        // host near RLIMIT_NOFILE is not told its user namespaces fail.
+        assert_eq!(
+            classify_ids_failure(
+                "pipe2",
+                &Error::Sys {
+                    call: "pipe2",
+                    errno: libc::EMFILE
+                },
+                &none
+            ),
+            Missing::ProbeFailed {
+                probe: "user-namespace",
+                stage: "pipe2",
+                detail: errno_detail(libc::EMFILE),
+            }
+        );
+        let proto = Error::Protocol(crate::error::ProtocolError::Length(7));
+        assert_eq!(
+            classify_ids_failure("report", &proto, &none),
+            Missing::ProbeFailed {
+                probe: "user-namespace",
+                stage: "report",
+                detail: proto.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces, seccomp filters"]
+    fn probe_child_killed_is_probe_failed() {
+        let _host = crate::test_guard::host_lock();
+        // A probe child that allocates is ended by the allocation guard
+        // (exit 97) before it can report. Neither child may then name its
+        // feature; both report probe-failed at the exit stage.
+        for missing in [
+            probe_ids_child(
+                Fault::Allocate(Step::UidMap),
+                std::time::Duration::from_secs(10),
+            ),
+            probe_filter_child(
+                Fault::Allocate(Step::Seccomp),
+                std::time::Duration::from_secs(10),
+            ),
+        ] {
+            match missing {
+                Some(Missing::ProbeFailed { stage, detail, .. }) => {
+                    assert_eq!(stage, "exit");
+                    assert!(detail.contains("97"), "detail: {detail}");
+                }
+                other => panic!("expected probe-failed, got {other:?}"),
+            }
+        }
     }
 
     #[test]

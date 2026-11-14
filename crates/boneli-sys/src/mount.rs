@@ -230,8 +230,13 @@ pub(crate) enum Op {
     RootBind { layer: CString, staging: CString },
     /// The layers as a read-only overlay onto `staging`; `options` names
     /// them relative to `parent`, the working directory while mounting.
+    /// `layers` holds the same directories as absolute paths, which the
+    /// child opens without following any symlink before it mounts, so a
+    /// symlinked layer fails closed like a bind source (ELOOP), not
+    /// silently resolves (ADR-007, D7).
     RootOverlay {
         parent: CString,
+        layers: Vec<CString>,
         options: CString,
         staging: CString,
     },
@@ -248,10 +253,16 @@ pub(crate) enum Op {
         target: CString,
         data: CString,
     },
-    /// See [`Mount::Overlay`].
+    /// See [`Mount::Overlay`]. The child opens `lower`, `upper` and `work`
+    /// without following any symlink before it mounts, so a symlinked
+    /// overlay directory fails closed like a bind source (ELOOP), not
+    /// silently resolves (ADR-007, D7).
     Overlay {
         index: u32,
         target: CString,
+        lower: CString,
+        upper: CString,
+        work: CString,
         data: CString,
     },
     /// See [`Mount::Proc`].
@@ -405,6 +416,14 @@ fn validate_root(root: &Root) -> Result<()> {
                             "an overlay directory is not an absolute path without '..', ',', ':' or '\\'",
                         ));
                     }
+                    // The root overlay rejects non-UTF-8 layer paths, and
+                    // `Op::Overlay`'s options are built from UTF-8, so a
+                    // lossy render could mount a different path; reject it
+                    // here too, so the two overlays behave the same
+                    // (ADR-007, D7).
+                    if p.to_str().is_none() {
+                        return Err(bad("an overlay directory path is not UTF-8"));
+                    }
                 }
             }
             Mount::Proc { .. } => {}
@@ -437,8 +456,16 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
         });
     } else {
         let (parent, options) = root_overlay_options(&root.layers)?;
+        let mut layers = Vec::with_capacity(root.layers.len());
+        for layer in &root.layers {
+            layers.push(c_string(
+                &path_bytes(layer),
+                nul("a layer path contains NUL"),
+            )?);
+        }
         ops.push(Op::RootOverlay {
             parent: c_string(&path_bytes(&parent), nul("a layer path contains NUL"))?,
+            layers,
             options: c_string(options.as_bytes(), nul("a layer path contains NUL"))?,
             staging,
         });
@@ -477,6 +504,8 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
             Mount::Overlay {
                 lower, upper, work, ..
             } => {
+                // validate_root rejects non-UTF-8 and the splitting
+                // characters, so the paths go into the options exactly.
                 let data = format!(
                     "lowerdir={},upperdir={},workdir={},userxattr",
                     lower.display(),
@@ -487,6 +516,15 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
                 Op::Overlay {
                     index,
                     target,
+                    lower: c_string(
+                        &path_bytes(lower),
+                        mount_nul("an overlay path contains NUL"),
+                    )?,
+                    upper: c_string(
+                        &path_bytes(upper),
+                        mount_nul("an overlay path contains NUL"),
+                    )?,
+                    work: c_string(&path_bytes(work), mount_nul("an overlay path contains NUL"))?,
                     data: c_string(data.as_bytes(), mount_nul("an overlay path contains NUL"))?,
                 }
             }
@@ -913,11 +951,20 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
             }
             Op::RootOverlay {
                 parent,
+                layers,
                 options,
                 staging,
             } => {
                 inject(fault, Step::Root)?;
                 let dir = step(open_host(parent), Step::Root, 0)?;
+                // overlayfs resolves the relative layer names below with
+                // LOOKUP_FOLLOW, so a symlinked layer would be followed.
+                // Open every layer first without following any symlink
+                // (as bind sources are), so a symlink fails closed (ELOOP)
+                // before the mount; the opened descriptors drop at once.
+                for layer in layers {
+                    drop(step(open_host(layer), Step::Root, 0)?);
+                }
                 // Overlay resolves the relative layer names from here.
                 // SAFETY: fchdir takes a descriptor.
                 if unsafe { libc::fchdir(dir.0) } < 0 {
@@ -984,10 +1031,20 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                     Op::Overlay {
                         index,
                         target: rel,
+                        lower,
+                        upper,
+                        work,
                         data,
                     } => {
                         let at = target(new_root, rel, *index, fault)?;
                         inject(fault, Step::Overlay)?;
+                        // overlayfs resolves lower, upper and work with
+                        // LOOKUP_FOLLOW; open each first without following
+                        // any symlink (as bind sources are), so a symlink
+                        // fails closed (ELOOP) before the mount.
+                        for dir in [lower, upper, work] {
+                            drop(step(open_host(dir), Step::Overlay, *index)?);
+                        }
                         step(
                             mount_on(
                                 &at,
@@ -1204,6 +1261,64 @@ mod tests {
             plan(&root_with(&["/l/a"], vec![overlay])),
             Err(Error::InvalidMount { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn overlay_non_utf8_path_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        // A non-UTF-8 overlay directory is rejected, like a non-UTF-8 root
+        // layer, so plan() never renders it lossily and mounts a different
+        // path (ADR-007, D7). Every one of the three directories.
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/o/l\xff"));
+        for overlay in [
+            Mount::Overlay {
+                lower: bad.clone(),
+                upper: PathBuf::from("/o/u"),
+                work: PathBuf::from("/o/w"),
+                target: p("/a"),
+            },
+            Mount::Overlay {
+                lower: PathBuf::from("/o/l"),
+                upper: bad.clone(),
+                work: PathBuf::from("/o/w"),
+                target: p("/a"),
+            },
+            Mount::Overlay {
+                lower: PathBuf::from("/o/l"),
+                upper: PathBuf::from("/o/u"),
+                work: bad.clone(),
+                target: p("/a"),
+            },
+        ] {
+            assert!(
+                matches!(
+                    plan(&root_with(&["/l/a"], vec![overlay])),
+                    Err(Error::InvalidMount { index: 0, .. })
+                ),
+                "a non-UTF-8 overlay path must be rejected"
+            );
+        }
+        // A UTF-8 overlay path still goes through, and its options hold the
+        // path exactly (no U+FFFD).
+        let ok = Mount::Overlay {
+            lower: PathBuf::from("/o/l"),
+            upper: PathBuf::from("/o/u"),
+            work: PathBuf::from("/o/w"),
+            target: p("/a"),
+        };
+        let ops = plan(&root_with(&["/l/a"], vec![ok])).expect("valid overlay");
+        let data = ops
+            .iter()
+            .find_map(|o| match o {
+                Op::Overlay { data, .. } => Some(data.to_bytes().to_vec()),
+                _ => None,
+            })
+            .expect("an overlay op");
+        assert!(
+            !data.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "the options hold a U+FFFD, so a path was rendered lossily: {data:?}"
+        );
+        assert_eq!(data, b"lowerdir=/o/l,upperdir=/o/u,workdir=/o/w,userxattr");
     }
 
     #[test]

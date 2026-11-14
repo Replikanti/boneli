@@ -686,3 +686,72 @@ fn program_resolves_inside_the_root() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+fn overlay_dir_symlink_rejected() {
+    // A writable overlay whose upper (then lower, then work) is a symlink
+    // to another host directory. A bind source fails ELOOP; the overlay
+    // directory must fail closed the same way, not follow the symlink into
+    // the target. Without the fix the write landed in the symlink target.
+    for which in ["upper", "lower", "work"] {
+        let fixture = Fixture::new("ovl-symlink");
+        let lower = fixture.tree().dir("ov/lower");
+        let upper = fixture.tree().dir("ov/upper");
+        let work = fixture.tree().dir("ov/work");
+        let elsewhere = fixture.tree().dir("ov/elsewhere");
+        let link = fixture.tree().path().join(format!("ov/{which}-link"));
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+        let (lower, upper, work) = match which {
+            "upper" => (lower, link.clone(), work),
+            "lower" => (link.clone(), upper, work),
+            _ => (lower, upper, link.clone()),
+        };
+        let mut mounts = fixture.mounts();
+        mounts.push(Mount::Overlay {
+            lower,
+            upper,
+            work,
+            target: inside("/work2"),
+        });
+        let index = index_of(&mounts, "/work2");
+        match spawn_error(fixture.root_with(vec![fixture.layer.clone()], mounts)) {
+            Error::Setup {
+                step: Step::Overlay,
+                index: got,
+                errno,
+            } => assert_eq!(
+                (got, errno),
+                (index, libc::ELOOP),
+                "overlay {which} symlink"
+            ),
+            other => panic!("overlay {which} symlink: {other:?}"),
+        }
+        assert!(
+            !elsewhere.join("new").exists(),
+            "the overlay followed the {which} symlink into its target"
+        );
+    }
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+fn root_layer_symlink_rejected() {
+    // A root layer that is a symlink to a host directory outside the layer
+    // store (holding a secret). The overlay must not follow it and expose
+    // the host directory as the top of the sandbox root; it fails closed
+    // (ELOOP) at the root step, as a symlinked bind source does.
+    let fixture = Fixture::new("layer-symlink");
+    let host = fixture.tree().dir("hostdir");
+    std::fs::write(host.join("secret"), b"HOSTSECRET").expect("write the secret");
+    let link = fixture.tree().path().join("top-link");
+    std::os::unix::fs::symlink(&host, &link).expect("symlink");
+    match spawn_error(fixture.root_with(vec![fixture.layer.clone(), link], fixture.mounts())) {
+        Error::Setup {
+            step: Step::Root,
+            errno,
+            ..
+        } => assert_eq!(errno, libc::ELOOP, "a symlinked layer must be rejected"),
+        other => panic!("{other:?}"),
+    }
+}
