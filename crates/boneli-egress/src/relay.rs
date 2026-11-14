@@ -7,7 +7,9 @@
 //! that fails or idles out shuts both sockets down, so the other
 //! direction's blocked read or write returns at once: no exit path leaves
 //! a thread waiting for a peer, and every handle is dropped when `relay`
-//! returns.
+//! returns. A direction whose peer is gone (a broken pipe or a reset on
+//! write) stops without that: the other direction reads from the same
+//! peer and decides how the tunnel ended.
 
 use std::io::{ErrorKind, Write};
 use std::net::Shutdown;
@@ -26,9 +28,12 @@ pub struct RelayOutcome {
     pub up: u64,
     /// Bytes from the upstream to the sandbox.
     pub down: u64,
-    /// `Eof` when both directions reached the end of their stream, `Idle`
-    /// when no byte moved in either direction for the idle timeout, `Error`
-    /// otherwise.
+    /// `Eof` when both directions reached the end of their stream, or one
+    /// did and the peer it read from then closed its socket before taking
+    /// the other direction's last bytes (a client that closes after its
+    /// request while the origin still sends a TLS `close_notify`). `Idle`
+    /// when the idle timeout ran out: no byte moved in either direction
+    /// for it, or a peer took no byte for it. `Error` otherwise.
     pub end: End,
 }
 
@@ -38,6 +43,8 @@ struct Shared {
     activity: Mutex<Instant>,
     /// The first end that was not `Eof`; it decides the outcome.
     abnormal: Mutex<Option<End>>,
+    /// How many directions stopped because the peer they wrote to was gone.
+    gone: Mutex<u8>,
     idle: Duration,
     buffer: usize,
 }
@@ -63,6 +70,22 @@ impl Shared {
     fn abnormal(&self) -> Option<End> {
         *self.abnormal.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn peer_gone(&self) {
+        *self.gone.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    }
+
+    /// The outcome once both directions are done: the first abnormal end;
+    /// `Error` when both peers were gone, since neither direction then saw
+    /// the end of a stream; `Eof` otherwise.
+    fn end(&self) -> End {
+        let gone = *self.gone.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.abnormal() {
+            Some(end) => end,
+            None if gone >= 2 => End::Error,
+            None => End::Eof,
+        }
+    }
 }
 
 /// Relays between `sandbox` and `upstream` until both directions are done.
@@ -79,6 +102,7 @@ pub fn relay(
     let shared = Shared {
         activity: Mutex::new(Instant::now()),
         abnormal: Mutex::new(None),
+        gone: Mutex::new(0),
         idle: settings.tunnel_idle(),
         buffer: settings.relay_buffer(),
     };
@@ -137,7 +161,7 @@ pub fn relay(
     RelayOutcome {
         up,
         down,
-        end: shared.abnormal().unwrap_or(End::Eof),
+        end: shared.end(),
     }
 }
 
@@ -153,6 +177,14 @@ fn stop(a: &dyn RelayStream, b: &dyn RelayStream) {
 /// written to `to`. At the end of the stream `to` gets `shutdown(Write)`
 /// and the other direction goes on (half-close); on an error or the idle
 /// timeout both sockets are shut down, which ends the other direction too.
+/// A write timeout is the idle timeout too: the write timeouts equal it.
+/// When `to`'s peer is gone the direction stops without a stop of the
+/// sockets and leaves the outcome to the other direction, which reads from
+/// that peer: the end of its stream (the peer closed after its last
+/// request) makes the tunnel `Eof`, an error or the idle timeout ends it
+/// as that. No shutdown is needed for the other direction to return, since
+/// its peer is gone; a peer that only stopped reading is still bounded by
+/// the idle timeout.
 fn direction(from: &mut dyn RelayStream, to: &mut dyn RelayStream, shared: &Shared) -> u64 {
     let mut buf = vec![0u8; shared.buffer];
     let mut moved = 0u64;
@@ -173,14 +205,19 @@ fn direction(from: &mut dyn RelayStream, to: &mut dyn RelayStream, shared: &Shar
             }
             Ok(n) => {
                 shared.touch();
-                if to.write_all(&buf[..n]).is_err() {
-                    break End::Error;
+                match to.write_all(&buf[..n]) {
+                    Ok(()) => moved += n as u64,
+                    Err(e) if gone(&e) => {
+                        shared.peer_gone();
+                        return moved;
+                    }
+                    Err(e) if timed_out(&e) => break End::Idle,
+                    Err(_) => break End::Error,
                 }
-                moved += n as u64;
             }
             // The read waited for the rest of the window; the loop checks
             // whether the other direction moved bytes meanwhile.
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) if timed_out(&e) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(_) => break End::Error,
         }
@@ -188,4 +225,19 @@ fn direction(from: &mut dyn RelayStream, to: &mut dyn RelayStream, shared: &Shar
     shared.record(end);
     stop(from, to);
     moved
+}
+
+/// A socket timeout: `WouldBlock` is how std reports `EAGAIN` from a
+/// socket with a timeout set, `TimedOut` covers platforms that differ.
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// The peer of the socket written to is gone: it closed (a Unix socket
+/// returns `EPIPE` on the first write after that) or reset the connection.
+fn gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
 }

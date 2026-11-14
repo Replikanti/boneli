@@ -1,5 +1,6 @@
-//! The relay through the proxy: half-close in both directions, the shared
-//! idle timeout, and traffic in one direction keeping a tunnel open
+//! The relay through the proxy: half-close in both directions, a full
+//! close after the request, the shared idle timeout (a peer that stops
+//! reading included), and traffic in one direction keeping a tunnel open
 //! (ADR-006, D7).
 
 mod common;
@@ -76,6 +77,41 @@ fn upstream_half_close_still_delivers_the_request() {
     assert_eq!(close(&proxy), (7, 8, End::Eof));
 }
 
+/// A client that closes its socket after its request, while the origin
+/// still answers the end of the upload (a TLS `close_notify`): the bytes
+/// cannot be delivered, a Unix socket refuses them with `EPIPE`, and the
+/// tunnel still ends as `eof`, not as an error.
+#[test]
+fn client_full_close_after_the_request_ends_eof() {
+    let (proxy, mut client, mut origin, _origins) = tunnel(DEADLINE);
+    send(&mut client, b"request");
+    drop(client);
+    assert_eq!(read_to_close(&mut origin), b"request");
+    send(&mut origin, b"close_notify");
+    drop(origin);
+    assert_eq!(close(&proxy), (7, 0, End::Eof));
+}
+
+/// A client that half-closes its upload and then stops reading while the
+/// origin pushes more than the socket buffers hold: the blocked write runs
+/// out the idle window, and the tunnel ends as `idle`.
+#[test]
+fn client_that_stops_reading_ends_idle() {
+    let start = Instant::now();
+    let (proxy, client, mut origin, _origins) = tunnel(Duration::from_millis(300));
+    client.shutdown(Shutdown::Write).expect("half-close");
+    origin.set_write_timeout(Some(DEADLINE)).expect("timeout");
+    let writer = thread::spawn(move || {
+        // Fails once the relay stops the tunnel; that is the point.
+        let _ = origin.write_all(&vec![b'x'; 8 << 20]);
+    });
+    let (up, _down, end) = close(&proxy);
+    assert_eq!((up, end), (0, End::Idle));
+    assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+    join(writer);
+    drop(client);
+}
+
 #[test]
 fn idle_tunnel_closes_after_the_idle_timeout() {
     let start = Instant::now();
@@ -106,8 +142,8 @@ fn traffic_in_one_direction_keeps_the_tunnel_open() {
     assert_eq!(close(&proxy), (0, 25, End::Eof));
 }
 
-/// An upstream whose writes always fail.
-struct FailingWrites(UnixStream);
+/// A stream whose writes always fail with the given kind.
+struct FailingWrites(UnixStream, std::io::ErrorKind);
 
 impl std::io::Read for FailingWrites {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -117,7 +153,7 @@ impl std::io::Read for FailingWrites {
 
 impl Write for FailingWrites {
     fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::other("write failure on purpose"))
+        Err(std::io::Error::new(self.1, "write failure on purpose"))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -127,7 +163,7 @@ impl Write for FailingWrites {
 
 impl RelayStream for FailingWrites {
     fn try_clone_box(&self) -> std::io::Result<Box<dyn RelayStream>> {
-        Ok(Box::new(FailingWrites(self.0.try_clone()?)))
+        Ok(Box::new(FailingWrites(self.0.try_clone()?, self.1)))
     }
 
     fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
@@ -159,7 +195,7 @@ fn a_failed_direction_stops_the_other() {
         boneli_egress::relay(
             Box::new(sandbox),
             Vec::new(),
-            Box::new(FailingWrites(upstream)),
+            Box::new(FailingWrites(upstream, std::io::ErrorKind::Other)),
             &settings,
         )
     });
@@ -170,4 +206,28 @@ fn a_failed_direction_stops_the_other() {
     assert_eq!((outcome.up, outcome.down), (0, 0));
     assert!(read_to_close(&mut client).is_empty());
     assert!(read_to_close(&mut origin).is_empty());
+}
+
+/// Both peers gone: each direction reads a byte and finds the peer it
+/// writes to gone, so neither saw the end of a stream, and the tunnel
+/// ends as `error`, not as `eof`.
+#[test]
+fn both_peers_gone_ends_error() {
+    let (sandbox, mut client) = UnixStream::pair().expect("pair");
+    let (upstream, mut origin) = UnixStream::pair().expect("pair");
+    send(&mut client, b"x");
+    send(&mut origin, b"y");
+    let settings = settings(Duration::from_secs(60));
+    let start = Instant::now();
+    let relay = thread::spawn(move || {
+        boneli_egress::relay(
+            Box::new(FailingWrites(sandbox, std::io::ErrorKind::BrokenPipe)),
+            Vec::new(),
+            Box::new(FailingWrites(upstream, std::io::ErrorKind::ConnectionReset)),
+            &settings,
+        )
+    });
+    let outcome = join(relay);
+    assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+    assert_eq!((outcome.up, outcome.down, outcome.end), (0, 0, End::Error));
 }

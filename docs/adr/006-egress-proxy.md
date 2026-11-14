@@ -334,6 +334,18 @@ even though the CONNECT is refused.
   first end other than `eof` decides the `close` record.
 - Half-close: the end of one side's stream becomes `shutdown(Write)` on the
   other, and the tunnel ends when both directions are done.
+- A peer that is gone (a write fails with a broken pipe or a reset) stops
+  its direction without the shutdown above, and the other direction, which
+  reads from that peer, decides the end: the end of that peer's stream
+  makes it `eof`, an error or the idle timeout makes it that. The case is
+  common: a client closes its socket after its request while the origin
+  still answers the end of the upload with a TLS `close_notify`, and the
+  sandbox side is a Unix socket, which refuses the first write after the
+  close with `EPIPE`. Logging it as `error` would fill the log with false
+  errors. The other direction needs no shutdown to return, since its peer
+  is gone; a peer that only stopped reading stays bounded by the idle
+  timeout. Both peers gone, so that neither direction saw the end of a
+  stream, is `error`.
 - **Buffer: 16 KiB**, the largest TLS plaintext fragment, 2^14 bytes (RFC
   8446, section 5.1). On the wire a protected record carries up to 2^14 +
   256 bytes, so a full record takes two reads and a typical one takes one;
@@ -345,7 +357,8 @@ even though the CONNECT is refused.
   the rest of the idle window. A direction whose read times out while the
   other direction moved bytes within the window waits again, so a long
   download with a silent upload stays open. The write timeouts on both
-  sockets are 660 s too.
+  sockets are 660 s too, so a peer that takes no byte for 660 s ends the
+  tunnel with `end=idle` as well.
   - Where 660 s comes from: the Anthropic SDKs time out a request after 10
     minutes by default (TypeScript SDK `DEFAULT_TIMEOUT = 600000` ms in
     `src/client.ts`, Python SDK `DEFAULT_TIMEOUT` of `10 * 60` s in
