@@ -12,9 +12,9 @@ unsafe_code = "allow"
 [lints.clippy]
 dbg_macro = "deny"
 todo = "deny"
-multiple_unsafe_ops_per_block = "deny"
+multiple_unsafe_ops_per_block = "forbid"
 unwrap_used = { level = "forbid", priority = 1 }
-undocumented_unsafe_blocks = { level = "deny" }
+undocumented_unsafe_blocks = { level = "forbid" }
 pedantic = { level = "deny", priority = -1 }
 
 [dependencies]

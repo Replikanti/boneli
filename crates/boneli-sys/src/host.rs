@@ -5,7 +5,7 @@ use std::fmt;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use crate::child::{ChildPlan, Fault};
+use crate::child::{ChildPlan, Fault, Step};
 use crate::error::{Error, Result, errno};
 use crate::ffi;
 use crate::spawn::{ExitStatus, await_report, launch, report_pipe};
@@ -43,6 +43,8 @@ pub enum MissingId {
     CloseRange,
     /// `seccomp-kill-process`
     SeccompKillProcess,
+    /// `seccomp-filter`
+    SeccompFilter,
     /// `landlock-unavailable`
     LandlockUnavailable,
     /// `landlock-abi`
@@ -51,7 +53,7 @@ pub enum MissingId {
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 11] = [
+    pub const ALL: [MissingId; 12] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
@@ -61,6 +63,7 @@ impl MissingId {
         MissingId::Clone3,
         MissingId::CloseRange,
         MissingId::SeccompKillProcess,
+        MissingId::SeccompFilter,
         MissingId::LandlockUnavailable,
         MissingId::LandlockAbi,
     ];
@@ -77,6 +80,7 @@ impl MissingId {
             MissingId::Clone3 => "clone3",
             MissingId::CloseRange => "close-range",
             MissingId::SeccompKillProcess => "seccomp-kill-process",
+            MissingId::SeccompFilter => "seccomp-filter",
             MissingId::LandlockUnavailable => "landlock-unavailable",
             MissingId::LandlockAbi => "landlock-abi",
         }
@@ -140,6 +144,12 @@ pub enum Missing {
         /// The errno of the attempt.
         errno: i32,
     },
+    /// The kernel refuses to install a seccomp filter (no
+    /// `CONFIG_SECCOMP_FILTER`), tried in the probe's child.
+    SeccompFilter {
+        /// The errno of the attempt.
+        errno: i32,
+    },
     /// Landlock is not built in or not enabled.
     LandlockUnavailable {
         /// The errno of the attempt.
@@ -167,6 +177,7 @@ impl Missing {
             Missing::Clone3 { .. } => MissingId::Clone3,
             Missing::CloseRange { .. } => MissingId::CloseRange,
             Missing::SeccompKillProcess { .. } => MissingId::SeccompKillProcess,
+            Missing::SeccompFilter { .. } => MissingId::SeccompFilter,
             Missing::LandlockUnavailable { .. } => MissingId::LandlockUnavailable,
             Missing::LandlockAbi { .. } => MissingId::LandlockAbi,
         }
@@ -222,6 +233,11 @@ impl fmt::Display for Missing {
             Missing::SeccompKillProcess { errno } => write!(
                 f,
                 "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 5.19 or newer)",
+                os(*errno)
+            ),
+            Missing::SeccompFilter { errno } => write!(
+                f,
+                "seccomp filters cannot be installed: {} (the kernel needs CONFIG_SECCOMP_FILTER)",
                 os(*errno)
             ),
             Missing::LandlockUnavailable { errno } => write!(
@@ -328,6 +344,12 @@ impl Features {
 }
 
 fn probe_userns() -> Option<Missing> {
+    probe_child(Fault::None, PROBE_TIMEOUT)
+}
+
+/// The probe's child: an allow-all seccomp filter, then the single id map
+/// writes in a new user namespace (child::Step::Seccomp, then the maps).
+pub(crate) fn probe_child(fault: Fault, timeout: std::time::Duration) -> Option<Missing> {
     // SAFETY: geteuid and getegid have no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     // SAFETY: as above.
@@ -347,7 +369,7 @@ fn probe_userns() -> Option<Missing> {
         uid_line: &uid_line,
         exec: None,
         report_fd: write.as_raw_fd(),
-        fault: Fault::None,
+        fault,
     };
     let launched = match launch(&plan) {
         Ok(l) => l,
@@ -360,7 +382,7 @@ fn probe_userns() -> Option<Missing> {
         Err(e) => return Some(other("clone3", &e)),
     };
     drop(write);
-    match await_report(&read, &launched, PROBE_TIMEOUT) {
+    match await_report(&read, &launched, timeout) {
         Ok(()) => {
             let mut child = crate::spawn::Child::from_launched(launched);
             match child.wait() {
@@ -372,6 +394,11 @@ fn probe_userns() -> Option<Missing> {
                 Err(e) => Some(other("waitid", &e)),
             }
         }
+        Err(Error::Setup {
+            step: Step::Seccomp,
+            errno,
+            ..
+        }) => Some(Missing::SeccompFilter { errno }),
         Err(Error::Setup { step, errno, .. }) => {
             Some(classify_userns(step.name(), errno, &UsernsSysctls::read()))
         }
@@ -516,6 +543,9 @@ mod tests {
             MissingId::SeccompKillProcess => Missing::SeccompKillProcess {
                 errno: libc::EOPNOTSUPP,
             },
+            MissingId::SeccompFilter => Missing::SeccompFilter {
+                errno: libc::EINVAL,
+            },
             MissingId::LandlockUnavailable => Missing::LandlockUnavailable {
                 errno: libc::EOPNOTSUPP,
             },
@@ -544,6 +574,10 @@ mod tests {
                 "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 5.19 or newer)",
                 e(libc::EOPNOTSUPP)
             ),
+            format!(
+                "seccomp filters cannot be installed: {} (the kernel needs CONFIG_SECCOMP_FILTER)",
+                e(libc::EINVAL)
+            ),
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
             "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
         ];
@@ -557,6 +591,7 @@ mod tests {
             "clone3",
             "close-range",
             "seccomp-kill-process",
+            "seccomp-filter",
             "landlock-unavailable",
             "landlock-abi",
         ];
@@ -654,5 +689,59 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces, seccomp filters"]
+    fn probe_child_installs_a_seccomp_filter() {
+        let _host = crate::test_guard::host_lock();
+        // The probe child hangs right after its filter step; its status
+        // must then show filter mode (2), not only that the kernel knows
+        // the action values (SECCOMP_GET_ACTION_AVAIL).
+        let worker = std::thread::spawn(|| {
+            probe_child(
+                Fault::Hang(Step::SetGroups),
+                std::time::Duration::from_millis(1500),
+            )
+        });
+        let child = crate::test_guard::wait_for_child(std::time::Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut mode = String::new();
+        while std::time::Instant::now() < deadline {
+            let status =
+                std::fs::read_to_string(format!("/proc/{child}/status")).unwrap_or_default();
+            mode = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Seccomp:"))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            if mode == "2" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = worker.join().expect("probe thread");
+        assert_eq!(mode, "2", "the probe child's seccomp mode");
+        assert!(
+            matches!(
+                &result,
+                Some(Missing::UsernsOther {
+                    stage: "report",
+                    ..
+                })
+            ),
+            "the hung child timed out: {result:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn probe_child_reports_filter_failure() {
+        let _host = crate::test_guard::host_lock();
+        let result = probe_child(
+            Fault::Fail(Step::Seccomp),
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(result, Some(Missing::SeccompFilter { errno: libc::EIO }));
     }
 }

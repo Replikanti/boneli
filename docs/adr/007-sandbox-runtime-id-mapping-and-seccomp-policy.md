@@ -132,7 +132,12 @@ under ABI 1 every rename or link into another directory is denied
 `Features::probe` checks the floor by trying each feature, not by reading
 `uname`, because distributions backport: a user namespace including the
 single id map writes, `clone3`, `close_range` with `CLOSE_RANGE_CLOEXEC`,
-`kill_process` through `SECCOMP_GET_ACTION_AVAIL`, the Landlock ABI, cgroup
+`kill_process` through `SECCOMP_GET_ACTION_AVAIL`, an allow-all seccomp
+filter that the probe's child installs (with `PR_SET_NO_NEW_PRIVS`, before
+its map writes: `SECCOMP_GET_ACTION_AVAIL` alone also succeeds on a kernel
+with `CONFIG_SECCOMP` but without `CONFIG_SECCOMP_FILTER`, review of PR 1;
+the child's status must show filter mode, `seccomp-filter` otherwise;
+this runs as `Step::Seccomp`, which `spawn` gets in PR 4), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup`, and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
 writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
@@ -160,18 +165,29 @@ process until the clone:
    arrays, the map lines, and the three stdio descriptors duplicated to
    numbers of at least 3 with close-on-exec (so no `dup2` in the child can
    overwrite a source a later one needs).
-3. **Clone**: a close-on-exec report pipe, then a raw `clone3` with
-   `CLONE_NEWUSER | CLONE_PIDFD`, `exit_signal = SIGCHLD` and no stack, so
-   the child continues on its copy of the parent's stack, as after `fork`.
+3. **Clone**: a close-on-exec report pipe whose write end is moved to a
+   number of at least 3 (a caller with 0-2 closed would otherwise get it
+   there, the child's stdio `dup2` would replace it, and every later
+   failure would be written into the program's stdio and read as an exec;
+   review of PR 1, reproduced). Then every signal is blocked on the
+   calling thread, a raw `clone3` with `CLONE_NEWUSER | CLONE_PIDFD`,
+   `exit_signal = SIGCHLD` and no stack runs, so the child continues on
+   its copy of the parent's stack, as after `fork`, and the parent
+   restores its mask right after the clone (glibc's `posix_spawn` does
+   the same).
 4. **Wait for the report** with `poll` until the setup timeout; on
    timeout the child is killed through its pidfd and reaped.
 
 The child runs a fixed sequence (`Step`): `deny` to `/proc/self/setgroups`,
 the gid map, the uid map; `setsid` (a new session without a controlling
 terminal); every signal disposition 1–64 except SIGKILL and SIGSTOP to
-`SIG_DFL` through the raw `rt_sigaction`, then an empty signal mask (in
-this order, so no parent handler can run in the child; std ignores
-SIGPIPE, and an ignored disposition survives `execve`); `dup2` of the
+`SIG_DFL` through the raw `rt_sigaction` while every signal is still
+blocked, then an empty signal mask. So no parent handler can run in the
+child: from the clone until the dispositions are reset nothing is
+delivered (without the block, a handler ran in the child during the map
+writes, review of PR 1), and after it every disposition is the default.
+std ignores SIGPIPE, and an ignored disposition survives `execve`, which
+is why every signal is reset; `dup2` of the
 three stdio descriptors; `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, so no
 other descriptor reaches the program (the CVE-2024-21626 class), while
 the report pipe stays open until the exec itself; `execve` with exactly
@@ -323,17 +339,28 @@ architecture check gets the rule `sys-lints`: every crate in
 holding every `workspace.lints` entry except `rust.unsafe_code` at the
 same or a stricter level (allow < warn < deny < forbid, string or
 `level` form), every lint of the new `[check] unsafe-lints` array in
-`tools/architecture.toml` at `deny` or `forbid`, and no other entry below
-`deny` (an allowed lint group with a higher `priority` would otherwise
-override a required lint). The array is required, so deleting it is a
-`policy-format` failure rather than a silent weakening. Its lints:
+`tools/architecture.toml` at `forbid`, and no other entry below `deny`
+(an allowed lint group with a higher `priority` would otherwise override
+a required lint). The array is required, so deleting it is a
+`policy-format` failure rather than a silent weakening.
+
+Why `forbid` and not `deny`: cargo passes the `[lints]` table to rustc as
+command-line levels, and an inner attribute in the source
+(`#![allow(clippy::undocumented_unsafe_blocks)]`, or `#[allow]` on one
+function) overrides every command-line level except `forbid`. At `deny`
+such an attribute passed both clippy and the architecture check (review
+of PR 1 of #6, reproduced); at `forbid` it is error E0453. The crate has
+no `allow` attribute, so `forbid` costs nothing. Its lints:
 
 - `rust.unsafe_op_in_unsafe_fn`: every unsafe operation sits in an
   explicit `unsafe` block, also inside an `unsafe fn`;
 - `clippy.undocumented_unsafe_blocks`: every block carries a
   `// SAFETY:` comment;
 - `clippy.multiple_unsafe_ops_per_block`: one operation per block, so
-  each comment justifies exactly one operation.
+  each comment justifies exactly one operation;
+- `clippy.unwrap_used`: no unwrap, because a panic in the cloned child
+  aborts it mid-setup without a report (the workspace has it at `deny`;
+  here it is `forbid` like the rest).
 
 The checker stays Python per ADR-001 D4 (its Rust port is #35).
 

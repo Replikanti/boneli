@@ -38,11 +38,16 @@ pub enum Step {
     CloseFds = 7,
     /// `execve` of the program.
     Exec = 8,
+    /// `PR_SET_NO_NEW_PRIVS` and a seccomp filter. Only the host probe runs
+    /// it so far, first and with an allow-all filter, to prove the kernel
+    /// installs filters at all (ADR-007, D3); `spawn` gets it before `Exec`
+    /// with the policy of ADR-007 D2 in a later part of #6.
+    Seccomp = 9,
 }
 
 impl Step {
-    /// Every step, in sequence order.
-    pub const ALL: [Step; 8] = [
+    /// Every step: the spawn sequence in order, then [`Step::Seccomp`].
+    pub const ALL: [Step; 9] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -51,6 +56,7 @@ impl Step {
         Step::Stdio,
         Step::CloseFds,
         Step::Exec,
+        Step::Seccomp,
     ];
 
     /// The step's code in the setup report.
@@ -74,6 +80,7 @@ impl Step {
             Step::Stdio => "stdio",
             Step::CloseFds => "close-fds",
             Step::Exec => "exec",
+            Step::Seccomp => "seccomp",
         }
     }
 }
@@ -94,7 +101,8 @@ pub(crate) struct ExecPlan<'a> {
 pub(crate) struct ChildPlan<'a> {
     pub gid_line: &'a [u8],
     pub uid_line: &'a [u8],
-    /// None: the host probe, which exits 0 after the id maps.
+    /// None: the host probe, which installs an allow-all seccomp filter,
+    /// writes the id maps and exits 0.
     pub exec: Option<ExecPlan<'a>>,
     /// The write end of the report pipe (close-on-exec).
     pub report_fd: c_int,
@@ -218,8 +226,47 @@ fn write_proc(path: &CStr, data: &[u8], step: Step) -> Result<(), Failure> {
     result
 }
 
+/// `PR_SET_NO_NEW_PRIVS`, then a one-instruction filter that allows every
+/// syscall: a kernel with `CONFIG_SECCOMP` but without
+/// `CONFIG_SECCOMP_FILTER` knows the action values but refuses this.
+fn allow_all_filter() -> Result<(), Failure> {
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+        return Err(fail(Step::Seccomp, 0, errno()));
+    }
+    let allow = [libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    }];
+    let prog = libc::sock_fprog {
+        len: allow.len() as u16,
+        filter: allow.as_ptr().cast_mut(),
+    };
+    // SAFETY: prog points at one valid instruction for the call's duration;
+    // the kernel copies the program.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0u32,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if rc < 0 {
+        return Err(fail(Step::Seccomp, 1, errno()));
+    }
+    Ok(())
+}
+
 fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     let fault = plan.fault;
+
+    if plan.exec.is_none() {
+        inject(fault, Step::Seccomp)?;
+        allow_all_filter()?;
+    }
 
     inject(fault, Step::SetGroups)?;
     write_proc(c"/proc/self/setgroups", b"deny", Step::SetGroups)?;
@@ -238,9 +285,11 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Err(fail(Step::Setsid, 0, errno()));
     }
 
-    // Dispositions first, then the mask: unblocking first could run one of
-    // the parent's handlers in this child. An ignored disposition survives
-    // execve (std ignores SIGPIPE), so every signal goes back to SIG_DFL.
+    // The parent blocked every signal around the clone (spawn::launch), so
+    // no handler of the parent can have run here. Dispositions first, while
+    // everything is still blocked, then the empty mask, as glibc's
+    // posix_spawn does. An ignored disposition survives execve (std ignores
+    // SIGPIPE), so every signal goes back to SIG_DFL.
     inject(fault, Step::Signals)?;
     let default = ffi::KernelSigaction {
         handler: libc::SIG_DFL,
@@ -331,7 +380,7 @@ mod tests {
     fn step_codes_round_trip() {
         let mut names = std::collections::BTreeSet::new();
         for (i, step) in Step::ALL.into_iter().enumerate() {
-            assert_eq!(step.code(), i as u32 + 1, "codes follow the sequence");
+            assert_eq!(step.code(), i as u32 + 1, "codes follow Step::ALL");
             assert_eq!(Step::from_code(step.code()), Some(step));
             assert_eq!(
                 Step::from_code(step.code()).map(Step::code),
@@ -340,7 +389,7 @@ mod tests {
             assert!(names.insert(step.name()), "names are unique");
         }
         assert_eq!(Step::from_code(0), None);
-        assert_eq!(Step::from_code(9), None);
+        assert_eq!(Step::from_code(10), None);
         assert_eq!(Step::from_code(9999), None);
     }
 }

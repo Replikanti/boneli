@@ -11,8 +11,9 @@ publish.workspace = true
 # The workspace lints without `unsafe_code = "forbid"`, plus the lints that
 # keep unsafe code reviewable. tools/check-architecture.sh (rule `sys-lints`)
 # checks that this table keeps every workspace lint at the same or a
-# stricter level and the three unsafe lints of `[check] unsafe-lints` in
-# tools/architecture.toml at deny or forbid (ADR-007, D6).
+# stricter level and the lints of `[check] unsafe-lints` in
+# tools/architecture.toml at forbid, which an inner `#![allow]` cannot
+# lower (ADR-007, D6).
 [lints.rust]
 missing_docs = "warn"
 # Every unsafe operation sits in its own `unsafe` block, also inside an
@@ -23,9 +24,9 @@ unsafe_op_in_unsafe_fn = "forbid"
 dbg_macro = "deny"
 todo = "deny"
 # A panic in the cloned child aborts it mid-setup with no report.
-unwrap_used = "deny"
-undocumented_unsafe_blocks = "deny"
-multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "forbid"
+undocumented_unsafe_blocks = "forbid"
+multiple_unsafe_ops_per_block = "forbid"
 
 [dependencies]
 # Syscall numbers, structs and constants for namespaces, mounts, seccomp

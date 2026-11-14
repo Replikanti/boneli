@@ -232,3 +232,26 @@ fn wait_and_kill_by_pidfd() {
         "a second wait is an error"
     );
 }
+
+#[test]
+#[ignore = "host: unprivileged user namespaces"]
+fn report_survives_closed_stdio() {
+    // A runner with 0-2 closed (daemonized): pipe2 would hand out 0 and 1
+    // for the report pipe, and the child's stdio dup2 would replace its
+    // write end, so the exec failure below would read as a success.
+    let dir = support::TempDir::new("closed-stdio");
+    let file = dir.path().join("result");
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "probe", "--nocapture", "--quiet"])
+        .env(support::probe::ACTION_VAR, "closed-stdio-spawn")
+        .env("BONELI_PROBE_FILE", &file)
+        .output()
+        .expect("run the probe");
+    let got = std::fs::read_to_string(&file).unwrap_or_default();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "spawn with 0-2 closed did not report Setup {{ Exec, ENOENT }}: {got}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

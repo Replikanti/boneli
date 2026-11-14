@@ -271,7 +271,10 @@ pub(crate) struct Launched {
     pub pidfd: OwnedFd,
 }
 
-/// A close-on-exec pipe: `(read, write)`.
+/// The close-on-exec report pipe: `(read, write)`. The write end is moved to
+/// a descriptor >= 3: a caller with 0-2 closed would get it there, and the
+/// child's `dup2` onto 0-2 would then replace it, so a later failed step
+/// would write its report into the program's stdio instead.
 pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: fds is a valid array of two ints for pipe2 to fill.
@@ -282,7 +285,29 @@ pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     // SAFETY: as above, for the write end.
     let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let write = dup_high(&write)?;
     Ok((read, write))
+}
+
+/// Sets the calling thread's signal mask with the raw syscall, which also
+/// covers the signals glibc reserves; returns the previous mask.
+fn set_signal_mask(mask: u64) -> Result<u64> {
+    let mut old: u64 = 0;
+    // SAFETY: both sets are valid kernel signal sets of the size passed.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &mask as *const u64,
+            &mut old as *mut u64,
+            crate::ffi::SIGSET_SIZE,
+        )
+    };
+    if rc < 0 {
+        Err(Error::last("rt_sigprocmask"))
+    } else {
+        Ok(old)
+    }
 }
 
 /// Clones a child into a new user namespace that runs `plan`. Returns in
@@ -303,6 +328,11 @@ pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
         set_tid_size: 0,
         cgroup: 0,
     };
+    // Every signal stays blocked from the clone until the child has reset
+    // its dispositions (Step::Signals), so no handler of this process runs
+    // in the child; this thread's mask is restored right after the clone,
+    // as glibc's posix_spawn does (ADR-007, D4).
+    let old_mask = set_signal_mask(!0)?;
     // SAFETY: args is a valid clone_args of the size passed. Without
     // CLONE_VM the child gets a copy of this address space, as with fork.
     let pid = unsafe {
@@ -312,13 +342,25 @@ pub(crate) fn launch(plan: &ChildPlan<'_>) -> Result<Launched> {
             std::mem::size_of::<libc::clone_args>(),
         )
     };
-    if pid < 0 {
-        return Err(Error::last("clone3"));
-    }
     if pid == 0 {
         // SAFETY: this is the child of the clone3 above, without CLONE_VM,
         // and plan refers to memory prepared before it.
         unsafe { child::run(plan) }
+    }
+    let clone_errno = errno();
+    let restored = set_signal_mask(old_mask);
+    if pid < 0 {
+        return Err(Error::Sys {
+            call: "clone3",
+            errno: clone_errno,
+        });
+    }
+    if let Err(e) = restored {
+        // SAFETY: clone3 stored a descriptor in pidfd that nothing owns yet.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let _ = send_kill(&pidfd);
+        let _ = reap(&pidfd);
+        return Err(e);
     }
     // SAFETY: clone3 with CLONE_PIDFD stored a new descriptor in pidfd that
     // nothing else owns.
@@ -445,11 +487,6 @@ pub(crate) fn spawn_inner(spec: &Spec, fault: Fault, pid: &mut libc::pid_t) -> R
 mod tests {
     use super::*;
     use crate::child::Step;
-    use std::sync::Mutex;
-
-    /// Serializes the host tests here, which count this process's
-    /// descriptors.
-    static HOST: Mutex<()> = Mutex::new(());
 
     fn null() -> OwnedFd {
         std::fs::File::options()
@@ -540,8 +577,10 @@ mod tests {
     #[test]
     #[ignore = "host: unprivileged user namespaces"]
     fn every_step_failure_is_reported() {
-        let _host = HOST.lock().expect("host test lock");
-        for step in Step::ALL {
+        let _host = crate::test_guard::host_lock();
+        // Step::Seccomp is not part of spawn's sequence yet (only the probe
+        // runs it; host::tests covers it there).
+        for step in Step::ALL.into_iter().filter(|s| *s != Step::Seccomp) {
             let before = open_fds();
             let mut pid = 0;
             let s = spec("/bin/true", Duration::from_secs(10));
@@ -565,7 +604,7 @@ mod tests {
     #[test]
     #[ignore = "host: unprivileged user namespaces"]
     fn setup_timeout_kills_hung_child() {
-        let _host = HOST.lock().expect("host test lock");
+        let _host = crate::test_guard::host_lock();
         let before = open_fds();
         let s = spec("/bin/true", Duration::from_millis(200));
         let mut pid = 0;
@@ -589,7 +628,7 @@ mod tests {
     #[test]
     #[ignore = "host: unprivileged user namespaces"]
     fn allocation_guard_catches_child_allocation() {
-        let _host = HOST.lock().expect("host test lock");
+        let _host = crate::test_guard::host_lock();
         let s = spec("/bin/true", Duration::from_secs(10));
         let mut pid = 0;
         // The guard ends the child before it reaches exec or writes a
@@ -600,6 +639,76 @@ mod tests {
         assert_eq!(
             child.wait().expect("wait"),
             ExitStatus::Exited(crate::test_guard::EXIT_ALLOCATED)
+        );
+    }
+
+    static HANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    extern "C" fn record_pid(_sig: libc::c_int) {
+        // SAFETY: getpid is async-signal-safe and cannot fail.
+        let pid = unsafe { libc::getpid() }.to_ne_bytes();
+        let fd = HANDLER_FD.load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: write is async-signal-safe; pid is a local array.
+        unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn parent_handlers_never_run_in_the_child() {
+        let _host = crate::test_guard::host_lock();
+        let (read, write) = report_pipe().expect("pipe");
+        // SAFETY: O_NONBLOCK on our own read end only changes how reads wait.
+        unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        HANDLER_FD.store(write.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: an all-zero sigaction is valid storage for both actions.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = record_pid as extern "C" fn(libc::c_int) as usize;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: as above.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: both actions are valid; the handler is async-signal-safe.
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, &mut old) },
+            0
+        );
+
+        // The child hangs after its id maps, before Step::Signals: the window
+        // in which it still has the parent's handlers.
+        let worker = std::thread::spawn(|| {
+            let s = spec("/bin/true", Duration::from_millis(1500));
+            let mut pid = 0;
+            let result = spawn_inner(&s, Fault::Hang(Step::Setsid), &mut pid);
+            (result.map(|_| ()), pid)
+        });
+        let child = crate::test_guard::wait_for_child(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(200));
+        // SAFETY: kill takes plain integers; the child is ours and alive
+        // until the setup timeout.
+        assert_eq!(unsafe { libc::kill(child, libc::SIGUSR1) }, 0);
+        // Control: the handler works in this process.
+        // SAFETY: as above, for this process.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(parent, libc::SIGUSR1) }, 0);
+        let (result, pid) = worker.join().expect("spawning thread");
+        assert!(matches!(result, Err(Error::SetupTimeout(_))), "{result:?}");
+        assert_eq!(pid, child);
+
+        // SAFETY: old holds the previous action.
+        unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
+        let mut ran_in = Vec::new();
+        let mut buf = [0u8; 4];
+        // SAFETY: buf is valid for 4 bytes; the read end is non-blocking.
+        while unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), 4) } == 4 {
+            ran_in.push(i32::from_ne_bytes(buf));
+        }
+        assert!(
+            ran_in.contains(&parent),
+            "the handler ran in the parent: {ran_in:?}"
+        );
+        assert!(
+            !ran_in.contains(&child),
+            "a parent handler ran in the child {child}: {ran_in:?}"
         );
     }
 }

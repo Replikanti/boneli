@@ -1,2 +1,2 @@
-# the own table drops a workspace lint (unwrap_used)
+# the own table drops a workspace lint (dbg_macro)
 sys-lints

@@ -63,6 +63,7 @@ pub fn main(action: &str) -> ! {
         "fds-env" => fds_env(),
         "session" => session(),
         "features" => features(),
+        "closed-stdio-spawn" => closed_stdio_spawn(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     std::process::exit(0)
@@ -204,4 +205,58 @@ fn features() {
             .join(","),
     };
     put("missing", &ids);
+}
+
+/// Spawns a missing program with descriptors 0-2 closed in this process
+/// (a daemonized runner): the report pipe must not land on 0-2, where the
+/// child's stdio `dup2` would replace it. Exits 0 when spawn returns
+/// `Setup { Exec, ENOENT }`, else writes what it got to `BONELI_PROBE_FILE`
+/// and exits 3. This process is not sandboxed: the host test runs it
+/// directly, so closing its stdio cannot disturb other tests.
+fn closed_stdio_spawn() {
+    let out = input("BONELI_PROBE_FILE");
+    let null = || -> std::os::fd::OwnedFd {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap_or_else(|e| fail(3, &format!("open /dev/null: {e}")))
+            .into()
+    };
+    // Opened while 0-2 are still open, so they sit at 3 and above.
+    let stdio = boneli_sys::Stdio {
+        stdin: null(),
+        stdout: null(),
+        stderr: null(),
+    };
+    for fd in 0..3 {
+        // SAFETY: closing this process's own stdio descriptors; nothing
+        // else in this process uses them from here on.
+        unsafe { libc::close(fd) };
+    }
+    let spec = boneli_sys::Spec {
+        program: "/nonexistent/boneli-sys-probe".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        stdio,
+        ids: boneli_sys::Ids::new(0, 0).unwrap_or_else(|e| fail(3, &e.to_string())),
+        setup_timeout: std::time::Duration::from_secs(10),
+    };
+    let result = boneli_sys::spawn(&spec);
+    let ok = matches!(
+        result,
+        Err(boneli_sys::Error::Setup {
+            step: boneli_sys::Step::Exec,
+            errno: libc::ENOENT,
+            ..
+        })
+    );
+    if !ok {
+        let got = match result {
+            Ok(mut child) => format!("Ok(child), which ended with {:?}", child.wait()),
+            Err(e) => format!("Err({e:?})"),
+        };
+        let _ = std::fs::write(&out, got);
+        std::process::exit(3);
+    }
 }

@@ -58,3 +58,45 @@ unsafe impl GlobalAlloc for Guard {
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
+
+/// Serializes the unit tests that start children: they count this
+/// process's descriptors and find their child among its children.
+static HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes the host test lock; a test that failed while holding it does not
+/// fail the others.
+pub fn host_lock() -> std::sync::MutexGuard<'static, ()> {
+    HOST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The pids of this process's children, from every thread's list.
+pub fn children() -> Vec<i32> {
+    let mut pids = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let list = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        pids.extend(
+            list.split_whitespace()
+                .filter_map(|p| p.parse::<i32>().ok()),
+        );
+    }
+    pids
+}
+
+/// The first child that appears within `bound` (a hang bound).
+pub fn wait_for_child(bound: std::time::Duration) -> i32 {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if let Some(&pid) = children().first() {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no child appeared within {bound:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}

@@ -861,9 +861,11 @@ def sys_lints(lints, ws_lints, unsafe_lints):
                 if (tool, name) == ("rust", "unsafe_code"):
                     continue
                 required[(tool, name)] = lint_level(value) or "forbid"
+    # forbid, not deny: cargo passes [lints] as command-line levels, and an
+    # inner #![allow(...)] in the source overrides every level but forbid
+    # (with forbid it is error E0453).
     for key in unsafe_lints:
-        if LEVELS[required.get(key, "allow")] < LEVELS["deny"]:
-            required[key] = "deny"
+        required[key] = "forbid"
     problems = []
     for (tool, name), need in sorted(required.items()):
         value = dig(lints, tool, name)

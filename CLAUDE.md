@@ -58,8 +58,9 @@ harness. Rust workspace, hexagonal architecture. Public repository
    has its own `[lints]` table instead (rule `sys-lints`): every workspace
    lint except `unsafe_code` at the same or a stricter level, the lints of
    `[check] unsafe-lints` (`unsafe_op_in_unsafe_fn`,
-   `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`) at `deny`
-   or `forbid`, and nothing else below `deny` (ADR-007, D6). No
+   `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`,
+   `unwrap_used`) at `forbid`, so no inner `#![allow]` can lower them, and
+   nothing else below `deny` (ADR-007, D6). No
    `.cargo/config*`, `clippy.toml`, `rust-toolchain*`, proc-macro crate,
    `#[path]`, `include!` or target source outside `.rs`; no build script in
    a member outside `roles.build-script` in `tools/architecture.toml` (empty;

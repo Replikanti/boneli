@@ -123,13 +123,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through a raw `clone3` with a pidfd; the child maps one id inside to the
   caller's uid and gid (`Ids`, single id mapping, `setgroups` denied),
   starts a new session, resets every signal disposition and the signal
-  mask, keeps only the three stdio descriptors and the given environment,
-  and execs, without allocating. A failed step comes back as
+  mask (every signal stays blocked from the clone until then, so no
+  handler of the caller runs in the child), keeps only the three stdio
+  descriptors and the given environment, and execs, without allocating. A failed step comes back as
   `Error::Setup` with the step, item and errno over a close-on-exec pipe;
-  a setup timeout or a malformed report kills and reaps the child. Callers
+  a setup timeout or a malformed report kills and reaps the child. The
+  pipe's write end sits at descriptor 3 or above, so it survives a caller
+  with 0-2 closed. Callers
   running as root or setuid are refused. `Features::probe` tries every
   host feature the runtime needs (user namespaces with the map writes,
-  `clone3`, `close_range`, `SECCOMP_RET_KILL_PROCESS`, Landlock ABI 2,
+  `clone3`, `close_range`, `SECCOMP_RET_KILL_PROCESS`, an installed
+  allow-all seccomp filter, Landlock ABI 2,
   cgroup v2 and delegation of the caller's cgroup) and names each missing
   one with a stable id and its cause, AppArmor's user-namespace
   restriction included.
@@ -139,7 +143,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
   its own `[lints]` table with every workspace lint but `unsafe_code` at
   the same or a stricter level, the lints of the new
-  `[check] unsafe-lints` array at deny or forbid, and nothing else below
+  `[check] unsafe-lints` array at forbid, and nothing else below
   deny; with fixtures.
 - CI: the `sandbox` job on x86_64 and arm64 runners, which asserts what a
   stock runner lacks, prepares the host with the host-setup block from

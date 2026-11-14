@@ -43,10 +43,12 @@ build-script = []
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # A target without std: the core crates must build for it.
 no-std-target = "x86_64-unknown-none"
-# Lints the unsafe crates (roles.unsafe) set to deny or forbid in their own
-# [lints] table, next to every workspace lint except unsafe_code (rule
-# sys-lints, ADR-007 D6): each unsafe operation in its own block, also in
-# an unsafe fn, and each block with a `// SAFETY:` comment.
+# Lints the unsafe crates (roles.unsafe) set to forbid in their own [lints]
+# table, next to every workspace lint except unsafe_code (rule sys-lints,
+# ADR-007 D6): each unsafe operation in its own block, also in an unsafe
+# fn, each block with a `// SAFETY:` comment, and no unwrap (a panic in the
+# cloned child aborts it mid-setup). forbid, because an inner #![allow]
+# in the source overrides deny.
 
 [external.libc]
 reason = "syscall declarations (namespaces, mount, seccomp, Landlock)"

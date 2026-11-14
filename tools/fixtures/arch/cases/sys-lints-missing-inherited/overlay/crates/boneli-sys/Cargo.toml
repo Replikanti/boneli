@@ -9,9 +9,9 @@ missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "forbid"
 
 [lints.clippy]
-dbg_macro = "deny"
 todo = "deny"
-undocumented_unsafe_blocks = "deny"
-multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "forbid"
+undocumented_unsafe_blocks = "forbid"
+multiple_unsafe_ops_per_block = "forbid"
 
 [dependencies]
