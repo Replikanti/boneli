@@ -7,9 +7,9 @@
 //! that fails or idles out shuts both sockets down, so the other
 //! direction's blocked read or write returns at once: no exit path leaves
 //! a thread waiting for a peer, and every handle is dropped when `relay`
-//! returns. A direction whose peer is gone (a broken pipe or a reset on
-//! write) stops without that: the other direction reads from the same
-//! peer and decides how the tunnel ended.
+//! returns. A direction whose peer is gone (a write fails with a broken
+//! pipe) stops without that: the other direction reads from the same peer
+//! and decides how the tunnel ended.
 
 use std::io::{ErrorKind, Write};
 use std::net::Shutdown;
@@ -233,11 +233,12 @@ fn timed_out(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-/// The peer of the socket written to is gone: it closed (a Unix socket
-/// returns `EPIPE` on the first write after that) or reset the connection.
+/// The peer of the socket written to is gone after the end of its stream,
+/// or the other direction already stopped the tunnel: `EPIPE`. A Unix
+/// socket returns it on the first write after the peer closed; TCP returns
+/// it for a reset that came after the peer's FIN, whose bytes stay
+/// readable. A reset without a FIN cuts a stream short and returns
+/// `ECONNRESET`, which is an error like any other (ADR-006, D7).
 fn gone(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-    )
+    e.kind() == ErrorKind::BrokenPipe
 }

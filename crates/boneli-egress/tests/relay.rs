@@ -5,8 +5,8 @@
 
 mod common;
 
-use std::io::Write;
-use std::net::Shutdown;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -223,11 +223,65 @@ fn both_peers_gone_ends_error() {
         boneli_egress::relay(
             Box::new(FailingWrites(sandbox, std::io::ErrorKind::BrokenPipe)),
             Vec::new(),
-            Box::new(FailingWrites(upstream, std::io::ErrorKind::ConnectionReset)),
+            Box::new(FailingWrites(upstream, std::io::ErrorKind::BrokenPipe)),
             &settings,
         )
     });
     let outcome = join(relay);
     assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
     assert_eq!((outcome.up, outcome.down, outcome.end), (0, 0, End::Error));
+}
+
+/// A reset is not a peer that is gone after its stream: the upload's write
+/// meets the reset first, the origin's end of stream follows, and the
+/// tunnel still ends as `error`, not as `eof`.
+#[test]
+fn reset_on_upload_write_ends_error() {
+    let (sandbox, mut client) = UnixStream::pair().expect("pair");
+    let (upstream, origin) = UnixStream::pair().expect("pair");
+    client.set_read_timeout(Some(DEADLINE)).expect("timeout");
+    let settings = settings(Duration::from_secs(60));
+    let relay = thread::spawn(move || {
+        boneli_egress::relay(
+            Box::new(sandbox),
+            Vec::new(),
+            Box::new(FailingWrites(upstream, std::io::ErrorKind::ConnectionReset)),
+            &settings,
+        )
+    });
+    send(&mut client, b"x");
+    origin.shutdown(Shutdown::Write).expect("half-close");
+    let outcome = join(relay);
+    assert_eq!((outcome.up, outcome.down, outcome.end), (0, 0, End::Error));
+    assert!(read_to_close(&mut client).is_empty());
+}
+
+/// A real TCP reset in the middle of a download (the origin closes with
+/// unread upload bytes, so Linux sends a reset instead of a FIN): the
+/// tunnel ends as `error` with the bytes that made it through.
+#[test]
+fn tcp_reset_mid_download_ends_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (mut origin, _) = listener.accept().expect("accept");
+    let (sandbox, mut client) = UnixStream::pair().expect("pair");
+    client.set_read_timeout(Some(DEADLINE)).expect("timeout");
+    origin.set_read_timeout(Some(DEADLINE)).expect("timeout");
+    let settings = settings(Duration::from_secs(60));
+    let start = Instant::now();
+    let relay = thread::spawn(move || {
+        boneli_egress::relay(Box::new(sandbox), Vec::new(), Box::new(upstream), &settings)
+    });
+    send(&mut client, b"x");
+    // The upload byte sits unread in the origin's receive queue.
+    let mut byte = [0u8; 1];
+    assert_eq!(origin.peek(&mut byte).expect("peek"), 1);
+    send(&mut origin, b"partial");
+    let mut got = [0u8; 7];
+    client.read_exact(&mut got).expect("partial download");
+    assert_eq!(&got, b"partial");
+    drop(origin);
+    let outcome = join(relay);
+    assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+    assert_eq!((outcome.up, outcome.down, outcome.end), (1, 7, End::Error));
 }

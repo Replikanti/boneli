@@ -334,7 +334,7 @@ even though the CONNECT is refused.
   first end other than `eof` decides the `close` record.
 - Half-close: the end of one side's stream becomes `shutdown(Write)` on the
   other, and the tunnel ends when both directions are done.
-- A peer that is gone (a write fails with a broken pipe or a reset) stops
+- A peer that is gone (a write fails with a broken pipe, `EPIPE`) stops
   its direction without the shutdown above, and the other direction, which
   reads from that peer, decides the end: the end of that peer's stream
   makes it `eof`, an error or the idle timeout makes it that. The case is
@@ -346,6 +346,15 @@ even though the CONNECT is refused.
   is gone; a peer that only stopped reading stays bounded by the idle
   timeout. Both peers gone, so that neither direction saw the end of a
   stream, is `error`.
+- A reset (`ECONNRESET`, `ECONNABORTED`) is an error like any other, never
+  a gone peer, whichever direction meets it first. Measured on 2026-11-15
+  on Linux 7.2 over loopback TCP: a write after a reset without a FIN
+  fails with `ECONNRESET`, a write after a FIN and then a reset fails with
+  `EPIPE`, and the bytes before that FIN stay readable. So `EPIPE` on the
+  upstream means the origin's stream had ended and the other direction
+  reads all of it, while `ECONNRESET` means the stream was cut. Treating a
+  reset as a gone peer would let a sandbox that writes at the right moment
+  turn a cut download into `end=eof`.
 - **Buffer: 16 KiB**, the largest TLS plaintext fragment, 2^14 bytes (RFC
   8446, section 5.1). On the wire a protected record carries up to 2^14 +
   256 bytes, so a full record takes two reads and a typical one takes one;
