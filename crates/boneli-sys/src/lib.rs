@@ -6,7 +6,8 @@
 //! raw `clone3` whose child runs a fixed setup sequence that allocates
 //! nothing ([`spawn`], ADR-007 D4) and gives it new mount, PID, network,
 //! IPC, UTS and cgroup namespaces with a read-only root ([`Root`], ADR-007
-//! D7), and it checks that a host has what the
+//! D7) inside a cgroup whose limits are in place before it starts
+//! ([`Cgroup`], ADR-007 D8), and it checks that a host has what the
 //! runtime needs ([`Features::probe`], ADR-007 D3). The kernel is reached
 //! through `libc` only.
 //!
@@ -21,6 +22,7 @@
 )))]
 compile_error!("boneli-sys supports only little-endian Linux on x86_64 and aarch64 (ADR-007)");
 
+mod cgroup;
 mod child;
 mod error;
 mod ffi;
@@ -30,6 +32,9 @@ mod mount;
 mod report;
 mod spawn;
 
+pub use cgroup::{
+    Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
+};
 pub use child::Step;
 pub use error::{Error, ProtocolError, Result};
 pub use host::{Features, Missing, MissingId};

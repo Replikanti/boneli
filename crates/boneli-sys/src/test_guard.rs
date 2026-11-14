@@ -124,7 +124,7 @@ impl UnitRoot {
             .expect("the test binary's directory")
             .join(format!("boneli-sys-unit-{}-{n}", std::process::id()));
         let layer = dir.join("layer");
-        for d in ["usr", "proc", "dev", "tmp", "work2"] {
+        for d in ["usr", "proc", "dev", "tmp", "work2", "sys/fs/cgroup"] {
             std::fs::create_dir_all(layer.join(d)).expect("create a mount point");
         }
         let mut mounts = vec![Mount::Bind {
@@ -169,6 +169,9 @@ impl UnitRoot {
                 target: InsidePath::new("/dev").expect("path"),
                 shm_size_bytes: 1 << 20,
             },
+            Mount::Cgroup2 {
+                target: InsidePath::new("/sys/fs/cgroup").expect("path"),
+            },
         ]);
         let root = crate::Root {
             layers: vec![layer],
@@ -201,4 +204,54 @@ pub fn remove_tree(dir: &std::path::Path) {
     }
     open_up(dir);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The delegated parent of the unit tests' sandbox cgroups, the same as
+/// the integration tests' `support::cgroup::parent` (ADR-007, D5 and D8):
+/// only with `BONELI_SYS_TEST_CGROUP=self`, it vacates the run's own
+/// cgroup into `leaf/` once, or uses the parent of a `leaf/` an earlier
+/// test binary of the run left this one in.
+pub fn cgroup_parent() -> &'static crate::Parent {
+    static PARENT: std::sync::OnceLock<crate::Parent> = std::sync::OnceLock::new();
+    PARENT.get_or_init(|| {
+        let mode = std::env::var("BONELI_SYS_TEST_CGROUP").unwrap_or_default();
+        assert_eq!(
+            mode, "self",
+            "host tests need BONELI_SYS_TEST_CGROUP=self in a delegated scope of their own \
+             (systemd-run --user --scope -p Delegate=yes, CLAUDE.md \"Host tests\")"
+        );
+        let text = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+        let own = text
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .expect("a cgroup v2 line");
+        let own = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
+        if own.file_name().is_some_and(|n| n == "leaf") {
+            if let Ok(parent) = crate::Parent::open(own.parent().expect("leaf/ has a parent")) {
+                return parent;
+            }
+        }
+        crate::Parent::vacate_and_delegate(&own)
+            .unwrap_or_else(|e| panic!("delegate {}: {e}", own.display()))
+    })
+}
+
+/// A sandbox cgroup for a unit test: 256 MiB without swap, 64 tasks, one
+/// CPU, no IO limit (the integration harness's defaults).
+pub fn sandbox_cgroup(tag: &str) -> crate::Cgroup {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("unit-{tag}-{}-{n}", std::process::id());
+    let limits = crate::Limits {
+        memory_max: 256 << 20,
+        memory_swap_max: 0,
+        pids_max: 64,
+        cpu: crate::CpuMax {
+            quota_us: 100_000,
+            period_us: 100_000,
+        },
+        io: crate::IoLimits::none(),
+    };
+    crate::Cgroup::create(cgroup_parent(), &name, &limits)
+        .unwrap_or_else(|e| panic!("create cgroup {name}: {e}"))
 }
