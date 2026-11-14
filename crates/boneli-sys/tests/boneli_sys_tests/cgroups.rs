@@ -796,3 +796,83 @@ fn drop_reports_a_cgroup_it_cannot_remove() {
     let _ = std::fs::remove_dir(&path);
     assert!(leaked.contains(&path), "{leaked:?}");
 }
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (io)"]
+fn failed_create_removes_its_cgroup() {
+    // Re-review of PR 3: a refused io.max line (an unknown device, ENODEV)
+    // made the teardown write the same line again, fail, and skip the
+    // removal. Only accepted lines are lifted now, and every teardown
+    // step runs.
+    let bad = boneli_sys::DeviceNumber {
+        major: 259,
+        minor: 65000,
+    };
+    let io = IoLimits::new(vec![IoMax {
+        dev: bad,
+        rbps: None,
+        wbps: Some(1 << 20),
+        riops: None,
+        wiops: None,
+    }])
+    .expect("one device");
+    let name = cgroup::unique_name("bad-io");
+    let path = cgroup::parent().path().join(&name);
+    let result = Cgroup::create(
+        cgroup::parent(),
+        &name,
+        &limits(64 << 20, 16, (100_000, 100_000), io),
+    );
+    let left = path.exists();
+    let leaked = boneli_sys::leaked_cgroups();
+    let _ = std::fs::remove_dir(&path);
+    assert!(
+        matches!(
+            result,
+            Err(Error::CgroupFile {
+                file: "io.max",
+                errno: libc::ENODEV
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(!left, "the failed create left {}", path.display());
+    assert!(!leaked.contains(&path), "{leaked:?}");
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation"]
+fn destroy_failure_is_recorded_with_path() {
+    // A sub-cgroup the host made keeps the rmdir failing: destroy returns
+    // the path with every error and lists the cgroup as leaked.
+    let cg = cgroup::sandbox("destroy-leak");
+    let path = cg.path().to_path_buf();
+    std::fs::write(path.join("cgroup.max.descendants"), "1").expect("raise from the host");
+    std::fs::write(path.join("cgroup.max.depth"), "1").expect("raise from the host");
+    std::fs::create_dir(path.join("sub")).expect("a sub-cgroup");
+    let result = cg.destroy();
+    let leaked = boneli_sys::leaked_cgroups();
+    let _ = std::fs::remove_dir(path.join("sub"));
+    let _ = std::fs::remove_dir(&path);
+    match result {
+        Err(Error::CgroupTeardown {
+            path: p,
+            removed: false,
+            errors,
+        }) => {
+            assert_eq!(p, path);
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    Error::Sys {
+                        call: "unlinkat(cgroup)",
+                        errno: libc::EBUSY
+                    }
+                )),
+                "{errors:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(leaked.contains(&path), "{leaked:?}");
+}

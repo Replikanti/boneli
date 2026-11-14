@@ -126,6 +126,21 @@ pub enum Error {
     },
     /// A cgroup still held processes this long after `cgroup.kill`.
     CgroupKillTimeout(Duration),
+    /// Tearing a sandbox cgroup down failed in at least one step; every
+    /// step was still tried (ADR-007, D8).
+    CgroupTeardown {
+        /// The cgroup.
+        path: PathBuf,
+        /// Whether its directory is gone; if not, it is also listed by
+        /// [`crate::leaked_cgroups`].
+        removed: bool,
+        /// Every failure, in order.
+        errors: Vec<Error>,
+    },
+    /// The cgroup2 hierarchy is mounted without `nsdelegate`, so a sandbox
+    /// could raise its own limits (ADR-007, D8); the mount's super options,
+    /// or why they are unknown.
+    NsdelegateMissing(String),
     /// The path's file system has no block device to limit with `io.max`
     /// (tmpfs, overlay).
     NoBlockDevice(PathBuf),
@@ -233,6 +248,27 @@ impl fmt::Display for Error {
             Error::CgroupKillTimeout(t) => {
                 write!(f, "the cgroup still had processes {t:?} after cgroup.kill")
             }
+            Error::CgroupTeardown {
+                path,
+                removed,
+                errors,
+            } => {
+                let what = if *removed {
+                    "was removed, with errors"
+                } else {
+                    "was not removed"
+                };
+                write!(f, "the sandbox cgroup {} {what}:", path.display())?;
+                for err in errors {
+                    write!(f, " {err};")?;
+                }
+                Ok(())
+            }
+            Error::NsdelegateMissing(options) => write!(
+                f,
+                "the cgroup v2 hierarchy is mounted without nsdelegate ({options}); \
+                 refusing a cgroup parent, since a sandbox could raise its own limits"
+            ),
             Error::NoBlockDevice(p) => {
                 write!(
                     f,

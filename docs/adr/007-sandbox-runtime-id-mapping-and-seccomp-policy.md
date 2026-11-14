@@ -635,7 +635,11 @@ of D7):
   `sysconf(_SC_PAGESIZE)`, because the kernel rounds memory limits down to
   a page and arm64 pages may be 4, 16 or 64 KiB; below one page the limit
   would read back as 0. `33554433` reads back `33554432` (measured;
-  `limit_files_render_and_read_back`).
+  `limit_files_render_and_read_back`). Huge pages are charged to `memory.max`
+  only when cgroup2 is mounted with `memory_hugetlb_accounting` (Linux
+  6.6, off by default), which the arm64 CI runner lacks (measured; the dev
+  host and the x86_64 runner have it), so PR 4's seccomp rows refuse
+  `MAP_HUGETLB`, `SHM_HUGETLB` and `MFD_HUGETLB`.
 - `memory_swap_max` any value, 0 for no swap; also rounded down to a page
   (measured).
 - `pids_max` at least 1: the kernel accepts 0 (measured), which leaves the
@@ -762,7 +766,11 @@ added in the review round of PR 3:
   delegated scope), so the stock-runner expectation and the host-setup
   block stay as they are; a host without it is refused with
   `cgroup-nsdelegate`, and only root can fix it (remount with
-  `nsdelegate`).
+  `nsdelegate`). The library checks it itself as well: `Parent::open` and
+  `Parent::vacate_and_delegate` read `/proc/self/mountinfo` and fail with
+  `Error::NsdelegateMissing` before they touch anything, so a runner that
+  skips `Features::require`, or a host remounted after the probe ran,
+  still gets no parent (re-review of PR 3; `parent_requires_nsdelegate`).
 - **No sub-cgroups:** `Cgroup::create` writes `cgroup.max.descendants`
   and `cgroup.max.depth` 0 and reads them back. `nsdelegate` does not stop
   `mkdir` (delegation is its purpose), and a sub-cgroup the sandbox made
@@ -795,13 +803,28 @@ and re-reads it at least every 100 ms in case a notification is missed;
 10 s is a hang bound, not a target (`destroy_kills_all_and_removes`
 measured about 3 ms for three sleepers). A killed child that its `Child`
 has not reaped yet does not keep the cgroup populated, and the directory
-can be removed before the reap (measured). `destroy` returns every
-failure. Dropping a `Cgroup` without `destroy` does the same work, but a
-drop cannot return an error, and a panic there would abort a process that
-is already unwinding; so a failed drop writes one line to stderr (the
-runner's journal; the crate has no logger, and `tracing` is on the
-do-not-use list) and records the path for `leaked_cgroups()`, which the
-runner (#8) can report and #33's sweep cleans up
+can be removed before the reap (measured).
+
+**Teardown never stops halfway** (re-review of PR 3). The kill, each lift,
+the wait and the `rmdir` are each attempted even when an earlier one
+failed, and every failure is collected into `Error::CgroupTeardown { path,
+removed, errors }`. Before this, a failed lift returned early and skipped
+the wait and the removal: a `Cgroup::create` whose `io.max` line the
+kernel refused (ENODEV for an unknown device or a partition) had its
+`Drop` write the same line again in the lift, fail, and leave the
+directory behind. Two changes close that: a device is recorded for the
+lift only after its `io.max` write succeeded (`refused_io_line_is_not_lifted`),
+and a failed lift no longer skips anything (`teardown_continues_after_a_failed_lift`;
+`failed_create_removes_its_cgroup` is the reviewer's repro: the directory
+is gone and nothing is listed as leaked). `destroy` returns the error with
+the path; a cgroup it could not remove is also recorded for
+`leaked_cgroups()` (`destroy_failure_is_recorded_with_path`). Dropping a
+`Cgroup` without `destroy` does the same work, but a drop cannot return
+an error, and a panic there would abort a process that is already
+unwinding; so a failed drop writes the error to stderr (the runner's
+journal; the crate has no logger, and `tracing` is on the do-not-use
+list) and records a directory it could not remove for `leaked_cgroups()`,
+which the runner (#8) can report and #33's sweep cleans up
 (`drop_reports_a_cgroup_it_cannot_remove`). A test failure or an early
 return therefore leaves nothing behind unnoticed; a spawn that fails at a step leaves an empty,
 removable cgroup (`failed_spawn_leaves_no_cgroup_process`, for an exec and

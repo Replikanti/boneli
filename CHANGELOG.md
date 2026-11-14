@@ -181,6 +181,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cgroup.max.descendants` and `cgroup.max.depth` 0; `Features::probe`
   requires `nsdelegate` (`cgroup-nsdelegate`); the child raises a
   negative inherited `oom_score_adj` to 0 (`Step::OomScoreAdj`).
+  Teardown tries every step and returns `Error::CgroupTeardown` with the
+  path; a cgroup `destroy` could not remove is listed by
+  `leaked_cgroups()` too; `Parent::open` and `vacate_and_delegate` refuse
+  a hierarchy without `nsdelegate` themselves.
 - `Features::probe`: a probe whose own machinery fails — a failed
   `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
   killed by a signal or ended before it could report, or a `clone3`

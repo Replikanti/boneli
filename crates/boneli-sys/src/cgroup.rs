@@ -381,6 +381,12 @@ impl Parent {
     /// its `cgroup.subtree_control` holds cpu, io, memory and pids, else
     /// [`Error::ControllerMissing`]: no sandbox runs without a limit.
     pub fn open(path: &Path) -> Result<Parent> {
+        Parent::open_checked(path, &read_mountinfo()?)
+    }
+
+    /// [`Parent::open`] against this mountinfo text.
+    pub(crate) fn open_checked(path: &Path, mountinfo: &[u8]) -> Result<Parent> {
+        check_nsdelegate(mountinfo)?;
         let dir = open_dir_path(path)?;
         check_cgroup2(&dir, path)?;
         check_controllers(&dir, "cgroup.subtree_control")?;
@@ -401,6 +407,13 @@ impl Parent {
     /// service; the test harness only with `BONELI_SYS_TEST_CGROUP=self`,
     /// so a terminal's cgroup is never reorganized.
     pub fn vacate_and_delegate(path: &Path) -> Result<Parent> {
+        Parent::vacate_checked(path, &read_mountinfo()?)
+    }
+
+    /// [`Parent::vacate_and_delegate`] against this mountinfo text; the
+    /// check comes before anything is moved.
+    pub(crate) fn vacate_checked(path: &Path, mountinfo: &[u8]) -> Result<Parent> {
+        check_nsdelegate(mountinfo)?;
         let dir = open_dir_path(path)?;
         check_cgroup2(&dir, path)?;
         check_controllers(&dir, "cgroup.controllers")?;
@@ -470,9 +483,9 @@ pub struct Cgroup {
 /// report; #33's sweep removes leftovers after a crash.
 static LEAKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
-/// The paths of the sandbox cgroups that a [`Cgroup`] dropped without
-/// [`Cgroup::destroy`] could not remove, in this process so far. Each one
-/// was also reported on stderr when it happened (ADR-007, D8).
+/// The paths of the sandbox cgroups that [`Cgroup::destroy`] or a drop
+/// could not remove, in this process so far. `destroy` also returned the
+/// error with the path; a drop reported it on stderr (ADR-007, D8).
 pub fn leaked_cgroups() -> Vec<PathBuf> {
     LEAKED.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
@@ -524,17 +537,20 @@ impl Cgroup {
             parent: parent_fd,
             name: cname,
             path: parent.path.join(name),
-            io_devices: limits.io.entries().iter().map(|e| e.dev).collect(),
+            // Filled by write_limits as each io.max line is accepted, so
+            // teardown never rewrites a line the kernel refused.
+            io_devices: Vec::new(),
             cpu_period_us: limits.cpu.period_us,
             live: true,
         };
+        let mut cg = cg;
         check_cgroup2(&cg.dir, &cg.path)?;
         cg.write_limits(limits)?;
         cg.check_limits(limits)?;
         Ok(cg)
     }
 
-    fn write_limits(&self, l: &Limits) -> Result<()> {
+    fn write_limits(&mut self, l: &Limits) -> Result<()> {
         write_file(&self.dir, "cgroup.max.descendants", b"0")?;
         write_file(&self.dir, "cgroup.max.depth", b"0")?;
         write_file(&self.dir, "memory.oom.group", b"1")?;
@@ -552,6 +568,8 @@ impl Cgroup {
         write_file(&self.dir, "cpu.max", render_cpu(&l.cpu).as_bytes())?;
         for io in l.io.entries() {
             write_file(&self.dir, "io.max", render_io(io).as_bytes())?;
+            // Only a line the kernel accepted is lifted again at the kill.
+            self.io_devices.push(io.dev);
         }
         Ok(())
     }
@@ -613,24 +631,81 @@ impl Cgroup {
     /// (a task waiting for throttled IO cannot die before its queued bios
     /// drain, review of PR 3), waits until the cgroup is empty
     /// (`populated 0` in `cgroup.events`, at most 10 s), and removes it.
-    /// Every failure is returned. A killed child that was not reaped yet does not keep it
-    /// populated (measured); its [`crate::Child`] still reaps it.
+    /// A killed child that was not reaped yet does not keep it populated
+    /// (measured); its [`crate::Child`] still reaps it.
+    ///
+    /// Every step runs even when an earlier one failed, so a failed lift
+    /// never skips the wait or the removal. Any failure is returned as
+    /// [`Error::CgroupTeardown`] with the path, whether the directory is
+    /// gone and every error in order; a cgroup left behind is also
+    /// recorded for [`leaked_cgroups`] (ADR-007, D8).
     pub fn destroy(mut self) -> Result<()> {
         self.live = false;
-        self.kill_and_remove()
+        let result = self.kill_and_remove();
+        if let Err(Error::CgroupTeardown { removed: false, .. }) = &result {
+            record_leak(&self.path);
+        }
+        result
     }
 
+    /// The teardown of [`Cgroup::destroy`] and the drop: every step is
+    /// attempted, every error is collected.
     fn kill_and_remove(&self) -> Result<()> {
-        write_file(&self.dir, "cgroup.kill", b"1")?;
+        let mut errors = Vec::new();
+        if let Err(e) = write_file(&self.dir, "cgroup.kill", b"1") {
+            errors.push(e);
+        }
         // Killed: no task returns to user space, so none can start new IO
         // or use the CPU it gets now; what is left is in the kernel.
-        self.lift_throttles()?;
+        self.lift_throttles(&mut errors);
+        if let Err(e) = self.wait_unpopulated() {
+            errors.push(e);
+        }
+        // Tried even after a failed wait: a cgroup that did empty in the
+        // meantime is still removed, and one that did not fails with EBUSY.
+        // SAFETY: the name is NUL-terminated; the parent is an open directory.
+        let rc = unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        };
+        let removed = if rc == 0 {
+            true
+        } else {
+            let e = Error::last("unlinkat(cgroup)");
+            // Gone already counts as removed.
+            let gone = matches!(
+                e,
+                Error::Sys {
+                    errno: libc::ENOENT,
+                    ..
+                }
+            );
+            errors.push(e);
+            gone
+        };
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::CgroupTeardown {
+                path: self.path.clone(),
+                removed,
+                errors,
+            })
+        }
+    }
+
+    /// Waits until `cgroup.events` says `populated 0`, at most
+    /// [`KILL_BOUND`].
+    fn wait_unpopulated(&self) -> Result<()> {
         let events = open_file(&self.dir, "cgroup.events", libc::O_RDONLY)?;
         let deadline = Instant::now() + KILL_BOUND;
         loop {
             let text = read_fd(&events, "cgroup.events")?;
             if text.lines().any(|l| l.trim() == "populated 0") {
-                break;
+                return Ok(());
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -647,32 +722,25 @@ impl Cgroup {
             // SAFETY: pfd is one valid pollfd for the call's duration.
             unsafe { libc::poll(&mut pfd, 1, ms) };
         }
-        // SAFETY: the name is NUL-terminated; the parent is an open directory.
-        let rc = unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        };
-        if rc < 0 {
-            return Err(Error::last("unlinkat(cgroup)"));
-        }
-        Ok(())
     }
 
-    /// Lifts every limit that can hold back a killed task: each `io.max`
-    /// line and the CPU quota.
-    fn lift_throttles(&self) -> Result<()> {
+    /// Lifts every limit that can hold back a killed task: each accepted
+    /// `io.max` line and the CPU quota. Best effort: every lift is tried,
+    /// and each failure is added to `errors`.
+    fn lift_throttles(&self, errors: &mut Vec<Error>) {
         for d in &self.io_devices {
             let line = format!(
                 "{}:{} rbps=max wbps=max riops=max wiops=max",
                 d.major, d.minor
             );
-            write_file(&self.dir, "io.max", line.as_bytes())?;
+            if let Err(e) = write_file(&self.dir, "io.max", line.as_bytes()) {
+                errors.push(e);
+            }
         }
         let cpu = format!("max {}", self.cpu_period_us);
-        write_file(&self.dir, "cpu.max", cpu.as_bytes())
+        if let Err(e) = write_file(&self.dir, "cpu.max", cpu.as_bytes()) {
+            errors.push(e);
+        }
     }
 
     /// A value that never was a cgroup, for the unit tests that fail before
@@ -705,19 +773,20 @@ impl Drop for Cgroup {
         }
         if let Err(e) = self.kill_and_remove() {
             let mut err = std::io::stderr();
-            let _ = std::io::Write::write_fmt(
-                &mut err,
-                format_args!(
-                    "boneli-sys: the sandbox cgroup {} was not removed: {e}\n",
-                    self.path.display()
-                ),
-            );
-            LEAKED
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(self.path.clone());
+            let _ = std::io::Write::write_fmt(&mut err, format_args!("boneli-sys: {e}\n"));
+            if let Error::CgroupTeardown { removed: false, .. } = e {
+                record_leak(&self.path);
+            }
         }
     }
+}
+
+/// Records a sandbox cgroup that was left behind, for [`leaked_cgroups`].
+fn record_leak(path: &Path) {
+    LEAKED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(path.to_path_buf());
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +862,22 @@ pub(crate) fn parse_mountinfo(text: &[u8]) -> Vec<MountEntry> {
         });
     }
     out
+}
+
+/// This process's `/proc/self/mountinfo`.
+fn read_mountinfo() -> Result<Vec<u8>> {
+    std::fs::read("/proc/self/mountinfo").map_err(|e| Error::Sys {
+        call: "read /proc/self/mountinfo",
+        errno: e.raw_os_error().unwrap_or(libc::EIO),
+    })
+}
+
+/// Fails with [`Error::NsdelegateMissing`] unless the cgroup2 hierarchy is
+/// mounted with `nsdelegate`: the library refuses to hand out a parent on
+/// such a host itself, whether or not the caller ran
+/// [`crate::Features::require`] (review of PR 3).
+fn check_nsdelegate(mountinfo: &[u8]) -> Result<()> {
+    cgroup2_nsdelegate(mountinfo).map_err(Error::NsdelegateMissing)
 }
 
 /// `Ok(())` when the last cgroup2 mount at `/sys/fs/cgroup` in a mountinfo
@@ -1007,10 +1092,7 @@ pub fn block_device_of(path: &Path) -> Result<DeviceNumber> {
             errno: libc::ENOSYS,
         });
     }
-    let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|e| Error::Sys {
-        call: "read /proc/self/mountinfo",
-        errno: e.raw_os_error().unwrap_or(libc::EIO),
-    })?;
+    let mountinfo = read_mountinfo()?;
     let st_dev = DeviceNumber {
         major: stx.stx_dev_major,
         minor: stx.stx_dev_minor,
@@ -1058,6 +1140,100 @@ mod tests {
             riops: None,
             wiops: None,
         }
+    }
+
+    #[test]
+    #[ignore = "host: cgroup v2 delegation"]
+    fn teardown_continues_after_a_failed_lift() {
+        // A lift that fails (here a device that never had a line) must not
+        // skip the wait or the removal; its error is still returned.
+        let _host = crate::test_guard::host_lock();
+        let mut cg = crate::test_guard::sandbox_cgroup("lift-fails");
+        cg.io_devices.push(DeviceNumber {
+            major: 259,
+            minor: 65000,
+        });
+        let path = cg.path().to_path_buf();
+        let result = cg.destroy();
+        let exists = path.exists();
+        let _ = std::fs::remove_dir(&path);
+        match result {
+            Err(Error::CgroupTeardown {
+                path: p,
+                removed: true,
+                errors,
+            }) => {
+                assert_eq!(p, path);
+                assert!(
+                    matches!(
+                        errors.as_slice(),
+                        [Error::CgroupFile {
+                            file: "io.max",
+                            errno: libc::ENODEV
+                        }]
+                    ),
+                    "{errors:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!exists, "{} left behind", path.display());
+        assert!(!leaked_cgroups().contains(&path));
+    }
+
+    #[test]
+    #[ignore = "host: cgroup v2 delegation (io)"]
+    fn refused_io_line_is_not_lifted() {
+        // Only an io.max line the kernel accepted is lifted at the kill, so
+        // a refused one (an unknown device, ENODEV) leaves a clean teardown.
+        let _host = crate::test_guard::host_lock();
+        let mut cg = crate::test_guard::sandbox_cgroup("refused-io");
+        let mut limits = base();
+        limits.io = IoLimits::new(vec![io(dev(259, 65000), Some(1 << 20))]).expect("io");
+        assert!(
+            matches!(
+                cg.write_limits(&limits),
+                Err(Error::CgroupFile {
+                    file: "io.max",
+                    errno: libc::ENODEV
+                })
+            ),
+            "the kernel refuses the line"
+        );
+        assert!(cg.io_devices.is_empty(), "{:?}", cg.io_devices);
+        let result = cg.destroy();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    #[ignore = "host: cgroup v2 delegation"]
+    fn parent_requires_nsdelegate() {
+        // Parent::open and vacate_and_delegate check nsdelegate themselves,
+        // before touching anything, whether or not the caller ran the probe.
+        let _host = crate::test_guard::host_lock();
+        let parent = crate::test_guard::cgroup_parent().path().to_path_buf();
+        let real = read_mountinfo().expect("mountinfo");
+        let without: &[u8] =
+            b"30 1 0:26 / /sys/fs/cgroup rw,relatime - cgroup2 cgroup2 rw,memory_recursiveprot\n";
+        assert!(Parent::open_checked(&parent, &real).is_ok());
+        assert!(
+            matches!(
+                Parent::open_checked(&parent, without),
+                Err(Error::NsdelegateMissing(o)) if o == "rw,memory_recursiveprot"
+            ),
+            "open without nsdelegate"
+        );
+        let sub = parent.join(format!("nsdel-{}", std::process::id()));
+        std::fs::create_dir(&sub).expect("a sub-cgroup");
+        let refused = Parent::vacate_checked(&sub, without);
+        let leaf_made = sub.join("leaf").exists();
+        let _ = std::fs::remove_dir(sub.join("leaf"));
+        let _ = std::fs::remove_dir(&sub);
+        assert!(
+            matches!(refused, Err(Error::NsdelegateMissing(_))),
+            "{refused:?}"
+        );
+        assert!(!leaf_made, "vacate changed the cgroup before the check");
     }
 
     #[test]
