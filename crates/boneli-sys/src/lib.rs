@@ -4,7 +4,9 @@
 //! Generic plumbing without domain knowledge: it starts a program in a new
 //! user namespace with a single id mapping ([`Ids`], ADR-007 D1), through a
 //! raw `clone3` whose child runs a fixed setup sequence that allocates
-//! nothing ([`spawn`], ADR-007 D4), and it checks that a host has what the
+//! nothing ([`spawn`], ADR-007 D4) and gives it new mount, PID, network,
+//! IPC, UTS and cgroup namespaces with a read-only root ([`Root`], ADR-007
+//! D7), and it checks that a host has what the
 //! runtime needs ([`Features::probe`], ADR-007 D3). The kernel is reached
 //! through `libc` only.
 //!
@@ -24,6 +26,7 @@ mod error;
 mod ffi;
 mod host;
 mod ids;
+mod mount;
 mod report;
 mod spawn;
 
@@ -31,6 +34,7 @@ pub use child::Step;
 pub use error::{Error, ProtocolError, Result};
 pub use host::{Features, Missing, MissingId};
 pub use ids::Ids;
+pub use mount::{DEV_ENTRIES, Hostname, InsidePath, Mount, OPTIONS_MAX, Root};
 pub use spawn::{Child, ExitStatus, Spec, Stdio, spawn};
 
 #[cfg(test)]

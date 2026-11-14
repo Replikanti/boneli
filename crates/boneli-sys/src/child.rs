@@ -13,10 +13,13 @@ use std::os::raw::{c_char, c_int};
 
 use crate::error::errno;
 use crate::ffi;
+use crate::mount::{self, Op};
 use crate::report;
 
-/// A step of the child's setup sequence, in order. The codes are the wire
-/// format of the setup report (ADR-007, D4).
+/// A step of the child's setup sequence. The codes are the wire format of
+/// the setup report (ADR-007, D4); they are stable, so the steps added by
+/// later parts of #6 got new codes instead of renumbering. The order the
+/// child runs them in is [`Step::SEQUENCE`].
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -43,11 +46,39 @@ pub enum Step {
     /// kernel installs filters at all (ADR-007, D3); `spawn` gets it before
     /// `Exec` with the policy of ADR-007 D2 in a later part of #6.
     Seccomp = 9,
+    /// `unshare(CLONE_NEWCGROUP)`: the cgroup namespace, created in the
+    /// child and not by `clone3` (ADR-007, D7).
+    CgroupNs = 10,
+    /// `mount("/", MS_REC | MS_PRIVATE)`.
+    MakePrivate = 11,
+    /// The read-only root on the staging directory: a bind of the one
+    /// layer or an overlay of several.
+    Root = 12,
+    /// Opening a mount target beneath the new root without following any
+    /// symlink; the item is the mount's index in `Root::mounts`.
+    MountTarget = 13,
+    /// A bind mount; the item is the mount's index.
+    Bind = 14,
+    /// A tmpfs mount; the item is the mount's index.
+    Tmpfs = 15,
+    /// A writable overlay mount; the item is the mount's index.
+    Overlay = 16,
+    /// A procfs mount; the item is the mount's index.
+    Proc = 17,
+    /// The minimal `/dev`; the item is the mount's index.
+    Dev = 18,
+    /// `pivot_root` onto the new root, the old root detached, and the
+    /// working directory.
+    Pivot = 19,
+    /// `sethostname` in the new UTS namespace.
+    Hostname = 20,
+    /// `lo` up in the new network namespace.
+    Loopback = 21,
 }
 
 impl Step {
-    /// Every step: the spawn sequence in order, then [`Step::Seccomp`].
-    pub const ALL: [Step; 9] = [
+    /// Every step, by code.
+    pub const ALL: [Step; 21] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -57,6 +88,44 @@ impl Step {
         Step::CloseFds,
         Step::Exec,
         Step::Seccomp,
+        Step::CgroupNs,
+        Step::MakePrivate,
+        Step::Root,
+        Step::MountTarget,
+        Step::Bind,
+        Step::Tmpfs,
+        Step::Overlay,
+        Step::Proc,
+        Step::Dev,
+        Step::Pivot,
+        Step::Hostname,
+        Step::Loopback,
+    ];
+
+    /// The steps of `spawn` in the order the child runs them.
+    /// [`Step::MountTarget`] precedes each mount; [`Step::Seccomp`] is the
+    /// probe's only (see there).
+    pub const SEQUENCE: [Step; 20] = [
+        Step::SetGroups,
+        Step::GidMap,
+        Step::UidMap,
+        Step::CgroupNs,
+        Step::MakePrivate,
+        Step::Root,
+        Step::MountTarget,
+        Step::Bind,
+        Step::Tmpfs,
+        Step::Overlay,
+        Step::Proc,
+        Step::Dev,
+        Step::Pivot,
+        Step::Hostname,
+        Step::Loopback,
+        Step::Setsid,
+        Step::Signals,
+        Step::Stdio,
+        Step::CloseFds,
+        Step::Exec,
     ];
 
     /// The step's code in the setup report.
@@ -81,6 +150,18 @@ impl Step {
             Step::CloseFds => "close-fds",
             Step::Exec => "exec",
             Step::Seccomp => "seccomp",
+            Step::CgroupNs => "cgroup-ns",
+            Step::MakePrivate => "make-private",
+            Step::Root => "root",
+            Step::MountTarget => "mount-target",
+            Step::Bind => "bind",
+            Step::Tmpfs => "tmpfs",
+            Step::Overlay => "overlay",
+            Step::Proc => "proc",
+            Step::Dev => "dev",
+            Step::Pivot => "pivot",
+            Step::Hostname => "hostname",
+            Step::Loopback => "loopback",
         }
     }
 }
@@ -95,6 +176,8 @@ pub(crate) struct ExecPlan<'a> {
     pub envp: &'a [*const c_char],
     /// Descriptors >= 3 that become 0, 1 and 2.
     pub stdio: [c_int; 3],
+    /// The root, mounts, hostname and loopback (ADR-007, D7).
+    pub ops: &'a [Op],
 }
 
 /// What the child does.
@@ -129,7 +212,7 @@ pub(crate) struct Failure {
 
 /// Every failure, injected ones included, is built here, so a change that
 /// made failures allocate shows in the fault tests.
-fn fail(step: Step, index: u32, errno: i32) -> Failure {
+pub(crate) fn fail(step: Step, index: u32, errno: i32) -> Failure {
     Failure { step, index, errno }
 }
 
@@ -154,7 +237,7 @@ pub(crate) enum Fault {
 }
 
 #[cfg(test)]
-fn inject(fault: Fault, step: Step) -> Result<(), Failure> {
+pub(crate) fn inject(fault: Fault, step: Step) -> Result<(), Failure> {
     match fault {
         Fault::Fail(s) if s == step => Err(fail(step, 0, libc::EIO)),
         Fault::Hang(s) if s == step => loop {
@@ -171,7 +254,7 @@ fn inject(fault: Fault, step: Step) -> Result<(), Failure> {
 
 #[cfg(not(test))]
 #[inline(always)]
-fn inject(_fault: Fault, _step: Step) -> Result<(), Failure> {
+pub(crate) fn inject(_fault: Fault, _step: Step) -> Result<(), Failure> {
     Ok(())
 }
 
@@ -291,6 +374,19 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Ok(());
     };
 
+    // The cgroup namespace is created here, not by clone3: copy_process
+    // creates namespaces before it moves the child into its target cgroup,
+    // so a namespace from clone3 would be rooted at the parent's cgroup
+    // (ADR-007, D7).
+    inject(fault, Step::CgroupNs)?;
+    // SAFETY: unshare takes plain flags.
+    if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } < 0 {
+        return Err(fail(Step::CgroupNs, 0, errno()));
+    }
+
+    // The root, the mounts, pivot_root, the hostname and lo.
+    mount::run(exec.ops, fault)?;
+
     inject(fault, Step::Setsid)?;
     // SAFETY: setsid has no memory arguments.
     if unsafe { libc::setsid() } < 0 {
@@ -401,7 +497,12 @@ mod tests {
             assert!(names.insert(step.name()), "names are unique");
         }
         assert_eq!(Step::from_code(0), None);
-        assert_eq!(Step::from_code(10), None);
+        assert_eq!(Step::from_code(Step::ALL.len() as u32 + 1), None);
+        // The sequence holds every step but the probe's Seccomp, once.
+        let mut seen: Vec<Step> = Step::SEQUENCE.to_vec();
+        seen.push(Step::Seccomp);
+        seen.sort_by_key(|s| s.code());
+        assert_eq!(seen, Step::ALL);
         assert_eq!(Step::from_code(9999), None);
     }
 }

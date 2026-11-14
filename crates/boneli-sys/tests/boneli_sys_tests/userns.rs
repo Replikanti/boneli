@@ -2,7 +2,8 @@
 
 use std::os::unix::fs::MetadataExt;
 
-use crate::support::{TempDir, host_ids, ids, read_number, run_probe};
+use crate::support::rootfs::Fixture;
+use crate::support::{host_ids, ids, read_number, run_probe, run_probe_on};
 
 #[test]
 #[ignore = "host: unprivileged user namespaces"]
@@ -33,10 +34,10 @@ fn inside_ids_match_single_mapping() {
 #[test]
 #[ignore = "host: unprivileged user namespaces"]
 fn other_ids_unusable() {
-    let dir = TempDir::new("other-ids");
-    let file = dir.path().join("f");
-    std::fs::write(&file, b"x").expect("create the file");
-    let file = file.to_str().expect("UTF-8 temp path");
+    // A host file owned by the host user, at /workspace/f inside.
+    let fixture = Fixture::new("other-ids");
+    std::fs::write(fixture.workspace.join("f"), b"x").expect("create the file");
+    let file = "/workspace/f";
 
     let p = run_probe("setuid", ids(0, 0), &[("BONELI_PROBE_ID", "12345")]);
     p.assert_ok();
@@ -47,10 +48,11 @@ fn other_ids_unusable() {
         p.raw
     );
 
-    let p = run_probe(
+    let p = run_probe_on(
         "chown",
         ids(0, 0),
         &[("BONELI_PROBE_ID", "12345"), ("BONELI_PROBE_FILE", file)],
+        fixture.root(),
     );
     p.assert_ok();
     assert_eq!(
@@ -80,12 +82,20 @@ fn ownership_maps_through_single_line() {
     let overflow_uid = read_number("/proc/sys/kernel/overflowuid");
     let overflow_gid = read_number("/proc/sys/kernel/overflowgid");
     for inside in [0, 999] {
-        let dir = TempDir::new("ownership");
-        let file = dir.path().join("created-inside");
-        let p = run_probe(
+        // The probe creates /workspace/created-inside, a host directory
+        // behind a writable bind, and stats /usr, the host's, owned by an
+        // id that is not mapped. (The root itself belongs to the host user,
+        // so it shows as the inside id.)
+        let fixture = Fixture::new("ownership");
+        let file = fixture.workspace.join("created-inside");
+        let p = run_probe_on(
             "create-file",
             ids(inside, inside),
-            &[("BONELI_PROBE_FILE", file.to_str().expect("UTF-8 temp path"))],
+            &[
+                ("BONELI_PROBE_FILE", "/workspace/created-inside"),
+                ("BONELI_PROBE_STAT", "/usr"),
+            ],
+            fixture.root(),
         );
         p.assert_ok();
         let meta = std::fs::metadata(&file).expect("the probe's file exists on the host");
@@ -97,13 +107,13 @@ fn ownership_maps_through_single_line() {
         assert_eq!(
             p.get("root_uid"),
             overflow_uid.to_string(),
-            "/ seen from inside {inside}: {}",
+            "/usr seen from inside {inside}: {}",
             p.raw
         );
         assert_eq!(
             p.get("root_gid"),
             overflow_gid.to_string(),
-            "/ seen from inside {inside}: {}",
+            "/usr seen from inside {inside}: {}",
             p.raw
         );
     }

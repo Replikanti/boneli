@@ -73,6 +73,30 @@ pub enum Error {
     HostUnsupported(Vec<Missing>),
     /// The child was already waited for.
     AlreadyWaited,
+    /// A path inside the sandbox is not of the accepted form (ADR-007, D7).
+    InvalidInsidePath {
+        /// The path, lossily rendered.
+        path: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A hostname is not 1-64 bytes of `[A-Za-z0-9.-]` (ADR-007, D7).
+    InvalidHostname(String),
+    /// The root's layers or staging directory are unusable (ADR-007, D7).
+    InvalidRoot(&'static str),
+    /// A mount of the root is unusable (ADR-007, D7).
+    InvalidMount {
+        /// Its index in `Root::mounts`.
+        index: usize,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// An overlay's mount options do not fit one page: 4096 bytes with the
+    /// terminating NUL (ADR-007, D7).
+    MountOptionsTooLong {
+        /// Their length with the NUL.
+        len: usize,
+    },
 }
 
 impl Error {
@@ -131,6 +155,18 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::AlreadyWaited => write!(f, "the child was already waited for"),
+            Error::InvalidInsidePath { path, reason } => {
+                write!(f, "sandbox path {path:?} {reason}")
+            }
+            Error::InvalidHostname(name) => {
+                write!(f, "hostname {name:?} is not 1-64 bytes of [A-Za-z0-9.-]")
+            }
+            Error::InvalidRoot(reason) => write!(f, "invalid sandbox root: {reason}"),
+            Error::InvalidMount { index, reason } => write!(f, "mount {index}: {reason}"),
+            Error::MountOptionsTooLong { len } => write!(
+                f,
+                "overlay options take {len} bytes with the NUL, more than one page (4096)"
+            ),
         }
     }
 }

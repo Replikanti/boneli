@@ -3,6 +3,7 @@
 
 pub mod alloc_guard;
 pub mod probe;
+pub mod rootfs;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use boneli_sys::{Child, ExitStatus, Ids, Spec, Stdio, spawn};
+use boneli_sys::{Child, ExitStatus, Ids, Root, Spec, Stdio, spawn};
 
 /// Hang bound of one probe run. A probe is this test binary started inside
 /// the sandbox; on a loaded CI host it starts in well under a second, so
@@ -123,9 +124,16 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// Runs `program` in a sandbox with the given ids and environment and
-/// collects its output.
+/// Runs `program` (a path inside the sandbox) in a sandbox on a default
+/// fixture root with the given ids and environment and collects its
+/// output.
 pub fn run(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)]) -> Output {
+    let fixture = rootfs::Fixture::new("run");
+    run_on(program, args, ids, env, fixture.root())
+}
+
+/// [`run`] on the given root.
+pub fn run_on(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)], root: Root) -> Output {
     let (out_r, out_w) = pipe();
     let (err_r, err_w) = pipe();
     let spec = Spec {
@@ -142,6 +150,7 @@ pub fn run(program: &Path, args: &[&str], ids: Ids, env: &[(&str, &str)]) -> Out
         },
         ids,
         setup_timeout: SETUP_TIMEOUT,
+        root,
     };
     let mut child = spawn(&spec).unwrap_or_else(|e| panic!("spawn {}: {e}", program.display()));
     // The write ends live in the spec; dropping it leaves the child as the
@@ -198,18 +207,25 @@ impl Probe {
     }
 }
 
-/// Re-executes this test binary inside a sandbox as a probe for `action`
-/// with the given ids. `env` is added to the probe's environment, which
-/// otherwise holds only the action.
+/// Re-executes this test binary inside a sandbox on a default fixture
+/// root as a probe for `action` with the given ids. `env` is added to the
+/// probe's environment, which otherwise holds only the action.
 pub fn run_probe(action: &str, ids: Ids, env: &[(&str, &str)]) -> Probe {
-    let exe = std::env::current_exe().expect("current_exe");
+    let fixture = rootfs::Fixture::new("probe");
+    run_probe_on(action, ids, env, fixture.root())
+}
+
+/// [`run_probe`] on the given root, which must bind this test binary at
+/// [`rootfs::PROBE`] (as [`rootfs::Fixture::mounts`] does).
+pub fn run_probe_on(action: &str, ids: Ids, env: &[(&str, &str)], root: Root) -> Probe {
     let mut full = vec![(probe::ACTION_VAR, action)];
     full.extend_from_slice(env);
-    let out = run(
-        &exe,
+    let out = run_on(
+        Path::new(rootfs::PROBE),
         &["--exact", "probe", "--nocapture", "--quiet"],
         ids,
         &full,
+        root,
     );
     parse_probe(out)
 }

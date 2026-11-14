@@ -140,6 +140,34 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-007 (proposed): the single id mapping, the seccomp policy table,
   the kernel floor (Linux 5.19), the spawn model, the host tests and CI,
   and the lints of the unsafe crate.
+- `boneli-sys` (ADR-007 D7, part 2 of #6): `spawn` takes a required
+  `Root` and starts the program in new user, mount, PID, network, IPC,
+  UTS and cgroup namespaces (the cgroup namespace created by the child).
+  The root is a read-only bind of one layer or a read-only overlay of
+  several (`userxattr`, options within one page), on a staging directory,
+  followed by `Mount::Bind` (same kind as the target, flags only added),
+  `Tmpfs`, `Overlay`, `Proc` and `Dev` (a read-only 64 KiB tmpfs with six
+  host device nodes, a private `devpts`, `shm` and the standard
+  symlinks), `pivot_root` with the old root detached, the hostname and
+  `lo` up. Mount targets are resolved beneath the new root without
+  following any symlink; every host path the child mounts — bind sources,
+  the staging directory, the overlay root's layers and `Mount::Overlay`'s
+  `lower`, `upper` and `work` — is opened without following any symlink,
+  so a symlinked layer or overlay directory fails closed (ELOOP). The
+  overlay mounts name the opened descriptors (`/proc/self/fd/<n>`) and
+  hold them across the mount, so a host thread swapping a path for a
+  symlink cannot redirect a layer or directory; the root overlay is
+  capped at 163 layers by the one-page option limit. `InsidePath`,
+  `Hostname` and the mount rules (no hidden or duplicate targets, no size
+  0) are checked before the clone. Every host test runs on a fixture
+  root.
+- `Features::probe`: a probe whose own machinery fails — a failed
+  `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
+  killed by a signal or ended before it could report, or a `clone3`
+  resource error (`EAGAIN` from `RLIMIT_NPROC` or `pids.max`, `ENOMEM`) —
+  is reported as `probe-failed` with the stage and cause, for both the
+  user-namespace and the seccomp-filter probe, instead of as a missing
+  feature.
 - The architecture rule `sys-lints`: every crate in `roles.unsafe` keeps
   its own `[lints]` table with every workspace lint but `unsafe_code` at
   the same or a stricter level, the lints of the new

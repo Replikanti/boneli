@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use boneli_sys::{Error, ExitStatus, Spec, Stdio, Step, spawn};
 
+use crate::support::rootfs::Fixture;
 use crate::support::{self, dev_null, ids, run, run_probe, wait_bounded};
 
-fn spec(program: &str, args: &[&str]) -> Spec {
+/// A spec on `fixture`'s default root.
+fn spec(fixture: &Fixture, program: &str, args: &[&str]) -> Spec {
     Spec {
         program: PathBuf::from(program),
         args: args.iter().map(OsString::from).collect(),
@@ -24,6 +26,7 @@ fn spec(program: &str, args: &[&str]) -> Spec {
         },
         ids: ids(0, 0),
         setup_timeout: support::SETUP_TIMEOUT,
+        root: fixture.root(),
     }
 }
 
@@ -166,7 +169,8 @@ fn new_session_without_terminal() {
 #[test]
 #[ignore = "host: unprivileged user namespaces"]
 fn exec_errors() {
-    match spawn(&spec("/nonexistent/boneli-sys-probe", &[])) {
+    let fixture = Fixture::new("exec-errors");
+    match spawn(&spec(&fixture, "/nonexistent/boneli-sys-probe", &[])) {
         Err(Error::Setup {
             step: Step::Exec,
             errno,
@@ -175,7 +179,7 @@ fn exec_errors() {
         other => panic!("missing program: {other:?}"),
     }
     // Rejected while preparing, before any clone.
-    match spawn(&spec("bin/true", &[])) {
+    match spawn(&spec(&fixture, "bin/true", &[])) {
         Err(Error::RelativeProgram(p)) => assert_eq!(p, PathBuf::from("bin/true")),
         other => panic!("relative program: {other:?}"),
     }
@@ -198,11 +202,13 @@ fn concurrent_spawns_from_threads() {
             n
         })
     };
+    let fixture = Arc::new(Fixture::new("concurrent"));
     let workers: Vec<_> = (0..4)
         .map(|_| {
-            std::thread::spawn(|| {
+            let fixture = Arc::clone(&fixture);
+            std::thread::spawn(move || {
                 for _ in 0..8 {
-                    let mut s = spec("/bin/true", &[]);
+                    let mut s = spec(&fixture, "/bin/true", &[]);
                     s.setup_timeout = BOUND;
                     let mut child = spawn(&s).expect("spawn /bin/true");
                     assert_eq!(wait_bounded(&mut child, BOUND), ExitStatus::Exited(0));
@@ -221,7 +227,8 @@ fn concurrent_spawns_from_threads() {
 #[test]
 #[ignore = "host: unprivileged user namespaces"]
 fn wait_and_kill_by_pidfd() {
-    let mut child = spawn(&spec("/bin/sleep", &["30"])).expect("spawn sleep");
+    let fixture = Fixture::new("kill");
+    let mut child = spawn(&spec(&fixture, "/bin/sleep", &["30"])).expect("spawn sleep");
     child.kill().expect("kill through the pidfd");
     assert_eq!(
         wait_bounded(&mut child, Duration::from_secs(10)),
@@ -241,10 +248,16 @@ fn report_survives_closed_stdio() {
     // write end, so the exec failure below would read as a success.
     let dir = support::TempDir::new("closed-stdio");
     let file = dir.path().join("result");
+    let fixture = Fixture::new("closed-stdio");
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args(["--exact", "probe", "--nocapture", "--quiet"])
         .env(support::probe::ACTION_VAR, "closed-stdio-spawn")
         .env("BONELI_PROBE_FILE", &file)
+        .env("BONELI_PROBE_LAYER", &fixture.layer)
+        .env(
+            "BONELI_PROBE_STAGING",
+            fixture.tree().path().join("staging"),
+        )
         .output()
         .expect("run the probe");
     let got = std::fs::read_to_string(&file).unwrap_or_default();

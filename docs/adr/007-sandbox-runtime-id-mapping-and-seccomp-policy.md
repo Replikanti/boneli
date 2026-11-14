@@ -136,17 +136,28 @@ single id map writes, `clone3`, `close_range` with `CLOSE_RANGE_CLOEXEC`,
 filter with `PR_SET_NO_NEW_PRIVS`, installed by a probe child of its own
 that is cloned without a new user namespace (`SECCOMP_GET_ACTION_AVAIL`
 alone also succeeds on a kernel with `CONFIG_SECCOMP` but without
-`CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` otherwise; it
-runs as `Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so
-that a host lacking both filters and user namespaces is told about both:
-the probe reports the exact missing set), the Landlock ABI, cgroup
+`CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` only when the
+child's own filter step fails or its install hangs; it runs as
+`Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so that a
+host lacking both filters and user namespaces is told about both: the
+probe reports the exact missing set), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup`, and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
 writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
 missing feature is reported with a stable id and a message naming its
 cause; a failed user namespace is classified from the errno and the
 sysctls that explain it (`userns-apparmor`, `userns-disabled`,
-`userns-other`). Under AppArmor's restriction an unconfined process still
+`userns-other`). A failure of a probe's own machinery, not the feature it
+tests — a failed `pipe2`, `poll`, `read` or `waitid`, a malformed report,
+a probe child killed by a signal or ended by the test allocation guard,
+or a `clone3` that fails for a resource (`EAGAIN` from `RLIMIT_NPROC` or
+the scope's `pids.max`, `ENOMEM`) rather than for a reason that says
+something about user namespaces (`EPERM`, `EACCES`, `ENOSPC`, `EINVAL`) —
+is reported as `probe-failed` with the stage and the cause, never as the
+feature itself, so a host near `RLIMIT_NOFILE` or `RLIMIT_NPROC` is not
+told its user namespaces or seccomp are broken, and both children
+classify the same resource error the same way (review of PR 1 and PR 2;
+`classify_ids_failure`, `classify_filter_failure`). Under AppArmor's restriction an unconfined process still
 creates the namespace, but without capabilities in it, so opening
 `/proc/self/setgroups` fails with EACCES (measured on both CI runners); a
 confined profile without `userns` fails the clone with EPERM. Both count
@@ -172,7 +183,8 @@ process until the clone:
    there, the child's stdio `dup2` would replace it, and every later
    failure would be written into the program's stdio and read as an exec;
    review of PR 1, reproduced). Then every signal is blocked on the
-   calling thread, a raw `clone3` with `CLONE_NEWUSER | CLONE_PIDFD`,
+   calling thread, a raw `clone3` with `CLONE_NEWUSER | CLONE_PIDFD` (since PR 2 with the
+   namespaces of D7 too),
    `exit_signal = SIGCHLD` and no stack runs, so the child continues on
    its copy of the parent's stack, as after `fork`, and the parent
    restores its mask right after the clone (glibc's `posix_spawn` does
@@ -181,7 +193,8 @@ process until the clone:
    timeout the child is killed through its pidfd and reaped.
 
 The child runs a fixed sequence (`Step`): `deny` to `/proc/self/setgroups`,
-the gid map, the uid map; `setsid` (a new session without a controlling
+the gid map, the uid map; the cgroup namespace, the root, the mounts,
+`pivot_root`, the hostname and `lo` (D7, PR 2); `setsid` (a new session without a controlling
 terminal); every signal disposition 1–64 except SIGKILL and SIGSTOP to
 `SIG_DFL` through the raw `rt_sigaction` while every signal is still
 blocked, then an empty signal mask. So no parent handler can run in the
@@ -235,7 +248,17 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   apply Landlock, are `#[ignore = "host: <features>"]`; `cargo test
   --workspace` lists them as ignored with that reason. Pure tests (ids,
   report decoding, step codes, probe messages and classification, the
-  host-setup block) run in `check`.
+  host-setup block, inside paths, hostnames, mount order and the mount
+  plan, the overlay option limit) run in `check`.
+- **Fixture roots** (PR 2). Every host test runs in a full sandbox on a
+  fixture root under `CARGO_TARGET_TMPDIR`: a base layer with the mount
+  points, the host's `/usr` (and `bin`, `lib`, `lib64`, `sbin` as the
+  symlinks they are on the host, or bound where they are directories)
+  and the test binary bound read-only at `/probe`, a writable
+  `/workspace`, a tmpfs `/tmp`, `/proc` and `/dev`; `etc/ld.so.cache` is
+  copied from the host for the dynamic loader. The unit tests use a root
+  next to the test binary with one mount of every kind, so a fault at
+  every step is reached.
 - **One integration test target**, `tests/boneli_sys_tests/`, so that the
   binaries that need user namespaces are exactly two: `boneli_sys-<hash>`
   (unit tests) and `boneli_sys_tests-<hash>`. Host tests re-execute their
@@ -366,6 +389,182 @@ no `allow` attribute, so `forbid` costs nothing. Its lints:
 
 The checker stays Python per ADR-001 D4 (its Rust port is #35).
 
+### D7. Namespaces, mounts and the brokers
+
+Added by PR 2 of #6; measurements on the dev host on 2026-11-14 unless
+they name CI.
+
+**Namespaces.** `clone3` creates user, mount, PID, network, IPC and UTS
+namespaces at once (`CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID |
+CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS`), so the program is PID 1 of
+its own PID namespace from its first instruction; `unshare(CLONE_NEWPID)`
+after a fork would only affect later children (D4). The cgroup namespace
+is the exception: `copy_process` creates namespaces before it moves the
+child into its target cgroup, so a cgroup namespace from `clone3` would
+be rooted at the parent's cgroup (from the kernel source, not measured).
+The child creates it with `unshare(CLONE_NEWCGROUP)` right after the id
+maps (`Step::CgroupNs`); PR 3 puts the child into its cgroup with
+`CLONE_INTO_CGROUP`, before this step, and its
+`cgroup_namespace_root_is_sandbox_cgroup` pins the order. The probe's id
+child keeps creating only a user namespace and its filter child none
+(D3).
+
+**The steps**, between the id maps and `setsid` (D4), each a `Step` with
+its own report code, the item being the mount's index in `Root::mounts`
+(for `Pivot` the sub-call, 0-4):
+
+1. `CgroupNs`, as above.
+2. `MakePrivate`: `mount("/", MS_REC | MS_PRIVATE)`, so nothing the
+   sandbox mounts propagates to the host and `pivot_root` accepts the
+   tree. (The kernel already turns copied shared mounts into slaves for a
+   less privileged mount namespace, and a host-side mount event needs
+   privileges, so no test can tell; `mount_step_order` pins the step.)
+3. `Root`: the root on the staging directory, read-only, `nosuid`,
+   `nodev`. One layer is bound (`open_tree(OPEN_TREE_CLONE)`, not
+   recursive, then `mount_setattr`, then `move_mount`), because overlayfs
+   refuses a single `lowerdir` without an `upperdir` (EINVAL, measured at
+   planning). Several layers become an overlay with `userxattr`, because
+   an unprivileged unpacker (#7) can write only `user.*` xattrs; each
+   layer is opened symlink-free and named in `lowerdir` by its descriptor
+   (`/proc/self/fd/<n>`, see Path resolution), top layer first.
+4. `MountTarget` and the mount, for every entry of `Root::mounts` in
+   order (below).
+5. `Pivot`: `fchdir` to the new root, `pivot_root(".", ".")`, `umount2(".",
+   MNT_DETACH)` (the old root and every host mount under it go at once),
+   `chdir("/")`, `chdir(cwd)`. The program path is resolved after this,
+   inside the root (`program_resolves_inside_the_root`).
+6. `Hostname`: `sethostname` in the new UTS namespace.
+7. `Loopback`: `lo` up with `SIOCGIFFLAGS` and `SIOCSIFFLAGS` on an
+   `AF_INET` datagram socket, so the pod and the shim's broker relay have
+   127.0.0.1. The network namespace has nothing else (measured: the only
+   interface is `lo`, TCP on 127.0.0.1 works, a connect to TEST-NET-1
+   gives ENETUNREACH).
+
+**Mounts** (`Mount`). Every target is an `InsidePath`: absolute, no `.`,
+`..` or empty component, no NUL, never `/`; no two mounts share a target,
+and a mount may not hide an earlier one (a later mount of an ancestor of
+its target), because the hidden mount would be invisible but still
+configured. Targets must exist in the root: the image or the top layer
+(#8) provides mount points; a missing one fails with ENOENT and its index.
+
+- `Bind { source, target, writable }`: a host file or directory, not
+  recursive; the target must be of the same kind (a directory onto a
+  directory, anything else onto a non-directory, such as a broker socket
+  onto an empty file), else `Step::Bind` with ENOTDIR or EISDIR and the
+  index. `mount_setattr` *adds* `nosuid`, `nodev` and `ro` unless writable,
+  never clears a flag, so the flags the kernel locked on a mount copied
+  from a more privileged namespace stay (`ro_bind_keeps_locked_flags`:
+  a read-only bind of `/dev/shm` keeps its `nosuid,nodev`). The fallback
+  the plan kept for a refused `mount_setattr` on a detached tree is not
+  needed: it works in a user namespace (measured).
+- `Tmpfs { target, size_bytes, mode }`: `nosuid,nodev`. Exec stays
+  allowed on tmpfs, overlay and bind mounts, because test runners
+  execute from `/tmp` and `/workspace`.
+- `Overlay { lower, upper, work, target }`: a writable overlay with
+  `userxattr`, `nosuid,nodev`; writes land in `upper`, `lower` is
+  unchanged (`writable_overlay_mount`).
+- `Proc { target }`: `nosuid,nodev,noexec`, mounted before `pivot_root`,
+  because the kernel lets a user namespace mount a new procfs only while
+  a fully visible one is in its mount namespace.
+- `Dev { target, shm_size_bytes }`: the OCI default devices without
+  `/dev/console`. A tmpfs of 64 KiB, mode 0755, `nosuid,noexec`, holding
+  `null`, `zero`, `full`, `random`, `urandom` and `tty` bound from the
+  host's nodes (`nosuid,noexec`, not `nodev`: they are devices), a
+  `devpts` with `newinstance,ptmxmode=0666,mode=0620`, the directories
+  `pts` and `shm` and the symlinks `ptmx -> pts/ptmx`, `fd`, `stdin`,
+  `stdout`, `stderr`; then the tmpfs is made read-only (13 entries,
+  `dev_minimal`; writing `/dev/null` and `posix_openpt` work, creating a
+  file gives EROFS). `shm` is a tmpfs of `shm_size_bytes`,
+  `nosuid,nodev,noexec`, for PostgreSQL's dynamic shared memory. 64 KiB:
+  the entries need no data pages (measured: 0 bytes used), so the number
+  only bounds a tmpfs that is read-only once filled; any size above 0
+  works, and 0 would mean unlimited.
+
+**Sizes have no default and 0 is refused**, because a tmpfs of size 0 is
+unlimited; #8 sets the values, as with ADR-003's limits. A tmpfs of
+1,048,576 bytes takes a file of exactly that size, and one byte more
+gives ENOSPC (measured, `tmpfs_size_inclusive`): the kernel charges whole
+pages of data, nothing for the inode.
+
+**Mount options fit one page**, 4096 bytes with the NUL: `mount(2)` copies
+its data argument as one page, and 4096 is the x86_64 page and the
+smallest arm64 page, so a longer string would work on some hosts and not
+others. The overlay options name the opened descriptors (below), so each
+layer renders as `/proc/self/fd/<n>`, at most 24 bytes (the 14-byte prefix
+plus the ten decimal digits of an `i32`), with a `:` between layers. With
+`lowerdir=` (9) and `,userxattr` (10) and the NUL, `9 + 25·N + 11 ≤ 4096`
+caps the root overlay at **163 lower layers**, checked in the parent
+(`Error::MountOptionsTooLong` before the clone;
+`overlay_option_page_limit` pins 163 fitting and 164 not). That cap also
+bounds the descriptors the child holds open at once. A writable
+`Mount::Overlay` names three descriptors and always fits. The layer and
+overlay directory paths are still required to be UTF-8 and free of `,`,
+`:` and `\` as input hygiene matching the rest of the path validation,
+though with fd-path options they no longer reach overlay's option parser
+(`overlay_non_utf8_path_rejected`).
+
+**Path resolution.** Targets are opened with `openat2(root,
+<target>, O_PATH, RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS)` beneath the new root and mounted onto
+`/proc/self/fd/<n>` (a stack buffer, no allocation), so a target swapped
+for a symlink cannot redirect a mount out of the root (the CVE-2021-30465
+class): a symlink anywhere in a target, the last component included,
+fails with ELOOP (`mount_target_symlink_rejected`). The plan had
+`O_NOFOLLOW` too; it is left out because with it `openat2` returns a
+descriptor of a trailing symlink itself instead of failing (measured, as
+openat2(2) documents), and the mount would then land on the symlink's
+inode. Every host path the child hands to the kernel is opened in the
+child with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` first, so a
+symlink in it fails with ELOOP and callers pass canonical paths: bind
+sources (`bind_source_symlink_rejected`), the staging directory, every
+root overlay layer (`root_layer_symlink_rejected`), and `Mount::Overlay`'s
+`lower`, `upper` and `work` (`overlay_dir_symlink_rejected`). overlayfs
+and `mount(2)` resolve a path argument with `LOOKUP_FOLLOW`, so a path
+that is only checked and then mounted by name is a check-then-use race: a
+host thread swapping the path for a symlink between the two wins (review
+of PR 2, round 2, measured: a writable overlay's `upper` and a root layer
+both escaped). So the opened descriptor must be what the mount uses, not a
+re-resolved path. For a bind that is `open_tree` on the fd. For an overlay
+the child keeps every opened descriptor open across the mount and names it
+in the options as `/proc/self/fd/<n>`; the kernel follows that `/proc`
+link to the exact inode that was opened symlink-free, so the swap cannot
+redirect a layer or directory (overlay accepts fd-path options in a user
+namespace, measured; `overlay_upper_swap_race_never_escapes`,
+`root_layer_swap_race_never_escapes` win zero of 120 spawns each while a
+thread swaps). The descriptors are CLOEXEC, held in a fixed-size set, and
+the child allocates nothing; once `mount(2)` returns the kernel has pinned
+the inodes and they are closed. The plan opened bind sources in the
+parent; that cannot work: `open_tree(OPEN_TREE_CLONE)` on a descriptor
+opened in the parent's mount namespace fails with EINVAL in the child's
+new one (measured), so the child opens them from the prepared path.
+
+**The root is read-only** (`root_is_read_only`: `/etc/x` and `mkdir /new`
+give EROFS, `/workspace` and `/tmp` are writable); a writable root for a
+prepare phase is #8's decision. After `pivot_root` only the root and the
+spec's mounts are in `mountinfo`, a host file outside every layer is
+unreachable by its host path and via `/..`, and `/proc/1/root` is `/`
+(`pivot_root_hides_host`).
+
+**Brokers** (ADR-006). The network namespace has only `lo`; the sandbox
+reaches the egress proxy through a pathname Unix socket that #8
+bind-mounts into the sandbox (the socket file, or its directory). A
+pathname socket is found through the filesystem, so `connect` reaches the
+host listener from any network namespace, also through a read-only bind
+(measured for inside ids 0 and 999, `broker_socket_reachable_through_ro_bind`);
+the shim (#9) relays it on loopback for `HTTPS_PROXY`. The socket must be
+writable by the host user the inside id maps to; the egress running as
+the runner's user gives that through the owner bits. Host abstract
+sockets are unreachable (ECONNREFUSED, `host_abstract_sockets_unreachable`),
+because the abstract namespace belongs to the network namespace. Pods
+sharing a network namespace come in #8; joining a namespace owned by
+another user namespace needs `CAP_SYS_ADMIN` over its owner, so a pod
+shares one user namespace.
+
+**Overlay whiteouts** (for #7): a 0:0 character device in an upper layer
+hides the file below and `user.overlay.opaque=y` hides a directory below
+(`overlay_layers_whiteout_and_opaque`); an unprivileged user may create
+the 0:0 whiteout (allowed, measured; Linux 5.8 lifted `CAP_MKNOD` for it).
+
 ## Consequences
 
 - `boneli-sys` depends on `libc` only (the edge `boneli-sys -> libc` is
@@ -373,6 +572,10 @@ The checker stays Python per ADR-001 D4 (its Rust port is #35).
 - The runtime needs Linux 5.19 and a host prepared for unprivileged user
   namespaces and cgroup delegation. Stock Ubuntu 23.10+ hosts need the
   AppArmor profile, and RHEL 9 and Ubuntu 22.04 GA are out.
+- Every sandbox has a read-only root and the mounts its spec names, and
+  nothing else of the host; callers pass canonical host paths, because
+  every host path the child mounts — bind sources, layers and overlay
+  directories — is resolved without following symlinks (D7).
 - One id inside: images that switch users fail, and the runner must be a
   dedicated user without privileged supplementary groups.
 - The host-setup block runs with root, on CI and on user hosts. It is
