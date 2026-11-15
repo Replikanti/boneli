@@ -844,7 +844,8 @@ bound, so `destroy` failed and left the cgroup; the workload picks that
 time (size ÷ rate). After the kill, every configured `io.max` device is
 written back to `max` (`destroy_lifts_io_throttle`: 89 ms on the dev host
 with `dd`, the reviewer measured 97 ms; with the probe's write since #52,
-20–26 ms on the dev host and 16–213 ms on CI).
+20–35 ms on the dev host and 16–225 ms on CI, every run listed in "The
+timing tests").
 A small CPU quota also holds killed
 tasks back until the next period refill: with `cpu.max` `1000 1000000`
 and four spinners, `destroy` took 496–506 ms without a lift (measured
@@ -852,15 +853,37 @@ three times), so `cpu.max` is written to `max <period>` as well
 (`destroy_lifts_cpu_throttle`: 4 ms). Lifting after the kill is safe: a
 killed task never returns to user space, so it can only finish what is
 already in the kernel. Memory and task limits do not delay an exit.
-What is already in the kernel includes the sandbox's dirty page cache, at
-most `memory.max` of data by the bound in the `io` bullet: after the lift
-it reaches the disk without the limit, so a destroy can release up to
-`memory.max` of unthrottled writes on the device behind the sandbox's
-writable files. This follows from that bound and the order in
-`kill_and_remove` (`write_kill`, then `lift_throttles`, then
-`wait_unpopulated`); the writeback after the lift is not measured (#54).
-#8 sizes `memory.max` with it and has the option of deleting or truncating
-the sandbox's files before the kill.
+What is already in the kernel reaches the disk without `io.max` after the
+lift, on the device behind the sandbox's writable files, and it has two
+parts (review of PR 53). First the page cache, the sandbox's dirty and
+writeback pages: at most `memory.max` by the bound in the `io` bullet.
+Second every direct-I/O write already submitted, which `memory.max` does
+not bound: an `O_DIRECT` write's bios carry the caller's own buffer pages, so
+one `write` or `writev` call from a small buffer queues up to the
+kernel's per-call cap (`MAX_RW_COUNT`, 2,147,479,552 bytes with 4 KiB
+pages, from the kernel source) while the cgroup's memory stays small.
+Measured by the reviewer on the dev host outside the sandbox, in a
+transient scope with `MemoryMax` 64 MiB, no swap and
+`IOWriteBandwidthMax` 1 MiB/s, on a btrfs directory without copy-on-write
+so the write was truly direct: one `O_DIRECT` `writev` of 1,024 iovecs
+over the same 128 KiB buffer (128 MiB in one call). At 3 s the task was
+in `D` inside the call, `memory.current` 3,796,992 with `file_dirty` and
+`file_writeback` 0, and the device-mapper line of `io.stat` counted all
+134,217,728 bytes (the throttled disk's line 2,883,584); 1 s after
+`cgroup.kill` the task was still in `D` and the cgroup populated; after
+the lift the rest drained in 64 ms. So about 125 MiB, twice `memory.max`,
+passed without the limit. `destroy_lifts_io_throttle` is an instance too:
+the roughly 38 MiB still queued at its kill are direct bios (`file_dirty`
+and `file_writeback` 0 on CI). Derived, not measured: per destroy the
+direct part can reach about 2 GiB per task inside such a call, times the
+tasks `pids.max` allows, plus asynchronous I/O (`io_submit`, which the D2
+policy does not deny; it denies `io_uring`). The release follows from the
+order in `kill_and_remove` (`write_kill`, then `lift_throttles`, then
+`wait_unpopulated`); the page-cache writeback after the lift is not
+measured (#54). #8 cannot bound the release with `memory.max` alone.
+Deleting or truncating the sandbox's files before the kill is an option
+for the page-cache part; whether it shortens queued direct I/O is not
+checked.
 **The limits are lifted only after the kill succeeded** (review round 3
 of PR 3). Before, a failed `cgroup.kill` write was followed by the lift
 anyway, so the surviving workload ran without its CPU limit (about
@@ -973,24 +996,39 @@ tmpfs, on fixture text.
   the cgroup must be populated, a task of the writer inside `write(2)`
   with that count (`/proc/<pid>/task/<tid>/syscall`), and its `wchar`
   under the count (`/proc/<pid>/io` adds a write only when it returns);
-  then `destroy` must end it by SIGKILL within 5 s. A held write needs at
+  `wbytes` on the `io.max` device's `io.stat` line must be above 0, so a
+  limit on a device the bios do not pass cannot read as held behind a slow
+  device (review of PR 53; a lower bound only, see below). Then `destroy`
+  must end the writer by SIGKILL within 5 s. A held write needs at
   least (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice may
   pass early), so at 2 s about 38 MiB are queued, which without the lift
   drain past `KILL_BOUND` (10 s). Measured through the sandbox: on the dev
   host the writer entered its write 263–872 ms after the spawn and read
-  `wchar` 38 at 2 s, Held at 2,005–2,006 ms with destroy 20–26 ms
-  (3 runs); on CI Held at 2,001–2,002 ms on Azure x86_64, Azure arm64 and
-  AWS x86_64, destroy 147–213 ms on Azure and 16 ms on AWS; without the
-  limit the writer had exited 0 by 2 s (dev host, 4 runs) and the test
-  fails with "io.max did not hold the writer". Where the runner refuses
-  those files (EACCES, EPERM), a task in `D` decides and the report line
-  says `hold-check=d-state`; `D` also shows a writer asleep elsewhere, for
+  `wchar` 38 at 2 s, Held at 2,005–2,007 ms with `wbytes` 1,048,576 to
+  1,572,864 and destroy 20–35 ms over 7 runs: 20–26 ms on the first tree
+  of PR 53 (3 runs), 22 and 35 ms on its 17ce203, 22 and 24 ms on the
+  tree of its first review round. On CI, in every run of PR 53's
+  `sandbox` jobs (runs 43757751313, 43758791004, 43759283155,
+  43759605908, 43769894075, 43770174212 and 43772627813), Held at
+  2,001–2,002 ms with `wbytes` 1,048,576 on every class, destroy in run
+  order 213, 211, 213, 225, 216 and 201 ms on Azure x86_64 (6 runs; the
+  third run's x86_64 job landed on AWS), 147, 131, 124, 125, 154, 126 and
+  123 ms on Azure arm64 (7 runs) and 16 ms on AWS x86_64 (1 run). Without
+  the limit the writer had exited 0 by 2 s (dev host, 4 runs before the
+  review and 1 in its first round) and the test fails with "io.max did
+  not hold the writer". Where the runner refuses those files (EACCES,
+  EPERM), a task in `D` decides and the report line says
+  `hold-check=d-state`; `D` also shows a writer asleep elsewhere, for
   example in dirty-page throttling, so it is only the fallback. Every CI
-  class so far has `ptrace_scope` 1 and read the files. `wbytes` is
-  reported, not asserted: where `io.stat` counts depends on the write path
-  (the dev host counted a direct write that btrfs served through the page
-  cache at its full 8 MiB within 0.5 s, CI counted the probe's true direct
-  write at 1,048,576 by 2 s).
+  class so far has `ptrace_scope` 1 and read the files. `wbytes` has no
+  upper bound: where `io.stat` counts depends on the write path, and some
+  lines count above the rate (measured: the dev host counted a direct
+  write that btrfs served through the page cache at its full 8 MiB within
+  0.5 s under 4 MiB/s; in the reviewer's `writev` repro under
+  "Destroying" the device-mapper line counted 134,217,728 bytes at 3 s
+  under 1 MiB/s while the throttled disk's line read 2,883,584), so a
+  bound tied to the rate could fail a held writer. Every class measured so far read 1,048,576
+  to 1,572,864 here, so the lower bound passes on all of them.
 - They run alone: every sandbox run of the test binary holds a shared lock
   that the timing tests take exclusively, so they do not compete with the
   other host tests for the CPU and the disk.

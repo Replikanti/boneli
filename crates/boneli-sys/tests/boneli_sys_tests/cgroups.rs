@@ -949,8 +949,9 @@ enum IoHold {
 }
 
 /// `Held` also needs `wbytes` above 0 on the `io.max` device's line, a
-/// lower bound only: where `io.stat` counts depends on the write path (the
-/// AWS probe's line read 8 MiB at 2 s under 1 MiB/s), so no upper bound.
+/// lower bound only: where `io.stat` counts depends on the write path, and
+/// some lines count above the rate (ADR-007, "The timing tests"), so no
+/// upper bound.
 fn io_hold_verdict(f: &IoFacts) -> IoHold {
     if f.populated == 0 {
         return IoHold::Finished;
@@ -1148,8 +1149,8 @@ fn io_hold_verdicts() {
     for wchar in [IO_KILL_SIZE - 1, 38] {
         let mut f = io_facts(1, syscall_check(vec![w()], wchar), &['D']);
         assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}");
-        // wbytes has a lower bound only: the AWS probe's device line read
-        // 8 MiB at 2 s under 1 MiB/s, so a large count is still Held.
+        // wbytes has a lower bound only: some io.stat lines count above
+        // the rate (ADR-007), so a large count is still Held.
         for wbytes in [1, IO_KILL_SIZE] {
             f.wbytes = wbytes;
             assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}, {wbytes}");
