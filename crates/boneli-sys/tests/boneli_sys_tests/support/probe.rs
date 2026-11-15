@@ -667,16 +667,100 @@ fn spin() {
     put("nr_throttled", &(throttled1 - throttled0).to_string());
 }
 
-/// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` in 1 MiB
-/// writes, with `O_DIRECT` where the file system takes it (else
-/// `fdatasync` after every write), and prints the elapsed time.
+/// How `io-write` opens its file (`BONELI_PROBE_DIRECT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoDirect {
+    /// Unset: `O_DIRECT`, and where the file system refuses it (EINVAL)
+    /// buffered with `fdatasync` after every write.
+    Auto,
+    /// `require`: `O_DIRECT`, no fallback.
+    Require,
+    /// `never`: no `O_DIRECT` and no `fdatasync` in the loop, so only the
+    /// kernel writes the data back while the loop runs.
+    Never,
+}
+
+/// What `io-write` writes: `size` bytes as writes of `chunk` bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IoWritePlan {
+    /// `BONELI_PROBE_SIZE`.
+    pub size: usize,
+    /// `BONELI_PROBE_CHUNK`, 1 MiB when unset.
+    pub chunk: usize,
+    /// `BONELI_PROBE_DIRECT`.
+    pub direct: IoDirect,
+}
+
+/// The plan from the values of `BONELI_PROBE_SIZE`, `BONELI_PROBE_CHUNK`
+/// and `BONELI_PROBE_DIRECT` (`None`: unset). A set chunk is ASCII digits,
+/// more than 0, a multiple of 4096 (the `O_DIRECT` alignment) and divides
+/// the size; the direct mode is exactly `require` or `never`.
+pub fn io_write_plan(
+    size: &str,
+    chunk: Option<&str>,
+    direct: Option<&str>,
+) -> Result<IoWritePlan, String> {
+    let size: usize = size
+        .parse()
+        .map_err(|_| "BONELI_PROBE_SIZE is not a number".to_string())?;
+    let chunk = match chunk {
+        None => 1 << 20,
+        Some(c) => {
+            let n: usize = if !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()) {
+                c.parse()
+                    .map_err(|_| format!("BONELI_PROBE_CHUNK {c:?} is out of range"))?
+            } else {
+                return Err(format!("BONELI_PROBE_CHUNK {c:?} is not a number"));
+            };
+            if n == 0 || n % 4096 != 0 || size % n != 0 {
+                return Err(format!(
+                    "BONELI_PROBE_CHUNK {n} must be a non-zero multiple of 4096 that divides {size}"
+                ));
+            }
+            n
+        }
+    };
+    let direct = match direct {
+        None => IoDirect::Auto,
+        Some("require") => IoDirect::Require,
+        Some("never") => IoDirect::Never,
+        Some(d) => return Err(format!("BONELI_PROBE_DIRECT {d:?} is not require or never")),
+    };
+    Ok(IoWritePlan {
+        size,
+        chunk,
+        direct,
+    })
+}
+
+/// A cgroup file's lines, whitespace normalized, joined by `;` (as
+/// [`map_lines`] does), so the file fits one probe line.
+pub fn joined_lines(text: &str) -> String {
+    text.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` as writes of
+/// `BONELI_PROBE_CHUNK` bytes (1 MiB when unset), opened as
+/// `BONELI_PROBE_DIRECT` says ([`IoDirect`]: by default with `O_DIRECT`
+/// where the file system takes it, else `fdatasync` after every write),
+/// then `fdatasync`s and prints the elapsed time. Before that final
+/// `fdatasync` it prints `loop_ms`, and with `never` also its cgroup's
+/// `file_dirty` and `file_writeback` (`loop_file_dirty`,
+/// `loop_file_writeback`) and its `io.stat` (`loop_io_stat`, lines joined
+/// by `;`).
 fn io_write() {
     use std::os::unix::fs::OpenOptionsExt;
-    const CHUNK: usize = 1 << 20;
     let path = input("BONELI_PROBE_FILE");
-    let size: usize = input("BONELI_PROBE_SIZE")
-        .parse()
-        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_SIZE is not a number"));
+    let plan = io_write_plan(
+        &input("BONELI_PROBE_SIZE"),
+        std::env::var("BONELI_PROBE_CHUNK").ok().as_deref(),
+        std::env::var("BONELI_PROBE_DIRECT").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| fail(2, &e));
+    let size = plan.size;
     let open = |extra: i32| {
         std::fs::OpenOptions::new()
             .write(true)
@@ -685,26 +769,39 @@ fn io_write() {
             .custom_flags(extra)
             .open(&path)
     };
-    let (mut file, direct) = match open(libc::O_DIRECT) {
-        Ok(f) => (f, true),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (
+    let (mut file, direct) = match plan.direct {
+        IoDirect::Auto => match open(libc::O_DIRECT) {
+            Ok(f) => (f, true),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (
+                open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
+                false,
+            ),
+            Err(e) => fail(3, &format!("open {path} with O_DIRECT: {e}")),
+        },
+        IoDirect::Require => (
+            open(libc::O_DIRECT)
+                .unwrap_or_else(|e| fail(3, &format!("open {path} with O_DIRECT: {e}"))),
+            true,
+        ),
+        IoDirect::Never => (
             open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
             false,
         ),
-        Err(e) => fail(3, &format!("open {path} with O_DIRECT: {e}")),
     };
+    let sync_each = !direct && plan.direct == IoDirect::Auto;
+    let chunk_len = plan.chunk;
     // O_DIRECT needs an aligned buffer; 4096 covers the logical block size
     // of every device the tests run on.
-    let layout = std::alloc::Layout::from_size_align(CHUNK, 4096)
+    let layout = std::alloc::Layout::from_size_align(chunk_len, 4096)
         .unwrap_or_else(|_| fail(3, "buffer layout"));
-    // SAFETY: the layout has a non-zero size.
+    // SAFETY: the layout has a non-zero size (the plan's chunk is > 0).
     let buf = unsafe { std::alloc::alloc_zeroed(layout) };
     if buf.is_null() {
         fail(3, "allocate the write buffer");
     }
-    // SAFETY: buf is CHUNK bytes, zeroed, owned by this function, and
+    // SAFETY: buf is chunk_len bytes, zeroed, owned by this function, and
     // nothing else refers to it.
-    let chunk = unsafe { std::slice::from_raw_parts_mut(buf, CHUNK) };
+    let chunk = unsafe { std::slice::from_raw_parts_mut(buf, chunk_len) };
     // Incompressible bytes (xorshift64): a compressing file system (btrfs
     // with compress=zstd, the dev host's) would write zeros as a few
     // hundred KiB and never reach the limit (measured).
@@ -720,11 +817,26 @@ fn io_write() {
     while written < size {
         file.write_all(chunk)
             .unwrap_or_else(|e| fail(3, &format!("write {path}: {e}")));
-        if !direct {
+        if sync_each {
             file.sync_data()
                 .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
         }
-        written += CHUNK;
+        written += chunk_len;
+    }
+    put("loop_ms", &start.elapsed().as_millis().to_string());
+    if plan.direct == IoDirect::Never {
+        let cg_file = |name: &str| {
+            std::fs::read_to_string(format!("/sys/fs/cgroup/{name}"))
+                .unwrap_or_else(|e| fail(3, &format!("read {name}: {e}")))
+        };
+        let memory = cg_file("memory.stat");
+        let keyed = crate::support::cgroup::keyed;
+        put("loop_file_dirty", &keyed(&memory, "file_dirty").to_string());
+        put(
+            "loop_file_writeback",
+            &keyed(&memory, "file_writeback").to_string(),
+        );
+        put("loop_io_stat", &joined_lines(&cg_file("io.stat")));
     }
     file.sync_data()
         .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
