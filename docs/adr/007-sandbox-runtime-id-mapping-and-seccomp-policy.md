@@ -1045,53 +1045,56 @@ tmpfs, on fixture text.
   lift could drain inside `KILL_BOUND` and pass (mutant MA): t ≤ 29.9 s.
   10 s sits between the two: at 10 s at least 31,352,423 bytes (29.9 MiB)
   are queued, three times what the proof needs, and the count may come
-  9 s after an entry at the spawn, or the first bio may be up to about
-  9 MiB at the latest entry measured. A host whose first bio is larger
-  fails, it never passes: huge-page buffers (forced in the same mutation
-  copy with `MADV_HUGEPAGE`: `AnonHugePages` 40,960 kB, no count by
-  10,035 ms, the 80th read, "the io.max device counted no write within
-  10000 ms of the spawn") or, derived and not measured, a kernel with
-  64 KiB pages, whose 256-segment bios reach 16 MiB. The wait costs time
-  only in that failure: every passing run measured ends at its first
-  read. `io_hold_deadline_keeps_the_lift_proven` pins the arithmetic, and
-  the report line names the read count and the buffer's mapping in
-  `/proc/<pid>/smaps` at the write's address (`nh` for the advice, and
-  `AnonHugePages`). Measured through the sandbox: on the dev
+  up to 10 s after an entry at the spawn, or the first bio may be up to
+  about 9 MiB at the latest entry measured. A host whose first bio is
+  larger fails, it never passes: huge-page buffers (forced in the same
+  mutation copy with `MADV_HUGEPAGE`: `AnonHugePages` 40,960 kB, no
+  count by 10,035 ms, the 80th read, "the io.max device counted no write
+  within 10000 ms of the spawn") or, derived and not measured, a kernel
+  with 64 KiB pages, whose 256-segment bios reach 16 MiB. The wait costs
+  up to 10 s in that failure and about half a second on a late entry
+  (the delayed-start runs above, Held at their sixth read); every other
+  run measured with the wait, on both CI legs and the dev host, ends at
+  its first read. `io_hold_deadline_keeps_the_lift_proven` pins the
+  arithmetic, and the report line names the read count and the buffer's
+  mapping in `/proc/<pid>/smaps` at the write's address (`nh` for the
+  advice, and `AnonHugePages`). Measured through the sandbox: on the dev
   host the writer entered its write 263–872 ms after the spawn and read
   `wchar` 38 at 2 s, Held at 2,005–2,007 ms with `wbytes` 1,048,576 to
   1,572,864 and destroy 20–35 ms over 7 runs: 20–26 ms on the first tree
   of PR 53 (3 runs), 22 and 35 ms on its 17ce203, 22 and 24 ms on the
   tree of its first review round. On the trees of its second review
-  round Held at the first read, 2,003–2,005 ms, destroy 20–27 ms (8 runs;
-  the 4 that looked the buffer up by the write's address read
+  round Held at the first read, 2,003–2,005 ms, destroy 20–27 ms (8
+  runs; the 4 that looked the buffer up by the write's address read
   `40960 kB nh AnonHugePages 0 kB`), and in the mutation copy on the
   directory without copy-on-write 16–19 ms (3 Held runs, `wbytes`
-  1,048,576 and `file_writeback` 0, as on CI). On CI, in the nine runs of
-  PR 53's `sandbox` jobs up to its first review round's last commit
+  1,048,576 and `file_writeback` 0, as on CI). On CI, in the nine runs
+  of PR 53's `sandbox` jobs up to its first review round's last commit
   ab19577 (runs 43757751313, 43758791004, 43759283155, 43759605908,
   43769894075, 43770174212, 43772627813, 43773252632 and 43773572845),
   Held at 2,001–2,002 ms with `wbytes` 1,048,576 on every class, destroy
-  in run order 213, 211, 213, 225, 216 and 201 ms on Azure x86_64 with an
-  NVMe disk (`259:0`, 6 runs; the third run's x86_64 job landed on AWS),
-  16 and 243 ms on Azure x86_64 with a SCSI disk (`8:0`, the same 7.0
-  kernel, both runs on ab19577), 147, 131, 124, 125, 154, 126, 123, 150
-  and 124 ms on Azure arm64 (9 runs) and 16 ms on AWS x86_64 (1 run).
-  These ranges cover the runs listed, not every runner class. Without
-  the limit the writer had exited 0 by 2 s (dev host, 4 runs before the
-  review and 1 in its first round) and the test fails with "io.max did
-  not hold the writer". Where the runner refuses those files (EACCES,
-  EPERM), a task in `D` decides and the report line says
+  in run order 213, 211, 213, 225, 216 and 201 ms on Azure x86_64 with
+  an NVMe disk (`259:0`, 6 runs; the third run's x86_64 job landed on
+  AWS), 16 and 243 ms on Azure x86_64 with a SCSI disk (`8:0`, the same
+  7.0 kernel, both runs on ab19577), 147, 131, 124, 125, 154, 126, 123,
+  150 and 124 ms on Azure arm64 (9 runs) and 16 ms on AWS x86_64 (1
+  run). These ranges cover the runs listed, not every runner class.
+  Without the limit the writer had exited 0 by 2 s (dev host, 4 runs
+  before the review and 1 in its first round) and the test fails with
+  "io.max did not hold the writer". Where the runner refuses those files
+  (EACCES, EPERM), a task in `D` decides and the report line says
   `hold-check=d-state`; `D` also shows a writer asleep elsewhere, for
   example in dirty-page throttling, so it is only the fallback. Every CI
   class so far has `ptrace_scope` 1 and read the files. `wbytes` has no
-  upper bound: where `io.stat` counts depends on the write path, and some
-  lines count above the rate (measured: the dev host counted a direct
-  write that btrfs served through the page cache at its full 8 MiB within
-  0.5 s under 4 MiB/s; in the reviewer's `writev` repro under
+  upper bound: where `io.stat` counts depends on the write path, and
+  some lines count above the rate (measured: the dev host counted a
+  direct write that btrfs served through the page cache at its full 8
+  MiB within 0.5 s under 4 MiB/s; in the reviewer's `writev` repro under
   "Destroying" the device-mapper line counted 134,217,728 bytes at 3 s
   under 1 MiB/s while the throttled disk's line read 2,883,584), so a
-  bound tied to the rate could fail a held writer. Every class measured so far read 1,048,576
-  to 1,572,864 here, so the lower bound passes on all of them.
+  bound tied to the rate could fail a held writer. Every class measured
+  so far read 1,048,576 to 1,572,864 here, so the lower bound passes on
+  all of them.
 - They run alone: every sandbox run of the test binary holds a shared lock
   that the timing tests take exclusively, so they do not compete with the
   other host tests for the CPU and the disk.
