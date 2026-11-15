@@ -769,17 +769,46 @@ fn io_write() {
     };
     let sync_each = !direct && plan.direct == IoDirect::Auto;
     let chunk_len = plan.chunk;
-    // O_DIRECT needs an aligned buffer; 4096 covers the logical block size
-    // of every device the tests run on.
-    let layout = std::alloc::Layout::from_size_align(chunk_len, 4096)
-        .unwrap_or_else(|_| fail(3, "buffer layout"));
-    // SAFETY: the layout has a non-zero size (the plan's chunk is > 0).
-    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
-    if buf.is_null() {
-        fail(3, "allocate the write buffer");
+    // O_DIRECT needs an aligned buffer: a fresh anonymous mapping is page
+    // aligned, which covers the logical block size of every device the
+    // tests run on. It is advised MADV_NOHUGEPAGE before any byte is
+    // touched (review round 2 of PR 53): transparent huge pages would make
+    // its pages physically contiguous, the O_DIRECT bios as large as the
+    // huge pages (blk-throttle charges a bio whole, so the first one was
+    // counted only after 15.6 s at 1 MiB/s, measured), and the timing of
+    // destroy_lifts_io_throttle would depend on the host's THP setting.
+    // The allocator cannot give that order: it writes its header next to
+    // the buffer, which faults a huge page in under THP `always`.
+    // SAFETY: a new private anonymous mapping, no address hint, no file.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            chunk_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        fail(
+            3,
+            &format!("mmap the write buffer: {}", std::io::Error::last_os_error()),
+        );
     }
-    // SAFETY: buf is chunk_len bytes, zeroed, owned by this function, and
-    // nothing else refers to it.
+    // SAFETY: map is the start of the chunk_len-byte mapping made above.
+    let rc = unsafe { libc::madvise(map, chunk_len, libc::MADV_NOHUGEPAGE) };
+    // EINVAL for valid arguments means a kernel without transparent huge
+    // pages, so there is nothing to opt out of.
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            fail(3, &format!("madvise MADV_NOHUGEPAGE: {e}"));
+        }
+    }
+    let buf = map.cast::<u8>();
+    // SAFETY: buf is the chunk_len-byte mapping, zero-filled by the kernel,
+    // owned by this function, and nothing else refers to it.
     let chunk = unsafe { std::slice::from_raw_parts_mut(buf, chunk_len) };
     // Incompressible bytes (xorshift64): a compressing file system (btrfs
     // with compress=zstd, the dev host's) would write zeros as a few
@@ -806,8 +835,18 @@ fn io_write() {
         .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
     put("elapsed_ms", &start.elapsed().as_millis().to_string());
     put("direct", &direct.to_string());
-    // SAFETY: buf was allocated above with this layout.
-    unsafe { std::alloc::dealloc(buf, layout) };
+    // SAFETY: map is the chunk_len-byte mapping made above, and chunk, the
+    // only reference into it, is not used after this.
+    let rc = unsafe { libc::munmap(map, chunk_len) };
+    if rc != 0 {
+        fail(
+            3,
+            &format!(
+                "munmap the write buffer: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
+    }
 }
 
 /// Mounts a cgroup2 of the sandbox's own cgroup namespace at `/tmp/cg`

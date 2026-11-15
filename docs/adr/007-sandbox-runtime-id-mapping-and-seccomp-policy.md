@@ -992,7 +992,24 @@ tmpfs, on fixture text.
   299,008 bytes in 113 ms (measured). Dev host: 2011 ms, `wbytes`
   8,425,472. No block device fails the test with the reason.
 - `destroy_lifts_io_throttle` (#52): the probe makes one 41,943,040-byte
-  `O_DIRECT` write from a 4096-aligned buffer under `wbps` 1 MiB/s. At 2 s
+  `O_DIRECT` write under `wbps` 1 MiB/s from a buffer of its own
+  anonymous mapping, advised `MADV_NOHUGEPAGE` before any byte is touched
+  (review round 2 of PR 53). With transparent huge pages the buffer's
+  pages are physically contiguous, the bios as large as the huge pages,
+  and blk-throttle charges a bio whole before it splits it, so the first
+  bio is dispatched only about its size ÷ `wbps` after the writer enters
+  its write. Measured by the reviewer on the dev host, true direct I/O on
+  a btrfs directory without copy-on-write, a 40 MiB write from a buffer
+  forced to huge pages: the device's `io.stat` line read no write at 2 s
+  and at 5 s while the writer sat in `D` inside the call, and counted
+  15,642,624 bytes at once at 15.6 s; with `MADV_NOHUGEPAGE` 2,097,152 at
+  2 s. Every class measured so far runs THP `madvise`, where an unadvised
+  buffer gets no huge pages either; under THP `always` the held writer
+  would have read as not on the device. The advice comes from a mapping
+  of the probe's own because the allocator writes its chunk header next
+  to the buffer, which under `always` can fault a huge page in before the
+  advice; a kernel without THP answers `EINVAL`, which the probe accepts.
+  At 2 s
   the cgroup must be populated, a task of the writer inside `write(2)`
   with that count (`/proc/<pid>/task/<tid>/syscall`), and its `wchar`
   under the count (`/proc/<pid>/io` adds a write only when it returns);
