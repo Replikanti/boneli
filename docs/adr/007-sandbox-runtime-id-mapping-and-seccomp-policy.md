@@ -355,6 +355,28 @@ effective inside the sandbox (D1); on CI that is accepted, a production
 runner must not have them. The 30 s bound of the bus wait is 30 times the
 measured start.
 
+**AWS-hosted x86_64 runners (#52).** Some `ubuntu-26.04` x86_64 jobs land
+on AWS-hosted machines (2 of the 22 x86_64 `sandbox` jobs before #52, read
+from the job logs; every arm64 job ran on Azure). They run
+`7.0.0-1016-aws` (image build 20261111.82.6), against `7.0.0-1019-azure`
+(x86_64) and `7.0.0-1017-azure` (arm64) on Azure. Their workspace is ext4
+on a device-mapper snapshot over NVMe whose queue reports `dma_alignment`
+511 and `max_sectors_kb` 128 (Azure: 3 and 63, 256 on both). Every class
+runs THP `madvise`, `vm.dirty_ratio` 20, `vm.dirty_background_ratio` 10
+and Yama `ptrace_scope` 1; the x86_64 images ship uutils coreutils 0.10.0
+as `dd`, the arm64 image GNU coreutils 9.4. On AWS the `dd oflag=direct`
+that `destroy_lifts_io_throttle` used before #52 exited 0 after 152 ms
+under `wbps` 1 MiB/s: its 40 MiB `O_DIRECT` write returned EINVAL, and
+`dd` cleared `O_DIRECT` and wrote the 40 MiB through the page cache
+(strace, outside any limit), so the call returned once the bytes were
+cached. The probe's one 40 MiB write from a 4096-aligned buffer is
+accepted on the same device and held by `io.max` (D8, "The timing tests");
+that `dd`'s buffer missed the device's 512-byte DMA alignment is inferred
+from the EINVAL and the queue limit, not checked. Whether `io.max`
+throttles the writeback of such page-cache data on AWS is open: over 3 s
+the 40 MiB stayed under writeback with `wbytes` 0 on both device lines
+(#54). The CI step "Host features" prints these facts on every run.
+
 ### D6. Lints of the unsafe crate
 
 `boneli-sys` cannot inherit the workspace lints, which forbid
@@ -664,7 +686,36 @@ of D7):
   `IoLimits::none()` is explicit: a sandbox whose writable files are on
   tmpfs has no block device to limit, and #8 decides when one is required.
   `dev` must be a whole disk: the kernel throttles per disk and gives
-  ENODEV for a partition (measured at planning).
+  ENODEV for a partition (measured at planning). A buffered write is
+  limited at its writeback, not in `write(2)`: the call returns once the
+  bytes are in the page cache, and `io.max` applies when the kernel writes
+  them out (D5: `dd`'s fallback on AWS). `memory.max` bounds the data
+  waiting there, dirty or under writeback, because those pages are charged
+  to the sandbox and cannot be reclaimed before they are written, so a
+  writer cannot finish S bytes before S − `memory.max` of them passed the
+  limit. Measured through the sandbox on the dev host (kernel 7.2, btrfs):
+  512 MiB written without `O_DIRECT` and without a sync into `memory.max`
+  256 MiB under `wbps` 32 MiB/s took 8,724–9,819 ms for the write loop
+  (7 runs), above the 7,500 ms that bound allows (256 MiB ÷ 32 MiB/s =
+  8,000 ms, less 100 ms for one throttle slice that may pass early and
+  400 ms for timer granularity), and 274 and 318 ms without `io.max`. On
+  the 7.0 CI kernels the same writer is OOM-killed instead of slowed: in
+  every run on Azure x86_64, Azure arm64 and AWS x86_64, and in a sweep on
+  Azure arm64 and AWS within 102 ms at `memory.max` 256 MiB and within
+  302–312 ms at 1 GiB with 1,280 MiB written, both under 32 MiB/s. Without
+  `io.max` some sizes were killed too (256 MiB on Azure arm64, 1 GiB on
+  AWS) and none at 2 GiB; with the host reading `memory.stat` every 50 ms
+  nothing was killed on the Azure legs (cause not verified). Small cgroups
+  on the dev host behave the same: `memory.max` 32 and 64 MiB under `wbps`
+  4 MiB/s and a 64 MiB write were killed after 325 and 644 ms with
+  `file_writeback` at about `memory.max`, and 32 MiB without `io.max` was
+  not (measured in transient units at planning). So a sandbox with
+  `io.max` that writes through the page cache faster than its device
+  drains can be OOM-killed with nothing wrong in its workload, and #8
+  sizes `memory.max` and `wbps` together. The cause, whether AWS throttles
+  that writeback and on which device line it counts, the sandbox's
+  handling and a test that pins buffered writes on CI are #54; until then
+  no test pins them.
 - `memory.oom.group` is always 1: a partial OOM kill leaves a half-dead
   pod (PostgreSQL gone, the application alive) whose test results
   mislead. `memory_limit_kills_whole_group`: with `memory.max` 32 MiB and
@@ -791,14 +842,25 @@ removes the directory. The lift (review of PR 3): a task in one large
 `wbps` 1 MiB/s and a 40 MiB write that is about 40 s, past the 10 s
 bound, so `destroy` failed and left the cgroup; the workload picks that
 time (size ÷ rate). After the kill, every configured `io.max` device is
-written back to `max` (`destroy_lifts_io_throttle`: 89 ms on the dev
-host; the reviewer measured 97 ms). A small CPU quota also holds killed
+written back to `max` (`destroy_lifts_io_throttle`: 89 ms on the dev host
+with `dd`, the reviewer measured 97 ms; with the probe's write since #52,
+20–26 ms on the dev host and 16–213 ms on CI).
+A small CPU quota also holds killed
 tasks back until the next period refill: with `cpu.max` `1000 1000000`
 and four spinners, `destroy` took 496–506 ms without a lift (measured
 three times), so `cpu.max` is written to `max <period>` as well
 (`destroy_lifts_cpu_throttle`: 4 ms). Lifting after the kill is safe: a
 killed task never returns to user space, so it can only finish what is
 already in the kernel. Memory and task limits do not delay an exit.
+What is already in the kernel includes the sandbox's dirty page cache, at
+most `memory.max` of data by the bound in the `io` bullet: after the lift
+it reaches the disk without the limit, so a destroy can release up to
+`memory.max` of unthrottled writes on the device behind the sandbox's
+writable files. This follows from that bound and the order in
+`kill_and_remove` (`write_kill`, then `lift_throttles`, then
+`wait_unpopulated`); the writeback after the lift is not measured (#54).
+#8 sizes `memory.max` with it and has the option of deleting or truncating
+the sandbox's files before the kill.
 **The limits are lifted only after the kill succeeded** (review round 3
 of PR 3). Before, a failed `cgroup.kill` write was followed by the lift
 anyway, so the surviving workload ran without its CPU limit (about
@@ -906,8 +968,31 @@ tmpfs, on fixture text.
   dev host's btrfs compresses, and 8 MiB of zeros reached the disk as
   299,008 bytes in 113 ms (measured). Dev host: 2011 ms, `wbytes`
   8,425,472. No block device fails the test with the reason.
-- Both run alone: every sandbox run of the test binary holds a shared
-  lock that the two take exclusively, so they do not compete with the
+- `destroy_lifts_io_throttle` (#52): the probe makes one 41,943,040-byte
+  `O_DIRECT` write from a 4096-aligned buffer under `wbps` 1 MiB/s. At 2 s
+  the cgroup must be populated, a task of the writer inside `write(2)`
+  with that count (`/proc/<pid>/task/<tid>/syscall`), and its `wchar`
+  under the count (`/proc/<pid>/io` adds a write only when it returns);
+  then `destroy` must end it by SIGKILL within 5 s. A held write needs at
+  least (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice may
+  pass early), so at 2 s about 38 MiB are queued, which without the lift
+  drain past `KILL_BOUND` (10 s). Measured through the sandbox: on the dev
+  host the writer entered its write 263–872 ms after the spawn and read
+  `wchar` 38 at 2 s, Held at 2,005–2,006 ms with destroy 20–26 ms
+  (3 runs); on CI Held at 2,001–2,002 ms on Azure x86_64, Azure arm64 and
+  AWS x86_64, destroy 147–213 ms on Azure and 16 ms on AWS; without the
+  limit the writer had exited 0 by 2 s (dev host, 4 runs) and the test
+  fails with "io.max did not hold the writer". Where the runner refuses
+  those files (EACCES, EPERM), a task in `D` decides and the report line
+  says `hold-check=d-state`; `D` also shows a writer asleep elsewhere, for
+  example in dirty-page throttling, so it is only the fallback. Every CI
+  class so far has `ptrace_scope` 1 and read the files. `wbytes` is
+  reported, not asserted: where `io.stat` counts depends on the write path
+  (the dev host counted a direct write that btrfs served through the page
+  cache at its full 8 MiB within 0.5 s, CI counted the probe's true direct
+  write at 1,048,576 by 2 s).
+- They run alone: every sandbox run of the test binary holds a shared lock
+  that the timing tests take exclusively, so they do not compete with the
   other host tests for the CPU and the disk.
 
 **The harness** gives every host test that does not set its own limits a
