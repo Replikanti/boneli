@@ -1499,6 +1499,123 @@ fn task_states(pid: i32) -> Vec<char> {
         .collect()
 }
 
+#[test]
+#[ignore = "host: diagnostic for #52"]
+fn diag_52_dd_write() {
+    // Temporary (#52, removed before the PR leaves draft): what dd's
+    // 40 MiB oflag=direct write does under the old test's limits, and how
+    // fast the buffered writer runs without io.max. No assertions.
+    let _alone = support::exclusive();
+    // (a) The old test's dd, polled every 50 ms for up to 5 s.
+    let fixture = Fixture::new("diag-dd");
+    let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
+    let io = IoLimits::new(vec![IoMax {
+        dev,
+        rbps: None,
+        wbps: Some(IO_KILL_WBPS),
+        riops: None,
+        wiops: None,
+    }])
+    .expect("one device");
+    let cg = cgroup::create("diag-dd", &limits(256 << 20, 16, (100_000, 100_000), io));
+    let dd_args = [
+        "if=/dev/urandom",
+        "of=/workspace/big",
+        "bs=40M",
+        "count=1",
+        "iflag=fullblock",
+        "oflag=direct",
+    ];
+    let start = Instant::now();
+    let mut child = spawn(&spec(fixture.root(), &cg, "/usr/bin/dd", &dd_args)).expect("spawn dd");
+    while populated(&cg) == 1 && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let t = start.elapsed().as_millis() as u64;
+    let exited = populated(&cg) == 0;
+    let memory = read(&cg, "memory.stat");
+    let (dirty, writeback) = (
+        keyed(&memory, "file_dirty"),
+        keyed(&memory, "file_writeback"),
+    );
+    let h1_bound = IO_KILL_SIZE.saturating_sub(IO_KILL_WBPS * (t + 500) / 1000);
+    report(&format!(
+        "diag_52 dd: exited {exited} at {t} ms, io.stat [{}], file_dirty {dirty} file_writeback {writeback}, \
+         backlog {} vs H1 bound {h1_bound}: page cache {}",
+        crate::support::probe::joined_lines(&read(&cg, "io.stat")),
+        dirty + writeback,
+        dirty + writeback >= h1_bound
+    ));
+    std::thread::sleep(Duration::from_secs(3));
+    let memory = read(&cg, "memory.stat");
+    report(&format!(
+        "diag_52 dd: 3 s later file_dirty {} file_writeback {}, io.stat [{}]",
+        keyed(&memory, "file_dirty"),
+        keyed(&memory, "file_writeback"),
+        crate::support::probe::joined_lines(&read(&cg, "io.stat"))
+    ));
+    let took = Instant::now();
+    let result = cg.destroy();
+    let took = took.elapsed();
+    let status = wait_bounded(&mut child, Duration::from_secs(120));
+    report(&format!(
+        "diag_52 dd: destroy took {took:?}: {result:?}, status {status:?}"
+    ));
+    if std::path::Path::new("/usr/bin/strace").exists() {
+        let of = fixture.workspace.join("strace-big");
+        let out = std::process::Command::new("/usr/bin/strace")
+            .args(["-f", "-e", "trace=openat,fcntl,write", "/usr/bin/dd"])
+            .args(dd_args.iter().map(|a| {
+                if *a == "of=/workspace/big" {
+                    format!("of={}", of.display())
+                } else {
+                    a.to_string()
+                }
+            }))
+            .output();
+        match out {
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                for line in err.lines().filter(|l| {
+                    l.contains("strace-big") || l.contains("fcntl(") || l.contains("write(")
+                }) {
+                    report(&format!(
+                        "diag_52 strace: {}",
+                        line.replace(&*fixture.workspace.to_string_lossy(), "<ws>")
+                    ));
+                }
+            }
+            Err(e) => report(&format!("diag_52 strace: {e}")),
+        }
+    } else {
+        report("diag_52 strace: absent");
+    }
+    drop(fixture);
+    // (b) The unthrottled baseline of the buffered writer.
+    let fixture = Fixture::new("diag-buffered");
+    let cg = cgroup::create(
+        "diag-buffered",
+        &limits(IO_BUF_MEMORY_MAX, 16, (100_000, 100_000), IoLimits::none()),
+    );
+    let p = buffered_writer_run(&fixture, &cg);
+    let loop_ms = p.values.get("loop_ms").and_then(|v| v.parse::<u64>().ok());
+    report(&format!(
+        "diag_52 baseline: status {:?}, loop_ms {}, elapsed_ms {}, loop file_dirty {} file_writeback {}, \
+         under half the bound (3750): {}",
+        p.status,
+        opt_ms(loop_ms),
+        p.values.get("elapsed_ms").map_or("none", String::as_str),
+        p.values
+            .get("loop_file_dirty")
+            .map_or("none", String::as_str),
+        p.values
+            .get("loop_file_writeback")
+            .map_or("none", String::as_str),
+        loop_ms.is_some_and(|l| l < 3750)
+    ));
+    let _ = cg.destroy();
+}
+
 /// A task line of the hold check, for the pure tests.
 fn task(tid: &str, raw: &str) -> TaskLine {
     TaskLine {
