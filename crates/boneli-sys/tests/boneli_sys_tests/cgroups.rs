@@ -1607,27 +1607,117 @@ fn diag_52_dd_write() {
         report("diag_52 strace: absent");
     }
     drop(fixture);
-    // (b) The unthrottled baseline of the buffered writer.
-    let fixture = Fixture::new("diag-buffered");
+    // (b) The buffered writer per memory.max and wbps, unthrottled and
+    // throttled, with the backlog sampled from the host.
+    for (memory_max, wbps, size) in [
+        (256u64 << 20, None, 512u64 << 20),
+        (256 << 20, Some(32u64 << 20), 512 << 20),
+        (512 << 20, None, 768 << 20),
+        (512 << 20, Some(32 << 20), 768 << 20),
+        (1 << 30, None, 1280 << 20),
+        (1 << 30, Some(32 << 20), 1280 << 20),
+    ] {
+        diag_52_sweep(memory_max, wbps, size);
+    }
+}
+
+/// Temporary (#52): one buffered writer run, sampled every 50 ms.
+fn diag_52_sweep(memory_max: u64, wbps: Option<u64>, size: u64) {
+    let fixture = Fixture::new("diag-sweep");
+    let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
+    let io = match wbps {
+        Some(w) => IoLimits::new(vec![IoMax {
+            dev,
+            rbps: None,
+            wbps: Some(w),
+            riops: None,
+            wiops: None,
+        }])
+        .expect("one device"),
+        None => IoLimits::none(),
+    };
     let cg = cgroup::create(
-        "diag-buffered",
-        &limits(IO_BUF_MEMORY_MAX, 16, (100_000, 100_000), IoLimits::none()),
+        "diag-sweep",
+        &limits(memory_max, 16, (100_000, 100_000), io),
     );
-    let p = buffered_writer_run(&fixture, &cg);
-    let loop_ms = p.values.get("loop_ms").and_then(|v| v.parse::<u64>().ok());
+    let (out_r, out_w) = support::pipe();
+    let (err_r, err_w) = support::pipe();
+    let mut s = spec(
+        root_with_cgroup(&fixture),
+        &cg,
+        crate::support::rootfs::PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+    );
+    s.stdio.stdout = out_w;
+    s.stdio.stderr = err_w;
+    let size_text = size.to_string();
+    s.env = [
+        (support::probe::ACTION_VAR, "io-write"),
+        ("BONELI_PROBE_FILE", "/workspace/buffered"),
+        ("BONELI_PROBE_SIZE", size_text.as_str()),
+        ("BONELI_PROBE_DIRECT", "never"),
+    ]
+    .iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    let start = Instant::now();
+    let mut child = spawn(&s).expect("spawn the buffered writer");
+    drop(s);
+    let readers = [out_r, err_r].map(|fd| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let (mut peak, mut peak_ms, mut next) = (0u64, 0u64, 0u64);
+    let mut samples = Vec::new();
+    while populated(&cg) == 1 && start.elapsed() < Duration::from_secs(150) {
+        let memory = read(&cg, "memory.stat");
+        let backlog = keyed(&memory, "file_dirty") + keyed(&memory, "file_writeback");
+        let ms = start.elapsed().as_millis() as u64;
+        if backlog > peak {
+            (peak, peak_ms) = (backlog, ms);
+        }
+        if ms >= next {
+            samples.push(format!("{}:{}", ms / 100, backlog >> 20));
+            next += 1000;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if populated(&cg) == 1 {
+        let _ = std::fs::write(cg.path().join("cgroup.kill"), "1");
+    }
+    let status = wait_bounded(&mut child, Duration::from_secs(60));
+    let [stdout, stderr] = readers.map(|r| r.join().unwrap_or_default());
+    let p = support::parse_probe(support::Output {
+        status,
+        stdout,
+        stderr,
+    });
+    let events = read(&cg, "memory.events");
+    let get = |k: &str| p.values.get(k).map_or("none", String::as_str);
     report(&format!(
-        "diag_52 baseline: status {:?}, loop_ms {}, elapsed_ms {}, loop file_dirty {} file_writeback {}, \
-         under half the bound (3750): {}",
-        p.status,
-        opt_ms(loop_ms),
-        p.values.get("elapsed_ms").map_or("none", String::as_str),
-        p.values
-            .get("loop_file_dirty")
-            .map_or("none", String::as_str),
-        p.values
-            .get("loop_file_writeback")
-            .map_or("none", String::as_str),
-        loop_ms.is_some_and(|l| l < 3750)
+        "diag_52 sweep: memory.max {} MiB, wbps {}, size {} MiB: status {status:?} at {} ms, loop_ms {}, \
+         elapsed_ms {}, loop file_dirty {} file_writeback {}, peak backlog {} MiB at {} ms, \
+         memory.events max {} oom_kill {}, samples (100 ms:MiB) [{}], stderr {:?}",
+        memory_max >> 20,
+        wbps.map_or("none".to_string(), |w| format!("{} MiB/s", w >> 20)),
+        size >> 20,
+        start.elapsed().as_millis(),
+        get("loop_ms"),
+        get("elapsed_ms"),
+        get("loop_file_dirty"),
+        get("loop_file_writeback"),
+        peak >> 20,
+        peak_ms,
+        keyed(&events, "max"),
+        keyed(&events, "oom_kill"),
+        samples.join(" "),
+        p.raw
+            .lines()
+            .filter(|l| l.contains("probe:") || l.contains("panicked"))
+            .collect::<Vec<_>>()
     ));
     let _ = cg.destroy();
 }
