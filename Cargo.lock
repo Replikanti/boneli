@@ -39,6 +39,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-json"
+version = "0.0.0"
+
+[[package]]
 name = "boneli-memory"
 version = "0.0.0"
 dependencies = [

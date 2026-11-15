@@ -1,0 +1,4 @@
+# The vendored JSONTestSuite files are test data whose exact bytes matter
+# (crates/boneli-json/tests/conformance.rs pins their digest): no line-ending
+# conversion may touch them.
+crates/boneli-json/tests/jsontestsuite/** -text
