@@ -665,7 +665,11 @@ fn destroy_lifts_io_throttle() {
     // and the report line names the fallback. wbytes on the io.max
     // device must be above 0 (review of PR 53: a limit on a device the
     // bios do not pass plus a slow device would read as held), with no
-    // upper bound: where io.stat counts depends on the write path.
+    // upper bound: where io.stat counts depends on the write path. The
+    // first count comes when the first bio is dispatched, about 1 s after
+    // the writer enters its write, so the check reads again every 100 ms
+    // until the device counts or IO_HOLD_DEADLINE_MS (review round 2 of
+    // PR 53: a writer that entered at ~1.2 s read wbytes 0 at 2 s).
     let _alone = support::exclusive();
     let fixture = Fixture::new("io-kill");
     let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
@@ -704,24 +708,35 @@ fn destroy_lifts_io_throttle() {
     let start = Instant::now();
     let child = writer.insert(spawn(&s).expect("spawn the writer"));
     drop(s);
-    // Let the writer fill its buffer and block in the throttled write.
+    let pid = child.pid();
+    // Let the writer fill its buffer and block in the throttled write,
+    // then wait for the io.max device to count its first bio. Each read
+    // takes the device's count first and the writer's own files after it.
     std::thread::sleep(Duration::from_secs(2));
-    let populated_now = populated(&cg);
-    let check = hold_check(child.pid());
-    let states = task_states(child.pid());
-    let wbytes = io_stat_wbytes(&read(&cg, "io.stat"), dev.major, dev.minor);
-    let memory = read(&cg, "memory.stat");
-    let facts = IoFacts {
-        dev: (dev.major, dev.minor),
-        elapsed_ms: start.elapsed().as_millis() as u64,
-        populated: populated_now,
-        check,
-        states,
-        wbytes,
-        file_dirty: keyed(&memory, "file_dirty"),
-        file_writeback: keyed(&memory, "file_writeback"),
-    };
-    let verdict = io_hold_verdict(&facts);
+    let (verdict, facts) = poll_io_hold(
+        || {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let wbytes = io_stat_wbytes(&read(&cg, "io.stat"), dev.major, dev.minor);
+            let populated_now = populated(&cg);
+            let check = hold_check(pid);
+            let states = task_states(pid);
+            let memory = read(&cg, "memory.stat");
+            let buffer = buffer_mapping(pid, &check);
+            IoFacts {
+                dev: (dev.major, dev.minor),
+                elapsed_ms,
+                populated: populated_now,
+                check,
+                states,
+                wbytes,
+                file_dirty: keyed(&memory, "file_dirty"),
+                file_writeback: keyed(&memory, "file_writeback"),
+                reads: 0,
+                buffer,
+            }
+        },
+        || std::thread::sleep(IO_HOLD_POLL),
+    );
     report(&format!(
         "destroy_lifts_io_throttle: {}",
         io_hold_text(verdict, &facts)
@@ -926,6 +941,105 @@ struct IoFacts {
     wbytes: u64,
     file_dirty: u64,
     file_writeback: u64,
+    reads: u32,
+    buffer: String,
+}
+
+/// How long after the spawn `destroy_lifts_io_throttle` waits for the
+/// `io.max` device to count a write of the held writer. The first count
+/// comes when blk-throttle dispatches the first bio, about its size ÷
+/// `wbps` after the writer enters its write: 1 MiB bios (the probe's
+/// buffer is `MADV_NOHUGEPAGE`) and an entry up to 872 ms after the spawn
+/// measured put it near 1.9 s, so one read at 2 s could miss it (review
+/// round 2 of PR 53). At 10 s at most 10 MiB plus one 100 ms slice has
+/// drained, so at least 29.9 MiB are still queued, more than `KILL_BOUND`
+/// (10 s) drains at 1 MiB/s, and the test still proves the lift (ADR-007,
+/// "The timing tests").
+const IO_HOLD_DEADLINE_MS: u64 = 10_000;
+/// The pause between two reads while the poll waits: one 100 ms throttle
+/// slice, the step in which blk-throttle dispatches.
+const IO_HOLD_POLL: Duration = Duration::from_millis(100);
+
+/// Reads the facts until a read is anything but `NotOnDevice`, or until a
+/// read taken at or past [`IO_HOLD_DEADLINE_MS`] after the spawn; returns
+/// the last verdict and its facts, `reads` set. Only the device's count
+/// is waited for: a read that finds the writer out of its write ends the
+/// poll with that verdict, so `Held` always means the writer was inside
+/// its write when the count was seen.
+fn poll_io_hold(mut read: impl FnMut() -> IoFacts, mut pause: impl FnMut()) -> (IoHold, IoFacts) {
+    let mut reads = 0;
+    loop {
+        let mut f = read();
+        reads += 1;
+        f.reads = reads;
+        let v = io_hold_verdict(&f);
+        if v != IoHold::NotOnDevice || f.elapsed_ms >= IO_HOLD_DEADLINE_MS {
+            return (v, f);
+        }
+        pause();
+    }
+}
+
+/// The mapping that holds `addr` in a `/proc/<pid>/smaps` text, for the
+/// report: its size, whether its `VmFlags` carry `nh` (`MADV_NOHUGEPAGE`)
+/// and its `AnonHugePages`.
+fn smaps_buffer(text: &str, addr: u64) -> String {
+    // A mapping starts with its address range, `<hex>-<hex>`, end exclusive.
+    let range = |l: &str| -> Option<(u64, u64)> {
+        let (a, b) = l.split_ascii_whitespace().next()?.split_once('-')?;
+        Some((hex_field(&format!("0x{a}"))?, hex_field(&format!("0x{b}"))?))
+    };
+    let kb = |l: &str, key: &str| -> Option<u64> {
+        l.strip_prefix(key)?
+            .trim()
+            .strip_suffix(" kB")?
+            .parse()
+            .ok()
+    };
+    let mut lines = text.lines();
+    if !lines
+        .by_ref()
+        .any(|l| range(l).is_some_and(|(a, b)| a <= addr && addr < b))
+    {
+        return format!("no mapping at {addr:#x}");
+    }
+    let block: Vec<&str> = lines.take_while(|l| range(l).is_none()).collect();
+    let size = block.iter().find_map(|l| kb(l, "Size:")).unwrap_or(0);
+    let huge = block
+        .iter()
+        .find_map(|l| kb(l, "AnonHugePages:"))
+        .unwrap_or(0);
+    let nh = block.iter().any(|l| {
+        l.strip_prefix("VmFlags:")
+            .is_some_and(|f| f.split_ascii_whitespace().any(|x| x == "nh"))
+    });
+    let nh = if nh { "nh" } else { "no nh" };
+    format!("{size} kB {nh} AnonHugePages {huge} kB")
+}
+
+/// The buffer address of the 40 MiB write, if a task of the hold check
+/// is inside it.
+fn write_buffer(check: &HoldCheck) -> Option<u64> {
+    let HoldCheck::Syscall { tasks, .. } = check else {
+        return None;
+    };
+    tasks.iter().find_map(|t| match t.call {
+        TaskSyscall::In { nr, args } if nr == libc::SYS_write && args[2] == IO_KILL_SIZE => {
+            Some(args[1])
+        }
+        _ => None,
+    })
+}
+
+/// [`smaps_buffer`] of `pid` at the write's buffer, or why not.
+fn buffer_mapping(pid: i32, check: &HoldCheck) -> String {
+    let Some(addr) = write_buffer(check) else {
+        return "unknown (not in the write)".to_string();
+    };
+    match std::fs::read_to_string(format!("/proc/{pid}/smaps")) {
+        Ok(text) => smaps_buffer(&text, addr),
+        Err(e) => format!("smaps unread: {e}"),
+    }
 }
 
 /// Whether io.max held the writer at the check.
@@ -944,7 +1058,8 @@ enum IoHold {
     NotBlocked,
     /// Held otherwise, but the `io.max` device's `io.stat` line counted no
     /// write: the limit may sit on a device the bios do not pass, so a slow
-    /// device and not `io.max` could be what holds the writer.
+    /// device and not `io.max` could be what holds the writer. Final only
+    /// at [`IO_HOLD_DEADLINE_MS`]; before it the poll reads again.
     NotOnDevice,
 }
 
@@ -998,20 +1113,26 @@ fn io_hold_text(v: IoHold, f: &IoFacts) -> String {
         HoldCheck::DState { refused } => (format!("refused {refused}"), "not read".to_string()),
     };
     format!(
-        "at {} ms hold-check={} verdict {v:?}, tasks [{tasks}], wchar {wchar}, states {:?}, \
-         device {}:{} wbytes {} file_dirty {} file_writeback {}",
+        "at {} ms (read {}) hold-check={} verdict {v:?}, tasks [{tasks}], wchar {wchar}, \
+         states {:?}, device {}:{} wbytes {} file_dirty {} file_writeback {}, buffer {}",
         f.elapsed_ms,
+        f.reads,
         hold_check_label(&f.check),
         f.states,
         f.dev.0,
         f.dev.1,
         f.wbytes,
         f.file_dirty,
-        f.file_writeback
+        f.file_writeback,
+        f.buffer
     )
 }
 
 fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
+    let off_device = format!(
+        "the io.max device counted no write within {IO_HOLD_DEADLINE_MS} ms of the spawn: \
+         the writer's bios may not pass the limited device"
+    );
     let why = match v {
         IoHold::Finished if status == ExitStatus::Exited(0) => {
             "io.max did not hold the writer: it finished its 40 MiB write before the check"
@@ -1022,10 +1143,7 @@ fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
         }
         IoHold::NotInWrite => "the writer was not inside its 40 MiB write",
         IoHold::NotBlocked => "the writer was not blocked in its write",
-        IoHold::NotOnDevice => {
-            "the io.max device counted no write by the check: \
-             the writer's bios may not pass the limited device"
-        }
+        IoHold::NotOnDevice => off_device.as_str(),
         IoHold::Held => "the writer was held",
     };
     format!("{why}: {}, status {status:?}", io_hold_text(v, f))
@@ -1123,6 +1241,8 @@ fn io_facts(populated: u64, check: HoldCheck, states: &[char]) -> IoFacts {
         wbytes: 1_048_576,
         file_dirty: 0,
         file_writeback: 41_418_752,
+        reads: 1,
+        buffer: "40960 kB nh AnonHugePages 0 kB".to_string(),
     }
 }
 
@@ -1317,7 +1437,7 @@ fn io_hold_failure_messages() {
             IoHold::NotOnDevice,
             ExitStatus::Signaled(9),
             &off_device,
-            "the io.max device counted no write by the check",
+            "the io.max device counted no write within 10000 ms of the spawn",
         ),
     ];
     for (v, status, facts, prefix) in cases {
@@ -1329,8 +1449,9 @@ fn io_hold_failure_messages() {
         for part in [
             hold_check_label(&facts.check).as_str(),
             "259:0",
-            "at 2004 ms",
+            "at 2004 ms (read 1)",
             &format!("wbytes {}", facts.wbytes),
+            "buffer 40960 kB nh AnonHugePages 0 kB",
             "file_dirty 0",
             "file_writeback 41418752",
             &format!("{status:?}"),
@@ -1353,6 +1474,185 @@ fn io_hold_failure_messages() {
     }
     // The held facts render too (the report line uses the same text).
     assert!(io_hold_failure(IoHold::Held, ExitStatus::Signaled(9), &f).contains("4101"));
+}
+
+/// The facts of one poll read: `verdict` picks the shape, `ms` the time
+/// since the spawn.
+fn poll_read(verdict: IoHold, ms: u64) -> IoFacts {
+    let w = || write_task(IO_KILL_SIZE, 2);
+    let mut f = match verdict {
+        IoHold::Held | IoHold::NotOnDevice => {
+            io_facts(1, syscall_check(vec![futex_task(), w()], 38), &['S', 'D'])
+        }
+        IoHold::Finished => io_facts(0, syscall_check(vec![w()], 41_943_130), &['Z']),
+        IoHold::Returned => io_facts(1, syscall_check(vec![w()], 41_943_130), &['S']),
+        IoHold::NotInWrite => io_facts(1, syscall_check(vec![futex_task()], 38), &['S']),
+        IoHold::NotBlocked => io_facts(
+            1,
+            HoldCheck::DState {
+                refused: "io: EPERM".to_string(),
+            },
+            &['S'],
+        ),
+    };
+    if verdict == IoHold::NotOnDevice {
+        f.wbytes = 0;
+    }
+    f.elapsed_ms = ms;
+    assert_eq!(io_hold_verdict(&f), verdict, "fixture for {verdict:?}");
+    f
+}
+
+/// Runs the poll over `reads` and returns its verdict, the time of the
+/// read it ended on, the reads it took and the pauses between them.
+fn run_poll(reads: Vec<IoFacts>) -> (IoHold, u64, u32, usize) {
+    let mut queue = reads.into_iter();
+    let mut pauses = 0;
+    let (v, f) = poll_io_hold(
+        || queue.next().expect("the poll read past the fixture"),
+        || pauses += 1,
+    );
+    (v, f.elapsed_ms, f.reads, pauses)
+}
+
+#[test]
+fn io_hold_polls() {
+    use IoHold::*;
+    // Held at the first read: no pause, no second read.
+    assert_eq!(run_poll(vec![poll_read(Held, 2004)]), (Held, 2004, 1, 0));
+    // Review round 2 of PR 53: a writer that entered its write at ~1.2 s
+    // read wbytes 0 at 2,007 ms and was first counted at 2,528 ms. The
+    // poll waits for the count and the writer still inside its write.
+    assert_eq!(
+        run_poll(vec![
+            poll_read(NotOnDevice, 2007),
+            poll_read(NotOnDevice, 2108),
+            poll_read(NotOnDevice, 2209),
+            poll_read(NotOnDevice, 2310),
+            poll_read(NotOnDevice, 2411),
+            poll_read(Held, 2528),
+        ]),
+        (Held, 2528, 6, 5)
+    );
+    // The count came, but the writer had left its write by then: the
+    // other verdicts end the poll as they would end the single read.
+    for late in [Finished, Returned, NotInWrite, NotBlocked] {
+        assert_eq!(
+            run_poll(vec![poll_read(NotOnDevice, 2004), poll_read(late, 2105)]),
+            (late, 2105, 2, 1),
+            "{late:?}"
+        );
+        assert_eq!(run_poll(vec![poll_read(late, 2004)]), (late, 2004, 1, 0));
+    }
+    // No count by the deadline: NotOnDevice, and no read after the one at
+    // the deadline (inclusive); one millisecond before it still waits.
+    let mut reads: Vec<IoFacts> = (0..80)
+        .map(|i| poll_read(NotOnDevice, 2004 + i * 100))
+        .filter(|f| f.elapsed_ms < IO_HOLD_DEADLINE_MS)
+        .collect();
+    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS - 1));
+    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS));
+    let n = reads.len() as u32;
+    assert_eq!(
+        run_poll(reads),
+        (NotOnDevice, IO_HOLD_DEADLINE_MS, n, n as usize - 1)
+    );
+    // A first read already past the deadline still decides by its facts.
+    assert_eq!(
+        run_poll(vec![poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS + 50)]),
+        (NotOnDevice, IO_HOLD_DEADLINE_MS + 50, 1, 0)
+    );
+    assert_eq!(
+        run_poll(vec![poll_read(Held, IO_HOLD_DEADLINE_MS + 50)]),
+        (Held, IO_HOLD_DEADLINE_MS + 50, 1, 0)
+    );
+}
+
+#[test]
+fn io_hold_deadline_keeps_the_lift_proven() {
+    // ADR-007, "The timing tests": by the deadline at most one slice more
+    // than the rate allows has drained, and what is still queued must
+    // take longer than KILL_BOUND (10 s) to drain at the rate, or a
+    // destroy without the lift would pass too (mutant MA).
+    let slice = IO_KILL_WBPS / 10;
+    let drained = IO_KILL_WBPS * IO_HOLD_DEADLINE_MS / 1000 + slice;
+    let queued = IO_KILL_SIZE - drained;
+    assert_eq!(queued, 31_352_423);
+    assert!(queued >= 10 * IO_KILL_WBPS, "{queued}");
+    // And the deadline covers the measured case: the latest entry into the
+    // write (872 ms after the spawn) plus a first 1 MiB bio at the rate.
+    let first_count_ms = 872 + 1_048_576 * 1000 / IO_KILL_WBPS;
+    assert_eq!(first_count_ms, 1_872);
+    assert!(first_count_ms < IO_HOLD_DEADLINE_MS, "{first_count_ms} ms");
+}
+
+/// One `/proc/<pid>/smaps` mapping for the pure tests.
+fn smaps_block(range: &str, size_kb: u64, anon_huge_kb: u64, flags: &str) -> String {
+    format!(
+        "{range} rw-p 00000000 00:00 0 \n\
+         Size:           {size_kb:>8} kB\n\
+         KernelPageSize:        4 kB\n\
+         Rss:            {size_kb:>8} kB\n\
+         AnonHugePages:  {anon_huge_kb:>8} kB\n\
+         VmFlags: {flags}\n"
+    )
+}
+
+#[test]
+fn smaps_buffer_parses() {
+    // Measured layout: a 64 MiB malloc arena (65404 kB) before the buffer,
+    // so the buffer is found by the write's address, not by its size.
+    let heap = smaps_block("55d0c000-55d2d000", 132, 0, "rd wr mr mw me ac");
+    let arena = smaps_block("7f3a04000000-7f3a07fdf000", 65_404, 0, "rd wr mr mw me ac");
+    let buffer = smaps_block(
+        "7f3a0d800000-7f3a10000000",
+        40_960,
+        0,
+        "rd wr mr mw me ac nh",
+    );
+    let thp = smaps_block(
+        "7f3a0d800000-7f3a10000000",
+        40_960,
+        34_816,
+        "rd wr mr mw me ac hg",
+    );
+    let text = format!("{heap}{arena}{buffer}");
+    for addr in [0x7f3a_0d80_0000, 0x7f3a_0fff_ffff] {
+        assert_eq!(
+            smaps_buffer(&text, addr),
+            "40960 kB nh AnonHugePages 0 kB",
+            "{addr:#x}"
+        );
+    }
+    assert_eq!(
+        smaps_buffer(&format!("{heap}{thp}{arena}"), 0x7f3a_0e00_0000),
+        "40960 kB no nh AnonHugePages 34816 kB"
+    );
+    assert_eq!(
+        smaps_buffer(&text, 0x7f3a_0400_1000),
+        "65404 kB no nh AnonHugePages 0 kB"
+    );
+    // The end is exclusive; an address in no mapping, or no text.
+    assert_eq!(
+        smaps_buffer(&text, 0x7f3a_1000_0000),
+        "no mapping at 0x7f3a10000000"
+    );
+    assert_eq!(smaps_buffer("", 0x1000), "no mapping at 0x1000");
+    // The write's address comes from the task inside the 40 MiB write.
+    let w = write_task(IO_KILL_SIZE, 2);
+    assert_eq!(
+        write_buffer(&syscall_check(vec![futex_task(), w], 38)),
+        Some(0x7f3a_0d7f_f000)
+    );
+    for check in [
+        syscall_check(vec![futex_task()], 38),
+        syscall_check(vec![futex_task(), write_task(1_048_576, 2)], 38),
+        HoldCheck::DState {
+            refused: "io: EPERM".to_string(),
+        },
+    ] {
+        assert_eq!(write_buffer(&check), None, "{check:?}");
+    }
 }
 
 #[test]

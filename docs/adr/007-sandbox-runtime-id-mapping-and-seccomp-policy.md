@@ -1009,17 +1009,54 @@ tmpfs, on fixture text.
   of the probe's own because the allocator writes its chunk header next
   to the buffer, which under `always` can fault a huge page in before the
   advice; a kernel without THP answers `EINVAL`, which the probe accepts.
-  At 2 s
-  the cgroup must be populated, a task of the writer inside `write(2)`
-  with that count (`/proc/<pid>/task/<tid>/syscall`), and its `wchar`
-  under the count (`/proc/<pid>/io` adds a write only when it returns);
-  `wbytes` on the `io.max` device's `io.stat` line must be above 0, so a
-  limit on a device the bios do not pass cannot read as held behind a slow
-  device (review of PR 53; a lower bound only, see below). Then `destroy`
-  must end the writer by SIGKILL within 5 s. A held write needs at
-  least (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice may
-  pass early), so at 2 s about 38 MiB are queued, which without the lift
-  drain past `KILL_BOUND` (10 s). Measured through the sandbox: on the dev
+  From 2 s
+  after the spawn on, every 100 ms (one throttle slice), the test reads
+  `wbytes` on the `io.max` device's `io.stat` line and then the writer's
+  own files: the cgroup must be populated, a task of the writer inside
+  `write(2)` with that count (`/proc/<pid>/task/<tid>/syscall`), and its
+  `wchar` under the count (`/proc/<pid>/io` adds a write only when it
+  returns); `wbytes` must be above 0, so a limit on a device the bios do
+  not pass cannot read as held behind a slow device (review of PR 53; a
+  lower bound only, see below). Only `wbytes` 0 makes it read again, up
+  to 10 s after the spawn; a read that finds the writer out of its write
+  ends the wait with that verdict, so Held means the writer was inside
+  its write after the device counted (review round 2 of PR 53). Then
+  `destroy` must end the writer by SIGKILL within 5 s. A held write needs
+  at least (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice
+  may pass early).
+  **Why a wait, and why 10 s.** The device counts a bio when blk-throttle
+  dispatches it, the first one about (its size − 104,858) ÷ 1 MiB/s after
+  the writer enters its write plus up to one slice of rounding, so at
+  most its size ÷ `wbps`. With the advised buffer the first bio is 1 MiB
+  (the reviewer's direct write counted 1,048,576 bytes at its first
+  count, and CI read 1,048,576 at 2 s on every class), so the count comes
+  up to 1.0 s after the entry; the dev host measured
+  entries up to 872 ms after the spawn, which puts it at 1.87 s, 0.13 s
+  before the single read at 2 s that the test made before. The reviewer
+  measured a writer that entered at about 1.2 s: `wbytes` 0 at 2,007 ms,
+  first count at 2,528 ms. Through the sandbox, with the probe delayed
+  1.2 s before its write (a mutation copy, on a btrfs directory without
+  copy-on-write so the write was truly direct), the single read at 2 s
+  read `NotOnDevice` at 2,005 ms (1 run) and the wait read Held at 2,519
+  and 2,520 ms, at its sixth read (2 runs). The upper limit is the proof
+  of the lift: t seconds after the spawn at most (t + 0.1) MiB have
+  drained, so 40 − (t + 0.1) MiB are still queued, and that must be more
+  than `KILL_BOUND` (10 s) × 1 MiB/s = 10 MiB, or a destroy without the
+  lift could drain inside `KILL_BOUND` and pass (mutant MA): t ≤ 29.9 s.
+  10 s sits between the two: at 10 s at least 31,352,423 bytes (29.9 MiB)
+  are queued, three times what the proof needs, and the count may come
+  9 s after an entry at the spawn, or the first bio may be up to about
+  9 MiB at the latest entry measured. A host whose first bio is larger
+  fails, it never passes: huge-page buffers (forced in the same mutation
+  copy with `MADV_HUGEPAGE`: `AnonHugePages` 40,960 kB, no count by
+  10,035 ms, the 80th read, "the io.max device counted no write within
+  10000 ms of the spawn") or, derived and not measured, a kernel with
+  64 KiB pages, whose 256-segment bios reach 16 MiB. The wait costs time
+  only in that failure: every passing run measured ends at its first
+  read. `io_hold_deadline_keeps_the_lift_proven` pins the arithmetic, and
+  the report line names the read count and the buffer's mapping in
+  `/proc/<pid>/smaps` at the write's address (`nh` for the advice, and
+  `AnonHugePages`). Measured through the sandbox: on the dev
   host the writer entered its write 263–872 ms after the spawn and read
   `wchar` 38 at 2 s, Held at 2,005–2,007 ms with `wbytes` 1,048,576 to
   1,572,864 and destroy 20–35 ms over 7 runs: 20–26 ms on the first tree

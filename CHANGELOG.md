@@ -274,8 +274,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checks before the kill that `io.max` holds the writer inside its one
   40 MiB write (`/proc/<pid>/task/<tid>/syscall` and `wchar`, with the
   task state as a named fallback where the runner refuses those files)
-  and that the `io.max` device counted a write, so a host where the limit
-  does not hold fails with a message that says so. On AWS-hosted CI
+  and that the `io.max` device counted a write, waiting up to 10 s after
+  the spawn for the first count, so a host where the limit does not hold
+  fails with a message that says so. The probe's write buffer is advised
+  `MADV_NOHUGEPAGE`, so the size of the first bio, and with it the time
+  of the first count, does not depend on the host's THP setting. On AWS-hosted CI
   runners the image's `dd` had fallen back to a buffered write. ADR-007
   records the cause, that buffered writers under `io.max` are OOM-killed
   on the 7.0 CI kernels (#54), and what a destroy releases without the
