@@ -1469,15 +1469,28 @@ fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
 }
 
 /// `wbytes` of the device's line in an `io.stat` text; no line yet means
-/// nothing was submitted (0). A line without a parseable `wbytes=` panics
-/// with the line quoted.
+/// nothing was submitted (0). The kernel prints the six byte and IO
+/// counters together and only when one of them is non-zero (CI: a line
+/// `259:0 ` after a killed writer), so a line without any of them is 0
+/// too. A line with some counters but no parseable `wbytes=` panics with
+/// the line quoted.
 fn io_stat_wbytes(stat: &str, major: u32, minor: u32) -> u64 {
+    const COUNTERS: [&str; 6] = ["rbytes=", "wbytes=", "rios=", "wios=", "dbytes=", "dios="];
     let key = format!("{major}:{minor} ");
     let Some(line) = stat.lines().find(|l| l.starts_with(&key)) else {
         return 0;
     };
-    line.split_whitespace()
+    let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if !fields
+        .iter()
+        .any(|f| COUNTERS.iter().any(|c| f.starts_with(c)))
+    {
+        return 0;
+    }
+    fields
+        .iter()
         .find_map(|f| f.strip_prefix("wbytes="))
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| panic!("no wbytes in io.stat line {line:?}"))
 }
@@ -2001,6 +2014,27 @@ fn io_stat_wbytes_parses() {
             io_stat_wbytes(&back, major, minor),
             io_stat_wbytes(stat, major, minor)
         );
+    }
+    // A line without counters (all zero, measured on CI) reads 0, also
+    // with another policy's keys on it.
+    assert_eq!(io_stat_wbytes("259:0 \n", 259, 0), 0);
+    assert_eq!(
+        io_stat_wbytes("259:0", 259, 0),
+        0,
+        "no key without the space"
+    );
+    assert_eq!(io_stat_wbytes("259:0 cost.usage=5\n", 259, 0), 0);
+    for bad in [
+        "8:1 rbytes=0 wios=1",
+        "8:1 wbytes=x rbytes=0",
+        "8:1 wbytes= rios=0",
+        "8:1 wbytes=+5",
+    ] {
+        let b = bad.to_string();
+        let m = panic_message(move || {
+            let _ = io_stat_wbytes(&b, 8, 1);
+        });
+        assert!(m.contains(&format!("{bad:?}")), "{bad:?}: {m}");
     }
     assert_eq!(crate::support::probe::joined_lines(""), "");
     assert_eq!(io_stat_wbytes(&"".replace(';', "\n"), 8, 1), 0);
