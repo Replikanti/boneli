@@ -1609,20 +1609,25 @@ fn diag_52_dd_write() {
     drop(fixture);
     // (b) The buffered writer per memory.max and wbps, unthrottled and
     // throttled, with the backlog sampled from the host.
-    for (memory_max, wbps, size) in [
-        (256u64 << 20, None, 512u64 << 20),
-        (256 << 20, Some(32u64 << 20), 512 << 20),
-        (512 << 20, None, 768 << 20),
-        (512 << 20, Some(32 << 20), 768 << 20),
-        (1 << 30, None, 1280 << 20),
-        (1 << 30, Some(32 << 20), 1280 << 20),
+    // Unsampled (only cgroup.events is polled) and one control sampled
+    // every second: on Azure the writer was OOM-killed at 256 MiB without
+    // sampling and never with memory.stat read every 50 ms.
+    let second = Some(Duration::from_secs(1));
+    for (memory_max, wbps, size, sample) in [
+        (256u64 << 20, None, 512u64 << 20, None),
+        (256 << 20, Some(32u64 << 20), 512 << 20, None),
+        (256 << 20, Some(32 << 20), 512 << 20, second),
+        (1 << 30, None, 1280 << 20, None),
+        (1 << 30, Some(32 << 20), 1280 << 20, None),
+        (2 << 30, None, 2304 << 20, None),
     ] {
-        diag_52_sweep(memory_max, wbps, size);
+        diag_52_sweep(memory_max, wbps, size, sample);
     }
 }
 
-/// Temporary (#52): one buffered writer run, sampled every 50 ms.
-fn diag_52_sweep(memory_max: u64, wbps: Option<u64>, size: u64) {
+/// Temporary (#52): one buffered writer run; with `sample`, memory.stat
+/// is read from the host at that interval.
+fn diag_52_sweep(memory_max: u64, wbps: Option<u64>, size: u64, sample: Option<Duration>) {
     let fixture = Fixture::new("diag-sweep");
     let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
     let io = match wbps {
@@ -1673,15 +1678,17 @@ fn diag_52_sweep(memory_max: u64, wbps: Option<u64>, size: u64) {
     let (mut peak, mut peak_ms, mut next) = (0u64, 0u64, 0u64);
     let mut samples = Vec::new();
     while populated(&cg) == 1 && start.elapsed() < Duration::from_secs(150) {
-        let memory = read(&cg, "memory.stat");
-        let backlog = keyed(&memory, "file_dirty") + keyed(&memory, "file_writeback");
         let ms = start.elapsed().as_millis() as u64;
-        if backlog > peak {
-            (peak, peak_ms) = (backlog, ms);
-        }
-        if ms >= next {
+        if let Some(every) = sample
+            && ms >= next
+        {
+            let memory = read(&cg, "memory.stat");
+            let backlog = keyed(&memory, "file_dirty") + keyed(&memory, "file_writeback");
+            if backlog > peak {
+                (peak, peak_ms) = (backlog, ms);
+            }
             samples.push(format!("{}:{}", ms / 100, backlog >> 20));
-            next += 1000;
+            next += every.as_millis() as u64;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1698,7 +1705,7 @@ fn diag_52_sweep(memory_max: u64, wbps: Option<u64>, size: u64) {
     let events = read(&cg, "memory.events");
     let get = |k: &str| p.values.get(k).map_or("none", String::as_str);
     report(&format!(
-        "diag_52 sweep: memory.max {} MiB, wbps {}, size {} MiB: status {status:?} at {} ms, loop_ms {}, \
+        "diag_52 sweep: memory.max {} MiB, wbps {}, size {} MiB, sample {sample:?}: status {status:?} at {} ms, loop_ms {}, \
          elapsed_ms {}, loop file_dirty {} file_writeback {}, peak backlog {} MiB at {} ms, \
          memory.events max {} oom_kill {}, samples (100 ms:MiB) [{}], stderr {:?}",
         memory_max >> 20,
