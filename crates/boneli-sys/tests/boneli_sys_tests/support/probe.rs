@@ -675,9 +675,6 @@ pub enum IoDirect {
     Auto,
     /// `require`: `O_DIRECT`, no fallback.
     Require,
-    /// `never`: no `O_DIRECT` and no `fdatasync` in the loop, so only the
-    /// kernel writes the data back while the loop runs.
-    Never,
 }
 
 /// What `io-write` writes: `size` bytes as writes of `chunk` bytes.
@@ -694,7 +691,7 @@ pub struct IoWritePlan {
 /// The plan from the values of `BONELI_PROBE_SIZE`, `BONELI_PROBE_CHUNK`
 /// and `BONELI_PROBE_DIRECT` (`None`: unset). A set chunk is ASCII digits,
 /// more than 0, a multiple of 4096 (the `O_DIRECT` alignment) and divides
-/// the size; the direct mode is exactly `require` or `never`.
+/// the size; the direct mode is exactly `require`.
 pub fn io_write_plan(
     size: &str,
     chunk: Option<&str>,
@@ -723,8 +720,7 @@ pub fn io_write_plan(
     let direct = match direct {
         None => IoDirect::Auto,
         Some("require") => IoDirect::Require,
-        Some("never") => IoDirect::Never,
-        Some(d) => return Err(format!("BONELI_PROBE_DIRECT {d:?} is not require or never")),
+        Some(d) => return Err(format!("BONELI_PROBE_DIRECT {d:?} is not require")),
     };
     Ok(IoWritePlan {
         size,
@@ -733,24 +729,11 @@ pub fn io_write_plan(
     })
 }
 
-/// A cgroup file's lines, whitespace normalized, joined by `;` (as
-/// [`map_lines`] does), so the file fits one probe line.
-pub fn joined_lines(text: &str) -> String {
-    text.lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
 /// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` as writes of
 /// `BONELI_PROBE_CHUNK` bytes (1 MiB when unset), opened as
 /// `BONELI_PROBE_DIRECT` says ([`IoDirect`]: by default with `O_DIRECT`
 /// where the file system takes it, else `fdatasync` after every write),
-/// then `fdatasync`s and prints the elapsed time. Before that final
-/// `fdatasync` it prints `loop_ms`, and with `never` also its cgroup's
-/// `file_dirty` and `file_writeback` (`loop_file_dirty`,
-/// `loop_file_writeback`) and its `io.stat` (`loop_io_stat`, lines joined
-/// by `;`).
+/// then `fdatasync`s and prints the elapsed time.
 fn io_write() {
     use std::os::unix::fs::OpenOptionsExt;
     let path = input("BONELI_PROBE_FILE");
@@ -782,10 +765,6 @@ fn io_write() {
             open(libc::O_DIRECT)
                 .unwrap_or_else(|e| fail(3, &format!("open {path} with O_DIRECT: {e}"))),
             true,
-        ),
-        IoDirect::Never => (
-            open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
-            false,
         ),
     };
     let sync_each = !direct && plan.direct == IoDirect::Auto;
@@ -822,21 +801,6 @@ fn io_write() {
                 .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
         }
         written += chunk_len;
-    }
-    put("loop_ms", &start.elapsed().as_millis().to_string());
-    if plan.direct == IoDirect::Never {
-        let cg_file = |name: &str| {
-            std::fs::read_to_string(format!("/sys/fs/cgroup/{name}"))
-                .unwrap_or_else(|e| fail(3, &format!("read {name}: {e}")))
-        };
-        let memory = cg_file("memory.stat");
-        let keyed = crate::support::cgroup::keyed;
-        put("loop_file_dirty", &keyed(&memory, "file_dirty").to_string());
-        put(
-            "loop_file_writeback",
-            &keyed(&memory, "file_writeback").to_string(),
-        );
-        put("loop_io_stat", &joined_lines(&cg_file("io.stat")));
     }
     file.sync_data()
         .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
