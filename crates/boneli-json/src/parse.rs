@@ -147,6 +147,7 @@ impl Parser<'_> {
                 }
                 Some(b']') => {
                     self.pos += 1;
+                    items.shrink_to_fit();
                     return Ok(Value::Array(items));
                 }
                 _ => return self.unexpected(),
@@ -194,6 +195,7 @@ impl Parser<'_> {
         }
         self.check_duplicates(&members, base)?;
         self.key_offsets.truncate(base);
+        members.shrink_to_fit();
         Ok(Value::Object(Object::from_distinct(members)))
     }
 
@@ -222,6 +224,11 @@ impl Parser<'_> {
     }
 
     /// A string at `pos` (on its opening quote), unescaped.
+    ///
+    /// Its capacity never exceeds its encoding: a string without escapes
+    /// is copied once at its exact length, and at the first escape the
+    /// buffer reserves exactly the encoded length up to the closing quote,
+    /// which the decoded string never outgrows (ADR-008, D5).
     #[inline(never)]
     fn string(&mut self) -> Result<String, Error> {
         let mut out = String::new();
@@ -231,11 +238,18 @@ impl Parser<'_> {
             match self.bytes.get(i) {
                 None => return self.fail(ErrorKind::UnexpectedEnd, i),
                 Some(b'"') => {
-                    out.push_str(&self.text[run..i]);
+                    let tail = &self.text[run..i];
                     self.pos = i + 1;
+                    if out.capacity() == 0 {
+                        return Ok(tail.to_owned());
+                    }
+                    out.push_str(tail);
                     return Ok(out);
                 }
                 Some(b'\\') => {
+                    if out.capacity() == 0 {
+                        out.reserve_exact(self.closing_quote(i) - run);
+                    }
                     out.push_str(&self.text[run..i]);
                     i = self.escape(i, &mut out)?;
                     run = i;
@@ -244,6 +258,24 @@ impl Parser<'_> {
                 Some(_) => i += 1,
             }
         }
+    }
+
+    /// The offset of the first unescaped quote at or after `from`, or the
+    /// end of the input. It skips the byte after every backslash, and a
+    /// UTF-8 continuation byte is never a quote or a backslash, so for a
+    /// valid string this is the quote `string` stops at. For an invalid
+    /// one `string` returns its error and drops the reservation, which the
+    /// input's length bounds.
+    fn closing_quote(&self, from: usize) -> usize {
+        let mut i = from;
+        while let Some(&b) = self.bytes.get(i) {
+            match b {
+                b'"' => return i,
+                b'\\' => i += 2,
+                _ => i += 1,
+            }
+        }
+        self.bytes.len()
     }
 
     /// The escape whose backslash is at `at`; returns the offset after it.

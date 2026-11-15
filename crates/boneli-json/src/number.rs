@@ -1,5 +1,7 @@
 //! Numbers keep their validated source text (ADR-008, D3).
 
+use std::fmt;
+
 use crate::error::{Error, ErrorKind};
 
 /// A JSON number, stored as its lexeme.
@@ -9,9 +11,18 @@ use crate::error::{Error, ErrorKind};
 /// byte for byte. The accessors convert on demand.
 ///
 /// Equality compares lexemes, so `1`, `1.0` and `1e0` are different
-/// numbers, and so are `-0` and `0`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// numbers, and so are `-0` and `0`. `Debug` prints the lexeme as
+/// `Number(1.5)`, the same with or without `#` (ADR-008, D9).
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Number(Box<str>);
+
+impl fmt::Debug for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Number(")?;
+        f.write_str(&self.0)?;
+        f.write_str(")")
+    }
+}
 
 impl Number {
     /// A number from its text, which must match the RFC 8259 grammar

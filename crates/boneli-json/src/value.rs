@@ -2,16 +2,24 @@
 //! hold a key twice (ADR-008, D4).
 
 use std::cmp::Ordering;
+use std::fmt;
 
+use crate::limits::MAX_DEPTH;
 use crate::number::Number;
 
 /// A JSON value.
 ///
-/// `Clone`, `PartialEq`, `Debug` and `Drop` recurse. Values from `parse`
-/// nest at most `MAX_DEPTH` deep, which keeps them inside the stack
-/// (ADR-008, D6); a value built by hand much deeper than that can overflow
-/// the stack in these operations, and `to_vec` refuses it with `TooDeep`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Clone`, `PartialEq` and `Drop` recurse. Values from `parse` nest at
+/// most `MAX_DEPTH` deep, which keeps them inside the stack (ADR-008, D6);
+/// a value built by hand much deeper than that can overflow the stack in
+/// these operations, and `to_vec` refuses it with `TooDeep`.
+///
+/// `Debug` is compact and the same with or without `#`, for example
+/// `Object {"a": Array [Number(1), String("x"), Null]}`, so its cost is
+/// linear in the value's size. A non-empty container inside `MAX_DEPTH`
+/// others prints `..` instead of its contents, so `Debug` recurses no
+/// deeper on a built value than on a parsed one (ADR-008, D6 and D9).
+#[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     /// `null`.
     Null,
@@ -79,6 +87,65 @@ impl Value {
     }
 }
 
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_value(self, f, 0)
+    }
+}
+
+/// Writes `value`, a value nested `depth` deep, straight to `f`: no
+/// `debug_list` or `debug_map`, whose `{:#?}` form passes every byte
+/// through one indentation adapter per level (ADR-008, D9).
+fn debug_value(value: &Value, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+    match value {
+        Value::Null => f.write_str("Null"),
+        Value::Bool(true) => f.write_str("Bool(true)"),
+        Value::Bool(false) => f.write_str("Bool(false)"),
+        Value::Number(n) => fmt::Debug::fmt(n, f),
+        Value::String(s) => {
+            f.write_str("String(")?;
+            fmt::Debug::fmt(s.as_str(), f)?;
+            f.write_str(")")
+        }
+        Value::Array(items) => {
+            f.write_str("Array [")?;
+            if depth >= MAX_DEPTH && !items.is_empty() {
+                f.write_str("..")?;
+            } else {
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    debug_value(item, f, depth + 1)?;
+                }
+            }
+            f.write_str("]")
+        }
+        Value::Object(o) => {
+            f.write_str("Object ")?;
+            debug_object(o, f, depth)
+        }
+    }
+}
+
+/// `{"key": value, ...}` for an object nested `depth` deep.
+fn debug_object(object: &Object, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+    f.write_str("{")?;
+    if depth >= MAX_DEPTH && !object.is_empty() {
+        f.write_str("..")?;
+    } else {
+        for (i, (key, item)) in object.members.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            fmt::Debug::fmt(key.as_str(), f)?;
+            f.write_str(": ")?;
+            debug_value(item, f, depth + 1)?;
+        }
+    }
+    f.write_str("}")
+}
+
 impl From<bool> for Value {
     fn from(b: bool) -> Value {
         Value::Bool(b)
@@ -131,10 +198,17 @@ impl From<Object> for Value {
 ///
 /// Lookups scan the members, which is fast for the small objects APIs
 /// send. Building an object of m members with `insert` costs O(m²) key
-/// comparisons; `collect` costs O(m log m).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// comparisons; `collect` costs O(m log m). `Debug` prints
+/// `{"key": value, ...}` in the compact form of [`Value`].
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Object {
     members: Vec<(String, Value)>,
+}
+
+impl fmt::Debug for Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_object(self, f, 0)
+    }
 }
 
 impl Object {
@@ -300,4 +374,63 @@ impl FromIterator<(String, Value)> for Object {
 /// Orders member indices by key, then by position.
 pub(crate) fn by_key_then_index(members: &[(String, Value)], a: usize, b: usize) -> Ordering {
     members[a].0.cmp(&members[b].0).then(a.cmp(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Object, Value};
+    use crate::{Limits, parse};
+
+    /// Every container of `value` holds exactly its elements, so no spare
+    /// slot counts toward the memory per value (ADR-008, D5).
+    fn assert_exact(value: &Value) {
+        let mut stack = vec![value];
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Array(items) => {
+                    assert_eq!(items.capacity(), items.len(), "array {v:?}");
+                    stack.extend(items.iter());
+                }
+                Value::Object(Object { members }) => {
+                    assert_eq!(members.capacity(), members.len(), "object {v:?}");
+                    stack.extend(members.iter().map(|(_, item)| item));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_containers_have_exact_capacity() {
+        let lim = Limits::new(1 << 16, 512, 1 << 16).expect("limits");
+        let mut wide = String::from("[");
+        for i in 0..1000 {
+            if i > 0 {
+                wide.push(',');
+            }
+            wide.push_str(&format!("{{\"k{i}\":[{i}]}}"));
+        }
+        wide.push(']');
+        let chains = format!(
+            "[{}0{},{}0{}]",
+            "{\"a\":".repeat(64),
+            "}".repeat(64),
+            "[".repeat(64),
+            "]".repeat(64)
+        );
+        for input in [
+            "[0]",
+            "{\"a\":0}",
+            "[{\"a\":0},{\"\":0}]",
+            "[[0],[0],[0]]",
+            "[0,0,0]",
+            "{\"a\":0,\"b\":0,\"c\":0}",
+            "[0,0,0,0,0]",
+            chains.as_str(),
+            wide.as_str(),
+        ] {
+            let v = parse(input.as_bytes(), &lim).expect("parses");
+            assert_exact(&v);
+        }
+    }
 }

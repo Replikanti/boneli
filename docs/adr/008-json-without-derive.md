@@ -140,41 +140,89 @@ inclusive.
   to at most 3, a surrogate pair is 12 and decodes to 4, `\n` is 2 and
   decodes to 1, raw UTF-8 is copied 1:1), so `max_bytes` also bounds
   strings, keys and lexemes, and there is no separate string limit.
+  The parser makes this hold for the allocation too, not only for the
+  length: a string without escapes is copied once at its exact length,
+  and at its first escape the buffer reserves exactly the encoded
+  length up to the closing quote, so it never grows. Appending to an
+  empty `String` instead would double the buffer at the first push
+  after a long run: `"` + 1 MiB of `a` + `\/b"` held 2,097,152 bytes of
+  capacity for 1,048,578 decoded bytes. `string_capacity_within_encoding`
+  pins capacity ≤ encoded length for that input, for all-escape strings
+  and for keys.
 - `max_depth` bounds nesting: a scalar has depth 0, `[]` depth 1,
   `[[]]` depth 2. It is checked before the parser descends, so the
   bytes after the offending bracket are never read.
 - `max_values` counts every value once (scalars, containers, elements;
   keys do not count), so `[1,2]` is 3 and `{"a":1}` is 2. Why a third
   limit when the issue names only depth and size: memory amplification.
-  Peak RSS of `parse` on 16 MiB inputs (release, glibc, x86_64, the
-  input held by the caller, 2.3 MiB process baseline):
+  Every array and object is shrunk to its length when it closes
+  (`shrink_to_fit`, which glibc's `realloc` does in place), so a parsed
+  value holds no spare slots. Peak RSS of the process around `parse` on
+  16 MiB inputs (release, glibc, x86_64, the input held by the caller):
 
   | Input | Values | Peak RSS | Per value | Peak / input |
   |---|---|---|---|---|
   | `[0,0,…]` | 8,388,608 | 530 MiB | 64 B | 33.1 |
-  | `[[],[],…]` | 5,592,406 | 189 MiB | 32 B | 11.8 |
-  | `["","",…]` | 5,592,406 | 189 MiB | 32 B | 11.8 |
-  | `[{},{},…]` | 5,592,406 | 189 MiB | 32 B | 11.8 |
-  | `{"0":0,"1":0,…}` (hex keys) | 1,626,881 | 229 MiB | 136 B | 14.3 |
+  | `[[],[],…]` | 5,592,406 | 188 MiB | 32 B | 11.8 |
+  | `["","",…]` | 5,592,406 | 188 MiB | 32 B | 11.8 |
+  | `[{},{},…]` | 5,592,406 | 188 MiB | 32 B | 11.8 |
+  | `{"0":0,"1":0,…}` (hex keys) | 1,626,882 | 228 MiB | **136 B** | 14.3 |
+  | `[{"a":0},…]` | 4,194,303 | 338 MiB | 80 B | 21.1 |
+  | `[{"":0},…]` | 4,793,491 | 310 MiB | 64 B | 19.4 |
+  | `[[0],[0],…]` | 8,388,607 | 466 MiB | 56 B | 29.1 |
+  | `[{"a":0,"b":0,"c":0},…]` | 3,355,441 | 338 MiB | 100 B | 21.1 |
+  | `[[0,0,0],…]` | 8,388,605 | 498 MiB | 60 B | 31.1 |
+  | `[{"a":{"a":…0}},…]`, chains 256 deep | 2,803,457 | 274 MiB | 96 B | 17.2 |
+  | `[{"":{"":…{}}},…]`, chains 500 deep | 3,358,001 | 223 MiB | 64 B | 13.9 |
+  | `[[[…[0]…]],…]`, chains 256 deep | 8,388,353 | 402 MiB | 48 B | 25.2 |
+  | `[{k distinct keys},…]`, k = 2 to 65,537 | | | 101 to 121 B | 14.6 to 22.9 |
+  | `[[k zeros],…]`, k = 2 to 65,537 | | | 59 to 65 B | 30.5 to 33.7 |
+  | `"aaa…a\/b"`, one string | 1 | 34 MiB | | 2.1 |
 
-  Per value is (peak − baseline − input) / values. A value is 32 bytes
-  (`size_of::<Value>()`, pinned by a test); a number adds its lexeme's
-  allocation, an object member adds its key (a `String` header and its
-  allocation), and `Vec` growth adds up to one spare slot per element.
+  Per value is (peak − RSS before the parse) / values; k is 2^j + 1,
+  the count just past a `Vec` growth step. Before containers were
+  shrunk (the first version of this ADR), a one-element container kept
+  std's minimum capacity of 4: `[{"a":0},…]` cost 168 B per value,
+  `{"a":{"a":…}}` chains 271 B, `[[0],[0],…]` 104 B and 53 times the
+  input, and `[[[…[0]…]],…]` chains 144 B and 73 times the input.
+
+  Where the worst case comes from: a value is 32 bytes in its array
+  (`size_of::<Value>()`, pinned by a test) and an object member 56 (the
+  key's `String` header and the value). On top of that come the
+  allocations: a lexeme, a string or a key takes a glibc chunk of at
+  least 32 bytes (up to 24 bytes of content; longer content counts
+  against `max_bytes`), a container's chunk adds at most 24 bytes of
+  header and rounding, and while an object is open the duplicate check
+  holds 16 bytes per member (the key offset and the sort order, D4). The
+  most a value can cost is therefore a member with a short key and a
+  number or string value in a large object: 56 + 32 + 32 + 16 = 136 B,
+  measured 135.9 B. A growing `Vec`'s unused capacity did not show in
+  any row: the large ones are mapped by `mmap` and grow with `mremap`,
+  and pages that are never written are not resident (measured at
+  2^20 + 1 members and 2^22 + 1 elements: 135.8 and 64.0 B).
+
+  Rejected: collecting every container's elements on one shared
+  scratch stack and copying them out at the exact length when the
+  container closes. It gives exact containers too, but the scratch
+  stack's own growth and the copy are resident together, so large
+  containers got worse: 192 B per value for the hex-key object and 96 B
+  for `[0,0,…]`. The parse times of the two variants and of the first
+  version did not differ beyond the run-to-run noise of the loaded
+  machine (up to 2 times between runs).
+
   So a gateway that must accept a 32 MiB request, mostly one base64
   string, would accept about 1 GiB of peak memory from a hostile
   `[0,0,…]` body of the same size if only `max_bytes` bounded it. With
-  `max_values` the peak is about 2 × `max_bytes` (the input, plus the
-  decoded strings, keys and lexemes, which are never longer than their
-  encoding) plus 136 B × `max_values` (the worst per-value cost
-  measured, object members with short keys). Consumers size
-  `max_values` with that number.
+  `max_values` the peak is at most about 2 × `max_bytes` (the input,
+  plus the decoded strings, keys and lexemes, whose capacity never
+  exceeds their encoding) plus 136 B × `max_values` (the worst
+  per-value cost, above). Consumers size `max_values` with that number.
 
 ### D6. `MAX_DEPTH = 512`
 
-The parser and the serializer recurse, `Clone`,
-`PartialEq` and `Debug` are derived and `Drop` is the default, so they
-recurse too. std gives a spawned thread 2 MiB of stack by default, and
+The parser and the serializer recurse; `Clone` and
+`PartialEq` are derived, `Debug` is written by hand (D9) and `Drop` is
+the default, and they recurse too. std gives a spawned thread 2 MiB of stack by default, and
 `boneli-http` serves each connection on such a thread. Half of it,
 1,048,576 bytes, is the budget for JSON; the other half belongs to the
 frames below (server, handler) and above (an adapter's own recursive
@@ -187,31 +235,32 @@ is the difference between depth 512 and depth 256, divided by 256:
 
 | Operation | Test profile, per level | Test profile, at 512 | Release, per level | Release, at 512 |
 |---|---|---|---|---|
-| parse, arrays | 832 B | 428,399 B | 176 B | 90,607 B |
-| parse, objects | 1,488 B | 765,151 B | 240 B | 123,695 B |
-| drop, objects | 256 B | 132,823 B | 64 B | 33,159 B |
-| clone, objects | 1,072 B | 550,703 B | 176 B | 90,479 B |
-| `==`, objects | 512 B | 263,855 B | ≤ 48 B | 24,759 B |
-| serialize, either | 832 B | 429,359 B | 112 B | 57,887 B |
-| `{:?}`, objects | 1,184 B | 608,479 B | 752 B | 385,487 B |
-| `{:#?}`, objects | 1,632 B | 837,599 B | 1,200 B | 614,863 B |
+| parse, arrays | 832 B | 427,543 B | 176 B | 90,655 B |
+| parse, objects | 1,488 B | 764,247 B | 240 B | 123,647 B |
+| drop, objects | 256 B | 131,415 B | 64 B | 32,943 B |
+| clone, objects | 1,072 B | 549,295 B | 192 B | 98,535 B |
+| `==`, objects | 512 B | 262,415 B | 48 B | 24,623 B |
+| serialize, either | 832 B | 427,999 B | 112 B | 57,799 B |
+| `{:?}` and `{:#?}`, objects | 496 B | 254,831 B | 64 B | 33,079 B |
 
 Arrays cost less than objects in every operation but serialize, where
-both are equal. The worst case is `{:#?}` on objects in the test
-profile: 837,599 bytes, 80% of the budget, so 20% is left for frame
-growth across compiler versions. The check: in the same build with only
+both are equal. The worst case is parse of objects in the test profile:
+764,247 bytes, 73% of the budget, so 27% is left for frame growth
+across compiler versions. The derived `Debug` of the first version of
+this ADR cost 1,184 B per level for `{:?}` and 1,632 B for `{:#?}` and
+was the worst case then (837,599 bytes at 512). The check: in the same build with only
 the ceiling raised, a test-profile parse on a 1 MiB thread passes at
 depth 1,250 and overflows at 1,253 for arrays, and passes at 697 and
 overflows at 701 for objects, which matches the painted marks (1,048,576
 bytes / 1,488 bytes per level is 704, less the thread's own overhead).
 
 Where 512 comes from: the worst operation fits the budget up to
-(1,048,576 − 2,015) / 1,632 = 641 levels (2,015 bytes is its fixed
+(1,048,576 − 2,391) / 1,488 = 703 levels (2,391 bytes is its fixed
 part). 512 is the largest power of two below that, and it is kept
-rather than about 600 because 600 would leave 6% headroom, which one
+rather than about 690 because 690 would leave 2% headroom, which one
 compiler upgrade can eat; `tests/stack.rs` would then fail in CI, not in
 production, but the ceiling is part of the API. At 1,024 the worst
-operation would need 1.67 MB, 80% of a connection thread's whole stack,
+operation would need 1.53 MB, 73% of a connection thread's whole stack,
 for one call. At 128, `i_structure_500_nested_arrays` would be rejected
 and the headroom over realistic documents would drop to about 5 times:
 OCI manifests nest about 5 deep, GitHub responses about 8, Messages API
@@ -228,9 +277,12 @@ smaller error type), then lower `MAX_DEPTH` in a new ADR, and below 128
 switch to an iterative design.
 
 A value built by hand deeper than `MAX_DEPTH` is refused by the
-serializer (`TooDeep`, checked before it descends), but its `Clone`,
-`PartialEq`, `Debug` and `Drop` are not bounded; building such a value
-is the consumer's choice, and parsed values never are that deep.
+serializer (`TooDeep`, checked before it descends), and `Debug` prints
+`..` for the contents of a non-empty container inside `MAX_DEPTH`
+others, so it recurses no deeper than on a parsed value
+(`debug_stops_at_max_depth`). Its `Clone`, `PartialEq` and `Drop` are
+not bounded; building such a value is the consumer's choice, and parsed
+values never are that deep.
 
 ### D7. Serializer
 
@@ -271,6 +323,28 @@ implements `std::error::Error` (`source` is the I/O error for `Io`).
 bytes: requests carry secrets, and errors get logged. A test feeds
 inputs holding a marker in strings and keys and checks that neither
 form of any error contains it.
+
+`Debug` of `Value`, `Object` and `Number` does show content, so
+consumers must not `Debug`-log request bodies. It is written by hand,
+compact, and the same with and without `#`:
+`Object {"a": Array [Number(1), String("x"), Null]}`. Its cost is linear
+in its output, and the output is at most 6 times the input (a raw DEL
+byte in a string prints as `\u{7f}`). The plan derived `Debug`, and the
+first version of this ADR kept the derive. Its `{:#?}` goes through
+std's `debug_list` and `debug_struct`, which pass every byte through one
+indentation adapter per enclosing level while the indented output grows
+with the square of the depth, so the cost is cubic: for values nested
+512 deep (a 1,024-byte and a 3,076-byte input) 6.7 s for arrays and
+61 s for objects in release, 26 s for arrays in the test profile. A
+public `Debug` cannot prove that no caller pretty-prints a hostile
+value, so it is fixed in the crate rather than ruled out by
+convention. The hand-written form formats the same values in 87 µs and
+186 µs in the test profile; `pretty_debug_of_deep_values_is_fast`
+fails above 2 s and requires `{:#?}` to equal `{:?}`. Rejected: an
+indented form written without the adapters. It is linear in its
+output too, but that output is quadratic in the depth (about 1 MB for
+the 1,024-byte input), and nothing reads `Debug` output that needs it;
+indented JSON is the job of a tool on the serialized form.
 
 ### D10. JSONTestSuite is vendored
 
@@ -316,14 +390,8 @@ the number edge cases round-trip too.
   picks a resolution rule and shows the gateway cannot be confused by it.
 - Every consumer has to choose and justify `max_bytes`, `max_depth` and
   `max_values`, using the memory table in D5.
-- **`{:#?}` of a deep value is slow**: std's pretty `Debug` output grows
-  with the square of the depth, and every byte passes through one
-  indentation adapter per level, so the cost is cubic. Measured in
-  release: 6.7 s for arrays nested 512 deep (a 1,024-byte input) and
-  61 s for objects (3,076 bytes); `{:?}` takes about 1.5 ms for either.
-  Consumers must not pretty-print untrusted values; they must not
-  `Debug`-log request bodies anyway (D9). The stack test pays this
-  cost in CI: about 80 s locally in the test profile.
+- `{:#?}` of a value prints the same single line as `{:?}` (D9). A
+  consumer that wants indented output formats the serialized form.
 - The depth ceiling is a property of the crate, but it holds for parsed
   values only; a deep value built by hand is the consumer's
   responsibility (D6).
@@ -335,7 +403,8 @@ the number edge cases round-trip too.
 
 - **A fully iterative parser, with hand-written iterative `Drop`, `Clone`,
   `PartialEq`, `Debug` and serializer.** It would remove the depth
-  ceiling, but it swaps four derives for four hand-written traversals, and
+  ceiling, but it swaps three derives and the recursive `Debug` for four
+  hand-written iterative traversals, and
   the adapters' own recursive walks over a `Value` (redaction in #20)
   would still need a bound. Kept as the fallback if the ceiling ever has
   to drop below 128.
@@ -352,8 +421,7 @@ the number edge cases round-trip too.
 - **Fetching the suite in CI.** Rejected in D10.
 - **A separate string-length limit.** `max_bytes` already bounds every
   string (D5).
-- **A hand-written compact `Debug`** that removes the cubic `{:#?}` cost.
-  Not taken now: the derive is less code, `{:?}` is fast, and the
-  consumers' rule (no `Debug` of untrusted bodies) already applies for
-  secrecy. It is the remedy if a consumer needs pretty output of
-  untrusted values.
+- **The derived `Debug`**, or a hand-written indented one. Rejected in
+  D9: the first is cubic in the depth with `{:#?}`, the second has an
+  output quadratic in the depth.
+- **Shared scratch stacks for container elements.** Rejected in D5.

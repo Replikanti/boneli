@@ -235,6 +235,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   has no defaults and bounds input bytes, nesting depth (at most
   `MAX_DEPTH`, 512) and the number of values. `ndjson::Reader` and
   `write_line` read and write one value per line with bounded lines.
+  Parsed containers and strings hold no spare capacity, and `Debug` of a
+  value is compact and linear in its output, with or without `#`.
   Tested against JSONTestSuite, vendored with its MIT notice, a
   305,491-mutant sweep, round trips and a stack gate on a 1 MiB thread.
 - ADR-008: the JSON subset, the number model, duplicate-key rejection,

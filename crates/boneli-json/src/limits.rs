@@ -11,8 +11,8 @@ use crate::error::{Error, ErrorKind};
 /// The parser and the serializer recurse, and `Clone`, `PartialEq`,
 /// `Debug` and `Drop` of `Value` are recursive, so this bound is what keeps
 /// every operation on a parsed value inside the stack. At 512 the deepest
-/// operation in the test profile (`{:#?}` of nested objects) uses 837,599
-/// bytes, 80% of 1 MiB, half the stack std gives a spawned thread; the
+/// operation in the test profile (parsing nested objects) uses 764,247
+/// bytes, 73% of 1 MiB, half the stack std gives a spawned thread; the
 /// measurement and the derivation are in ADR-008, D6, and
 /// `tests/stack.rs` enforces it.
 pub const MAX_DEPTH: usize = 512;

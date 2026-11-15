@@ -409,6 +409,59 @@ fn duplicate_check_not_quadratic() {
     assert_eq!((e.kind(), e.offset()), (ErrorKind::DuplicateKey, at + 1));
 }
 
+/// A decoded string or key never reserves more than its encoding, so the
+/// strings of a parse fit in `max_bytes` (ADR-008, D5). The first input is
+/// the one that used to double: one escape after a long run.
+#[test]
+fn string_capacity_within_encoding() {
+    let mut long = b"\"".to_vec();
+    long.resize(1 + (1 << 20), b'a');
+    long.extend_from_slice(b"\\/b\"");
+    let mut all_escapes = b"\"".to_vec();
+    for _ in 0..4096 {
+        all_escapes.extend_from_slice(b"\\u0041");
+    }
+    all_escapes.push(b'"');
+    // An escaped quote first: the reservation must reach past it to the
+    // closing quote.
+    let mut quote_first = b"\"\\\"".to_vec();
+    quote_first.resize(3 + 1000, b'a');
+    quote_first.extend_from_slice(b"\\/b\"");
+    let inputs: Vec<Vec<u8>> = vec![
+        long,
+        quote_first,
+        all_escapes,
+        b"\"\\/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"".to_vec(),
+        b"\"a\"".to_vec(),
+        b"\"abc\\n\"".to_vec(),
+        b"\"\\ud83d\\ude00x\"".to_vec(),
+        "\"\u{e9}\u{1f600}\\t\"".as_bytes().to_vec(),
+    ];
+    let lim = limits(4 << 20, 4, 4);
+    for input in inputs {
+        let encoded = input.len();
+        let Value::String(s) = parse(&input, &lim).expect("string") else {
+            panic!("not a string");
+        };
+        assert!(
+            s.capacity() <= encoded,
+            "encoded {encoded}, len {}, capacity {}",
+            s.len(),
+            s.capacity()
+        );
+        // The same string as a key.
+        let mut object = b"{".to_vec();
+        object.extend_from_slice(&input);
+        object.extend_from_slice(b":0}");
+        let Value::Object(o) = parse(&object, &lim).expect("object") else {
+            panic!("not an object");
+        };
+        let (key, _) = o.into_iter().next().expect("one member");
+        assert_eq!(key, s);
+        assert!(key.capacity() <= encoded, "key capacity {}", key.capacity());
+    }
+}
+
 #[test]
 fn object_order_preserved() {
     let v = ok(br#"{"b":1,"a":2,"c":{"z":0,"y":0}}"#);
