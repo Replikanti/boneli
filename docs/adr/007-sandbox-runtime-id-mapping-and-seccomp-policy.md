@@ -844,8 +844,8 @@ bound, so `destroy` failed and left the cgroup; the workload picks that
 time (size ÷ rate). After the kill, every configured `io.max` device is
 written back to `max` (`destroy_lifts_io_throttle`: 89 ms on the dev host
 with `dd`, the reviewer measured 97 ms; with the probe's write since #52,
-20–35 ms on the dev host and 16–225 ms on CI, every run listed in "The
-timing tests").
+16–35 ms on the dev host and 16–243 ms on CI, over the runs listed in
+"The timing tests").
 A small CPU quota also holds killed
 tasks back until the next period refill: with `cpu.max` `1000 1000000`
 and four spinners, `destroy` took 496–506 ms without a lift (measured
@@ -1061,13 +1061,22 @@ tmpfs, on fixture text.
   `wchar` 38 at 2 s, Held at 2,005–2,007 ms with `wbytes` 1,048,576 to
   1,572,864 and destroy 20–35 ms over 7 runs: 20–26 ms on the first tree
   of PR 53 (3 runs), 22 and 35 ms on its 17ce203, 22 and 24 ms on the
-  tree of its first review round. On CI, in every run of PR 53's
-  `sandbox` jobs (runs 43757751313, 43758791004, 43759283155,
-  43759605908, 43769894075, 43770174212 and 43772627813), Held at
-  2,001–2,002 ms with `wbytes` 1,048,576 on every class, destroy in run
-  order 213, 211, 213, 225, 216 and 201 ms on Azure x86_64 (6 runs; the
-  third run's x86_64 job landed on AWS), 147, 131, 124, 125, 154, 126 and
-  123 ms on Azure arm64 (7 runs) and 16 ms on AWS x86_64 (1 run). Without
+  tree of its first review round. On the trees of its second review
+  round Held at the first read, 2,003–2,005 ms, destroy 20–27 ms (8 runs;
+  the 4 that looked the buffer up by the write's address read
+  `40960 kB nh AnonHugePages 0 kB`), and in the mutation copy on the
+  directory without copy-on-write 16–19 ms (3 Held runs, `wbytes`
+  1,048,576 and `file_writeback` 0, as on CI). On CI, in the nine runs of
+  PR 53's `sandbox` jobs up to its first review round's last commit
+  ab19577 (runs 43757751313, 43758791004, 43759283155, 43759605908,
+  43769894075, 43770174212, 43772627813, 43773252632 and 43773572845),
+  Held at 2,001–2,002 ms with `wbytes` 1,048,576 on every class, destroy
+  in run order 213, 211, 213, 225, 216 and 201 ms on Azure x86_64 with an
+  NVMe disk (`259:0`, 6 runs; the third run's x86_64 job landed on AWS),
+  16 and 243 ms on Azure x86_64 with a SCSI disk (`8:0`, the same 7.0
+  kernel, both runs on ab19577), 147, 131, 124, 125, 154, 126, 123, 150
+  and 124 ms on Azure arm64 (9 runs) and 16 ms on AWS x86_64 (1 run).
+  These ranges cover the runs listed, not every runner class. Without
   the limit the writer had exited 0 by 2 s (dev host, 4 runs before the
   review and 1 in its first round) and the test fails with "io.max did
   not hold the writer". Where the runner refuses those files (EACCES,
