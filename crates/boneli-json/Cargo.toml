@@ -1,0 +1,16 @@
+[package]
+name = "boneli-json"
+description = "Boneli support crate: a strict RFC 8259 JSON parser and serializer without derive, with limits for untrusted input and newline-delimited JSON (ADR-008)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: docs/ARCHITECTURE.md ("Pure Rust and dependencies") puts
+# a JSON parser and serializer without derive on the list of parts we write
+# ourselves, and deny.toml bans serde (ADR-008).
