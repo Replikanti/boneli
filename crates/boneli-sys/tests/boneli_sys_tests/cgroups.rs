@@ -677,6 +677,12 @@ fn destroy_lifts_io_throttle() {
         wiops: None,
     }])
     .expect("one device");
+    // Declared before the cgroup, so a panic before the destroy drops the
+    // cgroup first: its drop kills and lifts io.max, then Child::drop
+    // reaps at once instead of waiting ~38 s for the throttled bios
+    // (review of PR 53; a panic injected after the check ended the test
+    // after 2.06 s, and after 40.29 s with the old order, on the dev host).
+    let mut writer = None;
     let cg = cgroup::create("io-kill", &limits(256 << 20, 16, (100_000, 100_000), io));
     let size = IO_KILL_SIZE.to_string();
     let mut s = spec(
@@ -696,7 +702,7 @@ fn destroy_lifts_io_throttle() {
     .map(|(k, v)| (OsString::from(k), OsString::from(v)))
     .collect();
     let start = Instant::now();
-    let mut child = spawn(&s).expect("spawn the writer");
+    let child = writer.insert(spawn(&s).expect("spawn the writer"));
     drop(s);
     // Let the writer fill its buffer and block in the throttled write.
     std::thread::sleep(Duration::from_secs(2));
@@ -723,7 +729,7 @@ fn destroy_lifts_io_throttle() {
     let path = cg.path().to_path_buf();
     if verdict != IoHold::Held {
         let _ = cg.destroy();
-        let status = wait_bounded(&mut child, Duration::from_secs(120));
+        let status = wait_bounded(child, Duration::from_secs(120));
         if path.exists() {
             let _ = std::fs::write(path.join("cgroup.kill"), "1");
             let _ = std::fs::remove_dir(&path);
@@ -736,7 +742,7 @@ fn destroy_lifts_io_throttle() {
     report(&format!(
         "destroy_lifts_io_throttle: destroy took {took:?}: {result:?}"
     ));
-    let status = wait_bounded(&mut child, Duration::from_secs(120));
+    let status = wait_bounded(child, Duration::from_secs(120));
     if path.exists() {
         // Leave nothing behind when the assertion below fails.
         let _ = std::fs::write(path.join("cgroup.kill"), "1");
