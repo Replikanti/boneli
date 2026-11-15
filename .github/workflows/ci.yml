@@ -119,7 +119,6 @@ jobs:
           # destroy_lifts_io_throttle may read the writer's /proc files is
           # the kernel/yama/ptrace_scope line above).
           echo "dd: $(command -v dd || echo absent): $(dd --version 2>/dev/null | head -n1 || true)"
-          echo "strace: $(command -v strace || echo absent)"
           echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo absent)"
           for k in dirty_ratio dirty_background_ratio dirty_bytes dirty_background_bytes; do
             echo "vm.$k = $(cat "/proc/sys/vm/$k" 2>/dev/null || echo absent)"
