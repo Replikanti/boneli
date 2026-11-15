@@ -435,26 +435,24 @@ const IO_BUF_SLACK_MS: u64 = 500;
 const IO_BUF_HANG: Duration = Duration::from_secs(120);
 
 /// Runs the buffered writer in `cg` on `fixture` and waits for it within
-/// [`IO_BUF_HANG`]. Its output goes to files, not pipes: `run_in` reads
-/// the pipes to EOF before its hang bound starts, so a stuck writer would
-/// hold the job until its timeout.
+/// [`IO_BUF_HANG`]. Its output goes through pipes read on threads, so the
+/// hang bound starts at once: `run_in` reads the pipes to EOF before its
+/// hang bound starts, so a stuck writer would hold the job until its
+/// timeout. Not files: the probe's output written to a file is a dirty
+/// page charged to the sandbox, which hid a loop that synced every write
+/// from the not-buffered guard (mutant MD, measured: 4,096 bytes).
 fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup) -> support::Probe {
     let _runs = support::shared();
-    let out_dir = fixture.tree().dir("buffered-out");
-    let (out_path, err_path) = (out_dir.join("stdout"), out_dir.join("stderr"));
-    let create = |p: &std::path::Path| -> std::os::fd::OwnedFd {
-        std::fs::File::create(p)
-            .unwrap_or_else(|e| panic!("create {}: {e}", p.display()))
-            .into()
-    };
+    let (out_r, out_w) = support::pipe();
+    let (err_r, err_w) = support::pipe();
     let mut s = spec(
         root_with_cgroup(fixture),
         cg,
         crate::support::rootfs::PROBE,
         &["--exact", "probe", "--nocapture", "--quiet"],
     );
-    s.stdio.stdout = create(&out_path);
-    s.stdio.stderr = create(&err_path);
+    s.stdio.stdout = out_w;
+    s.stdio.stderr = err_w;
     s.env = [
         (support::probe::ACTION_VAR, "io-write"),
         ("BONELI_PROBE_FILE", "/workspace/buffered"),
@@ -465,18 +463,23 @@ fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup) -> support::Probe {
     .map(|(k, v)| (OsString::from(k), OsString::from(v)))
     .collect();
     let mut child = spawn(&s).expect("spawn the buffered writer");
+    // The write ends live in the spec; dropping it leaves the child as the
+    // only writer, so the reads end when it exits.
     drop(s);
+    let readers = [out_r, err_r].map(|fd| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut buf)
+                .expect("read a pipe from the buffered writer");
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
     let status = wait_bounded(&mut child, IO_BUF_HANG);
-    let text = |p: &std::path::Path| {
-        String::from_utf8_lossy(
-            &std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
-        )
-        .into_owned()
-    };
+    let [stdout, stderr] = readers.map(|r| r.join().expect("a pipe reader"));
     support::parse_probe(support::Output {
         status,
-        stdout: text(&out_path),
-        stderr: text(&err_path),
+        stdout,
+        stderr,
     })
 }
 
