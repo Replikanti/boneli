@@ -328,8 +328,10 @@ form of any error contains it.
 consumers must not `Debug`-log request bodies. It is written by hand,
 compact, and the same with and without `#`:
 `Object {"a": Array [Number(1), String("x"), Null]}`. Its cost is linear
-in its output, and the output is at most 6 times the input (a raw DEL
-byte in a string prints as `\u{7f}`). The plan derived `Debug`, and the
+in its output, and the output is at most 6 times the input plus 8 bytes
+(a raw DEL byte in a string prints as `\u{7f}`; the 8 bytes cover a
+top-level one-digit number, where `0` prints as `Number(0)`). The plan
+derived `Debug`, and the
 first version of this ADR kept the derive. Its `{:#?}` goes through
 std's `debug_list` and `debug_struct`, which pass every byte through one
 indentation adapter per enclosing level while the indented output grows
