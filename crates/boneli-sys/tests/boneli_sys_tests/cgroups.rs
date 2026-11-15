@@ -662,8 +662,10 @@ fn destroy_lifts_io_throttle() {
     // (/proc/<pid>/task/<tid>/syscall), and wchar is under 40 MiB
     // (/proc/<pid>/io adds a write only when it returns). Where the runner
     // refuses those files (EACCES, EPERM), a task in D decides instead,
-    // and the report line names the fallback. wbytes is reported, not
-    // asserted: where io.stat counts depends on the write path.
+    // and the report line names the fallback. wbytes on the io.max
+    // device must be above 0 (review of PR 53: a limit on a device the
+    // bios do not pass plus a slow device would read as held), with no
+    // upper bound: where io.stat counts depends on the write path.
     let _alone = support::exclusive();
     let fixture = Fixture::new("io-kill");
     let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
@@ -923,7 +925,8 @@ struct IoFacts {
 /// Whether io.max held the writer at the check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IoHold {
-    /// Alive and inside its 40 MiB write (or in `D` in the fallback).
+    /// Alive and inside its 40 MiB write (or in `D` in the fallback), with
+    /// a write counted on the `io.max` device.
     Held,
     /// The cgroup was empty: the writer had ended.
     Finished,
@@ -933,13 +936,20 @@ enum IoHold {
     NotInWrite,
     /// Fallback only: no task in `D`.
     NotBlocked,
+    /// Held otherwise, but the `io.max` device's `io.stat` line counted no
+    /// write: the limit may sit on a device the bios do not pass, so a slow
+    /// device and not `io.max` could be what holds the writer.
+    NotOnDevice,
 }
 
+/// `Held` also needs `wbytes` above 0 on the `io.max` device's line, a
+/// lower bound only: where `io.stat` counts depends on the write path (the
+/// AWS probe's line read 8 MiB at 2 s under 1 MiB/s), so no upper bound.
 fn io_hold_verdict(f: &IoFacts) -> IoHold {
     if f.populated == 0 {
         return IoHold::Finished;
     }
-    match &f.check {
+    let held = match &f.check {
         HoldCheck::Syscall { tasks, wchar } => {
             if *wchar >= IO_KILL_SIZE {
                 IoHold::Returned
@@ -959,6 +969,11 @@ fn io_hold_verdict(f: &IoFacts) -> IoHold {
                 IoHold::NotBlocked
             }
         }
+    };
+    if held == IoHold::Held && f.wbytes == 0 {
+        IoHold::NotOnDevice
+    } else {
+        held
     }
 }
 
@@ -1000,6 +1015,10 @@ fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
         }
         IoHold::NotInWrite => "the writer was not inside its 40 MiB write",
         IoHold::NotBlocked => "the writer was not blocked in its write",
+        IoHold::NotOnDevice => {
+            "the io.max device counted no write by the check: \
+             the writer's bios may not pass the limited device"
+        }
         IoHold::Held => "the writer was held",
     };
     format!("{why}: {}, status {status:?}", io_hold_text(v, f))
@@ -1123,10 +1142,42 @@ fn io_hold_verdicts() {
     for wchar in [IO_KILL_SIZE - 1, 38] {
         let mut f = io_facts(1, syscall_check(vec![w()], wchar), &['D']);
         assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}");
-        // wbytes is not part of the verdict (D1: counted at submission).
-        f.wbytes = IO_KILL_SIZE;
-        assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}, wbytes");
+        // wbytes has a lower bound only: the AWS probe's device line read
+        // 8 MiB at 2 s under 1 MiB/s, so a large count is still Held.
+        for wbytes in [1, IO_KILL_SIZE] {
+            f.wbytes = wbytes;
+            assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}, {wbytes}");
+        }
+        // Nothing counted on the io.max device: the limit may sit on a
+        // device the bios do not pass (review of PR 53).
+        f.wbytes = 0;
+        assert_eq!(io_hold_verdict(&f), IoHold::NotOnDevice, "wchar {wchar}");
     }
+    // The device check comes last: every other verdict wins over it.
+    let zero = |populated, check, states: &[char]| {
+        let mut f = io_facts(populated, check, states);
+        f.wbytes = 0;
+        io_hold_verdict(&f)
+    };
+    assert_eq!(
+        zero(0, syscall_check(vec![w()], 38), &['D']),
+        IoHold::Finished
+    );
+    assert_eq!(
+        zero(1, syscall_check(vec![w()], IO_KILL_SIZE), &['D']),
+        IoHold::Returned
+    );
+    assert_eq!(
+        zero(1, syscall_check(vec![futex_task()], 38), &['S', 'D']),
+        IoHold::NotInWrite
+    );
+    let eperm = || HoldCheck::DState {
+        refused: "io: EPERM".to_string(),
+    };
+    assert_eq!(zero(1, eperm(), &['S']), IoHold::NotBlocked);
+    // The fallback's D needs a counted write too.
+    assert_eq!(zero(1, eperm(), &['S', 'D']), IoHold::NotOnDevice);
+    assert_eq!(zero(0, eperm(), &['D']), IoHold::Finished);
     // The measured layout: the futex main thread plus the writer, in
     // either order; the futex task alone is not in the write.
     for tasks in [vec![futex_task(), w()], vec![w(), futex_task()]] {
@@ -1212,6 +1263,12 @@ fn io_hold_failure_messages() {
         },
         &['S', 'R'],
     );
+    let mut off_device = io_facts(
+        1,
+        syscall_check(vec![futex_task(), w.clone()], 38),
+        &['S', 'D'],
+    );
+    off_device.wbytes = 0;
     let cases = [
         (
             IoHold::Finished,
@@ -1249,6 +1306,12 @@ fn io_hold_failure_messages() {
             &refused,
             "the writer was not blocked in its write",
         ),
+        (
+            IoHold::NotOnDevice,
+            ExitStatus::Signaled(9),
+            &off_device,
+            "the io.max device counted no write by the check",
+        ),
     ];
     for (v, status, facts, prefix) in cases {
         let m = io_hold_failure(v, status, facts);
@@ -1260,7 +1323,7 @@ fn io_hold_failure_messages() {
             hold_check_label(&facts.check).as_str(),
             "259:0",
             "at 2004 ms",
-            "wbytes 1048576",
+            &format!("wbytes {}", facts.wbytes),
             "file_dirty 0",
             "file_writeback 41418752",
             &format!("{status:?}"),
