@@ -17,7 +17,9 @@ version = "0.0.0"
 name = "boneli-egress"
 version = "0.0.0"
 dependencies = [
+ "boneli-app",
  "boneli-http",
+ "boneli-memory",
 ]
 
 [[package]]

@@ -16,3 +16,10 @@ workspace = true
 # CONNECT parsing and the authority grammar; a support crate. Allowlist
 # entries go through the same parser as CONNECT targets (ADR-006, D2).
 boneli-http.workspace = true
+# The `Clock` port, which `MonotonicClock` implements for the log's `t`
+# (ADR-006, D11).
+boneli-app.workspace = true
+
+[dev-dependencies]
+# `StepClock`, a deterministic `Clock` for the proxy tests.
+boneli-memory.workspace = true
