@@ -11,9 +11,9 @@
 //!   committed.
 //! - `layers/sha256/<hex>` and `<hex>.stats`: the layer cache.
 //!
-//! Temporary names in both directories carry their owner (PID namespace,
-//! pid, start time); `open` removes those whose owner is gone and leaves
-//! the rest.
+//! Temporary names in both directories carry their owner (boot id, PID
+//! namespace, pid, start time); `open` removes those whose owner is gone
+//! and leaves the rest.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -27,7 +27,7 @@ use boneli_https::{ConnectOptions, Roots, Sha256, TlsConfig};
 
 use crate::dial::{Dial, TlsDial};
 use crate::error::{Error, PullError, failed};
-use crate::layers::{self, LayerCache, Liveness, Owner};
+use crate::layers::{self, Judge, LayerCache, Liveness, Owner};
 use crate::limits::{Budget, Limits};
 use crate::manifest::{self, Descriptor, Document, ImageConfig};
 use crate::reference::{Digest, Reference};
@@ -227,11 +227,47 @@ fn private_dir(dir: &Path) -> Result<(), Error> {
         .map_err(|e| cache_err(dir, e))
 }
 
+/// Checks `dir` and each of its ancestors the way sshd's `StrictModes`
+/// checks a path: a directory, owned by root or by `uid`, and not writable
+/// by its group or by others unless it is sticky. Anyone who can rename an
+/// entry of an ancestor can swap the root after `open` and plant layers
+/// that the store then hands out; in a sticky directory only an entry's
+/// owner can rename it, and the next entry down is root's or the caller's.
+/// The filesystem root is checked for its mode only: whoever owns it owns
+/// every path on the host, and in a user namespace it shows the overflow
+/// uid. `dir` must be resolved, so the walk sees no symlink.
+fn check_ancestors(dir: &Path, uid: u32) -> Result<(), Error> {
+    for at in dir.ancestors() {
+        let refuse = |reason| {
+            Err(Error::Root {
+                path: at.to_path_buf(),
+                reason,
+            })
+        };
+        let meta = fs::symlink_metadata(at).map_err(|e| cache_err(at, e))?;
+        if !meta.is_dir() {
+            return refuse("an ancestor of the root must be a directory");
+        }
+        if at.parent().is_some() && meta.uid() != 0 && meta.uid() != uid {
+            return refuse("an ancestor of the root must be owned by root or the caller");
+        }
+        if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+            return refuse(
+                "an ancestor of the root must not be writable by its group or others unless it is sticky",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Removes every name in `dir` that carries an owner (D8) whose owner is
-/// gone, as `me` sees it, and returns how many it removed. Names of live
-/// owners and of owners in other PID namespaces stay, and so does every
-/// name that carries no owner.
-fn sweep(dir: &Path, me: &Owner) -> Result<u64, Error> {
+/// gone, as `judge` sees it, and returns how many it removed. Names of
+/// live owners and of owners it cannot judge stay, and so does every name
+/// that carries no owner. A name whose removal fails stays too, whatever
+/// the error: it is a dot name, never read as a layer or a blob, so it
+/// costs disk, while failing `open` for it would leave the store
+/// unopenable until someone removed it by hand.
+fn sweep(dir: &Path, judge: &Judge) -> Result<u64, Error> {
     let mut removed = 0;
     for entry in fs::read_dir(dir).map_err(|e| cache_err(dir, e))? {
         let entry = entry.map_err(|e| cache_err(dir, e))?;
@@ -239,15 +275,15 @@ fn sweep(dir: &Path, me: &Owner) -> Result<u64, Error> {
         let Some(owner) = name.to_str().and_then(Owner::of_name) else {
             continue;
         };
-        if owner.liveness(me) != Liveness::Dead {
+        if owner.liveness(judge) != Liveness::Dead {
             continue;
         }
-        let path = entry.path();
-        match layers::remove_tree_bounded(&path) {
-            Ok(_) => removed += 1,
-            // Another store's sweep removed it first.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(cache_err(&path, e)),
+        // An error is another store's sweep that removed it first, or a
+        // tree that cannot be removed by path (one deeper than `PATH_MAX`
+        // under this root's path, left by a process that reached the root
+        // through a shorter one).
+        if layers::remove_tree_bounded(&entry.path()).is_ok() {
+            removed += 1;
         }
     }
     Ok(removed)
@@ -299,17 +335,32 @@ impl OciImageStore {
     /// Opens the store at `root`:
     ///
     /// - `root` must be absolute, UTF-8 and free of `,`, `:` and `\`; it is
-    ///   created with mode `0o700` where it is missing, resolved, and
-    ///   checked again;
+    ///   created with mode `0o700` where it is missing, once its existing
+    ///   ancestors pass the check below, resolved, and checked again;
     /// - it must be a directory owned by the caller with no group or other
     ///   permission bits;
+    /// - each of its ancestors must be owned by root or the caller and not
+    ///   writable by its group or others unless it is sticky (sshd's
+    ///   `StrictModes`), so no one else can swap the root after `open`;
     /// - temporary names whose owner is gone are removed (D8);
     /// - its filesystem must keep exact names (D8) and hold the overlay
     ///   format (0:0 whiteouts, `user.*` xattrs, D1), or `open` fails
     ///   here rather than in a pull.
     pub fn open(root: &Path, config: StoreConfig) -> Result<OciImageStore, Error> {
         check_root_text(root)?;
+        let uid = own_uid(root)?;
         if fs::symlink_metadata(root).is_err() {
+            // Nothing is created under an ancestor that fails the check.
+            if let Some(existing) = root
+                .ancestors()
+                .skip(1)
+                .find(|a| fs::symlink_metadata(a).is_ok())
+            {
+                let existing = existing
+                    .canonicalize()
+                    .map_err(|e| cache_err(existing, e))?;
+                check_ancestors(&existing, uid)?;
+            }
             private_dir(root)?;
         }
         let resolved = root.canonicalize().map_err(|e| cache_err(root, e))?;
@@ -322,20 +373,23 @@ impl OciImageStore {
         if !meta.is_dir() {
             return Err(refuse("must be a directory"));
         }
+        if meta.uid() != uid {
+            return Err(refuse("must be owned by the caller"));
+        }
         if meta.mode() & 0o077 != 0 {
             return Err(refuse("must have no group or other permission bits"));
         }
-        if meta.uid() != own_uid(&resolved)? {
-            return Err(refuse("must be owned by the caller"));
+        if let Some(parent) = resolved.parent() {
+            check_ancestors(parent, uid)?;
         }
 
         let blobs = resolved.join("blobs").join("sha256");
         let layer_dir = resolved.join("layers").join("sha256");
         private_dir(&blobs)?;
         private_dir(&layer_dir)?;
-        let me = Owner::current()?;
-        sweep(&blobs, &me)?;
-        sweep(&layer_dir, &me)?;
+        let judge = Judge::current()?;
+        sweep(&blobs, &judge)?;
+        sweep(&layer_dir, &judge)?;
         let cache = LayerCache::new(&resolved)?;
         probe_overlay_format(&layer_dir)?;
         Ok(OciImageStore {

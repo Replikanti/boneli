@@ -138,8 +138,9 @@ systemd-run --user --scope -q -p Delegate=yes \
 `boneli_oci_tests`, with the same host needs and the same harness
 variable (ADR-009). `host::` mounts a pulled synthetic image in the
 sandbox, and checks a casefold store root (tmpfs `casefold`, Linux 6.13;
-list `tmpfs-casefold` in `BONELI_OCI_HOST_GAPS` where the kernel lacks it)
-and a ramfs root through `unshare -Urm`. `network::` pulls `node:22` and
+list `tmpfs-casefold` in `BONELI_OCI_HOST_GAPS` where the kernel lacks it),
+a ramfs root through `unshare -Urm`, and a store opened in a PID
+namespace without its own `/proc` through `unshare -Urpfm`. `network::` pulls `node:22` and
 `postgres:17` from Docker Hub and runs them; CI runs it in the weekly
 `oci-acceptance` workflow, not on every PR.
 

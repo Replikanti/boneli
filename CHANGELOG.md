@@ -326,10 +326,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first release without RUSTSEC-2026-0344, declares it (ADR-009, D5).
 - ADR-009 is accepted. The zstd window cap is 128 MiB (was 100 MiB), the
   reference decoder's default, so `zstd --long` layers decode (D5).
-  Temporary names in the store carry their owner's PID namespace, pid and
-  start time at fixed widths; the store removes only those of owners that
-  are gone in its own PID namespace, and a staging name is longer than a
-  committed layer's, so committed paths always fit `PATH_MAX` (D8).
+  Temporary names in the store carry their owner's boot id, PID
+  namespace, pid and start time at fixed widths; the store removes only
+  those of owners that are gone in its own boot and PID namespace, judged
+  through a `/proc` of that namespace, skips a leftover it cannot remove
+  instead of failing `open`, and a staging name is longer than a
+  committed layer's, so committed paths always fit `PATH_MAX` (D8). The
+  store root's ancestors must be owned by root or the caller and not
+  writable by group or others unless sticky (D8).
   `Client::get_blob` returns the checked file, open at its start.
 - The host-setup block's AppArmor profile also names the `boneli-oci`
   test binaries.

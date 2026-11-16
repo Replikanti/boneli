@@ -364,10 +364,12 @@ the store will use, and why:
   entry count and skipped devices, as
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
 - A layer is unpacked into `layers/sha256/.tmp-<owner>.<n>/`, where
-  `<owner>` is `<pidns>.<pid>.<start>`: the inode of the process's PID
-  namespace (`/proc/self/ns/pid`), its pid there and its start time from
-  `/proc/self/stat`, zero-padded to 20, 10 and 20 digits, and `<n>` a
-  20-digit counter (part 3; parts 1 and 2 used `<pid>.<starttime>.<n>`).
+  `<owner>` is `<boot>.<pidns>.<pid>.<start>`: the kernel's boot id
+  (`/proc/sys/kernel/random/boot_id`) as 32 lower-case hex digits, the
+  inode of the process's PID namespace (`/proc/self/ns/pid`), its pid
+  there and its start time from `/proc/self/stat`, zero-padded to 20, 10
+  and 20 digits, and `<n>` a 20-digit counter (part 3; parts 1 and 2 used
+  `<pid>.<starttime>.<n>`, and part 3 before its review had no boot id).
   Lookups use hex names only, so a dot name is never mistaken for a
   layer. Its sidecar is staged next to it as `.tmp-<owner>.<n>.stats`,
   so every temporary tree of
@@ -451,16 +453,47 @@ the store will use, and why:
   `OciImageStore::open` removes every name in `layers/sha256/` and
   `blobs/sha256/` that carries an owner (staging trees, staged sidecars
   and blobs, probes) whose owner is gone, and nothing else. Gone means:
-  in the store's own PID namespace, no `/proc/<pid>/stat`, or one with
-  another start time (the pid was reused). An owner in another PID
-  namespace is never judged: two runners in different PID namespaces can
-  share one store and have the same pid, and the one that opens second
-  cannot see the other's processes, so deciding by pid, even with the
-  start time, would delete a live runner's tree. Its names stay until a
-  process of its own namespace opens the store; a namespace that is gone
-  for good (a container that crashed mid-pull) leaves at most one partial
-  layer and one blob per crash behind, which the cache eviction of #56
-  removes with the rest. Rejected: an `flock` on a per-process lock file,
+  with the store's boot id, in its own PID namespace, read through a
+  `/proc` of that namespace, no `/proc/<pid>/stat`, or one with another
+  start time (the pid was reused). Every other owner is never judged:
+  - Another PID namespace: two runners in different PID namespaces can
+    share one store and have the same pid, and the one that opens second
+    cannot see the other's processes, so deciding by pid, even with the
+    start time, would delete a live runner's tree. Its names stay until a
+    process of its own namespace opens the store; a namespace that is
+    gone for good (a container that crashed mid-pull) leaves at most one
+    partial layer and one blob per crash behind, which the cache eviction
+    of #56 removes with the rest.
+  - Another boot id: the namespace inode does not identify a host, since
+    every host's initial PID namespace has the same inode
+    (`PROC_PID_INIT_INO`), so two hosts sharing a root over a network
+    filesystem that passes the probes (NFS 4.2 has `user.*` xattrs and
+    0:0 whiteouts) would judge each other's pids. The boot id is random
+    per host and per boot. Its price: a crash's leftovers from before a
+    reboot are never removed by `open` either, since a store cannot tell
+    an earlier boot of its own host from another host; they cost disk
+    until the eviction of #56, never a live tree. Rejected: the machine id
+    as a host id with the boot id deciding within it, because cloned
+    images and containers share machine ids, and a shared one would turn
+    another host's live tree into an earlier boot's leftover.
+  - A `/proc` that is not the store's PID namespace's: in a PID
+    namespace whose `/proc` was mounted for another one (`unshare -pf`
+    without `--mount-proc`, bwrap `--unshare-pid` without `--proc`),
+    `getpid()` is 1 while `/proc/1` is the host's init, so the store's own
+    staging names looked dead and a second `open` deleted them mid-pull
+    (review of #60, reproduced). The store judges no owner there: the
+    `/proc` counts as its own only if `/proc/self` reads `getpid()` and
+    the `NSpid` line of `/proc/self/status`, which lists the pid in the
+    `/proc`'s namespace and in every one below it, holds exactly that
+    pid. Pinned by `host::foreign_proc_judges_no_owner` (`unshare -Urpfm`,
+    rootless, in the `sandbox` CI job) and the unit test of the decision.
+  A leftover of a dead owner whose removal fails, for any reason, stays
+  too and `open` goes on: it is a dot name, never read as a layer or a
+  blob, and failing `open` for it would leave the store unopenable until
+  someone removed it by hand. One way to get there (review of #60): a root
+  reached through two paths of different length (a bind mount), where a
+  process on the short path dies mid-unpack and one on the long path
+  meets `ENAMETOOLONG`. Pinned by `unremovable_leftover_skipped`. Rejected: an `flock` on a per-process lock file,
   which decides liveness in every namespace, because std's `File::lock`
   needs Rust 1.89 (the MSRV is 1.87) and the alternative is a new
   `unsafe` wrapper in `boneli-sys`; a name that cannot be judged costs
@@ -468,14 +501,14 @@ the store will use, and why:
   changes. Names with an unknown prefix, or a field of the wrong width,
   carry no owner and stay.
 - **Staging names are longer than committed ones** (part 3, from the
-  review of part 1). A staging name has 78 characters (`.tmp-`, the
-  52-character owner, a dot, 20 digits), a committed layer 64 hex digits,
+  review of part 1). A staging name has 111 characters (`.tmp-`, the
+  85-character owner, a dot, 20 digits), a committed layer 64 hex digits,
   and the unpacker creates every entry by its absolute path, which must
   fit `PATH_MAX` (4,096 B with the terminating NUL). Every path of a
-  committed layer is therefore 14 B shorter than the path it was created
+  committed layer is therefore 47 B shorter than the path it was created
   at, so a path-based walk of committed layers (the GC of #56, a
   removal) never meets `ENAMETOOLONG` where the unpacker did not. The
-  price: a layer whose deepest absolute path is between 4,082 and 4,095 B
+  price: a layer whose deepest absolute path is between 4,049 and 4,095 B
   under its committed name is refused while it is unpacked; no
   first-stack path comes near that (node:22's longest is 128 B inside the
   layer). Rejected: unlinking relative to a
@@ -489,7 +522,28 @@ the store will use, and why:
   symlink cannot smuggle them in; created `0o700` when missing; a
   directory owned by the caller (the uid of `/proc/self`) with no group or
   other permission bits, because the runner user holds the git token and
-  the layers are what a sandbox runs. `open` then probes the overlay
+  the layers are what a sandbox runs. Its ancestors pass sshd's
+  `StrictModes` rule: each owned by root or the caller and not writable
+  by its group or others unless it is sticky (like `/tmp`), checked on the
+  resolved path and, for a root `open` creates, on its existing ancestors
+  before anything is created. The store reaches the root by path in every
+  later call, so whoever could rename an entry of an ancestor could swap
+  the root after `open` and plant a layer under the `diff_id` of an image
+  it pulls, which the store would hand out as a cache hit (review of #60,
+  reproduced under a `0o777` parent). In a sticky directory only an
+  entry's owner can rename it. The filesystem root is checked for its
+  mode only: whoever owns it owns every path on the host, and in a user
+  namespace it shows the overflow uid. A root under a group-writable
+  directory is refused even where the group is the caller's own (a
+  `umask` of `002`); the store cannot tell such a group from a shared
+  one. In a user namespace every ancestor the host's root owns shows the
+  overflow uid, so a store opened there needs a root whose ancestors
+  below `/` are the namespace's own mounts. Rejected for now: holding the
+  root's descriptor and working relative to it, which needs `openat`,
+  `mkdirat`, `renameat` and `unlinkat` wrappers in `boneli-sys` (new
+  `unsafe`) across the unpacker and the store, and would still hand the
+  sandbox paths for its overlay mount; with every ancestor closed to
+  others, a path cannot be swapped. `open` then probes the overlay
   format in `layers/sha256/`: a 0:0 whiteout made and read back, and the
   opaque marker set and read back through `user_xattr`. A filesystem
   without either (ramfs, some network filesystems) fails here with
@@ -926,7 +980,10 @@ Hub, 2026-11-16):
 - `boneli-oci` is on the always-review list (#7 STOP 1).
 - A store only grows: cache eviction and GC are #56. Temporary names of
   an owner in another PID namespace stay until a process of that
-  namespace opens the store (D8).
+  namespace opens the store, and those of another boot id, an earlier
+  boot's crash leftovers included, until #56 (D8).
+- A store root must sit under directories that only root or the caller
+  can write (sticky ones aside); a group-writable parent is refused (D8).
 - The `ImageStore` contract has a clause that every future adapter must
   pass: tampered bytes fail on every pull (D13).
 - Pulls reach registries directly from the runner, not through

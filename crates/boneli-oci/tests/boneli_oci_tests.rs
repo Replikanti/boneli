@@ -147,8 +147,14 @@ mod host {
 
     /// Re-executes this binary as `test` inside `unshare -Urm` after
     /// `setup` (a shell snippet over `$1`, a fresh directory) and passes
-    /// `$1/<child_dir>` to the child in `child_var`.
-    fn in_mount_namespace(test: &str, setup: &str, child_var: &str, child_dir: &str) {
+    /// `child_value` (a shell word, which may use `$1`) to the child in
+    /// `child_var`.
+    fn in_mount_namespace(test: &str, setup: &str, child_var: &str, child_value: &str) {
+        in_namespaces("-Urm", test, setup, child_var, child_value);
+    }
+
+    /// [`in_mount_namespace`] with other `unshare` flags.
+    fn in_namespaces(flags: &str, test: &str, setup: &str, child_var: &str, child_value: &str) {
         // The harness moves the run's processes into `leaf/` and enables
         // the controllers on the scope once, on first use. A child forked
         // into the scope before that, while another test does it, keeps
@@ -158,11 +164,11 @@ mod host {
         let mount_point = TempDir::new(test.rsplit("::").next().unwrap_or("ns"));
         let exe = std::env::current_exe().expect("test binary");
         let script = format!(
-            "{setup} && {child_var}=\"$1/{child_dir}\" exec \"$0\" --exact {test} --ignored \
+            "{setup} && {child_var}={child_value} exec \"$0\" --exact {test} --ignored \
              --test-threads=1 --nocapture"
         );
         let out = Command::new("unshare")
-            .args(["-Urm", "sh", "-c", &script])
+            .args([flags, "sh", "-c", &script])
             .arg(&exe)
             .arg(mount_point.path())
             .output()
@@ -239,7 +245,7 @@ mod host {
             "mount -t tmpfs -o casefold boneli-oci-casefold \"$1\" && mkdir \"$1/cf\" \
              && chattr +F \"$1/cf\"",
             CASEFOLD_CHILD,
-            "cf",
+            "\"$1/cf\"",
         );
     }
 
@@ -247,7 +253,11 @@ mod host {
 
     /// A store on a filesystem without `user.*` extended attributes
     /// (ramfs) fails at `open` with `Unsupported`, not later in a pull
-    /// (ADR-009, D1 and D8).
+    /// (ADR-009, D1 and D8). The ramfs is mounted on `/mnt`, in the
+    /// child's own mount namespace: in a user namespace every ancestor
+    /// that the host's root owns shows the overflow uid, which the root's
+    /// ancestor check refuses, so the root's ancestors must be the
+    /// namespace's own mounts (`/`, whose owner is not checked, aside).
     #[test]
     #[ignore = "host: needs an unprivileged user namespace and ramfs"]
     fn unsupported_filesystem_refused() {
@@ -264,10 +274,77 @@ mod host {
         }
         in_mount_namespace(
             "host::unsupported_filesystem_refused",
-            "mount -t ramfs boneli-oci-ramfs \"$1\" && mkdir \"$1/r\"",
+            "mount -t ramfs boneli-oci-ramfs /mnt && mkdir /mnt/r",
             RAMFS_CHILD,
-            "r",
+            "/mnt/r",
         );
+    }
+
+    const PIDNS_CHILD: &str = "BONELI_OCI_PIDNS_CHILD";
+
+    /// The review of #60: in a PID namespace whose `/proc` is not its own
+    /// (`unshare -pf` without `--mount-proc`, bwrap `--unshare-pid`
+    /// without `--proc`), `getpid()` is 1 while `/proc/1` is the host's
+    /// init. Judged by that `/proc`, this process's own staging name looks
+    /// dead and a second `open` used to delete it mid-pull. Now `open`
+    /// judges no owner there, so every owned name stays (ADR-009, D8).
+    #[test]
+    #[ignore = "host: needs an unprivileged user and PID namespace"]
+    fn foreign_proc_judges_no_owner() {
+        if let Some(dir) = std::env::var_os(PIDNS_CHILD) {
+            pidns_child(&PathBuf::from(dir));
+            return;
+        }
+        in_namespaces(
+            "-Urpfm",
+            "host::foreign_proc_judges_no_owner",
+            "mount -t tmpfs -o mode=0700 boneli-oci-pidns /mnt",
+            PIDNS_CHILD,
+            "/mnt",
+        );
+    }
+
+    fn pidns_child(dir: &Path) {
+        let pid = std::process::id();
+        let proc_self = std::fs::read_link("/proc/self").expect("/proc/self");
+        assert_eq!(pid, 1, "the child is its PID namespace's init");
+        assert_ne!(
+            proc_self.to_str(),
+            Some("1"),
+            "/proc is the host's, not the namespace's"
+        );
+        let fake = Fake::new(|_| unreachable!("open makes no request"));
+        let root = dir.join("store");
+        let first = open(&root, &fake);
+        let boot = crate::support::boot_hex();
+        let ns = crate::support::own_pidns();
+        let start = crate::support::start_of("self");
+        let layers = root.join("layers/sha256");
+        let blobs = root.join("blobs/sha256");
+        let named = |prefix: &str, pid: u32, start: u64, n: u64| {
+            crate::support::owned_name(
+                prefix,
+                &crate::support::owner_token(&boot, ns, pid, start),
+                n,
+            )
+        };
+        let kept = [
+            // This live process, as `Owner::current` names it.
+            layers.join(named(".tmp-", pid, start, 99)),
+            blobs.join(named(".tmp-", pid, start, 98)),
+            // A pid that names another process in the host's `/proc`.
+            layers.join(named(".tmp-", 2, start, 97)),
+            // A pid no process has in either view.
+            layers.join(named(".tmp-", 4_194_303, start, 96)),
+        ];
+        for path in &kept {
+            std::fs::create_dir_all(path.join("usr")).expect("staging");
+        }
+        drop(open(&root, &fake));
+        for path in &kept {
+            assert!(path.is_dir(), "{} was swept", path.display());
+        }
+        drop(first);
     }
 }
 

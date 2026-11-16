@@ -3,7 +3,7 @@
 
 mod support;
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -129,6 +129,149 @@ fn root_mode_rules() {
     open(&ok, &fake);
 }
 
+/// The ancestors of the root follow sshd's `StrictModes`: a parent or
+/// grandparent writable by its group or by others, and not sticky, is
+/// refused, whether the root exists or `open` would create it, and nothing
+/// is created under it; a sticky `1777` parent (like `/tmp`) is accepted.
+/// The reviewer's swap (rename the root away after `open`, plant a layer)
+/// needs such a parent, so it cannot start.
+#[test]
+fn root_ancestor_rules() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("root-ancestors");
+    let chmod = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+    };
+    for (i, mode) in [0o777, 0o775, 0o757, 0o770, 0o707].into_iter().enumerate() {
+        let shared = tmp.path().join(format!("shared{i}"));
+        std::fs::create_dir(&shared).expect("dir");
+        chmod(&shared, mode);
+        // Missing: refused before it is created.
+        let missing = shared.join("store");
+        assert_root_refused(&missing, &fake, "a writable parent, missing root");
+        assert!(!missing.exists(), "{mode:o}: the root was created");
+        // Existing and private: refused, nothing written into it.
+        std::fs::create_dir(&missing).expect("dir");
+        chmod(&missing, 0o700);
+        assert_root_refused(&missing, &fake, "a writable parent");
+        assert!(
+            names_in(&missing).is_empty(),
+            "{mode:o}: wrote into the root"
+        );
+        // A writable grandparent.
+        let deep = shared.join("mid");
+        std::fs::create_dir(&deep).expect("dir");
+        chmod(&deep, 0o755);
+        assert_root_refused(&deep.join("store"), &fake, "a writable grandparent");
+        assert!(
+            !deep.join("store").exists(),
+            "{mode:o}: the deep root was created"
+        );
+    }
+    match OciImageStore::open(&tmp.path().join("shared0").join("store"), config(&fake)) {
+        Err(Error::Root { path, reason }) => {
+            assert_eq!(
+                path,
+                tmp.path().join("shared0").canonicalize().expect("resolve")
+            );
+            assert!(reason.contains("ancestor"), "{reason}");
+        }
+        other => panic!("a 0o777 parent gave {other:?}"),
+    }
+    for (i, mode) in [0o1777, 0o1775, 0o755, 0o700].into_iter().enumerate() {
+        let parent = tmp.path().join(format!("ok{i}"));
+        std::fs::create_dir(&parent).expect("dir");
+        chmod(&parent, mode);
+        open(&parent.join("store"), &fake);
+    }
+}
+
+/// A root owned by someone else is refused for its owner, before anything
+/// is written: `/usr`, which is root's on every Linux host and CI runner.
+/// A run as root would own it, so the check does not apply there.
+#[test]
+fn root_owned_by_another_user_refused() {
+    let usr = Path::new("/usr");
+    let me = std::fs::metadata("/proc/self").expect("self").uid();
+    let owner = std::fs::metadata(usr).expect("/usr").uid();
+    if me == 0 || owner == me {
+        println!("skipped: this process owns /usr");
+        return;
+    }
+    let before = names_in(usr);
+    match OciImageStore::open(usr, config(&hub_fake(Hub::default()))) {
+        Err(Error::Root { path, reason }) => {
+            assert_eq!(path, usr.canonicalize().expect("resolve"));
+            assert_eq!(reason, "must be owned by the caller");
+        }
+        other => panic!("/usr gave {other:?}"),
+    }
+    assert_eq!(names_in(usr), before, "open wrote into /usr");
+}
+
+/// A leftover of a dead owner that cannot be removed does not make the
+/// store unopenable: here a staging tree deeper than `PATH_MAX`, as a root
+/// reached through a shorter path (a bind mount) can leave, whose
+/// path-based removal fails with `ENAMETOOLONG`. `open` skips it, removes
+/// the other dead leftovers, and the store pulls; the leftover is a dot
+/// name, never read as a layer.
+#[test]
+fn unremovable_leftover_skipped() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("unremovable");
+    let root = tmp.path().join("store");
+    drop(open(&root, &fake));
+    let layers = root.join("layers/sha256");
+    let blobs = root.join("blobs/sha256");
+    let boot = support::boot_hex();
+    let ns = support::own_pidns();
+    let dead = {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait");
+        pid
+    };
+    let deep = layers.join(owned(".tmp-", &boot, ns, dead, 7, 1));
+    let level = "d".repeat(250);
+    // A shell climbs down by relative names, so no path it uses is long.
+    let made = Command::new("sh")
+        .args([
+            "-c",
+            "mkdir \"$1\" && cd \"$1\" || exit 1; i=0; \
+             while [ $i -lt 20 ]; do mkdir \"$2\" && cd \"$2\" || exit 1; i=$((i + 1)); done; \
+             : > f",
+            "sh",
+        ])
+        .arg(&deep)
+        .arg(&level)
+        .status()
+        .expect("sh");
+    assert!(made.success(), "the deep tree");
+    let removable = [
+        layers.join(owned(".tmp-", &boot, ns, dead, 7, 2)),
+        blobs.join(owned(".tmp-", &boot, ns, dead, 7, 3)),
+    ];
+    for path in &removable {
+        std::fs::create_dir_all(path.join("a")).expect("leftover");
+    }
+
+    let store = OciImageStore::open(&root, config(&fake)).expect("an unremovable leftover");
+    for path in &removable {
+        assert!(!path.exists(), "{} was kept", path.display());
+    }
+    assert!(
+        deep.is_dir(),
+        "the deep leftover is gone, so the test proves nothing"
+    );
+    let rootfs = store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    assert_eq!(store.layers(&rootfs).expect("layers").len(), 3);
+    drop(store);
+    drop(open(&root, &fake));
+}
+
 /// The same image pulled again after the store is reopened: the same
 /// `RootfsRef`, and not one request.
 #[test]
@@ -224,38 +367,18 @@ fn concurrent_pulls_two_stores() {
     }
 }
 
-/// This process's PID namespace inode, from `/proc/self/ns/pid`.
-fn own_pidns() -> u64 {
-    let link = std::fs::read_link("/proc/self/ns/pid").expect("ns link");
-    link.to_str()
-        .and_then(|l| l.strip_prefix("pid:["))
-        .and_then(|l| l.strip_suffix(']'))
-        .and_then(|l| l.parse().ok())
-        .expect("pid:[inode]")
-}
-
-/// The start time of `pid`, field 22 of its stat.
-fn start_of(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
-    let after = &stat[stat.rfind(')').expect("comm") + 1..];
-    after
-        .split_whitespace()
-        .nth(19)
-        .and_then(|f| f.parse().ok())
-        .expect("starttime")
-}
-
-/// The name format of ADR-009 D8: `<prefix><pidns>.<pid>.<start>.<n>`,
-/// zero-padded to 20, 10, 20 and 20 digits.
-fn owned(prefix: &str, pidns: u64, pid: u32, start: u64, n: u64) -> String {
-    format!("{prefix}{pidns:020}.{pid:010}.{start:020}.{n:020}")
+/// The name format of ADR-009 D8: `<prefix><boot>.<pidns>.<pid>.<start>.<n>`.
+fn owned(prefix: &str, boot: &str, pidns: u64, pid: u32, start: u64, n: u64) -> String {
+    support::owned_name(prefix, &support::owner_token(boot, pidns, pid, start), n)
 }
 
 /// At `open`, a temporary name whose owner is gone (no such pid, or the pid
 /// reused with another start time) is removed, a tree as well as a file,
 /// in `layers/sha256/` and `blobs/sha256/`. A live owner's names stay, and
 /// so do the names of an owner in another PID namespace, whose processes
-/// this one cannot see, and dot names that carry no owner.
+/// this one cannot see, the names of an owner with another boot id (another
+/// host sharing the root, or an earlier boot), and dot names that carry no
+/// owner.
 #[test]
 fn stale_tmp_rules() {
     let fake = hub_fake(Hub::default());
@@ -265,9 +388,15 @@ fn stale_tmp_rules() {
     let layers = root.join("layers/sha256");
     let blobs = root.join("blobs/sha256");
 
-    let ns = own_pidns();
+    let boot = support::boot_hex();
+    let other_boot = if boot.starts_with('0') {
+        boot.replacen('0', "1", 1)
+    } else {
+        format!("0{}", &boot[1..])
+    };
+    let ns = support::own_pidns();
     let me = std::process::id();
-    let my_start = start_of(me);
+    let my_start = support::start_of("self");
     let dead = {
         let mut child = Command::new("true").spawn().expect("spawn true");
         let pid = child.id();
@@ -279,24 +408,41 @@ fn stale_tmp_rules() {
         .spawn()
         .expect("spawn sleep");
     let live = sleeper.id();
-    let live_start = start_of(live);
+    let live_start = support::start_of(&live.to_string());
 
     let removed = [
-        (layers.join(owned(".tmp-", ns, dead, my_start, 1)), true),
-        (layers.join(owned(".tmp-", ns, me, my_start - 1, 2)), true),
         (
-            layers.join(format!("{}.stats", owned(".tmp-", ns, dead, 7, 3))),
+            layers.join(owned(".tmp-", &boot, ns, dead, my_start, 1)),
+            true,
+        ),
+        (
+            layers.join(owned(".tmp-", &boot, ns, me, my_start - 1, 2)),
+            true,
+        ),
+        (
+            layers.join(format!("{}.stats", owned(".tmp-", &boot, ns, dead, 7, 3))),
             false,
         ),
-        (layers.join(owned(".probe-case-", ns, dead, 7, 4)), false),
-        (layers.join(owned(".probe-\u{e9}-", ns, dead, 7, 5)), false),
-        (blobs.join(owned(".tmp-", ns, dead, 7, 6)), false),
+        (
+            layers.join(owned(".probe-case-", &boot, ns, dead, 7, 4)),
+            false,
+        ),
+        (
+            layers.join(owned(".probe-\u{e9}-", &boot, ns, dead, 7, 5)),
+            false,
+        ),
+        (blobs.join(owned(".tmp-", &boot, ns, dead, 7, 6)), false),
     ];
     let kept = [
-        layers.join(owned(".tmp-", ns, me, my_start, 1)),
-        layers.join(owned(".tmp-", ns, live, live_start, 2)),
-        layers.join(owned(".tmp-", ns + 1, dead, 7, 3)),
-        blobs.join(owned(".tmp-", ns + 1, dead, 7, 4)),
+        layers.join(owned(".tmp-", &boot, ns, me, my_start, 1)),
+        layers.join(owned(".tmp-", &boot, ns, live, live_start, 2)),
+        layers.join(owned(".tmp-", &boot, ns + 1, dead, 7, 3)),
+        blobs.join(owned(".tmp-", &boot, ns + 1, dead, 7, 4)),
+        layers.join(owned(".tmp-", &other_boot, ns, dead, 7, 5)),
+        blobs.join(owned(".tmp-", &other_boot, ns, dead, 7, 6)),
+        layers.join(owned(".tmp-", &other_boot, ns, me, my_start - 1, 7)),
+        // The format before the boot id: no owner, so it stays.
+        layers.join(format!(".tmp-{ns:020}.{dead:010}.{:020}.{:020}", 7, 8)),
         layers.join(".tmp-1234.5678.0"),
         layers.join(".unrelated"),
     ];

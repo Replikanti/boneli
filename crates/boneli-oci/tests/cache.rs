@@ -243,16 +243,6 @@ fn own_start_time() -> String {
         .to_string()
 }
 
-/// This process's PID namespace inode, from `/proc/self/ns/pid`.
-fn own_pidns() -> u64 {
-    let link = std::fs::read_link("/proc/self/ns/pid").expect("ns link");
-    link.to_str()
-        .and_then(|l| l.strip_prefix("pid:["))
-        .and_then(|l| l.strip_suffix(']'))
-        .and_then(|l| l.parse().ok())
-        .expect("pid:[inode]")
-}
-
 /// A layer whose deepest path is exactly `PATH_MAX - 1` (4,095) bytes at
 /// its staging name unpacks, and once committed every path in it is
 /// shorter, so a path-based walk of the committed tree (a later GC, #56)
@@ -330,10 +320,11 @@ fn leftover_probes_do_not_block_open() {
     std::fs::create_dir_all(&layers).expect("layers");
     let pid = std::process::id();
     let start = own_start_time();
-    let token = format!(
-        "{:020}.{pid:010}.{:020}",
-        own_pidns(),
-        start.parse::<u64>().expect("start")
+    let token = support::owner_token(
+        &support::boot_hex(),
+        support::own_pidns(),
+        pid,
+        start.parse::<u64>().expect("start"),
     );
     let mut planted = Vec::new();
     for n in 0..64 {
