@@ -149,6 +149,12 @@ mod host {
     /// `setup` (a shell snippet over `$1`, a fresh directory) and passes
     /// `$1/<child_dir>` to the child in `child_var`.
     fn in_mount_namespace(test: &str, setup: &str, child_var: &str, child_dir: &str) {
+        // The harness moves the run's processes into `leaf/` and enables
+        // the controllers on the scope once, on first use. A child forked
+        // into the scope before that, while another test does it, keeps
+        // the scope from enabling them (EBUSY, seen on CI). So every test
+        // that forks takes the parent first.
+        sandbox::parent();
         let mount_point = TempDir::new(test.rsplit("::").next().unwrap_or("ns"));
         let exe = std::env::current_exe().expect("test binary");
         let script = format!(

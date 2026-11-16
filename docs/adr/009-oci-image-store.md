@@ -818,9 +818,98 @@ Hub, 2026-11-16):
   the deadline below TLS (D10). The TCP connect takes at most
   `connect_timeout` or what is left of the deadline. Weak spot: name
   resolution uses `getaddrinfo`, which has no timeout. The values are
-  part 3's, measured with the acceptance pulls; the plan's starting point
-  is `io` 30 s, `setup` 30 s and `min_rate` 1 MiB/s, which gives node:22's
-  largest compressed layer, 211,826,577 B, 30 + 202 = 232 s.
+  part 3's, from the acceptance pulls of node:22 and postgres:17
+  (`network::node_and_postgres_run_in_sandbox`, which measures every
+  connection of the production `TlsDial`; 2026-11-16, three runs on the
+  dev host's residential link and one per architecture on GitHub's
+  runners):
+
+  | | dev host (x86_64) | CI x86_64 | CI arm64 |
+  | --- | --- | --- | --- |
+  | largest fetch (node's largest layer) | 22.1 s and 6.5 s for 211,827,183 B (9.1 and 31.3 MiB/s) | 1.2 s (165 MiB/s) | 1.8 s for 203,372,485 B (108 MiB/s) |
+  | slowest fetch of at most 1 MiB, dial to last byte | 0.71 s | 0.22 s | 0.15 s |
+  | longest gap between two reads of a connection | 0.40 s | 0.13 s | 0.10 s |
+
+  - `io` 30 s, 75 times the longest measured gap of 0.40 s, so a
+    connection that stalls fails within 30 s, and a link that loses a few
+    segments in a row (TCP's retransmission timeout doubles from 1 s, so
+    the fourth retransmission waits 15 s) does not. Lower fails healthy
+    pulls on lossy links; higher only delays the failure of a dead
+    connection.
+  - `min_rate` 1 MiB/s (8.4 Mbit/s), 9.1 times below the slowest measured
+    large fetch, so a link a tenth as fast as the dev host's still pulls;
+    node's largest layer then gets 30 + 202 = 232 s against the 22.1 s
+    measured. Higher refuses slower customer links; lower lets a server
+    that trickles just under `io` hold a pull longer: a blob at the 4 GiB
+    cap already gets 30 + 4,096 s, about 69 minutes, and at 512 KiB/s it
+    would get 2 hours 17 minutes.
+  - `setup` 30 s, 42 times the slowest measured small fetch of 0.71 s
+    (name resolution, TCP, TLS, request and response). It must hold the
+    connect and handshake bounds below (10 s each) plus a round trip, so
+    lower than about 21 s would cut a connection off inside its own
+    bounds; higher only lets a small fetch hang longer.
+  - The connect timeout of `TlsDial` is 10 s per address: Linux sends a
+    SYN and retransmits it after 1, 3 and 7 s (the timeout starts at 1 s
+    and doubles), so 10 s lets three retransmissions through before the
+    next address is tried. The TLS handshake timeout is 10 s too: a
+    handshake is one or two round trips, measured inside the 0.71 s of a
+    whole small fetch. Lower fails on a lossy first round trip; higher
+    only delays trying the next address.
+
+  The values are the public constants of `boneli_oci` (`IO_TIMEOUT`,
+  `SETUP_TIMEOUT`, `MIN_RATE`, `CONNECT_TIMEOUT`, `HANDSHAKE_TIMEOUT`),
+  which `StoreConfig::new` uses; the other limits of this section and of
+  D7 are constants there too.
+
+### D13. The contract clause and the acceptance (part 3)
+
+- **`tampered-refused`.** Digest verification is the port's main security
+  property, and no clause of ADR-004 pinned it, so part 3 adds one under
+  ADR-004's extension rule: an image whose bytes do not match their
+  digest is `Failed` with a non-blank detail on the first pull and again
+  on the second. The second pull is the point: a store that writes what
+  it fetched before it checks it, and hands it out next time, passes a
+  one-pull clause. The clause has two sub-checks, one per pull, with a
+  mutant each (`AcceptsTampered`, `CachesTampered`) whose violation
+  detail starts with `first-pull:` or `second-pull:`, the way
+  `silent-failure-detail` has one mutant per operation (ADR-004, D2);
+  `mutant_table_covers_every_clause` now reads the sub-checks of both
+  clauses from one table. Counts: 49 clauses and 56 mutant cases (48 and
+  54 before). `MemoryImageStore::with_tampered` gives the in-memory
+  adapter its fixture; `boneli-oci/tests/contract.rs` serves a layer blob
+  with one byte flipped from the fake registry, which answers an unknown
+  repository with `401`, as Docker Hub does.
+- **Hermetic acceptance on every PR.** `host::` in the `boneli_oci_tests`
+  target pulls a synthetic image through the fake registry and mounts it
+  with `boneli_sys::spawn` over a base layer; the probe sees a whiteout
+  hide a lower file, an opaque directory hide the lower one's contents,
+  modes, a hard link (one inode, two links), a FIFO and a symlink. The
+  same target runs the casefold store root (moved from
+  `tests/casefold.rs`, which CI never ran) and a ramfs root, which `open`
+  refuses as `Unsupported`. The `sandbox` job of `ci.yml` builds both
+  crates' test binaries in one step and runs `host::` after the
+  `boneli-sys` host tests; the host-setup block's AppArmor profile names
+  the `boneli-oci` test binaries too. The job names stay, because they
+  are required checks.
+- **Docker Hub, weekly.** `network::` pulls the pinned node:22 and
+  postgres:17 indexes for the host's platform and runs
+  `/usr/local/bin/node --version` (inside id 0) and `postgres --version`
+  through `/bin/sh` and the image's `PATH` (inside id 999, the image's
+  postgres user, ADR-007 D1) on the image's layers alone. It runs in
+  `oci-acceptance.yml` on x86_64 and arm64: weekly, on demand, and on a
+  PR that edits that file (GitHub dispatches `workflow_dispatch` only for
+  workflows already on the default branch). Not on code PRs and not a
+  required check, so a Docker Hub outage cannot block one. Weekly,
+  because the things that break it (a garbage-collected digest, a CDN
+  host move, a change of the token flow) show up within 7 days at 4
+  manifest requests per architecture per run, far below the measured
+  anonymous limit of 100 per hour. Measured on part 3's PR: node v22.23.5
+  and PostgreSQL 17.12 run on both architectures; every layer of both
+  images is gzip.
+- **The CI-time guard** (decided at STOP 1): the `sandbox` legs now also
+  build the TLS stack and run `host::`; the PR records both legs before
+  and after, and a leg above 180 s would have stopped the flow for the
+  operator. The measured table is in the PR of part 3.
 
 ## Consequences
 
@@ -835,6 +924,11 @@ Hub, 2026-11-16):
 - Images that need devices, setuid bits, xattrs, sparse files, V7 tar,
   layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
 - `boneli-oci` is on the always-review list (#7 STOP 1).
+- A store only grows: cache eviction and GC are #56. Temporary names of
+  an owner in another PID namespace stay until a process of that
+  namespace opens the store (D8).
+- The `ImageStore` contract has a clause that every future adapter must
+  pass: tampered bytes fail on every pull (D13).
 - Pulls reach registries directly from the runner, not through
   `boneli-egress`, limited to each registry's allowlisted hosts (D10).
 - Images that need a tag, a nested index, schema 1, a `sha512` digest,
@@ -847,10 +941,12 @@ Hub, 2026-11-16):
 Flattening (D1), the `tar` crate (D4), `flate2` and the `zstd` crate (D5),
 `sha2`, our own SHA-256 and a pure-Rust TLS provider (D6), tags,
 `Docker-Content-Digest` and `expires_in` (D9), pulls through
-`boneli-egress` and `boneli_https::connect` (D10), each with the reason
-it lost in its decision.
+`boneli-egress` and `boneli_https::connect` (D10), an `flock` liveness
+check and descriptor-relative unlinking (D8), and a 100 MiB zstd window
+(D5), each with the reason it lost in its decision.
 
 ## Accept when
 
 Part 3 of #7 pulls `node:22` and `postgres:17` on x86_64 and arm64 and runs
-both in the sandbox.
+both in the sandbox. Met on 2026-11-16 by the `oci-acceptance` run of
+part 3's PR (D13).
