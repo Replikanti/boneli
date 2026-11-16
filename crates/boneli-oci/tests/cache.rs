@@ -25,9 +25,11 @@ fn layer_of(files: usize) -> Vec<u8> {
 }
 
 fn tmp_names(store: &Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(store.join("tmp"))
-        .expect("tmp")
+    // Staging trees and staged sidecars are dot names in layers/sha256/.
+    let mut v: Vec<String> = std::fs::read_dir(store.join("layers/sha256"))
+        .expect("layers")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
         .collect();
     v.sort();
     v
@@ -184,4 +186,48 @@ fn failed_deep_layer_removed_under_low_nofile() {
         stdout.contains("1 passed"),
         "the child ran the check: {stdout}"
     );
+}
+
+/// The temporary tree is staged inside `layers/sha256/` under a dot name,
+/// so the commit is a rename within one directory (no `..` to rewrite, no
+/// `u+w` to lend the root) and nothing else is created at the root.
+#[test]
+fn staging_stays_in_the_layers_directory() {
+    let store = TempDir::new("staging");
+    let cache = LayerCache::new(store.path()).expect("cache");
+    assert_eq!(names(store.path()), ["layers"]);
+    let ro = Tar::new().dir("./", 0o555).file("f", 0o444, b"x").finish();
+    let id = Sha256::digest(&ro);
+    cache
+        .unpack(&id, Compression::None, &ro[..], &mut Budget::new(limits()))
+        .expect("commit");
+    let layers = store.path().join("layers/sha256");
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(names(&layers), [hex.clone(), format!("{hex}.stats")]);
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(layers.join(&hex))
+        .expect("layer")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o555);
+    let e = cache
+        .unpack(
+            &[0u8; 32],
+            Compression::None,
+            &ro[..],
+            &mut Budget::new(limits()),
+        )
+        .expect_err("mismatch");
+    assert!(matches!(e, Error::DiffId { .. }), "{e}");
+    assert_eq!(names(&layers), [hex.clone(), format!("{hex}.stats")]);
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
 }

@@ -82,6 +82,22 @@ based and never follow a final symlink.
   this process writes it while it unpacks, so the tar stream, read
   sequentially, is the only adversary, and every link it planted is seen
   by the walk before the next create.
+- The walk does not repeat itself: it starts below the deepest ancestor
+  the layer already created or merged, which it keeps as a set of
+  directory paths (D7 has the cost). That set is sound only if a path
+  names exactly one directory. Every directory of the layer is in the
+  set, so a directory that `lstat` finds at a path outside it was reached
+  through an alias, or put there from outside: on a case-insensitive or
+  normalizing directory `A` resolves to `a`, and a symlink entry `A` then
+  removes the directory `a` while `a` stays in the set. Review of part 1
+  wrote a file outside the tree that way on a casefold tmpfs. Such a
+  directory refuses the layer wherever it is found: as a parent, as the
+  target of a removal or a merge, and on a hard link target's path.
+  Rejected: dropping every cached entry at and below an affected name,
+  because which names alias depends on the filesystem's folding and
+  normalization tables, which the unpacker cannot know; the refusal needs
+  no such knowledge. The store also refuses an aliasing root outright
+  (D8).
 - Symlink targets are data for the sandbox and are written as they are,
   absolute ones included.
 - Hard link targets are archive paths under the same rules, must already
@@ -338,15 +354,38 @@ the store will use, and why:
   `<root>/layers/sha256/<hex>.stats` its sidecar: uncompressed bytes,
   entry count and skipped devices, as
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
-- A layer is unpacked into `<root>/tmp/<pid>.<starttime>.<n>/` (the start
-  time from `/proc/self/stat`, so a reused pid is told from a live owner
-  when the store cleans up). Its sidecar is staged next to it as
-  `<pid>.<starttime>.<n>.stats`, so every temporary tree of every process
-  has its own (part 1 first derived it with `with_extension`, which drops
-  the counter; review measured two caches in one process committing each
-  other's sidecars).
+- A layer is unpacked into `layers/sha256/.tmp-<pid>.<starttime>.<n>/`
+  (the start time from `/proc/self/stat`, so a reused pid is told from a
+  live owner when the store cleans up). Lookups use hex names only, so a
+  dot name is never mistaken for a layer. Its sidecar is staged next to
+  it as `.tmp-<pid>.<starttime>.<n>.stats`, so every temporary tree of
+  every process has its own (part 1 first derived it with
+  `with_extension`, which drops the counter; review measured two caches
+  in one process committing each other's sidecars). The tree is staged in
+  the directory it is committed into because a rename within one
+  directory does not rewrite the moved directory's `..`, so a read-only
+  layer root (mode 0o555) needs no write permission lent to it, and no
+  crash can leave a committed root with a mode it did not have. Part 1
+  first staged under `<root>/tmp/` and lent `u+w` for the rename.
+- `LayerCache::new` refuses a `layers/sha256/` where names alias each
+  other. It creates a probe file and looks up its upper-case form and,
+  for a second probe with a precomposed `é`, its decomposed form; if
+  either lookup finds the file, the directory is case-insensitive or
+  normalizing (ext4 or f2fs casefold, tmpfs `casefold`, ZFS
+  `normalization`, vfat), and the store fails closed. A probe rather
+  than the casefold inode flag, because it also catches filesystems that
+  alias without that flag. Why checking that one directory suffices:
+  casefold is a directory flag that only an empty directory can take and
+  that new subdirectories inherit, normalization is a property of the
+  whole filesystem, and the unpacker never sets inode flags (it has no
+  ioctl, only std calls and the `boneli-sys` primitives of D1), so every
+  directory below a case-sensitive `layers/sha256/` is case-sensitive
+  too. The alias refusal of D2 holds on its own when a tree is unpacked
+  anywhere else.
 - The commit, in this order: the `diff_id` matches; the staged sidecar is
-  written; one `syncfs` on the store's filesystem makes the layer's file
+  written; one `syncfs` on the store's filesystem, through a descriptor
+  of the temporary tree opened before anything was written into it,
+  makes the layer's file
   data, its directory entries, its final modes and the staged sidecar
   durable; the sidecar is renamed into `layers/sha256/` and that
   directory is `fsync`ed; the layer directory is renamed to
@@ -362,19 +401,31 @@ the store will use, and why:
   itself. The cost of `syncfs`: it also writes back other dirty data on
   the same filesystem, which on a runner host is the runner's own; since
   Linux 5.8 it reports writeback errors, and the runtime needs 5.19
-  (ADR-007, D3). `boneli_sys::sync_filesystem` wraps it.
+  (ADR-007, D3). It reports them relative to the error state sampled
+  when its descriptor was opened, and an error another caller has
+  already seen counts as old for a descriptor opened later; the
+  descriptor is therefore opened when the temporary tree is created, so
+  an error during the layer's own writeback is reported to its commit.
+  `boneli_sys::sync_filesystem` wraps the call.
 - A mismatch or an error removes the temporary tree and its staged
   sidecar, and the budget is left as it was. The removal holds at most
   one directory descriptor at a time, whatever the depth: it walks by
-  path, lists a directory, closes the listing before it goes down a
-  level, and gives each directory `u+rwx` first, because final modes may
-  be 0 (std's `remove_dir_all` holds one descriptor per level and left a
-  deep tree behind under `ulimit -n 1024` in review). With the unpacker's
-  own handful (the blob, one open file, one directory), a cleanup fits any
-  descriptor limit a runner can start under; the test runs it under 48.
-- Moving a directory to another parent rewrites its `..`, which needs
-  write permission on it. A layer root without `u+w` gets it for the
-  rename only and gets its mode back, synced, before the final `fsync`.
+  path, lists each directory exactly once while it removes the
+  non-directories, keeps the names of the subdirectories (at most the
+  tree's entry count) and closes the listing before it goes down a
+  level, and it gives each directory `u+rwx` first, because final modes
+  may be 0. std's `remove_dir_all` holds one descriptor per level and
+  left a deep tree behind under `ulimit -n 1024` in review; a first
+  bounded version listed a directory again after each subdirectory and
+  took 28.6 s for 80,000 sibling directories (release build, btrfs on the
+  dev host), now 2.6 s against 2.2 s for `remove_dir_all` and 2.7 s for
+  the unpack itself. It unlinks by path rather than relative to the
+  directory's descriptor, because std has no `unlinkat` and the path
+  walk costs only that 20 percent over `remove_dir_all`; a `boneli-sys`
+  wrapper would add `unsafe` for it. With the unpacker's own handful of
+  descriptors (the blob, one open file, one directory, the `syncfs`
+  descriptor), a cleanup fits any descriptor limit a runner can start
+  under; the test runs it under 48.
 - Two stores committing the same layer: the rename of the second fails
   because the directory exists; it discards its tree and reads the
   winner's sidecar. The same `diff_id` means the same bytes, so the trees

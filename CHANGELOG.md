@@ -262,7 +262,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by rename only when its bytes hash to its `diff_id`, after one `syncfs`
   (`boneli_sys::sync_filesystem`) and with the sidecar and the rename
   synced, charges the budget only on commit, and removes a failed tree
-  with one directory descriptor at a time.
+  with one directory descriptor at a time, listing each directory once.
+  Trees are staged as dot names inside `layers/sha256/`, so the commit is
+  a rename within one directory. The store refuses a case-insensitive or
+  normalizing layer directory, and the unpacker refuses a directory it
+  did not create (a case or normalization alias).
 - ADR-009 (proposed): the layered format, path, type and metadata rules,
   the tar subset, the decompressors, SHA-256 from ring, the limits and
   the cache layout.

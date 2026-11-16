@@ -191,7 +191,19 @@ fn symlink_parent_traversal_refused() {
             .file(entry, 0o644, b"root::0:0")
             .finish();
         let (_dir, e) = refused(&bytes);
-        assert!(matches!(e, Error::Entry { .. }), "{entry}: {e}");
+        // Refused for the symlink itself, which the walk sees because it
+        // does not follow it; the alias rule would catch a followed link
+        // too, but as a second guard.
+        assert!(
+            matches!(
+                e,
+                Error::Entry {
+                    reason: "a parent directory is a symlink",
+                    ..
+                }
+            ),
+            "{entry}: {e}"
+        );
         assert!(names(outside.path()).is_empty(), "{entry}: wrote outside");
     }
     // Every kind of entry under a symlinked parent, including a relative
@@ -1406,8 +1418,12 @@ fn image_caps_count_cached_layers() {
 
 // ---- Layer cache (D8) -------------------------------------------------------
 
+/// Staging trees and staged sidecars left in layers/sha256/ (dot names).
 fn tmp_entries(store: &Path) -> Vec<String> {
-    names(&store.join("tmp"))
+    names(&store.join("layers/sha256"))
+        .into_iter()
+        .filter(|n| n.starts_with('.'))
+        .collect()
 }
 
 #[test]
@@ -1501,45 +1517,6 @@ fn corrupt_sidecar_is_an_error() {
     }
 }
 
-/// Per-entry cost does not grow with the square of the depth: parents a
-/// layer already verified are not walked again (the review measured
-/// 407 ms per entry at depth 1,932 before). Relative to a shallow layer, so
-/// the bound does not depend on the machine: quadratic cost makes the
-/// deep entries about 90 times dearer, linear path resolution a few times.
-#[test]
-fn deep_entries_cost_is_not_quadratic() {
-    fn per_entry(depth: usize) -> f64 {
-        let prefix = vec!["a"; depth - 1].join("/");
-        let entries = 60;
-        let mut t = Tar::new();
-        for i in 0..entries {
-            t.pax(&[("path", format!("{prefix}/f{i}").as_bytes())])
-                .file("x", 0o644, b"");
-        }
-        let bytes = t.finish();
-        let dir = TempDir::new("depth");
-        let start = std::time::Instant::now();
-        // Its own depth limit: the test pins the walk, not the cap.
-        let mut deep_budget = with_depth(1024);
-        unpack(&bytes[..], Compression::None, dir.path(), &mut deep_budget).expect("unpacks");
-        start.elapsed().as_secs_f64() / f64::from(entries)
-    }
-    // Warm up, then compare the median of three runs each.
-    per_entry(8);
-    let median = |depth: usize| {
-        let mut v = [per_entry(depth), per_entry(depth), per_entry(depth)];
-        v.sort_by(f64::total_cmp);
-        v[1]
-    };
-    let (shallow, deep) = (median(8), median(512));
-    assert!(
-        deep < 15.0 * shallow,
-        "depth 512 costs {:.3} ms per entry, depth 8 {:.3} ms",
-        deep * 1e3,
-        shallow * 1e3
-    );
-}
-
 fn with_depth(max_depth: u64) -> Budget {
     Budget::new(Limits::new(1 << 32, 1 << 34, 1 << 20, MIB, max_depth).expect("limits"))
 }
@@ -1630,4 +1607,31 @@ fn implicit_parents_count_as_entries() {
         &mut Budget::new(exact),
     )
     .expect("ten inodes");
+}
+
+/// Every directory in a layer is one this unpacker created or merged. A
+/// directory that `lstat` finds at a path the layer never made is an alias
+/// (a case-insensitive or normalizing directory) or something put there
+/// from outside, and the layer is refused instead of writing into it.
+#[test]
+fn directory_not_made_by_this_layer_is_refused() {
+    let shapes = [
+        Tar::new().file("x/f", 0o644, b"x").finish(),
+        Tar::new().dir("x", 0o755).finish(),
+        Tar::new().symlink("x", "/elsewhere").finish(),
+        Tar::new().file("x", 0o644, b"x").finish(),
+        Tar::new().hardlink("h", "x/keep").finish(),
+    ];
+    for bytes in shapes {
+        let dir = TempDir::new("foreign");
+        std::fs::create_dir(dir.path().join("x")).expect("foreign directory");
+        std::fs::write(dir.path().join("x/keep"), b"keep").expect("file");
+        let e =
+            unpack(&bytes[..], Compression::None, dir.path(), &mut budget()).expect_err("foreign");
+        assert!(matches!(e, Error::Entry { .. }), "{e}");
+        assert_eq!(
+            std::fs::read(dir.path().join("x/keep")).expect("kept"),
+            b"keep"
+        );
+    }
 }

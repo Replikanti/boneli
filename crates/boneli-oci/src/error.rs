@@ -63,6 +63,9 @@ pub enum Error {
     },
     /// A layer's sidecar is malformed (ADR-009, D8).
     Sidecar(PathBuf),
+    /// The store's layer directory treats names that differ in case or in
+    /// Unicode normalization as one (ADR-009, D8).
+    CaseInsensitive(PathBuf),
 }
 
 impl fmt::Display for Error {
@@ -87,6 +90,11 @@ impl fmt::Display for Error {
                 write!(f, "layer cache file {} failed: {source}", path.display())
             }
             Error::Sidecar(path) => write!(f, "malformed layer sidecar {}", path.display()),
+            Error::CaseInsensitive(path) => write!(
+                f,
+                "{} is case-insensitive or normalizes names; a layer store needs exact names",
+                path.display()
+            ),
         }
     }
 }

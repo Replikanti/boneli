@@ -174,7 +174,17 @@ struct Layer<'a> {
     entries: u64,
     skipped_devices: u64,
     budget: &'a Budget,
+    /// `lstat` calls of the parent walk, for the test that pins its cost.
+    parent_lstats: u64,
 }
+
+/// Why a directory that `lstat` finds at a path that is not a key of
+/// `dirs` is refused: every directory of the layer is a key, so such a
+/// directory was reached through an alias (a case-insensitive or
+/// normalizing directory resolves `A` to `a`) or put there from outside.
+/// Writing through it or removing it could leave a key pointing at
+/// something else, and the cached parent walk trusts keys (D2).
+const ALIAS: &str = "a directory this layer did not create (a case or normalization alias)";
 
 fn show(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
@@ -235,7 +245,12 @@ impl<'a> Layer<'a> {
             entries: 0,
             skipped_devices: 0,
             budget,
+            parent_lstats: 0,
         }
+    }
+
+    fn is_known_dir(&self, rel: &[u8]) -> bool {
+        self.dirs.contains_key(rel)
     }
 
     /// Counts one more entry or created directory against the image's
@@ -289,8 +304,13 @@ impl<'a> Layer<'a> {
         }
         for i in known + 1..comps.len() {
             let rel = join(&comps[..i]);
+            self.parent_lstats += 1;
             match self.lstat(&rel)? {
-                Some(m) if m.file_type().is_dir() => {}
+                Some(m) if m.file_type().is_dir() => {
+                    if !self.is_known_dir(&rel) {
+                        return Err(refuse(entry, ALIAS));
+                    }
+                }
                 Some(m) if m.file_type().is_symlink() => {
                     return Err(refuse(entry, "a parent directory is a symlink"));
                 }
@@ -335,6 +355,9 @@ impl<'a> Layer<'a> {
         };
         let host = self.host(rel);
         if m.file_type().is_dir() {
+            if !self.is_known_dir(rel) {
+                return Err(refuse(rel, ALIAS));
+            }
             fs::remove_dir_all(&host).map_err(|e| Self::write_err(rel, e))?;
             let mut prefix = rel.to_vec();
             prefix.push(b'/');
@@ -448,7 +471,11 @@ impl<'a> Layer<'a> {
         match self.lstat(rel)? {
             // A directory over a directory merges; the later entry's
             // metadata wins (moby).
-            Some(m) if m.file_type().is_dir() => {}
+            Some(m) if m.file_type().is_dir() => {
+                if !self.is_known_dir(rel) {
+                    return Err(refuse(rel, ALIAS));
+                }
+            }
             _ => {
                 self.remove(rel)?;
                 self.mkdir(rel)?;
@@ -505,8 +532,13 @@ impl<'a> Layer<'a> {
             return Err(refuse(&e.path, "a hard link to itself"));
         }
         for i in 1..target.len() {
-            match self.lstat(&join(&target[..i]))? {
-                Some(m) if m.file_type().is_dir() => {}
+            let part = join(&target[..i]);
+            match self.lstat(&part)? {
+                Some(m) if m.file_type().is_dir() => {
+                    if !self.is_known_dir(&part) {
+                        return Err(refuse(&e.path, ALIAS));
+                    }
+                }
                 Some(m) if m.file_type().is_symlink() => {
                     return Err(refuse(&e.path, "a hard link target crosses a symlink"));
                 }
@@ -562,4 +594,61 @@ impl<'a> Layer<'a> {
 fn set_times(file: &File, t: Mtime) -> io::Result<()> {
     let t = system_time(t).ok_or_else(|| io::Error::other("mtime out of range"))?;
     file.set_times(FileTimes::new().set_modified(t))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Entry, Kind, Layer, Mtime};
+    use crate::limits::{Budget, Limits};
+    use crate::tar::Reader;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("boneli-oci-unit-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn symlink_at(path: String) -> Entry {
+        Entry {
+            path: path.into_bytes(),
+            link: b"target".to_vec(),
+            kind: Kind::Symlink,
+            mode: 0o777,
+            mtime: Mtime { secs: 0, nanos: 0 },
+            size: 0,
+            devmajor: 0,
+            devminor: 0,
+        }
+    }
+
+    /// A parent the layer already verified is not checked again: 50
+    /// entries at depth 128 cost the 127 `lstat`s of the first entry's
+    /// chain, not 50 times that. Counted, not timed, so the build profile
+    /// and the machine do not matter.
+    #[test]
+    fn verified_parents_are_not_walked_again() {
+        let root = scratch("parents");
+        let budget =
+            Budget::new(Limits::new(1 << 32, 1 << 34, 1 << 20, 1 << 20, 128).expect("limits"));
+        let mut layer = Layer::new(&root, &budget);
+        let mut reader = Reader::new(std::io::empty(), 1);
+        let prefix = vec!["a"; 127].join("/");
+        for i in 0..50 {
+            layer
+                .entry(symlink_at(format!("{prefix}/l{i}")), &mut reader)
+                .expect("entry");
+        }
+        assert_eq!(layer.parent_lstats, 127);
+        // A sibling chain shares the verified part.
+        let sibling = format!("{}/b/l", vec!["a"; 100].join("/"));
+        layer
+            .entry(symlink_at(sibling), &mut reader)
+            .expect("entry");
+        assert_eq!(layer.parent_lstats, 128);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
