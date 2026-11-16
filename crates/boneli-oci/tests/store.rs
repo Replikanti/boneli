@@ -233,21 +233,19 @@ fn unremovable_leftover_skipped() {
         pid
     };
     let deep = layers.join(owned(".tmp-", &boot, ns, dead, 7, 1));
-    let level = "d".repeat(250);
-    // A shell climbs down by relative names, so no path it uses is long.
-    let made = Command::new("sh")
-        .args([
-            "-c",
-            "mkdir \"$1\" && cd \"$1\" || exit 1; i=0; \
-             while [ $i -lt 20 ]; do mkdir \"$2\" && cd \"$2\" || exit 1; i=$((i + 1)); done; \
-             : > f",
-            "sh",
-        ])
-        .arg(&deep)
-        .arg(&level)
-        .status()
-        .expect("sh");
-    assert!(made.success(), "the deep tree");
+    // Built where it fits `PATH_MAX`, then renamed under the longer
+    // staging name, where its deepest path no longer does.
+    let short = tmp.path().join("t");
+    let mut bottom = short.clone();
+    let mut left = 4097 - deep.as_os_str().len();
+    while left > 0 {
+        let len = left.saturating_sub(1).clamp(1, 200);
+        bottom.push("d".repeat(len));
+        left = left.saturating_sub(len + 1);
+    }
+    assert!(bottom.as_os_str().len() < 4096, "{}", bottom.display());
+    std::fs::create_dir_all(&bottom).expect("the deep tree");
+    std::fs::rename(&short, &deep).expect("rename");
     let removable = [
         layers.join(owned(".tmp-", &boot, ns, dead, 7, 2)),
         blobs.join(owned(".tmp-", &boot, ns, dead, 7, 3)),
