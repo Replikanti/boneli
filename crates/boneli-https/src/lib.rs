@@ -18,7 +18,15 @@
 //! decrypted, records that have arrived, and the part of a record that has
 //! arrived. A response that arrives inside TLS while a connection is idle
 //! therefore ends that connection, as on a plain socket (ADR-003, item 12).
+//!
+//! The crate also exports ring's SHA-256 as [`Sha256`], the one content
+//! hash of the runner (ADR-009, D6): ring is linked here for TLS already,
+//! so content addressing adds no crate and ring stays in this crate.
 #![doc(test(attr(forbid(unsafe_code))))]
+
+mod sha256;
+
+pub use sha256::Sha256;
 
 use std::fmt;
 use std::io::{self, Read, Write};

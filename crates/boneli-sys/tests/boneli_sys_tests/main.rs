@@ -16,6 +16,7 @@
 
 mod cgroups;
 mod host_setup;
+mod layer;
 mod mounts;
 mod namespaces;
 mod probe;

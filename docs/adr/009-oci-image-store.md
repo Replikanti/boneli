@@ -1,0 +1,462 @@
+# ADR-009: boneli-oci, an OCI image store with a layered rootfs
+
+- Status: proposed
+- Date: 2026-11-16
+
+## Context
+
+Issue #7 builds the `ImageStore` adapter, `boneli-oci`. It pulls an image
+pinned by digest from a registry and turns it into a root filesystem that
+`boneli-sys` mounts for the sandbox (ADR-007, D7). Its input is hostile in
+two ways. The registry, or whoever pinned the image, controls every byte
+of the archives, and the store unpacks them onto the host as the runner
+user, who holds the git token. A path bug here writes outside the store as
+that user, so `boneli-oci` is on the always-review list.
+
+The issue is split into three PRs. Part 1 (this ADR as proposed) unpacks
+layers and needs no network. Part 2 adds the registry client and part 3
+the store, the port contract and the acceptance, which settles this ADR.
+
+What the numbers below come from (Docker Hub, anonymous, 2026-11-16,
+`linux/amd64`):
+
+- `library/node:22`: 8 layers, 408,439,522 B compressed and 1,156,002,816 B
+  uncompressed. The largest layer is 597,621,760 B uncompressed. 34,097
+  tar entries, at most 13,350 in one layer. The longest path is 128 B, the
+  longest name 65 B, the deepest path 13 components. One layer carries PAX
+  headers (3 entries). No device nodes, FIFOs, opaque markers or PAX
+  xattrs. 16 setuid or setgid entries, 6 hard links, up to 194 absolute
+  symlinks per layer.
+- `library/postgres:17`: 14 layers, 167,333,338 B compressed and
+  478,661,120 B uncompressed, 2 whiteouts, up to 456 absolute symlinks per
+  layer.
+- Upstream constants, read in their sources: moby overlay2
+  `maxDepth = 128`; Go's `archive/tar` `maxSpecialFileSize = 1 << 20` and
+  its end-of-archive rules; `ruzstd` 0.8.2
+  `MAXIMUM_ALLOWED_WINDOW_SIZE = 100 MiB` and 0.9.1
+  `DEFAULT_MAX_WINDOW_SIZE = 128 MiB`; mke2fs's default
+  `inode_ratio = 16384`.
+
+## Decision
+
+### D1. One directory per layer, in the overlay format
+
+Each layer is unpacked into its own directory, keyed by its `diff_id`. A
+whiteout is a 0:0 character device and an opaque directory carries
+`user.overlay.opaque=y`, the format overlayfs reads with `userxattr`, so
+`boneli_sys::Root.layers` mounts the directories as they are (ADR-007, D7
+built and measured it for this issue). Docker's overlay2 driver also
+stacks one directory per layer, so the merged view is the one Docker
+shows.
+
+Rejected: flattening every image into one directory. It needs no new
+`unsafe` in `boneli-sys`, but it needs merge rules of its own (a directory
+over a symlink, opaque directories, a whiteout next to an entry of the same
+layer), and no runtime test pins them; with layers, overlayfs applies its
+own, tested rules. Flattening would also store a shared base layer once per
+image instead of once.
+
+`boneli-sys` gains the primitives an unprivileged process needs for this
+format and std cannot write without `libc`: `make_whiteout` (`mknod` of a
+0:0 character device, allowed without `CAP_MKNOD` since Linux 5.8),
+`make_fifo`, `mark_opaque` (`lsetxattr`) and `user_xattr` (`lgetxattr`,
+`user.` names only, values up to `XATTR_SIZE_MAX`, 65,536 B). All are path
+based and never follow a final symlink.
+
+### D2. Path rules
+
+- A leading `/` and `.` components are dropped and `//` collapses, so
+  `./a`, `/a`, `a//b` and `a/./b` mean `a` and `a/b`. An entry for `.`,
+  `./` or `/` is the layer root; it must be a directory and sets the
+  root's mode only.
+- A `..` component anywhere is refused, and so is NUL in a PAX `path` or
+  `linkpath`. The layer is refused, not the entry: a hostile layer gets no
+  partial result.
+- Before anything is created, every parent is checked component by
+  component with `symlink_metadata`. A symlink or a non-directory as a
+  parent refuses the layer; a missing parent is created with mode 0o755,
+  as Docker does. Nothing is ever followed: files are created with
+  `O_EXCL` after the old entry is removed, devices with `mknod`, xattrs
+  with `lsetxattr`, hard links with `linkat` without `AT_SYMLINK_FOLLOW`.
+  Why this is enough: the store directory is private (`0o700`) and only
+  this process writes it while it unpacks, so the tar stream, read
+  sequentially, is the only adversary, and every link it planted is seen
+  by the walk before the next create.
+- The walk does not repeat itself: it starts below the deepest ancestor
+  the layer already created or merged, which it keeps as a set of
+  directory paths (D7 has the cost). That set is sound only if a path
+  names exactly one directory. Every directory of the layer is in the
+  set, so a directory that `lstat` finds at a path outside it was reached
+  through an alias, or put there from outside: on a case-insensitive or
+  normalizing directory `A` resolves to `a`, and a symlink entry `A` then
+  removes the directory `a` while `a` stays in the set. Review of part 1
+  wrote a file outside the tree that way on a casefold tmpfs. Such a
+  directory refuses the layer wherever it is found: as a parent, as the
+  target of a removal or a merge, and on a hard link target's path.
+  Rejected: dropping every cached entry at and below an affected name,
+  because which names alias depends on the filesystem's folding and
+  normalization tables, which the unpacker cannot know; the refusal needs
+  no such knowledge. The store also refuses an aliasing root outright
+  (D8).
+- Symlink targets are data for the sandbox and are written as they are,
+  absolute ones included.
+- Hard link targets are archive paths under the same rules, must already
+  exist in this layer, may not cross a symlink, and may not be a
+  directory, a whiteout or the entry itself.
+- A later entry for the same path wins. A non-directory over a directory
+  removes the tree; a directory over a directory merges, with the later
+  entry's metadata (moby).
+- Name length is the kernel's: a 256 B component is `ENAMETOOLONG`, an
+  error, never a panic.
+
+Whiteouts:
+
+- `.wh.<name>` becomes a 0:0 character device `<name>`, whatever the
+  entry's type flag; the byte-exact prefix decides, as in Docker, so
+  look-alikes (`.WH.`, fullwidth dots, a zero-width space) are regular
+  names.
+- `.wh..wh..opq` marks its directory opaque. At the layer root it is
+  refused, because what overlayfs does with an opaque lower root is not
+  pinned by any test.
+- `.wh.`, `.wh..` and `.wh...` are refused (they would name nothing, the
+  directory itself or its parent), and so is a `.wh.` prefix in a parent
+  component.
+- aufs metadata at the root (`.wh..wh.plnk` and the like) is skipped with
+  everything under it, as moby does.
+- A whiteout hides lower layers only, so a real entry of the same layer
+  wins in either order (OCI image spec).
+
+### D3. Entry types and metadata
+
+- Regular files, directories, symlinks, hard links and FIFOs are written.
+  A 0:0 character device is a whiteout, the file Docker's overlay2 driver
+  writes. Any other character or block device is skipped and counted in
+  the layer's sidecar: the sandbox mounts its own `/dev`, and unprivileged
+  `mknod` refuses them.
+- Modes keep `& 0o1777`: setuid and setgid are dropped, sticky stays.
+  node:22 has 16 setuid or setgid entries, and a setuid file owned by the
+  runner user would let other local users run it as that user. Inside the
+  sandbox the single id mapping (ADR-007, D1) makes setuid meaningless
+  anyway.
+- uid and gid are ignored: every file belongs to the runner, the one
+  mapped id.
+- Tar xattrs (`SCHILY.xattr.*`) are never applied. `user.overlay.*` from
+  an archive would let a layer redirect or hide paths of other layers, and
+  `security.*` cannot be written unprivileged.
+- mtimes are kept for files and directories, PAX fractions and negative
+  times included. Symlinks get the unpack time, because std cannot set it
+  without following the link.
+- Directories are created `0o700` and get their final mode and time at
+  the end, deepest first, so read-only directories can be filled. A file
+  gets its mode and time through its open descriptor, so mode 0 does not
+  lock the writer out.
+
+### D4. The tar subset
+
+Go's `archive/tar` is the reader of record: Docker and containerd read
+layers with it, and most images are written by it. The reader here accepts
+what Go accepts in practice and refuses the rest:
+
+- ustar and GNU magic. V7 and other formats are refused (no current
+  writer emits them for images).
+- The header checksum as the unsigned or the signed sum.
+- Numbers in octal or base-256, up to `i64::MAX`; a negative base-256
+  number is refused.
+- PAX `x` (`path`, `linkpath`, `size`, `mtime`; every other key is
+  ignored), PAX `g` (framing checked, contents ignored, as Docker does),
+  GNU `L` and `K`. GNU names come first and PAX overrides them, Go's order.
+  A PAX or GNU body may be at most 1,048,576 B, Go's `maxSpecialFileSize`.
+- Types `0`, NUL and `7` as regular files (NUL with a trailing `/` is a
+  directory), `1`-`6`. Header-only types carry no data whatever their size
+  field says. Sparse files (`S`, `GNU.sparse.*`) and every other type are
+  refused.
+- The end of the archive is Go's: EOF at a header boundary, or a zero
+  block followed by EOF or a second zero block. A zero block followed by
+  anything else is refused. Bytes after the end are hashed into the
+  `diff_id` and counted, never extracted.
+
+Where this is stricter than Go, on purpose: a PAX or GNU header with no
+entry after it (Go reports a clean end), a PAX record length with a sign,
+V7 headers and sparse files. None of the measured images uses them, and
+refusing fails closed.
+
+Rejected: the `tar` crate. docs/ARCHITECTURE.md puts tar reading on the
+list of parts we write ourselves, the crate pulls `filetime` and `xattr`
+(with `libc` edges), and its unpacker applies its own path and permission
+policy that we would have to audit and override.
+
+### D5. Decompression
+
+- gzip: our RFC 1952 framing over `miniz_oxide` 0.9.1's raw deflate
+  (`default-features = false`, `with-alloc` for the streaming state).
+  Reserved `FLG` bits and `CM != 8` are refused, `FEXTRA`, `FNAME`,
+  `FCOMMENT` and `FHCRC` are skipped, `ISIZE` is checked. Several members
+  decode as one stream, and any byte after the last member that does not
+  start another member is refused, as in Go. CRC-32 is not computed,
+  because the `diff_id` covers every decoded byte; a corrupted CRC field
+  alone therefore passes, and the blob digest (part 2) covers it on the
+  compressed side. `miniz_oxide` forbids `unsafe` in its own code. It
+  pulls `adler2` (Adler-32 for the zlib format, `forbid(unsafe_code)`),
+  which we do not use, but the edge is unconditional; this ADR approves
+  the crate name.
+- zstd: `ruzstd` 0.9.1's `FrameDecoder` (`default-features = false`,
+  `std`, which pulls no crate): frames in sequence, skippable frames
+  skipped, anything after the last frame refused, checksums read but not
+  verified (no `hash` feature, which would pull `twox-hash`; the
+  `diff_id` covers the bytes). The reserved bit of the frame header
+  descriptor must be 0 (RFC 8878 says a decoder must check it; ruzstd does
+  not), so the reader checks it before ruzstd reads the header.
+- At least 0.9.1, and with it MSRV 1.87 (decided by the operator during
+  part 1, 2026-11-16). `cargo deny check` refused 0.8.2 for
+  RUSTSEC-2026-0344: a crafted frame under 128 KB makes one block expand
+  to gigabytes, because 0.8.2 never bounds a block's decoded size, so the
+  counting reader of D7, which sees the output only after a block is
+  decoded, cannot stop it. The fix exists only in 0.9.1, which declares
+  `rust-version = 1.87`; resolver 3 picks versions by `rust-version`, so
+  the workspace's `rust-version` moves from 1.85 to 1.87. The cost is
+  only the declared floor: CI and the hosts build with current stable.
+  Rejected: an advisory ignore in `deny.toml` (a denial of service on
+  hostile input, and widening the deny policy needs an ADR of its own),
+  and refusing zstd layers until later (zstd is in the OCI layer media
+  types the store must read). ADR-005 records "the workspace MSRV of 1.85
+  stays" for the TLS stack; that still holds for those crates (none
+  declares more than 1.85), but the workspace floor is now 1.87. ADR-005
+  is accepted and keeps its text; this paragraph is the record.
+- The zstd window cap is 100 MiB, set with `set_max_window_size`. ruzstd
+  0.9.1 checks it when a frame header is read, for the first frame,
+  later frames and single-segment frames (whose window is their content
+  size) alike, before it allocates the window (read in its source;
+  0.8.2 checked only later frames, which part 1 first worked around with
+  its own header parse). The decoder's memory is the window plus one
+  block of at most 128 KiB, which 0.9.1 now enforces. Why 100 MiB: it is
+  the value ruzstd 0.8.2 hard-coded and the plan adopted; 0.9.1's default
+  and zstd's own default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`) are
+  128 MiB. Consequence: a layer compressed with `zstd --long`, whose
+  default window log is 27 (128 MiB), is refused; raising the cap to
+  128 MiB admits it at 28 MiB more memory per decoding pull. Part 3
+  measures the first-stack images and settles the value.
+- `ruzstd` contains `unsafe` in its ring buffer, and RUSTSEC-2024-0400 was
+  an out-of-bounds read there (patched in 0.7.3). `cargo deny check` runs
+  advisories in CI. Its input is digest-verified before it is decoded
+  (part 2), so the adversary is whoever pinned the image, not the network.
+  ruzstd also does not read some fields: one flipped byte of the test
+  fixture's sequences section (measured with 0.8.2 and again with 0.9.1)
+  decodes to the same output, which the `diff_id` then matches, so the
+  result is the right bytes.
+- Every decompressor's output passes a counting reader that refuses the
+  first byte over a limit (D7), so a bomb stops there.
+
+Rejected: `flate2` (pulls `crc32fast` and `cfg-if` for a CRC we do not
+need, plus a backend switch), the `zstd` crate (C bindings with a build
+script, against "pure Rust" in docs/ARCHITECTURE.md).
+
+### D6. SHA-256: ring's, exported by boneli-https
+
+The one SHA-256 of the repository is `boneli_https::Sha256`: ring's
+SHA-256 through rustls' public hash-provider API
+(`rustls::crypto::hash`, the `hash_provider` of
+`TLS13_AES_128_GCM_SHA256`, read through an exhaustive `match` on
+`SupportedCipherSuite` with no panic path). This widens ring's exception
+in docs/ARCHITECTURE.md and ADR-005 from "TLS only" to "TLS and content
+hashing", still confined to `boneli-https`. Reasons:
+
+- The same BoringSSL-derived code is already linked into the runner and
+  already hashes the transcript of every TLS 1.3 connection on a SHA-256
+  suite, so no foreign code is added and no crate or edge either.
+- It uses the CPU's SHA instructions: ring 0.17.14 dispatches to
+  `sha256_block_data_order_hw` on x86_64 with the SHA extensions and on
+  aarch64, with AVX and SSSE3 paths on older x86_64.
+- ring is audited and widely deployed.
+
+Weak spot: dropping ring later means replacing the hash too. The single
+type confines that to one file and its tests. A rustls update that changes
+the API fails to compile there; one that swaps the provider fails the
+known-answer tests and `hash_provider_is_sha256`.
+
+ADR-004 requires the file store (#4) to use "a cryptographic digest from
+a vetted crate" and names `sha2` as the planned crate. The rule still
+holds and only the crate changes; ADR-004 stays as it is, because an
+accepted ADR changes only its status line. `sha2` leaves the dependency
+table and `tools/architecture.toml`, so #4 uses the same type.
+
+Alternatives:
+
+- Our own FIPS 180-4 implementation: rejected, it duplicates code that is
+  already linked.
+- `sha2` 0.11: rejected, it adds 6 crate names and the strict edge
+  `cpufeatures -> libc` on aarch64 for a second SHA-256 next to ring's.
+- Our own TLS primitives, or a pure-Rust rustls provider such as
+  `rustls-rustcrypto` that would make the hash pure Rust along with the
+  rest: rejected. TLS primitives handle secret keys, need constant-time
+  code and fail open on a signature-verification bug, whereas a
+  deterministic bug in a hash fails closed. ADR-005 is not edited.
+
+### D7. Limits
+
+`Limits::new(max_layer_bytes, max_image_bytes, max_image_entries,
+max_special_bytes, max_depth)` has no defaults and refuses a zero (the house style of
+ADR-003 and ADR-008), so the values live in one place, the store (part 3).
+Every limit is inclusive: the limit passes, one more is refused. The values
+the store will use, and why:
+
+- Per layer: 4,294,967,296 B uncompressed (4 GiB), 7.2 times node:22's
+  largest layer of 597,621,760 B. Counted on the decoded stream while it
+  is read, trailing bytes included. Lower refuses real first-stack images
+  sooner; higher lets one layer fill more disk before it is refused. Known
+  casualty: images with layers above 4 GiB (CUDA and ML images) are
+  refused until the value is raised.
+- Per image: 17,179,869,184 B (16 GiB), 14.9 times node:22's
+  1,156,002,816 B, and 1,048,576 entries, 30.8 times node:22's 34,097.
+  16 GiB divided by mke2fs's default 16,384 B per inode is exactly
+  1,048,576, so the two caps exhaust the same default ext4 at the same
+  time; neither is the weaker bound. Because the entry cap stands for
+  inodes, the directories the unpacker creates for missing parents count
+  as entries too; otherwise one tar entry at depth 128 would create 127
+  inodes the cap never sees. Layers already in the cache are charged from
+  their sidecars, so a warm cache and a cold one reach the same verdict;
+  a layer is charged only once it is committed, never on a failed
+  attempt.
+- A PAX or GNU extension body: 1,048,576 B, Go's `maxSpecialFileSize`, so
+  every archive Go reads passes; it is read into memory, so this is the
+  memory one header may take.
+- The zstd window: 100 MiB (D5).
+- Path depth: 128 components after normalization, whatever the entry's
+  type. Why a cap at all: review of part 1 measured a layer of ~1,900-deep
+  entries that cost 407 ms of CPU per entry, under every byte and entry
+  cap. The quadratic part of that is gone (the parent walk starts below
+  the deepest directory this layer already verified, so an entry in a
+  known directory costs no `lstat` for its parents), but the kernel still
+  resolves every path component by component, so each entry stays linear
+  in its depth. Measured after that change (release build, btrfs on the
+  dev host, 300 entries per depth, two runs): per entry 0.034-0.061 ms at
+  depth 13, 0.061 at 64, 0.068-0.110 at 128, 0.13-0.23 at 192-256, 0.46 at
+  384, 0.48-0.65 at 512, 0.96 at 1,024 and 4.2 at 1,900; a directory
+  created for a missing parent costs 0.037-0.068 ms at depth 13 to 128 and
+  0.11-0.15 ms at 512. 128 is the deepest measured depth whose per-entry
+  cost stays in the shallow band (within 2 times depth 13), so the worst
+  layer within the entry cap costs about as much as the worst shallow
+  one: 1,048,576 entries at 0.11 ms is about 2 minutes, against about
+  11 minutes at depth 512 (0.65 ms). It is 9.8 times node:22's deepest path of 13
+  components. Two more bounds hold with room: a traversal that holds one
+  descriptor per level (std's `remove_dir_all`) needs at most 129
+  descriptors, far below systemd's
+  default soft `RLIMIT_NOFILE` of 1,024 next to the up to 163 layer
+  descriptors a root mount opens (ADR-007, D7); and an entry at the cap
+  has an in-sandbox path of at least 256 B, so its components may average
+  31 B before it exceeds `PATH_MAX` (4,096 B). A lower cap refuses deeper
+  real trees sooner; a higher one buys deeper trees with per-entry CPU
+  that grows past the shallow band (0.46 ms at 384, about 4 times the
+  cap's).
+
+### D8. The cache layout and concurrency
+
+- `<root>/layers/sha256/<hex>` is the layer directory and
+  `<root>/layers/sha256/<hex>.stats` its sidecar: uncompressed bytes,
+  entry count and skipped devices, as
+  `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
+- A layer is unpacked into `layers/sha256/.tmp-<pid>.<starttime>.<n>/`
+  (the start time from `/proc/self/stat`, so a reused pid is told from a
+  live owner when the store cleans up). Lookups use hex names only, so a
+  dot name is never mistaken for a layer. Its sidecar is staged next to
+  it as `.tmp-<pid>.<starttime>.<n>.stats`, so every temporary tree of
+  every process has its own (part 1 first derived it with
+  `with_extension`, which drops the counter; review measured two caches
+  in one process committing each other's sidecars). The tree is staged in
+  the directory it is committed into because a rename within one
+  directory does not rewrite the moved directory's `..`, so a read-only
+  layer root (mode 0o555) needs no write permission lent to it, and no
+  crash can leave a committed root with a mode it did not have. Part 1
+  first staged under `<root>/tmp/` and lent `u+w` for the rename.
+- `LayerCache::new` refuses a `layers/sha256/` where names alias each
+  other. It creates a probe file and looks up its upper-case form and,
+  for a second probe with a precomposed `é`, its decomposed form; if
+  either lookup finds the file, the directory is case-insensitive or
+  normalizing (ext4 or f2fs casefold, tmpfs `casefold`, ZFS
+  `normalization`, vfat), and the store fails closed. A probe is named
+  `.probe-…-<pid>.<starttime>.<n>`; a name that exists is skipped and
+  never removed, because it may be a crashed process's leftover with the
+  same pid (deterministic in a container) or the live probe of a runner
+  in another PID namespace sharing the store, and only its owner may
+  delete it. A probe rather
+  than the casefold inode flag, because it also catches filesystems that
+  alias without that flag. Why checking that one directory suffices:
+  casefold is a directory flag that only an empty directory can take and
+  that new subdirectories inherit, normalization is a property of the
+  whole filesystem, and the unpacker never sets inode flags (it has no
+  ioctl, only std calls and the `boneli-sys` primitives of D1), so every
+  directory below a case-sensitive `layers/sha256/` is case-sensitive
+  too. The alias refusal of D2 holds on its own when a tree is unpacked
+  anywhere else.
+- The commit, in this order: the `diff_id` matches; the staged sidecar is
+  written; one `syncfs` on the store's filesystem, through a descriptor
+  of the temporary tree opened before anything was written into it,
+  makes the layer's file
+  data, its directory entries, its final modes and the staged sidecar
+  durable; the sidecar is renamed into `layers/sha256/` and that
+  directory is `fsync`ed; the layer directory is renamed to
+  `layers/sha256/<hex>`, the commit point, and `layers/sha256/` is
+  `fsync`ed again. A committed layer therefore always has its sidecar and
+  its data on disk; a crash before the last `fsync` loses at most the
+  rename, and the layer is unpacked again. Why `syncfs` and not an
+  `fsync` per file: measured on a synthetic layer the size of node:22's
+  largest (13,350 files in 100 directories, 608,385,024 B of tar; release
+  build, btrfs on LUKS on the dev host's NVMe, two rounds), an `fsync` of
+  each of the 13,451 inodes after the unpack took 18.4 s and 17.0 s,
+  one `syncfs` 0.35 s and 0.32 s, against 1.7-3.9 s for the unpack
+  itself. The cost of `syncfs`: it also writes back other dirty data on
+  the same filesystem, which on a runner host is the runner's own; since
+  Linux 5.8 it reports writeback errors, and the runtime needs 5.19
+  (ADR-007, D3). It reports them relative to the error state sampled
+  when its descriptor was opened, and an error another caller has
+  already seen counts as old for a descriptor opened later; the
+  descriptor is therefore opened when the temporary tree is created, so
+  an error during the layer's own writeback is reported to its commit.
+  `boneli_sys::sync_filesystem` wraps the call.
+- A mismatch or an error removes the temporary tree and its staged
+  sidecar, and the budget is left as it was. The removal holds at most
+  one directory descriptor at a time, whatever the depth: it walks by
+  path, lists each directory exactly once while it removes the
+  non-directories, keeps the names of the subdirectories (at most the
+  tree's entry count) and closes the listing before it goes down a
+  level, and it gives each directory `u+rwx` first, because final modes
+  may be 0. std's `remove_dir_all` holds one descriptor per level and
+  left a deep tree behind under `ulimit -n 1024` in review; a first
+  bounded version listed a directory again after each subdirectory and
+  took 28.6 s for 80,000 sibling directories (release build, btrfs on the
+  dev host), now 2.6 s against 2.2 s for `remove_dir_all` and 2.7 s for
+  the unpack itself. It unlinks by path rather than relative to the
+  directory's descriptor, because std has no `unlinkat` and the path
+  walk costs only that 20 percent over `remove_dir_all`; a `boneli-sys`
+  wrapper would add `unsafe` for it. With the unpacker's own handful of
+  descriptors (the blob, one open file, one directory, the `syncfs`
+  descriptor), a cleanup fits any descriptor limit a runner can start
+  under; the test runs it under 48.
+- Two stores committing the same layer: the rename of the second fails
+  because the directory exists; it discards its tree and reads the
+  winner's sidecar. The same `diff_id` means the same bytes, so the trees
+  and their totals are equal, and the loser's budget is charged with them.
+
+## Consequences
+
+- The sandbox mounts registry images without root and without a
+  flattening step, with overlayfs's merge rules.
+- The runner gains one more C-backed path, ring's SHA-256, inside the
+  crate that already holds ring.
+- `boneli-sys` grows by four path-based primitives and a `syncfs`
+  wrapper; `unsafe` stays there.
+- Every commit costs one `syncfs`, which also writes back other dirty
+  data on the store's filesystem (D8).
+- Images that need devices, setuid bits, xattrs, sparse files, V7 tar,
+  layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
+- `boneli-oci` is on the always-review list (#7 STOP 1).
+
+## Alternatives considered
+
+Flattening (D1), the `tar` crate (D4), `flate2` and the `zstd` crate (D5),
+`sha2`, our own SHA-256 and a pure-Rust TLS provider (D6), each with the
+reason it lost in its decision.
+
+## Accept when
+
+Part 3 of #7 pulls `node:22` and `postgres:17` on x86_64 and arm64 and runs
+both in the sandbox.
