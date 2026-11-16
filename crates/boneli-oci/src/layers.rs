@@ -67,7 +67,10 @@ impl LayerCache {
     /// Refuses a `layers/sha256/` where names alias each other (a
     /// case-insensitive or normalizing directory, D8): there a symlink
     /// named `A` replaces the directory `a`. Probed by creating one name
-    /// and looking up its case-folded and its decomposed form.
+    /// and looking up its case-folded and its decomposed form. Probe names
+    /// carry the pid, the process start time and a counter, and a name
+    /// that exists is skipped, never removed, so a crashed process's
+    /// leftover blocks no later one.
     pub fn new(root: &Path) -> Result<LayerCache, Error> {
         let layers = root.join("layers").join("sha256");
         DirBuilder::new()
@@ -75,26 +78,14 @@ impl LayerCache {
             .mode(0o700)
             .create(&layers)
             .map_err(|e| cache_err(&layers, e))?;
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let start = own_start_time()?;
         let pid = std::process::id();
-        for (created, alias) in [
-            (
-                format!(".probe-case-{pid}-{n}"),
-                format!(".PROBE-CASE-{pid}-{n}"),
-            ),
-            (
-                format!(".probe-\u{e9}-{pid}-{n}"),
-                format!(".probe-e\u{301}-{pid}-{n}"),
-            ),
+        for (stem, alias_stem) in [
+            (".probe-case-", ".PROBE-CASE-"),
+            (".probe-\u{e9}-", ".probe-e\u{301}-"),
         ] {
-            let probe = layers.join(&created);
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&probe)
-                .map_err(|e| cache_err(&probe, e))?;
-            let aliased = fs::symlink_metadata(layers.join(&alias));
+            let (probe, alias) = create_probe(&layers, pid, start, stem, alias_stem)?;
+            let aliased = fs::symlink_metadata(&alias);
             fs::remove_file(&probe).map_err(|e| cache_err(&probe, e))?;
             match aliased {
                 Ok(_) => return Err(Error::CaseInsensitive(layers)),
@@ -253,6 +244,44 @@ impl LayerCache {
     }
 }
 
+/// How many probe names `create_probe` tries before it gives up.
+const PROBE_ATTEMPTS: u32 = 1024;
+
+/// Creates a new probe file `<stem><pid>.<start>.<n>` in `layers` and
+/// returns it with its alias `<alias_stem><pid>.<start>.<n>`. A name that
+/// exists already is skipped, never removed: it may be a leftover of a
+/// crashed process with the same pid, or the probe of a live process in
+/// another PID namespace, and only its owner may delete it.
+fn create_probe(
+    layers: &Path,
+    pid: u32,
+    start: u64,
+    stem: &str,
+    alias_stem: &str,
+) -> Result<(PathBuf, PathBuf), Error> {
+    for _ in 0..PROBE_ATTEMPTS {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let probe = layers.join(format!("{stem}{pid}.{start}.{n}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let alias = layers.join(format!("{alias_stem}{pid}.{start}.{n}"));
+                return Ok((probe, alias));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(cache_err(&probe, e)),
+        }
+    }
+    Err(cache_err(
+        layers,
+        io::Error::other("no free name for the case probe"),
+    ))
+}
+
 /// Makes the entries of the directory `dir` durable.
 fn sync_dir(dir: &Path) -> Result<(), Error> {
     File::open(dir)
@@ -378,9 +407,8 @@ mod tests {
     #[test]
     fn removal_lists_each_directory_once() {
         use std::os::unix::fs::PermissionsExt;
-        let root =
-            std::env::temp_dir().join(format!("boneli-oci-unit-remove-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = crate::scratch::ScratchDir::new("remove");
+        let root = scratch.path().join("tree");
         std::fs::create_dir(&root).expect("root");
         for i in 0..1000 {
             let d = root.join(format!("d{i}"));

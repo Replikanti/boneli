@@ -231,3 +231,43 @@ fn names(dir: &Path) -> Vec<String> {
     v.sort();
     v
 }
+
+/// This process's start time in clock ticks, field 22 of /proc/self/stat.
+fn own_start_time() -> String {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("stat");
+    let after = &stat[stat.rfind(')').expect("comm") + 1..];
+    after
+        .split_whitespace()
+        .nth(19)
+        .expect("starttime")
+        .to_string()
+}
+
+/// A crash between the case probe's create and its unlink leaves the probe
+/// behind. A later process with the same pid (deterministic in a
+/// container) must still open the store, and must not delete a probe that
+/// another live process, perhaps in another PID namespace, may be using.
+#[test]
+fn leftover_probes_do_not_block_open() {
+    let store = TempDir::new("probe-leftover");
+    let layers = store.path().join("layers/sha256");
+    std::fs::create_dir_all(&layers).expect("layers");
+    let pid = std::process::id();
+    let start = own_start_time();
+    let mut planted = Vec::new();
+    for n in 0..64 {
+        for name in [
+            format!(".probe-case-{pid}-{n}"),
+            format!(".probe-\u{e9}-{pid}-{n}"),
+            format!(".probe-case-{pid}.{start}.{n}"),
+            format!(".probe-\u{e9}-{pid}.{start}.{n}"),
+        ] {
+            std::fs::write(layers.join(&name), b"").expect("leftover");
+            planted.push(name);
+        }
+    }
+    LayerCache::new(store.path()).expect("leftovers do not block the store");
+    for name in &planted {
+        assert!(layers.join(name).exists(), "{name} was deleted");
+    }
+}

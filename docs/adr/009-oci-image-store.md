@@ -372,7 +372,12 @@ the store will use, and why:
   for a second probe with a precomposed `é`, its decomposed form; if
   either lookup finds the file, the directory is case-insensitive or
   normalizing (ext4 or f2fs casefold, tmpfs `casefold`, ZFS
-  `normalization`, vfat), and the store fails closed. A probe rather
+  `normalization`, vfat), and the store fails closed. A probe is named
+  `.probe-…-<pid>.<starttime>.<n>`; a name that exists is skipped and
+  never removed, because it may be a crashed process's leftover with the
+  same pid (deterministic in a container) or the live probe of a runner
+  in another PID namespace sharing the store, and only its owner may
+  delete it. A probe rather
   than the casefold inode flag, because it also catches filesystems that
   alias without that flag. Why checking that one directory suffices:
   casefold is a directory flag that only an empty directory can take and

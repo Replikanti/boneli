@@ -20,6 +20,8 @@ mod error;
 mod gzip;
 mod layers;
 mod limits;
+#[cfg(test)]
+mod scratch;
 mod tar;
 mod unpack;
 mod zstd;

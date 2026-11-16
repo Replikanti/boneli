@@ -598,19 +598,9 @@ fn set_times(file: &File, t: Mtime) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{Entry, Kind, Layer, Mtime};
     use crate::limits::{Budget, Limits};
     use crate::tar::Reader;
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("boneli-oci-unit-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).expect("scratch dir");
-        dir
-    }
 
     fn symlink_at(path: String) -> Entry {
         Entry {
@@ -631,7 +621,8 @@ mod tests {
     /// and the machine do not matter.
     #[test]
     fn verified_parents_are_not_walked_again() {
-        let root = scratch("parents");
+        let scratch = crate::scratch::ScratchDir::new("parents");
+        let root = scratch.path().to_path_buf();
         let budget =
             Budget::new(Limits::new(1 << 32, 1 << 34, 1 << 20, 1 << 20, 128).expect("limits"));
         let mut layer = Layer::new(&root, &budget);
@@ -649,6 +640,5 @@ mod tests {
             .entry(symlink_at(sibling), &mut reader)
             .expect("entry");
         assert_eq!(layer.parent_lstats, 128);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
