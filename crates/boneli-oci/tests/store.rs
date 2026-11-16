@@ -1,0 +1,595 @@
+//! The store (ADR-009, D8) against the fake registry: one test per store
+//! edge case of the #7 plan, part 3.
+
+mod support;
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
+use boneli_oci::{Error, Limits, OciImageStore};
+
+use support::TempDir;
+use support::images::{Layer, blob_requests, config, manifest_requests, open, push};
+use support::registry::{Fake, Hub, Reply};
+use support::tarball::Tar;
+
+fn image_ref(name: &str, digest: &str) -> ImageRef {
+    ImageRef {
+        name: name.to_owned(),
+        digest: digest.to_owned(),
+        platform: "linux/amd64".to_owned(),
+    }
+}
+
+fn hub_fake(hub: Hub) -> Fake {
+    Fake::new(move |s| hub.handle(s))
+}
+
+/// A hub with `library/app`: three layers, the middle one gzip.
+fn app_hub() -> (Hub, support::images::Pushed) {
+    let mut hub = Hub::default();
+    let pushed = push(
+        &mut hub,
+        "library/app",
+        &[
+            Layer::file("etc/base", b"base\n"),
+            Layer::gzip(Tar::new().file("usr/bin/tool", 0o755, b"#!\n").finish()),
+            Layer::file("etc/top", b"top\n"),
+        ],
+        r#"{"User":"999","Env":["PATH=/usr/bin:/bin","LANG=C"],"Entrypoint":null,"Cmd":["tool","--version"],"WorkingDir":"/srv"}"#,
+    );
+    (hub, pushed)
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+fn assert_root_refused(root: &Path, fake: &Fake, why: &str) {
+    match OciImageStore::open(root, config(fake)) {
+        Err(Error::Root { .. }) => {}
+        other => panic!("{why}: {root:?} gave {other:?}"),
+    }
+}
+
+/// A relative root, `~/x` (relative, never expanded), `file:///x`, a root
+/// with `,`, `:` or `\`, or one that is not UTF-8 is refused. A symlinked
+/// root is resolved, then checked: a link to a name with `:` is refused,
+/// a link to a clean directory is accepted and the store reports the
+/// resolved root.
+#[test]
+fn root_path_forms() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("root-forms");
+    for relative in ["store", "~/store", "file:///store", "./store"] {
+        assert_root_refused(Path::new(relative), &fake, "relative");
+    }
+    for bad in ["a,b", "a:b", "a\\b"] {
+        assert_root_refused(&tmp.path().join(bad), &fake, "overlay separator");
+        assert!(!tmp.path().join(bad).exists(), "{bad} was created");
+    }
+    let not_utf8 = {
+        use std::os::unix::ffi::OsStrExt;
+        tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"))
+    };
+    assert_root_refused(&not_utf8, &fake, "not UTF-8");
+
+    let colon = tmp.path().join("real:dir");
+    std::fs::create_dir(&colon).expect("dir");
+    std::fs::set_permissions(&colon, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let link = tmp.path().join("link-to-colon");
+    std::os::unix::fs::symlink(&colon, &link).expect("symlink");
+    assert_root_refused(&link, &fake, "a link resolving to ':'");
+
+    let clean = tmp.path().join("clean");
+    std::fs::create_dir(&clean).expect("dir");
+    std::fs::set_permissions(&clean, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let link = tmp.path().join("link-to-clean");
+    std::os::unix::fs::symlink(&clean, &link).expect("symlink");
+    let store = OciImageStore::open(&link, config(&fake)).expect("a clean link");
+    assert_eq!(store.root(), clean.canonicalize().expect("resolve"));
+}
+
+/// A missing root is created `0o700`; an existing one with a group or
+/// other bit is refused, `0o700` is accepted.
+#[test]
+fn root_mode_rules() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("root-mode");
+    let fresh = tmp.path().join("fresh");
+    open(&fresh, &fake);
+    let mode = std::fs::metadata(&fresh)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o700);
+    for refused in [0o750, 0o701, 0o710, 0o707] {
+        let root = tmp.path().join(format!("m{refused:o}"));
+        std::fs::create_dir(&root).expect("dir");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(refused)).expect("chmod");
+        assert_root_refused(&root, &fake, "group or other bits");
+    }
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"").expect("file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert_root_refused(&file, &fake, "not a directory");
+    let ok = tmp.path().join("ok");
+    std::fs::create_dir(&ok).expect("dir");
+    std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    open(&ok, &fake);
+}
+
+/// The same image pulled again after the store is reopened: the same
+/// `RootfsRef`, and not one request.
+#[test]
+fn pull_idempotent_across_reopen() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("reopen");
+    let root = tmp.path().join("store");
+    let image = image_ref("library/app", &pushed.index);
+    let first = open(&root, &fake).pull(&image).expect("first pull");
+    assert_eq!(first.as_str(), pushed.manifest);
+    let requests = fake.seen().len();
+    let again = open(&root, &fake).pull(&image).expect("second pull");
+    assert_eq!(again, first);
+    assert_eq!(fake.seen().len(), requests, "the second pull made requests");
+}
+
+/// A pull that fails at the 5th of 8 layers, then a second pull: only the
+/// blobs of the layers not yet committed are requested.
+#[test]
+fn resume_fetches_only_missing() {
+    let mut hub = Hub::default();
+    let layers: Vec<Layer> = (0..8)
+        .map(|i| Layer::file(&format!("f{i}"), format!("layer {i}").as_bytes()))
+        .collect();
+    let pushed = push(&mut hub, "library/eight", &layers, "");
+    let fifth = pushed.blobs[4].clone();
+    let fail = Arc::new(AtomicBool::new(true));
+    let fake = {
+        let fail = Arc::clone(&fail);
+        Fake::new(move |s| {
+            if s.target.ends_with(&fifth) && fail.load(Ordering::SeqCst) {
+                Reply::status(503)
+            } else {
+                hub.handle(s)
+            }
+        })
+    };
+    let tmp = TempDir::new("resume");
+    let store = open(&tmp.path().join("store"), &fake);
+    let image = image_ref("library/eight", &pushed.index);
+    match store.pull(&image) {
+        Err(ImageError::Failed { detail }) => assert!(detail.contains("503"), "{detail}"),
+        other => panic!("the 5th layer must fail the pull: {other:?}"),
+    }
+    let before = fake.seen().len();
+    fail.store(false, Ordering::SeqCst);
+    store.pull(&image).expect("the second pull");
+    let seen = fake.seen();
+    let second = seen.get(before..).expect("requests of the second pull");
+    assert_eq!(blob_requests(second), pushed.blobs[4..].to_vec());
+    assert!(manifest_requests(second).is_empty(), "{second:?}");
+}
+
+/// Two stores on one root pull the same image from two threads: both
+/// succeed with the same `RootfsRef`, the layer directories are intact,
+/// and no temporary name is left behind.
+#[test]
+fn concurrent_pulls_two_stores() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("two-stores");
+    let root = tmp.path().join("store");
+    let image = image_ref("library/app", &pushed.index);
+    for round in 0..8 {
+        let root = root.join(format!("r{round}"));
+        std::fs::create_dir_all(root.parent().expect("parent")).expect("dirs");
+        let a = open(&root, &fake);
+        let b = open(&root, &fake);
+        let (ra, rb) = std::thread::scope(|s| {
+            let ta = s.spawn(|| a.pull(&image));
+            let tb = s.spawn(|| b.pull(&image));
+            (ta.join().expect("a"), tb.join().expect("b"))
+        });
+        let ra = ra.expect("store a");
+        assert_eq!(Ok(ra.clone()), rb);
+        let layers = a.layers(&ra).expect("layers");
+        assert_eq!(b.layers(&ra).expect("layers"), layers);
+        for (layer, want) in layers.iter().zip(["etc/base", "usr/bin/tool", "etc/top"]) {
+            assert!(
+                layer.join(want).is_file(),
+                "{} lacks {want}",
+                layer.display()
+            );
+        }
+        for dir in ["layers/sha256", "blobs/sha256"] {
+            let dots: Vec<String> = names_in(&a.root().join(dir))
+                .into_iter()
+                .filter(|n| n.starts_with('.'))
+                .collect();
+            assert!(dots.is_empty(), "round {round}: {dir} keeps {dots:?}");
+        }
+    }
+}
+
+/// This process's PID namespace inode, from `/proc/self/ns/pid`.
+fn own_pidns() -> u64 {
+    let link = std::fs::read_link("/proc/self/ns/pid").expect("ns link");
+    link.to_str()
+        .and_then(|l| l.strip_prefix("pid:["))
+        .and_then(|l| l.strip_suffix(']'))
+        .and_then(|l| l.parse().ok())
+        .expect("pid:[inode]")
+}
+
+/// The start time of `pid`, field 22 of its stat.
+fn start_of(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let after = &stat[stat.rfind(')').expect("comm") + 1..];
+    after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|f| f.parse().ok())
+        .expect("starttime")
+}
+
+/// The name format of ADR-009 D8: `<prefix><pidns>.<pid>.<start>.<n>`,
+/// zero-padded to 20, 10, 20 and 20 digits.
+fn owned(prefix: &str, pidns: u64, pid: u32, start: u64, n: u64) -> String {
+    format!("{prefix}{pidns:020}.{pid:010}.{start:020}.{n:020}")
+}
+
+/// At `open`, a temporary name whose owner is gone (no such pid, or the pid
+/// reused with another start time) is removed, a tree as well as a file,
+/// in `layers/sha256/` and `blobs/sha256/`. A live owner's names stay, and
+/// so do the names of an owner in another PID namespace, whose processes
+/// this one cannot see, and dot names that carry no owner.
+#[test]
+fn stale_tmp_rules() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("stale");
+    let root = tmp.path().join("store");
+    drop(open(&root, &fake));
+    let layers = root.join("layers/sha256");
+    let blobs = root.join("blobs/sha256");
+
+    let ns = own_pidns();
+    let me = std::process::id();
+    let my_start = start_of(me);
+    let dead = {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait");
+        pid
+    };
+    let mut sleeper = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn sleep");
+    let live = sleeper.id();
+    let live_start = start_of(live);
+
+    let removed = [
+        (layers.join(owned(".tmp-", ns, dead, my_start, 1)), true),
+        (layers.join(owned(".tmp-", ns, me, my_start - 1, 2)), true),
+        (
+            layers.join(format!("{}.stats", owned(".tmp-", ns, dead, 7, 3))),
+            false,
+        ),
+        (layers.join(owned(".probe-case-", ns, dead, 7, 4)), false),
+        (layers.join(owned(".probe-\u{e9}-", ns, dead, 7, 5)), false),
+        (blobs.join(owned(".tmp-", ns, dead, 7, 6)), false),
+    ];
+    let kept = [
+        layers.join(owned(".tmp-", ns, me, my_start, 1)),
+        layers.join(owned(".tmp-", ns, live, live_start, 2)),
+        layers.join(owned(".tmp-", ns + 1, dead, 7, 3)),
+        blobs.join(owned(".tmp-", ns + 1, dead, 7, 4)),
+        layers.join(".tmp-1234.5678.0"),
+        layers.join(".unrelated"),
+    ];
+    for (path, tree) in &removed {
+        if *tree {
+            std::fs::create_dir_all(path.join("a/b")).expect("tree");
+            std::fs::write(path.join("a/b/f"), b"x").expect("file");
+            std::fs::set_permissions(path.join("a"), std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+        } else {
+            std::fs::write(path, b"x").expect("file");
+        }
+    }
+    for path in &kept {
+        std::fs::create_dir(path).expect("kept");
+    }
+
+    drop(open(&root, &fake));
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    for (path, _) in &removed {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} was kept",
+            path.display()
+        );
+    }
+    for path in &kept {
+        assert!(path.is_dir(), "{} was removed", path.display());
+    }
+}
+
+/// A manifest that lists one `diff_id` twice: `layers` returns it once, at
+/// its topmost position.
+#[test]
+fn duplicate_diff_id_keeps_topmost() {
+    let mut hub = Hub::default();
+    let a = Layer::file("a", b"a");
+    let b = Layer::file("b", b"b");
+    let pushed = push(
+        &mut hub,
+        "library/dup",
+        &[a.clone(), b.clone(), a.clone()],
+        "",
+    );
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("dup");
+    let store = open(&tmp.path().join("store"), &fake);
+    let rootfs = store
+        .pull(&image_ref("library/dup", &pushed.index))
+        .expect("pull");
+    let layers = store.layers(&rootfs).expect("layers");
+    let names: Vec<String> = layers
+        .iter()
+        .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+        .collect();
+    let hex = |d: &str| d.trim_start_matches("sha256:").to_owned();
+    assert_eq!(names, vec![hex(&b.diff_id), hex(&a.diff_id)]);
+}
+
+/// `pull`, then `layers` and `config`; the store reopened, then `layers`
+/// and `config` again: equal. The config carries the runtime fields. An
+/// unknown or malformed `RootfsRef` is `Failed`.
+#[test]
+fn rootfs_ref_round_trip() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("round-trip");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let rootfs = store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let layers = store.layers(&rootfs).expect("layers");
+    let config = store.config(&rootfs).expect("config");
+    assert_eq!(layers.len(), 3);
+    assert_eq!(config.user.as_deref(), Some("999"));
+    assert_eq!(config.env, ["PATH=/usr/bin:/bin", "LANG=C"]);
+    assert!(config.entrypoint.is_empty());
+    assert_eq!(config.cmd, ["tool", "--version"]);
+    assert_eq!(config.working_dir.as_deref(), Some("/srv"));
+    drop(store);
+    let store = open(&root, &fake);
+    let reopened = RootfsRef::new(rootfs.as_str().to_owned());
+    assert_eq!(store.layers(&reopened).expect("layers"), layers);
+    assert_eq!(store.config(&reopened).expect("config"), config);
+}
+
+#[test]
+fn unknown_rootfs_refused() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("unknown-rootfs");
+    let store = open(&tmp.path().join("store"), &fake);
+    store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let zeros = format!("sha256:{}", "0".repeat(64));
+    for bad in [
+        zeros.as_str(),
+        "rootfs-1",
+        "sha256:XYZ",
+        "",
+        // The index is in the store, but it is not a manifest.
+        pushed.index.as_str(),
+        // So is the config, which is not a manifest either.
+        pushed.config.as_str(),
+    ] {
+        let rootfs = RootfsRef::new(bad.to_owned());
+        for got in [
+            store.layers(&rootfs).map(|_| ()),
+            store.config(&rootfs).map(|_| ()),
+        ] {
+            match got {
+                Err(ImageError::Failed { detail }) => assert!(!detail.trim().is_empty()),
+                other => panic!("{bad:?} gave {other:?}"),
+            }
+        }
+    }
+}
+
+/// After a pull the compressed layer blobs are gone and the index,
+/// manifest and config are kept, each with its `.type`.
+#[test]
+fn blob_retention() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("retention");
+    let store = open(&tmp.path().join("store"), &fake);
+    store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let hex = |d: &str| d.trim_start_matches("sha256:").to_owned();
+    let mut want: Vec<String> = [&pushed.index, &pushed.manifest, &pushed.config]
+        .iter()
+        .flat_map(|d| [hex(d), format!("{}.type", hex(d))])
+        .collect();
+    want.sort();
+    assert_eq!(names_in(&store.root().join("blobs/sha256")), want);
+}
+
+/// A cached document that no longer hashes to its digest is fetched again;
+/// the pull still succeeds and gives the same `RootfsRef`.
+#[test]
+fn corrupt_cached_json_refetched() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("corrupt");
+    let store = open(&tmp.path().join("store"), &fake);
+    let image = image_ref("library/app", &pushed.index);
+    let first = store.pull(&image).expect("pull");
+    let blobs = store.root().join("blobs/sha256");
+    for digest in [&pushed.index, &pushed.manifest, &pushed.config] {
+        let path = blobs.join(digest.trim_start_matches("sha256:"));
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[0] ^= 0x20;
+        std::fs::write(&path, &bytes).expect("corrupt");
+    }
+    let before = fake.seen().len();
+    assert_eq!(store.pull(&image).expect("second pull"), first);
+    let seen = fake.seen();
+    let second = seen.get(before..).expect("requests");
+    assert_eq!(
+        manifest_requests(second),
+        vec![pushed.index.clone(), pushed.manifest.clone()]
+    );
+    assert_eq!(blob_requests(second), vec![pushed.config.clone()]);
+}
+
+/// The image caps count layers already in the cache (D7): an image whose
+/// second layer is cached and whose total is over the cap is refused, warm
+/// as well as cold.
+#[test]
+fn image_caps_count_cached_layers() {
+    let mut hub = Hub::default();
+    let shared = Layer::file("shared", &[b's'; 3000]);
+    let small = push(&mut hub, "library/small", std::slice::from_ref(&shared), "");
+    let big = push(
+        &mut hub,
+        "library/big",
+        &[Layer::file("own", &[b'o'; 3000]), shared],
+        "",
+    );
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("caps");
+    let capped = |root: &Path| {
+        let mut config = config(&fake);
+        // Each layer is 4,608 B of tar: a 512 B header, 3,000 B padded to
+        // 3,072 and two 512 B zero blocks. 6,000 admits one, not two.
+        config.limits = Limits::new(1 << 20, 6_000, 1 << 20, 1 << 20, 128).expect("limits");
+        OciImageStore::open(root, config).expect("open")
+    };
+    let warm = capped(&tmp.path().join("warm"));
+    warm.pull(&image_ref("library/small", &small.index))
+        .expect("one layer fits");
+    let cold = capped(&tmp.path().join("cold"));
+    for (what, store) in [("warm", &warm), ("cold", &cold)] {
+        match store.pull(&image_ref("library/big", &big.index)) {
+            Err(ImageError::Failed { detail }) => {
+                assert!(
+                    detail.contains("uncompressed image size"),
+                    "{what}: {detail}"
+                )
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+}
+
+/// The store's own root is reported resolved, so a caller can build the
+/// sandbox's layer paths from it.
+#[test]
+fn layers_live_under_the_root() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("under-root");
+    let store = open(&tmp.path().join("store"), &fake);
+    let rootfs = store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let base: PathBuf = store.root().join("layers/sha256");
+    for layer in store.layers(&rootfs).expect("layers") {
+        assert_eq!(layer.parent(), Some(base.as_path()));
+    }
+}
+
+/// A dial that panics once, then dials `fake`.
+struct PanicOnce {
+    fake: Fake,
+    armed: AtomicBool,
+}
+
+impl boneli_oci::Dial for PanicOnce {
+    fn dial(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Box<dyn boneli_oci::Stream>> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            panic!("a dial that panics inside the store's lock");
+        }
+        self.fake.dial(host, port, deadline)
+    }
+}
+
+/// A pull that panics while it holds the store's lock poisons it; disk
+/// state commits only by rename, so the next pull recovers the lock
+/// (ADR-004, D8) and succeeds.
+#[test]
+fn poisoned_lock_recovered() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let mut config = config(&fake);
+    config.dial = Box::new(PanicOnce {
+        fake: fake.clone(),
+        armed: AtomicBool::new(true),
+    });
+    let tmp = TempDir::new("poison");
+    let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+    let image = image_ref("library/app", &pushed.index);
+    let panicked = std::thread::scope(|s| s.spawn(|| store.pull(&image)).join().is_err());
+    assert!(panicked, "the first pull panics");
+    store.pull(&image).expect("the lock is recovered");
+}
+
+/// A layer blob already on disk is used when it hashes to its digest and
+/// is fetched again when it does not.
+#[test]
+fn kept_layer_blob_used_only_if_it_hashes() {
+    let (hub, pushed) = app_hub();
+    let blobs: Vec<Vec<u8>> = pushed
+        .blobs
+        .iter()
+        .map(|d| hub.blobs.get(d).expect("blob").clone())
+        .collect();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("kept-blob");
+    let store = open(&tmp.path().join("store"), &fake);
+    let dir = store.root().join("blobs/sha256");
+    let path = |d: &str| dir.join(d.trim_start_matches("sha256:"));
+    std::fs::write(path(&pushed.blobs[0]), &blobs[0]).expect("an intact copy");
+    let mut bad = blobs[2].clone();
+    bad[0] ^= 1;
+    std::fs::write(path(&pushed.blobs[2]), &bad).expect("a corrupt copy");
+    store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    assert_eq!(
+        blob_requests(&fake.seen())
+            .into_iter()
+            .filter(|d| pushed.blobs.contains(d))
+            .collect::<Vec<_>>(),
+        pushed.blobs[1..].to_vec()
+    );
+}

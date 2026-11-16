@@ -243,6 +243,82 @@ fn own_start_time() -> String {
         .to_string()
 }
 
+/// This process's PID namespace inode, from `/proc/self/ns/pid`.
+fn own_pidns() -> u64 {
+    let link = std::fs::read_link("/proc/self/ns/pid").expect("ns link");
+    link.to_str()
+        .and_then(|l| l.strip_prefix("pid:["))
+        .and_then(|l| l.strip_suffix(']'))
+        .and_then(|l| l.parse().ok())
+        .expect("pid:[inode]")
+}
+
+/// A layer whose deepest path is exactly `PATH_MAX - 1` (4,095) bytes at
+/// its staging name unpacks, and once committed every path in it is
+/// shorter, so a path-based walk of the committed tree (a later GC, #56)
+/// cannot hit `ENAMETOOLONG`; one byte more is refused while it is
+/// unpacked. A staging name shorter than the 64 hex digits of the commit
+/// would let the second layer through and leave committed paths over the
+/// limit (review of #58).
+#[test]
+fn committed_layer_paths_fit_path_max() {
+    let store = TempDir::new("path-max");
+    let layers = store.path().join("layers/sha256");
+    let cache = LayerCache::new(store.path()).expect("cache");
+    let staging_dir = layers.as_os_str().len() + 1 + LayerCache::STAGING_NAME_LEN;
+    let layer = |rel_len: usize| {
+        // Components of 200 bytes and a shorter last one, `/`-joined.
+        let mut rel = String::new();
+        while rel.len() + 201 < rel_len {
+            rel.push_str(&"d".repeat(200));
+            rel.push('/');
+        }
+        rel.push_str(&"f".repeat(rel_len - rel.len()));
+        let bytes = Tar::new()
+            .pax(&[("path", rel.as_bytes())])
+            .file("placeholder", 0o644, b"deep\n")
+            .finish();
+        (rel, bytes)
+    };
+    let fits = 4095 - staging_dir - 1;
+    let (rel, bytes) = layer(fits);
+    let id = Sha256::digest(&bytes);
+    let stats = cache
+        .unpack(
+            &id,
+            Compression::None,
+            &bytes[..],
+            &mut Budget::new(limits()),
+        )
+        .expect("a path of 4,095 bytes at the staging name unpacks");
+    assert_eq!(stats.diff_id, id);
+    let committed = cache.layer_path(&id).join(&rel);
+    assert!(
+        committed.as_os_str().len() < 4095,
+        "{}",
+        committed.as_os_str().len()
+    );
+    assert_eq!(
+        std::fs::read(&committed).expect("readable by path"),
+        b"deep\n"
+    );
+
+    let (_, longer) = layer(fits + 1);
+    let id = Sha256::digest(&longer);
+    match cache.unpack(
+        &id,
+        Compression::None,
+        &longer[..],
+        &mut Budget::new(limits()),
+    ) {
+        Err(Error::Write { source, .. }) => {
+            assert_eq!(source.raw_os_error(), Some(36), "ENAMETOOLONG: {source}")
+        }
+        other => panic!("a path of 4,096 bytes at the staging name: {other:?}"),
+    }
+    assert!(cache.cached(&id).expect("lookup").is_none());
+}
+
 /// A crash between the case probe's create and its unlink leaves the probe
 /// behind. A later process with the same pid (deterministic in a
 /// container) must still open the store, and must not delete a probe that
@@ -254,6 +330,11 @@ fn leftover_probes_do_not_block_open() {
     std::fs::create_dir_all(&layers).expect("layers");
     let pid = std::process::id();
     let start = own_start_time();
+    let token = format!(
+        "{:020}.{pid:010}.{:020}",
+        own_pidns(),
+        start.parse::<u64>().expect("start")
+    );
     let mut planted = Vec::new();
     for n in 0..64 {
         for name in [
@@ -261,6 +342,8 @@ fn leftover_probes_do_not_block_open() {
             format!(".probe-\u{e9}-{pid}-{n}"),
             format!(".probe-case-{pid}.{start}.{n}"),
             format!(".probe-\u{e9}-{pid}.{start}.{n}"),
+            format!(".probe-case-{token}.{n:020}"),
+            format!(".probe-\u{e9}-{token}.{n:020}"),
         ] {
             std::fs::write(layers.join(&name), b"").expect("leftover");
             planted.push(name);

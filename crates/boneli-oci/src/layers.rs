@@ -2,9 +2,10 @@
 //! `diff_id`, under `<root>/layers/sha256/<hex>`, with a sidecar
 //! `<hex>.stats` next to it.
 //!
-//! A layer is unpacked into `<root>/layers/sha256/.tmp-<pid>.<starttime>.<n>/`
-//! while its uncompressed stream is hashed; lookups use hex names only, so
-//! they never see a dot name. On a `diff_id` match the sidecar is written
+//! A layer is unpacked into `<root>/layers/sha256/.tmp-<owner>.<n>/` while
+//! its uncompressed stream is hashed, where `<owner>` names this process by
+//! its PID namespace, pid and start time ([`Owner`]); lookups use hex names
+//! only, so they never see a dot name. On a `diff_id` match the sidecar is written
 //! (to a staged file, then renamed), and then the directory is renamed to
 //! its hex name: that rename, within one directory, is the commit point.
 //! One `syncfs` before the renames and an `fsync` of `layers/sha256/` after
@@ -60,17 +61,25 @@ struct Staging {
 }
 
 impl LayerCache {
+    /// The length of the name a layer is unpacked under before it is
+    /// renamed to its 64 hex digits (D8). It is longer, so a committed
+    /// layer's paths are shorter than the ones the unpacker created, and
+    /// every one of them still fits `PATH_MAX`; a layer whose deepest path
+    /// would not fit at the staging name is refused while it is unpacked.
+    pub const STAGING_NAME_LEN: usize = TEMPORARY_NAME_LEN;
+
     /// The cache under `root`, creating `layers/sha256/` with mode `0o700`
-    /// where it is missing. The store (#7, part 3) checks the root itself:
-    /// absolute, private, owned by the caller.
+    /// where it is missing. The store ([`crate::OciImageStore`]) checks the
+    /// root itself: absolute, private, owned by the caller.
     ///
     /// Refuses a `layers/sha256/` where names alias each other (a
     /// case-insensitive or normalizing directory, D8): there a symlink
     /// named `A` replaces the directory `a`. Probed by creating one name
     /// and looking up its case-folded and its decomposed form. Probe names
-    /// carry the pid, the process start time and a counter, and a name
-    /// that exists is skipped, never removed, so a crashed process's
-    /// leftover blocks no later one.
+    /// carry the owner (PID namespace, pid, start time) and a counter, and
+    /// a name that exists is skipped, never removed here, so a crashed
+    /// process's leftover blocks no later one; the store removes it once
+    /// its owner is gone.
     pub fn new(root: &Path) -> Result<LayerCache, Error> {
         let layers = root.join("layers").join("sha256");
         DirBuilder::new()
@@ -78,13 +87,13 @@ impl LayerCache {
             .mode(0o700)
             .create(&layers)
             .map_err(|e| cache_err(&layers, e))?;
-        let start = own_start_time()?;
-        let pid = std::process::id();
+        let owner = Owner::current()?;
         for (stem, alias_stem) in [
             (".probe-case-", ".PROBE-CASE-"),
             (".probe-\u{e9}-", ".probe-e\u{301}-"),
         ] {
-            let (probe, alias) = create_probe(&layers, pid, start, stem, alias_stem)?;
+            let (probe, n) = create_probe(&layers, &owner, stem)?;
+            let alias = layers.join(format!("{alias_stem}{}.{n}", owner.token()));
             let aliased = fs::symlink_metadata(&alias);
             fs::remove_file(&probe).map_err(|e| cache_err(&probe, e))?;
             match aliased {
@@ -163,9 +172,8 @@ impl LayerCache {
         result
     }
 
-    /// A new, empty `layers/sha256/.tmp-<pid>.<starttime>.<n>` directory
-    /// and its descriptor. The start time tells a live owner from a reused
-    /// pid when the store cleans up.
+    /// A new, empty `layers/sha256/.tmp-<owner>.<n>` directory and its
+    /// descriptor. The owner tells the store's cleanup whose tree it is.
     fn temporary(&self) -> Result<Staging, Error> {
         let name = temporary_name()?;
         let path = self.layers_dir().join(&name);
@@ -242,44 +250,155 @@ impl LayerCache {
     }
 }
 
-/// A new temporary name, `.tmp-<pid>.<starttime>.<n>`: a dot name, so
-/// lookups by hex never see it, and one the store's cleanup can tell from
-/// a live owner's (D8). The registry client stages blobs under such names
-/// too.
+/// A new temporary name, `.tmp-<owner>.<n>`: a dot name, so lookups by hex
+/// never see it, and one the store's cleanup can attribute to its owner
+/// (D8). The registry client stages blobs under such names too. Its length
+/// is fixed at [`TEMPORARY_NAME_LEN`], more than a committed layer's 64 hex
+/// digits, so a tree that fit `PATH_MAX` while it was unpacked still fits
+/// once it is renamed to its hex name.
 pub(crate) fn temporary_name() -> Result<String, Error> {
-    let start = own_start_time()?;
+    let owner = Owner::current()?;
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    Ok(format!(".tmp-{}.{start}.{n}", std::process::id()))
+    Ok(format!(".tmp-{}.{n:020}", owner.token()))
+}
+
+/// A new name `<stem><owner>.<n>` for a probe the store creates itself;
+/// `stem` is one of [`OWNED_PREFIXES`].
+pub(crate) fn owned_name(stem: &str) -> Result<String, Error> {
+    let owner = Owner::current()?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Ok(format!("{stem}{}.{n:020}", owner.token()))
+}
+
+/// The length of every [`temporary_name`]: `.tmp-`, the 52 characters of an
+/// owner token, a dot and a 20-digit counter.
+pub(crate) const TEMPORARY_NAME_LEN: usize = 5 + OWNER_TOKEN_LEN + 1 + 20;
+
+// A committed layer is named by 64 hex digits; its staging name is longer.
+const _: () = assert!(TEMPORARY_NAME_LEN > 64);
+
+/// The length of [`Owner::token`]: 20 + 1 + 10 + 1 + 20.
+const OWNER_TOKEN_LEN: usize = 52;
+
+/// The prefixes of the dot names this crate creates in `layers/sha256/`
+/// and `blobs/sha256/`, each followed by an owner token: staging trees,
+/// staged sidecars and blobs, and the probes of [`LayerCache::new`] and
+/// the store.
+pub(crate) const OWNED_PREFIXES: [&str; 5] = [
+    ".tmp-",
+    ".probe-case-",
+    ".probe-\u{e9}-",
+    ".probe-wh-",
+    ".probe-opq-",
+];
+
+/// The process that owns a temporary name (D8): its PID namespace (the
+/// inode of `/proc/self/ns/pid`), its pid in that namespace and its start
+/// time in clock ticks since boot. The pid alone does not identify a
+/// process: two runners in different PID namespaces can share a store and
+/// have the same pid, and a pid is reused once its process is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pidns: u64,
+    pid: u32,
+    start: u64,
+}
+
+/// Whether the owner of a temporary name is alive, as far as this process
+/// can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// It runs, or a process with its pid and start time does.
+    Alive,
+    /// It is gone: no process has its pid in this PID namespace, or the one
+    /// that has it started at another time.
+    Dead,
+    /// It lives in another PID namespace, whose processes this one may not
+    /// see, so nothing can be concluded and its names are left alone.
+    Unknown,
+}
+
+impl Owner {
+    /// This process.
+    pub(crate) fn current() -> Result<Owner, Error> {
+        Ok(Owner {
+            pidns: own_pid_namespace()?,
+            pid: std::process::id(),
+            start: own_start_time()?,
+        })
+    }
+
+    /// `<pidns>.<pid>.<start>`, zero-padded to fixed widths (20, 10 and 20
+    /// digits), so every name built on it has one length.
+    pub(crate) fn token(&self) -> String {
+        format!("{:020}.{:010}.{:020}", self.pidns, self.pid, self.start)
+    }
+
+    /// The owner of a name `<prefix><token>.<n>` or
+    /// `<prefix><token>.<n>.stats`, with a prefix of [`OWNED_PREFIXES`];
+    /// `None` for any other name.
+    pub(crate) fn of_name(name: &str) -> Option<Owner> {
+        let rest = OWNED_PREFIXES
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix))?;
+        let mut fields = rest.split('.');
+        let mut number = |width: usize| -> Option<u64> {
+            let f = fields.next()?;
+            (f.len() == width && f.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| f.parse().ok())
+                .flatten()
+        };
+        let pidns = number(20)?;
+        let pid = u32::try_from(number(10)?).ok()?;
+        let start = number(20)?;
+        number(20)?;
+        match (fields.next(), fields.next()) {
+            (None, _) | (Some("stats"), None) => Some(Owner { pidns, pid, start }),
+            _ => None,
+        }
+    }
+
+    /// Whether this owner is alive, seen from `me`. In `me`'s PID namespace
+    /// the pid and the start time decide; in any other, nothing does.
+    pub(crate) fn liveness(&self, me: &Owner) -> Liveness {
+        if self.pidns != me.pidns {
+            return Liveness::Unknown;
+        }
+        let path = PathBuf::from(format!("/proc/{}/stat", self.pid));
+        match fs::read(&path) {
+            Ok(stat) if start_time_of(&stat) == Some(self.start) => Liveness::Alive,
+            // A process whose stat cannot be read for another reason than
+            // its absence is alive as far as anyone can tell.
+            Ok(stat) if start_time_of(&stat).is_none() => Liveness::Alive,
+            Ok(_) => Liveness::Dead,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Liveness::Dead,
+            Err(_) => Liveness::Alive,
+        }
+    }
 }
 
 /// How many probe names `create_probe` tries before it gives up.
 const PROBE_ATTEMPTS: u32 = 1024;
 
-/// Creates a new probe file `<stem><pid>.<start>.<n>` in `layers` and
-/// returns it with its alias `<alias_stem><pid>.<start>.<n>`. A name that
-/// exists already is skipped, never removed: it may be a leftover of a
-/// crashed process with the same pid, or the probe of a live process in
-/// another PID namespace, and only its owner may delete it.
-fn create_probe(
+/// Creates a new probe file `<stem><token>.<n>` in `layers` and returns it
+/// with its `n`. A name that exists already is skipped, never removed here:
+/// it is a leftover of a crashed process with the same identity, which the
+/// store's cleanup removes once its owner is gone (D8).
+pub(crate) fn create_probe(
     layers: &Path,
-    pid: u32,
-    start: u64,
+    owner: &Owner,
     stem: &str,
-    alias_stem: &str,
-) -> Result<(PathBuf, PathBuf), Error> {
+) -> Result<(PathBuf, String), Error> {
     for _ in 0..PROBE_ATTEMPTS {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let probe = layers.join(format!("{stem}{pid}.{start}.{n}"));
+        let n = format!("{:020}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let probe = layers.join(format!("{stem}{}.{n}", owner.token()));
         match OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&probe)
         {
-            Ok(_) => {
-                let alias = layers.join(format!("{alias_stem}{pid}.{start}.{n}"));
-                return Ok((probe, alias));
-            }
+            Ok(_) => return Ok((probe, n)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(cache_err(&probe, e)),
         }
@@ -321,19 +440,33 @@ fn parse_sidecar(text: &[u8]) -> Option<(u64, u64, u64)> {
 fn own_start_time() -> Result<u64, Error> {
     let path = Path::new("/proc/self/stat");
     let stat = fs::read(path).map_err(|e| cache_err(path, e))?;
-    let bad = || cache_err(path, io::Error::other("unreadable start time"));
+    start_time_of(&stat).ok_or_else(|| cache_err(path, io::Error::other("unreadable start time")))
+}
+
+/// Field 22 of a `/proc/<pid>/stat` text, the start time.
+fn start_time_of(stat: &[u8]) -> Option<u64> {
     // The command name may contain spaces and parentheses; the fields
     // after the last ')' start with field 3.
     let after = stat
         .iter()
         .rposition(|&b| b == b')')
-        .and_then(|i| stat.get(i + 1..))
-        .ok_or_else(bad)?;
-    let text = std::str::from_utf8(after).map_err(|_| bad())?;
+        .and_then(|i| stat.get(i + 1..))?;
+    let text = std::str::from_utf8(after).ok()?;
     text.split_ascii_whitespace()
         .nth(22 - 3)
         .and_then(|f| f.parse().ok())
-        .ok_or_else(bad)
+}
+
+/// The inode of this process's PID namespace, from the link
+/// `/proc/self/ns/pid`, which reads `pid:[<inode>]`.
+fn own_pid_namespace() -> Result<u64, Error> {
+    let path = Path::new("/proc/self/ns/pid");
+    let link = fs::read_link(path).map_err(|e| cache_err(path, e))?;
+    link.to_str()
+        .and_then(|l| l.strip_prefix("pid:["))
+        .and_then(|l| l.strip_suffix(']'))
+        .and_then(|l| l.parse().ok())
+        .ok_or_else(|| cache_err(path, io::Error::other("unreadable PID namespace")))
 }
 
 /// Removes a temporary tree whose directories may have any final mode.
@@ -407,7 +540,85 @@ pub(crate) fn remove_tree_bounded(top: &Path) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{own_start_time, parse_sidecar};
+    use super::{
+        Liveness, OWNED_PREFIXES, Owner, TEMPORARY_NAME_LEN, own_start_time, parse_sidecar,
+        temporary_name,
+    };
+
+    /// Every temporary name has one length, longer than a committed
+    /// layer's 64 hex digits, so renaming a tree to its hex name never
+    /// makes a path inside it longer (D8).
+    #[test]
+    fn temporary_names_are_longer_than_hex() {
+        for _ in 0..3 {
+            let name = temporary_name().expect("name");
+            assert_eq!(name.len(), TEMPORARY_NAME_LEN, "{name}");
+        }
+    }
+
+    /// Every owned name parses back to its owner; names with a missing,
+    /// short, long or non-digit field, an unknown prefix or a suffix other
+    /// than `.stats` carry no owner.
+    #[test]
+    fn owner_round_trips_through_names() {
+        let me = Owner::current().expect("owner");
+        let token = me.token();
+        assert_eq!(token.len(), 52);
+        for prefix in OWNED_PREFIXES {
+            let name = format!("{prefix}{token}.{:020}", 7);
+            assert_eq!(Owner::of_name(&name), Some(me), "{name}");
+            assert_eq!(
+                Owner::of_name(&format!("{name}.stats")),
+                Some(me),
+                "{name}.stats"
+            );
+        }
+        let n = format!("{:020}", 7);
+        for bad in [
+            format!(".tmp-{token}"),
+            format!(".tmp-{token}.7"),
+            format!(".tmp-{token}.{n}.type"),
+            format!(".tmp-{token}.{n}.stats.x"),
+            format!(".tmp-{token}0.{n}"),
+            format!(".TMP-{token}.{n}"),
+            format!(".other-{token}.{n}"),
+            format!(".tmp-{}.{n}", token.replacen('0', "x", 1)),
+            format!(".tmp-{}.{n}", token.replacen('.', "-", 1)),
+            ".tmp-1234.5678.0".to_owned(),
+            format!(
+                ".tmp-{:020}.{:010}.{:020}.{n}",
+                1,
+                u64::from(u32::MAX) + 1,
+                1
+            ),
+        ] {
+            assert_eq!(Owner::of_name(&bad), None, "{bad}");
+        }
+    }
+
+    /// This process is alive; its pid with another start time is a reused
+    /// pid, so dead; a pid no process has is dead; an owner in another PID
+    /// namespace cannot be judged.
+    #[test]
+    fn liveness_rules() {
+        let me = Owner::current().expect("owner");
+        assert_eq!(me.liveness(&me), Liveness::Alive);
+        let reused = Owner {
+            start: me.start.wrapping_sub(1),
+            ..me
+        };
+        assert_eq!(reused.liveness(&me), Liveness::Dead);
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        let gone = Owner { pid, ..me };
+        assert_eq!(gone.liveness(&me), Liveness::Dead);
+        let foreign = Owner {
+            pidns: me.pidns.wrapping_add(1),
+            ..reused
+        };
+        assert_eq!(foreign.liveness(&me), Liveness::Unknown);
+    }
 
     /// Every directory is listed once, so removing a wide tree is linear:
     /// 1,000 sibling directories take 1,001 listings, not one listing of

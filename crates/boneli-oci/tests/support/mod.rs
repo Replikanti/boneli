@@ -2,7 +2,9 @@
 
 #![allow(dead_code)]
 
+pub mod images;
 pub mod registry;
+pub mod sandbox;
 pub mod tarball;
 
 use std::os::unix::fs::PermissionsExt;

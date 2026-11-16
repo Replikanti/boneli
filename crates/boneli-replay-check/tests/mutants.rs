@@ -29,11 +29,13 @@ fn every_clause_is_killed() {
     }
 }
 
-/// Every clause has a mutant, and `silent-failure-detail` has one per
-/// operation of its port.
+/// Every clause has a mutant, and a clause with sub-checks has one per
+/// sub-check: `silent-failure-detail` per operation of its port,
+/// `tampered-refused` per pull.
 #[test]
 fn mutant_table_covers_every_clause() {
-    let suites: [(&str, &[&str], &[&str]); 11] = [
+    type SubChecks = &'static [(&'static str, &'static [&'static str])];
+    let suites: [(&str, &[&str], SubChecks); 11] = [
         ("EventStore", contract::event_store::CLAUSES, &[]),
         ("Evidence", contract::evidence::CLAUSES, &[]),
         ("Clock", contract::clock::CLAUSES, &[]),
@@ -41,34 +43,41 @@ fn mutant_table_covers_every_clause() {
         (
             "Agent",
             contract::agent::CLAUSES,
-            contract::agent::OPERATIONS,
+            &[("silent-failure-detail", contract::agent::OPERATIONS)],
         ),
         (
             "Verifier",
             contract::verifier::CLAUSES,
-            contract::verifier::OPERATIONS,
+            &[("silent-failure-detail", contract::verifier::OPERATIONS)],
         ),
         (
             "Forge",
             contract::forge::CLAUSES,
-            contract::forge::OPERATIONS,
+            &[("silent-failure-detail", contract::forge::OPERATIONS)],
         ),
         ("Sandbox", contract::sandbox::CLAUSES, &[]),
         ("Git", contract::git::CLAUSES, &[]),
-        ("ImageStore", contract::image::CLAUSES, &[]),
+        (
+            "ImageStore",
+            contract::image::CLAUSES,
+            &[("tampered-refused", contract::image::TAMPERED_PULLS)],
+        ),
         ("DataSnapshot", contract::data::CLAUSES, &[]),
     ];
     let mut wanted = BTreeSet::new();
     let mut clauses = 0;
-    for (port, names, operations) in suites {
+    for (port, names, sub_checks) in suites {
         for &clause in names {
             clauses += 1;
-            if clause == "silent-failure-detail" {
-                for &operation in operations {
-                    wanted.insert((port, clause, operation));
+            match sub_checks.iter().find(|(c, _)| *c == clause) {
+                Some((_, subs)) => {
+                    for &sub in *subs {
+                        wanted.insert((port, clause, sub));
+                    }
                 }
-            } else {
-                wanted.insert((port, clause, ""));
+                None => {
+                    wanted.insert((port, clause, ""));
+                }
             }
         }
     }

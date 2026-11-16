@@ -16,7 +16,7 @@ pub enum Error {
     Read(io::Error),
     /// The gzip framing is invalid (ADR-009, D5).
     Gzip(&'static str),
-    /// The zstd stream is invalid, or its window is above 100 MiB
+    /// The zstd stream is invalid, or its window is above 128 MiB
     /// (ADR-009, D5).
     Zstd(String),
     /// The tar framing is invalid, truncated or uses a refused feature
@@ -69,6 +69,23 @@ pub enum Error {
     /// The store's layer directory treats names that differ in case or in
     /// Unicode normalization as one (ADR-009, D8).
     CaseInsensitive(PathBuf),
+    /// The store root is unusable (ADR-009, D8): not absolute, not UTF-8,
+    /// a name the overlay mount options cannot carry, not a directory, not
+    /// private or not the caller's.
+    Root {
+        /// The root as given, or as resolved.
+        path: PathBuf,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
+    /// The store's filesystem cannot hold the overlay format of D1: no 0:0
+    /// whiteouts or no `user.*` extended attributes.
+    Unsupported {
+        /// Where the probe ran.
+        path: PathBuf,
+        /// What is missing, and why, as the probe saw it.
+        detail: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -97,6 +114,14 @@ impl fmt::Display for Error {
             Error::CaseInsensitive(path) => write!(
                 f,
                 "{} is case-insensitive or normalizes names; a layer store needs exact names",
+                path.display()
+            ),
+            Error::Root { path, reason } => {
+                write!(f, "store root {}: {reason}", path.display())
+            }
+            Error::Unsupported { path, detail } => write!(
+                f,
+                "the filesystem of {} cannot hold overlay layers: {detail}",
                 path.display()
             ),
         }

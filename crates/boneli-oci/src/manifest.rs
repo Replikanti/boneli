@@ -114,10 +114,11 @@ pub enum Document {
     Manifest(Manifest),
 }
 
-/// What part 2 reads of an image config: its platform and the `diff_id`
-/// of each layer. The runtime fields (user, environment, entrypoint)
-/// belong to the store (#7, part 3).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What the store reads of an image config: its platform, the `diff_id`
+/// of each layer and the runtime fields of its `config` object, which the
+/// sandbox (#8) and the environment builder (#32) start the image with.
+/// Absent runtime fields are empty; `null` is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImageConfig {
     /// The operating system.
     pub os: String,
@@ -127,6 +128,16 @@ pub struct ImageConfig {
     pub variant: Option<String>,
     /// The digest of each uncompressed layer, bottom first.
     pub diff_ids: Vec<Digest>,
+    /// `config.User`: `user`, `uid`, `user:group` or `uid:gid`, as written.
+    pub user: Option<String>,
+    /// `config.Env`: `NAME=value` entries, in order.
+    pub env: Vec<String>,
+    /// `config.Entrypoint`.
+    pub entrypoint: Vec<String>,
+    /// `config.Cmd`.
+    pub cmd: Vec<String>,
+    /// `config.WorkingDir`.
+    pub working_dir: Option<String>,
 }
 
 type Object = boneli_json::Object;
@@ -318,11 +329,47 @@ pub(crate) fn parse_config(
         let id = id.as_str().ok_or("a diff_id is not a string")?;
         diff_ids.push(Digest::parse(id).map_err(|e| e.detail().to_owned())?);
     }
+    let runtime = match object.get("config") {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => Some(v.as_object().ok_or("config is not an object")?),
+    };
+    let text = |key: &str| -> Result<Option<String>, String> {
+        match runtime.and_then(|r| r.get(key)) {
+            None => Ok(None),
+            Some(v) if v.is_null() => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(|s| Some(s.to_owned()))
+                .ok_or_else(|| format!("config.{key} is not a string")),
+        }
+    };
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match runtime.and_then(|r| r.get(key)) {
+            None => Ok(Vec::new()),
+            Some(v) if v.is_null() => Ok(Vec::new()),
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| format!("config.{key} is not an array"))?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("config.{key} has an item that is not a string"))
+                })
+                .collect(),
+        }
+    };
     Ok(ImageConfig {
         os,
         architecture,
         variant,
         diff_ids,
+        user: text("User")?,
+        env: list("Env")?,
+        entrypoint: list("Entrypoint")?,
+        cmd: list("Cmd")?,
+        working_dir: text("WorkingDir")?,
     })
 }
 

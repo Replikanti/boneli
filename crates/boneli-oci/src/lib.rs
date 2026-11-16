@@ -23,6 +23,13 @@
 //!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production), with the
 //!   anonymous token flow, checks every byte against its digest, and
 //!   classifies failures as a [`PullError`].
+//!
+//! Part 3 adds the store:
+//!
+//! - [`OciImageStore`] is the `ImageStore` adapter: it opens a private
+//!   root, pulls through the client, keeps documents and layers by digest
+//!   and hands out the layer directories and the image config of a pulled
+//!   root filesystem; [`StoreConfig`] holds the values ADR-009 states.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
@@ -36,6 +43,7 @@ mod reference;
 mod registry;
 #[cfg(test)]
 mod scratch;
+mod store;
 mod tar;
 mod unpack;
 mod url;
@@ -49,5 +57,11 @@ pub use manifest::{Descriptor, Document, Entry, ImageConfig, Index, Layer, Manif
 pub use reference::{Digest, Platform, Reference, RegistryHost, Repository};
 pub use registry::{
     Client, FetchLimits, Fetched, MAX_REDIRECTS, Registry, Resolved, Timeouts, select,
+};
+pub use store::{
+    CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT, MAX_BLOB_BYTES, MAX_DEPTH, MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_VALUES, MAX_HEAD_BYTES, MAX_HEADERS, MAX_IMAGE_BYTES,
+    MAX_IMAGE_ENTRIES, MAX_LAYER_BYTES, MAX_LAYERS, MAX_PULL_BYTES, MAX_SPECIAL_BYTES,
+    MAX_TOKEN_BYTES, MIN_RATE, OciImageStore, SETUP_TIMEOUT, StoreConfig,
 };
 pub use unpack::{Compression, LayerStats, unpack};

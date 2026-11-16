@@ -359,7 +359,9 @@ fn get_blob_with(
 ) -> Result<(), PullError> {
     let hub = Registry::docker_hub();
     let limits = limits();
-    Client::new(&hub, fake, &limits, timeouts).get_blob(&repo("library/node"), descriptor, dest)
+    Client::new(&hub, fake, &limits, timeouts)
+        .get_blob(&repo("library/node"), descriptor, dest)
+        .map(|_| ())
 }
 
 /// A blobs directory and the destination of `descriptor` in it.

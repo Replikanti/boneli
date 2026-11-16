@@ -1,0 +1,72 @@
+name: oci-acceptance
+
+# The acceptance of ADR-009 (#7): pull node:22 and postgres:17, pinned by
+# index digest, from Docker Hub on both architectures and run both in the
+# sandbox. Weekly, because Docker Hub changes (a garbage-collected digest, a
+# CDN host move, the token flow) show up within 7 days at 4 manifest
+# requests per architecture per run, far below the measured anonymous
+# limit of 100 per hour. Never on code paths and not a required check, so
+# a Docker Hub outage cannot block a code PR. `pull_request` is limited to
+# this file: GitHub dispatches `workflow_dispatch` only for workflows
+# already on the default branch, so the PR that adds or edits this file
+# runs it before merge.
+on:
+  schedule:
+    # Mondays 05:17 UTC, off the hour to spread scheduler load.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/oci-acceptance.yml
+
+concurrency:
+  group: oci-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: acceptance (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      # As in ci.yml: the installed toolchain outranks any toolchain file
+      # in the checkout (ADR-001).
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo test -p boneli-oci --test boneli_oci_tests --no-run
+      # The same host preparation as the sandbox job of ci.yml: the
+      # host-setup block from CLAUDE.md, extracted between its markers.
+      - name: Prepare the runner host
+        run: |
+          awk '/^<!-- host-setup:begin -->$/ { m = 1; next }
+               /^<!-- host-setup:end -->$/ { m = 0 }
+               m && /^```$/ { c = 0 }
+               m && c { print }
+               m && /^```sh$/ { c = 1 }' CLAUDE.md > "$RUNNER_TEMP/host-setup.sh"
+          if [ ! -s "$RUNNER_TEMP/host-setup.sh" ]; then
+            echo "the host-setup block in CLAUDE.md is empty or missing"
+            exit 1
+          fi
+          TARGET_DIR="$GITHUB_WORKSPACE/target" RUN_USER="$USER" ENABLE_LINGER=1 sh -eu "$RUNNER_TEMP/host-setup.sh"
+      # Pull time, throughput, the longest gap between reads and the layer
+      # media types are printed per image (ADR-009, D5 and D12).
+      - name: Pull and run node:22 and postgres:17
+        run: |
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
+            env BONELI_SYS_TEST_CGROUP=self \
+            cargo test -p boneli-oci --test boneli_oci_tests -- --ignored network:: --nocapture

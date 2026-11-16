@@ -1,6 +1,6 @@
 # ADR-009: boneli-oci, an OCI image store with a layered rootfs
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-16
 
 ## Context
@@ -13,10 +13,10 @@ of the archives, and the store unpacks them onto the host as the runner
 user, who holds the git token. A path bug here writes outside the store as
 that user, so `boneli-oci` is on the always-review list.
 
-The issue is split into three PRs. Part 1 (this ADR as proposed) unpacks
-layers and needs no network. Part 2 adds the registry client (D9 to
-D12) and part 3 the store, the port contract and the acceptance, which
-settles this ADR.
+The issue is split into three PRs. Part 1 unpacks layers and needs no
+network. Part 2 adds the registry client (D9 to D12) and part 3 the
+store (D8), the port contract and the acceptance (D13), which settled
+this ADR.
 
 What the numbers below come from (Docker Hub, anonymous, 2026-11-16,
 `linux/amd64`):
@@ -223,19 +223,27 @@ policy that we would have to audit and override.
   stays" for the TLS stack; that still holds for those crates (none
   declares more than 1.85), but the workspace floor is now 1.87. ADR-005
   is accepted and keeps its text; this paragraph is the record.
-- The zstd window cap is 100 MiB, set with `set_max_window_size`. ruzstd
+- The zstd window cap is 128 MiB, set with `set_max_window_size`. ruzstd
   0.9.1 checks it when a frame header is read, for the first frame,
   later frames and single-segment frames (whose window is their content
   size) alike, before it allocates the window (read in its source;
   0.8.2 checked only later frames, which part 1 first worked around with
   its own header parse). The decoder's memory is the window plus one
-  block of at most 128 KiB, which 0.9.1 now enforces. Why 100 MiB: it is
-  the value ruzstd 0.8.2 hard-coded and the plan adopted; 0.9.1's default
-  and zstd's own default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`) are
-  128 MiB. Consequence: a layer compressed with `zstd --long`, whose
-  default window log is 27 (128 MiB), is refused; raising the cap to
-  128 MiB admits it at 28 MiB more memory per decoding pull. Part 3
-  measures the first-stack images and settles the value.
+  block of at most 128 KiB, which 0.9.1 now enforces. Why 128 MiB
+  (settled in part 3; part 1 used 100 MiB, the value ruzstd 0.8.2
+  hard-coded): it is the reference decoder's default limit
+  (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`) and ruzstd 0.9.1's default, so
+  every layer that `zstd -d` decodes without `--memory` decodes here,
+  `zstd --long` layers included (their default window log is 27), and
+  an image builder that turns on long-distance matching does not get
+  its images refused. The measured first-stack images do not decide it:
+  every layer of node:22 and postgres:17 is gzip on both architectures
+  (the `oci-acceptance` log prints the layer media types). The cost is
+  28 MiB more memory than 100 MiB while one layer is decoded, and pulls
+  are serialized per store (D8), so a store decodes one layer at a time.
+  Lower refuses `--long` layers that every other runtime reads; higher
+  needs `zstd -d --memory` to decode with the reference tool, and buys
+  memory per pull for frames no default encoder writes.
 - `ruzstd` contains `unsafe` in its ring buffer, and RUSTSEC-2024-0400 was
   an out-of-bounds read there (patched in 0.7.3). `cargo deny check` runs
   advisories in CI. Its input is digest-verified before it is decoded
@@ -320,7 +328,7 @@ the store will use, and why:
 - A PAX or GNU extension body: 1,048,576 B, Go's `maxSpecialFileSize`, so
   every archive Go reads passes; it is read into memory, so this is the
   memory one header may take.
-- The zstd window: 100 MiB (D5).
+- The zstd window: 128 MiB (D5).
 - Path depth: 128 components after normalization, whatever the entry's
   type. Why a cap at all: review of part 1 measured a layer of ~1,900-deep
   entries that cost 407 ms of CPU per entry, under every byte and entry
@@ -355,11 +363,14 @@ the store will use, and why:
   `<root>/layers/sha256/<hex>.stats` its sidecar: uncompressed bytes,
   entry count and skipped devices, as
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
-- A layer is unpacked into `layers/sha256/.tmp-<pid>.<starttime>.<n>/`
-  (the start time from `/proc/self/stat`, so a reused pid is told from a
-  live owner when the store cleans up). Lookups use hex names only, so a
-  dot name is never mistaken for a layer. Its sidecar is staged next to
-  it as `.tmp-<pid>.<starttime>.<n>.stats`, so every temporary tree of
+- A layer is unpacked into `layers/sha256/.tmp-<owner>.<n>/`, where
+  `<owner>` is `<pidns>.<pid>.<start>`: the inode of the process's PID
+  namespace (`/proc/self/ns/pid`), its pid there and its start time from
+  `/proc/self/stat`, zero-padded to 20, 10 and 20 digits, and `<n>` a
+  20-digit counter (part 3; parts 1 and 2 used `<pid>.<starttime>.<n>`).
+  Lookups use hex names only, so a dot name is never mistaken for a
+  layer. Its sidecar is staged next to it as `.tmp-<owner>.<n>.stats`,
+  so every temporary tree of
   every process has its own (part 1 first derived it with
   `with_extension`, which drops the counter; review measured two caches
   in one process committing each other's sidecars). The tree is staged in
@@ -374,11 +385,11 @@ the store will use, and why:
   either lookup finds the file, the directory is case-insensitive or
   normalizing (ext4 or f2fs casefold, tmpfs `casefold`, ZFS
   `normalization`, vfat), and the store fails closed. A probe is named
-  `.probe-…-<pid>.<starttime>.<n>`; a name that exists is skipped and
-  never removed, because it may be a crashed process's leftover with the
-  same pid (deterministic in a container) or the live probe of a runner
-  in another PID namespace sharing the store, and only its owner may
-  delete it. A probe rather
+  `.probe-…-<owner>.<n>`; a name that exists is skipped and never removed
+  there, because it may be a crashed process's leftover with the same
+  identity or the live probe of a runner in another PID namespace sharing
+  the store; the store's cleanup below removes it once its owner is
+  gone. A probe rather
   than the casefold inode flag, because it also catches filesystems that
   alias without that flag. Why checking that one directory suffices:
   casefold is a directory flag that only an empty directory can take and
@@ -436,6 +447,83 @@ the store will use, and why:
   because the directory exists; it discards its tree and reads the
   winner's sidecar. The same `diff_id` means the same bytes, so the trees
   and their totals are equal, and the loser's budget is charged with them.
+- **Cleanup of temporary names** (part 3, from the review of part 1).
+  `OciImageStore::open` removes every name in `layers/sha256/` and
+  `blobs/sha256/` that carries an owner (staging trees, staged sidecars
+  and blobs, probes) whose owner is gone, and nothing else. Gone means:
+  in the store's own PID namespace, no `/proc/<pid>/stat`, or one with
+  another start time (the pid was reused). An owner in another PID
+  namespace is never judged: two runners in different PID namespaces can
+  share one store and have the same pid, and the one that opens second
+  cannot see the other's processes, so deciding by pid, even with the
+  start time, would delete a live runner's tree. Its names stay until a
+  process of its own namespace opens the store; a namespace that is gone
+  for good (a container that crashed mid-pull) leaves at most one partial
+  layer and one blob per crash behind, which the cache eviction of #56
+  removes with the rest. Rejected: an `flock` on a per-process lock file,
+  which decides liveness in every namespace, because std's `File::lock`
+  needs Rust 1.89 (the MSRV is 1.87) and the alternative is a new
+  `unsafe` wrapper in `boneli-sys`; a name that cannot be judged costs
+  disk, never a live tree, so the safe direction wins until either
+  changes. Names with an unknown prefix, or a field of the wrong width,
+  carry no owner and stay.
+- **Staging names are longer than committed ones** (part 3, from the
+  review of part 1). A staging name has 78 characters (`.tmp-`, the
+  52-character owner, a dot, 20 digits), a committed layer 64 hex digits,
+  and the unpacker creates every entry by its absolute path, which must
+  fit `PATH_MAX` (4,096 B with the terminating NUL). Every path of a
+  committed layer is therefore 14 B shorter than the path it was created
+  at, so a path-based walk of committed layers (the GC of #56, a
+  removal) never meets `ENAMETOOLONG` where the unpacker did not. The
+  price: a layer whose deepest absolute path is between 4,082 and 4,095 B
+  under its committed name is refused while it is unpacked; no
+  first-stack path comes near that (node:22's longest is 128 B inside the
+  layer). Rejected: unlinking relative to a
+  directory descriptor, which needs an `unlinkat` wrapper in `boneli-sys`
+  (new `unsafe`, D8 above). Pinned by `committed_layer_paths_fit_path_max`
+  (a path of 4,095 B at the staging name unpacks and stays readable by
+  path once committed; one more byte is refused).
+- **The store root** (`OciImageStore::open`): absolute, UTF-8 and free of
+  `,`, `:` and `\`, which overlay mount options use as separators and
+  escapes (ADR-007, D7), checked as given and again once resolved, so a
+  symlink cannot smuggle them in; created `0o700` when missing; a
+  directory owned by the caller (the uid of `/proc/self`) with no group or
+  other permission bits, because the runner user holds the git token and
+  the layers are what a sandbox runs. `open` then probes the overlay
+  format in `layers/sha256/`: a 0:0 whiteout made and read back, and the
+  opaque marker set and read back through `user_xattr`. A filesystem
+  without either (ramfs, some network filesystems) fails here with
+  `Unsupported`, not in the middle of a pull.
+- **Documents and blobs.** `blobs/sha256/<hex>` keeps every index,
+  manifest and config a pull read, with `<hex>.type`, the `Content-Type`
+  it was served with (empty for none; the kind of a document without a
+  `mediaType` field comes from it, D9). The type is written before the
+  document, both through a temporary name, `fsync` and rename. Every read
+  re-hashes the document; a mismatch or a missing type removes it and it
+  is fetched again. A compressed layer blob is downloaded to
+  `blobs/sha256/<hex>` (D9), unpacked from the descriptor that checked
+  it, which `Client::get_blob` returns open at its start, and removed once
+  its layer is committed; a blob already on disk is used only if it is
+  exactly its descriptor's size and digest. Reading through the checked
+  descriptor means another store that commits the same layer and removes
+  the blob meanwhile changes nothing for this one.
+- **Pulls** are serialized by one mutex per store; a poisoned mutex is
+  recovered as in ADR-004 D8, because disk state commits only by rename.
+  A pull resolves through the kept documents first, so a pull of an image
+  already in the store makes no request; then, for each layer, the cache,
+  a kept blob or a fetch, in that order. A failed pull leaves what it
+  committed and the blobs it checked, and the next pull goes on from
+  there; the store does not retry (D11). The handle is
+  `sha256:<hex of the platform's manifest>`, which needs no state of its
+  own and is the same across processes and restarts. `layers(&RootfsRef)`
+  returns the layer directories bottom first, the order
+  `boneli_sys::Root.layers` takes; a `diff_id` listed twice keeps only its
+  topmost position, which leaves the merged view as it is.
+  `config(&RootfsRef)` returns the image config with its runtime fields
+  (`User`, `Env`, `Entrypoint`, `Cmd`, `WorkingDir`). Both are inherent
+  methods, not port operations: #8 and #32 bridge them in the composition
+  root, and the first use case that reads them through the port adds the
+  operation under ADR-004's extension rule (D11 of ADR-004).
 
 ### D9. The registry protocol and the anonymous token flow
 
@@ -620,8 +708,10 @@ with a detail that is never blank (ADR-004, D4). The client returns a
 The detail names hosts, digests, sizes and statuses. It never carries the
 token or a response body: a body is the registry's text and may be
 large or hostile, and the token is a credential. There are no retries
-beyond the single re-authentication of D9: a retry policy belongs to the
-store (part 3), which knows whether a pull is worth repeating.
+beyond the single re-authentication of D9. The store (part 3) adds none
+either: a failed pull keeps what it committed and the blobs it checked
+(D8), so the caller's next pull goes on from there, and the caller, the
+use case, decides whether a pull is worth repeating.
 
 ### D12. Limits and deadlines
 

@@ -68,12 +68,13 @@ jobs:
       - name: Architecture rule fixtures
         run: ./tools/check-architecture.sh --fixtures
 
-  # The boneli-sys host tests create user namespaces, so they need a
-  # prepared host (ADR-007, D5). The job proves what a stock runner lacks,
-  # prepares the runner with the host-setup block from CLAUDE.md (the same
-  # block users run; this workflow has no privileged step of its own) and
-  # runs every host test. Matrix values are literals; no step interpolates
-  # untrusted input. The job names are load-bearing (required checks).
+  # The boneli-sys and boneli-oci host tests create user namespaces, so
+  # they need a prepared host (ADR-007, D5; ADR-009). The job proves what
+  # a stock runner lacks, prepares the runner with the host-setup block
+  # from CLAUDE.md (the same block users run; this workflow has no
+  # privileged step of its own) and runs every host test. Matrix values
+  # are literals; no step interpolates untrusted input. The job names are
+  # load-bearing (required checks).
   sandbox:
     name: sandbox (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -134,8 +135,10 @@ jobs:
             echo "queue $f: $( [ -n "$q" ] && cat "$q/$f" 2>/dev/null || echo absent)"
           done
           lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
+      # Both crates' test binaries in one build, before the host is
+      # prepared: the AppArmor profile names their paths (ADR-009).
       - name: Build
-        run: cargo test -p boneli-sys --no-run
+        run: cargo test -p boneli-sys -p boneli-oci --no-run
       # The error a user gets on an unprepared host, asserted exactly.
       - name: Unprepared runner
         env:
@@ -163,6 +166,14 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS="$BONELI_SYS_HOST_GAPS" \
             cargo test -p boneli-sys -- --ignored
+      # boneli-oci's host tests (#7, ADR-009): a pulled synthetic image in
+      # the sandbox, the casefold and ramfs store roots. No network; the
+      # Docker Hub pulls run in oci-acceptance.yml.
+      - name: boneli-oci host tests
+        run: |
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
+            env BONELI_SYS_TEST_CGROUP=self \
+            cargo test -p boneli-oci --test boneli_oci_tests -- --ignored host::
 
   audit:
     runs-on: ubuntu-latest
