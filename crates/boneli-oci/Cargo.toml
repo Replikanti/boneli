@@ -17,8 +17,15 @@ workspace = true
 # crate, so the edge stays inside the generic plumbing.
 boneli-sys.workspace = true
 # `Sha256`, ring's SHA-256, the repository's one content hash (ADR-009,
-# D6); PR 2 adds its TLS client. A support crate, no new external edge.
+# D6), and the TLS client the registry client dials with (D10). A support
+# crate, no new external edge.
 boneli-https.workspace = true
+# The HTTP/1.1 client of the registry requests (ADR-009, D9; ADR-003). A
+# support crate, no new external edge.
+boneli-http.workspace = true
+# Parses indexes, manifests, configs and token responses under explicit
+# limits (ADR-009, D12; ADR-008). A support crate, no new external edge.
+boneli-json.workspace = true
 # Raw deflate for gzip layers; the gzip framing is ours (ADR-009, D5).
 # docs/ARCHITECTURE.md lists it for boneli-oci. `with-alloc` gives the
 # streaming `InflateState`; without default features it pulls only

@@ -7,8 +7,11 @@ use std::path::PathBuf;
 /// Everything that can go wrong while unpacking or caching a layer.
 #[derive(Debug)]
 pub enum Error {
-    /// The `Limits` are unusable: a zero.
+    /// The `Limits`, `FetchLimits` or `Timeouts` are unusable: a zero.
     InvalidLimits(&'static str),
+    /// A `Registry` host is not a host the client could dial (ADR-009,
+    /// D10).
+    InvalidRegistry(String),
     /// Reading the layer stream failed.
     Read(io::Error),
     /// The gzip framing is invalid (ADR-009, D5).
@@ -72,6 +75,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidLimits(what) => write!(f, "invalid limits: {what} must not be zero"),
+            Error::InvalidRegistry(what) => write!(f, "invalid registry: {what}"),
             Error::Read(e) => write!(f, "reading the layer failed: {e}"),
             Error::Gzip(what) => write!(f, "invalid gzip stream: {what}"),
             Error::Zstd(what) => write!(f, "invalid zstd stream: {what}"),
@@ -145,4 +149,46 @@ pub(crate) fn from_io(e: io::Error) -> Error {
         return Error::Tar("truncated archive");
     }
     Error::Read(e)
+}
+
+/// Why fetching an image from a registry failed, classified the way the
+/// `ImageStore` port reports it (ADR-009, D11). The detail is never blank
+/// (ADR-004, D4); it names hosts, digests and statuses, never a token or a
+/// response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullError {
+    /// The registry has no image under this reference: a `404` on a
+    /// manifest, a `401` on a manifest with a fresh token before anything
+    /// was authorized (Docker Hub's answer for an unknown repository), or
+    /// no manifest for the platform.
+    NotFound(String),
+    /// Anything else: an invalid reference, a refused host, a network,
+    /// TLS or HTTP error, a status other than the ones above, a document
+    /// outside the accepted subset or a digest mismatch.
+    Failed(String),
+}
+
+impl PullError {
+    /// The detail, never blank.
+    pub fn detail(&self) -> &str {
+        match self {
+            PullError::NotFound(detail) | PullError::Failed(detail) => detail,
+        }
+    }
+}
+
+impl fmt::Display for PullError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PullError::NotFound(detail) => write!(f, "image not found: {detail}"),
+            PullError::Failed(detail) => write!(f, "image pull failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for PullError {}
+
+/// A `PullError::Failed` with `detail`.
+pub(crate) fn failed(detail: impl Into<String>) -> PullError {
+    PullError::Failed(detail.into())
 }

@@ -167,9 +167,7 @@ impl LayerCache {
     /// and its descriptor. The start time tells a live owner from a reused
     /// pid when the store cleans up.
     fn temporary(&self) -> Result<Staging, Error> {
-        let start = own_start_time()?;
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".tmp-{}.{start}.{n}", std::process::id());
+        let name = temporary_name()?;
         let path = self.layers_dir().join(&name);
         DirBuilder::new()
             .mode(0o700)
@@ -242,6 +240,16 @@ impl LayerCache {
             Err(e) => Err(cache_err(&final_path, e)),
         }
     }
+}
+
+/// A new temporary name, `.tmp-<pid>.<starttime>.<n>`: a dot name, so
+/// lookups by hex never see it, and one the store's cleanup can tell from
+/// a live owner's (D8). The registry client stages blobs under such names
+/// too.
+pub(crate) fn temporary_name() -> Result<String, Error> {
+    let start = own_start_time()?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(".tmp-{}.{start}.{n}", std::process::id()))
 }
 
 /// How many probe names `create_probe` tries before it gives up.

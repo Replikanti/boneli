@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod registry;
 pub mod tarball;
 
 use std::os::unix::fs::PermissionsExt;
