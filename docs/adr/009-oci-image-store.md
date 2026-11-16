@@ -579,9 +579,17 @@ the client and saves at most one request per expiry).
   socket below TLS: a TLS read returns only once a whole record has
   arrived, so a peer that sends a record a byte at a time, each byte
   within the read timeout, would hold a read above TLS open far past any
-  deadline set there. The hosts it dials have passed the ADR-003 grammar
-  and the allowlist, so the name check `connect` makes before resolving
-  holds already.
+  deadline set there. `connect_over` checks the server name only once
+  TCP is connected, so `TlsDial` first checks the host and port against
+  the ADR-003 grammar (`Target::parse_authority`, the host in its
+  canonical lowercase form) and refuses anything else before it resolves
+  a name or opens a connection, as `connect` does (ADR-003, item 3).
+  Without it `127.1`, `2130706433` or `0x7f000001` reached a loopback
+  listener through `getaddrinfo`. The client's hosts have passed that
+  grammar and the allowlist already; the check keeps `TlsDial` safe for
+  any caller. The tests run `TlsDial` against a local rustls server with
+  boneli-https's test certificates, which takes the dev-dependency edge
+  `boneli-oci -> rustls`; production TLS stays in boneli-https.
 
 ### D11. Error classification
 
@@ -589,7 +597,8 @@ The `ImageStore` port has two errors (ADR-004): `NotFound` and `Failed`
 with a detail that is never blank (ADR-004, D4). The client returns a
 `PullError` with the same two cases:
 
-- `NotFound`: a `404` on a manifest; a `401` on a manifest with a token
+- `NotFound`: a `404` on the manifest the reference names; a `401` on a
+  manifest with a token
   fetched for that very request, before the API host answered any request
   of the pull with a document, a blob or a redirect to one, which is
   Docker Hub's answer for an unknown repository (measured:
@@ -599,8 +608,10 @@ with a detail that is never blank (ADR-004, D4). The client returns a
   later `401` is `Failed`; that holds when part 3 fetches a blob first
   because it read the manifests from its cache.
 - `Failed`, everything else: an invalid reference or a refused registry
-  host; a `404` on a blob (the manifest named it, so the registry is
-  broken, not the image missing); a second `401` on a blob, or on a
+  host; a `404` on a blob or on a manifest an index named (the manifest
+  or index named it, so the registry is broken, not the image missing,
+  and a store that remembered "no such image" would turn a half-replicated
+  mirror into a permanent miss); a second `401` on a blob, or on a
   manifest after the pull was authorized; `429`; `5xx`; any other status;
   a refused redirect, realm or token; a network, TLS or HTTP error; a
   deadline; a document outside D9's subset; a config that contradicts its
@@ -615,7 +626,7 @@ store (part 3), which knows whether a pull is worth repeating.
 ### D12. Limits and deadlines
 
 `FetchLimits::new(document, max_token_bytes, max_head_bytes, max_headers,
-max_layers, max_blob_bytes)` and `Timeouts::new(io, setup, min_rate)`
+max_layers, max_blob_bytes, max_pull_bytes)` and `Timeouts::new(io, setup, min_rate)`
 have no defaults and refuse a zero (the house style of ADR-003, ADR-008
 and D7), so the values live in one place, the store (part 3). Every limit
 is inclusive. The values the store will use, and why (measured on Docker
@@ -668,6 +679,44 @@ Hub, 2026-11-16):
   hundred KB under the cap can be refused here; none of the first stack is
   near it. Higher would let one download fill more disk than a layer may
   have; lower would refuse layers D7 admits.
+- **The pull**: the descriptor sizes of a manifest's config and layers,
+  summed with checked arithmetic (a sum beyond `u64` is over the cap), at
+  most 17,196,646,400 B, which is 16 GiB plus 16 MiB. Checked when the
+  manifest is read, before the config or any layer is requested, and
+  from descriptor sizes only, so a warm cache and a cold one reach the
+  same verdict (as in D7); each blob must be exactly its descriptor's
+  size, so the sum is what the pull downloads. Why a cap of its own: D7
+  charges decoded bytes, and compressed-side padding decodes to almost
+  nothing (gzip `FNAME` and `FCOMMENT` are skipped without a length
+  bound, zstd skippable frames are skipped), so without it 128 layers of
+  4 GiB pass every other limit and download 512 GiB, 32 times D7's
+  per-image budget. The index and the manifest are outside the sum; each
+  is at most the document limit.
+  - Derivation: an honest image at D7's per-image budget, 17,179,869,184
+    decoded bytes, downloads the most when its layers are incompressible,
+    because then each compressed layer is its decoded bytes plus framing.
+    Measured on 2026-11-16 over 67,108,864 B of random bytes, bytes over
+    the input: pigz -1/-6/-9 22,855/22,859/20,498; Python's zlib (gzip
+    levels 1/6/9) 20,503/20,503/20,423; Go 1.26 `compress/gzip` 20,503
+    at the default and best levels and 5,148 at best speed and Huffman-only; GNU gzip
+    -1/-6/-9 11,280/10,258/10,258; zstd -3 and -19 1,550. The zlib and
+    Go figures are 5 B per 16 KiB of input, one stored block header each.
+    The worst, pigz -6, is 0.0341 percent. Over the budget that is 256 ×
+    22,859 = 5,851,904 B. Each of up to 128 layers adds its fixed framing
+    once (gzip header and trailer, 18 B, or a zstd frame header and
+    checksum, at most 22 B, plus a partial last block and an optional
+    file name), bounded generously by 1 KiB per layer, 131,072 B. The
+    config is at most the document limit, 4,194,304 B. The honest worst
+    case is then 17,179,869,184 + 5,851,904 + 131,072 + 4,194,304 =
+    17,190,046,464 B. The cap rounds the overhead up to 1/1024 of the
+    budget, 16,777,216 B, 1.65 times the 10,177,280 B needed, so an
+    encoder whose stored blocks are as small as about 6.9 KB (5 B each,
+    after the config and framing allowances) still passes.
+  - Lower, down to the 16 GiB budget itself, refuses an image of
+    incompressible gzip layers that D7 admits, by up to about 10 MB;
+    higher admits nothing honest and lets a hostile image download more
+    padding that decodes to nothing. At this cap a pull downloads at most
+    what an honest image at D7's budget downloads.
 - **Deadlines**: a fetch of `size` bytes must complete by `setup + size /
   min_rate`; for a document without a descriptor, `size` is the document
   limit. One deadline covers the fetch with its token request
@@ -699,8 +748,9 @@ Hub, 2026-11-16):
 - Pulls reach registries directly from the runner, not through
   `boneli-egress`, limited to each registry's allowlisted hosts (D10).
 - Images that need a tag, a nested index, schema 1, a `sha512` digest,
-  foreign or nondistributable layers, more than 128 layers or a registry
-  login do not pull (#55 adds credentials).
+  foreign or nondistributable layers, more than 128 layers, a download of
+  more than 16 GiB plus 16 MiB or a registry login do not pull (#55 adds
+  credentials).
 
 ## Alternatives considered
 

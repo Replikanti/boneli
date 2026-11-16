@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-use boneli_http::{IdleCheck, Transport};
+use boneli_http::{IdleCheck, Target, Transport};
 use boneli_https::{ConnectOptions, Nonblocking, TlsConfig};
 
 /// A stream the client can send a request over: timeouts and the idle
@@ -32,11 +32,12 @@ pub trait Dial {
     fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>>;
 }
 
-/// The real dial: TCP to each address of the host in turn, then a TLS
-/// handshake with `boneli_https::connect_over`, certificates always
-/// verified against the caller's `TlsConfig` (ADR-005), and the timeouts
-/// of the caller's `ConnectOptions`. The deadline holds on the socket
-/// under TLS for the handshake and every later read and write.
+/// The real dial: the host checked against the grammar of ADR-003, then
+/// TCP to each address of the host in turn, then a TLS handshake with
+/// `boneli_https::connect_over`, certificates always verified against the
+/// caller's `TlsConfig` (ADR-005), and the timeouts of the caller's
+/// `ConnectOptions`. The deadline holds on the socket under TLS for the
+/// handshake and every later read and write.
 #[derive(Clone, Debug)]
 pub struct TlsDial {
     config: TlsConfig,
@@ -52,6 +53,7 @@ impl TlsDial {
 
 impl Dial for TlsDial {
     fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>> {
+        check_host(host, port)?;
         let mut last = None;
         for addr in (host, port).to_socket_addrs()? {
             let left = time_left(deadline)?;
@@ -74,6 +76,29 @@ impl Dial for TlsDial {
             }
         }
         Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))
+    }
+}
+
+/// Refuses, before anything is resolved or dialed, a host and port that
+/// are not in the canonical form of ADR-003's grammar
+/// (`Target::parse_authority`: LDH labels in lowercase, no numeric forms
+/// like `127.1` or `0x7f000001` that `getaddrinfo` would read as
+/// addresses, an IPv6 address without brackets, no port 0).
+/// `boneli_https::connect` checks the server name before it resolves
+/// (ADR-003, item 3); `connect_over` checks it only once TCP is
+/// connected, so the dial checks first (D10).
+fn check_host(host: &str, port: u16) -> io::Result<()> {
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    match Target::parse_authority(&authority) {
+        Ok(Target::Authority { host: h, port: p }) if h == host && p == port => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{host:?} port {port} is not a host and port the HTTP layer accepts"),
+        )),
     }
 }
 

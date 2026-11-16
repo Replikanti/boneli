@@ -23,10 +23,28 @@ use support::registry::{
 
 const AMD64: (&str, &str, Option<&str>) = ("linux", "amd64", None);
 
+/// The pull cap of ADR-009 D12: D7's 16 GiB per image plus 1/1024 of it
+/// for compression framing.
+const PULL_CAP: u64 = 17_196_646_400;
+
 /// The values ADR-009 D12 states.
 fn limits() -> FetchLimits {
+    limits_with(4_294_967_296, PULL_CAP)
+}
+
+/// D12's values with another blob and pull cap.
+fn limits_with(max_blob_bytes: u64, max_pull_bytes: u64) -> FetchLimits {
     let document = boneli_json::Limits::new(4_194_304, 16, 65_536).expect("json limits");
-    FetchLimits::new(document, 65_536, 16_384, 64, 128, 4_294_967_296).expect("limits")
+    FetchLimits::new(
+        document,
+        65_536,
+        16_384,
+        64,
+        128,
+        max_blob_bytes,
+        max_pull_bytes,
+    )
+    .expect("limits")
 }
 
 fn timeouts() -> Timeouts {
@@ -55,6 +73,13 @@ fn resolve_with(
     let registry = select(&registries, &hub, &reference)?;
     let limits = limits();
     Client::new(registry, fake, &limits, timeouts).resolve(&reference)
+}
+
+/// `resolve` under other limits.
+fn resolve_limited(fake: &Fake, digest: &str, limits: &FetchLimits) -> Result<Resolved, PullError> {
+    let reference = Reference::parse("library/node", digest, "linux/amd64")?;
+    let hub = Registry::docker_hub();
+    Client::new(&hub, fake, limits, &timeouts()).resolve(&reference)
 }
 
 fn resolve(fake: &Fake, name: &str, digest: &str, platform: &str) -> Result<Resolved, PullError> {
@@ -741,6 +766,25 @@ fn manifest_404_is_not_found() {
     );
 }
 
+/// A 404 on a manifest the index named is `Failed`: the index says the
+/// manifest exists, so the registry is broken, not the image missing
+/// (D11). The same 404 on the manifest the reference named stays
+/// `NotFound` (`manifest_404_is_not_found`).
+#[test]
+fn indexed_manifest_404_is_failed() {
+    let mut hub = Hub::default();
+    let missing = digest_of(b"a manifest the registry lost");
+    let bytes = index(&[entry(media::MANIFEST, &missing, 512, Some(AMD64))]);
+    let digest = hub.document("library/node", media::INDEX, &bytes);
+    let fake = hub_fake(hub);
+    let detail = assert_failed(
+        resolve(&fake, "library/node", &digest, "linux/amd64"),
+        "indexed manifest 404",
+    );
+    assert!(detail.contains("404"), "{detail}");
+    assert!(detail.contains(&missing), "{detail}");
+}
+
 // --- Documents and blobs ------------------------------------------------
 
 /// A valid OCI manifest body for linux/amd64 (one layer), with its hub
@@ -1307,6 +1351,88 @@ fn descriptor_size_cap_before_download() {
         "manifest with a 4 GiB + 1 layer",
     );
     assert!(fake.seen().iter().all(|s| !s.target.contains("/blobs/")));
+}
+
+/// A linux/amd64 manifest with a real config and layers of these
+/// descriptor sizes, whose blobs the hub does not hold (`resolve` never
+/// fetches a layer); returns the manifest's digest and the config's size.
+fn sized_image(hub: &mut Hub, layer_sizes: &[u64]) -> (String, u64) {
+    let digests: Vec<String> = (0..layer_sizes.len())
+        .map(|i| digest_of(format!("layer {i}").as_bytes()))
+        .collect();
+    let cfg = config("linux", "amd64", None, &digests);
+    let cfg_digest = hub.blob("library/node", &cfg);
+    let layers: Vec<String> = digests
+        .iter()
+        .zip(layer_sizes)
+        .map(|(d, size)| {
+            format!(
+                r#"{{"mediaType":"{}","digest":"{d}","size":{size}}}"#,
+                media::GZIP
+            )
+        })
+        .collect();
+    let bytes = manifest(&descriptor(media::CONFIG, &cfg_digest, cfg.len()), &layers);
+    let digest = hub.document("library/node", media::MANIFEST, &bytes);
+    (digest, cfg.len() as u64)
+}
+
+/// The config and layer descriptor sizes of one pull, summed, are held to
+/// `max_pull_bytes` before the config or any blob is requested: at the cap
+/// the pull resolves, one byte over it is refused (D12).
+#[test]
+fn pull_cap_inclusive() {
+    const GIB4: u64 = 4_294_967_296;
+    // The config's size is known only once it is built, so build once to
+    // learn it; it does not depend on the layer sizes.
+    let (_, cfg_len) = sized_image(&mut Hub::default(), &[GIB4; 5]);
+    let last = PULL_CAP - cfg_len - 4 * GIB4;
+    assert!(last <= GIB4);
+
+    let mut hub = Hub::default();
+    let (at, _) = sized_image(&mut hub, &[GIB4, GIB4, GIB4, GIB4, last]);
+    let fake = hub_fake(hub);
+    let got = resolve(&fake, "library/node", &at, "linux/amd64").expect("at the cap");
+    let total: u64 = got.manifest.config.size
+        + got
+            .manifest
+            .layers
+            .iter()
+            .map(|l| l.descriptor.size)
+            .sum::<u64>();
+    assert_eq!(total, PULL_CAP);
+
+    let mut hub = Hub::default();
+    let (over, _) = sized_image(&mut hub, &[GIB4, GIB4, GIB4, GIB4, last + 1]);
+    let fake = hub_fake(hub);
+    let detail = assert_failed(
+        resolve(&fake, "library/node", &over, "linux/amd64"),
+        "one byte over the cap",
+    );
+    assert!(detail.contains(&PULL_CAP.to_string()), "{detail}");
+    assert!(
+        fake.seen().iter().all(|s| !s.target.contains("/blobs/")),
+        "the config or a layer was requested"
+    );
+}
+
+/// Descriptor sizes whose sum does not fit in a u64 are refused, not
+/// wrapped around, even with every cap at its maximum.
+#[test]
+fn pull_size_overflow_refused() {
+    let half = u64::MAX / 2 + 1;
+    let mut hub = Hub::default();
+    let (digest, _) = sized_image(&mut hub, &[half, half]);
+    let fake = hub_fake(hub);
+    let detail = assert_failed(
+        resolve_limited(&fake, &digest, &limits_with(u64::MAX, u64::MAX)),
+        "overflowing sum",
+    );
+    assert!(detail.contains("limit"), "{detail}");
+    assert!(
+        fake.seen().iter().all(|s| !s.target.contains("/blobs/")),
+        "the config or a layer was requested"
+    );
 }
 
 #[test]

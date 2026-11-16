@@ -37,3 +37,9 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # RUSTSEC-2026-0344 (one block could expand to gigabytes); 0.9 declares
 # rust-version 1.87, the workspace's MSRV since ADR-009.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The local TLS server of the `TlsDial` tests (ADR-009, D10), with the
+# features boneli-https already enables, so the build does not change.
+# Test-only; production TLS stays in boneli-https.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

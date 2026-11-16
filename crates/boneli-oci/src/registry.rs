@@ -181,6 +181,7 @@ pub struct FetchLimits {
     max_headers: usize,
     max_layers: usize,
     max_blob_bytes: u64,
+    max_pull_bytes: u64,
 }
 
 impl FetchLimits {
@@ -189,7 +190,10 @@ impl FetchLimits {
     /// - `max_head_bytes`, `max_headers`: a response head;
     /// - `max_layers`: layers of a manifest;
     /// - `max_blob_bytes`: a blob's descriptor size, checked before the
-    ///   request.
+    ///   request;
+    /// - `max_pull_bytes`: the descriptor sizes of a manifest's config and
+    ///   layers, summed: what one pull downloads, checked when the
+    ///   manifest is read.
     pub fn new(
         document: boneli_json::Limits,
         max_token_bytes: usize,
@@ -197,6 +201,7 @@ impl FetchLimits {
         max_headers: usize,
         max_layers: usize,
         max_blob_bytes: u64,
+        max_pull_bytes: u64,
     ) -> Result<FetchLimits, Error> {
         for (value, what) in [
             (max_token_bytes as u64, "max_token_bytes"),
@@ -204,6 +209,7 @@ impl FetchLimits {
             (max_headers as u64, "max_headers"),
             (max_layers as u64, "max_layers"),
             (max_blob_bytes, "max_blob_bytes"),
+            (max_pull_bytes, "max_pull_bytes"),
         ] {
             if value == 0 {
                 return Err(Error::InvalidLimits(what));
@@ -216,6 +222,7 @@ impl FetchLimits {
             max_headers,
             max_layers,
             max_blob_bytes,
+            max_pull_bytes,
         })
     }
 
@@ -346,11 +353,12 @@ impl<'a> Client<'a> {
 
     /// Resolves `reference` to its platform's manifest and config: the
     /// document it names; if that is an index, the one entry for the
-    /// platform and its manifest; then the config. The config must list
-    /// one `diff_id` per layer, and its platform must be the requested
-    /// one: for a manifest named directly a mismatch is `NotFound`, for
-    /// one selected from an index it is `Failed`, because the index said
-    /// otherwise.
+    /// platform and its manifest; then the config, once every layer is
+    /// within `max_blob_bytes` and the config and layers together within
+    /// `max_pull_bytes`. The config must list one `diff_id` per layer, and
+    /// its platform must be the requested one: for a manifest named
+    /// directly a mismatch is `NotFound`, for one selected from an index
+    /// it is `Failed`, because the index said otherwise.
     pub fn resolve(&mut self, reference: &Reference) -> Result<Resolved, PullError> {
         let repo = reference.repository();
         let digest = reference.digest();
@@ -384,6 +392,7 @@ impl<'a> Client<'a> {
         for layer in &manifest.layers {
             self.check_blob_size(&layer.descriptor)?;
         }
+        self.check_pull_size(&manifest)?;
         let config = self.get_config(repo, &manifest.config)?;
         if config.diff_ids.len() != manifest.layers.len() {
             return Err(failed(format!(
@@ -430,8 +439,11 @@ impl<'a> Client<'a> {
 
     /// Fetches the index or manifest `digest`; `size` is its exact size
     /// when a descriptor gave it. The body is at most the document limit
-    /// and must hash to `digest`. A `404`, or a `401` with a fresh token
-    /// before anything was authorized, is `NotFound`.
+    /// and must hash to `digest`. A `404` on the manifest the reference
+    /// named (`size` is `None`), or a `401` with a fresh token before
+    /// anything was authorized, is `NotFound`; a `404` on a manifest an
+    /// index named (`size` is its descriptor's) is `Failed`, because the
+    /// index says it exists (D11).
     pub fn get_manifest(
         &mut self,
         repo: &Repository,
@@ -477,10 +489,13 @@ impl<'a> Client<'a> {
                         }))
                     }
                     401 => Ok(Step::Unauthorized(challenge(head))),
-                    404 => Err(PullError::NotFound(format!(
-                        "{} has no {what} in {repo} (404)",
-                        url.host
-                    ))),
+                    404 => {
+                        let detail = format!("{} has no {what} in {repo} (404)", url.host);
+                        Err(match size {
+                            None => PullError::NotFound(detail),
+                            Some(_) => failed(format!("{detail}, but the index names it")),
+                        })
+                    }
                     status => Err(status_error(&url, status, &what)),
                 },
             )?;
@@ -548,6 +563,32 @@ impl<'a> Client<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// The config and layer descriptor sizes of `manifest`, summed, must be
+    /// at most `max_pull_bytes`; a sum that does not fit in a `u64` is
+    /// over it. Checked before the config or any layer is requested, so
+    /// compressed-side padding that decodes to nothing (D7 charges only
+    /// decoded bytes) cannot make a pull download more (D12).
+    fn check_pull_size(&self, manifest: &Manifest) -> Result<(), PullError> {
+        let max = self.limits.max_pull_bytes;
+        let total = manifest
+            .layers
+            .iter()
+            .try_fold(manifest.config.size, |sum, layer| {
+                sum.checked_add(layer.descriptor.size)
+            });
+        match total {
+            Some(total) if total <= max => Ok(()),
+            Some(total) => Err(failed(format!(
+                "the image's config and {} layers have {total} bytes, more than the limit of {max}",
+                manifest.layers.len()
+            ))),
+            None => Err(failed(format!(
+                "the image's config and {} layers have more bytes than a u64 holds, more than the limit of {max}",
+                manifest.layers.len()
+            ))),
+        }
     }
 
     /// Fetches and parses a config; its size is held to the document limit

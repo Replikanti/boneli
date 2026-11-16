@@ -282,9 +282,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only, at most 10) go to the API host or a host under a redirect suffix,
   `Authorization` only to the API host. `FetchLimits` and `Timeouts` (no
   defaults) bound documents, token responses, response heads, layer
-  counts, blob sizes and every fetch's deadline, which `TlsDial` also
-  holds below TLS. Failures are `PullError::NotFound` or `Failed` with a
-  detail (ADR-009, D11).
+  counts, blob sizes, the total download of one pull (config and layer
+  descriptor sizes, summed when the manifest is read) and every fetch's
+  deadline, which `TlsDial` also holds below TLS. `TlsDial` refuses a host
+  outside ADR-003's grammar before it resolves or connects. Failures are
+  `PullError::NotFound` or `Failed` with a detail; a `404` is `NotFound`
+  only for the manifest the reference names, `Failed` for one an index
+  names (ADR-009, D11).
 - ADR-009 (still proposed) gains D9 to D12: the registry protocol and
   token flow, the host allowlist and redirects and why pulls bypass
   `boneli-egress`, error classification, and the client's limits and

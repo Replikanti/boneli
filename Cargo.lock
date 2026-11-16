@@ -65,6 +65,7 @@ dependencies = [
  "boneli-json",
  "boneli-sys",
  "miniz_oxide",
+ "rustls",
  "ruzstd",
 ]
 
