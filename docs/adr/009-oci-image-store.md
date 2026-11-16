@@ -14,8 +14,9 @@ user, who holds the git token. A path bug here writes outside the store as
 that user, so `boneli-oci` is on the always-review list.
 
 The issue is split into three PRs. Part 1 (this ADR as proposed) unpacks
-layers and needs no network. Part 2 adds the registry client and part 3
-the store, the port contract and the acceptance, which settles this ADR.
+layers and needs no network. Part 2 adds the registry client (D9 to
+D12) and part 3 the store, the port contract and the acceptance, which
+settles this ADR.
 
 What the numbers below come from (Docker Hub, anonymous, 2026-11-16,
 `linux/amd64`):
@@ -436,6 +437,301 @@ the store will use, and why:
   winner's sidecar. The same `diff_id` means the same bytes, so the trees
   and their totals are equal, and the loser's budget is charged with them.
 
+### D9. The registry protocol and the anonymous token flow
+
+Part 2 adds the registry client. It speaks the read side of the OCI
+distribution API, `GET /v2/<repository>/manifests/<digest>` and
+`GET /v2/<repository>/blobs/<digest>`, over `boneli-http` (ADR-003) and
+`boneli-https` (ADR-005), and nothing else: no tags, no listing, no push.
+
+- **References.** An `ImageRef` is parsed before any request. The name's
+  first component is a registry host when the name has more than one
+  component and the first contains `.` or `:` or is `localhost`, the rule
+  of `distribution/reference`; without one the store's default registry
+  applies. The repository path is `/`-separated components
+  `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`, at most 255 B
+  (`RepositoryNameTotalLengthMax`, applied to the path after the host).
+  Nothing is normalized: `node` is not rewritten to `library/node`,
+  uppercase is not lowered, whitespace is not trimmed, so a look-alike
+  (Cyrillic `о`, U+200B, U+00A0) is refused, never resolved to a real
+  repository. The digest is `sha256:` and 64 lowercase hex digits only;
+  `sha512` is refused, because nothing in the first stack uses it and the
+  repository has one hash (D6). The platform is `os/arch[/variant]`, each
+  part `[a-z0-9]+`. Every rejection is `Failed` (D11) and makes no
+  request.
+- **Documents.** The `Accept` field lists the OCI index, the OCI manifest,
+  Docker's manifest list and Docker's manifest v2. A document is read
+  into memory up to the document limit (D12), or exactly its descriptor's
+  size when an index gave one, and its SHA-256 must equal the requested
+  digest before it is parsed; `Docker-Content-Digest` is not read, the
+  bytes are. The kind comes from the `mediaType` field, or from
+  `Content-Type` (parameters dropped, lowercase) when the field is absent;
+  both present and different refuses the document, so a server cannot
+  make one body parse as two kinds. `schemaVersion` must be 2. Refused
+  outright: schema 1, a document with both `manifests` and `layers`, a
+  nested index (an index entry that names an index, or an entry that
+  names a manifest and serves an index), an entry whose media type differs
+  from the document it serves, unknown media types (a Cyrillic letter
+  inside a known one is unknown), config media types other than OCI's and
+  Docker's, foreign and nondistributable layers, any layer with `urls`
+  (the client fetches only from the registry), and `size` values that are
+  not unsigned 64-bit integers (negative, fractional, an exponent, above
+  `u64`, a string). Duplicate JSON keys are refused by `boneli-json`.
+  Accepted layer types: `application/vnd.oci.image.layer.v1.tar`, `+gzip`
+  and `+zstd`, and `application/vnd.docker.image.rootfs.diff.tar.gzip`.
+- **Platforms.** An index entry matches when its os and architecture are
+  the requested ones exactly and its variant is the requested variant; a
+  missing variant matches only a missing variant, except on `arm64`, where
+  a missing variant and `v8` are the same (the OCI image spec lists `v8`
+  as the only arm64 variant, and indexes write it either way). An entry
+  with an `unknown` os or architecture, which Docker's attestation
+  manifests carry, never matches. No match is `NotFound`; more than one
+  is `Failed`, because the store would otherwise pick by position. The
+  config's platform must match the request too: for a manifest named
+  directly a mismatch is `NotFound` (the image is not for this platform,
+  the contract's `platform-pinned`), for one selected from an index it is
+  `Failed` (the index contradicts the image). The config must list one
+  `diff_id` per layer.
+- **Blobs.** A blob is streamed into a temporary file next to its
+  destination, named like a layer's temporary tree
+  (`.tmp-<pid>.<starttime>.<n>`, D8), and hashed on the way. It must be
+  exactly its descriptor's size: the client reads that many bytes and then
+  one more, so a longer body is refused whatever its framing, and an end
+  before it is refused too. Only a matching digest is `fsync`ed and
+  renamed to the destination, whose directory is then `fsync`ed; on any
+  error the temporary file is removed, so a tampered blob never reaches
+  `blobs/`. A blob's descriptor size is checked against the blob limit
+  (D12) when its manifest is read and again before the request.
+- **Tokens.** Every first request to a registry gets a `401` with a
+  `WWW-Authenticate` challenge (Docker Hub, measured). It is parsed as RFC
+  9110, section 11.6.1, defines it: several challenges per field, quoted
+  strings with escapes, token68. Exactly one `Bearer` challenge must be
+  there, with a `realm` that is an `https` URL on one of the registry's
+  token hosts (D10); `Basic` alone is refused. The token request is `GET
+  <realm>` with `service` and `scope` appended to the realm's query (`&`
+  when it has one), percent-encoded; a missing `scope` becomes
+  `repository:<repository>:pull`. It carries no credentials (#55 adds
+  them). The token is `token`, or else `access_token`; it must be a
+  non-empty string of visible ASCII, so it can neither be blank nor break
+  or extend the `Authorization` field it goes into. It is reused for the
+  whole pull and fetched again once per fetch on a `401`. `expires_in`
+  (300 s on Docker Hub) is not read: a token that expired mid-pull gets
+  exactly one `401` and one new token, with no clock in the client.
+- **Connections.** One connection per request, no reuse: a node:22 pull is
+  about 22 requests (the first `401`, the token, the index, the manifest,
+  and the config and 8 layers with one redirect each). Reuse would save handshakes but
+  needs the idle check of ADR-003, item 12 across hops that change hosts;
+  part 3's acceptance logs the pull time, which shows whether the
+  handshakes matter (not measured yet).
+
+Rejected: following tags (a tag is mutable, and the port pins digests,
+ADR-004), trusting `Docker-Content-Digest` (the header is the registry's
+claim, the hash is ours), and reading `expires_in` (it needs a clock in
+the client and saves at most one request per expiry).
+
+### D10. Hosts, redirects, and why pulls bypass boneli-egress
+
+- **The allowlist.** A `Registry` names its image-name host (`docker.io`),
+  its API host and port (`registry-1.docker.io:443`), its token hosts
+  (`auth.docker.io`) and its redirect suffixes (`.docker.com`), every host
+  in the grammar of ADR-003 (`boneli_http::Target::parse_authority`: no
+  userinfo, LDH labels, no numeric forms like `127.1`, lowercase).
+  `Registry::docker_hub()` holds the measured values. An image name's host
+  selects a registry when it equals the name without a port, or the API
+  host with no port or the API port, after ASCII lowercasing; anything
+  else is refused before a request: a trailing dot, a longer or shorter
+  host, an `xn--` look-alike, userinfo, another port, an IP literal. A
+  token realm must be `https` on a token host and port exactly.
+- **Redirects.** Only blob requests follow redirects (`301`, `302`, `303`,
+  `307`, `308` with exactly one `Location`), at most 10, Go `net/http`'s
+  limit; Docker Hub uses one (measured), so 10 leaves room for CDN chains
+  and still ends a loop after 11 requests. A relative `Location` resolves
+  against the request URL (RFC 3986, section 5.2). The target must be
+  `https` and the API host and port exactly, or a host strictly under a
+  redirect suffix, on a dot boundary, on port 443:
+  `production.cloudfront.docker.com` passes, `evildocker.com`,
+  `docker.com` and `docker.com.evil.example` do not. Manifest and token
+  requests do not follow redirects; a `3xx` there is `Failed`.
+- **Authorization** goes only to the API host and port. Token and
+  redirect hosts never see it, so a CDN log or a hostile redirect target
+  gets no token.
+- **Why pulls bypass `boneli-egress`.** The egress proxy (ADR-006) is the
+  sandbox's broker: #32 builds its allowlist per sandbox phase, and its
+  connection log is the sandbox's evidence, so runner traffic there would
+  mix the two. A pull runs in the runner, the trusted side that already
+  reaches the forge directly, and its integrity does not depend on the
+  network path, because every byte is checked against the pinned digest.
+  An image reference may come from an agent later (ARCHITECTURE plan step
+  3); the request forgery that would allow is closed here: `https` only
+  with verified certificates, every host from the allowlist above, and
+  the token to the API host only. Weak spot: a customer network that
+  forces an HTTP proxy cannot pull yet; `boneli_http::connect_tunnel` plus
+  `boneli_https::connect_over` make that an additive `Dial` (#55).
+- **The `Dial` seam.** Requests go through a crate-local trait, modeled on
+  `boneli-egress`'s `Upstream` (ADR-006, D11): no use case drives it, so
+  it is not a `boneli-app` port and needs no in-memory adapter. The tests
+  serve a fake registry over `UnixStream::pair`, so the client's framing
+  is the real code. The production `TlsDial` connects TCP to each address
+  in turn and completes the handshake with `boneli_https::connect_over`,
+  certificates always verified (ADR-005), with the caller's
+  `ConnectOptions`. It uses `connect_over` rather than
+  `boneli_https::connect` so that the request's deadline (D12) sits on the
+  socket below TLS: a TLS read returns only once a whole record has
+  arrived, so a peer that sends a record a byte at a time, each byte
+  within the read timeout, would hold a read above TLS open far past any
+  deadline set there. `connect_over` checks the server name only once
+  TCP is connected, so `TlsDial` first checks the host and port against
+  the ADR-003 grammar (`Target::parse_authority`, the host in its
+  canonical lowercase form) and refuses anything else before it resolves
+  a name or opens a connection, as `connect` does (ADR-003, item 3).
+  Without it `127.1`, `2130706433` or `0x7f000001` reached a loopback
+  listener through `getaddrinfo`. The client's hosts have passed that
+  grammar and the allowlist already; the check keeps `TlsDial` safe for
+  any caller. The tests run `TlsDial` against a local rustls server with
+  boneli-https's test certificates, which takes the dev-dependency edge
+  `boneli-oci -> rustls`; production TLS stays in boneli-https.
+
+### D11. Error classification
+
+The `ImageStore` port has two errors (ADR-004): `NotFound` and `Failed`
+with a detail that is never blank (ADR-004, D4). The client returns a
+`PullError` with the same two cases:
+
+- `NotFound`: a `404` on the manifest the reference names; a `401` on a
+  manifest with a token
+  fetched for that very request, before the API host answered any request
+  of the pull with a document, a blob or a redirect to one, which is
+  Docker Hub's answer for an unknown repository (measured:
+  `401 UNAUTHORIZED` even with a fresh token); no index entry for the
+  platform; a manifest named directly whose config is for another
+  platform. Once the API host has answered, the repository exists, so a
+  later `401` is `Failed`; that holds when part 3 fetches a blob first
+  because it read the manifests from its cache.
+- `Failed`, everything else: an invalid reference or a refused registry
+  host; a `404` on a blob or on a manifest an index named (the manifest
+  or index named it, so the registry is broken, not the image missing,
+  and a store that remembered "no such image" would turn a half-replicated
+  mirror into a permanent miss); a second `401` on a blob, or on a
+  manifest after the pull was authorized; `429`; `5xx`; any other status;
+  a refused redirect, realm or token; a network, TLS or HTTP error; a
+  deadline; a document outside D9's subset; a config that contradicts its
+  index entry; a digest or length mismatch.
+
+The detail names hosts, digests, sizes and statuses. It never carries the
+token or a response body: a body is the registry's text and may be
+large or hostile, and the token is a credential. There are no retries
+beyond the single re-authentication of D9: a retry policy belongs to the
+store (part 3), which knows whether a pull is worth repeating.
+
+### D12. Limits and deadlines
+
+`FetchLimits::new(document, max_token_bytes, max_head_bytes, max_headers,
+max_layers, max_blob_bytes, max_pull_bytes)` and `Timeouts::new(io, setup, min_rate)`
+have no defaults and refuse a zero (the house style of ADR-003, ADR-008
+and D7), so the values live in one place, the store (part 3). Every limit
+is inclusive. The values the store will use, and why (measured on Docker
+Hub, 2026-11-16):
+
+- **Documents** (index, manifest, config), as `boneli_json::Limits`:
+  4,194,304 B, depth 16 and 65,536 values.
+  - 4 MiB is the size the OCI distribution spec tells clients to expect
+    for a manifest push ("at least 4 megabytes"), so a registry that
+    follows the spec cannot hold a manifest this client refuses for
+    size; the largest measured document is 10,237 B (the postgres index),
+    409 times less. Lower would refuse spec-conforming documents; higher
+    only buys memory for documents no registry should hold.
+  - Depth 16 is 4 times the measured maximum of 4 (annotations objects
+    nest one more); lower risks refusing a manifest with nested
+    annotations, higher only admits nesting no real document has
+    (`boneli-json` caps every consumer at 512 anyway, ADR-008, D6).
+  - 65,536 values is 294 times the measured 223; an index entry with a
+    platform is about 10 values, so 65,536 holds thousands of entries.
+    Lower would refuse large multi-platform indexes; higher costs 136 B
+    per value (ADR-008, D5).
+  - The peak memory per document is then about 2 × 4 MiB (the body and
+    its strings) + 136 B × 65,536 = 17,301,504 B, about 16.5 MiB
+    (ADR-008, D5), and a pull holds at most two at a time (an index and a
+    manifest).
+- **The token response**: 65,536 B, 11.9 times about 5.5 KB, the measured
+  response, which carries the 2,696 B token twice (`token` and
+  `access_token`). Lower would refuse registries with larger JWTs (more
+  claims); higher costs only memory, read once per token. Its depth and
+  value limits are the document's.
+- **Response heads**: 16,384 B and 64 fields, 20 times and 4 times the
+  measured 815 B and 16 fields (CDN responses carry the most). Lower
+  would refuse a CDN that adds tracing fields; higher lets a server make
+  the client buffer more per request. Bodies are not held to a framing
+  limit; the client checks them against what it expects (a document
+  limit, a token limit, a descriptor size).
+- **Layers**: 128 per manifest, moby overlay2's `maxDepth`, so every image
+  Docker can run passes. ADR-007 caps the root overlay at 163 lower
+  layers, since `25 * 163 + 19 = 4094 <= 4096` and `25 * 164 + 19 =
+  4119`, which leaves 35 for #8's own layers. Higher would admit images
+  Docker refuses and eat that headroom; lower would refuse images Docker
+  runs.
+- **Blobs**: a descriptor size of at most 4,294,967,296 B, the per-layer
+  cap of D7, checked when the manifest is read and before the request,
+  because a blob is downloaded in full before it is unpacked, so this is
+  the disk one download may take. A plain tar layer is its blob, so a
+  layer at D7's cap still downloads. Compression of incompressible data
+  adds a few bytes per block (gzip stored blocks: 5 B per 65,535 B, about
+  0.008 percent), so a compressed layer of incompressible data a few
+  hundred KB under the cap can be refused here; none of the first stack is
+  near it. Higher would let one download fill more disk than a layer may
+  have; lower would refuse layers D7 admits.
+- **The pull**: the descriptor sizes of a manifest's config and layers,
+  summed with checked arithmetic (a sum beyond `u64` is over the cap), at
+  most 17,196,646,400 B, which is 16 GiB plus 16 MiB. Checked when the
+  manifest is read, before the config or any layer is requested, and
+  from descriptor sizes only, so a warm cache and a cold one reach the
+  same verdict (as in D7); each blob must be exactly its descriptor's
+  size, so the sum is what the pull downloads. Why a cap of its own: D7
+  charges decoded bytes, and compressed-side padding decodes to almost
+  nothing (gzip `FNAME` and `FCOMMENT` are skipped without a length
+  bound, zstd skippable frames are skipped), so without it 128 layers of
+  4 GiB pass every other limit and download 512 GiB, 32 times D7's
+  per-image budget. The index and the manifest are outside the sum; each
+  is at most the document limit.
+  - Derivation: an honest image at D7's per-image budget, 17,179,869,184
+    decoded bytes, downloads the most when its layers are incompressible,
+    because then each compressed layer is its decoded bytes plus framing.
+    Measured on 2026-11-16 over 67,108,864 B of random bytes, bytes over
+    the input: pigz -1/-6/-9 22,855/22,859/20,498; Python's zlib (gzip
+    levels 1/6/9) 20,503/20,503/20,423; Go 1.26 `compress/gzip` 20,503
+    at the default and best levels and 5,148 at best speed and Huffman-only; GNU gzip
+    -1/-6/-9 11,280/10,258/10,258; zstd -3 and -19 1,550. The zlib and
+    Go figures are 5 B per 16 KiB of input, one stored block header each.
+    The worst, pigz -6, is 0.0341 percent. Over the budget that is 256 ×
+    22,859 = 5,851,904 B. Each of up to 128 layers adds its fixed framing
+    once (gzip header and trailer, 18 B, or a zstd frame header and
+    checksum, at most 22 B, plus a partial last block and an optional
+    file name), bounded generously by 1 KiB per layer, 131,072 B. The
+    config is at most the document limit, 4,194,304 B. The honest worst
+    case is then 17,179,869,184 + 5,851,904 + 131,072 + 4,194,304 =
+    17,190,046,464 B. The cap rounds the overhead up to 1/1024 of the
+    budget, 16,777,216 B, 1.65 times the 10,177,280 B needed, so an
+    encoder whose stored blocks are as small as about 6.9 KB (5 B each,
+    after the config and framing allowances) still passes.
+  - Lower, down to the 16 GiB budget itself, refuses an image of
+    incompressible gzip layers that D7 admits, by up to about 10 MB;
+    higher admits nothing honest and lets a hostile image download more
+    padding that decodes to nothing. At this cap a pull downloads at most
+    what an honest image at D7's budget downloads.
+- **Deadlines**: a fetch of `size` bytes must complete by `setup + size /
+  min_rate`; for a document without a descriptor, `size` is the document
+  limit. One deadline covers the fetch with its token request
+  and its redirects, so a server cannot extend it by answering `401` or
+  redirecting. Each read and write also has `io` as its timeout, and every
+  read and write after the deadline fails at once, so a body that stalls
+  fails within `io`, and one that trickles under `io` fails at the
+  deadline, within one `io` of it (`slow_body_deadline`). `TlsDial` holds
+  the deadline below TLS (D10). The TCP connect takes at most
+  `connect_timeout` or what is left of the deadline. Weak spot: name
+  resolution uses `getaddrinfo`, which has no timeout. The values are
+  part 3's, measured with the acceptance pulls; the plan's starting point
+  is `io` 30 s, `setup` 30 s and `min_rate` 1 MiB/s, which gives node:22's
+  largest compressed layer, 211,826,577 B, 30 + 202 = 232 s.
+
 ## Consequences
 
 - The sandbox mounts registry images without root and without a
@@ -449,12 +745,20 @@ the store will use, and why:
 - Images that need devices, setuid bits, xattrs, sparse files, V7 tar,
   layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
 - `boneli-oci` is on the always-review list (#7 STOP 1).
+- Pulls reach registries directly from the runner, not through
+  `boneli-egress`, limited to each registry's allowlisted hosts (D10).
+- Images that need a tag, a nested index, schema 1, a `sha512` digest,
+  foreign or nondistributable layers, more than 128 layers, a download of
+  more than 16 GiB plus 16 MiB or a registry login do not pull (#55 adds
+  credentials).
 
 ## Alternatives considered
 
 Flattening (D1), the `tar` crate (D4), `flate2` and the `zstd` crate (D5),
-`sha2`, our own SHA-256 and a pure-Rust TLS provider (D6), each with the
-reason it lost in its decision.
+`sha2`, our own SHA-256 and a pure-Rust TLS provider (D6), tags,
+`Docker-Content-Digest` and `expires_in` (D9), pulls through
+`boneli-egress` and `boneli_https::connect` (D10), each with the reason
+it lost in its decision.
 
 ## Accept when
 

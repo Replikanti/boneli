@@ -14,19 +14,40 @@
 //!   one only when its bytes hash to it (D8).
 //! - [`Limits`] and [`Budget`] bound every pull (D7); every violation is an
 //!   [`Error`], never a panic or an unbounded allocation.
+//!
+//! Part 2 adds the registry client (D9 to D12):
+//!
+//! - [`Reference`] parses an image's registry host, repository, digest and
+//!   platform before any request is made.
+//! - [`Client`] fetches manifests and blobs from an allowlisted
+//!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production), with the
+//!   anonymous token flow, checks every byte against its digest, and
+//!   classifies failures as a [`PullError`].
 #![doc(test(attr(forbid(unsafe_code))))]
 
+mod auth;
+mod dial;
 mod error;
 mod gzip;
 mod layers;
 mod limits;
+mod manifest;
+mod reference;
+mod registry;
 #[cfg(test)]
 mod scratch;
 mod tar;
 mod unpack;
+mod url;
 mod zstd;
 
-pub use error::Error;
+pub use dial::{Dial, Stream, TlsDial};
+pub use error::{Error, PullError};
 pub use layers::LayerCache;
 pub use limits::{Budget, Limits};
+pub use manifest::{Descriptor, Document, Entry, ImageConfig, Index, Layer, Manifest};
+pub use reference::{Digest, Platform, Reference, RegistryHost, Repository};
+pub use registry::{
+    Client, FetchLimits, Fetched, MAX_REDIRECTS, Registry, Resolved, Timeouts, select,
+};
 pub use unpack::{Compression, LayerStats, unpack};

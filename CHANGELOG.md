@@ -270,6 +270,29 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-009 (proposed): the layered format, path, type and metadata rules,
   the tar subset, the decompressors, SHA-256 from ring, the limits and
   the cache layout.
+- `boneli-oci`, part 2 of #7: the registry client. `Reference` parses an
+  image's registry host, repository path, `sha256` digest and platform
+  strictly, before any request. `Client` fetches indexes, manifests,
+  configs and blobs from an allowlisted `Registry` over `boneli-http` and
+  `boneli-https` (`Registry::docker_hub()` has the measured hosts), with
+  the anonymous Bearer token flow (one re-authentication per fetch), and
+  resolves an image to its platform's manifest and config. Every document
+  and blob is checked against its digest; a blob must be exactly its
+  descriptor's size and is renamed into place only then. Redirects (blobs
+  only, at most 10) go to the API host or a host under a redirect suffix,
+  `Authorization` only to the API host. `FetchLimits` and `Timeouts` (no
+  defaults) bound documents, token responses, response heads, layer
+  counts, blob sizes, the total download of one pull (config and layer
+  descriptor sizes, summed when the manifest is read) and every fetch's
+  deadline, which `TlsDial` also holds below TLS. `TlsDial` refuses a host
+  outside ADR-003's grammar before it resolves or connects. Failures are
+  `PullError::NotFound` or `Failed` with a detail; a `404` is `NotFound`
+  only for the manifest the reference names, `Failed` for one an index
+  names (ADR-009, D11).
+- ADR-009 (still proposed) gains D9 to D12: the registry protocol and
+  token flow, the host allowlist and redirects and why pulls bypass
+  `boneli-egress`, error classification, and the client's limits and
+  deadlines.
 
 ### Changed
 
