@@ -103,14 +103,6 @@ build-script = "ADR-005"
 reason = "boneli-https is the only place for TLS"
 decision = "ARCHITECTURE"
 
-[external.sha2]
-reason = "content addressing and evidence"
-decision = "ARCHITECTURE"
-
-[external.sha2.pulled-by.boneli-store-fs]
-reason = "the content-addressed store hashes blobs"
-decision = "ARCHITECTURE"
-
 [external.miniz_oxide]
 reason = "unpacking gzip OCI image layers"
 decision = "ARCHITECTURE"
@@ -118,6 +110,14 @@ decision = "ARCHITECTURE"
 [external.miniz_oxide.pulled-by.boneli-oci]
 reason = "the OCI image store unpacks layers"
 decision = "ARCHITECTURE"
+
+[external.adler2]
+reason = "Adler-32 for miniz_oxide's zlib format; boneli-oci reads raw deflate only, but the edge is unconditional"
+decision = "ADR-009"
+
+[external.adler2.pulled-by.miniz_oxide]
+reason = "miniz_oxide's one dependency without default features"
+decision = "ADR-009"
 
 [external.ruzstd]
 reason = "unpacking zstd OCI image layers"

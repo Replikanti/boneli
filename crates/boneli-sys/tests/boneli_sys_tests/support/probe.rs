@@ -709,7 +709,7 @@ pub fn io_write_plan(
             } else {
                 return Err(format!("BONELI_PROBE_CHUNK {c:?} is not a number"));
             };
-            if n == 0 || n % 4096 != 0 || size % n != 0 {
+            if n == 0 || !n.is_multiple_of(4096) || !size.is_multiple_of(n) {
                 return Err(format!(
                     "BONELI_PROBE_CHUNK {n} must be a non-zero multiple of 4096 that divides {size}"
                 ));

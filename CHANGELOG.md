@@ -242,9 +242,34 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-008: the JSON subset, the number model, duplicate-key rejection,
   the limits with their memory measurements, and the depth ceiling with
   its stack measurements.
+- `boneli_https::Sha256`: ring's SHA-256 through rustls' public hash
+  provider API, the repository's one content hash (ADR-009, D6).
+- `boneli-sys` layer primitives for the overlay format: `make_whiteout`
+  (a 0:0 character device), `make_fifo`, `mark_opaque`
+  (`user.overlay.opaque=y`) and `user_xattr` (`user.` names only), all
+  without following a final symlink.
+- `boneli-oci`, part 1 of #7 (ADR-009, proposed): unpacks a plain, gzip or
+  zstd layer into its own directory in the overlay format, with our own
+  tar reader (Go's subset) and gzip framing over `miniz_oxide`, zstd
+  through `ruzstd` 0.9.1 with a 100 MiB window cap.
+  Paths with `..`, writes through symlinks, root-level opaque markers and
+  invalid whiteouts refuse the layer; setuid and setgid bits, ownership
+  and tar xattrs are dropped; devices other than 0:0 whiteouts are
+  skipped and counted. `Limits` (no defaults) cap layer and image bytes,
+  image entries and extension headers while the stream is read.
+  `LayerCache` commits a layer by rename only when its bytes hash to its
+  `diff_id`.
+- ADR-009 (proposed): the layered format, path, type and metadata rules,
+  the tar subset, the decompressors, SHA-256 from ring, the limits and
+  the cache layout.
 
 ### Changed
 
+- `sha2` leaves the dependency allowlist and docs/ARCHITECTURE.md:
+  content addressing uses `boneli_https::Sha256` (ADR-009, D6). `adler2`,
+  which `miniz_oxide` pulls, joins it (ADR-009, D5).
+- The workspace `rust-version` is 1.87 (was 1.85): `ruzstd` 0.9.1, the
+  first release without RUSTSEC-2026-0344, declares it (ADR-009, D5).
 - `boneli_domain::gate::citation_problem` checks the path through the new
   `path_problem`, without a change in behavior (ADR-004, D1).
 - The architecture check is now `tools/check_architecture.py` behind the

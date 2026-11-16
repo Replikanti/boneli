@@ -1,0 +1,32 @@
+[package]
+name = "boneli-oci"
+description = "Boneli adapter: the OCI image store, which unpacks image layers into the layered rootfs the sandbox mounts (ADR-009)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The overlay primitives std cannot write without libc: 0:0 whiteouts,
+# FIFOs and the `user.overlay.opaque` marker (ADR-009, D3). A support
+# crate, so the edge stays inside the generic plumbing.
+boneli-sys.workspace = true
+# `Sha256`, ring's SHA-256, the repository's one content hash (ADR-009,
+# D6); PR 2 adds its TLS client. A support crate, no new external edge.
+boneli-https.workspace = true
+# Raw deflate for gzip layers; the gzip framing is ours (ADR-009, D5).
+# docs/ARCHITECTURE.md lists it for boneli-oci. `with-alloc` gives the
+# streaming `InflateState`; without default features it pulls only
+# `adler2` (ADR-009).
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+# zstd layers (ADR-009, D5), listed in docs/ARCHITECTURE.md for boneli-oci.
+# No `hash` feature (it would pull `twox-hash`; the diff_id covers every
+# decoded byte), so it pulls nothing. At least 0.9.1, which fixes
+# RUSTSEC-2026-0344 (one block could expand to gigabytes); 0.9 declares
+# rust-version 1.87, the workspace's MSRV since ADR-009.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
