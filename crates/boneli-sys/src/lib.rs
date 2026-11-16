@@ -40,7 +40,7 @@ pub use child::Step;
 pub use error::{Error, ProtocolError, Result};
 pub use host::{Features, Missing, MissingId};
 pub use ids::Ids;
-pub use layer::{make_fifo, make_whiteout, mark_opaque, user_xattr};
+pub use layer::{make_fifo, make_whiteout, mark_opaque, sync_filesystem, user_xattr};
 pub use mount::{DEV_ENTRIES, Hostname, InsidePath, Mount, OPTIONS_MAX, Root};
 pub use spawn::{Child, ExitStatus, Spec, Stdio, spawn};
 

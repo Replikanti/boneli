@@ -247,7 +247,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-sys` layer primitives for the overlay format: `make_whiteout`
   (a 0:0 character device), `make_fifo`, `mark_opaque`
   (`user.overlay.opaque=y`) and `user_xattr` (`user.` names only), all
-  without following a final symlink.
+  without following a final symlink, and `sync_filesystem` (`syncfs`).
 - `boneli-oci`, part 1 of #7 (ADR-009, proposed): unpacks a plain, gzip or
   zstd layer into its own directory in the overlay format, with our own
   tar reader (Go's subset) and gzip framing over `miniz_oxide`, zstd
@@ -257,8 +257,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and tar xattrs are dropped; devices other than 0:0 whiteouts are
   skipped and counted. `Limits` (no defaults) cap layer and image bytes,
   image entries and extension headers while the stream is read.
-  `LayerCache` commits a layer by rename only when its bytes hash to its
-  `diff_id`.
+  Directories created for missing parents count as entries, and paths
+  deeper than the depth limit are refused. `LayerCache` commits a layer
+  by rename only when its bytes hash to its `diff_id`, after one `syncfs`
+  (`boneli_sys::sync_filesystem`) and with the sidecar and the rename
+  synced, charges the budget only on commit, and removes a failed tree
+  with one directory descriptor at a time.
 - ADR-009 (proposed): the layered format, path, type and metadata rules,
   the tar subset, the decompressors, SHA-256 from ring, the limits and
   the cache layout.

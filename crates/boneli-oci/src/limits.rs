@@ -11,6 +11,7 @@ pub struct Limits {
     max_image_bytes: u64,
     max_image_entries: u64,
     max_special_bytes: u64,
+    max_depth: u64,
 }
 
 impl Limits {
@@ -18,20 +19,24 @@ impl Limits {
     ///   diff_id covers, bytes after the end of the archive included.
     /// - `max_image_bytes`: the same, summed over the image's layers,
     ///   cached ones included.
-    /// - `max_image_entries`: tar entries summed over the image's layers
-    ///   (PAX and GNU headers are not entries).
+    /// - `max_image_entries`: tar entries summed over the image's layers,
+    ///   plus the directories created for missing parents (PAX and GNU
+    ///   headers are not entries).
     /// - `max_special_bytes`: the body of one PAX or GNU long-name header.
+    /// - `max_depth`: path components of an entry after normalization.
     pub fn new(
         max_layer_bytes: u64,
         max_image_bytes: u64,
         max_image_entries: u64,
         max_special_bytes: u64,
+        max_depth: u64,
     ) -> Result<Limits, Error> {
         for (value, what) in [
             (max_layer_bytes, "max_layer_bytes"),
             (max_image_bytes, "max_image_bytes"),
             (max_image_entries, "max_image_entries"),
             (max_special_bytes, "max_special_bytes"),
+            (max_depth, "max_depth"),
         ] {
             if value == 0 {
                 return Err(Error::InvalidLimits(what));
@@ -42,6 +47,7 @@ impl Limits {
             max_image_bytes,
             max_image_entries,
             max_special_bytes,
+            max_depth,
         })
     }
 
@@ -63,6 +69,11 @@ impl Limits {
     /// The body of one PAX or GNU long-name header.
     pub fn max_special_bytes(&self) -> u64 {
         self.max_special_bytes
+    }
+
+    /// Path components of an entry.
+    pub fn max_depth(&self) -> u64 {
+        self.max_depth
     }
 }
 

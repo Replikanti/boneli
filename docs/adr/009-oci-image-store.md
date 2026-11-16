@@ -278,7 +278,7 @@ Alternatives:
 ### D7. Limits
 
 `Limits::new(max_layer_bytes, max_image_bytes, max_image_entries,
-max_special_bytes)` has no defaults and refuses a zero (the house style of
+max_special_bytes, max_depth)` has no defaults and refuses a zero (the house style of
 ADR-003 and ADR-008), so the values live in one place, the store (part 3).
 Every limit is inclusive: the limit passes, one more is refused. The values
 the store will use, and why:
@@ -293,13 +293,44 @@ the store will use, and why:
   1,156,002,816 B, and 1,048,576 entries, 30.8 times node:22's 34,097.
   16 GiB divided by mke2fs's default 16,384 B per inode is exactly
   1,048,576, so the two caps exhaust the same default ext4 at the same
-  time; neither is the weaker bound. Layers already in the cache are
-  charged from their sidecars, so a warm cache and a cold one reach the
-  same verdict.
+  time; neither is the weaker bound. Because the entry cap stands for
+  inodes, the directories the unpacker creates for missing parents count
+  as entries too; otherwise one tar entry at depth 128 would create 127
+  inodes the cap never sees. Layers already in the cache are charged from
+  their sidecars, so a warm cache and a cold one reach the same verdict;
+  a layer is charged only once it is committed, never on a failed
+  attempt.
 - A PAX or GNU extension body: 1,048,576 B, Go's `maxSpecialFileSize`, so
   every archive Go reads passes; it is read into memory, so this is the
   memory one header may take.
 - The zstd window: 100 MiB (D5).
+- Path depth: 128 components after normalization, whatever the entry's
+  type. Why a cap at all: review of part 1 measured a layer of ~1,900-deep
+  entries that cost 407 ms of CPU per entry, under every byte and entry
+  cap. The quadratic part of that is gone (the parent walk starts below
+  the deepest directory this layer already verified, so an entry in a
+  known directory costs no `lstat` for its parents), but the kernel still
+  resolves every path component by component, so each entry stays linear
+  in its depth. Measured after that change (release build, btrfs on the
+  dev host, 300 entries per depth, two runs): per entry 0.034-0.061 ms at
+  depth 13, 0.061 at 64, 0.068-0.110 at 128, 0.13-0.23 at 192-256, 0.46 at
+  384, 0.48-0.65 at 512, 0.96 at 1,024 and 4.2 at 1,900; a directory
+  created for a missing parent costs 0.037-0.068 ms at depth 13 to 128 and
+  0.11-0.15 ms at 512. 128 is the deepest measured depth whose per-entry
+  cost stays in the shallow band (within 2 times depth 13), so the worst
+  layer within the entry cap costs about as much as the worst shallow
+  one: 1,048,576 entries at 0.11 ms is about 2 minutes, against about
+  11 minutes at depth 512 (0.65 ms). It is 9.8 times node:22's deepest path of 13
+  components. Two more bounds hold with room: a traversal that holds one
+  descriptor per level (std's `remove_dir_all`) needs at most 129
+  descriptors, far below systemd's
+  default soft `RLIMIT_NOFILE` of 1,024 next to the up to 163 layer
+  descriptors a root mount opens (ADR-007, D7); and an entry at the cap
+  has an in-sandbox path of at least 256 B, so its components may average
+  31 B before it exceeds `PATH_MAX` (4,096 B). A lower cap refuses deeper
+  real trees sooner; a higher one buys deeper trees with per-entry CPU
+  that grows past the shallow band (0.46 ms at 384, about 4 times the
+  cap's).
 
 ### D8. The cache layout and concurrency
 
@@ -309,23 +340,45 @@ the store will use, and why:
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
 - A layer is unpacked into `<root>/tmp/<pid>.<starttime>.<n>/` (the start
   time from `/proc/self/stat`, so a reused pid is told from a live owner
-  when the store cleans up). The stream is hashed while it is unpacked. On
-  a `diff_id` match the sidecar is written to a temporary file and renamed
-  into place, then the directory is renamed to `layers/sha256/<hex>`: that
-  rename is the commit point. A mismatch or an error removes the
-  temporary tree, after giving every directory `u+rwx`, because final
-  modes may be 0.
+  when the store cleans up). Its sidecar is staged next to it as
+  `<pid>.<starttime>.<n>.stats`, so every temporary tree of every process
+  has its own (part 1 first derived it with `with_extension`, which drops
+  the counter; review measured two caches in one process committing each
+  other's sidecars).
+- The commit, in this order: the `diff_id` matches; the staged sidecar is
+  written; one `syncfs` on the store's filesystem makes the layer's file
+  data, its directory entries, its final modes and the staged sidecar
+  durable; the sidecar is renamed into `layers/sha256/` and that
+  directory is `fsync`ed; the layer directory is renamed to
+  `layers/sha256/<hex>`, the commit point, and `layers/sha256/` is
+  `fsync`ed again. A committed layer therefore always has its sidecar and
+  its data on disk; a crash before the last `fsync` loses at most the
+  rename, and the layer is unpacked again. Why `syncfs` and not an
+  `fsync` per file: measured on a synthetic layer the size of node:22's
+  largest (13,350 files in 100 directories, 608,385,024 B of tar; release
+  build, btrfs on LUKS on the dev host's NVMe, two rounds), an `fsync` of
+  each of the 13,451 inodes after the unpack took 18.4 s and 17.0 s,
+  one `syncfs` 0.35 s and 0.32 s, against 1.7-3.9 s for the unpack
+  itself. The cost of `syncfs`: it also writes back other dirty data on
+  the same filesystem, which on a runner host is the runner's own; since
+  Linux 5.8 it reports writeback errors, and the runtime needs 5.19
+  (ADR-007, D3). `boneli_sys::sync_filesystem` wraps it.
+- A mismatch or an error removes the temporary tree and its staged
+  sidecar, and the budget is left as it was. The removal holds at most
+  one directory descriptor at a time, whatever the depth: it walks by
+  path, lists a directory, closes the listing before it goes down a
+  level, and gives each directory `u+rwx` first, because final modes may
+  be 0 (std's `remove_dir_all` holds one descriptor per level and left a
+  deep tree behind under `ulimit -n 1024` in review). With the unpacker's
+  own handful (the blob, one open file, one directory), a cleanup fits any
+  descriptor limit a runner can start under; the test runs it under 48.
 - Moving a directory to another parent rewrites its `..`, which needs
   write permission on it. A layer root without `u+w` gets it for the
-  rename only; a crash between the rename and the restore leaves the root
-  with `u+w`, which changes nothing inside the read-only sandbox root.
+  rename only and gets its mode back, synced, before the final `fsync`.
 - Two stores committing the same layer: the rename of the second fails
   because the directory exists; it discards its tree and reads the
   winner's sidecar. The same `diff_id` means the same bytes, so the trees
-  are equal.
-- There is no `fsync`. A power loss after the commit can leave a layer
-  with lost data under its name; the store (part 3) and eviction (#56)
-  decide whether that needs a check.
+  and their totals are equal, and the loser's budget is charged with them.
 
 ## Consequences
 
@@ -333,9 +386,12 @@ the store will use, and why:
   flattening step, with overlayfs's merge rules.
 - The runner gains one more C-backed path, ring's SHA-256, inside the
   crate that already holds ring.
-- `boneli-sys` grows by four path-based primitives; `unsafe` stays there.
+- `boneli-sys` grows by four path-based primitives and a `syncfs`
+  wrapper; `unsafe` stays there.
+- Every commit costs one `syncfs`, which also writes back other dirty
+  data on the store's filesystem (D8).
 - Images that need devices, setuid bits, xattrs, sparse files, V7 tar,
-  or layers above 4 GiB do not pull. None of the first-stack images does.
+  layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
 - `boneli-oci` is on the always-review list (#7 STOP 1).
 
 ## Alternatives considered

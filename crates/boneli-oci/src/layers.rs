@@ -5,12 +5,13 @@
 //! A layer is unpacked into `<root>/tmp/<pid>.<starttime>.<n>/` while its
 //! uncompressed stream is hashed. On a `diff_id` match the sidecar is
 //! written (to a temporary file, then renamed), and then the directory is
-//! renamed into place: that rename is the commit point. A mismatch or an
-//! error removes the temporary tree. When another store committed the same
+//! renamed into place: that rename is the commit point. One `syncfs` before
+//! the renames and an `fsync` of `layers/sha256/` after each make the commit
+//! durable. A mismatch or an error removes the temporary tree. When another store committed the same
 //! layer first, its directory stays and this one is discarded; the same
 //! `diff_id` means the same bytes, so both trees are equal.
 
-use std::fs::{self, DirBuilder, Permissions};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -97,7 +98,9 @@ impl LayerCache {
     }
 
     /// Unpacks the layer `blob`, compressed as `compression`, checks it
-    /// against `diff_id` and commits it, charging `budget`.
+    /// against `diff_id` and commits it durably. `budget` is charged only
+    /// when the layer is committed (or was committed by another store); on
+    /// every error it is left as it was.
     pub fn unpack(
         &self,
         diff_id: &[u8; 32],
@@ -106,9 +109,21 @@ impl LayerCache {
         budget: &mut Budget,
     ) -> Result<LayerStats, Error> {
         let tmp = self.temporary()?;
-        let result = self.unpack_into(&tmp, diff_id, compression, blob, budget);
-        if result.is_err() {
-            remove_tree(&tmp);
+        let staged = staged_sidecar(&tmp);
+        let mut trial = budget.clone();
+        let result = self.unpack_into(&tmp, &staged, diff_id, compression, blob, &mut trial);
+        match &result {
+            Ok(stats) => {
+                // The committed tree may be another store's; its sidecar
+                // holds the same totals for the same bytes.
+                let mut charged = budget.clone();
+                charged.charge(stats)?;
+                *budget = charged;
+            }
+            Err(_) => {
+                remove_tree(&tmp);
+                let _ = fs::remove_file(&staged);
+            }
         }
         result
     }
@@ -129,9 +144,15 @@ impl LayerCache {
         Ok(path)
     }
 
+    /// The commit (D8). Before any rename, one `syncfs` makes the layer's
+    /// data, its directory entries and the staged sidecar durable. The
+    /// sidecar is renamed into place and its directory synced before the
+    /// layer is, so a committed layer always has its sidecar; the layer's
+    /// rename, the commit point, is synced last.
     fn unpack_into(
         &self,
         tmp: &Path,
+        staged: &Path,
         diff_id: &[u8; 32],
         compression: Compression,
         blob: impl Read,
@@ -145,18 +166,22 @@ impl LayerCache {
             });
         }
 
-        let sidecar = self.sidecar_path(diff_id);
-        let staged = tmp.with_extension("stats");
         let text = format!(
             "bytes {}\nentries {}\nskipped-devices {}\n",
             stats.bytes, stats.entries, stats.skipped_devices
         );
-        fs::write(&staged, text).map_err(|e| cache_err(&staged, e))?;
-        let renamed = fs::rename(&staged, &sidecar).map_err(|e| cache_err(&sidecar, e));
-        if renamed.is_err() {
-            let _ = fs::remove_file(&staged);
-        }
-        renamed?;
+        fs::write(staged, text).map_err(|e| cache_err(staged, e))?;
+        let tree = File::open(tmp).map_err(|e| cache_err(tmp, e))?;
+        boneli_sys::sync_filesystem(&tree).map_err(|e| Error::Sys {
+            path: tmp.display().to_string(),
+            source: e,
+        })?;
+        drop(tree);
+
+        let layers = self.root.join("layers").join("sha256");
+        let sidecar = self.sidecar_path(diff_id);
+        fs::rename(staged, &sidecar).map_err(|e| cache_err(&sidecar, e))?;
+        sync_dir(&layers)?;
 
         // Moving a directory to another parent rewrites its `..`, which
         // needs write permission on it: a root without u+w gets it for
@@ -175,14 +200,16 @@ impl LayerCache {
         match fs::rename(tmp, &final_path) {
             Ok(()) => {
                 if lifted {
-                    fs::set_permissions(&final_path, Permissions::from_mode(mode))
+                    let root = File::open(&final_path).map_err(|e| cache_err(&final_path, e))?;
+                    root.set_permissions(Permissions::from_mode(mode))
+                        .and_then(|()| root.sync_all())
                         .map_err(|e| cache_err(&final_path, e))?;
                 }
+                sync_dir(&layers)?;
                 Ok(stats)
             }
-            Err(e) if final_path.is_dir() => {
+            Err(_) if final_path.is_dir() => {
                 // Another store committed this layer first.
-                let _ = e;
                 remove_tree(tmp);
                 self.cached(diff_id)?
                     .ok_or_else(|| Error::Sidecar(self.sidecar_path(diff_id)))
@@ -190,6 +217,21 @@ impl LayerCache {
             Err(e) => Err(cache_err(&final_path, e)),
         }
     }
+}
+
+/// Where a temporary tree stages its sidecar: next to it, with `.stats`
+/// appended, so every tree of every process has its own.
+fn staged_sidecar(tmp: &Path) -> PathBuf {
+    let mut name = tmp.as_os_str().to_owned();
+    name.push(".stats");
+    PathBuf::from(name)
+}
+
+/// Makes the entries of the directory `dir` durable.
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| cache_err(dir, e))
 }
 
 /// `bytes N\nentries N\nskipped-devices N\n`, exactly.
@@ -231,33 +273,68 @@ fn own_start_time() -> Result<u64, Error> {
         .ok_or_else(bad)
 }
 
-/// Removes a temporary tree whose directories may have any final mode:
-/// first every directory gets `u+rwx`, then the tree goes. Best effort;
-/// the store removes what is left of dead processes when it opens.
+/// Removes a temporary tree whose directories may have any final mode.
+/// Best effort; the store removes what is left of dead processes when it
+/// opens.
 fn remove_tree(path: &Path) {
-    make_owner_rwx(path);
-    let _ = fs::remove_dir_all(path);
+    let _ = remove_tree_bounded(path);
 }
 
-fn make_owner_rwx(path: &Path) {
-    let Ok(m) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if !m.file_type().is_dir() {
-        return;
+/// Removes `top` and everything under it, holding at most one directory
+/// descriptor at any time, whatever the depth (std's `remove_dir_all`
+/// holds one per level). Paths are used instead: every path the unpacker
+/// created fits `PATH_MAX`. Each directory gets `u+rwx` before it is
+/// listed, because final modes may be 0. A directory is listed again after
+/// each subdirectory is gone, which costs one extra listing per
+/// subdirectory.
+pub(crate) fn remove_tree_bounded(top: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(top) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return fs::remove_file(top),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     }
-    let mode = m.permissions().mode() & 0o7777;
-    let _ = fs::set_permissions(path, Permissions::from_mode(mode | 0o700));
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            make_owner_rwx(&entry.path());
+    let mut chain = vec![top.to_path_buf()];
+    while let Some(dir) = chain.last() {
+        let mode = fs::symlink_metadata(dir)?.permissions().mode() & 0o7777;
+        if mode & 0o700 != 0o700 {
+            fs::set_permissions(dir, Permissions::from_mode(mode | 0o700))?;
+        }
+        let mut subdir = None;
+        // The listing's descriptor closes at the end of this loop, before
+        // the walk goes down a level.
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                subdir = Some(entry.path());
+                break;
+            }
+            fs::remove_file(entry.path())?;
+        }
+        match subdir {
+            Some(sub) => chain.push(sub),
+            None => {
+                fs::remove_dir(dir)?;
+                chain.pop();
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{own_start_time, parse_sidecar};
+    use std::path::Path;
+
+    use super::{own_start_time, parse_sidecar, staged_sidecar};
+
+    #[test]
+    fn every_temporary_has_its_own_staged_sidecar() {
+        let a = staged_sidecar(Path::new("/s/tmp/123.456.0"));
+        let b = staged_sidecar(Path::new("/s/tmp/123.456.17"));
+        assert_eq!(a, Path::new("/s/tmp/123.456.0.stats"));
+        assert_eq!(b, Path::new("/s/tmp/123.456.17.stats"));
+    }
 
     #[test]
     fn sidecar_format() {

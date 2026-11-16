@@ -15,11 +15,13 @@ use support::tarball::{self, BLOCK, Checksum, Header, MTIME, Magic, Tar};
 use support::{TempDir, make_writable};
 
 const MIB: u64 = 1 << 20;
+/// The path depth the store uses (ADR-009, D7).
+const DEPTH: u64 = 128;
 const OPAQUE: &str = "user.overlay.opaque";
 
 /// Generous limits, so only the case under test can trip one.
 fn limits() -> Limits {
-    Limits::new(1 << 32, 1 << 34, 1 << 20, MIB).expect("valid limits")
+    Limits::new(1 << 32, 1 << 34, 1 << 20, MIB, DEPTH).expect("valid limits")
 }
 
 fn budget() -> Budget {
@@ -1202,7 +1204,7 @@ impl Read for Trickle<'_> {
 #[test]
 fn gzip_bomb_stops_at_cap() {
     let cap = MIB;
-    let layer_limits = Limits::new(cap, 1 << 34, 1 << 20, MIB).expect("limits");
+    let layer_limits = Limits::new(cap, 1 << 34, 1 << 20, MIB, DEPTH).expect("limits");
 
     // Exactly the cap of zeros (an empty archive followed by zeros): passes.
     let exact = tarball::gzip(&vec![0u8; usize::try_from(cap).expect("fits")]);
@@ -1266,11 +1268,12 @@ fn gzip_and_zstd_layers_unpack() {
 
 #[test]
 fn limits_zero_refused() {
-    assert!(Limits::new(0, 1, 1, 1).is_err());
-    assert!(Limits::new(1, 0, 1, 1).is_err());
-    assert!(Limits::new(1, 1, 0, 1).is_err());
-    assert!(Limits::new(1, 1, 1, 0).is_err());
-    assert!(Limits::new(1, 1, 1, 1).is_ok());
+    assert!(Limits::new(0, 1, 1, 1, 1).is_err());
+    assert!(Limits::new(1, 0, 1, 1, 1).is_err());
+    assert!(Limits::new(1, 1, 0, 1, 1).is_err());
+    assert!(Limits::new(1, 1, 1, 0, 1).is_err());
+    assert!(Limits::new(1, 1, 1, 1, 0).is_err());
+    assert!(Limits::new(1, 1, 1, 1, 1).is_ok());
 }
 
 #[test]
@@ -1278,7 +1281,7 @@ fn layer_bytes_cap_inclusive() {
     let plain = three_entries().finish();
     let len = u64::try_from(plain.len()).expect("fits");
     for (compression, bytes) in encodings(&plain) {
-        let at_cap = Limits::new(len, 1 << 34, 1 << 20, MIB).expect("limits");
+        let at_cap = Limits::new(len, 1 << 34, 1 << 20, MIB, DEPTH).expect("limits");
         let dir = TempDir::new("cap");
         unpack(
             &bytes[..],
@@ -1287,7 +1290,7 @@ fn layer_bytes_cap_inclusive() {
             &mut Budget::new(at_cap),
         )
         .expect("exactly the cap");
-        let below = Limits::new(len - 1, 1 << 34, 1 << 20, MIB).expect("limits");
+        let below = Limits::new(len - 1, 1 << 34, 1 << 20, MIB, DEPTH).expect("limits");
         let dir = TempDir::new("cap");
         let e = unpack(&bytes[..], compression, dir.path(), &mut Budget::new(below))
             .expect_err("one byte over");
@@ -1312,20 +1315,21 @@ fn image_caps_inclusive() {
         unpack(&b[..], Compression::None, d2.path(), &mut budget)?;
         Ok(())
     };
-    run(Limits::new(1 << 32, a_len + b_len, 5, MIB).expect("limits")).expect("bytes at the cap");
+    run(Limits::new(1 << 32, a_len + b_len, 5, MIB, DEPTH).expect("limits"))
+        .expect("bytes at the cap");
     assert!(matches!(
-        run(Limits::new(1 << 32, a_len + b_len - 1, 5, MIB).expect("limits")),
+        run(Limits::new(1 << 32, a_len + b_len - 1, 5, MIB, DEPTH).expect("limits")),
         Err(Error::Limit { .. })
     ));
     assert!(matches!(
-        run(Limits::new(1 << 32, 1 << 34, 4, MIB).expect("limits")),
+        run(Limits::new(1 << 32, 1 << 34, 4, MIB, DEPTH).expect("limits")),
         Err(Error::Limit { .. })
     ));
 
     // The image limit stops a bomb in the stream, like the layer limit.
     let one = tarball::gzip(&vec![0u8; usize::try_from(MIB).expect("fits")]);
     let bomb = one.repeat(16);
-    let mut budget = Budget::new(Limits::new(1 << 32, a_len + MIB, 5, MIB).expect("limits"));
+    let mut budget = Budget::new(Limits::new(1 << 32, a_len + MIB, 5, MIB, DEPTH).expect("limits"));
     let d1 = TempDir::new("img");
     unpack(&a[..], Compression::None, d1.path(), &mut budget).expect("first layer");
     let mut source = Trickle {
@@ -1373,7 +1377,7 @@ fn image_caps_count_cached_layers() {
         (a_len + b_len, 4, false),
     ] {
         let mut warm =
-            Budget::new(Limits::new(1 << 32, max_bytes, max_entries, MIB).expect("limits"));
+            Budget::new(Limits::new(1 << 32, max_bytes, max_entries, MIB, DEPTH).expect("limits"));
         let cached = cache.cached(&a_id).expect("read").expect("a is cached");
         assert_eq!((cached.bytes, cached.entries), (a_len, 3));
         let warm_result = warm.charge(&cached).and_then(|()| {
@@ -1495,4 +1499,135 @@ fn corrupt_sidecar_is_an_error() {
         std::fs::write(&sidecar, text).expect("write");
         assert!(cache.cached(&id).is_err(), "{text:?}");
     }
+}
+
+/// Per-entry cost does not grow with the square of the depth: parents a
+/// layer already verified are not walked again (the review measured
+/// 407 ms per entry at depth 1,932 before). Relative to a shallow layer, so
+/// the bound does not depend on the machine: quadratic cost makes the
+/// deep entries about 90 times dearer, linear path resolution a few times.
+#[test]
+fn deep_entries_cost_is_not_quadratic() {
+    fn per_entry(depth: usize) -> f64 {
+        let prefix = vec!["a"; depth - 1].join("/");
+        let entries = 60;
+        let mut t = Tar::new();
+        for i in 0..entries {
+            t.pax(&[("path", format!("{prefix}/f{i}").as_bytes())])
+                .file("x", 0o644, b"");
+        }
+        let bytes = t.finish();
+        let dir = TempDir::new("depth");
+        let start = std::time::Instant::now();
+        // Its own depth limit: the test pins the walk, not the cap.
+        let mut deep_budget = with_depth(1024);
+        unpack(&bytes[..], Compression::None, dir.path(), &mut deep_budget).expect("unpacks");
+        start.elapsed().as_secs_f64() / f64::from(entries)
+    }
+    // Warm up, then compare the median of three runs each.
+    per_entry(8);
+    let median = |depth: usize| {
+        let mut v = [per_entry(depth), per_entry(depth), per_entry(depth)];
+        v.sort_by(f64::total_cmp);
+        v[1]
+    };
+    let (shallow, deep) = (median(8), median(512));
+    assert!(
+        deep < 15.0 * shallow,
+        "depth 512 costs {:.3} ms per entry, depth 8 {:.3} ms",
+        deep * 1e3,
+        shallow * 1e3
+    );
+}
+
+fn with_depth(max_depth: u64) -> Budget {
+    Budget::new(Limits::new(1 << 32, 1 << 34, 1 << 20, MIB, max_depth).expect("limits"))
+}
+
+/// The path depth is capped, inclusive: the number of components after
+/// normalization, whatever the entry's type (D7).
+#[test]
+fn depth_cap_inclusive() {
+    let ok_cases = [
+        Tar::new().file("a/b/c/d", 0o644, b"x").finish(),
+        Tar::new().file("./a//b/./c/d/", 0o644, b"x").finish(),
+        Tar::new().file("a/b/c/.wh.d", 0o644, b"").finish(),
+        Tar::new()
+            .dir("a/b/c/d", 0o755)
+            .file("a/b/c/.wh..wh..opq", 0o644, b"")
+            .finish(),
+    ];
+    for bytes in ok_cases {
+        let dir = TempDir::new("depth-ok");
+        unpack(
+            &bytes[..],
+            Compression::None,
+            dir.path(),
+            &mut with_depth(4),
+        )
+        .expect("depth 4");
+    }
+    let refused_cases = [
+        Tar::new().file("a/b/c/d/e", 0o644, b"x").finish(),
+        Tar::new().dir("a/b/c/d/e/", 0o755).finish(),
+        Tar::new().file("a/b/c/d/.wh.e", 0o644, b"").finish(),
+        Tar::new().symlink("a/b/c/d/e", "x").finish(),
+        Tar::new()
+            .file(".wh..wh.plnk/b/c/d/e", 0o644, b"x")
+            .finish(),
+    ];
+    for bytes in refused_cases {
+        let dir = TempDir::new("depth-refused");
+        let e = unpack(
+            &bytes[..],
+            Compression::None,
+            dir.path(),
+            &mut with_depth(4),
+        )
+        .expect_err("depth 5");
+        assert!(
+            matches!(
+                e,
+                Error::Limit {
+                    what: "path depth",
+                    max: 4
+                }
+            ),
+            "{e}"
+        );
+    }
+}
+
+/// Directories created for missing parents are inodes like any entry, so
+/// they count toward the entry limits: one tar entry cannot create an
+/// unbounded number of directories (D7).
+#[test]
+fn implicit_parents_count_as_entries() {
+    let bytes = Tar::new()
+        .file("a/b/c", 0o644, b"x")
+        .dir("a", 0o755)
+        .finish();
+    let (_dir, stats) = ok(&bytes);
+    assert_eq!(stats.entries, 4, "two tar entries and two created parents");
+
+    let deep = Tar::new().file("1/2/3/4/5/6/7/8/9/f", 0o644, b"x").finish();
+    let dir = TempDir::new("implicit");
+    let tight = Limits::new(1 << 32, 1 << 34, 9, MIB, DEPTH).expect("limits");
+    let e = unpack(
+        &deep[..],
+        Compression::None,
+        dir.path(),
+        &mut Budget::new(tight),
+    )
+    .expect_err("ten inodes");
+    assert!(matches!(e, Error::Limit { .. }), "{e}");
+    let dir = TempDir::new("implicit");
+    let exact = Limits::new(1 << 32, 1 << 34, 10, MIB, DEPTH).expect("limits");
+    unpack(
+        &deep[..],
+        Compression::None,
+        dir.path(),
+        &mut Budget::new(exact),
+    )
+    .expect("ten inodes");
 }

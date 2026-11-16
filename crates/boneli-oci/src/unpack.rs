@@ -48,8 +48,9 @@ pub struct LayerStats {
     pub diff_id: [u8; 32],
     /// Uncompressed bytes.
     pub bytes: u64,
-    /// Tar entries, skipped ones included; PAX and GNU extension headers
-    /// are not entries.
+    /// Tar entries, skipped ones included, plus the directories created
+    /// for missing parents, which are inodes too; PAX and GNU extension
+    /// headers are not entries.
     pub entries: u64,
     /// Character and block devices that were not written (D3): the sandbox
     /// mounts its own `/dev`, and unprivileged `mknod` refuses them.
@@ -97,10 +98,9 @@ pub fn unpack(
         image_room,
     };
     let mut reader = Reader::new(counted, budget.limits().max_special_bytes());
-    let mut layer = Layer::new(dest);
+    let mut layer = Layer::new(dest, budget);
     while let Some(entry) = reader.next_entry()? {
-        layer.entries += 1;
-        budget.check_entries(layer.entries)?;
+        layer.count()?;
         layer.entry(entry, &mut reader)?;
     }
     // Bytes after the end of the archive are hashed and counted, never
@@ -108,16 +108,17 @@ pub fn unpack(
     let mut counted = reader.into_inner();
     io::copy(&mut counted, &mut io::sink()).map_err(from_io)?;
     layer.finish()?;
+    let (entries, skipped_devices) = (layer.entries, layer.skipped_devices);
 
     let bytes = budget.check_bytes(counted.bytes)?;
-    let entries = budget.check_entries(layer.entries)?;
+    let total_entries = budget.check_entries(entries)?;
     let stats = LayerStats {
         diff_id: counted.hash.finish(),
         bytes: counted.bytes,
-        entries: layer.entries,
-        skipped_devices: layer.skipped_devices,
+        entries,
+        skipped_devices,
     };
-    budget.charge_totals(bytes, entries);
+    budget.charge_totals(bytes, total_entries);
     Ok(stats)
 }
 
@@ -166,9 +167,13 @@ struct DirMeta {
 struct Layer<'a> {
     root: &'a Path,
     /// Directories by their path relative to the root (`""` is the root).
+    /// Every key is a real directory that this unpacker created or merged,
+    /// and so is every ancestor of it: `remove` drops a key together with
+    /// everything under it, and nothing else replaces a directory.
     dirs: BTreeMap<Vec<u8>, DirMeta>,
     entries: u64,
     skipped_devices: u64,
+    budget: &'a Budget,
 }
 
 fn show(path: &[u8]) -> String {
@@ -215,7 +220,7 @@ fn system_time(t: Mtime) -> Option<SystemTime> {
 }
 
 impl<'a> Layer<'a> {
-    fn new(root: &'a Path) -> Layer<'a> {
+    fn new(root: &'a Path, budget: &'a Budget) -> Layer<'a> {
         let mut dirs = BTreeMap::new();
         dirs.insert(
             Vec::new(),
@@ -229,7 +234,15 @@ impl<'a> Layer<'a> {
             dirs,
             entries: 0,
             skipped_devices: 0,
+            budget,
         }
+    }
+
+    /// Counts one more entry or created directory against the image's
+    /// entry limit.
+    fn count(&mut self) -> Result<(), Error> {
+        self.entries += 1;
+        self.budget.check_entries(self.entries).map(|_| ())
     }
 
     fn host(&self, rel: &[u8]) -> PathBuf {
@@ -264,8 +277,17 @@ impl<'a> Layer<'a> {
     /// component: a missing one is created, a whiteout of this layer is
     /// replaced (the real entry wins), and a symlink or any other entry is
     /// refused, so nothing is ever written through a link.
+    ///
+    /// The walk starts below the deepest ancestor already in `dirs`, which
+    /// this layer verified or created before; in the usual case that is
+    /// the parent itself, so an entry costs no `lstat` for its parents and
+    /// the cost does not grow with the square of the depth.
     fn parents(&mut self, entry: &[u8], comps: &[&[u8]]) -> Result<(), Error> {
-        for i in 1..comps.len() {
+        let mut known = comps.len().saturating_sub(1);
+        while known > 0 && !self.dirs.contains_key(&join(&comps[..known])) {
+            known -= 1;
+        }
+        for i in known + 1..comps.len() {
             let rel = join(&comps[..i]);
             match self.lstat(&rel)? {
                 Some(m) if m.file_type().is_dir() => {}
@@ -274,10 +296,14 @@ impl<'a> Layer<'a> {
                 }
                 Some(m) if m.file_type().is_char_device() && m.rdev() == 0 => {
                     fs::remove_file(self.host(&rel)).map_err(|e| Self::write_err(&rel, e))?;
+                    self.count()?;
                     self.mkdir(&rel)?;
                 }
                 Some(_) => return Err(refuse(entry, "a parent is not a directory")),
-                None => self.mkdir(&rel)?,
+                None => {
+                    self.count()?;
+                    self.mkdir(&rel)?;
+                }
             }
         }
         Ok(())
@@ -322,6 +348,13 @@ impl<'a> Layer<'a> {
 
     fn entry<R: Read>(&mut self, e: Entry, reader: &mut Reader<R>) -> Result<(), Error> {
         let comps = components(&e.path)?;
+        let max_depth = self.budget.limits().max_depth();
+        if u64::try_from(comps.len()).map_or(true, |d| d > max_depth) {
+            return Err(Error::Limit {
+                what: "path depth",
+                max: max_depth,
+            });
+        }
         let Some((&name, parent)) = comps.split_last() else {
             // The layer root: mode only.
             if e.kind != Kind::Dir {

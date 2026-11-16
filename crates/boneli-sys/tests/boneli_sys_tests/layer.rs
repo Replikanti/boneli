@@ -136,3 +136,13 @@ fn layer_paths_with_nul_are_refused() {
     assert!(matches!(make_fifo(path, 0o600), Err(Error::Nul(_))));
     assert!(matches!(mark_opaque(path), Err(Error::Nul(_))));
 }
+
+#[test]
+fn sync_filesystem_flushes_a_directory() {
+    let dir = TempDir::new("layer-syncfs");
+    std::fs::write(dir.path().join("f"), b"data").expect("file");
+    let handle = std::fs::File::open(dir.path()).expect("open the directory");
+    boneli_sys::sync_filesystem(&handle).expect("syncfs");
+    let file = std::fs::File::open(dir.path().join("f")).expect("open the file");
+    boneli_sys::sync_filesystem(&file).expect("syncfs through a file on the same filesystem");
+}

@@ -3,11 +3,13 @@
 //! reads with `userxattr` (ADR-007, D7), and that std cannot do without
 //! `libc`.
 //!
-//! Every call is path based and never follows a final symlink: `mknod`
+//! Every call but `sync_filesystem` is path based and never follows a final symlink: `mknod`
 //! fails with `EEXIST` on any existing entry, symlinks included, and the
 //! `l*xattr` calls act on the link itself.
 
 use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -115,5 +117,21 @@ pub fn user_xattr(path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
                 e => Err(e),
             }
         }
+    }
+}
+
+/// Writes back every dirty page and inode of the filesystem that `file`
+/// is on and waits for it (`syncfs`). The layer cache calls it once per
+/// layer before its commit (ADR-009, D8): one call instead of an `fsync`
+/// per file. Since Linux 5.8 it reports writeback errors of the
+/// filesystem.
+pub fn sync_filesystem(file: &File) -> Result<()> {
+    // SAFETY: the descriptor belongs to `file`, which outlives the call;
+    // syncfs only reads it.
+    let rc = unsafe { libc::syncfs(file.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::last("syncfs"))
     }
 }
