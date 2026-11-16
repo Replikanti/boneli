@@ -363,6 +363,43 @@ fn io_limit_throttles_writes() {
 }
 
 #[test]
+fn io_write_plan_forms() {
+    use crate::support::probe::{IoDirect, io_write_plan};
+    let plan = |size: &str, chunk: Option<&str>, direct: Option<&str>| {
+        io_write_plan(size, chunk, direct).map(|p| (p.size, p.chunk, p.direct))
+    };
+    assert_eq!(
+        plan("8388608", None, None),
+        Ok((8_388_608, 1 << 20, IoDirect::Auto))
+    );
+    assert_eq!(8_388_608 / (1 << 20), 8);
+    assert_eq!(
+        plan("41943040", Some("41943040"), Some("require")),
+        Ok((41_943_040, 41_943_040, IoDirect::Require))
+    );
+    for chunk in ["0", "4097", "", "abc", " 4096", "+4096"] {
+        assert!(
+            plan("8388608", Some(chunk), None).is_err(),
+            "chunk {chunk:?}"
+        );
+    }
+    assert!(plan("8388608", Some("3145728"), None).is_err(), "remainder");
+    assert!(
+        plan("1048576", Some("2097152"), None).is_err(),
+        "chunk over size"
+    );
+    assert!(plan("abc", None, None).is_err(), "size");
+    for direct in [
+        "never", "Require", "require ", "Never", "NEVER", " never", "never ", "auto", "1", "",
+    ] {
+        assert!(
+            plan("8388608", None, Some(direct)).is_err(),
+            "direct {direct:?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "host: cgroup v2 delegation, user namespaces"]
 fn cgroup_namespace_root_is_sandbox_cgroup() {
     // The child enters its cgroup at clone (CLONE_INTO_CGROUP) and creates
@@ -608,45 +645,119 @@ fn failed_spawn_leaves_no_cgroup_process() {
 fn destroy_lifts_io_throttle() {
     // Review of PR 3: a task in one large O_DIRECT write at wbps 1 MiB/s
     // waits uninterruptibly for its queued bios, so cgroup.kill cannot end
-    // it before they drain at the throttled rate (40 MiB: about 40 s, past
-    // the 10 s bound). destroy lifts io.max after the kill, so the bios
-    // drain at once (the reviewer measured 97 ms with the lift).
+    // it before they drain at the throttled rate. destroy lifts io.max
+    // after the kill, so the bios drain at once (the reviewer measured
+    // 97 ms with the lift).
+    //
+    // The writer is the probe (#52): one 41,943,040-byte O_DIRECT write
+    // from a 4096-aligned buffer, never dd, whose write path depends on
+    // the image (on AWS runners dd's 40 MiB returned within the 2 s). A
+    // held write needs at least (41,943,040 - 104,858) / 1 MiB/s = 39.9 s
+    // (one 100 ms slice may pass early), so at the check about 38 MiB
+    // are still queued; without the lift that takes past KILL_BOUND
+    // (10 s) to drain. The dev host measured the writer inside its write
+    // 263-872 ms after the spawn, wchar 38 while held. Before the kill the
+    // test checks that io.max holds the writer inside that one write: the
+    // cgroup is populated, a task is in write(2) with the 40 MiB count
+    // (/proc/<pid>/task/<tid>/syscall), and wchar is under 40 MiB
+    // (/proc/<pid>/io adds a write only when it returns). Where the runner
+    // refuses those files (EACCES, EPERM), a task in D decides instead,
+    // and the report line names the fallback. wbytes on the io.max
+    // device must be above 0 (review of PR 53: a limit on a device the
+    // bios do not pass plus a slow device would read as held), with no
+    // upper bound: where io.stat counts depends on the write path. The
+    // first count comes when the first bio is dispatched, about 1 s after
+    // the writer enters its write, so the check reads again every 100 ms
+    // until the device counts or IO_HOLD_DEADLINE_MS (review round 2 of
+    // PR 53: a writer that entered at ~1.2 s read wbytes 0 at 2 s).
     let _alone = support::exclusive();
     let fixture = Fixture::new("io-kill");
     let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
     let io = IoLimits::new(vec![IoMax {
         dev,
         rbps: None,
-        wbps: Some(1 << 20),
+        wbps: Some(IO_KILL_WBPS),
         riops: None,
         wiops: None,
     }])
     .expect("one device");
+    // Declared before the cgroup, so a panic before the destroy drops the
+    // cgroup first: its drop kills and lifts io.max, then Child::drop
+    // reaps at once instead of waiting ~38 s for the throttled bios
+    // (review of PR 53; a panic injected after the check ended the test
+    // after 2.06 s, and after 40.29 s with the old order, on the dev host).
+    let mut writer = None;
     let cg = cgroup::create("io-kill", &limits(256 << 20, 16, (100_000, 100_000), io));
-    let mut child = spawn(&spec(
+    let size = IO_KILL_SIZE.to_string();
+    let mut s = spec(
         fixture.root(),
         &cg,
-        "/usr/bin/dd",
-        &[
-            "if=/dev/urandom",
-            "of=/workspace/big",
-            "bs=40M",
-            "count=1",
-            "iflag=fullblock",
-            "oflag=direct",
-        ],
-    ))
-    .expect("spawn dd");
-    // Let dd fill its buffer and block in the throttled write.
+        crate::support::rootfs::PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+    );
+    s.env = [
+        (support::probe::ACTION_VAR, "io-write"),
+        ("BONELI_PROBE_FILE", "/workspace/big"),
+        ("BONELI_PROBE_SIZE", size.as_str()),
+        ("BONELI_PROBE_CHUNK", size.as_str()),
+        ("BONELI_PROBE_DIRECT", "require"),
+    ]
+    .iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    let start = Instant::now();
+    let child = writer.insert(spawn(&s).expect("spawn the writer"));
+    drop(s);
+    let pid = child.pid();
+    // Let the writer fill its buffer and block in the throttled write,
+    // then wait for the io.max device to count its first bio. Each read
+    // takes the device's count first and the writer's own files after it.
     std::thread::sleep(Duration::from_secs(2));
+    let (verdict, facts) = poll_io_hold(
+        || {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let wbytes = io_stat_wbytes(&read(&cg, "io.stat"), dev.major, dev.minor);
+            let populated_now = populated(&cg);
+            let check = hold_check(pid);
+            let states = task_states(pid);
+            let memory = read(&cg, "memory.stat");
+            let buffer = buffer_mapping(pid, &check);
+            IoFacts {
+                dev: (dev.major, dev.minor),
+                elapsed_ms,
+                populated: populated_now,
+                check,
+                states,
+                wbytes,
+                file_dirty: keyed(&memory, "file_dirty"),
+                file_writeback: keyed(&memory, "file_writeback"),
+                reads: 0,
+                buffer,
+            }
+        },
+        || std::thread::sleep(IO_HOLD_POLL),
+    );
+    report(&format!(
+        "destroy_lifts_io_throttle: {}",
+        io_hold_text(verdict, &facts)
+    ));
     let path = cg.path().to_path_buf();
+    if verdict != IoHold::Held {
+        let _ = cg.destroy();
+        let status = wait_bounded(child, Duration::from_secs(120));
+        if path.exists() {
+            let _ = std::fs::write(path.join("cgroup.kill"), "1");
+            let _ = std::fs::remove_dir(&path);
+        }
+        panic!("{}", io_hold_failure(verdict, status, &facts));
+    }
     let start = Instant::now();
     let result = cg.destroy();
     let took = start.elapsed();
     report(&format!(
         "destroy_lifts_io_throttle: destroy took {took:?}: {result:?}"
     ));
-    let status = wait_bounded(&mut child, Duration::from_secs(120));
+    let status = wait_bounded(child, Duration::from_secs(120));
     if path.exists() {
         // Leave nothing behind when the assertion below fails.
         let _ = std::fs::write(path.join("cgroup.kill"), "1");
@@ -655,6 +766,1071 @@ fn destroy_lifts_io_throttle() {
     assert!(result.is_ok(), "{result:?} after {took:?}");
     assert!(took < Duration::from_secs(5), "destroy took {took:?}");
     assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
+}
+
+/// The one write of `destroy_lifts_io_throttle`: 40 MiB.
+const IO_KILL_SIZE: u64 = 40 << 20;
+/// Its `wbps`: 1 MiB/s.
+const IO_KILL_WBPS: u64 = 1 << 20;
+
+/// One task's `/proc/<pid>/task/<tid>/syscall`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskSyscall {
+    /// `running`: the task was on a CPU.
+    Running,
+    /// A negative number, sp and pc: asleep, not in a syscall (an exited
+    /// task reads `-1 0x0 0x0`, measured).
+    Blocked,
+    /// In syscall `nr` with these six arguments.
+    In { nr: libc::c_long, args: [u64; 6] },
+}
+
+/// ASCII digits with at most a leading `-`; `str::parse` would also take
+/// a leading `+`.
+fn is_decimal(s: &str) -> bool {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `0x` and at least one ASCII hex digit, within u64; `from_str_radix`
+/// would also take a leading `+`.
+fn hex_field(s: &str) -> Option<u64> {
+    let digits = s.strip_prefix("0x")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
+/// Parses one `syscall` file; anything but the kernel's three forms
+/// panics with the line quoted, never reads as held.
+fn parse_syscall(line: &str) -> TaskSyscall {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let fields: Vec<&str> = body.split_ascii_whitespace().collect();
+    if fields == ["running"] {
+        return TaskSyscall::Running;
+    }
+    let bad = || -> ! { panic!("unexpected syscall line {line:?}") };
+    let Some((first, rest)) = fields.split_first() else {
+        bad()
+    };
+    if !is_decimal(first) {
+        bad();
+    }
+    let nr: libc::c_long = first.parse().unwrap_or_else(|_| bad());
+    let hex: Vec<u64> = rest
+        .iter()
+        .map(|f| hex_field(f).unwrap_or_else(|| bad()))
+        .collect();
+    match (nr < 0, hex.len()) {
+        (true, 2) => TaskSyscall::Blocked,
+        (false, 8) => {
+            let mut args = [0; 6];
+            args.copy_from_slice(&hex[..6]);
+            TaskSyscall::In { nr, args }
+        }
+        _ => bad(),
+    }
+}
+
+/// One task of the writer as the hold check read it.
+#[derive(Debug, Clone)]
+struct TaskLine {
+    tid: String,
+    /// The `syscall` file without its newline, for the report.
+    raw: String,
+    call: TaskSyscall,
+}
+
+/// What the hold check read.
+#[derive(Debug)]
+enum HoldCheck {
+    /// Every task's `syscall` line, then `wchar` from `/proc/<pid>/io`.
+    Syscall { tasks: Vec<TaskLine>, wchar: u64 },
+    /// One of those files was refused (`syscall: EACCES`, `io: EPERM`):
+    /// the task states decide.
+    DState { refused: String },
+}
+
+/// `wchar` of a `/proc/<pid>/io` text: the first line that starts with
+/// `wchar: `, its value ASCII digits within u64; anything else panics
+/// with the text or the line quoted.
+fn proc_io_wchar(text: &str) -> u64 {
+    let Some(line) = text.lines().find(|l| l.starts_with("wchar: ")) else {
+        panic!("no wchar line in {text:?}")
+    };
+    let value = &line["wchar: ".len()..];
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        panic!("unexpected wchar line {line:?}");
+    }
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("wchar out of range in {line:?}"))
+}
+
+/// A refusal of a `/proc` file (the fallback's trigger), else `None`.
+fn proc_refusal(e: &std::io::Error) -> Option<&'static str> {
+    match e.raw_os_error() {
+        Some(libc::EACCES) => Some("EACCES"),
+        Some(libc::EPERM) => Some("EPERM"),
+        _ => None,
+    }
+}
+
+/// Reads every task's `syscall` file of `pid`, then its `wchar`; a refused
+/// file switches to the `D`-state fallback. A task that exited in between
+/// (ENOENT, ESRCH) is skipped. The writer is not reaped before
+/// `wait_bounded`, so its files stay readable after it exits.
+fn hold_check(pid: i32) -> HoldCheck {
+    let dir = format!("/proc/{pid}/task");
+    let tids: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let mut tasks = Vec::new();
+    for tid in tids {
+        match std::fs::read_to_string(format!("{dir}/{tid}/syscall")) {
+            Ok(text) => tasks.push(TaskLine {
+                call: parse_syscall(&text),
+                raw: text.strip_suffix('\n').unwrap_or(&text).to_string(),
+                tid,
+            }),
+            Err(e) => {
+                if let Some(r) = proc_refusal(&e) {
+                    return HoldCheck::DState {
+                        refused: format!("syscall: {r}"),
+                    };
+                }
+            }
+        }
+    }
+    let io = format!("/proc/{pid}/io");
+    match std::fs::read_to_string(&io) {
+        Ok(text) => HoldCheck::Syscall {
+            tasks,
+            wchar: proc_io_wchar(&text),
+        },
+        Err(e) => match proc_refusal(&e) {
+            Some(r) => HoldCheck::DState {
+                refused: format!("io: {r}"),
+            },
+            None => panic!("read {io}: {e}"),
+        },
+    }
+}
+
+/// `syscall`, or `d-state (<refused file>: <errno>)`.
+fn hold_check_label(c: &HoldCheck) -> String {
+    match c {
+        HoldCheck::Syscall { .. } => "syscall".to_string(),
+        HoldCheck::DState { refused } => format!("d-state ({refused})"),
+    }
+}
+
+/// What `destroy_lifts_io_throttle` read at the check.
+#[derive(Debug)]
+struct IoFacts {
+    dev: (u32, u32),
+    elapsed_ms: u64,
+    populated: u64,
+    check: HoldCheck,
+    states: Vec<char>,
+    wbytes: u64,
+    file_dirty: u64,
+    file_writeback: u64,
+    reads: u32,
+    buffer: String,
+}
+
+/// How long after the spawn `destroy_lifts_io_throttle` waits for the
+/// `io.max` device to count a write of the held writer. The first count
+/// comes when blk-throttle dispatches the first bio, about its size ÷
+/// `wbps` after the writer enters its write: 1 MiB bios (the probe's
+/// buffer is `MADV_NOHUGEPAGE`) and an entry up to 872 ms after the spawn
+/// measured put it near 1.9 s, so one read at 2 s could miss it (review
+/// round 2 of PR 53). At 10 s at most 10 MiB plus one 100 ms slice has
+/// drained, so at least 29.9 MiB are still queued, more than `KILL_BOUND`
+/// (10 s) drains at 1 MiB/s, and the test still proves the lift (ADR-007,
+/// "The timing tests").
+const IO_HOLD_DEADLINE_MS: u64 = 10_000;
+/// The pause between two reads while the poll waits: one 100 ms throttle
+/// slice, the step in which blk-throttle dispatches.
+const IO_HOLD_POLL: Duration = Duration::from_millis(100);
+
+/// Reads the facts until a read is anything but `NotOnDevice`, or until a
+/// read taken at or past [`IO_HOLD_DEADLINE_MS`] after the spawn; returns
+/// the last verdict and its facts, `reads` set. Only the device's count
+/// is waited for: a read that finds the writer out of its write ends the
+/// poll with that verdict, so `Held` always means the writer was inside
+/// its write when the count was seen.
+fn poll_io_hold(mut read: impl FnMut() -> IoFacts, mut pause: impl FnMut()) -> (IoHold, IoFacts) {
+    let mut reads = 0;
+    loop {
+        let mut f = read();
+        reads += 1;
+        f.reads = reads;
+        let v = io_hold_verdict(&f);
+        if v != IoHold::NotOnDevice || f.elapsed_ms >= IO_HOLD_DEADLINE_MS {
+            return (v, f);
+        }
+        pause();
+    }
+}
+
+/// The mapping that holds `addr` in a `/proc/<pid>/smaps` text, for the
+/// report: its size, whether its `VmFlags` carry `nh` (`MADV_NOHUGEPAGE`)
+/// and its `AnonHugePages`.
+fn smaps_buffer(text: &str, addr: u64) -> String {
+    // A mapping starts with its address range, `<hex>-<hex>`, end exclusive.
+    let range = |l: &str| -> Option<(u64, u64)> {
+        let (a, b) = l.split_ascii_whitespace().next()?.split_once('-')?;
+        Some((hex_field(&format!("0x{a}"))?, hex_field(&format!("0x{b}"))?))
+    };
+    let kb = |l: &str, key: &str| -> Option<u64> {
+        l.strip_prefix(key)?
+            .trim()
+            .strip_suffix(" kB")?
+            .parse()
+            .ok()
+    };
+    let mut lines = text.lines();
+    if !lines
+        .by_ref()
+        .any(|l| range(l).is_some_and(|(a, b)| a <= addr && addr < b))
+    {
+        return format!("no mapping at {addr:#x}");
+    }
+    let block: Vec<&str> = lines.take_while(|l| range(l).is_none()).collect();
+    let size = block.iter().find_map(|l| kb(l, "Size:")).unwrap_or(0);
+    let huge = block
+        .iter()
+        .find_map(|l| kb(l, "AnonHugePages:"))
+        .unwrap_or(0);
+    let nh = block.iter().any(|l| {
+        l.strip_prefix("VmFlags:")
+            .is_some_and(|f| f.split_ascii_whitespace().any(|x| x == "nh"))
+    });
+    let nh = if nh { "nh" } else { "no nh" };
+    format!("{size} kB {nh} AnonHugePages {huge} kB")
+}
+
+/// The buffer address of the 40 MiB write, if a task of the hold check
+/// is inside it.
+fn write_buffer(check: &HoldCheck) -> Option<u64> {
+    let HoldCheck::Syscall { tasks, .. } = check else {
+        return None;
+    };
+    tasks.iter().find_map(|t| match t.call {
+        TaskSyscall::In { nr, args } if nr == libc::SYS_write && args[2] == IO_KILL_SIZE => {
+            Some(args[1])
+        }
+        _ => None,
+    })
+}
+
+/// [`smaps_buffer`] of `pid` at the write's buffer, or why not.
+fn buffer_mapping(pid: i32, check: &HoldCheck) -> String {
+    let Some(addr) = write_buffer(check) else {
+        return "unknown (not in the write)".to_string();
+    };
+    match std::fs::read_to_string(format!("/proc/{pid}/smaps")) {
+        Ok(text) => smaps_buffer(&text, addr),
+        Err(e) => format!("smaps unread: {e}"),
+    }
+}
+
+/// Whether io.max held the writer at the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IoHold {
+    /// Alive and inside its 40 MiB write (or in `D` in the fallback), with
+    /// a write counted on the `io.max` device.
+    Held,
+    /// The cgroup was empty: the writer had ended.
+    Finished,
+    /// Alive, but `wchar` counts the whole write: it returned.
+    Returned,
+    /// Alive, but no task was inside the 40 MiB write.
+    NotInWrite,
+    /// Fallback only: no task in `D`.
+    NotBlocked,
+    /// Held otherwise, but the `io.max` device's `io.stat` line counted no
+    /// write: the limit may sit on a device the bios do not pass, so a slow
+    /// device and not `io.max` could be what holds the writer. Final only
+    /// at [`IO_HOLD_DEADLINE_MS`]; before it the poll reads again.
+    NotOnDevice,
+}
+
+/// `Held` also needs `wbytes` above 0 on the `io.max` device's line, a
+/// lower bound only: where `io.stat` counts depends on the write path, and
+/// some lines count above the rate (ADR-007, "The timing tests"), so no
+/// upper bound.
+fn io_hold_verdict(f: &IoFacts) -> IoHold {
+    if f.populated == 0 {
+        return IoHold::Finished;
+    }
+    let held = match &f.check {
+        HoldCheck::Syscall { tasks, wchar } => {
+            if *wchar >= IO_KILL_SIZE {
+                IoHold::Returned
+            } else if tasks.iter().any(|t| {
+                matches!(t.call, TaskSyscall::In { nr, args }
+                    if nr == libc::SYS_write && args[2] == IO_KILL_SIZE)
+            }) {
+                IoHold::Held
+            } else {
+                IoHold::NotInWrite
+            }
+        }
+        HoldCheck::DState { .. } => {
+            if f.states.contains(&'D') {
+                IoHold::Held
+            } else {
+                IoHold::NotBlocked
+            }
+        }
+    };
+    if held == IoHold::Held && f.wbytes == 0 {
+        IoHold::NotOnDevice
+    } else {
+        held
+    }
+}
+
+/// The report line's text, also the details of every failure message.
+fn io_hold_text(v: IoHold, f: &IoFacts) -> String {
+    let (tasks, wchar) = match &f.check {
+        HoldCheck::Syscall { tasks, wchar } => (
+            tasks
+                .iter()
+                .map(|t| format!("{} {:?}", t.tid, t.raw))
+                .collect::<Vec<_>>()
+                .join(", "),
+            wchar.to_string(),
+        ),
+        HoldCheck::DState { refused } => (format!("refused {refused}"), "not read".to_string()),
+    };
+    format!(
+        "at {} ms (read {}) hold-check={} verdict {v:?}, tasks [{tasks}], wchar {wchar}, \
+         states {:?}, device {}:{} wbytes {} file_dirty {} file_writeback {}, buffer {}",
+        f.elapsed_ms,
+        f.reads,
+        hold_check_label(&f.check),
+        f.states,
+        f.dev.0,
+        f.dev.1,
+        f.wbytes,
+        f.file_dirty,
+        f.file_writeback,
+        f.buffer
+    )
+}
+
+fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
+    let off_device = format!(
+        "the io.max device counted no write within {IO_HOLD_DEADLINE_MS} ms of the spawn: \
+         the writer's bios may not pass the limited device"
+    );
+    let why = match v {
+        IoHold::Finished if status == ExitStatus::Exited(0) => {
+            "io.max did not hold the writer: it finished its 40 MiB write before the check"
+        }
+        IoHold::Finished => "the writer failed before the kill",
+        IoHold::Returned => {
+            "io.max did not hold the writer: its 40 MiB write returned before the check"
+        }
+        IoHold::NotInWrite => "the writer was not inside its 40 MiB write",
+        IoHold::NotBlocked => "the writer was not blocked in its write",
+        IoHold::NotOnDevice => off_device.as_str(),
+        IoHold::Held => "the writer was held",
+    };
+    format!("{why}: {}, status {status:?}", io_hold_text(v, f))
+}
+
+/// `wbytes` of the device's line in an `io.stat` text; no line yet means
+/// nothing was submitted (0). The kernel prints the six byte and IO
+/// counters together and only when one of them is non-zero (CI: a line
+/// `259:0 ` after a killed writer), so a line without any of them is 0
+/// too. A line with some counters but no parseable `wbytes=` panics with
+/// the line quoted.
+fn io_stat_wbytes(stat: &str, major: u32, minor: u32) -> u64 {
+    const COUNTERS: [&str; 6] = ["rbytes=", "wbytes=", "rios=", "wios=", "dbytes=", "dios="];
+    let key = format!("{major}:{minor} ");
+    let Some(line) = stat.lines().find(|l| l.starts_with(&key)) else {
+        return 0;
+    };
+    let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if !fields
+        .iter()
+        .any(|f| COUNTERS.iter().any(|c| f.starts_with(c)))
+    {
+        return 0;
+    }
+    fields
+        .iter()
+        .find_map(|f| f.strip_prefix("wbytes="))
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no wbytes in io.stat line {line:?}"))
+}
+
+/// The state of a `/proc/.../stat` line: the first non-space character
+/// after the last `)` (the name may hold `)` and spaces).
+fn stat_state(line: &str) -> Option<char> {
+    let pos = line.rfind(')')?;
+    line[pos + 1..].chars().find(|c| !c.is_ascii_whitespace())
+}
+
+/// The state of every task of `pid`; unreadable entries are skipped.
+fn task_states(pid: i32) -> Vec<char> {
+    let dir = format!("/proc/{pid}/task");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter_map(|s| stat_state(&s))
+        .collect()
+}
+
+/// A task line of the hold check, for the pure tests.
+fn task(tid: &str, raw: &str) -> TaskLine {
+    TaskLine {
+        tid: tid.to_string(),
+        raw: raw.to_string(),
+        call: parse_syscall(raw),
+    }
+}
+
+/// The measured main thread: in `futex`, state `S`.
+fn futex_task() -> TaskLine {
+    task(
+        "4100",
+        &format!(
+            "{} 0x7f3a1652c910 0x80 0x0 0x0 0x0 0x0 0x7ffc0 0x7f3a1",
+            libc::SYS_futex
+        ),
+    )
+}
+
+/// A task in `write(2)` with the given count in the given argument.
+fn write_task(count: u64, arg: usize) -> TaskLine {
+    let mut args = ["0x3", "0x7f3a0d7ff000", "0x0", "0x0", "0x0", "0x0"].map(String::from);
+    args[2] = "0x0".to_string();
+    args[arg] = format!("{count:#x}");
+    task(
+        "4101",
+        &format!(
+            "{} {} 0x7f3a164aad28 0x7f3a1652b352",
+            libc::SYS_write,
+            args.join(" ")
+        ),
+    )
+}
+
+fn io_facts(populated: u64, check: HoldCheck, states: &[char]) -> IoFacts {
+    IoFacts {
+        dev: (259, 0),
+        elapsed_ms: 2004,
+        populated,
+        check,
+        states: states.to_vec(),
+        wbytes: 1_048_576,
+        file_dirty: 0,
+        file_writeback: 41_418_752,
+        reads: 1,
+        buffer: "40960 kB nh AnonHugePages 0 kB".to_string(),
+    }
+}
+
+fn syscall_check(tasks: Vec<TaskLine>, wchar: u64) -> HoldCheck {
+    HoldCheck::Syscall { tasks, wchar }
+}
+
+#[test]
+fn io_hold_verdicts() {
+    let w = || write_task(IO_KILL_SIZE, 2);
+    // Precedence: an unpopulated cgroup finished, whatever the tasks say.
+    assert_eq!(
+        io_hold_verdict(&io_facts(0, syscall_check(vec![w()], 38), &['D'])),
+        IoHold::Finished
+    );
+    // wchar first: a returned write is never Held (the bound is inclusive).
+    for wchar in [IO_KILL_SIZE, 41_943_130] {
+        assert_eq!(
+            io_hold_verdict(&io_facts(1, syscall_check(vec![w()], wchar), &['D'])),
+            IoHold::Returned,
+            "wchar {wchar}"
+        );
+    }
+    for wchar in [IO_KILL_SIZE - 1, 38] {
+        let mut f = io_facts(1, syscall_check(vec![w()], wchar), &['D']);
+        assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}");
+        // wbytes has a lower bound only: some io.stat lines count above
+        // the rate (ADR-007), so a large count is still Held.
+        for wbytes in [1, IO_KILL_SIZE] {
+            f.wbytes = wbytes;
+            assert_eq!(io_hold_verdict(&f), IoHold::Held, "wchar {wchar}, {wbytes}");
+        }
+        // Nothing counted on the io.max device: the limit may sit on a
+        // device the bios do not pass (review of PR 53).
+        f.wbytes = 0;
+        assert_eq!(io_hold_verdict(&f), IoHold::NotOnDevice, "wchar {wchar}");
+    }
+    // The device check comes last: every other verdict wins over it.
+    let zero = |populated, check, states: &[char]| {
+        let mut f = io_facts(populated, check, states);
+        f.wbytes = 0;
+        io_hold_verdict(&f)
+    };
+    assert_eq!(
+        zero(0, syscall_check(vec![w()], 38), &['D']),
+        IoHold::Finished
+    );
+    assert_eq!(
+        zero(1, syscall_check(vec![w()], IO_KILL_SIZE), &['D']),
+        IoHold::Returned
+    );
+    assert_eq!(
+        zero(1, syscall_check(vec![futex_task()], 38), &['S', 'D']),
+        IoHold::NotInWrite
+    );
+    let eperm = || HoldCheck::DState {
+        refused: "io: EPERM".to_string(),
+    };
+    assert_eq!(zero(1, eperm(), &['S']), IoHold::NotBlocked);
+    // The fallback's D needs a counted write too.
+    assert_eq!(zero(1, eperm(), &['S', 'D']), IoHold::NotOnDevice);
+    assert_eq!(zero(0, eperm(), &['D']), IoHold::Finished);
+    // The measured layout: the futex main thread plus the writer, in
+    // either order; the futex task alone is not in the write.
+    for tasks in [vec![futex_task(), w()], vec![w(), futex_task()]] {
+        assert_eq!(
+            io_hold_verdict(&io_facts(1, syscall_check(tasks, 38), &['S', 'D'])),
+            IoHold::Held
+        );
+    }
+    assert_eq!(
+        io_hold_verdict(&io_facts(1, syscall_check(vec![futex_task()], 38), &['S'])),
+        IoHold::NotInWrite
+    );
+    // Not in the write.
+    let fdatasync = task(
+        "4101",
+        &format!(
+            "{} 0x3 0x0 0x0 0x0 0x0 0x0 0x7ffc0 0x7f3a1",
+            libc::SYS_fdatasync
+        ),
+    );
+    let not_in_write: Vec<Vec<TaskLine>> = vec![
+        vec![task("4100", "running\n"), task("4101", "running")],
+        vec![
+            task("4100", "-1 0x7ffc0 0x7f3a1"),
+            task("4101", "-1 0x0 0x0"),
+        ],
+        vec![],
+        vec![futex_task(), fdatasync],
+        vec![futex_task(), write_task(IO_KILL_SIZE - 1, 2)],
+        vec![futex_task(), write_task(IO_KILL_SIZE + 1, 2)],
+        vec![futex_task(), write_task(1_048_576, 2)],
+        vec![futex_task(), write_task(IO_KILL_SIZE, 0)],
+        vec![futex_task(), write_task(IO_KILL_SIZE, 1)],
+    ];
+    for tasks in not_in_write {
+        let raws: Vec<String> = tasks.iter().map(|t| t.raw.clone()).collect();
+        // A task in D outside the write does not count when the syscall
+        // check ran.
+        assert_eq!(
+            io_hold_verdict(&io_facts(1, syscall_check(tasks, 38), &['S', 'D'])),
+            IoHold::NotInWrite,
+            "{raws:?}"
+        );
+    }
+    // The fallback decides by the task states.
+    let refused = || HoldCheck::DState {
+        refused: "syscall: EACCES".to_string(),
+    };
+    assert_eq!(
+        io_hold_verdict(&io_facts(1, refused(), &['S', 'D'])),
+        IoHold::Held
+    );
+    for states in [&['S', 'R'][..], &[]] {
+        assert_eq!(
+            io_hold_verdict(&io_facts(1, refused(), states)),
+            IoHold::NotBlocked,
+            "{states:?}"
+        );
+    }
+    assert_eq!(
+        io_hold_verdict(&io_facts(0, refused(), &['D'])),
+        IoHold::Finished
+    );
+    assert_eq!(hold_check_label(&refused()), "d-state (syscall: EACCES)");
+    assert_eq!(hold_check_label(&syscall_check(vec![], 38)), "syscall");
+}
+
+#[test]
+fn io_hold_failure_messages() {
+    let w = write_task(IO_KILL_SIZE, 2);
+    let f = io_facts(
+        1,
+        syscall_check(vec![futex_task(), w.clone()], 38),
+        &['S', 'D'],
+    );
+    let finished = io_facts(0, syscall_check(vec![w.clone()], 41_943_130), &[]);
+    let returned = io_facts(1, syscall_check(vec![w.clone()], 41_943_130), &['S']);
+    let not_in = io_facts(1, syscall_check(vec![futex_task()], 38), &['S']);
+    let refused = io_facts(
+        1,
+        HoldCheck::DState {
+            refused: "io: EPERM".to_string(),
+        },
+        &['S', 'R'],
+    );
+    let mut off_device = io_facts(
+        1,
+        syscall_check(vec![futex_task(), w.clone()], 38),
+        &['S', 'D'],
+    );
+    off_device.wbytes = 0;
+    let cases = [
+        (
+            IoHold::Finished,
+            ExitStatus::Exited(0),
+            &finished,
+            "io.max did not hold the writer",
+        ),
+        (
+            IoHold::Returned,
+            ExitStatus::Signaled(9),
+            &returned,
+            "io.max did not hold the writer: its 40 MiB write returned before the check",
+        ),
+        (
+            IoHold::Finished,
+            ExitStatus::Exited(3),
+            &finished,
+            "the writer failed before the kill",
+        ),
+        (
+            IoHold::Finished,
+            ExitStatus::Exited(2),
+            &finished,
+            "the writer failed before the kill",
+        ),
+        (
+            IoHold::NotInWrite,
+            ExitStatus::Signaled(9),
+            &not_in,
+            "the writer was not inside its 40 MiB write",
+        ),
+        (
+            IoHold::NotBlocked,
+            ExitStatus::Signaled(9),
+            &refused,
+            "the writer was not blocked in its write",
+        ),
+        (
+            IoHold::NotOnDevice,
+            ExitStatus::Signaled(9),
+            &off_device,
+            "the io.max device counted no write within 10000 ms of the spawn",
+        ),
+    ];
+    for (v, status, facts, prefix) in cases {
+        let m = io_hold_failure(v, status, facts);
+        assert!(m.starts_with(prefix), "{v:?} {status:?}: {m}");
+        if prefix.starts_with("the writer failed") {
+            assert!(!m.contains("io.max did not"), "{m}");
+        }
+        for part in [
+            hold_check_label(&facts.check).as_str(),
+            "259:0",
+            "at 2004 ms (read 1)",
+            &format!("wbytes {}", facts.wbytes),
+            "buffer 40960 kB nh AnonHugePages 0 kB",
+            "file_dirty 0",
+            "file_writeback 41418752",
+            &format!("{status:?}"),
+            &format!("{:?}", facts.states),
+        ] {
+            assert!(m.contains(part), "{v:?}: {part:?} missing in {m}");
+        }
+        match &facts.check {
+            HoldCheck::Syscall { tasks, wchar } => {
+                assert!(m.contains(&format!("wchar {wchar}")), "{m}");
+                for t in tasks {
+                    assert!(m.contains(&format!("{} {:?}", t.tid, t.raw)), "{m}");
+                }
+            }
+            HoldCheck::DState { refused } => {
+                assert!(m.contains("wchar not read"), "{m}");
+                assert!(m.contains(refused.as_str()), "{m}");
+            }
+        }
+    }
+    // The held facts render too (the report line uses the same text).
+    assert!(io_hold_failure(IoHold::Held, ExitStatus::Signaled(9), &f).contains("4101"));
+}
+
+/// The facts of one poll read: `verdict` picks the shape, `ms` the time
+/// since the spawn.
+fn poll_read(verdict: IoHold, ms: u64) -> IoFacts {
+    let w = || write_task(IO_KILL_SIZE, 2);
+    let mut f = match verdict {
+        IoHold::Held | IoHold::NotOnDevice => {
+            io_facts(1, syscall_check(vec![futex_task(), w()], 38), &['S', 'D'])
+        }
+        IoHold::Finished => io_facts(0, syscall_check(vec![w()], 41_943_130), &['Z']),
+        IoHold::Returned => io_facts(1, syscall_check(vec![w()], 41_943_130), &['S']),
+        IoHold::NotInWrite => io_facts(1, syscall_check(vec![futex_task()], 38), &['S']),
+        IoHold::NotBlocked => io_facts(
+            1,
+            HoldCheck::DState {
+                refused: "io: EPERM".to_string(),
+            },
+            &['S'],
+        ),
+    };
+    if verdict == IoHold::NotOnDevice {
+        f.wbytes = 0;
+    }
+    f.elapsed_ms = ms;
+    assert_eq!(io_hold_verdict(&f), verdict, "fixture for {verdict:?}");
+    f
+}
+
+/// Runs the poll over `reads` and returns its verdict, the time of the
+/// read it ended on, the reads it took and the pauses between them.
+fn run_poll(reads: Vec<IoFacts>) -> (IoHold, u64, u32, usize) {
+    let mut queue = reads.into_iter();
+    let mut pauses = 0;
+    let (v, f) = poll_io_hold(
+        || queue.next().expect("the poll read past the fixture"),
+        || pauses += 1,
+    );
+    (v, f.elapsed_ms, f.reads, pauses)
+}
+
+#[test]
+fn io_hold_polls() {
+    use IoHold::*;
+    // Held at the first read: no pause, no second read.
+    assert_eq!(run_poll(vec![poll_read(Held, 2004)]), (Held, 2004, 1, 0));
+    // Review round 2 of PR 53: a writer that entered its write at ~1.2 s
+    // read wbytes 0 at 2,007 ms and was first counted at 2,528 ms. The
+    // poll waits for the count and the writer still inside its write.
+    assert_eq!(
+        run_poll(vec![
+            poll_read(NotOnDevice, 2007),
+            poll_read(NotOnDevice, 2108),
+            poll_read(NotOnDevice, 2209),
+            poll_read(NotOnDevice, 2310),
+            poll_read(NotOnDevice, 2411),
+            poll_read(Held, 2528),
+        ]),
+        (Held, 2528, 6, 5)
+    );
+    // The count came, but the writer had left its write by then: the
+    // other verdicts end the poll as they would end the single read.
+    for late in [Finished, Returned, NotInWrite, NotBlocked] {
+        assert_eq!(
+            run_poll(vec![poll_read(NotOnDevice, 2004), poll_read(late, 2105)]),
+            (late, 2105, 2, 1),
+            "{late:?}"
+        );
+        assert_eq!(run_poll(vec![poll_read(late, 2004)]), (late, 2004, 1, 0));
+    }
+    // No count by the deadline: NotOnDevice, and no read after the one at
+    // the deadline (inclusive); one millisecond before it still waits.
+    let mut reads: Vec<IoFacts> = (0..80)
+        .map(|i| poll_read(NotOnDevice, 2004 + i * 100))
+        .filter(|f| f.elapsed_ms < IO_HOLD_DEADLINE_MS)
+        .collect();
+    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS - 1));
+    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS));
+    let n = reads.len() as u32;
+    assert_eq!(
+        run_poll(reads),
+        (NotOnDevice, IO_HOLD_DEADLINE_MS, n, n as usize - 1)
+    );
+    // A first read already past the deadline still decides by its facts.
+    assert_eq!(
+        run_poll(vec![poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS + 50)]),
+        (NotOnDevice, IO_HOLD_DEADLINE_MS + 50, 1, 0)
+    );
+    assert_eq!(
+        run_poll(vec![poll_read(Held, IO_HOLD_DEADLINE_MS + 50)]),
+        (Held, IO_HOLD_DEADLINE_MS + 50, 1, 0)
+    );
+}
+
+#[test]
+fn io_hold_deadline_keeps_the_lift_proven() {
+    // ADR-007, "The timing tests": by the deadline at most one slice more
+    // than the rate allows has drained, and what is still queued must
+    // take longer than KILL_BOUND (10 s) to drain at the rate, or a
+    // destroy without the lift would pass too (mutant MA).
+    let slice = IO_KILL_WBPS / 10;
+    let drained = IO_KILL_WBPS * IO_HOLD_DEADLINE_MS / 1000 + slice;
+    let queued = IO_KILL_SIZE - drained;
+    assert_eq!(queued, 31_352_423);
+    assert!(queued >= 10 * IO_KILL_WBPS, "{queued}");
+    // And the deadline covers the measured case: the latest entry into the
+    // write (872 ms after the spawn) plus a first 1 MiB bio at the rate.
+    let first_count_ms = 872 + 1_048_576 * 1000 / IO_KILL_WBPS;
+    assert_eq!(first_count_ms, 1_872);
+    assert!(first_count_ms < IO_HOLD_DEADLINE_MS, "{first_count_ms} ms");
+}
+
+/// One `/proc/<pid>/smaps` mapping for the pure tests.
+fn smaps_block(range: &str, size_kb: u64, anon_huge_kb: u64, flags: &str) -> String {
+    format!(
+        "{range} rw-p 00000000 00:00 0 \n\
+         Size:           {size_kb:>8} kB\n\
+         KernelPageSize:        4 kB\n\
+         Rss:            {size_kb:>8} kB\n\
+         AnonHugePages:  {anon_huge_kb:>8} kB\n\
+         VmFlags: {flags}\n"
+    )
+}
+
+#[test]
+fn smaps_buffer_parses() {
+    // Measured layout: a 64 MiB malloc arena (65404 kB) before the buffer,
+    // so the buffer is found by the write's address, not by its size.
+    let heap = smaps_block("55d0c000-55d2d000", 132, 0, "rd wr mr mw me ac");
+    let arena = smaps_block("7f3a04000000-7f3a07fdf000", 65_404, 0, "rd wr mr mw me ac");
+    let buffer = smaps_block(
+        "7f3a0d800000-7f3a10000000",
+        40_960,
+        0,
+        "rd wr mr mw me ac nh",
+    );
+    let thp = smaps_block(
+        "7f3a0d800000-7f3a10000000",
+        40_960,
+        34_816,
+        "rd wr mr mw me ac hg",
+    );
+    let text = format!("{heap}{arena}{buffer}");
+    for addr in [0x7f3a_0d80_0000, 0x7f3a_0fff_ffff] {
+        assert_eq!(
+            smaps_buffer(&text, addr),
+            "40960 kB nh AnonHugePages 0 kB",
+            "{addr:#x}"
+        );
+    }
+    assert_eq!(
+        smaps_buffer(&format!("{heap}{thp}{arena}"), 0x7f3a_0e00_0000),
+        "40960 kB no nh AnonHugePages 34816 kB"
+    );
+    assert_eq!(
+        smaps_buffer(&text, 0x7f3a_0400_1000),
+        "65404 kB no nh AnonHugePages 0 kB"
+    );
+    // The end is exclusive; an address in no mapping, or no text.
+    assert_eq!(
+        smaps_buffer(&text, 0x7f3a_1000_0000),
+        "no mapping at 0x7f3a10000000"
+    );
+    assert_eq!(smaps_buffer("", 0x1000), "no mapping at 0x1000");
+    // The write's address comes from the task inside the 40 MiB write.
+    let w = write_task(IO_KILL_SIZE, 2);
+    assert_eq!(
+        write_buffer(&syscall_check(vec![futex_task(), w], 38)),
+        Some(0x7f3a_0d7f_f000)
+    );
+    for check in [
+        syscall_check(vec![futex_task()], 38),
+        syscall_check(vec![futex_task(), write_task(1_048_576, 2)], 38),
+        HoldCheck::DState {
+            refused: "io: EPERM".to_string(),
+        },
+    ] {
+        assert_eq!(write_buffer(&check), None, "{check:?}");
+    }
+}
+
+#[test]
+fn parse_syscall_forms() {
+    assert_eq!(parse_syscall("running\n"), TaskSyscall::Running);
+    assert_eq!(parse_syscall("running"), TaskSyscall::Running);
+    assert_eq!(parse_syscall("-1 0x0 0x0"), TaskSyscall::Blocked);
+    assert_eq!(parse_syscall("-1 0x7ffc0 0x7f3a1\n"), TaskSyscall::Blocked);
+    let measured = TaskSyscall::In {
+        nr: 1,
+        args: [3, 0x7f3a_0d7f_f000, 41_943_040, 0, 0, 0],
+    };
+    assert_eq!(
+        parse_syscall("1 0x3 0x7f3a0d7ff000 0x2800000 0x0 0x0 0x0 0x7f3a164aad28 0x7f3a1652b352\n"),
+        measured
+    );
+    assert_eq!(
+        parse_syscall("1 0x3 0x7f3a0d7ff000 0x02800000 0x0 0x0 0x0 0x7f3a164aad28 0x7f3a1652b352"),
+        measured
+    );
+    assert_eq!(
+        parse_syscall("1\t0x3 0x7F3A0D7FF000 0x2800000 0x0 0x0 0x0 0x7F3A164AAD28 0x7f3a1652b352"),
+        measured
+    );
+}
+
+/// Runs `f` and returns its panic message; fails when it does not panic.
+fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    match std::panic::catch_unwind(f) {
+        Ok(()) => panic!("no panic"),
+        Err(e) => e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    }
+}
+
+#[test]
+fn parse_syscall_rejects() {
+    let nine = |nr: &str, hex: &[&str]| format!("{nr} {}", hex.join(" "));
+    let ok8 = [
+        "0x3",
+        "0x0",
+        "0x2800000",
+        "0x0",
+        "0x0",
+        "0x0",
+        "0x7ffc0",
+        "0x7f3a1",
+    ];
+    let mut cases: Vec<String> = [
+        "",
+        "running 1",
+        "Running",
+        "-1 0x0",
+        "-1 0x0 0x0 0x0",
+        "running\u{200b}",
+        "-1\u{a0}0x0 0x0",
+        "-1 0x0 0x\u{200b}0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    cases.push(nine("1", &ok8[..7]));
+    cases.push(format!("{} 0x0", nine("1", &ok8)));
+    cases.push(nine("+1", &ok8));
+    cases.push(nine("\u{ff11}", &ok8));
+    for bad in ["3", "0X3", "0x", "0x+3", "0xg", "0x10000000000000000"] {
+        let mut f = ok8;
+        f[0] = bad;
+        cases.push(nine("1", &f));
+    }
+    for line in cases {
+        let l = line.clone();
+        let m = panic_message(move || {
+            let _ = parse_syscall(&l);
+        });
+        assert!(m.contains(&format!("{line:?}")), "{line:?}: {m}");
+    }
+}
+
+#[test]
+fn proc_io_wchar_parses() {
+    let io = |wchar: &str| {
+        format!(
+            "rchar: 4096\nwchar: {wchar}\nsyscr: 2\nsyscw: 4\nread_bytes: 0\nwrite_bytes: 41943040\ncancelled_write_bytes: 0\n"
+        )
+    };
+    assert_eq!(proc_io_wchar(&io("38")), 38);
+    assert_eq!(proc_io_wchar(&io("41943130")), 41_943_130);
+    assert_eq!(proc_io_wchar("xwchar: 1\nwchar: 2\n"), 2);
+    assert_eq!(proc_io_wchar(&io("18446744073709551615")), u64::MAX);
+}
+
+#[test]
+fn proc_io_wchar_rejects() {
+    // No line with the key: the whole text is quoted.
+    for text in ["rchar: 1\nsyscw: 4\n", "wchar:38\n"] {
+        let t = text.to_string();
+        let m = panic_message(move || {
+            let _ = proc_io_wchar(&t);
+        });
+        assert!(m.contains(&format!("{text:?}")), "{text:?}: {m}");
+    }
+    // A line with the key and a bad value: the line is quoted.
+    for value in [
+        "",
+        "+38",
+        "-1",
+        "3 8",
+        "18446744073709551616",
+        "\u{ff13}\u{ff18}",
+    ] {
+        let line = format!("wchar: {value}");
+        let t = format!("rchar: 1\n{line}\nsyscr: 2\n");
+        let m = panic_message(move || {
+            let _ = proc_io_wchar(&t);
+        });
+        assert!(m.contains(&format!("{line:?}")), "{line:?}: {m}");
+    }
+}
+
+#[test]
+fn proc_refusal_classes() {
+    let e = std::io::Error::from_raw_os_error;
+    assert_eq!(proc_refusal(&e(libc::EACCES)), Some("EACCES"));
+    assert_eq!(proc_refusal(&e(libc::EPERM)), Some("EPERM"));
+    assert_eq!(proc_refusal(&e(libc::ENOENT)), None);
+    assert_eq!(proc_refusal(&e(libc::ESRCH)), None);
+}
+
+#[test]
+fn io_stat_wbytes_parses() {
+    let stat = "8:16 rbytes=1 wbytes=999 rios=1 wios=1 dbytes=0 dios=0\n\
+                8:1 rbytes=0 wbytes=4096 rios=0 wios=1 dbytes=0 dios=0\n";
+    // No line for the device yet: nothing submitted.
+    assert_eq!(io_stat_wbytes(stat, 259, 0), 0);
+    assert_eq!(io_stat_wbytes("", 8, 1), 0);
+    // The key ends in a space, so 8:1 never reads the 8:16 line.
+    assert_eq!(io_stat_wbytes(stat, 8, 1), 4096);
+    assert_eq!(io_stat_wbytes(stat, 8, 16), 999);
+    // A line without counters (all zero, measured on CI) reads 0, also
+    // with another policy's keys on it.
+    assert_eq!(io_stat_wbytes("259:0 \n", 259, 0), 0);
+    assert_eq!(
+        io_stat_wbytes("259:0", 259, 0),
+        0,
+        "no key without the space"
+    );
+    assert_eq!(io_stat_wbytes("259:0 cost.usage=5\n", 259, 0), 0);
+    for bad in [
+        "8:1 rbytes=0 wios=1",
+        "8:1 wbytes=x rbytes=0",
+        "8:1 wbytes= rios=0",
+        "8:1 wbytes=+5",
+    ] {
+        let b = bad.to_string();
+        let m = panic_message(move || {
+            let _ = io_stat_wbytes(&b, 8, 1);
+        });
+        assert!(m.contains(&format!("{bad:?}")), "{bad:?}: {m}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "8:1 rbytes=0 wios=1")]
+fn io_stat_wbytes_rejects_line_without_wbytes() {
+    let _ = io_stat_wbytes("8:1 rbytes=0 wios=1\n", 8, 1);
+}
+
+#[test]
+fn stat_state_parses() {
+    assert_eq!(stat_state("77 (a) D (b) S 1 2"), Some('S'));
+    assert_eq!(stat_state("4101 (probe) D 4100 4100 0 0\n"), Some('D'));
+    assert_eq!(stat_state("77 probe S 1 2"), None);
+    assert_eq!(stat_state("77 (probe)"), None);
+    assert_eq!(stat_state("77 (probe)  \n"), None);
 }
 
 #[test]

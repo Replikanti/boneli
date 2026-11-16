@@ -114,6 +114,26 @@ jobs:
           echo "controllers: $(cat "/sys/fs/cgroup$cg/cgroup.controllers")"
           echo "cgroup2 mount: $(awk '$5 == "/sys/fs/cgroup" { for (i = 7; $i != "-"; i++); print $(i + 1), $(i + 3) }' /proc/self/mountinfo)"
           echo "user: $(id)"
+          # The io write path (#52): which dd the image ships, what the
+          # sandbox's writes go through (whether the hold check of
+          # destroy_lifts_io_throttle may read the writer's /proc files is
+          # the kernel/yama/ptrace_scope line above).
+          echo "dd: $(command -v dd || echo absent): $(dd --version 2>/dev/null | head -n1 || true)"
+          echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo absent)"
+          for k in dirty_ratio dirty_background_ratio dirty_bytes dirty_background_bytes; do
+            echo "vm.$k = $(cat "/proc/sys/vm/$k" 2>/dev/null || echo absent)"
+          done
+          echo "workspace fs: $(findmnt -no MAJ:MIN,SOURCE,FSTYPE,OPTIONS -T "$GITHUB_WORKSPACE" 2>/dev/null || echo absent)"
+          dev=$(findmnt -no MAJ:MIN -T "$GITHUB_WORKSPACE" 2>/dev/null | head -n1 | tr -d ' ' || true)
+          q=""
+          if [ -n "$dev" ] && [ -d "/sys/dev/block/$dev" ]; then
+            q="/sys/dev/block/$dev/queue"
+            [ -d "$q" ] || q="/sys/dev/block/$dev/../queue"
+          fi
+          for f in logical_block_size max_sectors_kb max_hw_sectors_kb dma_alignment rotational scheduler; do
+            echo "queue $f: $( [ -n "$q" ] && cat "$q/$f" 2>/dev/null || echo absent)"
+          done
+          lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
       - name: Build
         run: cargo test -p boneli-sys --no-run
       # The error a user gets on an unprepared host, asserted exactly.

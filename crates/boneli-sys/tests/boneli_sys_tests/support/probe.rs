@@ -667,16 +667,83 @@ fn spin() {
     put("nr_throttled", &(throttled1 - throttled0).to_string());
 }
 
-/// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` in 1 MiB
-/// writes, with `O_DIRECT` where the file system takes it (else
-/// `fdatasync` after every write), and prints the elapsed time.
+/// How `io-write` opens its file (`BONELI_PROBE_DIRECT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoDirect {
+    /// Unset: `O_DIRECT`, and where the file system refuses it (EINVAL)
+    /// buffered with `fdatasync` after every write.
+    Auto,
+    /// `require`: `O_DIRECT`, no fallback.
+    Require,
+}
+
+/// What `io-write` writes: `size` bytes as writes of `chunk` bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IoWritePlan {
+    /// `BONELI_PROBE_SIZE`.
+    pub size: usize,
+    /// `BONELI_PROBE_CHUNK`, 1 MiB when unset.
+    pub chunk: usize,
+    /// `BONELI_PROBE_DIRECT`.
+    pub direct: IoDirect,
+}
+
+/// The plan from the values of `BONELI_PROBE_SIZE`, `BONELI_PROBE_CHUNK`
+/// and `BONELI_PROBE_DIRECT` (`None`: unset). A set chunk is ASCII digits,
+/// more than 0, a multiple of 4096 (the `O_DIRECT` alignment) and divides
+/// the size; the direct mode is exactly `require`.
+pub fn io_write_plan(
+    size: &str,
+    chunk: Option<&str>,
+    direct: Option<&str>,
+) -> Result<IoWritePlan, String> {
+    let size: usize = size
+        .parse()
+        .map_err(|_| "BONELI_PROBE_SIZE is not a number".to_string())?;
+    let chunk = match chunk {
+        None => 1 << 20,
+        Some(c) => {
+            let n: usize = if !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()) {
+                c.parse()
+                    .map_err(|_| format!("BONELI_PROBE_CHUNK {c:?} is out of range"))?
+            } else {
+                return Err(format!("BONELI_PROBE_CHUNK {c:?} is not a number"));
+            };
+            if n == 0 || n % 4096 != 0 || size % n != 0 {
+                return Err(format!(
+                    "BONELI_PROBE_CHUNK {n} must be a non-zero multiple of 4096 that divides {size}"
+                ));
+            }
+            n
+        }
+    };
+    let direct = match direct {
+        None => IoDirect::Auto,
+        Some("require") => IoDirect::Require,
+        Some(d) => return Err(format!("BONELI_PROBE_DIRECT {d:?} is not require")),
+    };
+    Ok(IoWritePlan {
+        size,
+        chunk,
+        direct,
+    })
+}
+
+/// Writes `BONELI_PROBE_SIZE` bytes to `BONELI_PROBE_FILE` as writes of
+/// `BONELI_PROBE_CHUNK` bytes (1 MiB when unset), opened as
+/// `BONELI_PROBE_DIRECT` says ([`IoDirect`]: by default with `O_DIRECT`
+/// where the file system takes it, else `fdatasync` after every write),
+/// then `fdatasync`s and prints the elapsed time.
 fn io_write() {
     use std::os::unix::fs::OpenOptionsExt;
-    const CHUNK: usize = 1 << 20;
     let path = input("BONELI_PROBE_FILE");
-    let size: usize = input("BONELI_PROBE_SIZE")
-        .parse()
-        .unwrap_or_else(|_| fail(2, "BONELI_PROBE_SIZE is not a number"));
+    let plan = io_write_plan(
+        &input("BONELI_PROBE_SIZE"),
+        std::env::var("BONELI_PROBE_CHUNK").ok().as_deref(),
+        std::env::var("BONELI_PROBE_DIRECT").ok().as_deref(),
+    )
+    .unwrap_or_else(|e| fail(2, &e));
+    let size = plan.size;
     let open = |extra: i32| {
         std::fs::OpenOptions::new()
             .write(true)
@@ -685,26 +752,64 @@ fn io_write() {
             .custom_flags(extra)
             .open(&path)
     };
-    let (mut file, direct) = match open(libc::O_DIRECT) {
-        Ok(f) => (f, true),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (
-            open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
-            false,
+    let (mut file, direct) = match plan.direct {
+        IoDirect::Auto => match open(libc::O_DIRECT) {
+            Ok(f) => (f, true),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => (
+                open(0).unwrap_or_else(|e| fail(3, &format!("open {path}: {e}"))),
+                false,
+            ),
+            Err(e) => fail(3, &format!("open {path} with O_DIRECT: {e}")),
+        },
+        IoDirect::Require => (
+            open(libc::O_DIRECT)
+                .unwrap_or_else(|e| fail(3, &format!("open {path} with O_DIRECT: {e}"))),
+            true,
         ),
-        Err(e) => fail(3, &format!("open {path} with O_DIRECT: {e}")),
     };
-    // O_DIRECT needs an aligned buffer; 4096 covers the logical block size
-    // of every device the tests run on.
-    let layout = std::alloc::Layout::from_size_align(CHUNK, 4096)
-        .unwrap_or_else(|_| fail(3, "buffer layout"));
-    // SAFETY: the layout has a non-zero size.
-    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
-    if buf.is_null() {
-        fail(3, "allocate the write buffer");
+    let sync_each = !direct && plan.direct == IoDirect::Auto;
+    let chunk_len = plan.chunk;
+    // O_DIRECT needs an aligned buffer: a fresh anonymous mapping is page
+    // aligned, which covers the logical block size of every device the
+    // tests run on. It is advised MADV_NOHUGEPAGE before any byte is
+    // touched (review round 2 of PR 53): transparent huge pages would make
+    // its pages physically contiguous, the O_DIRECT bios as large as the
+    // huge pages (blk-throttle charges a bio whole, so the first one was
+    // counted only after 15.6 s at 1 MiB/s, measured), and the timing of
+    // destroy_lifts_io_throttle would depend on the host's THP setting.
+    // The allocator cannot give that order: it writes its header next to
+    // the buffer, which faults a huge page in under THP `always`.
+    // SAFETY: a new private anonymous mapping, no address hint, no file.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            chunk_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        fail(
+            3,
+            &format!("mmap the write buffer: {}", std::io::Error::last_os_error()),
+        );
     }
-    // SAFETY: buf is CHUNK bytes, zeroed, owned by this function, and
-    // nothing else refers to it.
-    let chunk = unsafe { std::slice::from_raw_parts_mut(buf, CHUNK) };
+    // SAFETY: map is the start of the chunk_len-byte mapping made above.
+    let rc = unsafe { libc::madvise(map, chunk_len, libc::MADV_NOHUGEPAGE) };
+    // EINVAL for valid arguments means a kernel without transparent huge
+    // pages, so there is nothing to opt out of.
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            fail(3, &format!("madvise MADV_NOHUGEPAGE: {e}"));
+        }
+    }
+    let buf = map.cast::<u8>();
+    // SAFETY: buf is the chunk_len-byte mapping, zero-filled by the kernel,
+    // owned by this function, and nothing else refers to it.
+    let chunk = unsafe { std::slice::from_raw_parts_mut(buf, chunk_len) };
     // Incompressible bytes (xorshift64): a compressing file system (btrfs
     // with compress=zstd, the dev host's) would write zeros as a few
     // hundred KiB and never reach the limit (measured).
@@ -720,18 +825,28 @@ fn io_write() {
     while written < size {
         file.write_all(chunk)
             .unwrap_or_else(|e| fail(3, &format!("write {path}: {e}")));
-        if !direct {
+        if sync_each {
             file.sync_data()
                 .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
         }
-        written += CHUNK;
+        written += chunk_len;
     }
     file.sync_data()
         .unwrap_or_else(|e| fail(3, &format!("fdatasync {path}: {e}")));
     put("elapsed_ms", &start.elapsed().as_millis().to_string());
     put("direct", &direct.to_string());
-    // SAFETY: buf was allocated above with this layout.
-    unsafe { std::alloc::dealloc(buf, layout) };
+    // SAFETY: map is the chunk_len-byte mapping made above, and chunk, the
+    // only reference into it, is not used after this.
+    let rc = unsafe { libc::munmap(map, chunk_len) };
+    if rc != 0 {
+        fail(
+            3,
+            &format!(
+                "munmap the write buffer: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
+    }
 }
 
 /// Mounts a cgroup2 of the sandbox's own cgroup namespace at `/tmp/cg`
