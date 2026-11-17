@@ -1,0 +1,27 @@
+[package]
+name = "boneli-store-fs"
+description = "Boneli adapter: the run event log and the content-addressed evidence store on the filesystem (ADR-012)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The run, its events and the values they carry, which the log encodes
+# (ADR-002). An adapter depends on the core; no external edge.
+boneli-domain.workspace = true
+# The `EventStore` and `Evidence` ports this crate adapts (ADR-004, D1). An
+# adapter depends on the core; no external edge.
+boneli-app.workspace = true
+# The log's line codec: a strict parser with limits and a deterministic
+# serializer (ADR-008, ADR-012 D3). A support crate, no new external edge.
+boneli-json.workspace = true
+# `Sha256`, ring's SHA-256, the repository's one content hash (ADR-009, D6),
+# for evidence references and run log names (ADR-012 D2). A support crate,
+# no new external edge.
+boneli-https.workspace = true

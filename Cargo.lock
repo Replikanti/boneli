@@ -85,6 +85,17 @@ dependencies = [
  "boneli-app",
  "boneli-domain",
  "boneli-memory",
+ "boneli-store-fs",
+]
+
+[[package]]
+name = "boneli-store-fs"
+version = "0.0.0"
+dependencies = [
+ "boneli-app",
+ "boneli-domain",
+ "boneli-https",
+ "boneli-json",
 ]
 
 [[package]]

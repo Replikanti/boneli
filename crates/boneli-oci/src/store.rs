@@ -179,6 +179,10 @@ impl std::fmt::Debug for OciImageStore {
     }
 }
 
+// `own_uid`, `private_dir` and `check_ancestors` are copied into
+// `boneli-store-fs` (`src/root.rs`, ADR-012 D1); a fix to one copy goes
+// into the other until #66 extracts them.
+
 /// The owner of the root and of this process: the uid of `/proc/self`,
 /// which is this process's effective uid.
 fn own_uid(at: &Path) -> Result<u32, Error> {
