@@ -340,8 +340,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   duplicate paths, an entry beneath a file or symlink entry (every
   ancestor, in linear time), an empty or NUL-holding link target and
   more nodes than the cap: files, symlinks and every directory they
-  imply, 200,000 by default (`Workspace::nodes`). `without_metadata`
-  drops repository metadata. `materialize` writes a workspace into a
+  imply, 200,000 by default (`Workspace::nodes`).
+  `Workspace::from_sorted` builds a workspace from entries in path
+  order (as `git ls-tree -r -z` lists them) under the same checks and
+  cap, also in linear time, and refuses unsorted or duplicate input.
+  `without_metadata` drops repository metadata. `materialize` writes a workspace into a
   new, empty 0700 directory with `create_new` and explicit modes (also
   under any umask), creates each directory once, never writes through an
   existing symlink, creates an empty directory per gitlink, and refuses

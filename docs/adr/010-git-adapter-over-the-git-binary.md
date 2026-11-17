@@ -235,9 +235,12 @@ the sandbox hands back share one format, `boneli_git_cli::Workspace`.
     cap is checked before each entry is read and after its path is
     counted.
   - *Derivation of 200,000.* The candidate repositories of
-    docs/ARCHITECTURE.md, counted with `git ls-tree -r -t` on their
-    default branch (2026-11-17, a tree-only shallow clone): 3,731,
-    10,291 and 55,025 nodes. The largest has 44,776 files and 10,249
+    docs/ARCHITECTURE.md, measured on 2026-11-17 at the head of each
+    default branch through a tree-only shallow clone (depth 1, no
+    blobs) and counted with `git ls-tree -r -t`: 3,731, 10,291 and
+    55,025 nodes. The trees move with every commit; a recount later
+    that day found the largest a few nodes bigger, which changes
+    nothing below. The largest has 44,776 files and 10,249
     directories, at most 12 directories deep and with paths of at most
     242 bytes. The cap is about 3.6 times the largest, room for a
     larger repository or a generated tree without letting a hostile
@@ -246,9 +249,21 @@ the sandbox hands back share one format, `boneli_git_cli::Workspace`.
     closed with a detail naming the cap, and #8 decides what an export
     carries.
 - **`without_metadata`** drops every path `is_repository_metadata` names
-  (D1), as a file, a directory's entries or a symlink. `insert` and
-  `remove` keep the invariants `decode` checks, so a `Workspace` built in
-  code always encodes to bytes `decode` accepts.
+  (D1), as a file, a directory's entries or a symlink.
+- **Constructors.** A `Workspace` is built by `decode` or by
+  `Workspace::from_sorted(entries, max_nodes)`, which takes entries in
+  path order and applies the same checks and the same node cap through
+  the same linear code. Byte order of the full paths is the order
+  `git ls-tree -r -z` lists a tree in; input out of order or with a
+  duplicate is refused, never sorted silently. **Part 3 builds every
+  snapshot with `from_sorted`**, the applied checkout's included: its
+  paths come from the agent's workspace through `apply`, so they are as
+  long and deep as `PATH_MAX` allows. In review a constructor that
+  looked every ancestor up took 13 to 19 ms per path under one chain of
+  1,900 directories, about an hour of CPU for a tree that fills the
+  node cap; a test holds `from_sorted` under a deadline on that shape.
+  `insert`, which has that cost, is test-only. `remove` keeps the
+  invariants, so every `Workspace` encodes to bytes `decode` accepts.
 
 ### D3. Writing a workspace onto the host
 

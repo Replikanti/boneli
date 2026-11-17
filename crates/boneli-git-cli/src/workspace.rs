@@ -240,11 +240,13 @@ impl Workspace {
     }
 
     /// Adds or replaces the entry at `path`, unless that breaks an
-    /// invariant. It looks every ancestor up, so it costs O(depth * length)
-    /// per path: meant for trees from git, whose paths are short.
-    /// Agent-written bytes go through [`Workspace::decode`], which is
-    /// linear.
-    pub fn insert(
+    /// invariant. Test-only: it looks every ancestor up, so it costs
+    /// O(depth * length) per path, and a tree whose paths an agent chose
+    /// (a workspace, or a checkout after `apply`) could make that hours of
+    /// CPU (review of part 2). Code builds a workspace with
+    /// [`Workspace::decode`] or [`Workspace::from_sorted`], both linear.
+    #[cfg(test)]
+    pub(crate) fn insert(
         &mut self,
         path: RelativePath,
         kind: Kind,
@@ -322,6 +324,28 @@ impl Workspace {
         out
     }
 
+    /// Builds a workspace from entries in path order (the byte order of the
+    /// full paths, which is the order `git ls-tree -r -z` lists a tree in),
+    /// under the same rules and the same node cap as
+    /// [`Workspace::decode`], in time linear in the path bytes. Input out
+    /// of order or with a duplicate path is refused (`Unsorted`,
+    /// `Duplicate`), never sorted silently, so a listing that is not what
+    /// it claims fails closed. Errors count entries from 0 in input order.
+    /// This is the constructor for a tree read from git, the snapshot of
+    /// an applied checkout included, whose paths the agent chose.
+    pub fn from_sorted<I>(entries: I, max_nodes: usize) -> Result<Workspace, DecodeError>
+    where
+        I: IntoIterator<Item = (RelativePath, Kind, Vec<u8>)>,
+    {
+        let mut sorted = Sorted::new(max_nodes);
+        for (path, kind, data) in entries {
+            sorted.room()?;
+            sorted.check_path(path.as_str())?;
+            sorted.push(path, kind, data)?;
+        }
+        Ok(sorted.finish())
+    }
+
     /// Decodes an encoded workspace of at most `max_nodes` files, symlinks
     /// and implied directories ([`Workspace::nodes`]), refusing every
     /// encoding [`Workspace::encode`] would not produce.
@@ -334,59 +358,127 @@ impl Workspace {
     /// `/`. Looking every ancestor up in the map instead costs quadratic
     /// time on a deep path next to a sibling that shares its prefixes.
     pub fn decode(bytes: &[u8], max_nodes: usize) -> Result<Workspace, DecodeError> {
-        let too_many = DecodeError::TooManyNodes { max: max_nodes };
         let rest = bytes.strip_prefix(MAGIC).ok_or(DecodeError::Magic)?;
         let mut reader = Reader { rest, entry: 0 };
-        let mut entries = Vec::new();
-        let mut prefixes: Vec<&str> = Vec::new();
-        let mut nodes = 0usize;
+        let mut sorted = Sorted::new(max_nodes);
         while !reader.rest.is_empty() {
             let entry = reader.entry;
-            // Every entry adds at least itself.
-            if nodes >= max_nodes {
-                return Err(too_many);
-            }
+            sorted.room()?;
             let byte = reader.bytes("kind", 1)?[0];
             let kind = Kind::from_byte(byte).ok_or(DecodeError::UnknownKind { entry, byte })?;
             let raw = reader.field("path")?;
             let text = std::str::from_utf8(raw).map_err(|_| DecodeError::PathNotUtf8 { entry })?;
             let path = RelativePath::parse(text)
                 .map_err(|problem| DecodeError::Path { entry, problem })?;
-            if let Some(previous) = prefixes.last() {
-                // The top of the stack is always the previous path.
-                match text.cmp(*previous) {
-                    Ordering::Equal => return Err(DecodeError::Duplicate { entry }),
-                    Ordering::Less => return Err(DecodeError::Unsorted { entry }),
-                    Ordering::Greater => {}
-                }
-            }
-            nodes = nodes.saturating_add(1 + new_directories(prefixes.last().copied(), text));
-            if nodes > max_nodes {
-                return Err(too_many);
-            }
-            while prefixes.last().is_some_and(|top| !text.starts_with(top)) {
-                prefixes.pop();
-            }
-            // Each element is a shorter string prefix of `text`.
-            if prefixes.iter().any(|p| text.as_bytes()[p.len()] == b'/') {
-                return Err(DecodeError::Entry {
-                    entry,
-                    problem: EntryProblem::BeneathEntry,
-                });
-            }
-            prefixes.push(text);
+            sorted.check_path(text)?;
             let data = reader.field("data")?;
-            if let Some(problem) = target_problem(kind, data) {
-                return Err(DecodeError::Entry { entry, problem });
-            }
-            entries.push((path, (kind, data.to_vec())));
+            sorted.push(path, kind, data.to_vec())?;
             reader.entry += 1;
         }
-        // Already sorted, so the map is built in one pass, without a
-        // search per entry.
-        Ok(Workspace {
-            entries: entries.into_iter().collect(),
-        })
+        Ok(sorted.finish())
+    }
+}
+
+/// The checks that `decode` and `from_sorted` share, over entries that
+/// arrive in path order, in time linear in the path bytes.
+///
+/// The ancestor check keeps a stack (`prefixes`, indexes into `entries`)
+/// of the earlier entries that are a string prefix of the previous path.
+/// Paths that start with a prefix sort together, so every earlier entry
+/// that is a string prefix of the current path is still on the stack, and
+/// the path lies beneath one of them exactly when the byte after it is
+/// `/`. Looking every ancestor up in the map instead costs quadratic time
+/// on a deep path next to a sibling that shares its prefixes.
+struct Sorted {
+    entries: Vec<(RelativePath, (Kind, Vec<u8>))>,
+    prefixes: Vec<usize>,
+    nodes: usize,
+    max_nodes: usize,
+}
+
+impl Sorted {
+    fn new(max_nodes: usize) -> Sorted {
+        Sorted {
+            entries: Vec::new(),
+            prefixes: Vec::new(),
+            nodes: 0,
+            max_nodes,
+        }
+    }
+
+    fn too_many(&self) -> DecodeError {
+        DecodeError::TooManyNodes {
+            max: self.max_nodes,
+        }
+    }
+
+    /// Before the next entry is read: every entry adds at least itself.
+    fn room(&self) -> Result<(), DecodeError> {
+        if self.nodes >= self.max_nodes {
+            return Err(self.too_many());
+        }
+        Ok(())
+    }
+
+    /// Checks the next path against the earlier ones: order, the node cap
+    /// and the ancestors. It then sits on the stack as the entry
+    /// [`Sorted::push`] adds next.
+    fn check_path(&mut self, text: &str) -> Result<(), DecodeError> {
+        let entry = self.entries.len();
+        let previous = self.entries.last().map(|(p, _)| p.as_str());
+        if let Some(previous) = previous {
+            match text.cmp(previous) {
+                Ordering::Equal => return Err(DecodeError::Duplicate { entry }),
+                Ordering::Less => return Err(DecodeError::Unsorted { entry }),
+                Ordering::Greater => {}
+            }
+        }
+        self.nodes = self
+            .nodes
+            .saturating_add(1 + new_directories(previous, text));
+        if self.nodes > self.max_nodes {
+            return Err(self.too_many());
+        }
+        let entries = &self.entries;
+        let path_of = |i: usize| entries[i].0.as_str();
+        while self
+            .prefixes
+            .last()
+            .is_some_and(|top| !text.starts_with(path_of(*top)))
+        {
+            self.prefixes.pop();
+        }
+        // Each element is a shorter string prefix of `text`.
+        let beneath = self
+            .prefixes
+            .iter()
+            .any(|i| text.as_bytes()[path_of(*i).len()] == b'/');
+        if beneath {
+            return Err(DecodeError::Entry {
+                entry,
+                problem: EntryProblem::BeneathEntry,
+            });
+        }
+        self.prefixes.push(entry);
+        Ok(())
+    }
+
+    /// Adds the entry whose path [`Sorted::check_path`] just accepted.
+    fn push(&mut self, path: RelativePath, kind: Kind, data: Vec<u8>) -> Result<(), DecodeError> {
+        let entry = self.entries.len();
+        if let Some(problem) = target_problem(kind, &data) {
+            return Err(DecodeError::Entry { entry, problem });
+        }
+        self.entries.push((path, (kind, data)));
+        Ok(())
+    }
+
+    /// Already sorted, so the map is built in one pass, without a search
+    /// per entry.
+    fn finish(self) -> Workspace {
+        Workspace {
+            entries: self.entries.into_iter().collect(),
+        }
     }
 }
 
@@ -857,6 +949,93 @@ mod tests {
         assert_eq!(w.nodes(), w.len() + directories.len());
         assert_eq!(w.nodes(), 9 + 8);
         assert_eq!(Workspace::new().nodes(), 0);
+    }
+
+    /// `from_sorted` accepts and refuses exactly what `decode` does on the
+    /// same entries, with the same error.
+    #[test]
+    fn from_sorted_agrees_with_decode() {
+        let deep = "a/".repeat(10) + "f";
+        // (kind, path, data) rows, and the node cap.
+        type Row<'a> = (u8, &'a [u8], &'a [u8]);
+        let cases: Vec<(Vec<Row>, usize)> = vec![
+            (vec![], DEFAULT_MAX_NODES),
+            (
+                vec![
+                    (b'f', b"Z", b"1"),
+                    (b'x', b"a.txt", b"2"),
+                    (b'l', b"a/b", b"/"),
+                    (b'f', b"a/c/d", b""),
+                ],
+                DEFAULT_MAX_NODES,
+            ),
+            (
+                vec![(b'f', b"b", b""), (b'f', b"a", b"")],
+                DEFAULT_MAX_NODES,
+            ),
+            (
+                vec![(b'f', b"a", b"1"), (b'f', b"a", b"2")],
+                DEFAULT_MAX_NODES,
+            ),
+            (
+                vec![
+                    (b'f', b"a", b""),
+                    (b'f', b"a.txt", b""),
+                    (b'f', b"a/b", b""),
+                ],
+                DEFAULT_MAX_NODES,
+            ),
+            (
+                vec![(b'l', b"l", b"/"), (b'f', b"l/x", b"")],
+                DEFAULT_MAX_NODES,
+            ),
+            (vec![(b'l', b"l", b"")], DEFAULT_MAX_NODES),
+            (vec![(b'l', b"l", b"a\0")], DEFAULT_MAX_NODES),
+            (vec![(b'f', deep.as_bytes(), b"")], 10),
+            (vec![(b'f', deep.as_bytes(), b"")], 11),
+            (
+                vec![(b'f', b"a", b""), (b'f', b"b", b""), (b'f', b"c", b"")],
+                2,
+            ),
+        ];
+        for (entries, cap) in cases {
+            let decoded = Workspace::decode(&raw(&entries), cap);
+            let built = Workspace::from_sorted(
+                entries.iter().map(|(kind, p, data)| {
+                    let text = std::str::from_utf8(p).expect("UTF-8");
+                    (
+                        path(text),
+                        Kind::from_byte(*kind).expect("a kind"),
+                        data.to_vec(),
+                    )
+                }),
+                cap,
+            );
+            assert_eq!(built, decoded, "{entries:?} cap {cap}");
+        }
+    }
+
+    /// The review's shape for the snapshot of an applied checkout: files
+    /// under one chain of 1,900 directories. A constructor that looks
+    /// every ancestor up (`insert`) took 13-19 ms per path in a release
+    /// build, about an hour for a tree that fills the node cap;
+    /// `from_sorted` stays linear (well under a second here). The bound
+    /// leaves a wide margin both ways.
+    #[test]
+    fn from_sorted_is_linear_in_path_depth() {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+        let chain = "a/".repeat(1900);
+        let paths: Vec<RelativePath> = (0..3000)
+            .map(|n| path(&format!("{chain}f{n:05}")))
+            .collect();
+        let start = std::time::Instant::now();
+        let built = Workspace::from_sorted(
+            paths.into_iter().map(|p| (p, Kind::File, b"x".to_vec())),
+            DEFAULT_MAX_NODES,
+        );
+        assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+        let built = built.expect("built");
+        assert_eq!((built.len(), built.nodes()), (3000, 1900 + 3000));
     }
 
     #[test]
