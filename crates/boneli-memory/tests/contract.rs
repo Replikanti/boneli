@@ -262,19 +262,23 @@ pub fn repository() -> contract::git::Repository<MemoryGit> {
 /// Repository metadata an agent could leave in a workspace: a config that
 /// names a command for `core.fsmonitor` and a hooks directory, a hook git
 /// runs when it writes an index, and the config of a nested repository.
+/// The sentinel is an absolute path outside anything an adapter creates or
+/// removes, as `Tripwire` requires; `MemoryGit` runs nothing, so here it is
+/// only an example.
 pub fn metadata() -> Vec<(RelativePath, Vec<u8>)> {
     vec![
         (
             path(".git/config"),
-            b"[core]\n\tfsmonitor = touch tripped\n\thooksPath = .git/hooks\n".to_vec(),
+            b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n\thooksPath = .git/hooks\n"
+                .to_vec(),
         ),
         (
             path(".git/hooks/post-index-change"),
-            b"#!/bin/sh\ntouch tripped\n".to_vec(),
+            b"#!/bin/sh\ntouch /tmp/boneli-tripwire/tripped\n".to_vec(),
         ),
         (
             path("sub/.git/config"),
-            b"[core]\n\tfsmonitor = touch tripped\n".to_vec(),
+            b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n".to_vec(),
         ),
     ]
 }
@@ -286,6 +290,36 @@ impl contract::git::Tripwire<MemoryGit> for NothingRuns {
     fn tripped(&self, _adapter: &MemoryGit) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
+}
+
+/// Moves every change of `from` in a diff of `MemoryGit`'s format to `to`.
+pub fn retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> {
+    let mut rest = diff;
+    let mut out = Vec::new();
+    let field = |rest: &mut &[u8], out: &mut Vec<u8>, path: bool| {
+        let mut length = [0u8; 8];
+        length.copy_from_slice(&rest[..8]);
+        let n = u64::from_be_bytes(length) as usize;
+        let bytes = &rest[8..8 + n];
+        let bytes = if path && bytes == from.as_str().as_bytes() {
+            to.as_str().as_bytes()
+        } else {
+            bytes
+        };
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+        *rest = &rest[8 + n..];
+    };
+    while !rest.is_empty() {
+        field(&mut rest, &mut out, true);
+        let tag = rest[0];
+        out.push(tag);
+        rest = &rest[1..];
+        if tag == 1 {
+            field(&mut rest, &mut out, false);
+        }
+    }
+    out
 }
 
 /// Sets or removes a file in a workspace of `MemoryGit`'s snapshot format.
@@ -300,7 +334,10 @@ pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Ve
 
 #[test]
 fn in_memory_git_passes_contract() {
-    assert_eq!(contract::git::run(repository, edit, &NothingRuns), Ok(()));
+    assert_eq!(
+        contract::git::run(repository, edit, retarget, &NothingRuns),
+        Ok(())
+    );
 }
 
 fn git_clause(result: Result<(), contract::Violation>) -> (&'static str, String) {
@@ -319,10 +356,76 @@ fn metadata_fixture_must_be_metadata() {
         r.metadata.push((path("src/x.rs"), b"fn x() {}\n".to_vec()));
         r
     };
-    let (clause, detail) = git_clause(contract::git::run(content, edit, &NothingRuns));
+    let (clause, detail) = git_clause(contract::git::run(content, edit, retarget, &NothingRuns));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
     assert!(detail.contains("src/x.rs"), "{detail}");
+}
+
+/// An `edit` that never writes metadata into the workspace makes the
+/// clause vacuous: the adapter never sees any (review of #61).
+#[test]
+fn metadata_fixture_must_reach_the_workspace() {
+    let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        skipping,
+        retarget,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+}
+
+/// `apply-refuses` is only as good as the diff it applies: a `retarget`
+/// that makes garbage, or ignores its target, is a violation, and so is a
+/// base that already has the twin path.
+#[test]
+fn retarget_must_make_a_diff_that_applies() {
+    let garbage = |_: &[u8], _: &RelativePath, _: &RelativePath| b"garbage".to_vec();
+    let ignores = |d: &[u8], _: &RelativePath, _: &RelativePath| d.to_vec();
+    for result in [
+        contract::git::run(repository, edit, garbage, &NothingRuns),
+        contract::git::run(repository, edit, ignores, &NothingRuns),
+    ] {
+        let (clause, detail) = git_clause(result);
+        assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+        assert!(detail.starts_with("fixture:"), "{detail}");
+        assert!(detail.contains("retarget"), "{detail}");
+    }
+    let twin_exists = || {
+        let r = repository();
+        let mut files: Tree = [
+            (path("src/lib.rs"), b"fn total() {}\n".to_vec()),
+            (path("src/missing.rs.twin"), b"here".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        files.insert(path("README"), b"app".to_vec());
+        contract::git::Repository {
+            adapter: MemoryGit::new(vec![GitCommit {
+                repo: r.repo.clone(),
+                sha: r.base.clone(),
+                files,
+            }]),
+            ..r
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        twin_exists,
+        edit,
+        retarget,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    assert!(detail.contains("twin"), "{detail}");
 }
 
 /// No metadata: every adapter would pass, so it is a violation.
@@ -332,7 +435,7 @@ fn metadata_fixture_must_not_be_empty() {
         metadata: vec![],
         ..repository()
     };
-    let (clause, detail) = git_clause(contract::git::run(empty, edit, &NothingRuns));
+    let (clause, detail) = git_clause(contract::git::run(empty, edit, retarget, &NothingRuns));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
 }
@@ -346,7 +449,12 @@ fn tripped_before_the_clause_is_a_violation() {
             Ok(vec![String::from("left over from an earlier run")])
         }
     }
-    let (clause, detail) = git_clause(contract::git::run(repository, edit, &AlwaysTripped));
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        edit,
+        retarget,
+        &AlwaysTripped,
+    ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
     // A tripwire that cannot look is a violation too, not a pass.
@@ -356,7 +464,7 @@ fn tripped_before_the_clause_is_a_violation() {
             Err(String::from("cannot read the sentinel directory"))
         }
     }
-    let (clause, detail) = git_clause(contract::git::run(repository, edit, &Blind));
+    let (clause, detail) = git_clause(contract::git::run(repository, edit, retarget, &Blind));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.contains("cannot read"), "{detail}");
 }
@@ -372,7 +480,10 @@ fn memory_diff_drops_repository_metadata() {
     let plain = edit(&snapshot, &r.path, Some(&r.edited));
     let mut hostile = plain.clone();
     for (file, content) in [
-        (".git/config", &b"[core]\n\tfsmonitor = touch tripped\n"[..]),
+        (
+            ".git/config",
+            &b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n"[..],
+        ),
         ("sub/.git/HEAD", b"ref: refs/heads/main\n"),
     ] {
         hostile = edit(&hostile, &path(file), Some(content));
@@ -503,7 +614,7 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(
-        clause(contract::git::run(unchanged, edit, &NothingRuns)),
+        clause(contract::git::run(unchanged, edit, retarget, &NothingRuns)),
         "apply-then-read"
     );
     let own_base = || {
@@ -514,7 +625,7 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(
-        clause(contract::git::run(own_base, edit, &NothingRuns)),
+        clause(contract::git::run(own_base, edit, retarget, &NothingRuns)),
         "unknown-commit"
     );
     let same_digest = || contract::image::Images {

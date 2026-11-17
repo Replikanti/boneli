@@ -69,9 +69,23 @@ fn two_processes_produce_identical_debug_output() {
     assert_eq!(
         out_a
             .lines()
+            .filter(|l| l.starts_with("regression "))
+            .count(),
+        mutants::regression_mutants().len()
+    );
+    assert_eq!(
+        out_a
+            .lines()
             .filter(|l| l.starts_with("blank-status "))
             .count(),
         3
+    );
+    assert_eq!(
+        out_a
+            .lines()
+            .filter(|l| l.starts_with("vacuous-fixture "))
+            .count(),
+        mutants::vacuous_fixture_violations().len()
     );
 }
 

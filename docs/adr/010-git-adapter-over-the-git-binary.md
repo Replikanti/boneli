@@ -63,38 +63,85 @@ adversarial review.
   path, as `git apply` refuses it as an invalid path. `MemoryGit` follows
   both halves.
 - **The clause `workspace-metadata-inert`** is the 11th `Git` clause,
-  added under ADR-004's extension rule. Its fixture is new: a list of
-  metadata entries (path and content) that the suite plants in a
-  workspace, and a `Tripwire` that reports what that metadata made run on
-  the host. Only the adapter's own test knows how to look; for the git
-  binary it is a sentinel file that the planted hook or `core.fsmonitor`
-  would create. The clause works in this order:
+  added under ADR-004's extension rule. It binds both halves of the rule,
+  `diff` and `apply`. Its fixtures are new:
+  - a list of metadata entries (path and content) that the suite plants in
+    a workspace;
+  - `retarget`, a hook that moves every change of one path in a diff of
+    the adapter's own format to another path, because only the adapter's
+    test knows that format;
+  - a `Tripwire` that reports what the planted metadata made run on the
+    host. Only the adapter's own test knows how to look; for the git
+    binary it is a sentinel file that the planted hook or `core.fsmonitor`
+    would create. The sentinel must sit at an absolute path outside every
+    directory the adapter creates or removes: git runs a relative command
+    in the directory it works in, which the adapter deletes, and the run
+    would go unseen (review of the part 1 PR).
+
+  The clause works in this order:
   1. Fixture guards, each a violation and not a pass: the metadata list is
-     not empty, every path is repository metadata, and the tripwire
-     reports nothing before the clause starts. A tripwire that fails to
-     look is a violation too. So no fixture can make the clause vacuous.
-  2. `plain` is the base snapshot with the fixture's file edited, and
-     `hostile` is `plain` plus every metadata entry. `d_plain` is the diff
-     of `plain`, taken before `d_hostile`, the diff of `hostile`.
-  3. `nothing-ran`: the tripwire is empty.
-  4. `same-diff`: `d_hostile == d_plain`.
-  5. `later-diff`: a fresh `fetch_base`, and the diff of its unchanged
-     snapshot is empty. This catches an adapter that adopted the planted
-     config into a store it reuses.
-  6. `nothing-ran` again, after the later diff.
+     not empty, every path is repository metadata, the tripwire reports
+     nothing before the clause starts (a tripwire that fails to look is a
+     violation too), and `edit` really writes the metadata, so the
+     workspace with it differs from the one without it. An `edit` that
+     drops `.git` paths, as a codec that keeps its own invariants might,
+     would otherwise make every sub-check vacuous.
+  2. Before any metadata reaches the adapter: `plain` is the base snapshot
+     with the fixture's file edited, `d_plain` its diff, `reference` the
+     snapshot of `d_plain` applied to the base, and `d_add` a diff that
+     adds the fixture's missing path. `retarget` must move `d_add` to a
+     twin content path (`<missing>.twin`, absent at the base) as a diff
+     that applies and reads back the fixture's content; otherwise a
+     `retarget` that makes garbage would pass `apply-refuses` on every
+     adapter.
+  3. `hostile` is `plain` plus every metadata entry, and `d_hostile` its
+     diff.
+  4. `nothing-ran`: the tripwire is empty. It is checked again after each
+     later step.
+  5. `same-diff`: `d_hostile == d_plain`.
+  6. `same-checkout`: the base checkout, diffed again, gives `d_plain` for
+     the edited snapshot and an empty diff for the unchanged one. This
+     catches config or hooks adopted into the store of the checkout that
+     was diffed, which is where part 3's per-fetch stores would hold
+     them. It also catches adopted config that changes only non-empty
+     diffs (`diff.noprefix`, `core.quotePath`).
+  7. `fresh-checkout`: the same for a checkout fetched afterwards, which
+     catches adoption into whatever new checkouts start from.
+  8. `same-apply`: `d_plain` applied to either checkout gives `reference`.
+  9. `apply-refuses`: `d_add` retargeted to each metadata path does not
+     apply, and the base checkout's snapshot is unchanged afterwards.
 
   Each violation detail starts with its sub-check name (or `fixture:`)
   and quotes lengths, not bytes, so the replay gate renders it
   deterministically (ADR-004, D10).
 - **Mutants.** Each sub-check has its own mutant in `boneli-replay-check`
   (ADR-004, D2), and its violation must start with that sub-check's name:
-  `RunsMetadata` (a correct diff that records a run when it sees a
-  `.git/hooks/` entry), `MetadataIsContent` (the metadata is encoded into
-  the diff) and `AdoptsMetadata` (after a diff that saw metadata, every
-  later diff starts with a header). `d_plain` comes before `d_hostile`
-  because otherwise `AdoptsMetadata` would spoil `d_plain` and be caught
-  at `same-diff`, so `later-diff` would have no mutant of its own. Counts:
-  50 clauses and 59 mutant cases (49 and 56 before).
+  - `RunsMetadata` (`nothing-ran`): a correct diff that records a run when
+    it sees a `.git/hooks/` entry;
+  - `MetadataIsContent` (`same-diff`): the metadata is encoded into the
+    diff;
+  - `AdoptsPerCheckout` (`same-checkout`): later diffs of the checkout
+    that saw metadata start with a header;
+  - `AdoptsIntoNewCheckouts` (`fresh-checkout`): diffs of checkouts
+    fetched after a diff saw metadata start with a header;
+  - `AdoptsOnApply` (`same-apply`): after a diff saw metadata, `apply`
+    also writes a file;
+  - `AppliesMetadata` (`apply-refuses`): `apply` accepts a diff that
+    writes metadata.
+
+  The table stays a bijection of mutants and clause cases. Mutants that a
+  review found passing an earlier version of the clause, or that pin a
+  second check site of a case, go into a separate regression table that
+  is checked and rendered the same way, and each must name a case the
+  table covers: `AdoptsMetadata` and `AdoptsOnChanges` (`same-checkout`),
+  `RunsOnRediff` (`nothing-ran`, a hook that runs only on a second diff
+  of the same checkout) and `WritesThenRefuses` (`apply-refuses`, the
+  unchanged-checkout check). The two mutants that a metadata-dropping
+  `edit` let through are rendered as fixture violations, like the
+  blank-status ones. Everything compared later is taken before
+  `d_hostile`, so an adapter that adopts the metadata cannot pass by
+  spoiling both sides. Counts: 50 clauses and 62 mutant cases (49 and 56
+  before), plus 4 regression mutants and 2 vacuous fixtures.
 - **ADR-004 is accepted and stays unchanged.** Its D2 counts and its D11
   clause table describe the suites as it accepted them; this ADR records
   the addition, as ADR-009 D13 did for `tampered-refused`.
@@ -111,12 +158,16 @@ a file or the snapshot.
 
 ## Consequences
 
-- Every `Git` adapter must pass `workspace-metadata-inert`; its test has to
-  supply a tripwire that would actually see a hook or `core.fsmonitor` run.
-  Part 3 proves the fixture is not vacuous on real git: a test-local
-  wrapper that runs `git add -A` with discovery inside the unpacked
-  workspace fails the clause at `nothing-ran`.
-- The `Git` suite's `run` takes a third argument, the tripwire.
+- Every `Git` adapter must pass `workspace-metadata-inert`. Its test has
+  to supply a tripwire that would actually see a hook or `core.fsmonitor`
+  run, with a sentinel at an absolute path outside the adapter's
+  directories, and a `retarget` hook for its diff format. Part 3 proves
+  the fixture is not vacuous on real git: a test-local wrapper that runs
+  `git add -A` with discovery inside the unpacked workspace, and then
+  deletes that directory as the adapter does, fails the clause at
+  `nothing-ran`.
+- The `Git` suite's `run` takes two more arguments, `retarget` and the
+  tripwire.
 - A fix that edits a repository's own `.git` content cannot reach a pull
   request. That is intended: such a change is not source.
 - An agent that changes the sandbox's `.git` (commits, config) changes
@@ -131,6 +182,12 @@ a file or the snapshot.
   `post-index-change` hook there (Context).
 - **Checking only that the diff is unchanged.** An adapter that runs a hook
   and then diffs correctly would pass; `nothing-ran` needs the tripwire.
+- **Checking later only a fresh checkout's unchanged diff** (the first
+  version of this clause). Review showed adoption into the diffed
+  checkout's own store, adoption that changes only non-empty diffs and a
+  hook that runs only on a second diff all passing it (step 6).
+- **Leaving `apply`'s refusal to the adapter's own tests.** The rule is the
+  port's, so the contract binds it; the cost is the `retarget` fixture.
 - **A rule that also matches look-alikes** (case-folded `.git`, 8.3 short
   names). The core cannot know the file system the pull request will be
   checked out on, and git's own `protectNTFS`/`protectHFS` checks are the

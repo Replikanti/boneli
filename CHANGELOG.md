@@ -318,12 +318,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arm64 and runs them in the sandbox.
 - The `Git` contract gains `workspace-metadata-inert`, part 1 of #30
   (ADR-010, proposed): repository metadata planted in a workspace (`.git`,
-  also nested) runs nothing, leaves the diff unchanged and does not steer
-  a later diff. `RelativePath::is_repository_metadata` is the one rule
-  (some component is exactly `.git`); `MemoryGit` drops metadata from a
-  workspace and refuses a diff that touches it. The suite takes a
-  `Tripwire` fixture; one mutant per sub-check (`RunsMetadata`,
-  `MetadataIsContent`, `AdoptsMetadata`): 50 clauses, 59 mutant cases.
+  also nested) runs nothing, leaves the diff unchanged, does not change
+  later diffs or applies of the same or a fresh checkout, and a diff that
+  writes it does not apply. `RelativePath::is_repository_metadata` is the
+  one rule (some component is exactly `.git`); `MemoryGit` drops metadata
+  from a workspace and refuses a diff that touches it. The suite takes a
+  `retarget` hook and a `Tripwire` fixture; one mutant per sub-check
+  (`RunsMetadata`, `MetadataIsContent`, `AdoptsPerCheckout`,
+  `AdoptsIntoNewCheckouts`, `AdoptsOnApply`, `AppliesMetadata`): 50
+  clauses, 62 mutant cases. `boneli_replay_check::mutants` gains a
+  regression table (4 mutants) and vacuous-fixture violations (2), both
+  rendered under the replay gate.
 
 ### Changed
 

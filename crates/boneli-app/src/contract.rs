@@ -1281,7 +1281,14 @@ pub mod git {
 
     /// The sub-checks of `workspace-metadata-inert`, each with its own
     /// mutant (ADR-004, D2; ADR-010, D1).
-    pub const METADATA_CHECKS: &[&str] = &["nothing-ran", "same-diff", "later-diff"];
+    pub const METADATA_CHECKS: &[&str] = &[
+        "nothing-ran",
+        "same-diff",
+        "same-checkout",
+        "fresh-checkout",
+        "same-apply",
+        "apply-refuses",
+    ];
 
     /// An adapter with a repository whose content at the base commit the
     /// adapter's own test knows.
@@ -1312,7 +1319,10 @@ pub mod git {
 
     /// Whether anything the planted metadata asks for ran on the host. Only
     /// the adapter's own test knows how to look (for the git binary, a
-    /// sentinel that a hook or `core.fsmonitor` would create).
+    /// sentinel that a hook or `core.fsmonitor` would create). The sentinel
+    /// must sit at an absolute path outside every directory the adapter
+    /// creates or removes: a relative one lands in the directory git runs
+    /// in, which the adapter deletes, and the run would go unseen.
     pub trait Tripwire<G> {
         /// What ran, one entry each; empty when nothing did. An error is
         /// reported as the clause's detail.
@@ -1324,11 +1334,15 @@ pub mod git {
     /// `edit` takes a workspace in the adapter's snapshot format, a path
     /// and content, and returns the workspace with that file set to that
     /// content, or removed for `None`. The snapshot format belongs to the
-    /// adapter (#30), so only its own test knows how. `tripwire` reports
-    /// what the planted metadata of `workspace-metadata-inert` made run.
+    /// adapter (#30), so only its own test knows how. `retarget` takes a
+    /// diff in the adapter's format and two paths and returns the diff with
+    /// every change of the first path moved to the second; the suite proves
+    /// on a content path that the result applies. `tripwire` reports what
+    /// the planted metadata of `workspace-metadata-inert` made run.
     pub fn run<G: Git>(
         make: impl Fn() -> Repository<G>,
         edit: impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        retarget: impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         tripwire: &impl Tripwire<G>,
     ) -> Result<(), Violation> {
         read_at_base(&make())?;
@@ -1341,7 +1355,7 @@ pub mod git {
         added_file(&make(), &edit)?;
         removed_file(&make(), &edit)?;
         apply_mismatch_fails(&make(), &edit)?;
-        workspace_metadata_inert(&make(), &edit, tripwire)
+        workspace_metadata_inert(&make(), &edit, &retarget, tripwire)
     }
 
     fn call<T>(
@@ -1526,6 +1540,13 @@ pub mod git {
         expect_read(r, clause, &once, &r.path, None)
     }
 
+    const METADATA: &str = "workspace-metadata-inert";
+
+    /// A fixture that would make `workspace-metadata-inert` vacuous.
+    fn metadata_fixture(detail: String) -> Violation {
+        violation(PORT, METADATA, format!("fixture: {detail}"))
+    }
+
     /// The tripwire's report; an error is the clause's detail under
     /// `check`, so a tripwire that cannot look never passes.
     fn tripped<G: Git>(
@@ -1536,7 +1557,7 @@ pub mod git {
         tripwire.tripped(&r.adapter).map_err(|error| {
             violation(
                 PORT,
-                "workspace-metadata-inert",
+                METADATA,
                 format!("{check}: the tripwire failed: {error}"),
             )
         })
@@ -1549,7 +1570,7 @@ pub mod git {
         after: &str,
     ) -> Result<(), Violation> {
         let ran = tripped(r, tripwire, "nothing-ran")?;
-        ensure(ran.is_empty(), PORT, "workspace-metadata-inert", || {
+        ensure(ran.is_empty(), PORT, METADATA, || {
             format!(
                 "nothing-ran: after {after}, the tripwire reports {} runs of what the \
                  workspace's repository metadata asks for: {ran:?}",
@@ -1558,56 +1579,146 @@ pub mod git {
         })
     }
 
+    /// The snapshot of the checkout that applying `diff` to `checkout`
+    /// makes.
+    fn applied_snapshot<G: Git>(
+        r: &Repository<G>,
+        checkout: &CheckoutId,
+        diff: &[u8],
+    ) -> Result<Vec<u8>, Violation> {
+        let after = call(METADATA, "apply", r.adapter.apply(checkout, diff))?;
+        call(METADATA, "snapshot", r.adapter.snapshot(&after))
+    }
+
+    /// `sub`: the diffs of `checkout`'s snapshot, edited as for `d_plain`
+    /// and unchanged, are `d_plain` and empty.
+    fn diffs_as_before<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        checkout: &CheckoutId,
+        d_plain: &[u8],
+        sub: &str,
+        which: &str,
+    ) -> Result<(), Violation> {
+        let snapshot = call(METADATA, "snapshot", r.adapter.snapshot(checkout))?;
+        let edited = edit(&snapshot, &r.path, Some(&r.edited));
+        let d_edited = call(METADATA, "diff", r.adapter.diff(checkout, &edited))?;
+        let d_unchanged = call(METADATA, "diff", r.adapter.diff(checkout, &snapshot))?;
+        ensure(
+            d_edited == d_plain && d_unchanged.is_empty(),
+            PORT,
+            METADATA,
+            || {
+                format!(
+                    "{sub}: after a diff of a workspace with repository metadata, {which} \
+                     diffs the edited snapshot to {} bytes ({} before, equal: {}) and the \
+                     unchanged snapshot to {} bytes (expected none)",
+                    d_edited.len(),
+                    d_plain.len(),
+                    d_edited == d_plain,
+                    d_unchanged.len()
+                )
+            },
+        )
+    }
+
+    /// The fixture half of `apply-refuses`, run before any metadata reaches
+    /// the adapter: a diff that adds [`Repository::missing`], and proof
+    /// that `retarget` moves it to another content path as a diff that
+    /// applies. Without that proof, a `retarget` that makes garbage would
+    /// pass the sub-check on every adapter.
+    fn retargetable_diff<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        retarget: &impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
+        base: &CheckoutId,
+        snapshot: &[u8],
+    ) -> Result<Vec<u8>, Violation> {
+        let added = edit(snapshot, &r.missing, Some(&r.edited));
+        let d_add = call(METADATA, "diff", r.adapter.diff(base, &added))?;
+        let twin_name = format!("{}.twin", r.missing.as_str());
+        let twin = RelativePath::parse(&twin_name).map_err(|problem| {
+            metadata_fixture(format!(
+                "the twin path {twin_name:?} is invalid: {problem:?}"
+            ))
+        })?;
+        if call(METADATA, "read", r.adapter.read(base, &twin))?.is_some() {
+            return Err(metadata_fixture(format!(
+                "the base has a file at the twin path {twin_name:?}, so a retargeted diff \
+                 cannot be shown to add it"
+            )));
+        }
+        let moved = retarget(&d_add, &r.missing, &twin);
+        let read = r
+            .adapter
+            .apply(base, &moved)
+            .and_then(|after| r.adapter.read(&after, &twin));
+        if read.as_ref().map(Option::as_deref) != Ok(Some(r.edited.as_slice())) {
+            return Err(metadata_fixture(format!(
+                "the retarget hook moved a diff that adds {:?} to {twin_name:?}, and \
+                 applying it gave {:?}, expected a file there with the fixture's content \
+                 ({} bytes); a retarget hook that does not make diffs that apply would let \
+                 every adapter pass apply-refuses",
+                r.missing.as_str(),
+                read.map(|got| got.map(|bytes| bytes.len())),
+                r.edited.len()
+            )));
+        }
+        Ok(d_add)
+    }
+
     /// The workspace comes from the sandbox, where the agent writes, and
     /// the adapter diffs it on the host as the runner user (#30). Its
     /// repository metadata (`.git`, also nested) is not content and never
-    /// steers the adapter's git: nothing it asks for runs (`nothing-ran`),
-    /// the diff is the one without it (`same-diff`), and a later diff of a
-    /// fresh checkout is unchanged (`later-diff`), so a store that adopted
-    /// the planted config is caught. `d_plain` is taken before `d_hostile`,
-    /// so an adapter that adopts the metadata cannot pass `same-diff` by
-    /// spoiling both. Details quote lengths, not bytes (ADR-004, D10).
+    /// steers the adapter's git (ADR-010, D1):
+    ///
+    /// - `nothing-ran`: nothing it asks for runs, checked after every
+    ///   later step too;
+    /// - `same-diff`: the diff is the one without it;
+    /// - `same-checkout`: later diffs of the checkout that saw it are as
+    ///   before, the edited one and the unchanged one, so an adapter that
+    ///   adopted the config into that checkout's store is caught, also
+    ///   when the config changes only non-empty diffs;
+    /// - `fresh-checkout`: the same for a checkout fetched afterwards, so
+    ///   adoption into what new checkouts start from is caught;
+    /// - `same-apply`: applying the plain diff to either checkout gives
+    ///   the snapshot it gave before the metadata was seen;
+    /// - `apply-refuses`: a diff that writes a metadata path, made by
+    ///   moving a diff that adds a file there with the adapter's own
+    ///   `retarget`, does not apply, and the checkout stays as it was.
+    ///
+    /// Everything compared later is taken before the hostile diff, so an
+    /// adapter that adopts the metadata cannot pass by spoiling both sides.
+    /// Details quote lengths, not bytes (ADR-004, D10).
     fn workspace_metadata_inert<G: Git>(
         r: &Repository<G>,
         edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        retarget: &impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         tripwire: &impl Tripwire<G>,
     ) -> Result<(), Violation> {
-        let clause = "workspace-metadata-inert";
         if r.metadata.is_empty() {
-            return Err(violation(
-                PORT,
-                clause,
-                String::from(
-                    "fixture: no repository metadata, so the clause cannot tell an adapter \
-                     that obeys it from one that ignores it",
-                ),
-            ));
+            return Err(metadata_fixture(String::from(
+                "no repository metadata, so the clause cannot tell an adapter that obeys it \
+                 from one that ignores it",
+            )));
         }
         if let Some((path, _)) = r.metadata.iter().find(|(p, _)| !p.is_repository_metadata()) {
-            return Err(violation(
-                PORT,
-                clause,
-                format!(
-                    "fixture: {:?} is not repository metadata, so an adapter that diffs \
-                     metadata as content could pass on it",
-                    path.as_str()
-                ),
-            ));
+            return Err(metadata_fixture(format!(
+                "{:?} is not repository metadata, so an adapter that diffs metadata as \
+                 content could pass on it",
+                path.as_str()
+            )));
         }
         let before = tripped(r, tripwire, "fixture")?;
         if !before.is_empty() {
-            return Err(violation(
-                PORT,
-                clause,
-                format!(
-                    "fixture: the tripwire reports {} runs before the clause ran anything, \
-                     so it cannot tell what the clause caused: {before:?}",
-                    before.len()
-                ),
-            ));
+            return Err(metadata_fixture(format!(
+                "the tripwire reports {} runs before the clause ran anything, so it cannot \
+                 tell what the clause caused: {before:?}",
+                before.len()
+            )));
         }
-        let base = checkout(r, clause)?;
-        let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
+        let base = checkout(r, METADATA)?;
+        let snapshot = call(METADATA, "snapshot", r.adapter.snapshot(&base))?;
         let plain = edit(&snapshot, &r.path, Some(&r.edited));
         let hostile = r
             .metadata
@@ -1615,10 +1726,20 @@ pub mod git {
             .fold(plain.clone(), |workspace, (path, content)| {
                 edit(&workspace, path, Some(content))
             });
-        let d_plain = call(clause, "diff", r.adapter.diff(&base, &plain))?;
-        let d_hostile = call(clause, "diff", r.adapter.diff(&base, &hostile))?;
-        nothing_ran(r, tripwire, "the diffs")?;
-        ensure(d_hostile == d_plain, PORT, clause, || {
+        if hostile == plain {
+            return Err(metadata_fixture(String::from(
+                "the edit hook returned the same workspace with the metadata as without it, \
+                 so the adapter never sees any",
+            )));
+        }
+        // Taken before any metadata reaches the adapter.
+        let d_plain = call(METADATA, "diff", r.adapter.diff(&base, &plain))?;
+        let reference = applied_snapshot(r, &base, &d_plain)?;
+        let d_add = retargetable_diff(r, edit, retarget, &base, &snapshot)?;
+
+        let d_hostile = call(METADATA, "diff", r.adapter.diff(&base, &hostile))?;
+        nothing_ran(r, tripwire, "the diff of a workspace with metadata")?;
+        ensure(d_hostile == d_plain, PORT, METADATA, || {
             format!(
                 "same-diff: with {} metadata entries planted the diff has {} bytes, without \
                  them {} bytes; expected the same diff",
@@ -1627,17 +1748,58 @@ pub mod git {
                 d_plain.len()
             )
         })?;
-        let fresh = checkout(r, clause)?;
-        let unchanged = call(clause, "snapshot", r.adapter.snapshot(&fresh))?;
-        let later = call(clause, "diff", r.adapter.diff(&fresh, &unchanged))?;
-        ensure(later.is_empty(), PORT, clause, || {
-            format!(
-                "later-diff: after a diff of a workspace with repository metadata, the diff \
-                 of a fresh checkout's unchanged snapshot has {} bytes, expected none",
-                later.len()
-            )
+
+        diffs_as_before(
+            r,
+            edit,
+            &base,
+            &d_plain,
+            "same-checkout",
+            "the same checkout",
+        )?;
+        nothing_ran(r, tripwire, "later diffs of the same checkout")?;
+
+        let fresh = checkout(r, METADATA)?;
+        diffs_as_before(
+            r,
+            edit,
+            &fresh,
+            &d_plain,
+            "fresh-checkout",
+            "a fresh checkout",
+        )?;
+        nothing_ran(r, tripwire, "diffs of a fresh checkout")?;
+
+        for (which, from) in [("the same checkout", &base), ("a fresh checkout", &fresh)] {
+            let got = applied_snapshot(r, from, &d_plain)?;
+            ensure(got == reference, PORT, METADATA, || {
+                format!(
+                    "same-apply: applying the plain diff to {which} gives a snapshot of {} \
+                     bytes that differs from the one it gave before the metadata was seen \
+                     ({} bytes)",
+                    got.len(),
+                    reference.len()
+                )
+            })?;
+        }
+        nothing_ran(r, tripwire, "the applies")?;
+
+        for (path, _) in &r.metadata {
+            let hostile_diff = retarget(&d_add, &r.missing, path);
+            let got = r.adapter.apply(&base, &hostile_diff);
+            ensure(got.is_err(), PORT, METADATA, || {
+                format!(
+                    "apply-refuses: a diff that writes {:?} applied to {base:?} as {got:?}, \
+                     expected an error",
+                    path.as_str()
+                )
+            })?;
+        }
+        let after = call(METADATA, "snapshot", r.adapter.snapshot(&base))?;
+        ensure(after == snapshot, PORT, METADATA, || {
+            format!("apply-refuses: {base:?} changed when diffs that write metadata were refused")
         })?;
-        nothing_ran(r, tripwire, "the later diff")
+        nothing_ran(r, tripwire, "the refused applies")
     }
 
     fn unchanged_snapshot_empty_diff<G: Git>(r: &Repository<G>) -> Result<(), Violation> {

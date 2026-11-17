@@ -3,11 +3,15 @@
 use std::collections::BTreeSet;
 
 use boneli_app::contract;
-use boneli_replay_check::mutants::{blank_status_violations, mutants};
+use boneli_replay_check::mutants::{
+    blank_status_violations, mutants, regression_mutants, vacuous_fixture_violations,
+};
 
+/// Every mutant, and every regression mutant from review, fails its suite
+/// at its own clause case.
 #[test]
 fn every_clause_is_killed() {
-    for m in mutants() {
+    for m in mutants().into_iter().chain(regression_mutants()) {
         let (port, clause, operation) = (m.port, m.clause, m.operation);
         match (m.run)() {
             Ok(()) => panic!("the {port} mutant for {clause} {operation} passed its suite"),
@@ -110,5 +114,44 @@ fn blank_fixture_status_is_a_violation() {
             (port, "silent-failure-detail")
         );
         assert!(violation.detail.contains("is blank"), "{violation:?}");
+    }
+}
+
+/// Regression mutants name clause cases that the bijective table already
+/// covers, so the table stays one mutant per case.
+#[test]
+fn regression_mutants_name_covered_cases() {
+    let table: BTreeSet<(&str, &str, &str)> = mutants()
+        .iter()
+        .map(|m| (m.port, m.clause, m.operation))
+        .collect();
+    let regressions = regression_mutants();
+    assert!(!regressions.is_empty());
+    for m in regressions {
+        assert!(
+            table.contains(&(m.port, m.clause, m.operation)),
+            "{} {} {} has no primary mutant",
+            m.port,
+            m.clause,
+            m.operation
+        );
+    }
+}
+
+/// An `edit` hook that never writes metadata is a fixture violation of
+/// `workspace-metadata-inert`, not a pass (review of #61).
+#[test]
+fn metadata_skipping_edit_is_a_violation() {
+    for (bug, result) in vacuous_fixture_violations() {
+        let violation = result.expect_err("a vacuous fixture must not pass");
+        assert_eq!(
+            (violation.port, violation.clause),
+            ("Git", "workspace-metadata-inert"),
+            "{bug}"
+        );
+        assert!(
+            violation.detail.starts_with("fixture:"),
+            "{bug}: {violation:?}"
+        );
     }
 }
