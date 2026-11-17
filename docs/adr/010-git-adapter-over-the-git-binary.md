@@ -168,10 +168,164 @@ adversarial review.
   clause table describe the suites as it accepted them; this ADR records
   the addition, as ADR-009 D13 did for `tampered-refused`.
 
+### D2. The workspace and snapshot format
+
+Part 2 of #30. A snapshot the adapter hands the sandbox and a workspace
+the sandbox hands back share one format, `boneli_git_cli::Workspace`.
+
+- **Encoding.** The magic `boneli-workspace 1\n`, then the entries in
+  path order. Each entry is a kind byte, the path and the data; path and
+  data are each a length in 8 big-endian bytes followed by the bytes.
+  The kinds are exactly the blob modes git records: `f` a regular file
+  (0644), `x` an executable (0755) and `l` a symlink, whose data is its
+  target as raw bytes. Directories are implicit, as in a git tree: an
+  entry's parents are directories, and an empty directory cannot be
+  expressed. Gitlinks are not entries; the adapter reads them from the
+  base tree (D3).
+- **Canonical.** Path order is the byte order of the UTF-8 path, which is
+  `RelativePath`'s order and needs no collation. A tree has exactly one
+  encoding, so two snapshots of one tree are equal byte strings, and
+  `decode` refuses every byte string `encode` would not produce.
+- **What `decode` refuses**, each as a `DecodeError` that names the entry
+  by index and quotes lengths, never the agent-written bytes (as ADR-004
+  D10 does for violation details):
+  - a wrong or truncated magic, an unknown kind byte, and a length past
+    the end, `u64::MAX` included, or a partial trailing entry;
+  - a path that is not UTF-8 or that `RelativePath::parse` refuses
+    (absolute, `..`, `.`, empty components, backslash, NUL, blank);
+  - a path equal to or sorting before the previous one;
+  - an entry beneath a file or symlink entry, against every ancestor and
+    not only the previous entry: `a`, `a.txt`, `a/b` sorts `a.txt`
+    between the file `a` and the entry beneath it;
+  - a symlink with an empty target or a NUL in it. Any other target is
+    kept as written, absolute or with `..`: a link is never resolved on
+    the host (D3), and which links a fix may add is the patch policy's
+    question (#17);
+  - more nodes than the cap (below).
+- **Bounded on hostile input.** Every length is compared with the bytes
+  left, as a `u64`, before anything is copied, so nothing is allocated
+  ahead of the input: a decoded workspace holds at most the input's bytes
+  plus a fixed overhead per entry, and the node cap bounds the entries. The
+  ancestor check runs in linear time over a stack of the earlier paths
+  that are a string prefix of the current one. Paths that share a prefix
+  sort together, so every earlier entry that is a prefix of the current
+  path is still on the stack, and the path lies beneath one exactly when
+  the next byte is `/`. A lookup of every ancestor in an ordered map
+  instead compares O(L^2) bytes for a path of length L next to a sibling
+  that shares its prefixes; a test of a 4 MB path holds the decoder under
+  a deadline that such a lookup misses.
+- **The node cap.** `decode(bytes, max_nodes)` counts nodes, the files
+  and symlinks plus every distinct directory they imply
+  (`Workspace::nodes`), and refuses past `max_nodes`, which defaults to
+  200,000 (`DEFAULT_MAX_NODES`). That is the number of file system
+  objects `materialize` creates (D3), so the cap bounds the inodes a
+  hostile workspace can ask of the host, whatever its size.
+  - *Why directories count.* A directory costs two bytes of input (`a/`),
+    so one entry can imply as many directories as half its path length.
+    A cap on entries alone bounded nothing: in review one entry of 3,837
+    bytes made 1,900 directories under a cap of 1, and a 200 MB workspace
+    could ask for about 100 million directories (200 MB / 2 bytes),
+    about 380 million under 200,000 entries. Without any cap the bound
+    is that same input size / 2.
+  - *Counting is linear.* In path order, a directory two paths both imply
+    lies inside their common prefix, and everything between two paths
+    that start with `d/` starts with it too. So a path adds exactly the
+    directories at its `/` positions at or past its common prefix with
+    the previous path, and the count costs one pass over the bytes. The
+    cap is checked before each entry is read and after its path is
+    counted.
+  - *Derivation of 200,000.* The candidate repositories of
+    docs/ARCHITECTURE.md, measured on 2026-11-17 at the head of each
+    default branch through a tree-only shallow clone (depth 1, no
+    blobs) and counted with `git ls-tree -r -t`: 3,731, 10,291 and
+    55,025 nodes. The trees move with every commit; a recount later
+    that day found the largest a few nodes bigger, which changes
+    nothing below. The largest has 44,776 files and 10,249
+    directories, at most 12 directories deep and with paths of at most
+    242 bytes. The cap is about 3.6 times the largest, room for a
+    larger repository or a generated tree without letting a hostile
+    workspace grow the host's inode use past 200,000.
+  - A workspace that carries `node_modules` may exceed it; that fails
+    closed with a detail naming the cap, and #8 decides what an export
+    carries.
+- **`without_metadata`** drops every path `is_repository_metadata` names
+  (D1), as a file, a directory's entries or a symlink.
+- **Constructors.** A `Workspace` is built by `decode` or by
+  `Workspace::from_sorted(entries, max_nodes)`, which takes entries in
+  path order and applies the same checks and the same node cap through
+  the same linear code. Byte order of the full paths is the order
+  `git ls-tree -r -z` lists a tree in; input out of order or with a
+  duplicate is refused, never sorted silently. **Part 3 builds every
+  snapshot with `from_sorted`**, the applied checkout's included: its
+  paths come from the agent's workspace through `apply`, so they are as
+  long and deep as `PATH_MAX` allows. In review a constructor that
+  looked every ancestor up took 13 to 19 ms per path under one chain of
+  1,900 directories, about an hour of CPU for a tree that fills the
+  node cap; a test holds `from_sorted` under a deadline on that shape.
+  `insert`, which has that cost, is test-only. `remove` keeps the
+  invariants, so every `Workspace` encodes to bytes `decode` accepts.
+
+### D3. Writing a workspace onto the host
+
+`boneli_git_cli::materialize(workspace, dir, gitlinks, max_nodes)` writes a decoded
+workspace for `git add -A` (part 3). It runs as the runner user on
+agent-written entries, so it never trusts what is on disk and never
+follows a symlink.
+
+- **The target** must be a new, empty directory with mode 0700, checked
+  through `symlink_metadata`, so a symlink to a directory is refused.
+- **Checked before anything is written.** Repository metadata is refused
+  (defense in depth: `diff` drops it first, D1), and so is an entry at or
+  under a gitlink, a gitlink beneath an entry, and a gitlink that is
+  repository metadata. The gitlink lookups for an entry stop at the
+  length of the longest gitlink, so a deep agent-written path costs no
+  more than that.
+- **The node cap, again.** The workspace's nodes (D2) plus the
+  directories the gitlinks add (each gitlink and its parents, once,
+  unless an entry already implies them) must fit `max_nodes`, checked
+  before the first write. A decoded workspace already holds the cap;
+  this check also covers the gitlinks and a workspace built in code, and
+  what `materialize` creates is exactly what it counted.
+- **Parents** are created one component at a time with `create_dir`, and
+  each directory once: the parents an entry shares with the previous
+  entry lie inside their common prefix and were made for it, so only the
+  rest are created. Creating every parent again for every entry costs
+  O(depth^2) path lookups per entry; in review 500 entries under one
+  chain of 1,900 directories took 150 s that way. Every call is
+  path-based and the kernel refuses a path over `PATH_MAX` (4,096 bytes),
+  so each call walks at most that many bytes, and the work is linear in
+  the node count; a test holds the review's shape under a deadline. One
+  that already exists must be a real directory by `symlink_metadata`;
+  anything else is `NotADirectory`. D2 keeps every entry off the paths
+  beneath another entry, so on a case-sensitive file system this check
+  never fires for a valid workspace; it is the guard against a symlink
+  entry that a case or normalization alias makes a parent, and against
+  anything else on disk that the format rules out.
+- **Files** are opened with `create_new` (`O_CREAT | O_EXCL`, which also
+  refuses a symlink at the final name) with mode 0600, written, and then
+  given 0644 or 0755 through the open file (`fchmod`), so the umask does
+  not matter. A directory gets 0755 by a `chmod` of its path right after
+  `create_dir` made it, so the umask does not matter there either; a test
+  runs again in a child under `umask 077` to hold both.
+- **Symlinks** are created with `std::os::unix::fs::symlink`, their target
+  passed as raw bytes through `OsStrExt`, and never resolved.
+- **Gitlinks.** Each gitlink of the base tree becomes an empty directory
+  after the entries, so `git add -A` keeps the gitlink instead of
+  recording its removal.
+- **Order and failure.** Entries are written in path order. On an error
+  the directory may hold part of the workspace; the caller removes it
+  (part 3 removes its scratch directory on every path). Errors name the
+  entry or gitlink by index, never by its path.
+- **Same-user races.** The calls are path-based, so the kernel follows a
+  symlink in an intermediate component, and "never follows a symlink"
+  holds only while nothing else writes into the target during the call.
+  Inside the private 0700 target only a process with the runner's own uid
+  could plant one, and such a process already holds everything the
+  runner holds, so the race crosses no permission boundary.
+
 ### Later parts
 
-Part 2 adds the workspace and snapshot format, its entry cap and the
-materializer rules (D2 and D3). Part 3 adds the git runner with its fixed
+Part 3 adds the git runner with its fixed
 environment and command-scope config, the transports, the operations and
 the git version floor (D4 to D7), and the rule for #19: the token reaches
 git only as `http.<url>.extraHeader` through `GIT_CONFIG_KEY_n` and
@@ -194,6 +348,15 @@ a file or the snapshot.
   request. That is intended: such a change is not source.
 - An agent that changes the sandbox's `.git` (commits, config) changes
   nothing that leaves the sandbox; only the working tree's content does.
+- The workspace codec lives in the adapter crate, and nothing may depend
+  on an adapter. #8, which copies a snapshot into a sandbox and exports a
+  workspace from one, needs the same codec: when it does, it moves
+  `Workspace` and `materialize` into a support crate and passes the path
+  rule (`RelativePath::parse` and `is_repository_metadata`) in as a
+  validator, so the support crate stays generic.
+- An empty directory, a FIFO, a device or a hard link in the sandbox
+  cannot be expressed in a workspace (D2). #8 decides how the export
+  treats them; nothing the format cannot carry reaches `diff`.
 
 ## Alternatives considered
 
@@ -217,6 +380,16 @@ a file or the snapshot.
   only exit codes and never git's English messages, so it would need its
   own parse of the diff's paths before `git apply`. That is a change to
   part 3's plan, not made here.
+- **tar as the workspace format.** A tar stream has many encodings of one
+  tree (header variants, pax and GNU extensions, hard links, devices,
+  directory entries in any order), so it is not canonical, and the tar
+  reader of `boneli-oci` lives in another adapter, which this crate may
+  not depend on. The length-prefixed format needs a few dozen lines and
+  has exactly one encoding per tree.
+- **`MemoryGit`'s snapshot format.** It has no kinds, so it cannot carry
+  the executable bit or a symlink, and it is that adapter's own (ADR-004).
+- **An ancestor check by map lookup.** Simpler, but quadratic in the path
+  length on hostile input (D2).
 - **A rule that also matches look-alikes** (case-folded `.git`, 8.3 short
   names). The core cannot know the file system the pull request will be
   checked out on, and git's own `protectNTFS`/`protectHFS` checks are the
