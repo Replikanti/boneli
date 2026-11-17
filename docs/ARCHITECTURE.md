@@ -285,7 +285,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 | `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries; ring's SHA-256 for content addressing (ADR-009) | only `boneli-https`; their transitive crates (`rustls-webpki`, `rustls-pki-types`, `untrusted`, `subtle`, `zeroize`, `once_cell`, `getrandom`, `cfg-if`, and `cc`, `shlex`, `find-msvc-tools` for ring's build) are listed in ADR-005 |
 | `miniz_oxide`, `ruzstd` | unpacking OCI image layers; `miniz_oxide` pulls `adler2` (ADR-009) | `boneli-oci` |
 
-**We write ourselves:** an HTTP/1.1 server over a Unix socket and a client over TLS (ADR-003), a JSON parser and serializer without derive (ADR-008), a parser for a TOML subset for configuration, tar reading and gzip framing (ADR-009), argument parsing, structured logging, error types, RFC 3339 and ID generation.
+**We write ourselves:** an HTTP/1.1 server over a Unix socket and a client over TLS (ADR-003), a JSON parser and serializer without derive (ADR-008), a parser for a TOML subset for configuration (ADR-011), tar reading and gzip framing (ADR-009), argument parsing, structured logging, error types, RFC 3339 and ID generation.
 
 **We do not use:** tokio, serde, clap, tracing, anyhow, rusqlite.
 

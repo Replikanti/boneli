@@ -1,0 +1,22 @@
+[package]
+name = "boneli-toml"
+description = "Boneli support crate: a strict parser for a documented TOML 1.0 subset, with tables in insertion order and limits for untrusted input (ADR-011)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: docs/ARCHITECTURE.md ("Pure Rust and dependencies") puts
+# a parser for a TOML subset for configuration on the list of parts we write
+# ourselves, and the `toml` crate pulls serde, which deny.toml bans (ADR-011).
+
+[dev-dependencies]
+# Decodes toml-test's expected JSON in the conformance test and writes the
+# tagged JSON of the toml-test decoder example (ADR-011, D9). Test-only, and
+# a support -> support edge, which rule graph-support allows.
+boneli-json.workspace = true
