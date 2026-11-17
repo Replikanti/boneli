@@ -50,10 +50,10 @@ fn images() -> Images<Store> {
         "",
     );
     let blob = tampered.blobs[0].clone();
-    if let Some(bytes) = hub.blobs.get_mut(&blob) {
-        if let Some(b) = bytes.last_mut() {
-            *b ^= 1;
-        }
+    if let Some(bytes) = hub.blobs.get_mut(&blob)
+        && let Some(b) = bytes.last_mut()
+    {
+        *b ^= 1;
     }
     let fake = Fake::new(move |s| hub.handle(s));
     let root = TempDir::new("contract");

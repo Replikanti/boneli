@@ -547,10 +547,10 @@ impl Model<'_> {
                     cost = 1_000;
                 }
             }
-            if let (None, Some(what)) = (&failed, job.stores) {
-                if let Some(FaultKind::Evidence(error)) = self.hit(Call::Put) {
-                    failed = Some(format!("storing the {what} failed: {error}"));
-                }
+            if let (None, Some(what)) = (&failed, job.stores)
+                && let Some(FaultKind::Evidence(error)) = self.hit(Call::Put)
+            {
+                failed = Some(format!("storing the {what} failed: {error}"));
             }
             let mut duration = 0;
             if job.measured {

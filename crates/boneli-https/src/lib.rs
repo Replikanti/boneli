@@ -91,10 +91,10 @@ impl From<io::Error> for Error {
     /// Unwraps the TLS error that rustls carries inside an `io::Error`.
     fn from(e: io::Error) -> Self {
         if e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) {
-            if let Some(inner) = e.into_inner() {
-                if let Ok(tls) = inner.downcast::<rustls::Error>() {
-                    return Error::Tls(*tls);
-                }
+            if let Some(inner) = e.into_inner()
+                && let Ok(tls) = inner.downcast::<rustls::Error>()
+            {
+                return Error::Tls(*tls);
             }
             return Error::InvalidInput("lost TLS error");
         }

@@ -163,10 +163,10 @@ pub(crate) fn carry(e: Error) -> io::Error {
 /// of the stream is a truncated archive.
 pub(crate) fn from_io(e: io::Error) -> Error {
     if e.get_ref().is_some_and(|inner| inner.is::<Carried>()) {
-        if let Some(inner) = e.into_inner() {
-            if let Ok(carried) = inner.downcast::<Carried>() {
-                return carried.0;
-            }
+        if let Some(inner) = e.into_inner()
+            && let Ok(carried) = inner.downcast::<Carried>()
+        {
+            return carried.0;
         }
         return Error::Tar("unreadable stream");
     }

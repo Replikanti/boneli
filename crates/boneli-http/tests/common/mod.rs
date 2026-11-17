@@ -180,10 +180,10 @@ pub fn statuses(output: &[u8]) -> Vec<u16> {
     let mut rest: &str = &text;
     while let Some(at) = rest.find("HTTP/1.1 ") {
         let code = &rest[at + 9..];
-        if code.len() >= 3 {
-            if let Ok(n) = code[..3].parse() {
-                found.push(n);
-            }
+        if code.len() >= 3
+            && let Ok(n) = code[..3].parse()
+        {
+            found.push(n);
         }
         rest = &rest[at + 9..];
     }

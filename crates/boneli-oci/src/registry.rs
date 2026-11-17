@@ -510,12 +510,12 @@ impl<'a> Client<'a> {
         size: Option<u64>,
     ) -> Result<Fetched, PullError> {
         let max = self.limits.document.max_bytes() as u64;
-        if let Some(size) = size {
-            if size > max {
-                return Err(failed(format!(
-                    "manifest {digest} has {size} bytes, more than the limit of {max}"
-                )));
-            }
+        if let Some(size) = size
+            && size > max
+        {
+            return Err(failed(format!(
+                "manifest {digest} has {size} bytes, more than the limit of {max}"
+            )));
         }
         let deadline = self.timeouts.deadline(size.unwrap_or(max))?;
         let url = self

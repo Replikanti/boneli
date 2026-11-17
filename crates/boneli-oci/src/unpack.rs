@@ -394,10 +394,11 @@ impl<'a> Layer<'a> {
         };
         // aufs metadata at the root (`.wh..wh.plnk`, ...) is skipped with
         // everything under it, as moby does; only the opaque marker counts.
-        if let Some(first) = comps.first() {
-            if first.starts_with(AUFS_META_PREFIX) && *first != OPAQUE_MARKER {
-                return Ok(());
-            }
+        if let Some(first) = comps.first()
+            && first.starts_with(AUFS_META_PREFIX)
+            && *first != OPAQUE_MARKER
+        {
+            return Ok(());
         }
         if parent.iter().any(|c| c.starts_with(WHITEOUT_PREFIX)) {
             return Err(refuse(&e.path, "a whiteout name as a parent directory"));

@@ -291,13 +291,12 @@ pub fn probe(action: &str, env: &[(&str, &str)], ids: Ids, root: Root) -> BTreeM
     assert_eq!(out.status, ExitStatus::Exited(0), "probe failed: {out:?}");
     let mut values = BTreeMap::new();
     for line in out.stdout.lines() {
-        if let Some(pos) = line.find(PREFIX) {
-            if let Some((k, v)) = line
+        if let Some(pos) = line.find(PREFIX)
+            && let Some((k, v)) = line
                 .get(pos + PREFIX.len()..)
                 .and_then(|r| r.split_once('='))
-            {
-                values.insert(k.to_owned(), v.to_owned());
-            }
+        {
+            values.insert(k.to_owned(), v.to_owned());
         }
     }
     values

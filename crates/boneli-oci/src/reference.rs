@@ -33,8 +33,8 @@ impl Digest {
             return Err(refuse());
         }
         let mut out = [0u8; 32];
-        for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-            let (Some(hi), Some(lo)) = (nibble(pair[0]), nibble(pair[1])) else {
+        for (byte, [hi, lo]) in out.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
+            let (Some(hi), Some(lo)) = (nibble(*hi), nibble(*lo)) else {
                 return Err(refuse());
             };
             *byte = hi << 4 | lo;
