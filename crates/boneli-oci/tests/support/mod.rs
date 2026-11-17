@@ -78,6 +78,21 @@ pub fn own_pidns() -> u64 {
         .expect("pid:[inode]")
 }
 
+/// This process's time namespace inode, from `/proc/self/ns/time`, or 0
+/// on a kernel without time namespaces (ADR-009, D8).
+pub fn own_timens() -> u64 {
+    match std::fs::read_link("/proc/self/ns/time") {
+        Ok(link) => link
+            .to_str()
+            .and_then(|l| l.strip_prefix("time:["))
+            .and_then(|l| l.strip_suffix(']'))
+            .and_then(|l| l.parse().ok())
+            .expect("time:[inode]"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => panic!("/proc/self/ns/time: {e}"),
+    }
+}
+
 /// The start time of the process `/proc/<pid>` names, field 22 of its
 /// stat; `"self"` names this one.
 pub fn start_of(pid: &str) -> u64 {
@@ -90,10 +105,16 @@ pub fn start_of(pid: &str) -> u64 {
         .expect("starttime")
 }
 
-/// The owner token of ADR-009 D8, `<boot>.<pidns>.<pid>.<start>`: 32 hex
-/// digits, then 20, 10 and 20 decimal digits.
+/// The owner token of ADR-009 D8, `<boot>.<pidns>.<timens>.<pid>.<start>`:
+/// 32 hex digits, then 20, 20, 10 and 20 decimal digits. The time
+/// namespace is this process's ([`own_timens`]).
 pub fn owner_token(boot: &str, pidns: u64, pid: u32, start: u64) -> String {
-    format!("{boot}.{pidns:020}.{pid:010}.{start:020}")
+    owner_token_in(boot, pidns, own_timens(), pid, start)
+}
+
+/// [`owner_token`] with a given time namespace.
+pub fn owner_token_in(boot: &str, pidns: u64, timens: u64, pid: u32, start: u64) -> String {
+    format!("{boot}.{pidns:020}.{timens:020}.{pid:010}.{start:020}")
 }
 
 /// An owned name `<prefix><token>.<n>` with a 20-digit counter.

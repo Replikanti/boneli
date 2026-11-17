@@ -4,8 +4,8 @@
 //!
 //! A layer is unpacked into `<root>/layers/sha256/.tmp-<owner>.<n>/` while
 //! its uncompressed stream is hashed, where `<owner>` names this process by
-//! the kernel's boot id, its PID namespace, pid and start time ([`Owner`]);
-//! lookups use hex names
+//! the kernel's boot id, its PID and time namespaces, pid and start time
+//! ([`Owner`]); lookups use hex names
 //! only, so they never see a dot name. On a `diff_id` match the sidecar is written
 //! (to a staged file, then renamed), and then the directory is renamed to
 //! its hex name: that rename, within one directory, is the commit point.
@@ -20,6 +20,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
@@ -77,7 +78,8 @@ impl LayerCache {
     /// case-insensitive or normalizing directory, D8): there a symlink
     /// named `A` replaces the directory `a`. Probed by creating one name
     /// and looking up its case-folded and its decomposed form. Probe names
-    /// carry the owner (boot id, PID namespace, pid, start time) and a
+    /// carry the owner (boot id, PID and time namespaces, pid, start time)
+    /// and a
     /// counter, and
     /// a name that exists is skipped, never removed here, so a crashed
     /// process's leftover blocks no later one; the store removes it once
@@ -272,15 +274,15 @@ pub(crate) fn owned_name(stem: &str) -> Result<String, Error> {
     Ok(format!("{stem}{}.{n:020}", owner.token()))
 }
 
-/// The length of every [`temporary_name`]: `.tmp-`, the 52 characters of an
-/// owner token, a dot and a 20-digit counter.
+/// The length of every [`temporary_name`]: `.tmp-`, the 106 characters of
+/// an owner token, a dot and a 20-digit counter.
 pub(crate) const TEMPORARY_NAME_LEN: usize = 5 + OWNER_TOKEN_LEN + 1 + 20;
 
 // A committed layer is named by 64 hex digits; its staging name is longer.
 const _: () = assert!(TEMPORARY_NAME_LEN > 64);
 
-/// The length of [`Owner::token`]: 32 + 1 + 20 + 1 + 10 + 1 + 20.
-const OWNER_TOKEN_LEN: usize = 85;
+/// The length of [`Owner::token`]: 32 + 1 + 20 + 1 + 20 + 1 + 10 + 1 + 20.
+const OWNER_TOKEN_LEN: usize = 106;
 
 /// The prefixes of the dot names this crate creates in `layers/sha256/`
 /// and `blobs/sha256/`, each followed by an owner token: staging trees,
@@ -295,8 +297,12 @@ pub(crate) const OWNED_PREFIXES: [&str; 5] = [
 ];
 
 /// The process that owns a temporary name (D8): the kernel's boot id, its
-/// PID namespace (the inode of `/proc/self/ns/pid`), its pid in that
-/// namespace and its start time in clock ticks since boot. The pid alone
+/// PID namespace (the inode of `/proc/self/ns/pid`), its time namespace
+/// (the inode of `/proc/self/ns/time`), its pid in the PID namespace and
+/// its start time in clock ticks since boot, as its time namespace shows
+/// it: `/proc/<pid>/stat` shifts start times by the boottime offset of
+/// the reader's time namespace, so only a reader in the same one reads
+/// the start time the owner recorded. The pid alone
 /// does not identify a process: two runners in different PID namespaces
 /// can share a store and have the same pid, and a pid is reused once its
 /// process is gone. Nor does the namespace inode identify a host: every
@@ -307,9 +313,19 @@ pub(crate) const OWNED_PREFIXES: [&str; 5] = [
 pub(crate) struct Owner {
     boot: u128,
     pidns: u64,
+    timens: u64,
     pid: u32,
     start: u64,
 }
+
+/// The time namespace an owner records on a kernel built without time
+/// namespaces, which has no `/proc/self/ns/time` and shifts no start time.
+const NO_TIME_NAMESPACE: u64 = 0;
+
+/// The time namespace an owner records when it cannot read its own. No
+/// namespace inode equals it, and a judge that records it judges no owner,
+/// so the names of such an owner are never judged, by anyone.
+const UNREADABLE_TIME_NAMESPACE: u64 = u64::MAX;
 
 /// Whether the owner of a temporary name is alive, as far as this process
 /// can tell.
@@ -321,9 +337,11 @@ pub(crate) enum Liveness {
     /// that has it started at another time.
     Dead,
     /// Nothing can be concluded, so its names are left alone: it lives in
-    /// another PID namespace, whose processes this one may not see, or on
-    /// another host or an earlier boot (another boot id), or the `/proc`
-    /// this process reads is not its own PID namespace's.
+    /// another PID namespace, whose processes this one may not see, in
+    /// another time namespace, whose start times read differently here, or
+    /// on another host or an earlier boot (another boot id); or the
+    /// `/proc` this process reads is not its own PID namespace's, or one of
+    /// the two cannot read its time namespace or boot id.
     Unknown,
 }
 
@@ -380,21 +398,27 @@ fn proc_is_own(self_link: Option<&str>, status: Option<&[u8]>, pid: u32) -> bool
 impl Owner {
     /// This process.
     pub(crate) fn current() -> Result<Owner, Error> {
+        // The PID namespace first: once `/proc/self/ns/` has been read,
+        // a missing `time` link there means a kernel without time
+        // namespaces, not a missing `/proc`.
+        let pidns = own_pid_namespace()?;
         Ok(Owner {
-            boot: own_boot_id()?,
-            pidns: own_pid_namespace()?,
+            boot: own_boot_id(),
+            pidns,
+            timens: time_namespace_of(fs::read_link("/proc/self/ns/time")),
             pid: std::process::id(),
             start: own_start_time()?,
         })
     }
 
-    /// `<boot>.<pidns>.<pid>.<start>`: the boot id as 32 lower-case hex
-    /// digits, then zero-padded decimals of fixed widths (20, 10 and 20
-    /// digits), so every name built on it has one length.
+    /// `<boot>.<pidns>.<timens>.<pid>.<start>`: the boot id as 32
+    /// lower-case hex digits, then zero-padded decimals of fixed widths
+    /// (20, 20, 10 and 20 digits), so every name built on it has one
+    /// length.
     pub(crate) fn token(&self) -> String {
         format!(
-            "{:032x}.{:020}.{:010}.{:020}",
-            self.boot, self.pidns, self.pid, self.start
+            "{:032x}.{:020}.{:020}.{:010}.{:020}",
+            self.boot, self.pidns, self.timens, self.pid, self.start
         )
     }
 
@@ -415,6 +439,7 @@ impl Owner {
                 .flatten()
         };
         let pidns = number(20)?;
+        let timens = number(20)?;
         let pid = u32::try_from(number(10)?).ok()?;
         let start = number(20)?;
         number(20)?;
@@ -422,6 +447,7 @@ impl Owner {
             (None, _) | (Some("stats"), None) => Some(Owner {
                 boot,
                 pidns,
+                timens,
                 pid,
                 start,
             }),
@@ -430,10 +456,11 @@ impl Owner {
     }
 
     /// Whether this owner is alive, as `judge` sees it. In the judge's
-    /// boot and PID namespace, through a `/proc` of that namespace, the pid
-    /// and the start time decide; anywhere else nothing does.
+    /// boot, PID namespace and time namespace, through a `/proc` of that
+    /// PID namespace, the pid and the start time decide; anywhere else
+    /// nothing does.
     pub(crate) fn liveness(&self, judge: &Judge) -> Liveness {
-        if self.boot != judge.me.boot || self.pidns != judge.me.pidns || !judge.own_proc {
+        if !self.judged_by(judge) {
             return Liveness::Unknown;
         }
         let path = PathBuf::from(format!("/proc/{}/stat", self.pid));
@@ -446,6 +473,17 @@ impl Owner {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Liveness::Dead,
             Err(_) => Liveness::Alive,
         }
+    }
+
+    /// Whether `judge` can tell this owner's liveness from its pid and
+    /// start time: same boot id, same PID namespace read through its own
+    /// `/proc`, and same time namespace, which the judge could read.
+    fn judged_by(&self, judge: &Judge) -> bool {
+        self.boot == judge.me.boot
+            && self.pidns == judge.me.pidns
+            && self.timens == judge.me.timens
+            && judge.me.timens != UNREADABLE_TIME_NAMESPACE
+            && judge.own_proc
     }
 }
 
@@ -530,11 +568,39 @@ fn start_time_of(stat: &[u8]) -> Option<u64> {
 }
 
 /// The kernel's boot id, `/proc/sys/kernel/random/boot_id`: a UUID, random
-/// per boot.
-fn own_boot_id() -> Result<u128, Error> {
-    let path = Path::new("/proc/sys/kernel/random/boot_id");
-    let text = fs::read(path).map_err(|e| cache_err(path, e))?;
-    parse_boot_id(&text).ok_or_else(|| cache_err(path, io::Error::other("unreadable boot id")))
+/// per boot. Where it cannot be read (a `/proc` mounted with
+/// `subset=pid`, systemd's `ProcSubset=pid`), a random id instead, which
+/// no boot id equals ([`boot_id_or_random`]). Read once per process, so
+/// every name of one process carries the same id.
+fn own_boot_id() -> u128 {
+    static BOOT: OnceLock<u128> = OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let text = fs::read("/proc/sys/kernel/random/boot_id").ok();
+        boot_id_or_random(text.as_deref(), random_u128)
+    })
+}
+
+/// The version digit of a UUID in the `u128` of its 32 hex digits: the
+/// 13th digit, the first of the third group.
+const UUID_VERSION: u128 = 0xf << 76;
+
+/// The boot id in `text`, or, where there is none, `random()` with its
+/// UUID version digit cleared. The kernel makes every boot id a version 4
+/// UUID, so a fallback id never equals one: no other process judges the
+/// names of an owner that could not read its boot id (D8), and the
+/// randomness keeps two such processes apart.
+fn boot_id_or_random(text: Option<&[u8]>, random: impl FnOnce() -> u128) -> u128 {
+    text.and_then(parse_boot_id)
+        .unwrap_or_else(|| random() & !UUID_VERSION)
+}
+
+/// 128 random bits from std's `RandomState`, whose keys std draws from the
+/// operating system's random source: two SipHash outputs under one
+/// random key. Not for secrets; it keeps owner ids apart.
+fn random_u128() -> u128 {
+    use std::hash::BuildHasher;
+    let state = std::collections::hash_map::RandomState::new();
+    (u128::from(state.hash_one(0u8)) << 64) | u128::from(state.hash_one(1u8))
 }
 
 /// A boot id as the kernel prints it, `8-4-4-4-12` lower-case hex digits
@@ -567,6 +633,25 @@ fn own_pid_namespace() -> Result<u64, Error> {
         .and_then(|l| l.strip_suffix(']'))
         .and_then(|l| l.parse().ok())
         .ok_or_else(|| cache_err(path, io::Error::other("unreadable PID namespace")))
+}
+
+/// The time namespace in the link `/proc/self/ns/time`, which reads
+/// `time:[<inode>]`. No link means a kernel without time namespaces, since
+/// `/proc/<pid>/ns/` lists exactly the namespace types the kernel was
+/// built with ([`NO_TIME_NAMESPACE`]); any other failure, or a link that
+/// does not parse, is [`UNREADABLE_TIME_NAMESPACE`].
+fn time_namespace_of(link: io::Result<PathBuf>) -> u64 {
+    match link {
+        Ok(link) => link
+            .to_str()
+            .and_then(|l| l.strip_prefix("time:["))
+            .and_then(|l| l.strip_suffix(']'))
+            .and_then(|l| l.parse().ok())
+            .filter(|&ino| ino != NO_TIME_NAMESPACE && ino != UNREADABLE_TIME_NAMESPACE)
+            .unwrap_or(UNREADABLE_TIME_NAMESPACE),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => NO_TIME_NAMESPACE,
+        Err(_) => UNREADABLE_TIME_NAMESPACE,
+    }
 }
 
 /// Removes a temporary tree whose directories may have any final mode.
@@ -640,9 +725,13 @@ pub(crate) fn remove_tree_bounded(top: &Path) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
     use super::{
-        Judge, Liveness, OWNED_PREFIXES, Owner, TEMPORARY_NAME_LEN, own_boot_id, own_start_time,
-        parse_boot_id, parse_sidecar, proc_is_own, temporary_name,
+        Judge, Liveness, NO_TIME_NAMESPACE, OWNED_PREFIXES, Owner, TEMPORARY_NAME_LEN,
+        UNREADABLE_TIME_NAMESPACE, UUID_VERSION, boot_id_or_random, own_boot_id, own_start_time,
+        parse_boot_id, parse_sidecar, proc_is_own, random_u128, temporary_name, time_namespace_of,
     };
 
     /// Every temporary name has one length, longer than a committed
@@ -663,7 +752,7 @@ mod tests {
     fn owner_round_trips_through_names() {
         let me = Owner::current().expect("owner");
         let token = me.token();
-        assert_eq!(token.len(), 85);
+        assert_eq!(token.len(), 106);
         for prefix in OWNED_PREFIXES {
             let name = format!("{prefix}{token}.{:020}", 7);
             assert_eq!(Owner::of_name(&name), Some(me), "{name}");
@@ -686,14 +775,20 @@ mod tests {
             format!(".tmp-{}.{n}", token.replacen('.', "-", 1)),
             ".tmp-1234.5678.0".to_owned(),
             format!(
-                ".tmp-{:032x}.{:020}.{:010}.{:020}.{n}",
+                ".tmp-{:032x}.{:020}.{:020}.{:010}.{:020}.{n}",
+                1,
                 1,
                 1,
                 u64::from(u32::MAX) + 1,
                 1
             ),
-            // The format before the boot id.
+            // The format before the boot id, and the one before the time
+            // namespace.
             format!(".tmp-{:020}.{:010}.{:020}.{n}", me.pidns, me.pid, me.start),
+            format!(
+                ".tmp-{:032x}.{:020}.{:010}.{:020}.{n}",
+                me.boot, me.pidns, me.pid, me.start
+            ),
             // A boot id in upper case, one digit short or long, with dashes.
             format!(".tmp-{}.{n}", token.replacen(&token[..1], "A", 1)),
             format!(".tmp-{}.{n}", &token[1..]),
@@ -745,6 +840,122 @@ mod tests {
         for owner in [reused, gone, me, foreign] {
             assert_eq!(owner.liveness(&blind), Liveness::Unknown, "{owner:?}");
         }
+        // Another time namespace reads start times shifted (review of
+        // #60): even this live process's own name is not judged there,
+        // nor are a reused or a vanished pid.
+        for other_timens in [
+            me.timens.wrapping_add(1),
+            NO_TIME_NAMESPACE,
+            UNREADABLE_TIME_NAMESPACE,
+        ] {
+            if other_timens == me.timens {
+                continue;
+            }
+            for owner in [reused, gone, me] {
+                let shifted = Owner {
+                    timens: other_timens,
+                    ..owner
+                };
+                assert_eq!(shifted.liveness(&judge), Liveness::Unknown, "{shifted:?}");
+            }
+        }
+    }
+
+    /// The time-namespace rule of D8 on fixed identities, so it holds on a
+    /// kernel with and one without time namespaces: equal namespaces are
+    /// judged, another one is not, and a judge that could not read its
+    /// own judges no owner, even one that recorded the same value.
+    #[test]
+    fn time_namespace_rules() {
+        let judge = Judge::current().expect("judge");
+        let me = judge.me;
+        for timens in [NO_TIME_NAMESPACE, 4_026_531_834] {
+            let judge = Judge {
+                me: Owner { timens, ..me },
+                own_proc: true,
+            };
+            let owner = Owner { timens, ..me };
+            assert!(owner.judged_by(&judge), "{owner:?}");
+            assert_eq!(owner.liveness(&judge), Liveness::Alive);
+            let dead = Owner {
+                start: me.start.wrapping_sub(1),
+                ..owner
+            };
+            assert_eq!(dead.liveness(&judge), Liveness::Dead);
+            for other in [NO_TIME_NAMESPACE, 4_026_531_834, 4_026_532_000] {
+                if other != timens {
+                    let elsewhere = Owner {
+                        timens: other,
+                        ..dead
+                    };
+                    assert!(!elsewhere.judged_by(&judge), "{elsewhere:?}");
+                    assert_eq!(elsewhere.liveness(&judge), Liveness::Unknown);
+                }
+            }
+        }
+        let unreadable = Judge {
+            me: Owner {
+                timens: UNREADABLE_TIME_NAMESPACE,
+                ..me
+            },
+            own_proc: true,
+        };
+        let dead = Owner {
+            timens: UNREADABLE_TIME_NAMESPACE,
+            start: me.start.wrapping_sub(1),
+            ..me
+        };
+        assert!(!dead.judged_by(&unreadable));
+        assert_eq!(dead.liveness(&unreadable), Liveness::Unknown);
+    }
+
+    /// The link `time:[<inode>]` gives the inode; no link is a kernel
+    /// without time namespaces; any other error, a malformed link and an
+    /// inode equal to one of the two markers are unreadable.
+    #[test]
+    fn time_namespace_link() {
+        let link = |s: &str| Ok(PathBuf::from(s));
+        assert_eq!(time_namespace_of(link("time:[4026531834]")), 4_026_531_834);
+        assert_eq!(
+            time_namespace_of(Err(io::ErrorKind::NotFound.into())),
+            NO_TIME_NAMESPACE
+        );
+        for err in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                time_namespace_of(Err(err.into())),
+                UNREADABLE_TIME_NAMESPACE,
+                "{err:?}"
+            );
+        }
+        for bad in [
+            "pid:[4026531834]",
+            "time:4026531834",
+            "time:[4026531834",
+            "time:[]",
+            "time:[-1]",
+            "time:[0x10]",
+            "time:[0]",
+            "time:[18446744073709551615]",
+            "time:[18446744073709551616]",
+            "time_for_children:[4026531834]",
+        ] {
+            assert_eq!(
+                time_namespace_of(link(bad)),
+                UNREADABLE_TIME_NAMESPACE,
+                "{bad}"
+            );
+        }
+        // This process reads its own, or runs on a kernel without them.
+        let me = Owner::current().expect("owner");
+        assert_ne!(me.timens, UNREADABLE_TIME_NAMESPACE);
+        assert_eq!(
+            me.timens == NO_TIME_NAMESPACE,
+            std::fs::symlink_metadata("/proc/self/ns/time").is_err()
+        );
     }
 
     /// `/proc` is this process's own only if `self` reads its pid and
@@ -797,8 +1008,54 @@ mod tests {
         ] {
             assert_eq!(parse_boot_id(bad), None, "{bad:?}");
         }
-        let a = own_boot_id().expect("boot id");
-        assert_eq!(own_boot_id().expect("boot id"), a);
+        let a = own_boot_id();
+        assert_eq!(own_boot_id(), a);
+        // The kernel's boot ids are version 4 UUIDs, which the fallback
+        // relies on; the test host reads its own.
+        let text = std::fs::read("/proc/sys/kernel/random/boot_id").expect("boot id");
+        assert_eq!(parse_boot_id(&text), Some(a));
+        assert_eq!(a & UUID_VERSION, 4 << 76, "{a:032x}");
+    }
+
+    /// The second review of #60: an unreadable or malformed boot id no
+    /// longer fails `open`. It is replaced by a random id with its UUID
+    /// version digit cleared, so it never equals a kernel's boot id, and
+    /// two fallbacks differ; a readable boot id is used as it is.
+    #[test]
+    fn boot_id_fallback() {
+        let id = b"0123abcd-4567-49ef-8123-456789abcdef\n";
+        assert_eq!(
+            boot_id_or_random(Some(id), || unreachable!("the boot id was read")),
+            0x0123abcd_4567_49ef_8123_456789abcdef
+        );
+        for text in [None, Some(&b""[..]), Some(&id[..id.len() - 1])] {
+            assert_eq!(
+                boot_id_or_random(text, || u128::MAX),
+                0xffff_ffff_ffff_0fff_ffff_ffff_ffff_ffff,
+                "{text:?}"
+            );
+            // Only the version digit is cleared.
+            let fallback = boot_id_or_random(text, || 0x4000_0000_0000_4000_0000_0000_0000_0042);
+            assert_eq!(fallback, 0x4000_0000_0000_0000_0000_0000_0000_0042);
+            assert_eq!(fallback & UUID_VERSION, 0);
+        }
+        let a = boot_id_or_random(None, random_u128);
+        let b = boot_id_or_random(None, random_u128);
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
+        assert_eq!(a & UUID_VERSION, 0);
+        // An owner with a fallback id is never judged by a process that
+        // read its boot id, nor the other way round.
+        let judge = Judge::current().expect("judge");
+        let me = judge.me;
+        let fallback = Owner { boot: a, ..me };
+        assert_eq!(fallback.liveness(&judge), Liveness::Unknown);
+        let blind = Judge {
+            me: fallback,
+            own_proc: true,
+        };
+        assert_eq!(me.liveness(&blind), Liveness::Unknown);
+        assert_eq!(fallback.liveness(&blind), Liveness::Alive);
     }
 
     /// Every directory is listed once, so removing a wide tree is linear:

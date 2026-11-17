@@ -12,8 +12,8 @@
 //! - `layers/sha256/<hex>` and `<hex>.stats`: the layer cache.
 //!
 //! Temporary names in both directories carry their owner (boot id, PID
-//! namespace, pid, start time); `open` removes those whose owner is gone
-//! and leaves the rest.
+//! and time namespaces, pid, start time); `open` removes those whose owner
+//! is gone and leaves the rest.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};

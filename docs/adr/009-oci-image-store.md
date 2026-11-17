@@ -364,12 +364,23 @@ the store will use, and why:
   entry count and skipped devices, as
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
 - A layer is unpacked into `layers/sha256/.tmp-<owner>.<n>/`, where
-  `<owner>` is `<boot>.<pidns>.<pid>.<start>`: the kernel's boot id
-  (`/proc/sys/kernel/random/boot_id`) as 32 lower-case hex digits, the
-  inode of the process's PID namespace (`/proc/self/ns/pid`), its pid
-  there and its start time from `/proc/self/stat`, zero-padded to 20, 10
-  and 20 digits, and `<n>` a 20-digit counter (part 3; parts 1 and 2 used
-  `<pid>.<starttime>.<n>`, and part 3 before its review had no boot id).
+  `<owner>` is `<boot>.<pidns>.<timens>.<pid>.<start>`: the kernel's
+  boot id (`/proc/sys/kernel/random/boot_id`) as 32 lower-case hex
+  digits, the inode of the process's PID namespace (`/proc/self/ns/pid`),
+  the inode of its time namespace (`/proc/self/ns/time`; 0 on a kernel
+  built without time namespaces, `u64::MAX` when the link cannot be
+  read), its pid in the PID namespace and its start time from
+  `/proc/self/stat`, zero-padded to 20, 20, 10 and 20 digits, and `<n>` a
+  20-digit counter (part 3; parts 1 and 2 used `<pid>.<starttime>.<n>`,
+  part 3 before its first review had no boot id and before its second
+  no time namespace). A process that cannot read its boot id (a `/proc`
+  mounted with `subset=pid`, systemd's `ProcSubset=pid`) records a random
+  id with the UUID version digit cleared instead, drawn once per process
+  from std's `RandomState` (keys from the operating system's random
+  source, no new crate or `libc` edge). The kernel makes every boot id a
+  version 4 UUID, so no boot id equals it and no other process ever
+  judges that process's names (below); at 430563c such a process could
+  open no store at all (second review of #60).
   Lookups use hex names only, so a dot name is never mistaken for a
   layer. Its sidecar is staged next to it as `.tmp-<owner>.<n>.stats`,
   so every temporary tree of
@@ -453,9 +464,10 @@ the store will use, and why:
   `OciImageStore::open` removes every name in `layers/sha256/` and
   `blobs/sha256/` that carries an owner (staging trees, staged sidecars
   and blobs, probes) whose owner is gone, and nothing else. Gone means:
-  with the store's boot id, in its own PID namespace, read through a
-  `/proc` of that namespace, no `/proc/<pid>/stat`, or one with another
-  start time (the pid was reused). Every other owner is never judged:
+  with the store's boot id, in its own PID and time namespaces, read
+  through a `/proc` of that PID namespace, no `/proc/<pid>/stat`, or one
+  with another start time (the pid was reused). Every other owner is
+  never judged:
   - Another PID namespace: two runners in different PID namespaces can
     share one store and have the same pid, and the one that opens second
     cannot see the other's processes, so deciding by pid, even with the
@@ -487,6 +499,34 @@ the store will use, and why:
     `/proc`'s namespace and in every one below it, holds exactly that
     pid. Pinned by `host::foreign_proc_judges_no_owner` (`unshare -Urpfm`,
     rootless, in the `sandbox` CI job) and the unit test of the decision.
+  - Another time namespace: since Linux 5.6, `/proc/<pid>/stat` reports
+    the start time shifted by the boottime offset of the reader's time
+    namespace, so a store opened under `unshare -T --boottime N`, with
+    the same boot id, PID namespace and `/proc`, read a live owner's
+    start time as another one and deleted its staging tree mid-pull
+    (second review of #60, reproduced: 10 of 10 pulls failed). The time
+    namespace inode is part of the owner, and only an owner with the
+    store's own is judged; a store that cannot read its own time
+    namespace (a link that exists but does not read) judges no owner.
+    Why the identity and not a correction by the offset in
+    `/proc/self/timens_offsets`: the identity is the PID-namespace rule
+    again, one more field read the same way, while the correction needs
+    a second parser and its own failure handling for a file that only a
+    kernel with time namespaces has; two runners in different time
+    namespaces sharing a store are rare, and an owner that is not judged
+    costs disk, never a live tree. A kernel built without time
+    namespaces has no `ns/time` link (`/proc/<pid>/ns/` lists exactly
+    the namespace types the kernel has), shifts nothing and records 0.
+    Pinned by `host::other_time_namespace_judges_no_owner` (rootless
+    `unshare -Urm`, then `unshare -T --boottime 100000` inside it, in the
+    `sandbox` CI job) and the unit tests of the decision and the link.
+  - An owner that could not read its boot id (above): its random id
+    equals no other process's boot id, so only the process itself judges
+    its names. A crash of such a process leaves at most one partial
+    layer and one blob per crash behind until #56, like another PID
+    namespace's. Pinned by `host::pid_only_proc_opens` (`unshare -Urpfm`
+    with `/proc` remounted `subset=pid`) and the unit test of the
+    fallback.
   A leftover of a dead owner whose removal fails, for any reason, stays
   too and `open` goes on: it is a dot name, never read as a layer or a
   blob, and failing `open` for it would leave the store unopenable until
@@ -501,14 +541,14 @@ the store will use, and why:
   changes. Names with an unknown prefix, or a field of the wrong width,
   carry no owner and stay.
 - **Staging names are longer than committed ones** (part 3, from the
-  review of part 1). A staging name has 111 characters (`.tmp-`, the
-  85-character owner, a dot, 20 digits), a committed layer 64 hex digits,
+  review of part 1). A staging name has 132 characters (`.tmp-`, the
+  106-character owner, a dot, 20 digits), a committed layer 64 hex digits,
   and the unpacker creates every entry by its absolute path, which must
   fit `PATH_MAX` (4,096 B with the terminating NUL). Every path of a
-  committed layer is therefore 47 B shorter than the path it was created
+  committed layer is therefore 68 B shorter than the path it was created
   at, so a path-based walk of committed layers (the GC of #56, a
   removal) never meets `ENAMETOOLONG` where the unpacker did not. The
-  price: a layer whose deepest absolute path is between 4,049 and 4,095 B
+  price: a layer whose deepest absolute path is between 4,028 and 4,095 B
   under its committed name is refused while it is unpacked; no
   first-stack path comes near that (node:22's longest is 128 B inside the
   layer). Rejected: unlinking relative to a
@@ -979,9 +1019,10 @@ Hub, 2026-11-16):
   layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
 - `boneli-oci` is on the always-review list (#7 STOP 1).
 - A store only grows: cache eviction and GC are #56. Temporary names of
-  an owner in another PID namespace stay until a process of that
+  an owner in another PID or time namespace stay until a process of that
   namespace opens the store, and those of another boot id, an earlier
-  boot's crash leftovers included, until #56 (D8).
+  boot's crash leftovers and the leftovers of a process that could not
+  read its boot id included, until #56 (D8).
 - A store root must sit under directories that only root or the caller
   can write (sticky ones aside); a group-writable parent is refused (D8).
 - The `ImageStore` contract has a clause that every future adapter must

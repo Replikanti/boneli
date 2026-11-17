@@ -346,6 +346,154 @@ mod host {
         }
         drop(first);
     }
+
+    const PIDPROC_CHILD: &str = "BONELI_OCI_PIDPROC_CHILD";
+
+    /// The second review of #60: under a `/proc` that shows only process
+    /// directories (procfs `subset=pid`, systemd's `ProcSubset=pid`), the
+    /// boot id cannot be read, and `open` failed. Now such a process names
+    /// its owner with a random id that no boot id equals, so the store
+    /// opens and pulls, and no other process ever judges its names
+    /// (ADR-009, D8).
+    #[test]
+    #[ignore = "host: needs an unprivileged user and PID namespace"]
+    fn pid_only_proc_opens() {
+        if let Some(dir) = std::env::var_os(PIDPROC_CHILD) {
+            pidproc_child(&PathBuf::from(dir));
+            return;
+        }
+        in_namespaces(
+            "-Urpfm",
+            "host::pid_only_proc_opens",
+            "mount -t proc -o subset=pid proc /proc \
+             && mount -t tmpfs -o mode=0700 boneli-oci-pidproc /mnt",
+            PIDPROC_CHILD,
+            "/mnt",
+        );
+    }
+
+    fn pidproc_child(dir: &Path) {
+        assert!(
+            !Path::new("/proc/sys/kernel/random/boot_id").exists(),
+            "the boot id is hidden"
+        );
+        let mut tar = Tar::new();
+        tar.file("etc/hostname", 0o644, b"pid-only\n");
+        let mut hub = Hub::default();
+        let pushed = push(&mut hub, "library/app", &[Layer::tar(tar.finish())], "");
+        let fake = Fake::new(move |s| hub.handle(s));
+        let root = dir.join("store");
+        let store = open(&root, &fake);
+        store
+            .pull(&ImageRef {
+                name: "library/app".to_owned(),
+                digest: pushed.index.clone(),
+                platform: "linux/amd64".to_owned(),
+            })
+            .expect("pull");
+        drop(open(&root, &fake));
+    }
+
+    const TIMENS_CHILD: &str = "BONELI_OCI_TIMENS_CHILD";
+    const TIMENS_JUDGE: &str = "BONELI_OCI_TIMENS_JUDGE";
+    const TIMENS_OWNER: &str = "BONELI_OCI_TIMENS_OWNER";
+    const TIMENS_GAP: &str = "timens";
+
+    /// The second review of #60: `/proc/<pid>/stat` reports start times
+    /// shifted by the reader's time-namespace boottime offset, so a store
+    /// opened under `unshare -T --boottime N`, with the same boot id, PID
+    /// namespace and `/proc`, read a live owner's start time as another
+    /// one and deleted its staging tree mid-pull. Now an owner in another
+    /// time namespace is not judged (ADR-009, D8). The child (the owner)
+    /// runs in `unshare -Urm` on a tmpfs root; the judge it starts runs in
+    /// a new time namespace of that user namespace. Where the kernel has
+    /// no time namespaces, list `timens` in `BONELI_OCI_HOST_GAPS`.
+    #[test]
+    #[ignore = "host: needs an unprivileged user namespace and a time namespace"]
+    fn other_time_namespace_judges_no_owner() {
+        if let Some(dir) = std::env::var_os(TIMENS_JUDGE) {
+            timens_judge(&PathBuf::from(dir));
+            return;
+        }
+        if let Some(dir) = std::env::var_os(TIMENS_CHILD) {
+            timens_owner(&PathBuf::from(dir));
+            return;
+        }
+        if gap_listed(TIMENS_GAP) {
+            println!("skipped: {TIMENS_GAP} listed in {GAPS}");
+            return;
+        }
+        in_mount_namespace(
+            "host::other_time_namespace_judges_no_owner",
+            "mount -t tmpfs -o mode=0700 boneli-oci-timens /mnt",
+            TIMENS_CHILD,
+            "/mnt",
+        );
+    }
+
+    fn timens_owner(dir: &Path) {
+        let fake = Fake::new(|_| unreachable!("open makes no request"));
+        let root = dir.join("store");
+        let first = open(&root, &fake);
+        let pid = std::process::id();
+        let start = crate::support::start_of("self");
+        let token = crate::support::owner_token(
+            &crate::support::boot_hex(),
+            crate::support::own_pidns(),
+            pid,
+            start,
+        );
+        // This live process's names, as `Owner::current` makes them.
+        let kept = [
+            root.join("layers/sha256")
+                .join(crate::support::owned_name(".tmp-", &token, 99)),
+            root.join("blobs/sha256")
+                .join(crate::support::owned_name(".tmp-", &token, 98)),
+        ];
+        for path in &kept {
+            std::fs::create_dir_all(path.join("usr")).expect("staging");
+        }
+        let exe = std::env::current_exe().expect("test binary");
+        let out = Command::new("unshare")
+            .args(["-T", "--boottime", "100000", "-f"])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "host::other_time_namespace_judges_no_owner",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(TIMENS_JUDGE, dir)
+            .env(TIMENS_OWNER, format!("{pid}:{start}"))
+            .output()
+            .expect("spawn unshare -T");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the judge failed:\n{text}");
+        assert!(text.contains("1 passed"), "the judge ran: {text}");
+        for path in &kept {
+            assert!(path.is_dir(), "{} was swept", path.display());
+        }
+        drop(first);
+    }
+
+    /// Runs in the new time namespace: checks that it reads the owner's
+    /// start time shifted, then opens the store.
+    fn timens_judge(dir: &Path) {
+        let owner = std::env::var(TIMENS_OWNER).expect("owner");
+        let (pid, start) = owner.split_once(':').expect("pid:start");
+        let start: u64 = start.parse().expect("start");
+        assert!(
+            crate::support::start_of(pid) > start,
+            "the judge reads the owner's start time shifted"
+        );
+        let fake = Fake::new(|_| unreachable!("open makes no request"));
+        drop(open(&dir.join("store"), &fake));
+    }
 }
 
 mod network {

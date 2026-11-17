@@ -365,7 +365,9 @@ fn concurrent_pulls_two_stores() {
     }
 }
 
-/// The name format of ADR-009 D8: `<prefix><boot>.<pidns>.<pid>.<start>.<n>`.
+/// The name format of ADR-009 D8,
+/// `<prefix><boot>.<pidns>.<timens>.<pid>.<start>.<n>`, in this process's
+/// time namespace.
 fn owned(prefix: &str, boot: &str, pidns: u64, pid: u32, start: u64, n: u64) -> String {
     support::owned_name(prefix, &support::owner_token(boot, pidns, pid, start), n)
 }
@@ -375,8 +377,9 @@ fn owned(prefix: &str, boot: &str, pidns: u64, pid: u32, start: u64, n: u64) -> 
 /// in `layers/sha256/` and `blobs/sha256/`. A live owner's names stay, and
 /// so do the names of an owner in another PID namespace, whose processes
 /// this one cannot see, the names of an owner with another boot id (another
-/// host sharing the root, or an earlier boot), and dot names that carry no
-/// owner.
+/// host sharing the root, or an earlier boot), the names of an owner in
+/// another time namespace, whose start times read differently here, and
+/// dot names that carry no owner.
 #[test]
 fn stale_tmp_rules() {
     let fake = hub_fake(Hub::default());
@@ -393,6 +396,7 @@ fn stale_tmp_rules() {
         format!("0{}", &boot[1..])
     };
     let ns = support::own_pidns();
+    let timens = support::own_timens();
     let me = std::process::id();
     let my_start = support::start_of("self");
     let dead = {
@@ -439,6 +443,21 @@ fn stale_tmp_rules() {
         layers.join(owned(".tmp-", &other_boot, ns, dead, 7, 5)),
         blobs.join(owned(".tmp-", &other_boot, ns, dead, 7, 6)),
         layers.join(owned(".tmp-", &other_boot, ns, me, my_start - 1, 7)),
+        layers.join(support::owned_name(
+            ".tmp-",
+            &support::owner_token_in(&boot, ns, timens + 1, dead, 7),
+            9,
+        )),
+        blobs.join(support::owned_name(
+            ".tmp-",
+            &support::owner_token_in(&boot, ns, timens + 1, me, my_start - 1),
+            10,
+        )),
+        // The format before the time namespace: no owner, so it stays.
+        layers.join(format!(
+            ".tmp-{boot}.{ns:020}.{dead:010}.{:020}.{:020}",
+            7, 11
+        )),
         // The format before the boot id: no owner, so it stays.
         layers.join(format!(".tmp-{ns:020}.{dead:010}.{:020}.{:020}", 7, 8)),
         layers.join(".tmp-1234.5678.0"),
