@@ -20,3 +20,10 @@ boneli-app.workspace = true
 # The in-memory adapters the app scenarios run on (ADR-004); only roots may
 # depend on an adapter crate.
 boneli-memory.workspace = true
+
+[dev-dependencies]
+# The file store's acceptance test (#4, ADR-012): `DebugTicket` on
+# `FsStore` with the corpus's job adapters, replayed after a restart. A
+# root may depend on an adapter; as a dev-dependency it stays out of the
+# replay binary, which therefore does not link ring.
+boneli-store-fs.workspace = true
