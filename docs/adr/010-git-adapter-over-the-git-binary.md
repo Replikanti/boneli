@@ -232,3 +232,8 @@ temporary directory, outside the adapter root. The same PR's
 `nothing-ran` through a wrapper that runs `git add -A` with discovery
 inside the unpacked workspace and then deletes that working directory,
 as the adapter does, so the trip is seen only through the sentinel.
+That proof runs twice, once with only the hook entry and once with only
+the `core.fsmonitor` entry, and each run must fail at `nothing-ran` on
+its own. Git ignores a hook that is not executable, so the hook entry
+must reach the workspace with its executable bit set; a GitCli that pins
+fsmonitor off but still runs workspace hooks would otherwise pass.
