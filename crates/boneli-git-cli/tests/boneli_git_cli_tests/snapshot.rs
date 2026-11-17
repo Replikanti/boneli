@@ -3,7 +3,9 @@
 use boneli_app::{Git, GitError};
 use boneli_git_cli::Kind;
 
-use crate::support::{Source, TempDir, cli, decode, edit, entries, failed, fgit, path, sha};
+use crate::support::{
+    Source, TempDir, cli, decode, edit, entries, failed, fgit, listing, path, sha,
+};
 
 const ALLOWLIST: &[&str] = &[
     ".git/HEAD",
@@ -152,6 +154,26 @@ fn snapshot_refuses_base_metadata() {
         }
     };
     assert!(detail.contains("repository metadata"), "{detail}");
+}
+
+/// A base tree path with a component that is `.git` on another file system
+/// is refused by `snapshot`, as `diff` would refuse it, before anything is
+/// written: git and its fsck accept these names, so they pass `fetch_base`,
+/// and without the check every later `diff` of the run would fail.
+#[test]
+fn snapshot_refuses_base_lookalikes() {
+    for p in ["sub/.g\u{200B}it/x", ".g\u{2060}it/x", "a/\u{00AD}.GIT"] {
+        let tmp = TempDir::new("base-lookalike");
+        let source = Source::new(&tmp, "src", false);
+        source.write("ok", b"ok", false);
+        source.write(p, b"x", false);
+        let base = source.commit("base");
+        let git = cli(&tmp);
+        let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+        let detail = failed(git.snapshot(&c));
+        assert!(detail.contains(&format!("{p:?}")), "{p:?}: {detail}");
+        assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+    }
 }
 
 /// The source repository's config has a remote, a credential helper and a

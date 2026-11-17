@@ -69,3 +69,69 @@ fn open_refuses() {
         assert_eq!(mode, 0o700, "{answer:?}");
     }
 }
+
+/// A relative root is refused before anything is created: git runs with
+/// the store as its working directory and `--git-dir`, so a relative root
+/// would name another directory in every call after `open`.
+#[test]
+fn open_refuses_a_relative_root() {
+    let tmp = TempDir::new("open-relative");
+    let target = tmp.path().join("relroot");
+    // The same directory, relative to the test's working directory.
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(target.strip_prefix("/").expect("absolute"));
+    assert!(relative.is_relative());
+    let got = GitCli::open(config(host_git(), relative));
+    assert!(matches!(got, Err(OpenError::RootNotAbsolute)), "{got:?}");
+    assert!(!target.exists());
+}
+
+/// Fake gits are written by a child process, so the test process never
+/// holds a write descriptor to one: a process another test thread forks
+/// cannot inherit such a descriptor, and exec of a script written a moment
+/// earlier never fails with "Text file busy" (ETXTBSY). Here 16 threads
+/// spawn processes without pause while scripts are written and started.
+/// With the scripts written in-process, 35 of 400 opens failed with
+/// ETXTBSY; through `write_executable`, none. About a minute under a
+/// 3-CPU cap, so it is not in the default run:
+/// `cargo test -p boneli-git-cli --test boneli_git_cli_tests -- --ignored open::fresh_executables`
+#[test]
+#[ignore = "stress: about a minute of concurrent process spawning"]
+fn fresh_executables_start_under_concurrent_spawns() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const OPENS: usize = 400;
+    let tmp = TempDir::new("etxtbsy");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..16)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for k in 0..OPENS {
+        let git = version_only(&tmp, &format!("busy-{k}"), "git version 2.56.0");
+        if let Err(e) = GitCli::open(config(git, tmp.path().join(format!("busy-root-{k}")))) {
+            failures.push(format!("{k}: {e}"));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for spawner in spawners {
+        spawner.join().expect("spawner");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {OPENS} opens failed: {failures:?}",
+        failures.len()
+    );
+}

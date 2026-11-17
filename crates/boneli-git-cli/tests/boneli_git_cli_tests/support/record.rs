@@ -5,10 +5,9 @@
 //! arguments.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::{TempDir, host_git};
+use super::{TempDir, host_git, write_executable};
 
 /// One recorded call.
 #[derive(Clone, Debug)]
@@ -74,8 +73,7 @@ impl Recorder {
             log = log.display(),
             real = real.display(),
         );
-        fs::write(&git, script).expect("write the recorder");
-        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("mode");
+        write_executable(&git, script.as_bytes());
         Recorder { git, log }
     }
 
@@ -124,23 +122,24 @@ impl Recorder {
 /// every other call with `status` and no output.
 pub fn silent_failure(tmp: &TempDir, status: u8) -> PathBuf {
     let git = tmp.path().join("silent-git");
-    fs::write(
+    write_executable(
         &git,
         format!(
             "#!/bin/sh\n\
              if [ \"$1\" = version ]; then echo 'git version 2.56.0'; exit 0; fi\n\
              exit {status}\n"
-        ),
-    )
-    .expect("write the fake git");
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("mode");
+        )
+        .as_bytes(),
+    );
     git
 }
 
 /// A fake git that answers `version` with `answer` and nothing else.
 pub fn version_only(tmp: &TempDir, name: &str, answer: &str) -> PathBuf {
     let git = tmp.path().join(name);
-    fs::write(&git, format!("#!/bin/sh\nprintf '%s\\n' '{answer}'\n")).expect("write the fake git");
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("mode");
+    write_executable(
+        &git,
+        format!("#!/bin/sh\nprintf '%s\\n' '{answer}'\n").as_bytes(),
+    );
     git
 }

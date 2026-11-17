@@ -8,6 +8,8 @@
 //! in. They need no root and no network; `network::` is ignored and
 //! fetches this repository from GitHub:
 //! `cargo test -p boneli-git-cli --test boneli_git_cli_tests -- --ignored network::`
+//! `open::fresh_executables_start_under_concurrent_spawns` is ignored too:
+//! a stress test of the harness's own fake gits (`support::write_executable`).
 
 mod support;
 

@@ -3,7 +3,6 @@
 //! (ADR-010, D4).
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use boneli_app::Git;
@@ -197,6 +196,28 @@ fn every_call_has_the_fixed_environment() {
     assert!(seen_objects);
 }
 
+/// Whether `call` belongs to the probe of a failed fetch (ADR-010, D6):
+/// `init`, the filtered `fetch` or `cat-file` in a throwaway repository
+/// under `<root>/tmp/`, the only calls that name a git dir outside
+/// `<root>/stores/`.
+fn is_probe(call: &Call) -> bool {
+    let root = std::path::Path::new(call.var("HOME").expect("HOME"))
+        .parent()
+        .expect("the root");
+    let in_tmp = call
+        .args
+        .iter()
+        .find_map(|a| a.strip_prefix("--git-dir="))
+        .is_some_and(|dir| std::path::Path::new(dir).starts_with(root.join("tmp")));
+    let filtered = call.args.iter().any(|a| a == "--filter=tree:0");
+    in_tmp
+        && match call.subcommand() {
+            Some("init" | "cat-file") => true,
+            Some("fetch") => filtered,
+            _ => false,
+        }
+}
+
 #[test]
 fn every_call_names_its_git_dir() {
     let tmp = TempDir::new("git-dir");
@@ -215,7 +236,7 @@ fn every_call_names_its_git_dir() {
             .collect();
         assert_eq!(dirs.len(), 1, "{call:?}");
         let dir = dirs[0].strip_prefix("--git-dir=").expect("prefix");
-        assert!(dir.contains("/stores/"), "{call:?}");
+        assert!(dir.contains("/stores/") || is_probe(call), "{call:?}");
         assert_eq!(call.cwd.to_string_lossy(), dir, "{call:?}");
         let trees: Vec<&String> = globals
             .iter()
@@ -244,7 +265,10 @@ fn no_call_runs_in_a_workspace() {
             .parent()
             .expect("the root");
         assert!(!call.cwd.starts_with(root.join("scratch")), "{call:?}");
-        assert!(!call.cwd.starts_with(root.join("tmp")), "{call:?}");
+        assert!(
+            !call.cwd.starts_with(root.join("tmp")) || is_probe(call),
+            "{call:?}"
+        );
         assert!(!call.cwd.starts_with(base_dir.join("tripwire")), "{call:?}");
     }
 }
@@ -273,8 +297,7 @@ fn hostile_env(dir: &std::path::Path, sentinel: &std::path::Path) -> Vec<(String
     fs::create_dir_all(&hooks).expect("hooks");
     for hook in ["post-index-change", "pre-auto-gc", "reference-transaction"] {
         let file = hooks.join(hook);
-        fs::write(&file, format!("#!/bin/sh\n{touch}\n")).expect("hook");
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("mode");
+        crate::support::write_executable(&file, format!("#!/bin/sh\n{touch}\n").as_bytes());
     }
     let config = format!(
         "[core]\n\tfsmonitor = {touch}\n\thooksPath = {}\n[credential]\n\thelper = !{touch}\n",

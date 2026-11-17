@@ -58,6 +58,39 @@ fn apply_refuses_hostile_diffs() {
     assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
 }
 
+/// A diff that adds a path with a component that is `.git` on another file
+/// system is refused, as `diff` and `snapshot` refuse one, also where git
+/// itself accepts the name and also through a rename; no checkout is issued
+/// (ADR-010, D6).
+#[test]
+fn apply_refuses_lookalikes() {
+    let tmp = TempDir::new("apply-lookalike");
+    let (source, base) = source(&tmp);
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let before = git.snapshot(&c).expect("snapshot");
+    let renamed = |to: &str| {
+        format!("diff --git a/b b/{to}\nsimilarity index 100%\nrename from b\nrename to {to}\n")
+            .into_bytes()
+    };
+    for (p, diff) in [
+        ("sub/.g\u{200B}it/x", adds("sub/.g\u{200B}it/x")),
+        (".g\u{2060}it/config", adds(".g\u{2060}it/config")),
+        ("sub/\u{00AD}.GIT", adds("sub/\u{00AD}.GIT")),
+        ("dir/.g\u{200B}it", renamed("dir/.g\u{200B}it")),
+    ] {
+        let detail = failed(git.apply(&c, &diff));
+        assert!(detail.contains(&format!("{p:?}")), "{p:?}: {detail}");
+    }
+    assert_eq!(git.snapshot(&c), Ok(before));
+    assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+    // No id was spent on a refused diff.
+    assert_eq!(
+        git.apply(&c, &adds("new/x")),
+        Ok(CheckoutId::new("checkout-2".to_owned()))
+    );
+}
+
 /// A two-file diff whose second hunk does not apply changes nothing.
 #[test]
 fn apply_is_all_or_nothing() {

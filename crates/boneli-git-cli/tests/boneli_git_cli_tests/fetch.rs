@@ -155,17 +155,15 @@ fn incompressible(len: usize) -> Vec<u8> {
 /// A git that cannot write a file past 256 KiB (`ulimit -f 512`, in
 /// 512-byte blocks): a stand-in for a full disk under the root.
 fn write_limited_git(tmp: &TempDir) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let git = tmp.path().join("limited-git");
-    std::fs::write(
+    crate::support::write_executable(
         &git,
         format!(
             "#!/bin/sh\nulimit -f 512\nexec '{}' \"$@\"\n",
             crate::support::host_git().display()
-        ),
-    )
-    .expect("write the wrapper");
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        )
+        .as_bytes(),
+    );
     git
 }
 
@@ -286,4 +284,154 @@ fn rebuild_has_no_later_commit() {
     );
     assert_eq!(fgit(&dir, &["rev-list", "--all"]), a);
     assert_eq!(fgit(&dir, &["status", "--porcelain"]), "");
+}
+
+/// A source whose commit A is not a tip: A holds 2 MiB no compressor
+/// shrinks, and its child B, the only tip, drops it. `filter` lets the
+/// remote's upload-pack serve `--filter` requests.
+fn non_tip_source(tmp: &TempDir, name: &str, filter: bool) -> (Source, String, String) {
+    let source = Source::new(tmp, name, false);
+    source.write("blob", &incompressible(2 << 20), false);
+    let a = source.commit("A");
+    std::fs::remove_file(source.dir.join("blob")).expect("drop the blob");
+    source.write("small", b"small\n", false);
+    let b = source.commit("B");
+    if filter {
+        fgit(&source.dir, &["config", "uploadpack.allowFilter", "true"]);
+    }
+    (source, a, b)
+}
+
+/// Every path under `dir` with its size.
+fn sized(dir: &Path) -> Vec<(String, u64)> {
+    tree(dir)
+        .into_iter()
+        .map(|p| {
+            let len = dir.join(&p).symlink_metadata().expect("meta").len();
+            (p, len)
+        })
+        .collect()
+}
+
+/// The probes among the recorded calls: fetches with `--filter=tree:0`,
+/// as the `--git-dir` each ran on.
+fn probes(recorder: &Recorder) -> Vec<String> {
+    recorder
+        .calls()
+        .into_iter()
+        .filter(|c| {
+            c.subcommand() == Some("fetch") && c.args.iter().any(|a| a == "--filter=tree:0")
+        })
+        .map(|c| {
+            c.args
+                .iter()
+                .find_map(|a| a.strip_prefix("--git-dir="))
+                .expect("a --git-dir")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A base that is not an advertised tip and whose fetch fails while the
+/// remote answers is `Failed` once a fetch of the commit alone proves the
+/// commit exists; ids that are no commit stay `UnknownCommit` although the
+/// probe gets a tree. Each probe runs in its own repository under
+/// `<root>/tmp`, which is removed, so no store changes (ADR-010, D6).
+#[test]
+fn non_tip_fetch_failure_is_failed() {
+    let tmp = TempDir::new("non-tip");
+    let (source, a, b) = non_tip_source(&tmp, "src", true);
+    let recorder = Recorder::wrapping(&tmp, &write_limited_git(&tmp));
+    let git = open(&tmp, &recorder.git, DEFAULT_MAX_NODES);
+    let good = git
+        .fetch_base(&source.url(), &sha(&b))
+        .expect("the tip fits");
+    let stores = listing(&git.root().join("stores"));
+    assert_eq!(stores.len(), 1);
+    let store = git.root().join("stores").join(&stores[0]);
+    let before = sized(&store);
+    let in_tmp = |dir: &String| Path::new(dir).starts_with(git.root().join("tmp"));
+
+    // The full fetch of A breaks on the file size limit, a stand-in for a
+    // full disk; the probe's pack holds one commit and fits.
+    recorder.clear();
+    let detail = failed(git.fetch_base(&source.url(), &sha(&a)));
+    assert!(!detail.trim().is_empty());
+    let ran = probes(&recorder);
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert!(ran.iter().all(in_tmp), "{ran:?}");
+
+    // A's tree does not fit either, but the probe of a tree id gets just
+    // the tree: not a commit, so still the input's fault.
+    let tree_id = fgit(&source.dir, &["rev-parse", &format!("{a}^{{tree}}")]);
+    for id in [tree_id.as_str(), "1111111111111111111111111111111111111111"] {
+        recorder.clear();
+        assert_eq!(
+            git.fetch_base(&source.url(), &sha(id)),
+            Err(GitError::UnknownCommit),
+            "{id}"
+        );
+        let ran = probes(&recorder);
+        assert_eq!(ran.len(), 1, "{id}: {ran:?}");
+        assert!(ran.iter().all(in_tmp), "{id}: {ran:?}");
+    }
+
+    assert_eq!(listing(&git.root().join("stores")), stores);
+    assert_eq!(sized(&store), before);
+    assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+    assert_eq!(
+        git.read(&good, &path("small")),
+        Ok(Some(b"small\n".to_vec()))
+    );
+}
+
+/// A remote that does not serve `--filter` ignores it (git warns), so the
+/// probe is a full depth-1 fetch of the same commit: no larger than the
+/// fetch that failed, and it fails the same way. The result is the
+/// residual of ADR-010's Consequences, `UnknownCommit`, and nothing is
+/// left behind.
+#[test]
+fn probe_without_filter_support_stays_bounded() {
+    let tmp = TempDir::new("non-tip-unfiltered");
+    let (source, a, _) = non_tip_source(&tmp, "src", false);
+    let git = open(&tmp, &write_limited_git(&tmp), DEFAULT_MAX_NODES);
+    assert_eq!(
+        git.fetch_base(&source.url(), &sha(&a)),
+        Err(GitError::UnknownCommit)
+    );
+    assert_eq!(listing(&git.root().join("stores")), Vec::<String>::new());
+    assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+}
+
+/// A probe that cannot even start (its `init` fails) is no evidence that
+/// the commit is missing: the fetch's own failure stands, as `Failed`.
+#[test]
+fn probe_that_cannot_start_is_failed() {
+    let tmp = TempDir::new("probe-init");
+    let (source, a, _) = non_tip_source(&tmp, "src", true);
+    let git = tmp.path().join("second-init-fails");
+    let marker = tmp.path().join("init-seen");
+    crate::support::write_executable(
+        &git,
+        format!(
+            "#!/bin/sh\n\
+             ulimit -f 512\n\
+             for a in \"$@\"; do\n\
+             if [ \"$a\" = init ]; then\n\
+             if [ -e '{marker}' ]; then exit 1; fi\n\
+             : > '{marker}'\n\
+             fi\n\
+             done\n\
+             exec '{real}' \"$@\"\n",
+            marker = marker.display(),
+            real = crate::support::host_git().display(),
+        )
+        .as_bytes(),
+    );
+    let cli = open(&tmp, &git, DEFAULT_MAX_NODES);
+    let detail = failed(cli.fetch_base(&source.url(), &sha(&a)));
+    assert!(!detail.trim().is_empty());
+    assert!(marker.exists());
+    assert_eq!(listing(&cli.root().join("stores")), Vec::<String>::new());
+    assert_eq!(listing(&cli.root().join("tmp")), Vec::<String>::new());
 }

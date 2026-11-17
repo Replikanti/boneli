@@ -5,7 +5,9 @@
 //! - Each `fetch_base` makes a fresh bare store under `<root>/stores/` and
 //!   fetches the base commit alone, depth 1, by URL: no remote, no refs,
 //!   no `FETCH_HEAD`. A checkout is a tree id in a store, so a checkout
-//!   never changes.
+//!   never changes. When that fetch fails, the remote's tips and a probe
+//!   fetch of the commit alone, in a throwaway repository under
+//!   `<root>/tmp/<n>`, decide between `UnknownCommit` and `Failed`.
 //! - `diff` decodes the workspace with the strict codec, drops repository
 //!   metadata, refuses a name that is `.git` on another file system,
 //!   writes the rest into a fresh `<root>/scratch/<n>` and runs
@@ -13,9 +15,11 @@
 //!   and a throwaway object directory under `<root>/tmp/<n>`, so the store
 //!   keeps nothing of the workspace. Both directories are removed on every
 //!   path.
-//! - `apply` is `git apply --cached` on a throwaway index.
+//! - `apply` is `git apply --cached` on a throwaway index; a result that
+//!   holds a name `diff` refuses is refused.
 //! - `snapshot` is the tree's files plus a generated one-commit `.git`
-//!   with no remote, hook or credential.
+//!   with no remote, hook or credential; a tree that holds a name `diff`
+//!   refuses is refused.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -41,8 +45,8 @@ use crate::workspace::{Kind, Workspace};
 pub struct GitCliConfig {
     /// The git binary, an absolute path; `PATH` is never searched.
     pub git: PathBuf,
-    /// The adapter's own directory. It must not exist; `open` creates it
-    /// with mode 0700.
+    /// The adapter's own directory, an absolute path. It must not exist;
+    /// `open` creates it with mode 0700.
     pub root: PathBuf,
     /// The URL forms `fetch_base` accepts.
     pub transports: Transports,
@@ -56,6 +60,8 @@ pub struct GitCliConfig {
 pub enum OpenError {
     /// The git path is relative.
     GitNotAbsolute,
+    /// The root is relative.
+    RootNotAbsolute,
     /// The root already exists.
     RootExists,
     /// The root could not be created.
@@ -74,6 +80,7 @@ impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OpenError::GitNotAbsolute => f.write_str("the git binary must be an absolute path"),
+            OpenError::RootNotAbsolute => f.write_str("the adapter root must be an absolute path"),
             OpenError::RootExists => f.write_str("the adapter root already exists"),
             OpenError::Io(e) => write!(f, "cannot create the adapter root: {e}"),
             OpenError::Git(detail) => write!(f, "git version failed: {detail}"),
@@ -210,6 +217,12 @@ fn tree_path(raw: &[u8]) -> Result<RelativePath, GitError> {
     })
 }
 
+/// Whether some component of `path` is `.git` on another file system
+/// (`src/lookalike.rs`).
+fn lookalike(path: &str) -> bool {
+    path.split('/').any(names_git_elsewhere)
+}
+
 /// Whether `ls-remote` output, `<oid> TAB <ref>` lines, names `sha` as an
 /// object id.
 fn advertises(refs: &[u8], sha: &str) -> bool {
@@ -239,6 +252,12 @@ impl GitCli {
     pub fn open(config: GitCliConfig) -> Result<GitCli, OpenError> {
         if !config.git.is_absolute() {
             return Err(OpenError::GitNotAbsolute);
+        }
+        // Every call runs with its store as the working directory and the
+        // same path in `--git-dir`, so a relative root names another
+        // directory there.
+        if !config.root.is_absolute() {
+            return Err(OpenError::RootNotAbsolute);
         }
         let root = config.root;
         match private_dir(&root) {
@@ -329,15 +348,16 @@ impl GitCli {
         Ok(text.trim_end_matches('\n').to_owned())
     }
 
-    fn fetch(&self, store: &Path, url: &str, sha: &str) -> Result<String, GitError> {
-        let sha256 = sha.len() == 64;
-        let format = if sha256 {
+    /// `init --bare` of an empty repository at `dir` for objects of `sha`'s
+    /// format.
+    fn init(&self, dir: &Path, sha: &str) -> Result<(), GitError> {
+        let format = if sha.len() == 64 {
             "--object-format=sha256"
         } else {
             "--object-format=sha1"
         };
         self.git(
-            Call::on(store),
+            Call::on(dir),
             &[
                 os("init"),
                 os("--bare"),
@@ -345,7 +365,46 @@ impl GitCli {
                 os("--template="),
                 os(format),
             ],
-        )?;
+        )
+        .map(drop)
+    }
+
+    /// Whether the remote has `sha` as a commit: a fetch of that commit
+    /// alone, `--depth=1 --filter=tree:0`, into a throwaway repository
+    /// `<root>/tmp/<n>` that is removed on every path, so no store sees
+    /// it. `Ok(false)` when that fetch fails or gets something other than
+    /// a commit; `Err` when the probe could not be set up, which is no
+    /// evidence either way.
+    fn remote_has_commit(&self, url: &str, sha: &str) -> Result<bool, GitError> {
+        let tmp = self.fresh("tmp")?;
+        self.init(&tmp.path, sha)?;
+        let probe = Call::on(&tmp.path);
+        let fetched = self.git(
+            probe,
+            &[
+                os("fetch"),
+                os("-q"),
+                os("--depth=1"),
+                os("--filter=tree:0"),
+                os("--no-tags"),
+                os("--no-write-fetch-head"),
+                os("--no-recurse-submodules"),
+                os("--"),
+                os(url),
+                os(sha),
+            ],
+        );
+        if fetched.is_err() {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.line(Call::on(&tmp.path), &[os("cat-file"), os("-t"), os(sha)]),
+            Ok(kind) if kind == "commit"
+        ))
+    }
+
+    fn fetch(&self, store: &Path, url: &str, sha: &str) -> Result<String, GitError> {
+        self.init(store, sha)?;
         // Attributes are neutral, so `add` stores bytes as written and no
         // agent-written `.gitattributes` converts or filters content.
         let info = store.join("info");
@@ -372,16 +431,21 @@ impl GitCli {
             ],
         );
         if let Err(error) = fetched {
-            // What the remote advertises decides; git's message is never
-            // parsed. A remote that does not answer, or that advertises
-            // the commit, failed the fetch for another reason (the network,
-            // a full disk, a broken remote).
+            // Evidence decides; git's message is never parsed. A remote
+            // that does not answer, that advertises the commit, or that
+            // hands it out alone to the probe has it, so the fetch failed
+            // for another reason (the network, a full disk, a broken
+            // remote). Only a remote that answers, does not advertise the
+            // SHA and fails the probe too leaves `UnknownCommit`.
             let advertised = self.git(
                 Call::on(store),
                 &[os("ls-remote"), os("-q"), os("--"), os(url)],
             );
             return Err(match advertised {
-                Ok(refs) if !advertises(&refs, sha) => GitError::UnknownCommit,
+                Ok(refs) if !advertises(&refs, sha) => match self.remote_has_commit(url, sha) {
+                    Ok(false) => GitError::UnknownCommit,
+                    Ok(true) | Err(_) => error,
+                },
                 _ => error,
             });
         }
@@ -601,6 +665,14 @@ impl Git for GitCli {
                     path.as_str()
                 )));
             }
+            // `diff` refuses these names, so a checkout that holds one
+            // could never return a diff.
+            if lookalike(path.as_str()) {
+                return Err(failed(format!(
+                    "the tree has a path that is .git on another file system: {:?}",
+                    path.as_str()
+                )));
+            }
             files.push((path, kind));
             oids.push(entry.oid);
         }
@@ -640,10 +712,7 @@ impl Git for GitCli {
         // Before anything is written: on a case-insensitive scratch
         // directory git would read `sub/.GIT` as `sub/.git` while it walks
         // the tree, before its own path checks see the name.
-        if let Some((path, _, _)) = workspace
-            .iter()
-            .find(|(p, _, _)| p.as_str().split('/').any(names_git_elsewhere))
-        {
+        if let Some((path, _, _)) = workspace.iter().find(|(p, _, _)| lookalike(p.as_str())) {
             return Err(failed(format!(
                 "the workspace has a path that is .git on another file system: {:?}",
                 path.as_str()
@@ -722,6 +791,29 @@ impl Git for GitCli {
             &[os("apply"), os("--cached"), os("--whitespace=nowarn")],
         )?;
         let tree = self.line(indexed(), &[os("write-tree")])?;
+        // git refuses its own look-alikes only. The applied tree gets the
+        // check `diff` and `snapshot` make, so no checkout holds a path
+        // that `diff` would refuse.
+        let paths = self.git(
+            Call::on(store),
+            &[
+                os("ls-tree"),
+                os("-r"),
+                os("-z"),
+                os("--full-tree"),
+                os("--name-only"),
+                os(&tree),
+            ],
+        )?;
+        if let Some(path) = paths
+            .split(|b| *b == 0)
+            .map(String::from_utf8_lossy)
+            .find(|p| lookalike(p))
+        {
+            return Err(failed(format!(
+                "the diff leaves a path that is .git on another file system: {path:?}"
+            )));
+        }
         self.issue(Checkout {
             store: Arc::clone(&c.store),
             tree,

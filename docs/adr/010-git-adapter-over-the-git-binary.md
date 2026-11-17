@@ -50,7 +50,7 @@ adversarial review.
   zero-width character inside the name) are content as far as the core is
   concerned; they name `.git` only on case-insensitive, normalizing or
   Windows file systems, and part 3's `diff` refuses them before it writes
-  anything (D6). git's own `core.protectNTFS` and `core.protectHFS` path
+  anything, as `snapshot` and `apply` refuse a tree that holds one (D6). git's own `core.protectNTFS` and `core.protectHFS` path
   checks stay on as a second layer, but alone they come too late: they
   check the names `add` records, and on a casefold scratch directory git
   reads an untracked `sub/.GIT` gitfile as `sub/.git` while it walks the
@@ -440,23 +440,44 @@ runner (`src/run.rs`), so no call can forget a rule.
   tree id in a store, so checkouts never change and an applied one shares
   its base's store. Ids are `checkout-<n>` from a counter that only a
   successful `fetch_base` or `apply` advances.
-- **Failure classification.** When the fetch fails, `ls-remote -- <url>`
-  decides. `UnknownCommit` needs evidence that the commit is the input's
-  fault: the remote answers and none of the ids it advertises is the
-  SHA. Every other failure is `Failed` with the fetch's error: a remote
-  that does not answer, and a remote that advertises the SHA, because
-  then the commit exists and the fetch broke for another reason (a full
-  disk under the root, an object the remote lost, a connection cut
-  mid-pack). `UnknownCommit` reads as a wrong SHA, so a caller neither
-  retries it nor alerts anyone; `Failed` stays the kind for what may
-  pass on a retry or needs an operator. Then `cat-file -t` must say
-  `commit` (a tree, blob or tag id is `UnknownCommit`). Reading git's
-  message to tell the cases apart is what this decision rules out, so a
-  commit that is not an advertised tip, the usual base of a bug, stays
-  ambiguous: when its fetch fails for one of those other reasons while
-  the remote answers, it is still `UnknownCommit` (Consequences). A
-  fetch that `transfer.fsckObjects` refuses is `UnknownCommit` or
-  `Failed` by the same rule. The store is removed on every failure.
+- **Failure classification.** When the fetch fails, evidence decides;
+  git's message is never read. `UnknownCommit` reads as a wrong SHA, so a
+  caller neither retries it nor alerts anyone; `Failed` stays the kind
+  for what may pass on a retry or needs an operator. So `UnknownCommit`
+  needs evidence that the commit is the input's fault:
+  1. `ls-remote -- <url>`. A remote that does not answer, or that
+     advertises the SHA, gives `Failed` with the fetch's error: then the
+     commit exists, or the remote cannot be asked, and the fetch broke
+     for another reason (a full disk under the root, an object the
+     remote lost, a connection cut mid-pack).
+  2. A remote that answers without advertising the SHA, the usual case,
+     since the base of a bug is rarely a tip, gets a probe: `fetch
+     --depth=1 --filter=tree:0 -- <url> <sha>` into a fresh bare
+     repository `<root>/tmp/<n>`, through the same runner, environment
+     and config as every call, and removed on every path, so no store
+     sees it. Depth 1 cuts the parents and `tree:0` leaves out every tree
+     and blob, so where the remote serves filters the pack is the commit
+     object alone (in review, a non-tip commit of this repository from
+     GitHub: a pack directory of 3,516 bytes). If the probe succeeds and
+     `cat-file -t` there says `commit`, the commit exists: `Failed` with
+     the first fetch's error. A full disk or a cut that hit the base's
+     tree, and a tree or blob the remote lost, therefore no longer read
+     as a wrong SHA.
+  3. Only a probe that fails too, or that gets a tree, blob or tag (the
+     wanted object is sent despite the filter), leaves `UnknownCommit`.
+     A probe that cannot be set up (its `init` fails) is no evidence
+     either way and gives `Failed`.
+
+  A remote that does not serve filters (`uploadpack.allowFilter` off)
+  ignores the filter with a warning, and the probe is a full depth-1
+  fetch of the same commit: no larger than the fetch that failed, so a
+  failure costs at most one more fetch of that size, and one that
+  depends on size fails the same way (the residual in Consequences).
+  Then `cat-file -t` must say `commit` (a tree, blob or tag id is
+  `UnknownCommit`). A fetch that `transfer.fsckObjects` refuses is
+  `UnknownCommit` or `Failed` by the same rule; a bad tree under a
+  commit that is not a tip is `Failed`, since the probe does not fetch
+  the tree. The store is removed on every failure.
 - **`read`** lists the path with `ls-tree -z --full-tree <tree> -- <path>`
   (literal pathspecs, so `*` and `:(top)x` are file names) and returns
   the blob for a regular or executable file, `None` for anything else.
@@ -473,10 +494,14 @@ runner (`src/run.rs`), so no call can forget a rule.
   applied checkout, so `git diff` in the verify sandbox shows the fix.
   The entries are merged in path order and built with
   `Workspace::from_sorted` under the node cap (D2). A tree path the path
-  rule refuses (a backslash, a blank name, non-UTF-8) and a tree path
-  that is repository metadata are `Failed`, naming the path: git only
-  warns about a `.git` tree entry, and such an entry would otherwise
-  merge into the generated `.git`.
+  rule refuses (a backslash, a blank name, non-UTF-8), a tree path that
+  is repository metadata and a tree path with a component that is
+  `.git` on another file system (the check `diff` makes, below) are
+  `Failed`, naming the path, before anything is written: git only warns
+  about a `.git` tree entry, and such an entry would otherwise merge into
+  the generated `.git`; git and its fsck accept a look-alike outside
+  git's HFS list, such as `.g<U+200B>it`, and every later `diff` of the
+  checkout would refuse it.
 - **`diff`** decodes the workspace under the node cap, drops metadata
   (D1), and refuses, as `Failed` naming the path, any path with a
   component that is `.git` on another file system, before it lists the
@@ -510,9 +535,13 @@ runner (`src/run.rs`), so no call can forget a rule.
 - **`apply`** of an empty diff issues a new id for the same tree.
   Otherwise `read-tree`, `apply --cached --whitespace=nowarn` (never
   `--unsafe-paths` or `--reject`) and `write-tree` on a throwaway index.
-  git refuses a path into `.git` (also nested and look-alikes), `..`, an
-  absolute path and a file beyond a symlink, and applies all hunks or
-  none; any failure is `Failed`, with no new checkout.
+  git refuses a path into `.git` (also nested, and its own look-alikes:
+  the NTFS forms and its HFS list), `..`, an absolute path and a file
+  beyond a symlink, and applies all hunks or none. Then every path of
+  the new tree (`ls-tree -r --name-only`) gets the look-alike check
+  `diff` makes: git accepts `.g<U+200B>it`, also as a rename target, and
+  without the check `apply` would issue a checkout that no `diff` can
+  read. Any failure is `Failed`, with no new checkout.
 
 ### D7. The git version floor
 
@@ -536,9 +565,13 @@ numbers (`2.100.0` is newer than `2.39.1`; `2.43.0.windows.1` reads as
   an unpatched one, so the floor fails closed at one version that
   certainly has it. The features the adapter uses are older:
   `GIT_CONFIG_COUNT` (2.31), `GIT_CONFIG_GLOBAL` (2.32),
-  `--no-write-fetch-head` and `--object-format` (2.29). A host with an
+  `--no-write-fetch-head` and `--object-format` (2.29), the probe's
+  `tree:0` filter (2.20). A host with an
   older git installs a newer one and names it in the configuration.
-- **`open`** also refuses a relative git path and a root that exists; it
+- **`open`** also refuses a relative git path, a relative root (every
+  call runs with its store as the working directory and the same path in
+  `--git-dir`, so a relative root would name another directory there and
+  every `fetch_base` would fail) and a root that exists; it
   creates the root with mode 0700 and its `home`, `stores`, `scratch`
   and `tmp` directories, and removes the root again when the version
   check fails.
@@ -568,17 +601,21 @@ numbers (`2.100.0` is newer than `2.39.1`; `2.43.0.windows.1` reads as
 - An empty directory, a FIFO, a device or a hard link in the sandbox
   cannot be expressed in a workspace (D2). #8 decides how the export
   treats them; nothing the format cannot carry reaches `diff`.
-- A base tree with a path the workspace cannot carry fails `snapshot`,
-  and with it the run. This repository is one: at the commit the network
+- A base tree with a path the workspace cannot carry, or with a component
+  that is `.git` on another file system, fails `snapshot`, and with it
+  the run, before a sandbox starts rather than at every `diff` after it. This repository is one: at the commit the network
   test fetches, an architecture-checker fixture has a backslash in its
   name, and the test pins that the snapshot names it. Widening the path
   rule is a change to D1 and D2, not made here.
-- A failed fetch of a commit the remote does not advertise as a tip is
-  `UnknownCommit` whenever the remote answers (D6), also when the real
-  cause is a full disk, a lost object or a cut connection: git reports
-  those only in English, and `ls-remote` lists tips only. A caller that
-  sees `UnknownCommit` for a SHA it got from the forge may retry once
-  before it reports the SHA as wrong.
+- A failed fetch of a commit the remote does not advertise as a tip
+  costs one more fetch, the probe (D6). The residual: a remote that
+  answers `ls-remote` and then fails both fetches still reports
+  `UnknownCommit`, also when the real cause is a full disk (the probe
+  of a remote that ignores `--filter` is a full depth-1 fetch and meets
+  the same limit) or a connection cut twice; git reports those causes
+  only in English. The port's doc comment on `GitError::UnknownCommit`
+  says so: a caller that sees `UnknownCommit` for a SHA it got from the
+  forge may retry once before it reports the SHA as wrong.
 - The adapter never removes a store; `<root>` grows by one depth-1 store
   per `fetch_base` until whoever owns the root removes it (the
   composition roots, #32 and #33).

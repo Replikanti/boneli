@@ -48,6 +48,30 @@ impl Drop for TempDir {
     }
 }
 
+/// Writes `data` to `file` with mode 0755 through a child process
+/// (`sh -c 'cat > "$1" && chmod 755 "$1"'`, the data on stdin), so the
+/// test process never holds a write descriptor to the file. A process
+/// another test thread forks inherits every descriptor the test process
+/// has open until it execs, and exec of a file that some process holds
+/// open for writing fails with ETXTBSY ("Text file busy"); every file a
+/// test may exec, a fake git or a planted hook, is written here.
+pub fn write_executable(file: &Path, data: &[u8]) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(file)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("start the writer");
+    {
+        let mut stdin = child.stdin.take().expect("the writer's stdin");
+        stdin.write_all(data).expect("feed the writer");
+    }
+    let status = child.wait().expect("wait for the writer");
+    assert!(status.success(), "writing {}: {status}", file.display());
+}
+
 /// The test's own git: the first `git` on `PATH`, as an absolute path. The
 /// adapter never searches `PATH`; the test does it for it.
 pub fn host_git() -> PathBuf {
@@ -133,9 +157,12 @@ impl Source {
     pub fn write(&self, rel: &str, data: &[u8], executable: bool) -> &Source {
         let file = self.dir.join(OsStr::from_bytes(rel.as_bytes()));
         fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
-        fs::write(&file, data).expect("write");
-        let mode = if executable { 0o755 } else { 0o644 };
-        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).expect("mode");
+        if executable {
+            write_executable(&file, data);
+        } else {
+            fs::write(&file, data).expect("write");
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("mode");
+        }
         self
     }
 
@@ -300,14 +327,10 @@ pub fn unpack_all(workspace: &[u8], dir: &Path) {
         fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
         match kind {
             Kind::Symlink => symlink(OsStr::from_bytes(data), &file).expect("symlink"),
-            Kind::File | Kind::Executable => {
+            Kind::Executable => write_executable(&file, data),
+            Kind::File => {
                 fs::write(&file, data).expect("write");
-                let mode = if kind == Kind::Executable {
-                    0o755
-                } else {
-                    0o644
-                };
-                fs::set_permissions(&file, fs::Permissions::from_mode(mode)).expect("mode");
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("mode");
             }
         }
     }
