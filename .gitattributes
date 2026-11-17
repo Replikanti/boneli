@@ -2,3 +2,7 @@
 # (crates/boneli-json/tests/conformance.rs pins their digest): no line-ending
 # conversion may touch them.
 crates/boneli-json/tests/jsontestsuite/** -text
+
+# The vendored toml-test files likewise (crates/boneli-toml/tests/conformance.rs
+# pins their digest); seven of them depend on exact CR and CRLF bytes.
+crates/boneli-toml/tests/toml-test/** -text

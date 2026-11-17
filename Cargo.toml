@@ -35,5 +35,6 @@ boneli-http = { path = "crates/boneli-http" }
 boneli-memory = { path = "crates/boneli-memory" }
 boneli-https = { path = "crates/boneli-https" }
 boneli-json = { path = "crates/boneli-json" }
+boneli-toml = { path = "crates/boneli-toml" }
 boneli-oci = { path = "crates/boneli-oci" }
 boneli-sys = { path = "crates/boneli-sys" }

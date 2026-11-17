@@ -376,6 +376,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   git older than 2.39.1 (CVE-2022-23521). `GitCli` passes the whole `Git` suite, and a git that
   discovers the workspace's repository fails `workspace-metadata-inert`
   at `nothing-ran`, by the hook alone and by `core.fsmonitor` alone.
+- `boneli-toml` (ADR-011): a strict parser for TOML 1.0 without floats,
+  dates and times and hexadecimal, octal and binary integers, which fail
+  with an `Unsupported` error that names the feature. Duplicate keys and
+  redefined tables are errors, with the table definition rules of TOML 1.0
+  as tomllib reads them. `Table` keeps members in first-creation order
+  without hash maps; `Limits` has no defaults and bounds input bytes and
+  nesting depth (at most `MAX_DEPTH`, 128). Errors carry a position and
+  never input bytes, and `Debug` of a value is compact with or without
+  `#`. Tested against the TOML 1.0.0 files of toml-test, vendored with
+  their MIT notice and an outcome pinned per file, every TOML file of the
+  workspace, a sweep of about 870,000 mutants, round trips through 15
+  written forms and a stack gate on a 256 KiB thread.
+  `examples/toml_test_decoder` speaks the toml-test decoder protocol.
+- ADR-011: the TOML subset, the encoding and table definition rules, the
+  limits with their memory measurements (peak at most about 65 times the
+  input), and the depth ceiling with its stack measurements.
 
 ### Changed
 

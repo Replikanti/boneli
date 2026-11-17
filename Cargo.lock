@@ -95,6 +95,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-toml"
+version = "0.0.0"
+dependencies = [
+ "boneli-json",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
