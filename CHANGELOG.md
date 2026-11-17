@@ -351,6 +351,31 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metadata, entries at or under a gitlink, gitlinks beneath an entry and
   more nodes than its cap, gitlink directories included, before it
   writes anything.
+- `GitCli`, part 3 of #30 (ADR-010 D4 to D7, accepted): the `Git` port
+  over the git binary. Every git call runs from an absolute path with a
+  cleared environment, a private empty `HOME`, no system or global config,
+  command-scope config (hooks, fsmonitor and credential helpers off, NTFS
+  and HFS path protection on, https only, fsck on transfer) and an explicit
+  `--git-dir`, so neither the workspace nor the host environment steers
+  it. `fetch_base` fetches the base SHA alone, depth 1, into a fresh bare
+  store (`Transports::Https`; `HttpsAndFile` for tests) and reports
+  `UnknownCommit` only when the remote answers `ls-remote` without
+  advertising the SHA and a probe fetch of that commit alone
+  (`--depth=1 --filter=tree:0`, in a throwaway repository) is refused by
+  git too or gets no commit, `Failed` otherwise (also when a probe step
+  cannot start or is killed); `snapshot` is
+  the tree's files plus a generated one-commit `.git` with no remote, hook
+  or credential, the same bytes every time; `diff` drops repository
+  metadata, refuses names that are `.git` on a case-insensitive or Windows
+  file system before it writes anything (`snapshot` and `apply` refuse a
+  tree with such a name too, gitlinks included), writes the workspace with
+  `materialize` and diffs it through `git add -A` on a throwaway index and
+  a throwaway object directory, so the store keeps nothing of a diff;
+  `apply` is `git apply --cached`, all
+  or nothing, and refuses a result with a path the workspace cannot carry. `GitCli::open` refuses a relative git path or root and a
+  git older than 2.39.1 (CVE-2022-23521). `GitCli` passes the whole `Git` suite, and a git that
+  discovers the workspace's repository fails `workspace-metadata-inert`
+  at `nothing-ran`, by the hook alone and by `core.fsmonitor` alone.
 
 ### Changed
 

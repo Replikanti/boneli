@@ -51,7 +51,16 @@ impl CheckoutId {
 /// Why the git adapter did not do what was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitError {
-    /// The repository has no such commit.
+    /// The repository answered and has no commit with this id: the id is
+    /// absent there, or names a tree, blob or tag. An adapter reports it
+    /// only on evidence that the id is at fault, and reports a failure
+    /// that may pass on a retry as `Failed`. Residual of the git adapter
+    /// (ADR-010, D6): a remote that lists its refs, then fails both the
+    /// fetch of a commit that is not a tip and the probe fetch of that
+    /// commit alone (a remote that ignores `--filter` and a full disk, or
+    /// a connection cut twice), is reported here too, so a caller that
+    /// got the SHA from the forge may retry once before it reports the
+    /// SHA as wrong.
     UnknownCommit,
     /// No checkout with this handle exists.
     UnknownCheckout,

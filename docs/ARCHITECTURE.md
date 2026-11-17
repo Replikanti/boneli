@@ -126,7 +126,7 @@ The states, events, commands and terminal outcomes of the run, the budget units 
 - **Judgment parts** are checked by a second agent in a review step. Every finding cites a specific paragraph of the standard, and the citation is verified the same way as in the root cause analysis. Findings go into the pull request; only the checkable part blocks.
 - The pull request states which version of the standards the run used.
 
-**Git.** The runner holds a short-lived token (GitHub App, GitLab project token without merge rights). The sandbox gets a snapshot without remotes, hooks or credential helpers; only the diff comes back.
+**Git.** The runner holds a short-lived token (GitHub App, GitLab project token without merge rights). The sandbox gets a snapshot without remotes, hooks or credential helpers: the files of the base tree plus a generated one-commit `.git` (depth 1, only the base commit and its tree). Only the diff comes back, and the host's git reads it with a cleared environment, command-scope config and an explicit `--git-dir`, so nothing in the workspace, its `.git` included, steers it (ADR-010).
 
 ## Environment and data
 
@@ -156,7 +156,7 @@ The benchmark measures debugging, not whether the model remembers the fix or fin
 
 **Leakage through the environment:**
 
-- the repository is rebuilt only from objects reachable from the base SHA (`git init` and `git fetch` of the base SHA), with no future commits, branches or tags,
+- the repository is rebuilt only from the base commit and its tree (`git init` and a depth-1 `git fetch` of the base SHA, ADR-010), with no history, future commits, branches or tags,
 - the issue only as it was before the fix, without links to pull requests or commits, passed through an LLM and checked by hand,
 - no egress during the agent phase, and no github.com even during preparation,
 - tests from the fix only as a hidden oracle in the verifier,
