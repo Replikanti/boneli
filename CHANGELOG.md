@@ -331,6 +331,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   once moved back to content. `boneli_replay_check::mutants` gains a
   regression table (5 mutants) and vacuous-fixture violations (5), both
   rendered under the replay gate.
+- `boneli-git-cli`, part 2 of #30 (ADR-010 D2 and D3, still proposed):
+  the workspace format and the materializer; no git runs yet.
+  `Workspace` encodes a tree canonically (a magic line, then files,
+  executables and symlinks in path order, length-prefixed), and
+  `Workspace::decode` refuses a wrong magic, an unknown kind, a length
+  past the end, a path the citation path rule refuses, unsorted or
+  duplicate paths, an entry beneath a file or symlink entry (every
+  ancestor, in linear time), an empty or NUL-holding link target and
+  more entries than the cap (200,000 by default). `without_metadata`
+  drops repository metadata. `materialize` writes a workspace into a
+  new, empty 0700 directory with `create_new` and explicit modes, never
+  writes through an existing symlink, creates an empty directory per
+  gitlink, and refuses metadata, entries at or under a gitlink and
+  gitlinks beneath an entry before it writes anything.
 
 ### Changed
 

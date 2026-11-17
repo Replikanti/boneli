@@ -168,10 +168,106 @@ adversarial review.
   clause table describe the suites as it accepted them; this ADR records
   the addition, as ADR-009 D13 did for `tampered-refused`.
 
+### D2. The workspace and snapshot format
+
+Part 2 of #30. A snapshot the adapter hands the sandbox and a workspace
+the sandbox hands back share one format, `boneli_git_cli::Workspace`.
+
+- **Encoding.** The magic `boneli-workspace 1\n`, then the entries in
+  path order. Each entry is a kind byte, the path and the data; path and
+  data are each a length in 8 big-endian bytes followed by the bytes.
+  The kinds are exactly the blob modes git records: `f` a regular file
+  (0644), `x` an executable (0755) and `l` a symlink, whose data is its
+  target as raw bytes. Directories are implicit, as in a git tree: an
+  entry's parents are directories, and an empty directory cannot be
+  expressed. Gitlinks are not entries; the adapter reads them from the
+  base tree (D3).
+- **Canonical.** Path order is the byte order of the UTF-8 path, which is
+  `RelativePath`'s order and needs no collation. A tree has exactly one
+  encoding, so two snapshots of one tree are equal byte strings, and
+  `decode` refuses every byte string `encode` would not produce.
+- **What `decode` refuses**, each as a `DecodeError` that names the entry
+  by index and quotes lengths, never the agent-written bytes (as ADR-004
+  D10 does for violation details):
+  - a wrong or truncated magic, an unknown kind byte, and a length past
+    the end, `u64::MAX` included, or a partial trailing entry;
+  - a path that is not UTF-8 or that `RelativePath::parse` refuses
+    (absolute, `..`, `.`, empty components, backslash, NUL, blank);
+  - a path equal to or sorting before the previous one;
+  - an entry beneath a file or symlink entry, against every ancestor and
+    not only the previous entry: `a`, `a.txt`, `a/b` sorts `a.txt`
+    between the file `a` and the entry beneath it;
+  - a symlink with an empty target or a NUL in it. Any other target is
+    kept as written, absolute or with `..`: a link is never resolved on
+    the host (D3), and which links a fix may add is the patch policy's
+    question (#17);
+  - more entries than the cap.
+- **Bounded on hostile input.** Every length is compared with the bytes
+  left, as a `u64`, before anything is copied, so nothing is allocated
+  ahead of the input: a decoded workspace holds at most the input's bytes
+  plus a fixed overhead per entry, and the cap bounds the entries. The
+  ancestor check runs in linear time over a stack of the earlier paths
+  that are a string prefix of the current one. Paths that share a prefix
+  sort together, so every earlier entry that is a prefix of the current
+  path is still on the stack, and the path lies beneath one exactly when
+  the next byte is `/`. A lookup of every ancestor in an ordered map
+  instead compares O(L^2) bytes for a path of length L next to a sibling
+  that shares its prefixes; a test of a 4 MB path holds the decoder under
+  a deadline that such a lookup misses.
+- **The entry cap** defaults to 200,000 (`DEFAULT_MAX_ENTRIES`). The
+  largest base tree measured on the candidate repositories of
+  docs/ARCHITECTURE.md has at least 37,835 files (GitHub API,
+  2026-11-17; the listing was truncated), so the cap is about five times
+  that. The cap bounds the inodes a hostile workspace can create in the
+  host's scratch directory: an entry takes at least 18 bytes (a kind
+  byte, two lengths and a one-byte path), so a 200 MB workspace could
+  otherwise ask for about 11 million files. A workspace that carries
+  `node_modules` may exceed it; that fails closed with a detail naming
+  the cap, and #8 decides what an export carries.
+- **`without_metadata`** drops every path `is_repository_metadata` names
+  (D1), as a file, a directory's entries or a symlink. `insert` and
+  `remove` keep the invariants `decode` checks, so a `Workspace` built in
+  code always encodes to bytes `decode` accepts.
+
+### D3. Writing a workspace onto the host
+
+`boneli_git_cli::materialize(workspace, dir, gitlinks)` writes a decoded
+workspace for `git add -A` (part 3). It runs as the runner user on
+agent-written entries, so it never trusts what is on disk and never
+follows a symlink.
+
+- **The target** must be a new, empty directory with mode 0700, checked
+  through `symlink_metadata`, so a symlink to a directory is refused.
+- **Checked before anything is written.** Repository metadata is refused
+  (defense in depth: `diff` drops it first, D1), and so is an entry at or
+  under a gitlink, a gitlink beneath an entry, and a gitlink that is
+  repository metadata. The gitlink lookups for an entry stop at the
+  length of the longest gitlink, so a deep agent-written path costs no
+  more than that.
+- **Parents** are created one component at a time with `create_dir`. One
+  that already exists must be a real directory by `symlink_metadata`;
+  anything else is `NotADirectory`. D2 keeps every entry off the paths
+  beneath another entry, so on a case-sensitive file system this check
+  never fires for a valid workspace; it is the guard against a symlink
+  entry that a case or normalization alias makes a parent, and against
+  anything else on disk that the format rules out.
+- **Files** are opened with `create_new` (`O_CREAT | O_EXCL`, which also
+  refuses a symlink at the final name) with mode 0600, written, and then
+  given 0644 or 0755 through the open file, so the umask does not matter.
+  Directories get 0755 after `create_dir` the same way.
+- **Symlinks** are created with `std::os::unix::fs::symlink`, their target
+  passed as raw bytes through `OsStrExt`, and never resolved.
+- **Gitlinks.** Each gitlink of the base tree becomes an empty directory
+  after the entries, so `git add -A` keeps the gitlink instead of
+  recording its removal.
+- **Order and failure.** Entries are written in path order. On an error
+  the directory may hold part of the workspace; the caller removes it
+  (part 3 removes its scratch directory on every path). Errors name the
+  entry or gitlink by index, never by its path.
+
 ### Later parts
 
-Part 2 adds the workspace and snapshot format, its entry cap and the
-materializer rules (D2 and D3). Part 3 adds the git runner with its fixed
+Part 3 adds the git runner with its fixed
 environment and command-scope config, the transports, the operations and
 the git version floor (D4 to D7), and the rule for #19: the token reaches
 git only as `http.<url>.extraHeader` through `GIT_CONFIG_KEY_n` and
@@ -194,6 +290,15 @@ a file or the snapshot.
   request. That is intended: such a change is not source.
 - An agent that changes the sandbox's `.git` (commits, config) changes
   nothing that leaves the sandbox; only the working tree's content does.
+- The workspace codec lives in the adapter crate, and nothing may depend
+  on an adapter. #8, which copies a snapshot into a sandbox and exports a
+  workspace from one, needs the same codec: when it does, it moves
+  `Workspace` and `materialize` into a support crate and passes the path
+  rule (`RelativePath::parse` and `is_repository_metadata`) in as a
+  validator, so the support crate stays generic.
+- An empty directory, a FIFO, a device or a hard link in the sandbox
+  cannot be expressed in a workspace (D2). #8 decides how the export
+  treats them; nothing the format cannot carry reaches `diff`.
 
 ## Alternatives considered
 
@@ -217,6 +322,16 @@ a file or the snapshot.
   only exit codes and never git's English messages, so it would need its
   own parse of the diff's paths before `git apply`. That is a change to
   part 3's plan, not made here.
+- **tar as the workspace format.** A tar stream has many encodings of one
+  tree (header variants, pax and GNU extensions, hard links, devices,
+  directory entries in any order), so it is not canonical, and the tar
+  reader of `boneli-oci` lives in another adapter, which this crate may
+  not depend on. The length-prefixed format needs a few dozen lines and
+  has exactly one encoding per tree.
+- **`MemoryGit`'s snapshot format.** It has no kinds, so it cannot carry
+  the executable bit or a symlink, and it is that adapter's own (ADR-004).
+- **An ancestor check by map lookup.** Simpler, but quadratic in the path
+  length on hostile input (D2).
 - **A rule that also matches look-alikes** (case-folded `.git`, 8.3 short
   names). The core cannot know the file system the pull request will be
   checked out on, and git's own `protectNTFS`/`protectHFS` checks are the
