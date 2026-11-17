@@ -232,3 +232,164 @@ fn concurrent_diffs_do_not_share_scratch() {
     assert_eq!(two, Ok(one));
     scratch_is_empty(&git);
 }
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    for name in listing(dir) {
+        let p = dir.join(name);
+        if p.symlink_metadata().expect("meta").is_dir() {
+            n += files_under(&p);
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `diff` writes the workspace's objects into a throwaway object directory,
+/// so repeated diffs leave the store as `fetch_base` left it (ADR-010, D2
+/// and D6); the diff still applies.
+#[test]
+fn diff_leaves_the_store_unchanged() {
+    let tmp = TempDir::new("store-unchanged");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"a", false);
+    let base = source.commit("base");
+    let (git, c, snapshot) = fetched(&tmp, &source, &base);
+    let stores = listing(&git.root().join("stores"));
+    assert_eq!(stores.len(), 1);
+    let objects = git.root().join("stores").join(&stores[0]).join("objects");
+    let before = files_under(&objects);
+    let mut w = snapshot.clone();
+    for k in 0..200 {
+        w = edit(
+            &w,
+            &path(&format!("new/f{k}")),
+            Some(format!("{k}\n").as_bytes()),
+        );
+    }
+    let first = git.diff(&c, &w).expect("diff");
+    assert!(!first.is_empty());
+    for _ in 0..2 {
+        assert_eq!(git.diff(&c, &w).as_ref(), Ok(&first));
+        assert_eq!(files_under(&objects), before);
+    }
+    scratch_is_empty(&git);
+    let after = git.apply(&c, &first).expect("apply");
+    assert_eq!(git.read(&after, &path("new/f7")), Ok(Some(b"7\n".to_vec())));
+}
+
+/// The store's object directory reaches git as an alternate in the
+/// environment, quoted, so a root whose path holds the separator `:` or
+/// starts an entry with `"` still names it.
+#[test]
+fn diff_under_a_root_with_a_colon() {
+    let tmp = TempDir::new("colon");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"a", false);
+    let base = source.commit("base");
+    let parent = tmp.path().join("a:\"b");
+    std::fs::create_dir(&parent).expect("parent");
+    let git = GitCli::open(boneli_git_cli::GitCliConfig {
+        git: host_git(),
+        root: parent.join("root"),
+        transports: boneli_git_cli::Transports::HttpsAndFile,
+        max_workspace_nodes: boneli_git_cli::DEFAULT_MAX_NODES,
+    })
+    .expect("open");
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let snapshot = git.snapshot(&c).expect("snapshot");
+    assert_eq!(git.diff(&c, &snapshot), Ok(vec![]));
+    let diff = git
+        .diff(&c, &edit(&snapshot, &path("a"), Some(b"b")))
+        .expect("diff");
+    let after = git.apply(&c, &diff).expect("apply");
+    assert_eq!(git.read(&after, &path("a")), Ok(Some(b"b".to_vec())));
+}
+
+/// The store's `info/attributes` turns off `ident` and
+/// `working-tree-encoding` too: an agent's `.gitattributes` that asks for
+/// them changes no byte (ADR-010, D6).
+#[test]
+fn ident_and_encoding_are_not_applied() {
+    let tmp = TempDir::new("ident-encoding");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"a", false);
+    let base = source.commit("base");
+    let (git, c, snapshot) = fetched(&tmp, &source, &base);
+    let id: &[u8] = b"keep $Id: original $ here\n";
+    let utf16: &[u8] = b"h\0i\0\n\0";
+    let w = edit(
+        &snapshot,
+        &path(".gitattributes"),
+        Some(b"* ident\nu.txt working-tree-encoding=UTF-16LE\n"),
+    );
+    let w = edit(&w, &path("id.txt"), Some(id));
+    let w = edit(&w, &path("u.txt"), Some(utf16));
+    let diff = git.diff(&c, &w).expect("diff");
+    let after = git.apply(&c, &diff).expect("apply");
+    assert_eq!(git.read(&after, &path("id.txt")), Ok(Some(id.to_vec())));
+    assert_eq!(git.read(&after, &path("u.txt")), Ok(Some(utf16.to_vec())));
+}
+
+/// A name that is `.git` on a case-insensitive, normalizing or Windows file
+/// system is refused before anything is written and before git runs: on a
+/// casefold scratch directory an untracked `sub/.GIT` gitfile would make
+/// `add -A` record another repository's HEAD before git's own path checks
+/// see a name (ADR-010, D1 and D6).
+#[test]
+fn lookalikes_are_refused_before_git_runs() {
+    let tmp = TempDir::new("lookalikes-first");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"a", false);
+    let base = source.commit("base");
+    let other = Source::new(&tmp, "other", false);
+    other.write("o", b"o", false);
+    other.commit("other");
+    let recorder = crate::support::record::Recorder::new(&tmp);
+    let git = open(&tmp, &recorder.git, boneli_git_cli::DEFAULT_MAX_NODES);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let snapshot = git.snapshot(&c).expect("snapshot");
+    let gitfile = format!("gitdir: {}/.git\n", other.dir.display());
+    for p in [
+        "sub/.GIT",
+        "sub/.Git/HEAD",
+        ".GIT/config",
+        "git~1/x",
+        "GIT~1/x",
+        "sub/.git./x",
+        "sub/.git /x",
+        "sub/.git::$INDEX_ALLOCATION/x",
+        "sub/.g\u{200C}it/x",
+        // Default-ignorable, but not in git's HFS list.
+        "sub/.g\u{200B}it",
+        "sub/\u{FEFF}.GiT",
+    ] {
+        let w = edit(&snapshot, &path(p), Some(gitfile.as_bytes()));
+        let w = edit(&w, &path("sub/x"), Some(b"x"));
+        recorder.clear();
+        let detail = failed(git.diff(&c, &w));
+        assert!(detail.contains(&format!("{p:?}")), "{p:?}: {detail}");
+        assert!(recorder.calls().is_empty(), "{p:?}: {:?}", recorder.calls());
+        scratch_is_empty(&git);
+    }
+    // Names that only start like `.git` are content.
+    let w = [
+        ".gitignore",
+        ".github/x",
+        "git",
+        ".gitx",
+        "x.git",
+        "git~2",
+        ".git~1",
+    ]
+    .iter()
+    .fold(snapshot.clone(), |w, p| edit(&w, &path(p), Some(b"ok\n")));
+    let diff = git.diff(&c, &w).expect("diff");
+    let after = git.apply(&c, &diff).expect("apply");
+    assert_eq!(
+        git.read(&after, &path(".git~1")),
+        Ok(Some(b"ok\n".to_vec()))
+    );
+}

@@ -7,9 +7,12 @@
 //!   no `FETCH_HEAD`. A checkout is a tree id in a store, so a checkout
 //!   never changes.
 //! - `diff` decodes the workspace with the strict codec, drops repository
-//!   metadata, writes the rest into a fresh `<root>/scratch/<n>` and runs
-//!   `git add -A` there with an explicit `--git-dir` and a throwaway index
-//!   under `<root>/tmp/<n>`. Both directories are removed on every path.
+//!   metadata, refuses a name that is `.git` on another file system,
+//!   writes the rest into a fresh `<root>/scratch/<n>` and runs
+//!   `git add -A` there with an explicit `--git-dir`, a throwaway index
+//!   and a throwaway object directory under `<root>/tmp/<n>`, so the store
+//!   keeps nothing of the workspace. Both directories are removed on every
+//!   path.
 //! - `apply` is `git apply --cached` on a throwaway index.
 //! - `snapshot` is the tree's files plus a generated one-commit `.git`
 //!   with no remote, hook or credential.
@@ -27,6 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use boneli_app::{CheckoutId, Git, GitError, RelativePath, RepoUrl};
 use boneli_domain::CommitSha;
 
+use crate::lookalike::names_git_elsewhere;
 use crate::materialize::materialize;
 use crate::run::{Call, MIN_GIT_VERSION, Runner, parse_version};
 use crate::url::Transports;
@@ -206,6 +210,13 @@ fn tree_path(raw: &[u8]) -> Result<RelativePath, GitError> {
     })
 }
 
+/// Whether `ls-remote` output, `<oid> TAB <ref>` lines, names `sha` as an
+/// object id.
+fn advertises(refs: &[u8], sha: &str) -> bool {
+    refs.split(|b| *b == b'\n')
+        .any(|line| line.split(|b| *b == b'\t').next() == Some(sha.as_bytes()))
+}
+
 /// The fixed config of a snapshot's `.git`: no remote, credential, URL,
 /// http, include or hooks path.
 fn snapshot_config(sha256: bool) -> String {
@@ -251,6 +262,7 @@ impl GitCli {
             git_dir: None,
             work_tree: None,
             index: None,
+            objects: None,
             stdin: None,
         };
         let out = runner.run(call, &[os("version")]).map_err(OpenError::Git)?;
@@ -360,18 +372,17 @@ impl GitCli {
             ],
         );
         if let Err(error) = fetched {
-            // Whether the remote answers decides; git's message is never
-            // parsed.
-            let answers = self
-                .git(
-                    Call::on(store),
-                    &[os("ls-remote"), os("-q"), os("--"), os(url)],
-                )
-                .is_ok();
-            return Err(if answers {
-                GitError::UnknownCommit
-            } else {
-                error
+            // What the remote advertises decides; git's message is never
+            // parsed. A remote that does not answer, or that advertises
+            // the commit, failed the fetch for another reason (the network,
+            // a full disk, a broken remote).
+            let advertised = self.git(
+                Call::on(store),
+                &[os("ls-remote"), os("-q"), os("--"), os(url)],
+            );
+            return Err(match advertised {
+                Ok(refs) if !advertises(&refs, sha) => GitError::UnknownCommit,
+                _ => error,
             });
         }
         match self.line(Call::on(store), &[os("cat-file"), os("-t"), os(sha)]) {
@@ -626,23 +637,44 @@ impl Git for GitCli {
         let workspace = Workspace::decode(workspace, self.max_nodes)
             .map_err(|e| failed(format!("the workspace is refused: {e}")))?
             .without_metadata();
+        // Before anything is written: on a case-insensitive scratch
+        // directory git would read `sub/.GIT` as `sub/.git` while it walks
+        // the tree, before its own path checks see the name.
+        if let Some((path, _, _)) = workspace
+            .iter()
+            .find(|(p, _, _)| p.as_str().split('/').any(names_git_elsewhere))
+        {
+            return Err(failed(format!(
+                "the workspace has a path that is .git on another file system: {:?}",
+                path.as_str()
+            )));
+        }
         let gitlinks = self.gitlinks(store, &c.tree)?;
         let scratch = self.fresh("scratch")?;
         let tmp = self.fresh("tmp")?;
         materialize(&workspace, &scratch.path, &gitlinks, self.max_nodes)
             .map_err(|e| failed(format!("the workspace cannot be written: {e}")))?;
         let index = tmp.path.join("index");
+        // The workspace's blobs and trees go here and are removed with
+        // `tmp`; the store is only read.
+        let objects = tmp.path.join("objects");
+        private_dir(&objects)
+            .map_err(|e| failed(format!("cannot create an object directory: {e}")))?;
+        let throwaway = || Call {
+            objects: Some(&objects),
+            ..Call::on(store)
+        };
         let in_tree = || Call {
             work_tree: Some(&scratch.path),
             index: Some(&index),
-            ..Call::on(store)
+            ..throwaway()
         };
         self.git(in_tree(), &[os("read-tree"), os(&c.tree)])?;
         self.git(in_tree(), &[os("add"), os("-A")])?;
         let new = self.line(
             Call {
                 index: Some(&index),
-                ..Call::on(store)
+                ..throwaway()
             },
             &[os("write-tree")],
         )?;
@@ -650,7 +682,7 @@ impl Git for GitCli {
             return Ok(Vec::new());
         }
         self.git(
-            Call::on(store),
+            throwaway(),
             &[
                 os("diff-tree"),
                 os("-r"),
@@ -716,5 +748,17 @@ mod tests {
         ] {
             assert!(ls_tree(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn advertises_matches_whole_ids() {
+        let a = "0123456789abcdef0123456789abcdef01234567";
+        let refs = format!("{a}\tHEAD\n{a}\trefs/heads/main\n");
+        assert!(advertises(refs.as_bytes(), a));
+        assert!(!advertises(refs.as_bytes(), &a[..39]));
+        assert!(!advertises(b"", a));
+        // A ref name is not an id.
+        let named = format!("1111111111111111111111111111111111111111\trefs/heads/{a}\n");
+        assert!(!advertises(named.as_bytes(), a));
     }
 }

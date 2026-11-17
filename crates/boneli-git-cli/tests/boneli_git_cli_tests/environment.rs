@@ -64,6 +64,31 @@ const CONFIG: &[(&str, &str)] = &[
 /// The subcommands that work on a throwaway index.
 const INDEXED: &[&str] = &["read-tree", "add", "write-tree", "apply"];
 
+/// The subcommands of `diff`, which write to a throwaway object directory.
+const THROWAWAY_OBJECTS: &[&str] = &["read-tree", "add", "write-tree", "diff-tree"];
+
+/// Undoes the runner's quoting of an alternate: `"..."` with octal escapes.
+fn unquote(entry: &str) -> String {
+    let inner = entry
+        .strip_prefix('"')
+        .and_then(|e| e.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("not quoted: {entry}"));
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let octal = std::str::from_utf8(&bytes[i + 1..i + 4]).expect("ascii");
+            out.push(u8::from_str_radix(octal, 8).expect("octal"));
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("utf-8")
+}
+
 /// Runs the whole suite through a recording git and returns every call.
 fn recorded_suite(tmp: &TempDir) -> (Vec<Call>, std::path::PathBuf) {
     let (source, base) = contract_source(tmp);
@@ -94,9 +119,11 @@ fn every_call_has_the_fixed_environment() {
     }
     want.sort();
     let mut seen_indexed = false;
+    let mut seen_objects = false;
     for call in &calls {
         let mut keys = call.keys();
-        let indexed = INDEXED.contains(&call.subcommand().unwrap_or(""));
+        let sub = call.subcommand().unwrap_or("");
+        let indexed = INDEXED.contains(&sub);
         if indexed {
             let at = keys
                 .iter()
@@ -104,6 +131,37 @@ fn every_call_has_the_fixed_environment() {
                 .unwrap_or_else(|| panic!("no GIT_INDEX_FILE: {call:?}"));
             keys.remove(at);
             seen_indexed = true;
+        }
+        // `diff`'s calls, and only they, write new objects to a throwaway
+        // directory under `<root>/tmp/` and read the store's as the one
+        // alternate: `add` and `diff-tree` always, `read-tree` when it
+        // reads a work tree.
+        let in_work_tree = call.args.iter().any(|a| a.starts_with("--work-tree="));
+        let must = sub == "add" || sub == "diff-tree" || (sub == "read-tree" && in_work_tree);
+        if let Some(objects) = call.var("GIT_OBJECT_DIRECTORY") {
+            assert!(THROWAWAY_OBJECTS.contains(&sub), "{call:?}");
+            let root = std::path::Path::new(call.var("HOME").expect("HOME"))
+                .parent()
+                .expect("the root");
+            let objects = std::path::Path::new(objects);
+            assert!(objects.starts_with(root.join("tmp")), "{call:?}");
+            assert!(objects.ends_with("objects"), "{call:?}");
+            let git_dir = call
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix("--git-dir="))
+                .expect("a git dir");
+            let alternate = call
+                .var("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .unwrap_or_else(|| panic!("no alternate: {call:?}"));
+            assert_eq!(unquote(alternate), format!("{git_dir}/objects"), "{call:?}");
+            for key in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+                let at = keys.iter().position(|k| k == key).expect("present");
+                keys.remove(at);
+            }
+            seen_objects = true;
+        } else {
+            assert!(!must, "no throwaway object directory: {call:?}");
         }
         assert_eq!(keys, want, "{call:?}");
         assert_eq!(
@@ -136,6 +194,7 @@ fn every_call_has_the_fixed_environment() {
         );
     }
     assert!(seen_indexed);
+    assert!(seen_objects);
 }
 
 #[test]
@@ -177,11 +236,16 @@ fn every_call_names_its_git_dir() {
 #[test]
 fn no_call_runs_in_a_workspace() {
     let tmp = TempDir::new("no-workspace");
-    let (calls, _) = recorded_suite(&tmp);
+    let (calls, base_dir) = recorded_suite(&tmp);
     for call in &calls {
-        let cwd = call.cwd.to_string_lossy();
-        assert!(!cwd.contains("/scratch"), "{call:?}");
-        assert!(!cwd.contains("tripwire"), "{call:?}");
+        // `HOME` is `<root>/home`; compared as path prefixes, so a
+        // checkout under a directory named `scratch...` changes nothing.
+        let root = std::path::Path::new(call.var("HOME").expect("HOME"))
+            .parent()
+            .expect("the root");
+        assert!(!call.cwd.starts_with(root.join("scratch")), "{call:?}");
+        assert!(!call.cwd.starts_with(root.join("tmp")), "{call:?}");
+        assert!(!call.cwd.starts_with(base_dir.join("tripwire")), "{call:?}");
     }
 }
 

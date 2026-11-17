@@ -2,8 +2,10 @@
 //!
 //! - The binary is an absolute path; `PATH` is never searched.
 //! - The environment is cleared and then holds exactly [`Runner`]'s fixed
-//!   variables, a throwaway `GIT_INDEX_FILE` where a call needs one, and
-//!   the command-scope config of [`CONFIG`] through `GIT_CONFIG_COUNT`,
+//!   variables, a throwaway `GIT_INDEX_FILE` where a call needs one, a
+//!   throwaway `GIT_OBJECT_DIRECTORY` with the store's objects as its only
+//!   alternate where a call must not write into the store, and the
+//!   command-scope config of [`CONFIG`] through `GIT_CONFIG_COUNT`,
 //!   `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`. Nothing from the host's
 //!   environment reaches git (`GIT_DIR`, `GIT_CONFIG_PARAMETERS`, `HOME`,
 //!   `GIT_SSH_COMMAND`, ...), no system or global config is read, and the
@@ -18,8 +20,9 @@
 //!   stderr is blank (ADR-004, D4). git's messages are reported, never
 //!   parsed.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -78,6 +81,10 @@ pub(crate) struct Call<'a> {
     pub work_tree: Option<&'a Path>,
     /// `GIT_INDEX_FILE`.
     pub index: Option<&'a Path>,
+    /// `GIT_OBJECT_DIRECTORY`, a throwaway directory that new objects go
+    /// to; `<git_dir>/objects` is then its only alternate, read and never
+    /// written.
+    pub objects: Option<&'a Path>,
     /// Bytes for stdin; stdin is empty without them.
     pub stdin: Option<&'a [u8]>,
 }
@@ -89,9 +96,27 @@ impl Call<'_> {
             git_dir: Some(git_dir),
             work_tree: None,
             index: None,
+            objects: None,
             stdin: None,
         }
     }
+}
+
+/// `path` as one entry of `GIT_ALTERNATE_OBJECT_DIRECTORIES`: in double
+/// quotes, every byte but `[A-Za-z0-9/._-]` as a three-digit octal escape.
+/// git C-unquotes an entry that starts with `"`, so neither the separator
+/// `:` nor a leading `"` or `#` in the root's path changes what it names.
+fn alternate(path: &Path) -> OsString {
+    let mut out = vec![b'"'];
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-') {
+            out.push(b);
+        } else {
+            out.extend_from_slice(format!("\\{b:03o}").as_bytes());
+        }
+    }
+    out.push(b'"');
+    OsString::from_vec(out)
 }
 
 /// Starts git processes under the rules above.
@@ -151,6 +176,15 @@ impl Runner {
         }
         if let Some(index) = call.index {
             command.env("GIT_INDEX_FILE", index);
+        }
+        if let Some(objects) = call.objects {
+            let store = call
+                .git_dir
+                .ok_or("a throwaway object directory needs a --git-dir")?;
+            command.env("GIT_OBJECT_DIRECTORY", objects).env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                alternate(&store.join("objects")),
+            );
         }
         match call.git_dir {
             Some(dir) => {
@@ -293,6 +327,16 @@ mod tests {
         }
         // Numeric, not lexical: 2.100 is newer than 2.39.
         assert!(parse_version("git version 2.100.0") > parse_version("git version 2.39.1"));
+    }
+
+    #[test]
+    fn alternate_is_quoted() {
+        let quoted = |p: &[u8]| alternate(Path::new(OsStr::from_bytes(p))).into_vec();
+        assert_eq!(quoted(b"/r/s_1/a-b.c"), b"\"/r/s_1/a-b.c\"");
+        assert_eq!(
+            quoted(b"/a:b\"#c \\\xff"),
+            b"\"/a\\072b\\042\\043c\\040\\134\\377\""
+        );
     }
 
     #[test]

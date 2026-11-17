@@ -23,6 +23,7 @@
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod cli;
+mod lookalike;
 mod materialize;
 mod run;
 #[cfg(test)]

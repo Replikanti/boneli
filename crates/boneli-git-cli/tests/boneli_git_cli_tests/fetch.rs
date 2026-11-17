@@ -8,7 +8,7 @@ use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Transports};
 
 use crate::support::record::Recorder;
 use crate::support::{
-    Source, TempDir, cli, decode, edit, failed, fgit, listing, path, sha, unpack_all,
+    Source, TempDir, cli, decode, edit, failed, fgit, listing, open, path, sha, unpack_all,
 };
 
 /// Every refused URL is refused by the pure check and by `fetch_base`
@@ -137,6 +137,70 @@ fn fetch_classification() {
     // And a good fetch keeps its store.
     git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     assert_eq!(stores().len(), 1);
+}
+
+/// `len` bytes no compressor shrinks: a xorshift stream.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[3]
+        })
+        .collect()
+}
+
+/// A git that cannot write a file past 256 KiB (`ulimit -f 512`, in
+/// 512-byte blocks): a stand-in for a full disk under the root.
+fn write_limited_git(tmp: &TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let git = tmp.path().join("limited-git");
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nulimit -f 512\nexec '{}' \"$@\"\n",
+            crate::support::host_git().display()
+        ),
+    )
+    .expect("write the wrapper");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    git
+}
+
+/// The remote advertises the commit, so a failed fetch of it is the fetch's
+/// failure, never `UnknownCommit`: a local write failure and a remote that
+/// lost an object (ADR-010, D6). The store is removed either way.
+#[test]
+fn advertised_commit_fetch_failure_is_failed() {
+    let tmp = TempDir::new("advertised-failure");
+    // A local write failure while the pack arrives.
+    let big = Source::new(&tmp, "big", false);
+    big.write("blob", &incompressible(2 << 20), false);
+    let tip = big.commit("big");
+    let git = open(&tmp, &write_limited_git(&tmp), DEFAULT_MAX_NODES);
+    let detail = failed(git.fetch_base(&big.url(), &sha(&tip)));
+    assert!(!detail.trim().is_empty());
+    assert_eq!(listing(&git.root().join("stores")), Vec::<String>::new());
+
+    // A remote that lost a blob of its advertised HEAD.
+    let broken = Source::new(&tmp, "broken", false);
+    broken.write("a", b"lost blob\n", false);
+    let head = broken.commit("base");
+    let blob = fgit(&broken.dir, &["rev-parse", "HEAD:a"]);
+    std::fs::remove_file(
+        broken
+            .dir
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .expect("remove the loose blob");
+    let git = cli(&tmp);
+    let detail = failed(git.fetch_base(&broken.url(), &sha(&head)));
+    assert!(!detail.trim().is_empty());
+    assert_eq!(listing(&git.root().join("stores")), Vec::<String>::new());
 }
 
 #[test]

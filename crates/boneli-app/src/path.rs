@@ -45,7 +45,7 @@ impl RelativePath {
     /// `.git`, the top-level repository's or a nested one's. The one rule
     /// for the `Git` suite, `MemoryGit` and the real adapter (#30, ADR-010
     /// D1). Look-alikes (`.GIT`, `git~1`, `.git.`) are content here; the
-    /// real adapter refuses them through git's own path checks.
+    /// real adapter refuses them before it writes a workspace (ADR-010 D6).
     pub fn is_repository_metadata(&self) -> bool {
         self.0.split('/').any(|component| component == ".git")
     }
