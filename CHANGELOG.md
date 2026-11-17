@@ -316,6 +316,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run) and a ramfs root. The `oci-acceptance` workflow (weekly, on demand
   and on PRs that edit it) pulls `node:22` and `postgres:17` on x86_64 and
   arm64 and runs them in the sandbox.
+- The `Git` contract gains `workspace-metadata-inert`, part 1 of #30
+  (ADR-010, proposed): repository metadata planted in a workspace (`.git`,
+  also nested) runs nothing, leaves the diff unchanged, does not change
+  later diffs or applies of the same or a fresh checkout, and a diff that
+  writes it does not apply. `RelativePath::is_repository_metadata` is the
+  one rule (some component is exactly `.git`); `MemoryGit` drops metadata
+  from a workspace and refuses a diff that touches it. The suite takes a
+  `retarget` hook and a `Tripwire` fixture; one mutant per sub-check
+  (`RunsMetadata`, `MetadataIsContent`, `AdoptsPerCheckout`,
+  `AdoptsIntoNewCheckouts`, `AdoptsOnApply`, `AppliesMetadata`): 50
+  clauses, 62 mutant cases. Fixture guards require every metadata entry
+  to reach the workspace and every diff pointed at metadata to apply
+  once moved back to content. `boneli_replay_check::mutants` gains a
+  regression table (5 mutants) and vacuous-fixture violations (5), both
+  rendered under the replay gate.
 
 ### Changed
 

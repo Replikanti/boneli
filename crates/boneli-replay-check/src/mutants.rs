@@ -778,9 +778,86 @@ enum GitBug {
     /// A diff that does not apply is ignored instead of refused: `apply`
     /// returns the checkout it was given.
     ToleratesMismatch,
+    /// A correct diff that runs a hook it finds in the workspace, as a git
+    /// that discovers the workspace's `.git` would (#30).
+    RunsMetadata,
+    /// `diff` encodes repository metadata as content.
+    MetadataIsContent,
+    /// After a diff that saw repository metadata, every later diff starts
+    /// with a header, as a store that adopted the workspace's config would.
+    AdoptsMetadata,
+    /// Adoption into the store of the checkout whose diff saw metadata:
+    /// later diffs of that checkout start with a header (review of #61).
+    AdoptsPerCheckout,
+    /// Adoption that shows only in a non-empty diff, as a planted
+    /// `diff.noprefix` would (review of #61).
+    AdoptsOnChanges,
+    /// A hook that runs only when the same checkout is diffed again
+    /// (review of #61).
+    RunsOnRediff,
+    /// Adoption into what new checkouts start from, as a shared template
+    /// or global config would: diffs of checkouts fetched after a diff saw
+    /// metadata start with a header.
+    AdoptsIntoNewCheckouts,
+    /// After a diff that saw metadata, `apply` also writes a file, as an
+    /// adopted hook would.
+    AdoptsOnApply,
+    /// `apply` accepts a diff that writes repository metadata, leaving the
+    /// tree as it was instead of refusing it.
+    AppliesMetadata,
+    /// `apply` refuses a diff that writes repository metadata, but only
+    /// after writing into the checkout it was given.
+    WritesThenRefuses,
+    /// `diff` drops only the top-level `.git` and encodes nested
+    /// repository metadata as content (review round 2 of #61).
+    NestedIsContent,
 }
 
 const HEADER: &[u8] = b"diff\n";
+
+/// Repository metadata below the top level, such as `sub/.git/config`.
+fn is_nested_metadata(path: &RelativePath) -> bool {
+    path.is_repository_metadata() && !path.as_str().starts_with(".git/")
+}
+
+/// Whether some component of the path is `.git` and the next is `hooks`.
+fn is_hook(path: &RelativePath) -> bool {
+    let components: Vec<&str> = path.as_str().split('/').collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0] == ".git" && pair[1] == "hooks")
+}
+
+/// The metadata entries of a workspace in `MemoryGit`'s diff format: each
+/// path, `1` and the content, as an adapter that does not drop them would
+/// write them.
+fn metadata_as_changes(workspace: &Tree) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (path, content) in workspace {
+        if path.is_repository_metadata() {
+            put_field(&mut out, path.as_str().as_bytes());
+            out.push(1);
+            put_field(&mut out, content);
+        }
+    }
+    out
+}
+
+/// One field of `MemoryGit`'s formats: its length in 8 big-endian bytes,
+/// then the bytes.
+fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Reads one field; `None` when it runs past the end.
+fn take_field<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length = rest.get(..8)?;
+    let n = usize::try_from(u64::from_be_bytes(length.try_into().ok()?)).ok()?;
+    let bytes = rest.get(8..8usize.checked_add(n)?)?;
+    *rest = &rest[8 + n..];
+    Some(bytes)
+}
 
 struct GitMutant {
     bug: GitBug,
@@ -789,6 +866,28 @@ struct GitMutant {
     moved: Mutex<Vec<(CheckoutId, CheckoutId)>>,
     /// The last diff applied (`PoisonsBase`).
     last_diff: Mutex<Option<Vec<u8>>>,
+    /// Whether a hook ran (`RunsMetadata`); [`MutantTripwire`] reads it.
+    ran: Mutex<bool>,
+    /// Whether a diff saw repository metadata (`AdoptsMetadata`).
+    adopted: Mutex<bool>,
+    /// Checkouts whose diff saw metadata (`AdoptsPerCheckout`,
+    /// `RunsOnRediff`) or that were fetched after one did
+    /// (`AdoptsIntoNewCheckouts`).
+    tainted: Mutex<Vec<CheckoutId>>,
+}
+
+/// Reports a hook run that [`GitBug::RunsMetadata`] recorded.
+struct MutantTripwire;
+
+impl contract::git::Tripwire<GitMutant> for MutantTripwire {
+    fn tripped(&self, adapter: &GitMutant) -> Result<Vec<String>, String> {
+        let ran = *adapter.ran.lock().expect("not poisoned");
+        Ok(if ran {
+            vec![String::from("a hook from the workspace")]
+        } else {
+            vec![]
+        })
+    }
 }
 
 impl GitMutant {
@@ -812,9 +911,15 @@ impl Git for GitMutant {
                 None => Ok(fetched),
             };
         }
+        let adopted = *self.adopted.lock().expect("not poisoned");
         match (self.bug, self.inner.fetch_base(repo, base)) {
             (GitBug::UnknownIsOk, Err(GitError::UnknownCommit)) => {
                 Ok(CheckoutId::new(String::from("checkout-0")))
+            }
+            (GitBug::AdoptsIntoNewCheckouts, Ok(fetched)) if adopted => {
+                let mut tainted = self.tainted.lock().expect("not poisoned");
+                tainted.push(fetched.clone());
+                Ok(fetched)
             }
             (_, got) => got,
         }
@@ -844,7 +949,11 @@ impl Git for GitMutant {
         let from = self.resolve(checkout);
         let base = unpack_tree(&self.inner.snapshot(&from)?).unwrap_or_default();
         let mut tree = unpack_tree(workspace).unwrap_or_default();
+        let sees_metadata = tree.keys().any(RelativePath::is_repository_metadata);
         match self.bug {
+            GitBug::RunsMetadata if tree.keys().any(is_hook) => {
+                *self.ran.lock().expect("not poisoned") = true;
+            }
             GitBug::DropsNewFiles => tree.retain(|path, _| base.contains_key(path)),
             GitBug::DropsRemovals => {
                 for (path, content) in base {
@@ -859,8 +968,37 @@ impl Git for GitMutant {
             }
             _ => self.inner.diff(&from, workspace)?,
         };
+        let adopted = {
+            let mut adopted = self.adopted.lock().expect("not poisoned");
+            let before = *adopted;
+            *adopted |= sees_metadata;
+            before
+        };
+        let tainted = {
+            let mut tainted = self.tainted.lock().expect("not poisoned");
+            let before = tainted.contains(checkout);
+            let per_checkout = matches!(self.bug, GitBug::AdoptsPerCheckout | GitBug::RunsOnRediff);
+            if per_checkout && sees_metadata && !before {
+                tainted.push(checkout.clone());
+            }
+            before
+        };
+        if let (GitBug::RunsOnRediff, true) = (self.bug, tainted) {
+            *self.ran.lock().expect("not poisoned") = true;
+        }
         Ok(match self.bug {
             GitBug::Header => [HEADER, &diff].concat(),
+            GitBug::MetadataIsContent => [diff, metadata_as_changes(&tree)].concat(),
+            GitBug::NestedIsContent => {
+                let mut nested = tree.clone();
+                nested.retain(|path, _| !path.as_str().starts_with(".git/"));
+                [diff, metadata_as_changes(&nested)].concat()
+            }
+            GitBug::AdoptsMetadata if adopted => [HEADER, &diff].concat(),
+            GitBug::AdoptsOnChanges if adopted && !diff.is_empty() => [HEADER, &diff].concat(),
+            GitBug::AdoptsPerCheckout | GitBug::AdoptsIntoNewCheckouts if tainted => {
+                [HEADER, &diff].concat()
+            }
             _ => diff,
         })
     }
@@ -877,6 +1015,32 @@ impl Git for GitMutant {
                 Err(GitError::Failed { .. }) => Ok(checkout.clone()),
                 other => other,
             },
+            GitBug::AppliesMetadata => match self.inner.apply(&from, diff) {
+                Err(GitError::Failed { .. }) if diff.windows(4).any(|w| w == b".git") => {
+                    self.inner.apply(&from, &[])
+                }
+                other => other,
+            },
+            GitBug::WritesThenRefuses => match self.inner.apply(&from, diff) {
+                Err(error) if diff.windows(4).any(|w| w == b".git") => {
+                    let mut extra = Vec::new();
+                    put_field(&mut extra, b"written");
+                    extra.push(1);
+                    put_field(&mut extra, b"before the refusal");
+                    let written = self.inner.apply(&from, &extra)?;
+                    let mut moved = self.moved.lock().expect("not poisoned");
+                    moved.push((checkout.clone(), written));
+                    Err(error)
+                }
+                other => other,
+            },
+            GitBug::AdoptsOnApply if *self.adopted.lock().expect("not poisoned") => {
+                let mut extra = Vec::new();
+                put_field(&mut extra, b"adopted");
+                extra.push(1);
+                put_field(&mut extra, b"by a hook");
+                self.inner.apply(&from, &[diff, &extra].concat())
+            }
             GitBug::InPlace => {
                 let applied = self.inner.apply(&from, diff)?;
                 let mut moved = self.moved.lock().expect("not poisoned");
@@ -907,6 +1071,9 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
             inner,
             moved: Mutex::new(Vec::new()),
             last_diff: Mutex::new(None),
+            ran: Mutex::new(false),
+            adopted: Mutex::new(false),
+            tainted: Mutex::new(Vec::new()),
         },
         repo,
         base,
@@ -915,7 +1082,55 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
         missing: path("src/missing.rs"),
         unknown: CommitSha::parse(OTHER).expect("valid SHA"),
         edited: b"fn total() { 1 }\n".to_vec(),
+        // A fixed sentinel: nothing runs it here, and the replay gate
+        // compares the rendered lengths of `same-diff` across processes, so
+        // it must not vary. A real adapter's test uses a unique one per
+        // fixture (`contract::git::Tripwire`).
+        metadata: vec![
+            (
+                path(".git/config"),
+                b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n\thooksPath = .git/hooks\n".to_vec(),
+            ),
+            (
+                path(".git/hooks/post-index-change"),
+                b"#!/bin/sh\ntouch /tmp/boneli-tripwire/tripped\n".to_vec(),
+            ),
+            (
+                path("sub/.git/config"),
+                b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n".to_vec(),
+            ),
+        ],
     }
+}
+
+/// Moves every change of `from` in a diff of `MemoryGit`'s format to
+/// `to`; a malformed diff comes back as it was.
+fn git_retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> {
+    let mut rest = diff;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let Some(path) = take_field(&mut rest) else {
+            return diff.to_vec();
+        };
+        let path = if path == from.as_str().as_bytes() {
+            to.as_str().as_bytes()
+        } else {
+            path
+        };
+        put_field(&mut out, path);
+        let Some((&tag, tail)) = rest.split_first() else {
+            return diff.to_vec();
+        };
+        rest = tail;
+        out.push(tag);
+        if tag == 1 {
+            let Some(content) = take_field(&mut rest) else {
+                return diff.to_vec();
+            };
+            put_field(&mut out, content);
+        }
+    }
+    out
 }
 
 fn git_edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
@@ -1243,9 +1458,10 @@ pub fn mutants() -> Vec<Mutant> {
             contract::sandbox::run(|| sandbox_workspace(bug))
         })
     };
-    let git = |clause, bug| {
-        mutant("Git", clause, move || {
-            contract::git::run(|| git_repository(bug), git_edit)
+    let git = |clause, bug| mutant("Git", clause, move || git_suite(bug));
+    let git_metadata = |sub, bug| {
+        sub_mutant("Git", "workspace-metadata-inert", sub, move || {
+            git_suite(bug)
         })
     };
     let image = |clause, bug| {
@@ -1278,6 +1494,12 @@ pub fn mutants() -> Vec<Mutant> {
         git("added-file", GitBug::DropsNewFiles),
         git("removed-file", GitBug::DropsRemovals),
         git("apply-mismatch-fails", GitBug::ToleratesMismatch),
+        git_metadata("nothing-ran", GitBug::RunsMetadata),
+        git_metadata("same-diff", GitBug::MetadataIsContent),
+        git_metadata("same-checkout", GitBug::AdoptsPerCheckout),
+        git_metadata("fresh-checkout", GitBug::AdoptsIntoNewCheckouts),
+        git_metadata("same-apply", GitBug::AdoptsOnApply),
+        git_metadata("apply-refuses", GitBug::AppliesMetadata),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
@@ -1321,6 +1543,121 @@ pub fn mutants() -> Vec<Mutant> {
         }));
     }
     all
+}
+
+fn git_suite(bug: GitBug) -> Result<(), Violation> {
+    contract::git::run(
+        || git_repository(bug),
+        git_edit,
+        git_retarget,
+        &MutantTripwire,
+    )
+}
+
+/// Mutants that review found passing an earlier version of a suite, and
+/// mutants for a second check site of a case. Each is caught by a clause
+/// case that already has its own mutant in [`mutants`], so they stay out
+/// of that table, which is a bijection; they are checked and rendered the
+/// same way.
+pub fn regression_mutants() -> Vec<Mutant> {
+    let git_metadata = |sub, bug| {
+        sub_mutant("Git", "workspace-metadata-inert", sub, move || {
+            git_suite(bug)
+        })
+    };
+    vec![
+        // Review of #61: adoption that every later diff shows; it was the
+        // `later-diff` mutant before that sub-check was split.
+        git_metadata("same-checkout", GitBug::AdoptsMetadata),
+        // Review of #61: adoption that shows only in a non-empty diff.
+        git_metadata("same-checkout", GitBug::AdoptsOnChanges),
+        // Review of #61: a hook that runs only on a second diff of the same
+        // checkout.
+        git_metadata("nothing-ran", GitBug::RunsOnRediff),
+        // The second site of `apply-refuses`: the refused checkout is
+        // unchanged.
+        git_metadata("apply-refuses", GitBug::WritesThenRefuses),
+        // Review round 2 of #61: nested metadata treated as content.
+        git_metadata("same-diff", GitBug::NestedIsContent),
+    ]
+}
+
+/// An `edit` fixture hook of the `Git` suite.
+type EditHook = dyn Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>;
+
+/// The violations of `workspace-metadata-inert` with fixture hooks that
+/// review of #61 showed making it vacuous, each on a mutant it let
+/// through: an `edit` that never writes metadata (round 1), one that skips
+/// or later drops the nested entry, and a `retarget` that breaks diffs
+/// pointed at metadata (round 2). The suite rejects the fixture.
+pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)> {
+    let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let run = |bug| {
+        contract::git::run(
+            || git_repository(bug),
+            skipping,
+            git_retarget,
+            &MutantTripwire,
+        )
+    };
+    // Review round 2 of #61: an `edit` that skips only the nested entry,
+    // or drops it once the top-level `.git` is there.
+    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if is_nested_metadata(p) {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        let top = unpack_tree(w)
+            .unwrap_or_default()
+            .keys()
+            .any(|k| k.as_str().starts_with(".git/"));
+        if top && is_nested_metadata(p) {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let nested = |edit: &EditHook| {
+        contract::git::run(
+            || git_repository(GitBug::NestedIsContent),
+            edit,
+            git_retarget,
+            &MutantTripwire,
+        )
+    };
+    // Review round 2 of #61: a `retarget` that breaks diffs pointed at
+    // metadata, so any `apply` refuses them.
+    let garbles_metadata = |d: &[u8], from: &RelativePath, to: &RelativePath| {
+        if to.is_repository_metadata() {
+            b"garbage".to_vec()
+        } else {
+            git_retarget(d, from, to)
+        }
+    };
+    vec![
+        ("RunsMetadata", run(GitBug::RunsMetadata)),
+        ("MetadataIsContent", run(GitBug::MetadataIsContent)),
+        ("NestedIsContent skipped", nested(&skip_nested)),
+        ("NestedIsContent dropped later", nested(&drop_nested_later)),
+        (
+            "AppliesMetadata garbled",
+            contract::git::run(
+                || git_repository(GitBug::AppliesMetadata),
+                git_edit,
+                garbles_metadata,
+                &MutantTripwire,
+            ),
+        ),
+    ]
 }
 
 /// The violations of fixtures with a blank status, one per job-port
@@ -1367,7 +1704,9 @@ pub fn blank_status_violations() -> Vec<(&'static str, Result<(), Violation>)> {
 }
 
 /// For each mutant: `mutant <port> <clause> <operation>` and the pretty
-/// `Debug` of its suite's result; then the blank-status violations.
+/// `Debug` of its suite's result; the same for each regression mutant
+/// (`regression ...`); then the blank-status and vacuous-fixture
+/// violations.
 pub fn render_violations() -> String {
     let mut out = String::new();
     for m in mutants() {
@@ -1381,8 +1720,21 @@ pub fn render_violations() -> String {
             (m.run)()
         );
     }
+    for m in regression_mutants() {
+        let _ = write!(
+            out,
+            "regression {} {} {}\n{:#?}\n",
+            m.port,
+            m.clause,
+            m.operation,
+            (m.run)()
+        );
+    }
     for (port, result) in blank_status_violations() {
         let _ = write!(out, "blank-status {port}\n{result:#?}\n");
+    }
+    for (name, result) in vacuous_fixture_violations() {
+        let _ = write!(out, "vacuous-fixture Git {name}\n{result:#?}\n");
     }
     out
 }

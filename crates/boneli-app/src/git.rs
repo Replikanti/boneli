@@ -91,6 +91,12 @@ pub trait Git {
 
     /// The diff from the checkout to a workspace in the snapshot format.
     /// Empty when the workspace is the checkout's own snapshot.
+    ///
+    /// The workspace comes from the sandbox, where the agent writes. Its
+    /// repository metadata ([`RelativePath::is_repository_metadata`]) is
+    /// not content and never steers the adapter's git: it is left out of
+    /// the diff, nothing it names (a hook, `core.fsmonitor`) runs, and no
+    /// later operation follows its config (ADR-010, D1).
     fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError>;
 
     /// Applies a diff to the checkout and returns a new checkout; the one

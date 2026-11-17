@@ -1,5 +1,7 @@
 //! Every in-memory adapter passes its port's contract suite (ADR-004, D2).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
     Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase, RelativePath, RepoUrl,
@@ -255,7 +257,90 @@ pub fn repository() -> contract::git::Repository<MemoryGit> {
         missing: path("src/missing.rs"),
         unknown: CommitSha::parse(OTHER).expect("valid SHA"),
         edited: b"fn total() { 1 }\n".to_vec(),
+        metadata: metadata(),
     }
+}
+
+/// Repository metadata an agent could leave in a workspace: a config that
+/// names a command for `core.fsmonitor` and a hooks directory, a hook git
+/// runs when it writes an index, and the config of a nested repository.
+/// The sentinel is an absolute path outside anything an adapter creates or
+/// removes, unique to each fixture, as `Tripwire` requires; `MemoryGit`
+/// runs nothing, so here it is only an example and is never created.
+pub fn metadata() -> Vec<(RelativePath, Vec<u8>)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let sentinel = std::env::temp_dir()
+        .join(format!("boneli-tripwire-{}-{n}", std::process::id()))
+        .join("tripped");
+    let touch = format!("touch {}", sentinel.display());
+    vec![
+        (
+            path(".git/config"),
+            format!("[core]\n\tfsmonitor = {touch}\n\thooksPath = .git/hooks\n").into_bytes(),
+        ),
+        (
+            path(".git/hooks/post-index-change"),
+            format!("#!/bin/sh\n{touch}\n").into_bytes(),
+        ),
+        (
+            path("sub/.git/config"),
+            format!("[core]\n\tfsmonitor = {touch}\n").into_bytes(),
+        ),
+    ]
+}
+
+/// `MemoryGit` runs nothing, so nothing it does can trip.
+pub struct NothingRuns;
+
+impl contract::git::Tripwire<MemoryGit> for NothingRuns {
+    fn tripped(&self, _adapter: &MemoryGit) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+}
+
+/// One field of `MemoryGit`'s formats; `None` when it runs past the end.
+fn take_field<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let n = usize::try_from(u64::from_be_bytes(length)).ok()?;
+    let bytes = rest.get(8..8usize.checked_add(n)?)?;
+    *rest = &rest[8 + n..];
+    Some(bytes)
+}
+
+fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Moves every change of `from` in a diff of `MemoryGit`'s format to `to`;
+/// a malformed diff comes back as it was.
+pub fn retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> {
+    let mut rest = diff;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let Some(path) = take_field(&mut rest) else {
+            return diff.to_vec();
+        };
+        let path = if path == from.as_str().as_bytes() {
+            to.as_str().as_bytes()
+        } else {
+            path
+        };
+        put_field(&mut out, path);
+        let Some((&tag, tail)) = rest.split_first() else {
+            return diff.to_vec();
+        };
+        rest = tail;
+        out.push(tag);
+        if tag == 1 {
+            let Some(content) = take_field(&mut rest) else {
+                return diff.to_vec();
+            };
+            put_field(&mut out, content);
+        }
+    }
+    out
 }
 
 /// Sets or removes a file in a workspace of `MemoryGit`'s snapshot format.
@@ -270,7 +355,262 @@ pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Ve
 
 #[test]
 fn in_memory_git_passes_contract() {
-    assert_eq!(contract::git::run(repository, edit), Ok(()));
+    assert_eq!(
+        contract::git::run(repository, edit, retarget, &NothingRuns),
+        Ok(())
+    );
+}
+
+fn git_clause(result: Result<(), contract::Violation>) -> (&'static str, String) {
+    match result {
+        Ok(()) => ("", String::new()),
+        Err(v) => (v.clause, v.detail),
+    }
+}
+
+/// A metadata fixture that holds a content path would let an adapter that
+/// treats metadata as content pass `same-diff` on that entry alone.
+#[test]
+fn metadata_fixture_must_be_metadata() {
+    let content = || {
+        let mut r = repository();
+        r.metadata.push((path("src/x.rs"), b"fn x() {}\n".to_vec()));
+        r
+    };
+    let (clause, detail) = git_clause(contract::git::run(content, edit, retarget, &NothingRuns));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    assert!(detail.contains("src/x.rs"), "{detail}");
+}
+
+/// An `edit` that never writes metadata into the workspace makes the
+/// clause vacuous: the adapter never sees any (review of #61).
+#[test]
+fn metadata_fixture_must_reach_the_workspace() {
+    let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        skipping,
+        retarget,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+}
+
+/// `apply-refuses` is only as good as the diff it applies: a `retarget`
+/// that makes garbage, or ignores its target, is a violation, and so is a
+/// base that already has the twin path.
+#[test]
+fn retarget_must_make_a_diff_that_applies() {
+    let garbage = |_: &[u8], _: &RelativePath, _: &RelativePath| b"garbage".to_vec();
+    let ignores = |d: &[u8], _: &RelativePath, _: &RelativePath| d.to_vec();
+    for result in [
+        contract::git::run(repository, edit, garbage, &NothingRuns),
+        contract::git::run(repository, edit, ignores, &NothingRuns),
+    ] {
+        let (clause, detail) = git_clause(result);
+        assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+        assert!(detail.starts_with("fixture:"), "{detail}");
+        assert!(detail.contains("retarget"), "{detail}");
+    }
+    let twin_exists = || {
+        let r = repository();
+        let mut files: Tree = [
+            (path("src/lib.rs"), b"fn total() {}\n".to_vec()),
+            (path("src/missing.rs.twin"), b"here".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        files.insert(path("README"), b"app".to_vec());
+        contract::git::Repository {
+            adapter: MemoryGit::new(vec![GitCommit {
+                repo: r.repo.clone(),
+                sha: r.base.clone(),
+                files,
+            }]),
+            ..r
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        twin_exists,
+        edit,
+        retarget,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    assert!(detail.contains("twin"), "{detail}");
+}
+
+/// Every metadata entry must reach the workspace on its own and in the
+/// full set: an `edit` that skips the nested entry, or drops it once the
+/// top-level `.git` is there, would let an adapter that drops only the
+/// top-level `.git` pass (review round 2 of #61).
+#[test]
+fn metadata_fixture_entries_each_reach_the_workspace() {
+    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        let top = unpack_tree(w)
+            .expect("a workspace")
+            .keys()
+            .any(|k| k.as_str().starts_with(".git/"));
+        if top && p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    for result in [
+        contract::git::run(repository, skip_nested, retarget, &NothingRuns),
+        contract::git::run(repository, drop_nested_later, retarget, &NothingRuns),
+    ] {
+        let (clause, detail) = git_clause(result);
+        assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+        assert!(detail.starts_with("fixture:"), "{detail}");
+        assert!(detail.contains("sub/.git/config"), "{detail}");
+    }
+}
+
+/// The refusal must come from the metadata rule, not from a diff that
+/// `retarget` broke for metadata targets: a diff retargeted to each
+/// metadata path and back must apply (review round 2 of #61).
+#[test]
+fn retarget_must_round_trip_through_metadata_paths() {
+    let garbles_metadata = |d: &[u8], from: &RelativePath, to: &RelativePath| {
+        if to.is_repository_metadata() {
+            b"garbage".to_vec()
+        } else {
+            retarget(d, from, to)
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        edit,
+        garbles_metadata,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    assert!(detail.contains(".git/config"), "{detail}");
+}
+
+/// Each fixture gets its own sentinel, so tests that run in parallel cannot
+/// clear each other's (review round 2 of #61).
+#[test]
+fn fixture_sentinels_are_unique() {
+    assert_ne!(repository().metadata, repository().metadata);
+}
+
+/// No metadata: every adapter would pass, so it is a violation.
+#[test]
+fn metadata_fixture_must_not_be_empty() {
+    let empty = || contract::git::Repository {
+        metadata: vec![],
+        ..repository()
+    };
+    let (clause, detail) = git_clause(contract::git::run(empty, edit, retarget, &NothingRuns));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+}
+
+/// A tripwire that is already tripped cannot tell what the clause caused.
+#[test]
+fn tripped_before_the_clause_is_a_violation() {
+    struct AlwaysTripped;
+    impl contract::git::Tripwire<MemoryGit> for AlwaysTripped {
+        fn tripped(&self, _adapter: &MemoryGit) -> Result<Vec<String>, String> {
+            Ok(vec![String::from("left over from an earlier run")])
+        }
+    }
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        edit,
+        retarget,
+        &AlwaysTripped,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    // A tripwire that cannot look is a violation too, not a pass.
+    struct Blind;
+    impl contract::git::Tripwire<MemoryGit> for Blind {
+        fn tripped(&self, _adapter: &MemoryGit) -> Result<Vec<String>, String> {
+            Err(String::from("cannot read the sentinel directory"))
+        }
+    }
+    let (clause, detail) = git_clause(contract::git::run(repository, edit, retarget, &Blind));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.contains("cannot read"), "{detail}");
+}
+
+/// Repository metadata in a workspace is not content: the diff is the one
+/// of the same workspace without it.
+#[test]
+fn memory_diff_drops_repository_metadata() {
+    use boneli_app::Git;
+    let r = repository();
+    let base = r.adapter.fetch_base(&r.repo, &r.base).expect("fetched");
+    let snapshot = r.adapter.snapshot(&base).expect("snapshot");
+    let plain = edit(&snapshot, &r.path, Some(&r.edited));
+    let mut hostile = plain.clone();
+    for (file, content) in [
+        (
+            ".git/config",
+            &b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n"[..],
+        ),
+        ("sub/.git/HEAD", b"ref: refs/heads/main\n"),
+    ] {
+        hostile = edit(&hostile, &path(file), Some(content));
+    }
+    let expected = r.adapter.diff(&base, &plain).expect("diff");
+    assert!(!expected.is_empty());
+    assert_eq!(r.adapter.diff(&base, &hostile), Ok(expected));
+    // Metadata alone is an unchanged workspace.
+    let only = edit(&snapshot, &path(".git/config"), Some(b"[core]\n"));
+    assert_eq!(r.adapter.diff(&base, &only), Ok(vec![]));
+}
+
+/// A diff that writes or removes a metadata path does not apply, as
+/// `git apply` refuses it with "invalid path".
+#[test]
+fn memory_apply_refuses_metadata_paths() {
+    use boneli_app::Git;
+    let r = repository();
+    let base = r.adapter.fetch_base(&r.repo, &r.base).expect("fetched");
+    let field = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    };
+    // Sets `.git/config`, packed by hand in `MemoryGit`'s diff format.
+    let mut sets = Vec::new();
+    field(&mut sets, b".git/config");
+    sets.push(1);
+    field(&mut sets, b"[core]\n");
+    // Removes `sub/.git`.
+    let mut removes = Vec::new();
+    field(&mut removes, b"sub/.git");
+    removes.push(0);
+    for diff in [sets, removes] {
+        assert!(matches!(
+            r.adapter.apply(&base, &diff),
+            Err(boneli_app::GitError::Failed { .. })
+        ));
+    }
+    // Nothing was created: the next checkout is the second one.
+    let next = r.adapter.fetch_base(&r.repo, &r.base).expect("fetched");
+    assert_eq!(next.as_str(), "checkout-2");
 }
 
 fn image(name: &str, digest: &str, platform: &str) -> ImageRef {
@@ -360,7 +700,7 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(
-        clause(contract::git::run(unchanged, edit)),
+        clause(contract::git::run(unchanged, edit, retarget, &NothingRuns)),
         "apply-then-read"
     );
     let own_base = || {
@@ -370,7 +710,10 @@ fn vacuous_fixtures_are_violations() {
             ..r
         }
     };
-    assert_eq!(clause(contract::git::run(own_base, edit)), "unknown-commit");
+    assert_eq!(
+        clause(contract::git::run(own_base, edit, retarget, &NothingRuns)),
+        "unknown-commit"
+    );
     let same_digest = || contract::image::Images {
         other_digest: images().present,
         ..images()
