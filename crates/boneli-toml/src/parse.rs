@@ -14,9 +14,13 @@ use crate::value::{Table, Value};
 /// In this order: the input is at most `limits.max_bytes()` long
 /// (`TooLarge` at offset `max_bytes`), it is UTF-8 (`InvalidUtf8` at the
 /// first bad byte), and then it is read in one pass. Depth is checked
-/// before every table or array is created, so the bytes after the
-/// offending bracket or key segment are never read. A value of a type
-/// outside the subset is `Unsupported` at its first byte.
+/// before every table or array is created, so nothing is built past
+/// `max_depth`. An over-deep bracket stops the read at that bracket. A
+/// key is read whole first (a header up to its closing `]`), so a syntax
+/// error later in an over-deep dotted key is reported instead of
+/// `TooDeep`; a well-formed one is `TooDeep` at the offending segment.
+/// A value of a type outside the subset is `Unsupported` at its first
+/// byte.
 pub fn parse(input: &[u8], limits: &Limits) -> Result<Table, Error> {
     if input.len() > limits.max_bytes() {
         return Err(Error::at(ErrorKind::TooLarge, limits.max_bytes(), input));

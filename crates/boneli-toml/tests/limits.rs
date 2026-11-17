@@ -88,6 +88,21 @@ fn depth_counts_every_route() {
     assert!(accepts("[[a]]\n[a.b]", &four));
 }
 
+// A key is read whole before its depth is checked (a header up to its
+// closing bracket), so a syntax error later in an over-deep key wins over
+// `TooDeep`; nothing is built past the limit either way.
+#[test]
+fn key_is_read_whole_before_depth() {
+    let two = limits(64, 2);
+    assert_eq!(kind_at("a.b.c = 1", &two), (ErrorKind::TooDeep, 2));
+    assert_eq!(
+        kind_at("a.b.\"\\q\" = 1", &two),
+        (ErrorKind::InvalidEscape, 5)
+    );
+    assert_eq!(kind_at("[a.b]", &two), (ErrorKind::TooDeep, 3));
+    assert_eq!(kind_at("[a.b\u{1}", &two), (ErrorKind::UnexpectedByte, 4));
+}
+
 #[test]
 fn depth_adds_header_dotted_and_inline() {
     let input = "[a.b]\nc.d = [{e = 1}]";

@@ -154,8 +154,12 @@ measured below.
 - `max_depth` bounds nesting: the root table is depth 1 and every table
   or array below it adds 1, whichever route creates it (a header, a
   dotted key, an inline value; `[[a]]` is 3, the array and its element).
-  It is checked before a container is created, so the bytes after the
-  offending bracket or key segment are never read.
+  It is checked before a container is created, so nothing is built past
+  the limit. An over-deep bracket stops the read at that bracket. A key
+  is read whole first (a header up to its closing `]`), so a syntax error
+  later in an over-deep dotted key is reported instead of `TooDeep`; a
+  well-formed one is `TooDeep` at the offending segment. Reading the key
+  allocates one segment list bounded by `max_bytes`, never a container.
 
 A decoded string never outgrows its encoding (escapes shrink, CRLF reads
 as LF, a line-ending backslash drops bytes), and the parser makes that
