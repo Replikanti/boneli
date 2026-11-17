@@ -940,6 +940,11 @@ enum ImageBug {
     ByName,
     /// Images resolve by name and digest; the platform is ignored.
     IgnoresPlatform,
+    /// Bytes that do not match their digest are accepted.
+    AcceptsTampered,
+    /// The first pull of a tampered image fails, but what it fetched is
+    /// kept and handed out by the second.
+    CachesTampered,
 }
 
 struct ImageMutant {
@@ -959,6 +964,18 @@ impl ImageStore for ImageMutant {
         });
         let image = resolved.unwrap_or(image);
         match (self.bug, self.inner.pull(image)) {
+            (ImageBug::AcceptsTampered, Err(ImageError::Failed { .. })) => {
+                Ok(RootfsRef::new(String::from("rootfs-tampered")))
+            }
+            (ImageBug::CachesTampered, Err(ImageError::Failed { detail })) => {
+                let mut pulls = self.pulls.lock().expect("not poisoned");
+                *pulls += 1;
+                if *pulls == 1 {
+                    Err(ImageError::Failed { detail })
+                } else {
+                    Ok(RootfsRef::new(String::from("rootfs-tampered")))
+                }
+            }
             (ImageBug::NewRootfsPerPull, Ok(rootfs)) => {
                 let mut pulls = self.pulls.lock().expect("not poisoned");
                 *pulls += 1;
@@ -982,10 +999,12 @@ fn image_ref(name: &str, digest: &str, platform: &str) -> ImageRef {
 
 fn images(bug: ImageBug) -> contract::image::Images<ImageMutant> {
     let present = image_ref("library/postgres", "sha256:aa", "linux/amd64");
+    let tampered = image_ref("library/redis", "sha256:cc", "linux/amd64");
     contract::image::Images {
         adapter: ImageMutant {
             bug,
-            inner: MemoryImageStore::new(vec![present.clone()]),
+            inner: MemoryImageStore::new(vec![present.clone()])
+                .with_tampered(vec![tampered.clone()]),
             pulls: Mutex::new(0),
             known: vec![present.clone()],
         },
@@ -993,6 +1012,7 @@ fn images(bug: ImageBug) -> contract::image::Images<ImageMutant> {
         missing: image_ref("library/node", "sha256:aa", "linux/amd64"),
         other_digest: image_ref("library/postgres", "sha256:bb", "linux/amd64"),
         other_platform: image_ref("library/postgres", "sha256:aa", "linux/arm64"),
+        tampered,
     }
 }
 
@@ -1134,6 +1154,22 @@ fn mutant(
     }
 }
 
+/// A mutant that breaks one sub-check (`operation`) of a clause that
+/// checks several; its violation detail starts with `<operation>:`.
+fn sub_mutant(
+    port: &'static str,
+    clause: &'static str,
+    operation: &'static str,
+    run: impl Fn() -> Result<(), Violation> + 'static,
+) -> Mutant {
+    Mutant {
+        port,
+        clause,
+        operation,
+        run: Box::new(run),
+    }
+}
+
 fn silent_mutant(
     port: &'static str,
     operation: &'static str,
@@ -1246,6 +1282,12 @@ pub fn mutants() -> Vec<Mutant> {
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
         image("platform-pinned", ImageBug::IgnoresPlatform),
+        sub_mutant("ImageStore", "tampered-refused", "first-pull", || {
+            contract::image::run(|| images(ImageBug::AcceptsTampered))
+        }),
+        sub_mutant("ImageStore", "tampered-refused", "second-pull", || {
+            contract::image::run(|| images(ImageBug::CachesTampered))
+        }),
         data("distinct-copies", DataBug::SameCopy),
         data("copies-independent", DataBug::SharedData),
         data("removed-copy-unknown", DataBug::RemoveIgnored),

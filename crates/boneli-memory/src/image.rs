@@ -10,10 +10,12 @@ use crate::lock;
 /// An `ImageStore` with a fixed set of images. The first pull of an image
 /// issues `rootfs-<n>` from a counter starting at 1, and every later pull
 /// of the same reference returns it again; an image outside the set is
-/// `NotFound`.
+/// `NotFound`, and a tampered one (its bytes do not match its digest)
+/// fails on every pull.
 #[derive(Debug, Default)]
 pub struct MemoryImageStore {
     images: BTreeSet<ImageRef>,
+    tampered: BTreeSet<ImageRef>,
     pulled: Mutex<BTreeMap<ImageRef, RootfsRef>>,
 }
 
@@ -22,13 +24,26 @@ impl MemoryImageStore {
     pub fn new(images: Vec<ImageRef>) -> MemoryImageStore {
         MemoryImageStore {
             images: images.into_iter().collect(),
+            tampered: BTreeSet::new(),
             pulled: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The same store, whose registry also serves these images with bytes
+    /// that do not match their digest (the `tampered-refused` clause).
+    pub fn with_tampered(mut self, tampered: Vec<ImageRef>) -> MemoryImageStore {
+        self.tampered = tampered.into_iter().collect();
+        self
     }
 }
 
 impl ImageStore for MemoryImageStore {
     fn pull(&self, image: &ImageRef) -> Result<RootfsRef, ImageError> {
+        if self.tampered.contains(image) {
+            return Err(ImageError::Failed {
+                detail: format!("{} does not match its digest {}", image.name, image.digest),
+            });
+        }
         if !self.images.contains(image) {
             return Err(ImageError::NotFound);
         }

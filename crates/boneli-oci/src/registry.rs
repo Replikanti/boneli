@@ -15,7 +15,7 @@
 //!   `setup + size / min_rate`, its token request and redirects included.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -226,6 +226,16 @@ impl FetchLimits {
         })
     }
 
+    /// The limits of an index, manifest or config.
+    pub(crate) fn document_limits(&self) -> &boneli_json::Limits {
+        &self.document
+    }
+
+    /// Layers of a manifest.
+    pub(crate) fn max_layers(&self) -> usize {
+        self.max_layers
+    }
+
     fn token(&self) -> Result<boneli_json::Limits, PullError> {
         boneli_json::Limits::new(
             self.max_token_bytes,
@@ -306,6 +316,29 @@ pub struct Resolved {
     pub config: ImageConfig,
 }
 
+/// Where [`Client::resolve_with`] keeps the documents it fetched: indexes,
+/// manifests and configs, by digest. The store keeps them on disk and
+/// re-hashes them on every read (ADR-009, D8).
+pub(crate) trait Documents {
+    /// The document `digest`, if it is kept and its bytes still hash to it.
+    fn get(&mut self, digest: &Digest) -> Result<Option<Fetched>, PullError>;
+    /// Keeps the document `digest`, whose bytes were checked against it.
+    fn put(&mut self, digest: &Digest, fetched: &Fetched) -> Result<(), PullError>;
+}
+
+/// Keeps nothing: every document is fetched.
+struct NoDocuments;
+
+impl Documents for NoDocuments {
+    fn get(&mut self, _: &Digest) -> Result<Option<Fetched>, PullError> {
+        Ok(None)
+    }
+
+    fn put(&mut self, _: &Digest, _: &Fetched) -> Result<(), PullError> {
+        Ok(())
+    }
+}
+
 /// What one exchange ended in.
 enum Step<T> {
     Done(T),
@@ -360,16 +393,26 @@ impl<'a> Client<'a> {
     /// directly a mismatch is `NotFound`, for one selected from an index
     /// it is `Failed`, because the index said otherwise.
     pub fn resolve(&mut self, reference: &Reference) -> Result<Resolved, PullError> {
+        self.resolve_with(reference, &mut NoDocuments)
+    }
+
+    /// [`Client::resolve`], taking each document from `documents` when it
+    /// is kept there and keeping every one it fetches.
+    pub(crate) fn resolve_with(
+        &mut self,
+        reference: &Reference,
+        documents: &mut dyn Documents,
+    ) -> Result<Resolved, PullError> {
         let repo = reference.repository();
         let digest = reference.digest();
         let platform = reference.platform();
-        let top = self.get_manifest(repo, digest, None)?;
+        let top = self.kept_manifest(documents, repo, digest, None)?;
         let (index, manifest_digest, manifest) = match self.document(&top, digest)? {
             Document::Manifest(m) => (None, *digest, m),
             Document::Index(index) => {
                 let entry = manifest::select(&index, platform)?;
                 let d = entry.descriptor.clone();
-                let fetched = self.get_manifest(repo, &d.digest, Some(d.size))?;
+                let fetched = self.kept_manifest(documents, repo, &d.digest, Some(d.size))?;
                 match self.document(&fetched, &d.digest)? {
                     Document::Manifest(m) if m.media_type == d.media_type => {
                         (Some(*digest), d.digest, m)
@@ -393,7 +436,7 @@ impl<'a> Client<'a> {
             self.check_blob_size(&layer.descriptor)?;
         }
         self.check_pull_size(&manifest)?;
-        let config = self.get_config(repo, &manifest.config)?;
+        let config = self.get_config(documents, repo, &manifest.config)?;
         if config.diff_ids.len() != manifest.layers.len() {
             return Err(failed(format!(
                 "config {} lists {} diff_ids for {} layers",
@@ -425,6 +468,22 @@ impl<'a> Client<'a> {
             manifest,
             config,
         })
+    }
+
+    /// The manifest `digest` from `documents`, or fetched and kept there.
+    fn kept_manifest(
+        &mut self,
+        documents: &mut dyn Documents,
+        repo: &Repository,
+        digest: &Digest,
+        size: Option<u64>,
+    ) -> Result<Fetched, PullError> {
+        if let Some(kept) = documents.get(digest)? {
+            return Ok(kept);
+        }
+        let fetched = self.get_manifest(repo, digest, size)?;
+        documents.put(digest, &fetched)?;
+        Ok(fetched)
     }
 
     fn document(&self, fetched: &Fetched, digest: &Digest) -> Result<Document, PullError> {
@@ -518,13 +577,15 @@ impl<'a> Client<'a> {
     /// and renames it to `dest` only when it is exactly `size` bytes that
     /// hash to its digest; on any error the temporary file is removed and
     /// `dest` is untouched. A size above `max_blob_bytes` is refused before
-    /// any request.
+    /// any request. Returns the file, open for reading at its start, so a
+    /// caller reads the bytes it checked even if another process replaces
+    /// or removes `dest` meanwhile.
     pub fn get_blob(
         &mut self,
         repo: &Repository,
         descriptor: &Descriptor,
         dest: &Path,
-    ) -> Result<(), PullError> {
+    ) -> Result<File, PullError> {
         self.check_blob_size(descriptor)?;
         let io_err = |what: &str, path: &Path, e: io::Error| {
             failed(format!("{what} {} failed: {e}", path.display()))
@@ -535,6 +596,7 @@ impl<'a> Client<'a> {
         let name = crate::layers::temporary_name().map_err(|e| failed(e.to_string()))?;
         let temp = dir.join(name);
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -548,11 +610,16 @@ impl<'a> Client<'a> {
                 File::open(dir)
                     .and_then(|d| d.sync_all())
                     .map_err(|e| io_err("syncing", dir, e))
+            })
+            .and_then(|()| {
+                file.seek(SeekFrom::Start(0))
+                    .map(|_| ())
+                    .map_err(|e| io_err("rewinding", dest, e))
             });
         if result.is_err() {
             let _ = fs::remove_file(&temp);
         }
-        result
+        result.map(|()| file)
     }
 
     fn check_blob_size(&self, descriptor: &Descriptor) -> Result<(), PullError> {
@@ -591,10 +658,11 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Fetches and parses a config; its size is held to the document limit
-    /// before the request.
+    /// Fetches and parses a config, or takes it from `documents`; its size
+    /// is held to the document limit before the request.
     fn get_config(
         &mut self,
+        documents: &mut dyn Documents,
         repo: &Repository,
         descriptor: &Descriptor,
     ) -> Result<ImageConfig, PullError> {
@@ -605,8 +673,19 @@ impl<'a> Client<'a> {
                 descriptor.digest, descriptor.size
             )));
         }
-        let mut bytes = Vec::new();
-        self.fetch_blob(repo, descriptor, &mut bytes)?;
+        let bytes = match documents.get(&descriptor.digest)? {
+            Some(kept) => kept.bytes,
+            None => {
+                let mut bytes = Vec::new();
+                self.fetch_blob(repo, descriptor, &mut bytes)?;
+                let fetched = Fetched {
+                    bytes,
+                    content_type: None,
+                };
+                documents.put(&descriptor.digest, &fetched)?;
+                fetched.bytes
+            }
+        };
         manifest::parse_config(&bytes, &self.limits.document)
             .map_err(|e| failed(format!("config {}: {e}", descriptor.digest)))
     }

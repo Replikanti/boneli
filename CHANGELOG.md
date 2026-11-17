@@ -293,6 +293,29 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   token flow, the host allowlist and redirects and why pulls bypass
   `boneli-egress`, error classification, and the client's limits and
   deadlines.
+- `boneli-oci`, part 3 of #7: `OciImageStore`, the `ImageStore` adapter.
+  `open` takes an absolute, private root owned by the caller (refusing
+  `,`, `:`, `\` and non-UTF-8 names before and after it is resolved),
+  removes temporary names whose owner is gone, and fails at once on a
+  filesystem without 0:0 whiteouts or `user.*` xattrs. `pull` keeps
+  indexes, manifests and configs under `blobs/sha256/`, re-hashed on every
+  read, fetches only missing blobs, unpacks only missing layers, removes a
+  layer blob once its layer is committed, and returns
+  `sha256:<platform manifest>`, stable across restarts. `layers` lists a
+  pulled image's layer directories bottom first (a repeated `diff_id`
+  keeps its topmost place), `config` its runtime fields (`User`, `Env`,
+  `Entrypoint`, `Cmd`, `WorkingDir`). `StoreConfig` carries the values of
+  ADR-009 D7 and D12 (`StoreConfig::mozilla()` for production).
+- The `ImageStore` contract gains `tampered-refused` (an image whose bytes
+  do not match their digest fails twice, with a detail), with
+  `MemoryImageStore::with_tampered` and one mutant per pull
+  (`AcceptsTampered`, `CachesTampered`): 49 clauses, 56 mutant cases.
+- `boneli-oci` host tests (`boneli_oci_tests`, `host::`) in the `sandbox`
+  CI job: a pulled synthetic image mounted by `boneli_sys::spawn`, the
+  casefold store root (formerly `tests/casefold.rs`, which CI did not
+  run) and a ramfs root. The `oci-acceptance` workflow (weekly, on demand
+  and on PRs that edit it) pulls `node:22` and `postgres:17` on x86_64 and
+  arm64 and runs them in the sandbox.
 
 ### Changed
 
@@ -301,6 +324,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which `miniz_oxide` pulls, joins it (ADR-009, D5).
 - The workspace `rust-version` is 1.87 (was 1.85): `ruzstd` 0.9.1, the
   first release without RUSTSEC-2026-0344, declares it (ADR-009, D5).
+- ADR-009 is accepted. The zstd window cap is 128 MiB (was 100 MiB), the
+  reference decoder's default, so `zstd --long` layers decode (D5).
+  Temporary names in the store carry their owner's boot id (a random id
+  where `/proc` hides it), PID and time namespaces (the calling thread's,
+  so an exited main thread never reads as a kernel without time
+  namespaces), pid and start time at fixed widths; the store removes only those of owners that are gone in
+  its own boot, PID and time namespace, judged through a `/proc` of that
+  PID namespace, skips a leftover it cannot remove
+  instead of failing `open`, and a staging name is longer than a
+  committed layer's, so committed paths always fit `PATH_MAX` (D8). The
+  store root's ancestors must be owned by root or the caller and not
+  writable by group or others unless sticky (D8).
+  `Client::get_blob` returns the checked file, open at its start.
+- The host-setup block's AppArmor profile also names the `boneli-oci`
+  test binaries.
 - `boneli_domain::gate::citation_problem` checks the path through the new
   `path_problem`, without a change in behavior (ADR-004, D1).
 - The architecture check is now `tools/check_architecture.py` behind the

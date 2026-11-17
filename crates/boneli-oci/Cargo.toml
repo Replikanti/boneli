@@ -12,6 +12,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# The `ImageStore` port this crate adapts (ADR-004, D1). An adapter depends
+# on the core; no external edge.
+boneli-app.workspace = true
 # The overlay primitives std cannot write without libc: 0:0 whiteouts,
 # FIFOs and the `user.overlay.opaque` marker (ADR-009, D3). A support
 # crate, so the edge stays inside the generic plumbing.

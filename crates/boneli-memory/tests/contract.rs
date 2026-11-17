@@ -285,11 +285,16 @@ fn image(name: &str, digest: &str, platform: &str) -> ImageRef {
 pub fn images() -> contract::image::Images<MemoryImageStore> {
     let present = image("library/postgres", "sha256:aa", "linux/amd64");
     contract::image::Images {
-        adapter: MemoryImageStore::new(vec![present.clone()]),
+        adapter: MemoryImageStore::new(vec![present.clone()]).with_tampered(vec![image(
+            "library/redis",
+            "sha256:cc",
+            "linux/amd64",
+        )]),
         present,
         missing: image("library/node", "sha256:aa", "linux/amd64"),
         other_digest: image("library/postgres", "sha256:bb", "linux/amd64"),
         other_platform: image("library/postgres", "sha256:aa", "linux/arm64"),
+        tampered: image("library/redis", "sha256:cc", "linux/amd64"),
     }
 }
 

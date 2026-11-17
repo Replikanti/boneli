@@ -1533,7 +1533,14 @@ pub mod image {
         "missing-image",
         "digest-pinned",
         "platform-pinned",
+        "tampered-refused",
     ];
+
+    /// The two pulls `tampered-refused` checks, each its own sub-check
+    /// with its own mutant (ADR-004, D2): a store that accepts tampered
+    /// bytes at once fails the first, one that keeps them after a refused
+    /// pull fails the second.
+    pub const TAMPERED_PULLS: &[&str] = &["first-pull", "second-pull"];
 
     /// An adapter and the images its own test knows.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1548,6 +1555,9 @@ pub mod image {
         pub other_digest: ImageRef,
         /// [`Images::present`] with a platform its index does not list.
         pub other_platform: ImageRef,
+        /// An image the registry serves with bytes that do not match their
+        /// digest (#7, ADR-009).
+        pub tampered: ImageRef,
     }
 
     /// Checks every clause; each clause gets a fresh adapter from `make`.
@@ -1555,7 +1565,28 @@ pub mod image {
         pull_idempotent(&make())?;
         missing_image(&make())?;
         digest_pinned(&make())?;
-        platform_pinned(&make())
+        platform_pinned(&make())?;
+        tampered_refused(&make())
+    }
+
+    /// Digest verification is the port's main security property: an image
+    /// whose bytes do not match their digest fails, with a detail, on the
+    /// first pull and again on the second, so a store that keeps what it
+    /// fetched before checking it cannot hand it out later.
+    fn tampered_refused<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let clause = "tampered-refused";
+        for &pull in TAMPERED_PULLS {
+            let got = i.adapter.pull(&i.tampered);
+            let refused = matches!(&got, Err(ImageError::Failed { detail }) if !is_blank(detail));
+            ensure(refused, PORT, clause, || {
+                format!(
+                    "{pull}: pull of {:?}, whose bytes do not match its digest, gave {got:?}, \
+                     expected Failed with a detail",
+                    i.tampered
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// A pull of `variant`, which differs from the present image in one

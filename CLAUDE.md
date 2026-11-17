@@ -132,6 +132,24 @@ systemd-run --user --scope -q -p Delegate=yes \
   (ADR-007, D8). Without it every host test that starts a sandbox
   fails. Never set it in a terminal whose cgroup holds other processes.
 
+### Host tests (boneli-oci)
+
+`boneli-oci`'s host and network tests live in one target,
+`boneli_oci_tests`, with the same host needs and the same harness
+variable (ADR-009). `host::` mounts a pulled synthetic image in the
+sandbox, and checks a casefold store root (tmpfs `casefold`, Linux 6.13;
+list `tmpfs-casefold` in `BONELI_OCI_HOST_GAPS` where the kernel lacks it),
+a ramfs root through `unshare -Urm`, and a store opened in a PID
+namespace without its own `/proc` through `unshare -Urpfm`. `network::` pulls `node:22` and
+`postgres:17` from Docker Hub and runs them; CI runs it in the weekly
+`oci-acceptance` workflow, not on every PR.
+
+```sh
+systemd-run --user --scope -q -p Delegate=yes \
+  env BONELI_SYS_TEST_CGROUP=self \
+  cargo test -p boneli-oci --test boneli_oci_tests -- --ignored host::
+```
+
 **Preparing a host** takes the block below, run once with root through
 `sudo`. CI runs exactly this block (it extracts it between the markers),
 so a user and CI prepare a host the same way. Inputs: `TARGET_DIR`,
@@ -139,11 +157,11 @@ cargo's target directory; `RUN_USER`, the user who runs the tests;
 `ENABLE_LINGER=1` on hosts without a login session.
 
 1. **AppArmor** (only where `kernel.apparmor_restrict_unprivileged_userns`
-   is 1): a profile that allows user namespaces for the two `boneli-sys`
-   test binaries only, `boneli_sys-<hash>` and `boneli_sys_tests-<hash>`
-   under `$TARGET_DIR/<profile>/deps/` (cargo before 1.100) or
-   `$TARGET_DIR/<profile>/build/boneli-sys/<hash>/out/` (cargo 1.100's
-   build directory layout). Everything else on the host keeps
+   is 1): a profile that allows user namespaces for the `boneli-sys` and
+   `boneli-oci` test binaries only, `boneli_{sys,oci}-<hash>` and
+   `boneli_{sys,oci}_tests-<hash>` under `$TARGET_DIR/<profile>/deps/`
+   (cargo before 1.100) or `$TARGET_DIR/<profile>/build/boneli-{sys,oci}/<hash>/out/`
+   (cargo 1.100's build directory layout). Everything else on the host keeps
    the restriction; what the test binaries exec inherits the profile. Undo: `sudo apparmor_parser -R
    /etc/apparmor.d/boneli-sys-tests && sudo rm
    /etc/apparmor.d/boneli-sys-tests`. Builds with `--target <triple>` sit
@@ -183,12 +201,12 @@ check_target_dir() {
 check_target_dir "$TARGET_DIR"
 TARGET_DIR=$(realpath -e -- "$TARGET_DIR")
 check_target_dir "$TARGET_DIR"
-# 1. AppArmor (Ubuntu 23.10+): allow user namespaces for the boneli-sys test binaries only.
+# 1. AppArmor (Ubuntu 23.10+): allow user namespaces for the boneli-sys and boneli-oci test binaries only.
 if [ "${APPARMOR_USERNS:-$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)}" = 1 ]; then
   sudo tee /etc/apparmor.d/boneli-sys-tests >/dev/null <<EOF
 abi <abi/4.0>,
 include <tunables/global>
-profile boneli-sys-tests $TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out}/boneli_sys{,_tests}-[0-9a-f]* flags=(unconfined) {
+profile boneli-sys-tests $TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out,build/boneli-oci/[0-9a-f]*/out}/boneli_{sys,oci}{,_tests}-[0-9a-f]* flags=(unconfined) {
   userns,
 }
 EOF

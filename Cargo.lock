@@ -60,6 +60,7 @@ dependencies = [
 name = "boneli-oci"
 version = "0.0.0"
 dependencies = [
+ "boneli-app",
  "boneli-http",
  "boneli-https",
  "boneli-json",

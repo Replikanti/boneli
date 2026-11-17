@@ -1,6 +1,6 @@
 # ADR-009: boneli-oci, an OCI image store with a layered rootfs
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-16
 
 ## Context
@@ -13,10 +13,10 @@ of the archives, and the store unpacks them onto the host as the runner
 user, who holds the git token. A path bug here writes outside the store as
 that user, so `boneli-oci` is on the always-review list.
 
-The issue is split into three PRs. Part 1 (this ADR as proposed) unpacks
-layers and needs no network. Part 2 adds the registry client (D9 to
-D12) and part 3 the store, the port contract and the acceptance, which
-settles this ADR.
+The issue is split into three PRs. Part 1 unpacks layers and needs no
+network. Part 2 adds the registry client (D9 to D12) and part 3 the
+store (D8), the port contract and the acceptance (D13), which settled
+this ADR.
 
 What the numbers below come from (Docker Hub, anonymous, 2026-11-16,
 `linux/amd64`):
@@ -223,19 +223,27 @@ policy that we would have to audit and override.
   stays" for the TLS stack; that still holds for those crates (none
   declares more than 1.85), but the workspace floor is now 1.87. ADR-005
   is accepted and keeps its text; this paragraph is the record.
-- The zstd window cap is 100 MiB, set with `set_max_window_size`. ruzstd
+- The zstd window cap is 128 MiB, set with `set_max_window_size`. ruzstd
   0.9.1 checks it when a frame header is read, for the first frame,
   later frames and single-segment frames (whose window is their content
   size) alike, before it allocates the window (read in its source;
   0.8.2 checked only later frames, which part 1 first worked around with
   its own header parse). The decoder's memory is the window plus one
-  block of at most 128 KiB, which 0.9.1 now enforces. Why 100 MiB: it is
-  the value ruzstd 0.8.2 hard-coded and the plan adopted; 0.9.1's default
-  and zstd's own default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`) are
-  128 MiB. Consequence: a layer compressed with `zstd --long`, whose
-  default window log is 27 (128 MiB), is refused; raising the cap to
-  128 MiB admits it at 28 MiB more memory per decoding pull. Part 3
-  measures the first-stack images and settles the value.
+  block of at most 128 KiB, which 0.9.1 now enforces. Why 128 MiB
+  (settled in part 3; part 1 used 100 MiB, the value ruzstd 0.8.2
+  hard-coded): it is the reference decoder's default limit
+  (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`) and ruzstd 0.9.1's default, so
+  every layer that `zstd -d` decodes without `--memory` decodes here,
+  `zstd --long` layers included (their default window log is 27), and
+  an image builder that turns on long-distance matching does not get
+  its images refused. The measured first-stack images do not decide it:
+  every layer of node:22 and postgres:17 is gzip on both architectures
+  (the `oci-acceptance` log prints the layer media types). The cost is
+  28 MiB more memory than 100 MiB while one layer is decoded, and pulls
+  are serialized per store (D8), so a store decodes one layer at a time.
+  Lower refuses `--long` layers that every other runtime reads; higher
+  needs `zstd -d --memory` to decode with the reference tool, and buys
+  memory per pull for frames no default encoder writes.
 - `ruzstd` contains `unsafe` in its ring buffer, and RUSTSEC-2024-0400 was
   an out-of-bounds read there (patched in 0.7.3). `cargo deny check` runs
   advisories in CI. Its input is digest-verified before it is decoded
@@ -320,7 +328,7 @@ the store will use, and why:
 - A PAX or GNU extension body: 1,048,576 B, Go's `maxSpecialFileSize`, so
   every archive Go reads passes; it is read into memory, so this is the
   memory one header may take.
-- The zstd window: 100 MiB (D5).
+- The zstd window: 128 MiB (D5).
 - Path depth: 128 components after normalization, whatever the entry's
   type. Why a cap at all: review of part 1 measured a layer of ~1,900-deep
   entries that cost 407 ms of CPU per entry, under every byte and entry
@@ -355,11 +363,27 @@ the store will use, and why:
   `<root>/layers/sha256/<hex>.stats` its sidecar: uncompressed bytes,
   entry count and skipped devices, as
   `bytes N\nentries N\nskipped-devices N\n`, parsed exactly.
-- A layer is unpacked into `layers/sha256/.tmp-<pid>.<starttime>.<n>/`
-  (the start time from `/proc/self/stat`, so a reused pid is told from a
-  live owner when the store cleans up). Lookups use hex names only, so a
-  dot name is never mistaken for a layer. Its sidecar is staged next to
-  it as `.tmp-<pid>.<starttime>.<n>.stats`, so every temporary tree of
+- A layer is unpacked into `layers/sha256/.tmp-<owner>.<n>/`, where
+  `<owner>` is `<boot>.<pidns>.<timens>.<pid>.<start>`: the kernel's
+  boot id (`/proc/sys/kernel/random/boot_id`) as 32 lower-case hex
+  digits, the inode of the process's PID namespace
+  (`/proc/thread-self/ns/pid`), the inode of its time namespace
+  (`/proc/thread-self/ns/time`; 0 on a kernel built without time
+  namespaces, `u64::MAX` when the link cannot be read), its pid in the PID namespace and its start time from
+  `/proc/self/stat`, zero-padded to 20, 20, 10 and 20 digits, and `<n>` a
+  20-digit counter (part 3; parts 1 and 2 used `<pid>.<starttime>.<n>`,
+  part 3 before its first review had no boot id and before its second
+  no time namespace). A process that cannot read its boot id (a `/proc`
+  mounted with `subset=pid`, systemd's `ProcSubset=pid`) records a random
+  id with the UUID version digit cleared instead, drawn once per process
+  from std's `RandomState` (keys from the operating system's random
+  source, no new crate or `libc` edge). The kernel makes every boot id a
+  version 4 UUID, so no boot id equals it and no other process ever
+  judges that process's names (below); at 430563c such a process could
+  open no store at all (second review of #60).
+  Lookups use hex names only, so a dot name is never mistaken for a
+  layer. Its sidecar is staged next to it as `.tmp-<owner>.<n>.stats`,
+  so every temporary tree of
   every process has its own (part 1 first derived it with
   `with_extension`, which drops the counter; review measured two caches
   in one process committing each other's sidecars). The tree is staged in
@@ -374,11 +398,11 @@ the store will use, and why:
   either lookup finds the file, the directory is case-insensitive or
   normalizing (ext4 or f2fs casefold, tmpfs `casefold`, ZFS
   `normalization`, vfat), and the store fails closed. A probe is named
-  `.probe-…-<pid>.<starttime>.<n>`; a name that exists is skipped and
-  never removed, because it may be a crashed process's leftover with the
-  same pid (deterministic in a container) or the live probe of a runner
-  in another PID namespace sharing the store, and only its owner may
-  delete it. A probe rather
+  `.probe-…-<owner>.<n>`; a name that exists is skipped and never removed
+  there, because it may be a crashed process's leftover with the same
+  identity or the live probe of a runner in another PID namespace sharing
+  the store; the store's cleanup below removes it once its owner is
+  gone. A probe rather
   than the casefold inode flag, because it also catches filesystems that
   alias without that flag. Why checking that one directory suffices:
   casefold is a directory flag that only an empty directory can take and
@@ -436,6 +460,188 @@ the store will use, and why:
   because the directory exists; it discards its tree and reads the
   winner's sidecar. The same `diff_id` means the same bytes, so the trees
   and their totals are equal, and the loser's budget is charged with them.
+- **Cleanup of temporary names** (part 3, from the review of part 1).
+  `OciImageStore::open` removes every name in `layers/sha256/` and
+  `blobs/sha256/` that carries an owner (staging trees, staged sidecars
+  and blobs, probes) whose owner is gone, and nothing else. Gone means:
+  with the store's boot id, in its own PID and time namespaces, read
+  through a `/proc` of that PID namespace, no `/proc/<pid>/stat`, or one
+  with another start time (the pid was reused). Every other owner is
+  never judged:
+  - Another PID namespace: two runners in different PID namespaces can
+    share one store and have the same pid, and the one that opens second
+    cannot see the other's processes, so deciding by pid, even with the
+    start time, would delete a live runner's tree. Its names stay until a
+    process of its own namespace opens the store; a namespace that is
+    gone for good (a container that crashed mid-pull) leaves at most one
+    partial layer and one blob per crash behind, which the cache eviction
+    of #56 removes with the rest.
+  - Another boot id: the namespace inode does not identify a host, since
+    every host's initial PID namespace has the same inode
+    (`PROC_PID_INIT_INO`), so two hosts sharing a root over a network
+    filesystem that passes the probes (NFS 4.2 has `user.*` xattrs and
+    0:0 whiteouts) would judge each other's pids. The boot id is random
+    per host and per boot. Its price: a crash's leftovers from before a
+    reboot are never removed by `open` either, since a store cannot tell
+    an earlier boot of its own host from another host; they cost disk
+    until the eviction of #56, never a live tree. Rejected: the machine id
+    as a host id with the boot id deciding within it, because cloned
+    images and containers share machine ids, and a shared one would turn
+    another host's live tree into an earlier boot's leftover.
+  - A `/proc` that is not the store's PID namespace's: in a PID
+    namespace whose `/proc` was mounted for another one (`unshare -pf`
+    without `--mount-proc`, bwrap `--unshare-pid` without `--proc`),
+    `getpid()` is 1 while `/proc/1` is the host's init, so the store's own
+    staging names looked dead and a second `open` deleted them mid-pull
+    (review of #60, reproduced). The store judges no owner there: the
+    `/proc` counts as its own only if `/proc/self` reads `getpid()` and
+    the `NSpid` line of `/proc/self/status`, which lists the pid in the
+    `/proc`'s namespace and in every one below it, holds exactly that
+    pid. Pinned by `host::foreign_proc_judges_no_owner` (`unshare -Urpfm`,
+    rootless, in the `sandbox` CI job) and the unit test of the decision.
+  - Another time namespace: since Linux 5.6, `/proc/<pid>/stat` reports
+    the start time shifted by the boottime offset of the reader's time
+    namespace, so a store opened under `unshare -T --boottime N`, with
+    the same boot id, PID namespace and `/proc`, read a live owner's
+    start time as another one and deleted its staging tree mid-pull
+    (second review of #60, reproduced: 10 of 10 pulls failed). The time
+    namespace inode is part of the owner, and only an owner with the
+    store's own is judged; a store that cannot read its own time
+    namespace (a link that exists but does not read) judges no owner.
+    Why the identity and not a correction by the offset in
+    `/proc/self/timens_offsets`: the identity is the PID-namespace rule
+    again, one more field read the same way, while the correction needs
+    a second parser and its own failure handling for a file that only a
+    kernel with time namespaces has; two runners in different time
+    namespaces sharing a store are rare, and an owner that is not judged
+    costs disk, never a live tree. A kernel built without time
+    namespaces shifts nothing and records 0.
+    The namespace links are the calling thread's, `/proc/thread-self/ns/`,
+    not `/proc/self/ns/` (third review of #60): `/proc/self` names the
+    thread-group leader, and once the main thread has exited while other
+    threads run, the kernel has cleared the leader's namespaces, so its
+    `ns/time` fails with `ENOENT` on a kernel that has time namespaces.
+    Read as "no time namespaces", that recorded 0, and two such processes
+    in different time namespaces judged each other's shifted start times
+    and swept a live staging blob (reproduced: 10 of 10 pulls failed). A
+    running thread's links always read, and a thread group shares its PID
+    and time namespaces (`setns` into a time namespace needs a
+    single-threaded caller). The rule for 0, which holds whatever thread
+    reads it: the link fails with `ENOENT` and the thread's `ns/` is a
+    directory with no `time` entry. `/proc/<pid>/ns/` lists exactly the
+    namespace types the kernel was built with, whether or not their links
+    read, so on a kernel with time namespaces the entry is there even
+    where the link fails; anything else (another error, a missing or
+    unsearchable `ns/`, a `time` entry whose link fails) is `u64::MAX`,
+    never judged. The other `/proc/self` reads keep the leader and stay
+    correct after it exits: `/proc/self` still reads `getpid()`,
+    `status` still has the `NSpid` line, `stat` the start time judges
+    read in `/proc/<pid>/stat`, and the directory's uid the effective uid
+    (checked on a zombie leader); any of them that fails ends in a foreign
+    `/proc` (no owner judged) or a failed `open`, never in a sweep.
+    Pinned by `host::other_time_namespace_judges_no_owner` (rootless
+    `unshare -Urm`, then `unshare -T --boottime 100000` inside it, in the
+    `sandbox` CI job) and the unit tests of the decision and the link,
+    including one through a helper process whose main thread has exited
+    (`exited_main_thread_reads_unreadable`).
+  - An owner that could not read its boot id (above): its random id
+    equals no other process's boot id, so only the process itself judges
+    its names. A crash of such a process leaves at most one partial
+    layer and one blob per crash behind until #56, like another PID
+    namespace's. Pinned by `host::pid_only_proc_opens` (`unshare -Urpfm`
+    with `/proc` remounted `subset=pid`) and the unit test of the
+    fallback.
+  A leftover of a dead owner whose removal fails, for any reason, stays
+  too and `open` goes on: it is a dot name, never read as a layer or a
+  blob, and failing `open` for it would leave the store unopenable until
+  someone removed it by hand. One way to get there (review of #60): a root
+  reached through two paths of different length (a bind mount), where a
+  process on the short path dies mid-unpack and one on the long path
+  meets `ENAMETOOLONG`. Pinned by `unremovable_leftover_skipped`. Rejected: an `flock` on a per-process lock file,
+  which decides liveness in every namespace, because std's `File::lock`
+  needs Rust 1.89 (the MSRV is 1.87) and the alternative is a new
+  `unsafe` wrapper in `boneli-sys`; a name that cannot be judged costs
+  disk, never a live tree, so the safe direction wins until either
+  changes. Names with an unknown prefix, or a field of the wrong width,
+  carry no owner and stay.
+- **Staging names are longer than committed ones** (part 3, from the
+  review of part 1). A staging name has 132 characters (`.tmp-`, the
+  106-character owner, a dot, 20 digits), a committed layer 64 hex digits,
+  and the unpacker creates every entry by its absolute path, which must
+  fit `PATH_MAX` (4,096 B with the terminating NUL). Every path of a
+  committed layer is therefore 68 B shorter than the path it was created
+  at, so a path-based walk of committed layers (the GC of #56, a
+  removal) never meets `ENAMETOOLONG` where the unpacker did not. The
+  price: a layer whose deepest absolute path is between 4,028 and 4,095 B
+  under its committed name is refused while it is unpacked; no
+  first-stack path comes near that (node:22's longest is 128 B inside the
+  layer). Rejected: unlinking relative to a
+  directory descriptor, which needs an `unlinkat` wrapper in `boneli-sys`
+  (new `unsafe`, D8 above). Pinned by `committed_layer_paths_fit_path_max`
+  (a path of 4,095 B at the staging name unpacks and stays readable by
+  path once committed; one more byte is refused).
+- **The store root** (`OciImageStore::open`): absolute, UTF-8 and free of
+  `,`, `:` and `\`, which overlay mount options use as separators and
+  escapes (ADR-007, D7), checked as given and again once resolved, so a
+  symlink cannot smuggle them in; created `0o700` when missing; a
+  directory owned by the caller (the uid of `/proc/self`) with no group or
+  other permission bits, because the runner user holds the git token and
+  the layers are what a sandbox runs. Its ancestors pass sshd's
+  `StrictModes` rule: each owned by root or the caller and not writable
+  by its group or others unless it is sticky (like `/tmp`), checked on the
+  resolved path and, for a root `open` creates, on its existing ancestors
+  before anything is created. The store reaches the root by path in every
+  later call, so whoever could rename an entry of an ancestor could swap
+  the root after `open` and plant a layer under the `diff_id` of an image
+  it pulls, which the store would hand out as a cache hit (review of #60,
+  reproduced under a `0o777` parent). In a sticky directory only an
+  entry's owner can rename it. The filesystem root is checked for its
+  mode only: whoever owns it owns every path on the host, and in a user
+  namespace it shows the overflow uid. A root under a group-writable
+  directory is refused even where the group is the caller's own (a
+  `umask` of `002`); the store cannot tell such a group from a shared
+  one. In a user namespace every ancestor the host's root owns shows the
+  overflow uid, so a store opened there needs a root whose ancestors
+  below `/` are the namespace's own mounts. Rejected for now: holding the
+  root's descriptor and working relative to it, which needs `openat`,
+  `mkdirat`, `renameat` and `unlinkat` wrappers in `boneli-sys` (new
+  `unsafe`) across the unpacker and the store, and would still hand the
+  sandbox paths for its overlay mount; with every ancestor closed to
+  others, a path cannot be swapped. `open` then probes the overlay
+  format in `layers/sha256/`: a 0:0 whiteout made and read back, and the
+  opaque marker set and read back through `user_xattr`. A filesystem
+  without either (ramfs, some network filesystems) fails here with
+  `Unsupported`, not in the middle of a pull.
+- **Documents and blobs.** `blobs/sha256/<hex>` keeps every index,
+  manifest and config a pull read, with `<hex>.type`, the `Content-Type`
+  it was served with (empty for none; the kind of a document without a
+  `mediaType` field comes from it, D9). The type is written before the
+  document, both through a temporary name, `fsync` and rename. Every read
+  re-hashes the document; a mismatch or a missing type removes it and it
+  is fetched again. A compressed layer blob is downloaded to
+  `blobs/sha256/<hex>` (D9), unpacked from the descriptor that checked
+  it, which `Client::get_blob` returns open at its start, and removed once
+  its layer is committed; a blob already on disk is used only if it is
+  exactly its descriptor's size and digest. Reading through the checked
+  descriptor means another store that commits the same layer and removes
+  the blob meanwhile changes nothing for this one.
+- **Pulls** are serialized by one mutex per store; a poisoned mutex is
+  recovered as in ADR-004 D8, because disk state commits only by rename.
+  A pull resolves through the kept documents first, so a pull of an image
+  already in the store makes no request; then, for each layer, the cache,
+  a kept blob or a fetch, in that order. A failed pull leaves what it
+  committed and the blobs it checked, and the next pull goes on from
+  there; the store does not retry (D11). The handle is
+  `sha256:<hex of the platform's manifest>`, which needs no state of its
+  own and is the same across processes and restarts. `layers(&RootfsRef)`
+  returns the layer directories bottom first, the order
+  `boneli_sys::Root.layers` takes; a `diff_id` listed twice keeps only its
+  topmost position, which leaves the merged view as it is.
+  `config(&RootfsRef)` returns the image config with its runtime fields
+  (`User`, `Env`, `Entrypoint`, `Cmd`, `WorkingDir`). Both are inherent
+  methods, not port operations: #8 and #32 bridge them in the composition
+  root, and the first use case that reads them through the port adds the
+  operation under ADR-004's extension rule (D11 of ADR-004).
 
 ### D9. The registry protocol and the anonymous token flow
 
@@ -620,8 +826,10 @@ with a detail that is never blank (ADR-004, D4). The client returns a
 The detail names hosts, digests, sizes and statuses. It never carries the
 token or a response body: a body is the registry's text and may be
 large or hostile, and the token is a credential. There are no retries
-beyond the single re-authentication of D9: a retry policy belongs to the
-store (part 3), which knows whether a pull is worth repeating.
+beyond the single re-authentication of D9. The store (part 3) adds none
+either: a failed pull keeps what it committed and the blobs it checked
+(D8), so the caller's next pull goes on from there, and the caller, the
+use case, decides whether a pull is worth repeating.
 
 ### D12. Limits and deadlines
 
@@ -728,9 +936,98 @@ Hub, 2026-11-16):
   the deadline below TLS (D10). The TCP connect takes at most
   `connect_timeout` or what is left of the deadline. Weak spot: name
   resolution uses `getaddrinfo`, which has no timeout. The values are
-  part 3's, measured with the acceptance pulls; the plan's starting point
-  is `io` 30 s, `setup` 30 s and `min_rate` 1 MiB/s, which gives node:22's
-  largest compressed layer, 211,826,577 B, 30 + 202 = 232 s.
+  part 3's, from the acceptance pulls of node:22 and postgres:17
+  (`network::node_and_postgres_run_in_sandbox`, which measures every
+  connection of the production `TlsDial`; 2026-11-16, three runs on the
+  dev host's residential link and one per architecture on GitHub's
+  runners):
+
+  | | dev host (x86_64) | CI x86_64 | CI arm64 |
+  | --- | --- | --- | --- |
+  | largest fetch (node's largest layer) | 22.1 s and 6.5 s for 211,827,183 B (9.1 and 31.3 MiB/s) | 1.2 s (165 MiB/s) | 1.8 s for 203,372,485 B (108 MiB/s) |
+  | slowest fetch of at most 1 MiB, dial to last byte | 0.71 s | 0.22 s | 0.15 s |
+  | longest gap between two reads of a connection | 0.40 s | 0.13 s | 0.10 s |
+
+  - `io` 30 s, 75 times the longest measured gap of 0.40 s, so a
+    connection that stalls fails within 30 s, and a link that loses a few
+    segments in a row (TCP's retransmission timeout doubles from 1 s, so
+    the fourth retransmission waits 15 s) does not. Lower fails healthy
+    pulls on lossy links; higher only delays the failure of a dead
+    connection.
+  - `min_rate` 1 MiB/s (8.4 Mbit/s), 9.1 times below the slowest measured
+    large fetch, so a link a tenth as fast as the dev host's still pulls;
+    node's largest layer then gets 30 + 202 = 232 s against the 22.1 s
+    measured. Higher refuses slower customer links; lower lets a server
+    that trickles just under `io` hold a pull longer: a blob at the 4 GiB
+    cap already gets 30 + 4,096 s, about 69 minutes, and at 512 KiB/s it
+    would get 2 hours 17 minutes.
+  - `setup` 30 s, 42 times the slowest measured small fetch of 0.71 s
+    (name resolution, TCP, TLS, request and response). It must hold the
+    connect and handshake bounds below (10 s each) plus a round trip, so
+    lower than about 21 s would cut a connection off inside its own
+    bounds; higher only lets a small fetch hang longer.
+  - The connect timeout of `TlsDial` is 10 s per address: Linux sends a
+    SYN and retransmits it after 1, 3 and 7 s (the timeout starts at 1 s
+    and doubles), so 10 s lets three retransmissions through before the
+    next address is tried. The TLS handshake timeout is 10 s too: a
+    handshake is one or two round trips, measured inside the 0.71 s of a
+    whole small fetch. Lower fails on a lossy first round trip; higher
+    only delays trying the next address.
+
+  The values are the public constants of `boneli_oci` (`IO_TIMEOUT`,
+  `SETUP_TIMEOUT`, `MIN_RATE`, `CONNECT_TIMEOUT`, `HANDSHAKE_TIMEOUT`),
+  which `StoreConfig::new` uses; the other limits of this section and of
+  D7 are constants there too.
+
+### D13. The contract clause and the acceptance (part 3)
+
+- **`tampered-refused`.** Digest verification is the port's main security
+  property, and no clause of ADR-004 pinned it, so part 3 adds one under
+  ADR-004's extension rule: an image whose bytes do not match their
+  digest is `Failed` with a non-blank detail on the first pull and again
+  on the second. The second pull is the point: a store that writes what
+  it fetched before it checks it, and hands it out next time, passes a
+  one-pull clause. The clause has two sub-checks, one per pull, with a
+  mutant each (`AcceptsTampered`, `CachesTampered`) whose violation
+  detail starts with `first-pull:` or `second-pull:`, the way
+  `silent-failure-detail` has one mutant per operation (ADR-004, D2);
+  `mutant_table_covers_every_clause` now reads the sub-checks of both
+  clauses from one table. Counts: 49 clauses and 56 mutant cases (48 and
+  54 before). `MemoryImageStore::with_tampered` gives the in-memory
+  adapter its fixture; `boneli-oci/tests/contract.rs` serves a layer blob
+  with one byte flipped from the fake registry, which answers an unknown
+  repository with `401`, as Docker Hub does.
+- **Hermetic acceptance on every PR.** `host::` in the `boneli_oci_tests`
+  target pulls a synthetic image through the fake registry and mounts it
+  with `boneli_sys::spawn` over a base layer; the probe sees a whiteout
+  hide a lower file, an opaque directory hide the lower one's contents,
+  modes, a hard link (one inode, two links), a FIFO and a symlink. The
+  same target runs the casefold store root (moved from
+  `tests/casefold.rs`, which CI never ran) and a ramfs root, which `open`
+  refuses as `Unsupported`. The `sandbox` job of `ci.yml` builds both
+  crates' test binaries in one step and runs `host::` after the
+  `boneli-sys` host tests; the host-setup block's AppArmor profile names
+  the `boneli-oci` test binaries too. The job names stay, because they
+  are required checks.
+- **Docker Hub, weekly.** `network::` pulls the pinned node:22 and
+  postgres:17 indexes for the host's platform and runs
+  `/usr/local/bin/node --version` (inside id 0) and `postgres --version`
+  through `/bin/sh` and the image's `PATH` (inside id 999, the image's
+  postgres user, ADR-007 D1) on the image's layers alone. It runs in
+  `oci-acceptance.yml` on x86_64 and arm64: weekly, on demand, and on a
+  PR that edits that file (GitHub dispatches `workflow_dispatch` only for
+  workflows already on the default branch). Not on code PRs and not a
+  required check, so a Docker Hub outage cannot block one. Weekly,
+  because the things that break it (a garbage-collected digest, a CDN
+  host move, a change of the token flow) show up within 7 days at 4
+  manifest requests per architecture per run, far below the measured
+  anonymous limit of 100 per hour. Measured on part 3's PR: node v22.23.5
+  and PostgreSQL 17.12 run on both architectures; every layer of both
+  images is gzip.
+- **The CI-time guard** (decided at STOP 1): the `sandbox` legs now also
+  build the TLS stack and run `host::`; the PR records both legs before
+  and after, and a leg above 180 s would have stopped the flow for the
+  operator. The measured table is in the PR of part 3.
 
 ## Consequences
 
@@ -745,6 +1042,15 @@ Hub, 2026-11-16):
 - Images that need devices, setuid bits, xattrs, sparse files, V7 tar,
   layers above 4 GiB or paths deeper than 128 components do not pull. None of the first-stack images does.
 - `boneli-oci` is on the always-review list (#7 STOP 1).
+- A store only grows: cache eviction and GC are #56. Temporary names of
+  an owner in another PID or time namespace stay until a process of that
+  namespace opens the store, and those of another boot id, an earlier
+  boot's crash leftovers and the leftovers of a process that could not
+  read its boot id included, until #56 (D8).
+- A store root must sit under directories that only root or the caller
+  can write (sticky ones aside); a group-writable parent is refused (D8).
+- The `ImageStore` contract has a clause that every future adapter must
+  pass: tampered bytes fail on every pull (D13).
 - Pulls reach registries directly from the runner, not through
   `boneli-egress`, limited to each registry's allowlisted hosts (D10).
 - Images that need a tag, a nested index, schema 1, a `sha512` digest,
@@ -757,10 +1063,12 @@ Hub, 2026-11-16):
 Flattening (D1), the `tar` crate (D4), `flate2` and the `zstd` crate (D5),
 `sha2`, our own SHA-256 and a pure-Rust TLS provider (D6), tags,
 `Docker-Content-Digest` and `expires_in` (D9), pulls through
-`boneli-egress` and `boneli_https::connect` (D10), each with the reason
-it lost in its decision.
+`boneli-egress` and `boneli_https::connect` (D10), an `flock` liveness
+check and descriptor-relative unlinking (D8), and a 100 MiB zstd window
+(D5), each with the reason it lost in its decision.
 
 ## Accept when
 
 Part 3 of #7 pulls `node:22` and `postgres:17` on x86_64 and arm64 and runs
-both in the sandbox.
+both in the sandbox. Met on 2026-11-16 by the `oci-acceptance` run of
+part 3's PR (D13).

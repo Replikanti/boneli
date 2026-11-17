@@ -243,7 +243,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 | `Git` | `boneli-git-cli` | native implementation |
 | `Verifier` | on `Sandbox` and `Git`, per-stack test classification (#17) | |
 | `EventStore`, `Evidence` | `boneli-store-fs`, append-only log and content-addressed storage | Postgres in the control plane |
-| `ImageStore` | `boneli-oci`, one directory per layer for the overlay root (ADR-009) | |
+| `ImageStore` | `boneli-oci`, images pinned by digest from allowlisted registries, one directory per layer for the overlay root (ADR-009) | private registries (#55), signatures (#57) |
 | `DataSnapshot` | `boneli-data-postgres`, commands through the `Sandbox` port | MySQL |
 | `Standards` | repository files, web pages through a broker | Confluence, Notion |
 | `Broker` | | SQL, Sentry, logs |

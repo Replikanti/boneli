@@ -2,7 +2,7 @@
 //!
 //! Frames follow each other; skippable frames (`0x184D2A50..=0x184D2A5F`)
 //! are skipped, and anything after the last frame that is not another frame
-//! is refused. The decoder refuses a window above 100 MiB
+//! is refused. The decoder refuses a window above 128 MiB
 //! (`set_max_window_size`), for the first frame, later frames and
 //! single-segment frames alike, before it allocates anything. The reserved
 //! bit of the frame header descriptor must be 0 (RFC 8878, 3.1.1.1.1),
@@ -16,8 +16,11 @@ use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::error::{Error, carry};
 
-/// The largest window a frame may declare, inclusive: 100 MiB.
-pub(crate) const MAX_WINDOW: u64 = 100 * 1024 * 1024;
+/// The largest window a frame may declare, inclusive: 128 MiB, the
+/// reference decoder's default limit (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`),
+/// so every layer `zstd -d` decodes without `--memory`, `zstd --long`
+/// layers included, decodes here (ADR-009, D5).
+pub(crate) const MAX_WINDOW: u64 = 128 * 1024 * 1024;
 
 const MAGIC: u32 = 0xfd2f_b528;
 const SKIPPABLE: std::ops::RangeInclusive<u32> = 0x184d_2a50..=0x184d_2a5f;
@@ -211,15 +214,15 @@ mod tests {
     }
 
     #[test]
-    fn zstd_window_above_100mib_refused() {
+    fn zstd_window_above_128mib_refused() {
         // Window descriptor: 2^(10 + exponent) plus mantissa eighths.
-        // 64 MiB + 5/8 = 104 MiB and 128 MiB are above the cap; so is a
-        // single-segment frame whose content size, its window, is 100 MiB
+        // 128 MiB + 1/8 = 144 MiB and 256 MiB are above the cap; so is a
+        // single-segment frame whose content size, its window, is 128 MiB
         // plus one byte.
         let wd = |exp: u8, mantissa: u8| (exp << 3) | mantissa;
         let mut single = vec![0xe0];
         single.extend_from_slice(&(MAX_WINDOW + 1).to_le_bytes());
-        for header in [vec![0x00, wd(16, 5)], vec![0x00, wd(17, 0)], single] {
+        for header in [vec![0x00, wd(17, 1)], vec![0x00, wd(18, 0)], single] {
             // Refused for the first frame and for a later one, before any
             // block is read.
             let mut first = 0xfd2f_b528u32.to_le_bytes().to_vec();
@@ -231,12 +234,13 @@ mod tests {
             let e = decode(&second).expect_err("window above the cap");
             assert!(e.to_string().contains("window_size is too big"), "{e}");
         }
-        // Exactly 100 MiB passes the window check, as a window descriptor
-        // (64 MiB + 4/8 = 96 MiB is the largest below it) and as a
-        // single-segment content size; the frames then end early.
+        // Exactly 128 MiB passes the window check, as a window descriptor
+        // (`zstd --long`'s default window log of 27) and as a
+        // single-segment content size; so does 112 MiB (64 MiB + 6/8),
+        // which part 1's cap of 100 MiB refused. The frames then end early.
         let mut exact = vec![0xe0];
         exact.extend_from_slice(&MAX_WINDOW.to_le_bytes());
-        for header in [vec![0x00, wd(16, 4)], exact] {
+        for header in [vec![0x00, wd(17, 0)], vec![0x00, wd(16, 6)], exact] {
             let mut f = 0xfd2f_b528u32.to_le_bytes().to_vec();
             f.extend_from_slice(&header);
             let e = decode(&f).expect_err("no blocks");

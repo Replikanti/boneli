@@ -11,9 +11,13 @@ use core::fmt;
 /// short name, which the core token scan bans (ADR-001).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ImageRef {
-    /// The repository name, for example `library/postgres`.
+    /// The repository name, for example `library/postgres`. It may start
+    /// with a registry host (`registry.example:5000/team/app`); without
+    /// one, the store's default registry applies.
     pub name: String,
-    /// The content digest of the manifest, for example `sha256:...`.
+    /// The content digest of an image index or of a manifest, for example
+    /// `sha256:...`; for an index the store picks the manifest of
+    /// [`ImageRef::platform`].
     pub digest: String,
     /// The platform to pull, for example `linux/amd64`.
     pub platform: String,
