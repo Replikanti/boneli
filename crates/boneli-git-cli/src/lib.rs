@@ -1,8 +1,8 @@
 //! Boneli adapter: the `Git` port over the git binary (#30, ADR-010).
 //!
 //! The workspace an agent returns from the sandbox is agent-controlled,
-//! and this crate reads it on the host as the runner user. Part 2 adds the
-//! two pieces that touch those bytes before any git runs:
+//! and this crate reads it on the host as the runner user, who will hold
+//! the git token.
 //!
 //! - [`Workspace`] is the snapshot and workspace format (ADR-010, D2): a
 //!   magic line and canonical, length-prefixed entries, each a file, an
@@ -15,14 +15,23 @@
 //!   ever followed, modes are explicit, each directory is made once, and
 //!   repository metadata, an entry at or under a gitlink or more nodes
 //!   than the cap is refused.
-//!
-//! Part 3 adds the adapter that runs git.
+//! - [`GitCli`] implements the port by running git (D4 to D7): every call
+//!   gets a cleared, fixed environment and command-scope config and names
+//!   its repository explicitly, so nothing in a workspace or in the host's
+//!   environment steers it; [`Transports`] limits the URLs `fetch_base`
+//!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
 #![doc(test(attr(forbid(unsafe_code))))]
 
+mod cli;
 mod materialize;
+mod run;
 #[cfg(test)]
 mod scratch;
+mod url;
 mod workspace;
 
+pub use cli::{GitCli, GitCliConfig, OpenError};
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
+pub use run::MIN_GIT_VERSION;
+pub use url::{Transports, UrlProblem};
 pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};

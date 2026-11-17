@@ -1,6 +1,6 @@
 # ADR-010: boneli-git-cli, the Git port over the git binary
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-17
 
 ## Context
@@ -323,14 +323,182 @@ follows a symlink.
   could plant one, and such a process already holds everything the
   runner holds, so the race crosses no permission boundary.
 
-### Later parts
+### D4. The git runner
 
-Part 3 adds the git runner with its fixed
-environment and command-scope config, the transports, the operations and
-the git version floor (D4 to D7), and the rule for #19: the token reaches
-git only as `http.<url>.extraHeader` through `GIT_CONFIG_KEY_n` and
-`GIT_CONFIG_VALUE_n` in that one git process's environment, never in argv,
-a file or the snapshot.
+Part 3 of #30. Every git process the adapter starts goes through one
+runner (`src/run.rs`), so no call can forget a rule.
+
+- **The binary** is an absolute path from the configuration; a relative
+  one is refused at `open`, and `PATH` is never searched. The runner
+  user's `PATH` is part of the host environment this decision shuts out.
+- **The environment** is cleared, then holds exactly: `HOME` (an empty
+  0700 directory under the root) and `XDG_CONFIG_HOME` (beneath it,
+  absent), `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_ATTR_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_LITERAL_PATHSPECS=1`, `GIT_NO_REPLACE_OBJECTS=1`,
+  `GIT_ALLOW_PROTOCOL` (`https`, or `https:file` for the test transport),
+  `GIT_PROTOCOL_FROM_USER=0`, `LC_ALL=C`, `TZ=UTC`, the command-scope
+  config below, and `GIT_INDEX_FILE` on the calls that use a throwaway
+  index (`read-tree`, `add`, `write-tree`, `apply`). Why cleared rather
+  than filtered: git reads dozens of variables (`GIT_DIR`,
+  `GIT_CONFIG_PARAMETERS`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`,
+  `GIT_EXEC_PATH`, `GIT_INDEX_FILE`, ...), and a denylist misses the next
+  one; an allowlist cannot. Without `PATH`, git puts its own exec path
+  first and falls back to a fixed system path, which is what finds
+  `git-remote-https`.
+- **The command-scope config** (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n`,
+  `GIT_CONFIG_VALUE_n`) overrides every repository config, the store's
+  included, and is one of the protected scopes `safe.bareRepository`
+  obeys:
+  - nothing named by config runs: `core.hooksPath=/dev/null`,
+    `core.fsmonitor=false`, `core.untrackedCache=false`,
+    `credential.helper=` (empty);
+  - bytes, modes and links are stored as written: `core.autocrlf=false`,
+    `core.symlinks=true`, `core.fileMode=true`, `core.ignoreCase=false`;
+  - names that are `.git` on another file system fail:
+    `core.protectNTFS=true`, `core.protectHFS=true` (D1's look-alikes;
+    git 2.56.0 refuses `.GIT`, `.Git`, `git~1`, `GIT~1`, `.git.`,
+    `.git ` and `.g<U+200C>it` with them, checked by
+    `lookalikes_are_refused`);
+  - `safe.bareRepository=explicit`, so only an explicit `--git-dir`
+    names a repository;
+  - transports: `protocol.allow=never`, `protocol.https.allow=always`
+    (plus `protocol.file.allow=always` for the test transport),
+    `protocol.version=2`, `http.followRedirects=false`, and
+    `transfer.fsckObjects=true`, `fetch.recurseSubmodules=false`,
+    `submodule.recurse=false`;
+  - `http.lowSpeedLimit=1` and `http.lowSpeedTime=300`: below one byte
+    per second for five minutes is a stalled connection, not a slow
+    one, so a dead remote fails a fetch instead of holding the run;
+    a lower time would cut off a server that pauses while it builds a
+    large pack, a higher one only delays the failure;
+  - no background work and stable packs: `gc.auto=0`,
+    `maintenance.auto=false`, `pack.threads=1` (one delta search order,
+    so a snapshot's pack is the same bytes every time),
+    `pack.writeReverseIndex=false` (no `.rev` file next to the pack).
+- **No discovery.** Every call except `git version` passes
+  `--git-dir=<store>` and runs with the store as its working directory;
+  only `read-tree` and `add` in `diff` also pass `--work-tree=<scratch>`.
+  git never looks for a repository in a directory the agent wrote.
+- **stdin** is written from its own thread and stderr read from another,
+  so a large diff cannot deadlock against a full pipe
+  (`large_diff_applies` moves more than 1 MiB each way).
+- **Failure details** are git's stderr, prefixed with the subcommand, or
+  `git <cmd>: exit status N, no error output` / `killed by signal N`
+  when stderr is blank (ADR-004, D4). git's English messages are
+  reported and never parsed.
+- **The rule for #19.** The token reaches git only as
+  `http.<url>.extraHeader` through `GIT_CONFIG_KEY_n` and
+  `GIT_CONFIG_VALUE_n` in the environment of the one git process that
+  needs it: never in argv (which other users of the host can read in
+  `/proc`), a file or the snapshot. #19 implements it; nothing in this
+  part handles a token.
+
+### D5. Transports
+
+`fetch_base` checks the URL before any process starts, and passes it after
+`--`, so it can never be read as an option.
+
+- `Transports::Https`, the production setting, accepts only
+  `https://<host>/<path>`: a lowercase scheme, a non-empty authority
+  without userinfo (`@`), a `/` after it, and no whitespace, control
+  character or NUL anywhere. Credentials never ride in a URL, and the
+  test table refuses `http`, `ssh`, `git`, `ext::`, `file` and a leading
+  `-` or space.
+- `Transports::HttpsAndFile` also accepts `file:///<absolute path>` with
+  no `.`, `..` or empty component, for the adapter's tests over local
+  fixture repositories.
+- The same set is enforced twice, by the check and by
+  `GIT_ALLOW_PROTOCOL` plus `protocol.*.allow`, so a URL that slipped past
+  the check still cannot reach another transport.
+
+### D6. The operations
+
+- **Stores and checkouts.** `fetch_base` makes a fresh bare store,
+  `<root>/stores/<n>`, per call: `init --bare --template=` with an
+  explicit `--object-format` (`sha256` for a 64-hex SHA), then
+  `info/attributes` with `* -text -eol -filter -ident
+  -working-tree-encoding`, then `fetch --depth=1 --no-tags
+  --no-write-fetch-head --no-recurse-submodules -- <url> <sha>`. No
+  remote, ref or `FETCH_HEAD` is written; the store holds the base commit
+  and its tree, and its `shallow` file cuts the history. A checkout is a
+  tree id in a store, so checkouts never change and an applied one shares
+  its base's store. Ids are `checkout-<n>` from a counter that only a
+  successful `fetch_base` or `apply` advances.
+- **Failure classification.** When the fetch fails, `ls-remote -- <url>`
+  decides: the remote answers, so the commit is not there:
+  `UnknownCommit`; it does not: `Failed` with the fetch's error. Then
+  `cat-file -t` must say `commit` (a tree, blob or tag id is
+  `UnknownCommit`). A fetch that `transfer.fsckObjects` refuses is also
+  `UnknownCommit` when the remote answers; reading git's message to tell
+  the two apart is what this decision rules out. The store is removed on
+  every failure.
+- **`read`** lists the path with `ls-tree -z --full-tree <tree> -- <path>`
+  (literal pathspecs, so `*` and `:(top)x` are file names) and returns
+  the blob for a regular or executable file, `None` for anything else.
+- **`snapshot`** is the tree's files from `ls-tree -r -z` and one
+  `cat-file --batch` (raw blobs, no smudge), gitlinks left out, plus the
+  generated `.git`: exactly `HEAD` (`ref: refs/heads/main`), `config`
+  (fixed text without remote, credential, URL, http, include or hooks
+  path; SHA-256 adds `extensions.objectformat`), `index` (from
+  `read-tree` of the base tree: zeroed stat data, so deterministic),
+  `shallow`, `refs/heads/main` (the base SHA) and one pack with its index
+  from `pack-objects --revs` of the base commit. The pack holds what is
+  reachable from the base, which the shallow boundary limits to the base
+  commit and its tree. The `.git` is always the base's, also for an
+  applied checkout, so `git diff` in the verify sandbox shows the fix.
+  The entries are merged in path order and built with
+  `Workspace::from_sorted` under the node cap (D2). A tree path the path
+  rule refuses (a backslash, a blank name, non-UTF-8) and a tree path
+  that is repository metadata are `Failed`, naming the path: git only
+  warns about a `.git` tree entry, and such an entry would otherwise
+  merge into the generated `.git`.
+- **`diff`** decodes the workspace under the node cap, drops metadata
+  (D1), lists the checkout's gitlinks, writes the rest with `materialize`
+  (D3) into `<root>/scratch/<n>`, and builds the new tree in a throwaway
+  index under `<root>/tmp/<n>`: `read-tree <tree>`, `add -A`,
+  `write-tree`. `add -A` follows the workspace's `.gitignore`, so an
+  ignored untracked file stays out and a tracked one stays in. The diff
+  is `diff-tree -r -p --binary --full-index --no-renames --no-ext-diff
+  --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/`, empty when
+  the trees are equal. Both directories are removed on every path, and
+  each call has its own, so concurrent diffs of one checkout share
+  nothing.
+- **`apply`** of an empty diff issues a new id for the same tree.
+  Otherwise `read-tree`, `apply --cached --whitespace=nowarn` (never
+  `--unsafe-paths` or `--reject`) and `write-tree` on a throwaway index.
+  git refuses a path into `.git` (also nested and look-alikes), `..`, an
+  absolute path and a file beyond a symlink, and applies all hunks or
+  none; any failure is `Failed`, with no new checkout.
+
+### D7. The git version floor
+
+`GitCli::open` runs `git version` and refuses anything older than
+2.39.1 (`MIN_GIT_VERSION`), comparing the first three components as
+numbers (`2.100.0` is newer than `2.39.1`; `2.43.0.windows.1` reads as
+2.43.0; an unreadable version is refused).
+
+- **Why 2.39.1.** It is the 2.39 release that carries the fix for
+  CVE-2022-23521, integer overflows in `.gitattributes` parsing that can
+  give arbitrary heap reads and writes (the git release notes of 2.30.7,
+  which 2.39.1 merges, describe it). `diff` runs `git add` over a
+  workspace whose `.gitattributes` the agent wrote, and the attributes
+  from the tree reach git through `read-tree` too, so a git without the
+  fix is a host code execution path. The same release fixes
+  CVE-2022-41903 (`--format` padding), which this adapter does not
+  reach.
+- **Why not the patched maintenance releases.** 2.30.7, 2.31.6, 2.32.5,
+  2.33.6, 2.34.6, 2.35.6, 2.36.4, 2.37.5 and 2.38.3 carry the same fix,
+  but a version string cannot tell a distribution's patched 2.34.1 from
+  an unpatched one, so the floor fails closed at one version that
+  certainly has it. The features the adapter uses are older:
+  `GIT_CONFIG_COUNT` (2.31), `GIT_CONFIG_GLOBAL` (2.32),
+  `--no-write-fetch-head` and `--object-format` (2.29). A host with an
+  older git installs a newer one and names it in the configuration.
+- **`open`** also refuses a relative git path and a root that exists; it
+  creates the root with mode 0700 and its `home`, `stores`, `scratch`
+  and `tmp` directories, and removes the root again when the version
+  check fails.
 
 ## Consequences
 
@@ -357,6 +525,19 @@ a file or the snapshot.
 - An empty directory, a FIFO, a device or a hard link in the sandbox
   cannot be expressed in a workspace (D2). #8 decides how the export
   treats them; nothing the format cannot carry reaches `diff`.
+- A base tree with a path the workspace cannot carry fails `snapshot`,
+  and with it the run. This repository is one: at the commit the network
+  test fetches, an architecture-checker fixture has a backslash in its
+  name, and the test pins that the snapshot names it. Widening the path
+  rule is a change to D1 and D2, not made here.
+- A fetch that `transfer.fsckObjects` refuses reports `UnknownCommit`
+  when the remote answers (D6), so the run's error names the commit, not
+  the corrupt object.
+- The adapter never removes a store; `<root>` grows by one depth-1 store
+  per `fetch_base` until whoever owns the root removes it (the
+  composition roots, #32 and #33).
+- A host needs git 2.39.1 or newer (D7); a long-term-support
+  distribution with an older, patched git needs a newer git installed.
 
 ## Alternatives considered
 
@@ -380,6 +561,14 @@ a file or the snapshot.
   only exit codes and never git's English messages, so it would need its
   own parse of the diff's paths before `git apply`. That is a change to
   part 3's plan, not made here.
+- **Filtering the host environment instead of clearing it.** A denylist
+  of the variables git reads misses the next one git adds; the cleared
+  environment plus an allowlist cannot (D4).
+- **Running git in the scratch directory without `--git-dir`.** Discovery
+  would find nothing there after metadata is dropped, but it would also
+  walk up into whatever repository holds the root; an explicit
+  `--git-dir` with the store as the working directory needs no such
+  argument (D4).
 - **tar as the workspace format.** A tar stream has many encodings of one
   tree (header variants, pax and GNU extensions, hard links, devices,
   directory entries in any order), so it is not canonical, and the tar
@@ -410,3 +599,11 @@ the `core.fsmonitor` entry, and each run must fail at `nothing-ran` on
 its own. Git ignores a hook that is not executable, so the hook entry
 must reach the workspace with its executable bit set; a GitCli that pins
 fsmonitor off but still runs workspace hooks would otherwise pass.
+
+Met on 2026-11-17 by part 3's PR: `git_cli_passes_contract` passes the
+whole suite over `file://` with a sentinel directory per test in that
+test's own temporary directory (the `Tripwire` is passed once per suite
+run, so its sentinel is per run, which is per test), and
+`metadata_fixture_trips_a_discovering_git` fails the clause at
+`nothing-ran` with the hook entry alone (written executable by the
+test's `edit`), with the `core.fsmonitor` entry alone, and with both.

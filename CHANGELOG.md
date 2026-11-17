@@ -351,6 +351,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metadata, entries at or under a gitlink, gitlinks beneath an entry and
   more nodes than its cap, gitlink directories included, before it
   writes anything.
+- `GitCli`, part 3 of #30 (ADR-010 D4 to D7, accepted): the `Git` port
+  over the git binary. Every git call runs from an absolute path with a
+  cleared environment, a private empty `HOME`, no system or global config,
+  command-scope config (hooks, fsmonitor and credential helpers off, NTFS
+  and HFS path protection on, https only, fsck on transfer) and an explicit
+  `--git-dir`, so neither the workspace nor the host environment steers
+  it. `fetch_base` fetches the base SHA alone, depth 1, into a fresh bare
+  store (`Transports::Https`; `HttpsAndFile` for tests) and tells an
+  unknown commit from an unreachable remote by `ls-remote`; `snapshot` is
+  the tree's files plus a generated one-commit `.git` with no remote, hook
+  or credential, the same bytes every time; `diff` drops repository
+  metadata, writes the workspace with `materialize` and diffs it through
+  `git add -A` on a throwaway index; `apply` is `git apply --cached`, all
+  or nothing. `GitCli::open` refuses a git older than 2.39.1
+  (CVE-2022-23521). `GitCli` passes the whole `Git` suite, and a git that
+  discovers the workspace's repository fails `workspace-metadata-inert`
+  at `nothing-ran`, by the hook alone and by `core.fsmonitor` alone.
 
 ### Changed
 

@@ -11,12 +11,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# Adapter crate: the domain and the application only (ADR-010, part 2 of
-# #30). No external edge.
+# Adapter crate: the domain and the application only (ADR-010). No
+# external edge; git is a process, not a dependency.
 [dependencies]
 # `CitationProblem`, the reason the path rule gives when a workspace path
-# is refused.
+# is refused, and `CommitSha`, the base `fetch_base` takes.
 boneli-domain.workspace = true
 # `RelativePath` and its repository-metadata rule (ADR-010, D1), and the
-# `Git` port the adapter implements in part 3.
+# `Git` port `GitCli` implements; its tests run the port's contract suite.
 boneli-app.workspace = true
