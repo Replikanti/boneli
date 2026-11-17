@@ -326,8 +326,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `retarget` hook and a `Tripwire` fixture; one mutant per sub-check
   (`RunsMetadata`, `MetadataIsContent`, `AdoptsPerCheckout`,
   `AdoptsIntoNewCheckouts`, `AdoptsOnApply`, `AppliesMetadata`): 50
-  clauses, 62 mutant cases. `boneli_replay_check::mutants` gains a
-  regression table (4 mutants) and vacuous-fixture violations (2), both
+  clauses, 62 mutant cases. Fixture guards require every metadata entry
+  to reach the workspace and every diff pointed at metadata to apply
+  once moved back to content. `boneli_replay_check::mutants` gains a
+  regression table (5 mutants) and vacuous-fixture violations (5), both
   rendered under the replay gate.
 
 ### Changed

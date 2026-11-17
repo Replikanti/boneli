@@ -1,5 +1,7 @@
 //! Every in-memory adapter passes its port's contract suite (ADR-004, D2).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
     Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase, RelativePath, RepoUrl,
@@ -263,22 +265,27 @@ pub fn repository() -> contract::git::Repository<MemoryGit> {
 /// names a command for `core.fsmonitor` and a hooks directory, a hook git
 /// runs when it writes an index, and the config of a nested repository.
 /// The sentinel is an absolute path outside anything an adapter creates or
-/// removes, as `Tripwire` requires; `MemoryGit` runs nothing, so here it is
-/// only an example.
+/// removes, unique to each fixture, as `Tripwire` requires; `MemoryGit`
+/// runs nothing, so here it is only an example and is never created.
 pub fn metadata() -> Vec<(RelativePath, Vec<u8>)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let sentinel = std::env::temp_dir()
+        .join(format!("boneli-tripwire-{}-{n}", std::process::id()))
+        .join("tripped");
+    let touch = format!("touch {}", sentinel.display());
     vec![
         (
             path(".git/config"),
-            b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n\thooksPath = .git/hooks\n"
-                .to_vec(),
+            format!("[core]\n\tfsmonitor = {touch}\n\thooksPath = .git/hooks\n").into_bytes(),
         ),
         (
             path(".git/hooks/post-index-change"),
-            b"#!/bin/sh\ntouch /tmp/boneli-tripwire/tripped\n".to_vec(),
+            format!("#!/bin/sh\n{touch}\n").into_bytes(),
         ),
         (
             path("sub/.git/config"),
-            b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n".to_vec(),
+            format!("[core]\n\tfsmonitor = {touch}\n").into_bytes(),
         ),
     ]
 }
@@ -292,31 +299,45 @@ impl contract::git::Tripwire<MemoryGit> for NothingRuns {
     }
 }
 
-/// Moves every change of `from` in a diff of `MemoryGit`'s format to `to`.
+/// One field of `MemoryGit`'s formats; `None` when it runs past the end.
+fn take_field<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let n = usize::try_from(u64::from_be_bytes(length)).ok()?;
+    let bytes = rest.get(8..8usize.checked_add(n)?)?;
+    *rest = &rest[8 + n..];
+    Some(bytes)
+}
+
+fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Moves every change of `from` in a diff of `MemoryGit`'s format to `to`;
+/// a malformed diff comes back as it was.
 pub fn retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> {
     let mut rest = diff;
     let mut out = Vec::new();
-    let field = |rest: &mut &[u8], out: &mut Vec<u8>, path: bool| {
-        let mut length = [0u8; 8];
-        length.copy_from_slice(&rest[..8]);
-        let n = u64::from_be_bytes(length) as usize;
-        let bytes = &rest[8..8 + n];
-        let bytes = if path && bytes == from.as_str().as_bytes() {
+    while !rest.is_empty() {
+        let Some(path) = take_field(&mut rest) else {
+            return diff.to_vec();
+        };
+        let path = if path == from.as_str().as_bytes() {
             to.as_str().as_bytes()
         } else {
-            bytes
+            path
         };
-        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        out.extend_from_slice(bytes);
-        *rest = &rest[8 + n..];
-    };
-    while !rest.is_empty() {
-        field(&mut rest, &mut out, true);
-        let tag = rest[0];
+        put_field(&mut out, path);
+        let Some((&tag, tail)) = rest.split_first() else {
+            return diff.to_vec();
+        };
+        rest = tail;
         out.push(tag);
-        rest = &rest[1..];
         if tag == 1 {
-            field(&mut rest, &mut out, false);
+            let Some(content) = take_field(&mut rest) else {
+                return diff.to_vec();
+            };
+            put_field(&mut out, content);
         }
     }
     out
@@ -426,6 +447,71 @@ fn retarget_must_make_a_diff_that_applies() {
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
     assert!(detail.contains("twin"), "{detail}");
+}
+
+/// Every metadata entry must reach the workspace on its own and in the
+/// full set: an `edit` that skips the nested entry, or drops it once the
+/// top-level `.git` is there, would let an adapter that drops only the
+/// top-level `.git` pass (review round 2 of #61).
+#[test]
+fn metadata_fixture_entries_each_reach_the_workspace() {
+    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        let top = unpack_tree(w)
+            .expect("a workspace")
+            .keys()
+            .any(|k| k.as_str().starts_with(".git/"));
+        if top && p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    for result in [
+        contract::git::run(repository, skip_nested, retarget, &NothingRuns),
+        contract::git::run(repository, drop_nested_later, retarget, &NothingRuns),
+    ] {
+        let (clause, detail) = git_clause(result);
+        assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+        assert!(detail.starts_with("fixture:"), "{detail}");
+        assert!(detail.contains("sub/.git/config"), "{detail}");
+    }
+}
+
+/// The refusal must come from the metadata rule, not from a diff that
+/// `retarget` broke for metadata targets: a diff retargeted to each
+/// metadata path and back must apply (review round 2 of #61).
+#[test]
+fn retarget_must_round_trip_through_metadata_paths() {
+    let garbles_metadata = |d: &[u8], from: &RelativePath, to: &RelativePath| {
+        if to.is_repository_metadata() {
+            b"garbage".to_vec()
+        } else {
+            retarget(d, from, to)
+        }
+    };
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        edit,
+        garbles_metadata,
+        &NothingRuns,
+    ));
+    assert_eq!(clause, "workspace-metadata-inert", "{detail}");
+    assert!(detail.starts_with("fixture:"), "{detail}");
+    assert!(detail.contains(".git/config"), "{detail}");
+}
+
+/// Each fixture gets its own sentinel, so tests that run in parallel cannot
+/// clear each other's (review round 2 of #61).
+#[test]
+fn fixture_sentinels_are_unique() {
+    assert_ne!(repository().metadata, repository().metadata);
 }
 
 /// No metadata: every adapter would pass, so it is a violation.

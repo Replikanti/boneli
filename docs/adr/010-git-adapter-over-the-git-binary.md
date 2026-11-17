@@ -76,24 +76,42 @@ adversarial review.
     would create. The sentinel must sit at an absolute path outside every
     directory the adapter creates or removes: git runs a relative command
     in the directory it works in, which the adapter deletes, and the run
-    would go unseen (review of the part 1 PR).
+    would go unseen (review of the part 1 PR). It must also be unique to
+    the fixture, inside the test's own temporary directory: tests run in
+    parallel, and one that resets a shared sentinel would erase another's
+    trip (review round 2). The in-memory fixture shows the pattern; the
+    replay fixture keeps a fixed one, because nothing runs it and the
+    replay gate compares rendered lengths across processes.
 
   The clause works in this order:
   1. Fixture guards, each a violation and not a pass: the metadata list is
      not empty, every path is repository metadata, the tripwire reports
      nothing before the clause starts (a tripwire that fails to look is a
-     violation too), and `edit` really writes the metadata, so the
-     workspace with it differs from the one without it. An `edit` that
-     drops `.git` paths, as a codec that keeps its own invariants might,
-     would otherwise make every sub-check vacuous.
+     violation too), and `edit` really writes every metadata entry: for
+     each entry, the workspace with all entries differs from the one
+     without that entry. An `edit` that drops `.git` paths, as a codec
+     that keeps its own invariants might, would otherwise make every
+     sub-check vacuous, and one that skips or later drops only the nested
+     entry would let an adapter that mishandles only nested metadata pass
+     (review round 2). This check needs no adapter call. A check that
+     each entry alone changes the workspace adds nothing to it: any skip
+     or drop already makes the two workspaces equal.
   2. Before any metadata reaches the adapter: `plain` is the base snapshot
      with the fixture's file edited, `d_plain` its diff, `reference` the
      snapshot of `d_plain` applied to the base, and `d_add` a diff that
-     adds the fixture's missing path. `retarget` must move `d_add` to a
-     twin content path (`<missing>.twin`, absent at the base) as a diff
-     that applies and reads back the fixture's content; otherwise a
-     `retarget` that makes garbage would pass `apply-refuses` on every
-     adapter.
+     adds the fixture's missing path. For each metadata path, `retarget`
+     moves `d_add` there and back to a twin content path
+     (`<missing>.twin`, absent at the base), and that diff must apply and
+     read back the fixture's content. This proves that the diff pointed
+     at metadata carries the change, so its refusal can only come from
+     the adapter's metadata rule. Without it, a `retarget` that makes
+     garbage, ignores its target, or breaks only diffs pointed at `.git`
+     (review round 2) would pass `apply-refuses` on every adapter. The
+     round trip also covers a plain move to content; round 1's separate
+     proof of that was dropped as redundant. `apply-refuses` applies
+     exactly these proven diffs. What no
+     such proof reaches is a `retarget` that recognizes metadata paths,
+     breaks the diff on the way there and repairs it on the way back.
   3. `hostile` is `plain` plus every metadata entry, and `d_hostile` its
      diff.
   4. `nothing-ran`: the tripwire is empty. It is checked again after each
@@ -135,13 +153,17 @@ adversarial review.
   is checked and rendered the same way, and each must name a case the
   table covers: `AdoptsMetadata` and `AdoptsOnChanges` (`same-checkout`),
   `RunsOnRediff` (`nothing-ran`, a hook that runs only on a second diff
-  of the same checkout) and `WritesThenRefuses` (`apply-refuses`, the
-  unchanged-checkout check). The two mutants that a metadata-dropping
-  `edit` let through are rendered as fixture violations, like the
-  blank-status ones. Everything compared later is taken before
+  of the same checkout), `WritesThenRefuses` (`apply-refuses`, the
+  unchanged-checkout check) and `NestedIsContent` (`same-diff`, only the
+  top-level `.git` dropped). The fixture hooks that made the clause
+  vacuous in review are rendered as fixture violations, like the
+  blank-status ones, each on a mutant it let through: an `edit` that
+  writes no metadata (`RunsMetadata`, `MetadataIsContent`), one that
+  skips or later drops the nested entry (`NestedIsContent`), and a
+  `retarget` that breaks diffs pointed at metadata (`AppliesMetadata`). Everything compared later is taken before
   `d_hostile`, so an adapter that adopts the metadata cannot pass by
   spoiling both sides. Counts: 50 clauses and 62 mutant cases (49 and 56
-  before), plus 4 regression mutants and 2 vacuous fixtures.
+  before), plus 5 regression mutants and 5 vacuous fixtures.
 - **ADR-004 is accepted and stays unchanged.** Its D2 counts and its D11
   clause table describe the suites as it accepted them; this ADR records
   the addition, as ADR-009 D13 did for `tampered-refused`.
@@ -188,6 +210,13 @@ a file or the snapshot.
   hook that runs only on a second diff all passing it (step 6).
 - **Leaving `apply`'s refusal to the adapter's own tests.** The rule is the
   port's, so the contract binds it; the cost is the `retarget` fixture.
+- **A dedicated `GitError` variant for a refused metadata path**, so that
+  `apply-refuses` could require that variant instead of any error. It
+  would close the residual named in step 2 without the round-trip proof,
+  but `GitCli` would then have to classify git's refusal. Its plan reads
+  only exit codes and never git's English messages, so it would need its
+  own parse of the diff's paths before `git apply`. That is a change to
+  part 3's plan, not made here.
 - **A rule that also matches look-alikes** (case-folded `.git`, 8.3 short
   names). The core cannot know the file system the pull request will be
   checked out on, and git's own `protectNTFS`/`protectHFS` checks are the
@@ -196,5 +225,10 @@ a file or the snapshot.
 ## Accept when
 
 Part 3 of #30 merges with `GitCli` passing the whole `Git` suite,
-`workspace-metadata-inert` included, on a fixture repository, and with the
-discovering-git wrapper failing that clause at `nothing-ran`.
+`workspace-metadata-inert` included, on a fixture repository whose
+tripwire sentinel is unique to each fixture and sits in the test's own
+temporary directory, outside the adapter root. The same PR's
+`metadata_fixture_trips_a_discovering_git` must fail that clause at
+`nothing-ran` through a wrapper that runs `git add -A` with discovery
+inside the unpacked workspace and then deletes that working directory,
+as the adapter does, so the trip is seen only through the sentinel.

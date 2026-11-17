@@ -808,9 +808,17 @@ enum GitBug {
     /// `apply` refuses a diff that writes repository metadata, but only
     /// after writing into the checkout it was given.
     WritesThenRefuses,
+    /// `diff` drops only the top-level `.git` and encodes nested
+    /// repository metadata as content (review round 2 of #61).
+    NestedIsContent,
 }
 
 const HEADER: &[u8] = b"diff\n";
+
+/// Repository metadata below the top level, such as `sub/.git/config`.
+fn is_nested_metadata(path: &RelativePath) -> bool {
+    path.is_repository_metadata() && !path.as_str().starts_with(".git/")
+}
 
 /// Whether some component of the path is `.git` and the next is `hooks`.
 fn is_hook(path: &RelativePath) -> bool {
@@ -981,6 +989,11 @@ impl Git for GitMutant {
         Ok(match self.bug {
             GitBug::Header => [HEADER, &diff].concat(),
             GitBug::MetadataIsContent => [diff, metadata_as_changes(&tree)].concat(),
+            GitBug::NestedIsContent => {
+                let mut nested = tree.clone();
+                nested.retain(|path, _| !path.as_str().starts_with(".git/"));
+                [diff, metadata_as_changes(&nested)].concat()
+            }
             GitBug::AdoptsMetadata if adopted => [HEADER, &diff].concat(),
             GitBug::AdoptsOnChanges if adopted && !diff.is_empty() => [HEADER, &diff].concat(),
             GitBug::AdoptsPerCheckout | GitBug::AdoptsIntoNewCheckouts if tainted => {
@@ -1069,6 +1082,10 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
         missing: path("src/missing.rs"),
         unknown: CommitSha::parse(OTHER).expect("valid SHA"),
         edited: b"fn total() { 1 }\n".to_vec(),
+        // A fixed sentinel: nothing runs it here, and the replay gate
+        // compares the rendered lengths of `same-diff` across processes, so
+        // it must not vary. A real adapter's test uses a unique one per
+        // fixture (`contract::git::Tripwire`).
         metadata: vec![
             (
                 path(".git/config"),
@@ -1560,12 +1577,19 @@ pub fn regression_mutants() -> Vec<Mutant> {
         // The second site of `apply-refuses`: the refused checkout is
         // unchanged.
         git_metadata("apply-refuses", GitBug::WritesThenRefuses),
+        // Review round 2 of #61: nested metadata treated as content.
+        git_metadata("same-diff", GitBug::NestedIsContent),
     ]
 }
 
-/// The violations of `workspace-metadata-inert` with an `edit` hook that
-/// never writes metadata into the workspace, on the two mutants it let
-/// through in review of #61: the suite rejects the fixture.
+/// An `edit` fixture hook of the `Git` suite.
+type EditHook = dyn Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>;
+
+/// The violations of `workspace-metadata-inert` with fixture hooks that
+/// review of #61 showed making it vacuous, each on a mutant it let
+/// through: an `edit` that never writes metadata (round 1), one that skips
+/// or later drops the nested entry, and a `retarget` that breaks diffs
+/// pointed at metadata (round 2). The suite rejects the fixture.
 pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)> {
     let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
         if p.is_repository_metadata() {
@@ -1582,9 +1606,57 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
             &MutantTripwire,
         )
     };
+    // Review round 2 of #61: an `edit` that skips only the nested entry,
+    // or drops it once the top-level `.git` is there.
+    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        if is_nested_metadata(p) {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+        let top = unpack_tree(w)
+            .unwrap_or_default()
+            .keys()
+            .any(|k| k.as_str().starts_with(".git/"));
+        if top && is_nested_metadata(p) {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let nested = |edit: &EditHook| {
+        contract::git::run(
+            || git_repository(GitBug::NestedIsContent),
+            edit,
+            git_retarget,
+            &MutantTripwire,
+        )
+    };
+    // Review round 2 of #61: a `retarget` that breaks diffs pointed at
+    // metadata, so any `apply` refuses them.
+    let garbles_metadata = |d: &[u8], from: &RelativePath, to: &RelativePath| {
+        if to.is_repository_metadata() {
+            b"garbage".to_vec()
+        } else {
+            git_retarget(d, from, to)
+        }
+    };
     vec![
         ("RunsMetadata", run(GitBug::RunsMetadata)),
         ("MetadataIsContent", run(GitBug::MetadataIsContent)),
+        ("NestedIsContent skipped", nested(&skip_nested)),
+        ("NestedIsContent dropped later", nested(&drop_nested_later)),
+        (
+            "AppliesMetadata garbled",
+            contract::git::run(
+                || git_repository(GitBug::AppliesMetadata),
+                git_edit,
+                garbles_metadata,
+                &MutantTripwire,
+            ),
+        ),
     ]
 }
 

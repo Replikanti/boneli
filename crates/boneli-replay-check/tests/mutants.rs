@@ -138,10 +138,12 @@ fn regression_mutants_name_covered_cases() {
     }
 }
 
-/// An `edit` hook that never writes metadata is a fixture violation of
-/// `workspace-metadata-inert`, not a pass (review of #61).
+/// Fixture hooks that review of #61 showed making the clause vacuous (an
+/// `edit` that skips or drops metadata, a `retarget` that breaks diffs
+/// pointed at it) are fixture violations of `workspace-metadata-inert`,
+/// not passes.
 #[test]
-fn metadata_skipping_edit_is_a_violation() {
+fn vacuous_fixture_hooks_are_violations() {
     for (bug, result) in vacuous_fixture_violations() {
         let violation = result.expect_err("a vacuous fixture must not pass");
         assert_eq!(

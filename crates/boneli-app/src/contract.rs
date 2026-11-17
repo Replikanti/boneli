@@ -1322,7 +1322,10 @@ pub mod git {
     /// sentinel that a hook or `core.fsmonitor` would create). The sentinel
     /// must sit at an absolute path outside every directory the adapter
     /// creates or removes: a relative one lands in the directory git runs
-    /// in, which the adapter deletes, and the run would go unseen.
+    /// in, which the adapter deletes, and the run would go unseen. It must
+    /// also be unique to the fixture, in the test's own temporary
+    /// directory: tests run in parallel, and one that resets a shared
+    /// sentinel would erase another's trip.
     pub trait Tripwire<G> {
         /// What ran, one entry each; empty when nothing did. An error is
         /// reported as the clause's detail.
@@ -1622,18 +1625,51 @@ pub mod git {
         )
     }
 
+    /// Applies `diff` to `base` and reads `twin` from the result: `Ok` when
+    /// it reads back [`Repository::edited`], otherwise what it gave
+    /// instead (lengths, not bytes), for the detail.
+    fn adds_twin<G: Git>(
+        r: &Repository<G>,
+        base: &CheckoutId,
+        diff: &[u8],
+        twin: &RelativePath,
+    ) -> Result<(), String> {
+        let read = r
+            .adapter
+            .apply(base, diff)
+            .and_then(|after| r.adapter.read(&after, twin));
+        if read.as_ref().map(Option::as_deref) == Ok(Some(r.edited.as_slice())) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{:?}",
+                read.map(|got| got.map(|bytes| bytes.len()))
+            ))
+        }
+    }
+
     /// The fixture half of `apply-refuses`, run before any metadata reaches
-    /// the adapter: a diff that adds [`Repository::missing`], and proof
-    /// that `retarget` moves it to another content path as a diff that
-    /// applies. Without that proof, a `retarget` that makes garbage would
-    /// pass the sub-check on every adapter.
-    fn retargetable_diff<G: Git>(
+    /// the adapter. It makes a diff that adds [`Repository::missing`] and,
+    /// with `retarget`, one diff per metadata path that adds the file
+    /// there; it returns those. Each must first prove itself: moved back
+    /// from its metadata path to a twin content path (`<missing>.twin`,
+    /// absent at the base), it applies and reads back the fixture's
+    /// content. Otherwise it is a fixture violation, because a `retarget`
+    /// that makes garbage, ignores its target or breaks only diffs pointed
+    /// at metadata would make every refusal a parse error and let every
+    /// adapter pass (review rounds 1 and 2 of #61). The round trip also
+    /// covers a plain move to content, so no separate proof is needed.
+    ///
+    /// A `retarget` that breaks a diff on the way to a metadata path and
+    /// repairs it on the way back is out of reach of any such proof; it
+    /// would have to recognize metadata paths and undo its own damage.
+    fn metadata_diffs<G: Git>(
         r: &Repository<G>,
         edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
         retarget: &impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         base: &CheckoutId,
         snapshot: &[u8],
-    ) -> Result<Vec<u8>, Violation> {
+    ) -> Result<Vec<(RelativePath, Vec<u8>)>, Violation> {
         let added = edit(snapshot, &r.missing, Some(&r.edited));
         let d_add = call(METADATA, "diff", r.adapter.diff(base, &added))?;
         let twin_name = format!("{}.twin", r.missing.as_str());
@@ -1648,23 +1684,55 @@ pub mod git {
                  cannot be shown to add it"
             )));
         }
-        let moved = retarget(&d_add, &r.missing, &twin);
-        let read = r
-            .adapter
-            .apply(base, &moved)
-            .and_then(|after| r.adapter.read(&after, &twin));
-        if read.as_ref().map(Option::as_deref) != Ok(Some(r.edited.as_slice())) {
-            return Err(metadata_fixture(format!(
-                "the retarget hook moved a diff that adds {:?} to {twin_name:?}, and \
-                 applying it gave {:?}, expected a file there with the fixture's content \
-                 ({} bytes); a retarget hook that does not make diffs that apply would let \
-                 every adapter pass apply-refuses",
-                r.missing.as_str(),
-                read.map(|got| got.map(|bytes| bytes.len())),
-                r.edited.len()
-            )));
+        let mut diffs = Vec::new();
+        for (path, _) in &r.metadata {
+            let to_metadata = retarget(&d_add, &r.missing, path);
+            let back = retarget(&to_metadata, path, &twin);
+            adds_twin(r, base, &back, &twin).map_err(|got| {
+                metadata_fixture(format!(
+                    "the retarget hook moved a diff that adds {:?} to {:?} and back to \
+                     {twin_name:?}, and applying that gave {got}, expected a file there with \
+                     the fixture's content ({} bytes); the diff pointed at the metadata path \
+                     is not shown to be well formed, so its refusal would prove nothing",
+                    r.missing.as_str(),
+                    path.as_str(),
+                    r.edited.len()
+                ))
+            })?;
+            diffs.push((path.clone(), to_metadata));
         }
-        Ok(d_add)
+        Ok(diffs)
+    }
+
+    /// Every metadata entry reaches the workspace: leaving it out of the
+    /// full set changes `hostile`. An `edit` that skips an entry, or drops
+    /// it once another is there (the nested `.git` after the top-level
+    /// one, say), would otherwise let an adapter that mishandles only that
+    /// entry pass (review round 2 of #61). This also covers an `edit` that
+    /// writes no metadata at all. Pure: the adapter sees none of it.
+    fn every_entry_reaches_the_workspace(
+        r_metadata: &[(RelativePath, Vec<u8>)],
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        plain: &[u8],
+        hostile: &[u8],
+    ) -> Result<(), Violation> {
+        for (k, (path, _)) in r_metadata.iter().enumerate() {
+            let without = r_metadata
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != k)
+                .fold(plain.to_vec(), |workspace, (_, (other, content))| {
+                    edit(&workspace, other, Some(content))
+                });
+            if without == hostile {
+                return Err(metadata_fixture(format!(
+                    "the workspace with every metadata entry equals the one without {:?}, so \
+                     the edit hook dropped it and the adapter never sees it",
+                    path.as_str()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The workspace comes from the sandbox, where the agent writes, and
@@ -1685,7 +1753,8 @@ pub mod git {
     ///   the snapshot it gave before the metadata was seen;
     /// - `apply-refuses`: a diff that writes a metadata path, made by
     ///   moving a diff that adds a file there with the adapter's own
-    ///   `retarget`, does not apply, and the checkout stays as it was.
+    ///   `retarget` and shown to apply once moved back to content, does
+    ///   not apply, and the checkout stays as it was.
     ///
     /// Everything compared later is taken before the hostile diff, so an
     /// adapter that adopts the metadata cannot pass by spoiling both sides.
@@ -1726,16 +1795,11 @@ pub mod git {
             .fold(plain.clone(), |workspace, (path, content)| {
                 edit(&workspace, path, Some(content))
             });
-        if hostile == plain {
-            return Err(metadata_fixture(String::from(
-                "the edit hook returned the same workspace with the metadata as without it, \
-                 so the adapter never sees any",
-            )));
-        }
+        every_entry_reaches_the_workspace(&r.metadata, edit, &plain, &hostile)?;
         // Taken before any metadata reaches the adapter.
         let d_plain = call(METADATA, "diff", r.adapter.diff(&base, &plain))?;
         let reference = applied_snapshot(r, &base, &d_plain)?;
-        let d_add = retargetable_diff(r, edit, retarget, &base, &snapshot)?;
+        let metadata_diffs = metadata_diffs(r, edit, retarget, &base, &snapshot)?;
 
         let d_hostile = call(METADATA, "diff", r.adapter.diff(&base, &hostile))?;
         nothing_ran(r, tripwire, "the diff of a workspace with metadata")?;
@@ -1784,9 +1848,8 @@ pub mod git {
         }
         nothing_ran(r, tripwire, "the applies")?;
 
-        for (path, _) in &r.metadata {
-            let hostile_diff = retarget(&d_add, &r.missing, path);
-            let got = r.adapter.apply(&base, &hostile_diff);
+        for (path, hostile_diff) in &metadata_diffs {
+            let got = r.adapter.apply(&base, hostile_diff);
             ensure(got.is_err(), PORT, METADATA, || {
                 format!(
                     "apply-refuses: a diff that writes {:?} applied to {base:?} as {got:?}, \
