@@ -327,8 +327,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-009 is accepted. The zstd window cap is 128 MiB (was 100 MiB), the
   reference decoder's default, so `zstd --long` layers decode (D5).
   Temporary names in the store carry their owner's boot id (a random id
-  where `/proc` hides it), PID and time namespaces, pid and start time at
-  fixed widths; the store removes only those of owners that are gone in
+  where `/proc` hides it), PID and time namespaces (the calling thread's,
+  so an exited main thread never reads as a kernel without time
+  namespaces), pid and start time at fixed widths; the store removes only those of owners that are gone in
   its own boot, PID and time namespace, judged through a `/proc` of that
   PID namespace, skips a leftover it cannot remove
   instead of failing `open`, and a staging name is longer than a

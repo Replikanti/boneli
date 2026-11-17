@@ -366,10 +366,10 @@ the store will use, and why:
 - A layer is unpacked into `layers/sha256/.tmp-<owner>.<n>/`, where
   `<owner>` is `<boot>.<pidns>.<timens>.<pid>.<start>`: the kernel's
   boot id (`/proc/sys/kernel/random/boot_id`) as 32 lower-case hex
-  digits, the inode of the process's PID namespace (`/proc/self/ns/pid`),
-  the inode of its time namespace (`/proc/self/ns/time`; 0 on a kernel
-  built without time namespaces, `u64::MAX` when the link cannot be
-  read), its pid in the PID namespace and its start time from
+  digits, the inode of the process's PID namespace
+  (`/proc/thread-self/ns/pid`), the inode of its time namespace
+  (`/proc/thread-self/ns/time`; 0 on a kernel built without time
+  namespaces, `u64::MAX` when the link cannot be read), its pid in the PID namespace and its start time from
   `/proc/self/stat`, zero-padded to 20, 20, 10 and 20 digits, and `<n>` a
   20-digit counter (part 3; parts 1 and 2 used `<pid>.<starttime>.<n>`,
   part 3 before its first review had no boot id and before its second
@@ -515,11 +515,35 @@ the store will use, and why:
     kernel with time namespaces has; two runners in different time
     namespaces sharing a store are rare, and an owner that is not judged
     costs disk, never a live tree. A kernel built without time
-    namespaces has no `ns/time` link (`/proc/<pid>/ns/` lists exactly
-    the namespace types the kernel has), shifts nothing and records 0.
+    namespaces shifts nothing and records 0.
+    The namespace links are the calling thread's, `/proc/thread-self/ns/`,
+    not `/proc/self/ns/` (third review of #60): `/proc/self` names the
+    thread-group leader, and once the main thread has exited while other
+    threads run, the kernel has cleared the leader's namespaces, so its
+    `ns/time` fails with `ENOENT` on a kernel that has time namespaces.
+    Read as "no time namespaces", that recorded 0, and two such processes
+    in different time namespaces judged each other's shifted start times
+    and swept a live staging blob (reproduced: 10 of 10 pulls failed). A
+    running thread's links always read, and a thread group shares its PID
+    and time namespaces (`setns` into a time namespace needs a
+    single-threaded caller). The rule for 0, which holds whatever thread
+    reads it: the link fails with `ENOENT` and the thread's `ns/` is a
+    directory with no `time` entry. `/proc/<pid>/ns/` lists exactly the
+    namespace types the kernel was built with, whether or not their links
+    read, so on a kernel with time namespaces the entry is there even
+    where the link fails; anything else (another error, a missing or
+    unsearchable `ns/`, a `time` entry whose link fails) is `u64::MAX`,
+    never judged. The other `/proc/self` reads keep the leader and stay
+    correct after it exits: `/proc/self` still reads `getpid()`,
+    `status` still has the `NSpid` line, `stat` the start time judges
+    read in `/proc/<pid>/stat`, and the directory's uid the effective uid
+    (checked on a zombie leader); any of them that fails ends in a foreign
+    `/proc` (no owner judged) or a failed `open`, never in a sweep.
     Pinned by `host::other_time_namespace_judges_no_owner` (rootless
     `unshare -Urm`, then `unshare -T --boottime 100000` inside it, in the
-    `sandbox` CI job) and the unit tests of the decision and the link.
+    `sandbox` CI job) and the unit tests of the decision and the link,
+    including one through a helper process whose main thread has exited
+    (`exited_main_thread_reads_unreadable`).
   - An owner that could not read its boot id (above): its random id
     equals no other process's boot id, so only the process itself judges
     its names. A crash of such a process leaves at most one partial

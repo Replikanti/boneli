@@ -297,8 +297,8 @@ pub(crate) const OWNED_PREFIXES: [&str; 5] = [
 ];
 
 /// The process that owns a temporary name (D8): the kernel's boot id, its
-/// PID namespace (the inode of `/proc/self/ns/pid`), its time namespace
-/// (the inode of `/proc/self/ns/time`), its pid in the PID namespace and
+/// PID namespace (the inode of `/proc/thread-self/ns/pid`), its time
+/// namespace (the inode of `/proc/thread-self/ns/time`), its pid in the PID namespace and
 /// its start time in clock ticks since boot, as its time namespace shows
 /// it: `/proc/<pid>/stat` shifts start times by the boottime offset of
 /// the reader's time namespace, so only a reader in the same one reads
@@ -319,8 +319,18 @@ pub(crate) struct Owner {
 }
 
 /// The time namespace an owner records on a kernel built without time
-/// namespaces, which has no `/proc/self/ns/time` and shifts no start time.
+/// namespaces, which has no `ns/time` entry and shifts no start time.
 const NO_TIME_NAMESPACE: u64 = 0;
+
+/// The namespace links of the calling thread. Not `/proc/self/ns`:
+/// `/proc/self` names the thread-group leader, and once the main thread has
+/// exited while others run, the kernel has cleared its namespaces, so its
+/// `ns/time` link fails with `ENOENT` on a kernel that has time namespaces
+/// (round-3 review of #60). A running thread's own links always read, and
+/// a thread group shares its PID and time namespaces: `setns` into a time
+/// namespace needs a single-threaded caller, and a PID namespace is never
+/// a thread's own.
+const OWN_NAMESPACES: &str = "/proc/thread-self/ns";
 
 /// The time namespace an owner records when it cannot read its own. No
 /// namespace inode equals it, and a judge that records it judges no owner,
@@ -398,14 +408,11 @@ fn proc_is_own(self_link: Option<&str>, status: Option<&[u8]>, pid: u32) -> bool
 impl Owner {
     /// This process.
     pub(crate) fn current() -> Result<Owner, Error> {
-        // The PID namespace first: once `/proc/self/ns/` has been read,
-        // a missing `time` link there means a kernel without time
-        // namespaces, not a missing `/proc`.
-        let pidns = own_pid_namespace()?;
+        let ns = Path::new(OWN_NAMESPACES);
         Ok(Owner {
             boot: own_boot_id(),
-            pidns,
-            timens: time_namespace_of(fs::read_link("/proc/self/ns/time")),
+            pidns: own_pid_namespace(ns)?,
+            timens: own_time_namespace(ns),
             pid: std::process::id(),
             start: own_start_time()?,
         })
@@ -623,10 +630,10 @@ fn is_boot_hex(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The inode of this process's PID namespace, from the link
-/// `/proc/self/ns/pid`, which reads `pid:[<inode>]`.
-fn own_pid_namespace() -> Result<u64, Error> {
-    let path = Path::new("/proc/self/ns/pid");
+/// The inode of this process's PID namespace, from the link `pid` in the
+/// calling thread's namespace directory `ns`, which reads `pid:[<inode>]`.
+fn own_pid_namespace(ns: &Path) -> Result<u64, Error> {
+    let path = &ns.join("pid");
     let link = fs::read_link(path).map_err(|e| cache_err(path, e))?;
     link.to_str()
         .and_then(|l| l.strip_prefix("pid:["))
@@ -635,12 +642,22 @@ fn own_pid_namespace() -> Result<u64, Error> {
         .ok_or_else(|| cache_err(path, io::Error::other("unreadable PID namespace")))
 }
 
-/// The time namespace in the link `/proc/self/ns/time`, which reads
-/// `time:[<inode>]`. No link means a kernel without time namespaces, since
-/// `/proc/<pid>/ns/` lists exactly the namespace types the kernel was
-/// built with ([`NO_TIME_NAMESPACE`]); any other failure, or a link that
-/// does not parse, is [`UNREADABLE_TIME_NAMESPACE`].
-fn time_namespace_of(link: io::Result<PathBuf>) -> u64 {
+/// The time namespace of the thread whose namespace directory is `ns`
+/// ([`OWN_NAMESPACES`] for this one), by the rule of [`time_namespace_of`].
+fn own_time_namespace(ns: &Path) -> u64 {
+    time_namespace_of(
+        fs::read_link(ns.join("time")),
+        kernel_lacks_time_namespaces(ns),
+    )
+}
+
+/// The time namespace in the link `ns/time`, which reads `time:[<inode>]`.
+/// A link that fails with `ENOENT` is [`NO_TIME_NAMESPACE`] only when
+/// `lacks` proves the kernel was built without time namespaces
+/// ([`kernel_lacks_time_namespaces`]); without that proof, any other
+/// failure, and a link that does not parse, it is
+/// [`UNREADABLE_TIME_NAMESPACE`], whose owner nobody judges (D8).
+fn time_namespace_of(link: io::Result<PathBuf>, lacks: bool) -> u64 {
     match link {
         Ok(link) => link
             .to_str()
@@ -649,9 +666,20 @@ fn time_namespace_of(link: io::Result<PathBuf>) -> u64 {
             .and_then(|l| l.parse().ok())
             .filter(|&ino| ino != NO_TIME_NAMESPACE && ino != UNREADABLE_TIME_NAMESPACE)
             .unwrap_or(UNREADABLE_TIME_NAMESPACE),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => NO_TIME_NAMESPACE,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && lacks => NO_TIME_NAMESPACE,
         Err(_) => UNREADABLE_TIME_NAMESPACE,
     }
+}
+
+/// Whether the namespace directory `ns` of a running thread proves a
+/// kernel without time namespaces: it is a directory and has no `time`
+/// entry. `/proc/<pid>/ns/` lists exactly the namespace types the kernel
+/// was built with, whether or not their links read, so a link that does
+/// not read still has its entry. A missing or unreadable directory is no
+/// proof.
+fn kernel_lacks_time_namespaces(ns: &Path) -> bool {
+    fs::symlink_metadata(ns).is_ok_and(|m| m.is_dir())
+        && fs::symlink_metadata(ns.join("time")).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
 }
 
 /// Removes a temporary tree whose directories may have any final mode.
@@ -726,11 +754,13 @@ pub(crate) fn remove_tree_bounded(top: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::path::PathBuf;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        Judge, Liveness, NO_TIME_NAMESPACE, OWNED_PREFIXES, Owner, TEMPORARY_NAME_LEN,
-        UNREADABLE_TIME_NAMESPACE, UUID_VERSION, boot_id_or_random, own_boot_id, own_start_time,
+        Judge, Liveness, NO_TIME_NAMESPACE, OWN_NAMESPACES, OWNED_PREFIXES, Owner,
+        TEMPORARY_NAME_LEN, UNREADABLE_TIME_NAMESPACE, UUID_VERSION, boot_id_or_random,
+        kernel_lacks_time_namespaces, own_boot_id, own_start_time, own_time_namespace,
         parse_boot_id, parse_sidecar, proc_is_own, random_u128, temporary_name, time_namespace_of,
     };
 
@@ -909,27 +939,44 @@ mod tests {
         assert_eq!(dead.liveness(&unreadable), Liveness::Unknown);
     }
 
-    /// The link `time:[<inode>]` gives the inode; no link is a kernel
-    /// without time namespaces; any other error, a malformed link and an
-    /// inode equal to one of the two markers are unreadable.
+    /// The link `time:[<inode>]` gives the inode. A link that does not
+    /// read (`ENOENT`) is a kernel without time namespaces only where the
+    /// thread's `ns/` directory proves it has no `time` entry; any other
+    /// failure, a malformed link and an inode equal to one of the two
+    /// markers are unreadable.
     #[test]
     fn time_namespace_link() {
         let link = |s: &str| Ok(PathBuf::from(s));
-        assert_eq!(time_namespace_of(link("time:[4026531834]")), 4_026_531_834);
+        for lacks in [false, true] {
+            assert_eq!(
+                time_namespace_of(link("time:[4026531834]"), lacks),
+                4_026_531_834
+            );
+        }
         assert_eq!(
-            time_namespace_of(Err(io::ErrorKind::NotFound.into())),
+            time_namespace_of(Err(io::ErrorKind::NotFound.into()), true),
             NO_TIME_NAMESPACE
+        );
+        // The round-3 review of #60: a process whose main thread has exited
+        // reads `ENOENT` for the leader's `ns/time` on a kernel that has
+        // time namespaces. Without proof that the kernel lacks them, that
+        // is unreadable, never 0.
+        assert_eq!(
+            time_namespace_of(Err(io::ErrorKind::NotFound.into()), false),
+            UNREADABLE_TIME_NAMESPACE
         );
         for err in [
             io::ErrorKind::PermissionDenied,
             io::ErrorKind::InvalidInput,
             io::ErrorKind::Other,
         ] {
-            assert_eq!(
-                time_namespace_of(Err(err.into())),
-                UNREADABLE_TIME_NAMESPACE,
-                "{err:?}"
-            );
+            for lacks in [false, true] {
+                assert_eq!(
+                    time_namespace_of(Err(err.into()), lacks),
+                    UNREADABLE_TIME_NAMESPACE,
+                    "{err:?} {lacks}"
+                );
+            }
         }
         for bad in [
             "pid:[4026531834]",
@@ -943,18 +990,112 @@ mod tests {
             "time:[18446744073709551616]",
             "time_for_children:[4026531834]",
         ] {
-            assert_eq!(
-                time_namespace_of(link(bad)),
-                UNREADABLE_TIME_NAMESPACE,
-                "{bad}"
-            );
+            for lacks in [false, true] {
+                assert_eq!(
+                    time_namespace_of(link(bad), lacks),
+                    UNREADABLE_TIME_NAMESPACE,
+                    "{bad}"
+                );
+            }
         }
         // This process reads its own, or runs on a kernel without them.
         let me = Owner::current().expect("owner");
         assert_ne!(me.timens, UNREADABLE_TIME_NAMESPACE);
         assert_eq!(
             me.timens == NO_TIME_NAMESPACE,
-            std::fs::symlink_metadata("/proc/self/ns/time").is_err()
+            std::fs::symlink_metadata("/proc/thread-self/ns/time").is_err()
+        );
+    }
+
+    /// The proof that a kernel has no time namespaces: a directory without
+    /// a `time` entry. A `time` entry, even one whose link does not read,
+    /// a missing directory and a file are no proof.
+    #[test]
+    fn time_namespace_absence_needs_proof() {
+        let scratch = crate::scratch::ScratchDir::new("timens");
+        let ns = scratch.path().join("ns");
+        assert!(!kernel_lacks_time_namespaces(&ns), "missing directory");
+        std::fs::write(&ns, b"").expect("file");
+        assert!(!kernel_lacks_time_namespaces(&ns), "a file");
+        std::fs::remove_file(&ns).expect("remove");
+        std::fs::create_dir(&ns).expect("dir");
+        std::os::unix::fs::symlink("pid:[4026531836]", ns.join("pid")).expect("pid");
+        assert!(kernel_lacks_time_namespaces(&ns), "no time entry");
+        // A directory that cannot be searched answers `EACCES`, not
+        // `ENOENT`, for every entry: no proof (unless the tests run with
+        // `CAP_DAC_OVERRIDE`, which searches anyway).
+        let mode = |m| std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(m));
+        mode(0o600).expect("chmod");
+        if std::fs::symlink_metadata(ns.join("pid")).is_err() {
+            assert!(!kernel_lacks_time_namespaces(&ns), "unsearchable");
+        }
+        mode(0o700).expect("chmod");
+        std::os::unix::fs::symlink("time:[4026531834]", ns.join("time")).expect("time");
+        assert!(!kernel_lacks_time_namespaces(&ns), "a time entry");
+        assert_eq!(
+            kernel_lacks_time_namespaces(Path::new(OWN_NAMESPACES)),
+            std::fs::symlink_metadata("/proc/thread-self/ns/time").is_err()
+        );
+    }
+
+    /// On this kernel, through a process whose main thread has exited
+    /// while another thread runs (a python3 helper; std cannot end the main
+    /// thread alone): the leader's `ns/time` does not read, which must give
+    /// the unreadable marker, never 0, and the running thread's still reads
+    /// the namespace this process is in (round-3 review of #60).
+    #[test]
+    fn exited_main_thread_reads_unreadable() {
+        use std::io::BufRead;
+        const HELPER: &str = "import ctypes, os, threading, time\n\
+            nr = {'x86_64': 60, 'aarch64': 93}[os.uname().machine]\n\
+            def run():\n\
+            \x20   while open('/proc/self/stat').read().rsplit(')', 1)[1].split()[0] != 'Z':\n\
+            \x20       time.sleep(0.01)\n\
+            \x20   print(threading.get_native_id(), flush=True)\n\
+            \x20   time.sleep(60)\n\
+            threading.Thread(target=run).start()\n\
+            ctypes.CDLL(None).syscall(nr, 0)\n";
+        let mut child = std::process::Command::new("python3")
+            .args(["-I", "-c", HELPER])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3, which the architecture check needs too");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("the helper's thread id");
+        let pid = child.id();
+        let tid: u32 = line.trim().parse().expect("thread id");
+        let leader = own_time_namespace(Path::new(&format!("/proc/{pid}/ns")));
+        let thread = own_time_namespace(Path::new(&format!("/proc/{pid}/task/{tid}/ns")));
+        let _ = child.kill();
+        let _ = child.wait();
+        let me = Owner::current().expect("owner");
+        assert_eq!(thread, me.timens);
+        if me.timens == NO_TIME_NAMESPACE {
+            assert_eq!(leader, NO_TIME_NAMESPACE);
+        } else {
+            assert_eq!(leader, UNREADABLE_TIME_NAMESPACE);
+        }
+    }
+
+    /// The owner reads the namespace links of the calling thread, not of
+    /// the thread-group leader behind `/proc/self`, whose links stop
+    /// reading once the main thread has exited (round-3 review of #60).
+    #[test]
+    fn namespaces_are_read_from_the_calling_thread() {
+        let own = std::thread::spawn(|| std::fs::canonicalize(OWN_NAMESPACES))
+            .join()
+            .expect("thread")
+            .expect("canonical");
+        let leader = std::fs::canonicalize("/proc/self/ns").expect("leader");
+        assert_ne!(own, leader);
+        let parts: Vec<_> = own.components().collect();
+        let n = parts.len();
+        assert!(
+            n >= 3 && parts[n - 3].as_os_str() == "task" && parts[n - 1].as_os_str() == "ns",
+            "{}",
+            own.display()
         );
     }
 
