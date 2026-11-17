@@ -8,7 +8,10 @@
 //! adapter's own; the real adapter (#30) has its own. Unpacking checks
 //! every length against what is left and every path against the citation
 //! path rule ([`RelativePath`]), so a workspace from the sandbox cannot
-//! name a path outside the tree.
+//! name a path outside the tree. Repository metadata
+//! ([`RelativePath::is_repository_metadata`]) is not content: `diff` drops
+//! it from the workspace and `apply` refuses a diff that writes or removes
+//! it, as `git apply` refuses an invalid path (ADR-010, D1).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -135,6 +138,12 @@ fn apply_diff(tree: &Tree, diff: &[u8]) -> Result<Tree, String> {
     let mut tree = tree.clone();
     while !fields.rest.is_empty() {
         let path = fields.path()?;
+        if path.is_repository_metadata() {
+            return Err(format!(
+                "{:?} is repository metadata, not content",
+                path.as_str()
+            ));
+        }
         match fields.bytes(1, "change")? {
             [1] => {
                 tree.insert(path, fields.field("content")?.to_vec());
@@ -228,7 +237,8 @@ impl Git for MemoryGit {
 
     fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
         let from = self.tree(checkout)?;
-        let to = unpack_tree(workspace).map_err(|e| failed(format!("the workspace: {e}")))?;
+        let mut to = unpack_tree(workspace).map_err(|e| failed(format!("the workspace: {e}")))?;
+        to.retain(|path, _| !path.is_repository_metadata());
         Ok(pack_diff(&changes(&from, &to)))
     }
 

@@ -8,9 +8,10 @@
 //! refused by the type before it reaches a port.
 //!
 //! The rule is lexical. It does not resolve symlinks, and it accepts
-//! `.git/config`: a symlink planted in a workspace, or a path into the
-//! repository's own metadata, is the real adapter's to refuse (ADR-004,
-//! D11).
+//! `.git/config`: a symlink planted in a workspace is the real adapter's to
+//! refuse (ADR-004, D11), and a path into the repository's own metadata is
+//! dropped from a workspace by every `Git` adapter
+//! ([`RelativePath::is_repository_metadata`], ADR-010).
 
 use alloc::string::String;
 
@@ -38,6 +39,15 @@ impl RelativePath {
     /// The path as written.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether the path is repository metadata: some component is exactly
+    /// `.git`, the top-level repository's or a nested one's. The one rule
+    /// for the `Git` suite, `MemoryGit` and the real adapter (#30, ADR-010
+    /// D1). Look-alikes (`.GIT`, `git~1`, `.git.`) are content here; the
+    /// real adapter refuses them through git's own path checks.
+    pub fn is_repository_metadata(&self) -> bool {
+        self.0.split('/').any(|component| component == ".git")
     }
 }
 
@@ -107,6 +117,34 @@ mod tests {
         for path in accepted {
             assert_eq!(path_problem(path), None, "{path:?}");
             assert_eq!(as_citation(path), None, "{path:?}");
+        }
+    }
+
+    /// Only a component that is exactly `.git` is repository metadata;
+    /// look-alikes are content as far as the core is concerned (#30).
+    #[test]
+    fn repository_metadata_is_an_exact_git_component() {
+        let metadata = [".git", ".git/config", "a/.git", "a/.git/b"];
+        for text in metadata {
+            let path = RelativePath::parse(text).expect("a valid path");
+            assert!(path.is_repository_metadata(), "{text:?}");
+        }
+        let content = [
+            ".github/x",
+            ".gitignore",
+            ".git-blame-ignore-revs",
+            "a.git/x",
+            ".gitx",
+            "git/x",
+            ".GIT/config",
+            ".git /x",
+            ".git./x",
+            ".g\u{200C}it/x",
+            "git~1/x",
+        ];
+        for text in content {
+            let path = RelativePath::parse(text).expect("a valid path");
+            assert!(!path.is_repository_metadata(), "{text:?}");
         }
     }
 }

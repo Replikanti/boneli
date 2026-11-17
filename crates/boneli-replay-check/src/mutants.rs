@@ -778,9 +778,44 @@ enum GitBug {
     /// A diff that does not apply is ignored instead of refused: `apply`
     /// returns the checkout it was given.
     ToleratesMismatch,
+    /// A correct diff that runs a hook it finds in the workspace, as a git
+    /// that discovers the workspace's `.git` would (#30).
+    RunsMetadata,
+    /// `diff` encodes repository metadata as content.
+    MetadataIsContent,
+    /// After a diff that saw repository metadata, every later diff starts
+    /// with a header, as a store that adopted the workspace's config would.
+    AdoptsMetadata,
 }
 
 const HEADER: &[u8] = b"diff\n";
+
+/// Whether some component of the path is `.git` and the next is `hooks`.
+fn is_hook(path: &RelativePath) -> bool {
+    let components: Vec<&str> = path.as_str().split('/').collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0] == ".git" && pair[1] == "hooks")
+}
+
+/// The metadata entries of a workspace in `MemoryGit`'s diff format: each
+/// path, `1` and the content, as an adapter that does not drop them would
+/// write them.
+fn metadata_as_changes(workspace: &Tree) -> Vec<u8> {
+    let field = |out: &mut Vec<u8>, bytes: &[u8]| {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    };
+    let mut out = Vec::new();
+    for (path, content) in workspace {
+        if path.is_repository_metadata() {
+            field(&mut out, path.as_str().as_bytes());
+            out.push(1);
+            field(&mut out, content);
+        }
+    }
+    out
+}
 
 struct GitMutant {
     bug: GitBug,
@@ -789,6 +824,24 @@ struct GitMutant {
     moved: Mutex<Vec<(CheckoutId, CheckoutId)>>,
     /// The last diff applied (`PoisonsBase`).
     last_diff: Mutex<Option<Vec<u8>>>,
+    /// Whether a hook ran (`RunsMetadata`); [`MutantTripwire`] reads it.
+    ran: Mutex<bool>,
+    /// Whether a diff saw repository metadata (`AdoptsMetadata`).
+    adopted: Mutex<bool>,
+}
+
+/// Reports a hook run that [`GitBug::RunsMetadata`] recorded.
+struct MutantTripwire;
+
+impl contract::git::Tripwire<GitMutant> for MutantTripwire {
+    fn tripped(&self, adapter: &GitMutant) -> Result<Vec<String>, String> {
+        let ran = *adapter.ran.lock().expect("not poisoned");
+        Ok(if ran {
+            vec![String::from("a hook from the workspace")]
+        } else {
+            vec![]
+        })
+    }
 }
 
 impl GitMutant {
@@ -844,7 +897,11 @@ impl Git for GitMutant {
         let from = self.resolve(checkout);
         let base = unpack_tree(&self.inner.snapshot(&from)?).unwrap_or_default();
         let mut tree = unpack_tree(workspace).unwrap_or_default();
+        let sees_metadata = tree.keys().any(RelativePath::is_repository_metadata);
         match self.bug {
+            GitBug::RunsMetadata if tree.keys().any(is_hook) => {
+                *self.ran.lock().expect("not poisoned") = true;
+            }
             GitBug::DropsNewFiles => tree.retain(|path, _| base.contains_key(path)),
             GitBug::DropsRemovals => {
                 for (path, content) in base {
@@ -859,8 +916,16 @@ impl Git for GitMutant {
             }
             _ => self.inner.diff(&from, workspace)?,
         };
+        let adopted = {
+            let mut adopted = self.adopted.lock().expect("not poisoned");
+            let before = *adopted;
+            *adopted |= sees_metadata;
+            before
+        };
         Ok(match self.bug {
             GitBug::Header => [HEADER, &diff].concat(),
+            GitBug::MetadataIsContent => [diff, metadata_as_changes(&tree)].concat(),
+            GitBug::AdoptsMetadata if adopted => [HEADER, &diff].concat(),
             _ => diff,
         })
     }
@@ -907,6 +972,8 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
             inner,
             moved: Mutex::new(Vec::new()),
             last_diff: Mutex::new(None),
+            ran: Mutex::new(false),
+            adopted: Mutex::new(false),
         },
         repo,
         base,
@@ -915,6 +982,20 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
         missing: path("src/missing.rs"),
         unknown: CommitSha::parse(OTHER).expect("valid SHA"),
         edited: b"fn total() { 1 }\n".to_vec(),
+        metadata: vec![
+            (
+                path(".git/config"),
+                b"[core]\n\tfsmonitor = touch tripped\n\thooksPath = .git/hooks\n".to_vec(),
+            ),
+            (
+                path(".git/hooks/post-index-change"),
+                b"#!/bin/sh\ntouch tripped\n".to_vec(),
+            ),
+            (
+                path("sub/.git/config"),
+                b"[core]\n\tfsmonitor = touch tripped\n".to_vec(),
+            ),
+        ],
     }
 }
 
@@ -1245,7 +1326,12 @@ pub fn mutants() -> Vec<Mutant> {
     };
     let git = |clause, bug| {
         mutant("Git", clause, move || {
-            contract::git::run(|| git_repository(bug), git_edit)
+            contract::git::run(|| git_repository(bug), git_edit, &MutantTripwire)
+        })
+    };
+    let git_metadata = |sub, bug| {
+        sub_mutant("Git", "workspace-metadata-inert", sub, move || {
+            contract::git::run(|| git_repository(bug), git_edit, &MutantTripwire)
         })
     };
     let image = |clause, bug| {
@@ -1278,6 +1364,9 @@ pub fn mutants() -> Vec<Mutant> {
         git("added-file", GitBug::DropsNewFiles),
         git("removed-file", GitBug::DropsRemovals),
         git("apply-mismatch-fails", GitBug::ToleratesMismatch),
+        git_metadata("nothing-ran", GitBug::RunsMetadata),
+        git_metadata("same-diff", GitBug::MetadataIsContent),
+        git_metadata("later-diff", GitBug::AdoptsMetadata),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
