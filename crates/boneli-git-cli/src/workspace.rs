@@ -12,7 +12,14 @@
 //! that decodes and encodes again gives back its own bytes. The decoder
 //! takes agent-written bytes: it checks every length against what is left
 //! before it copies anything, never allocates ahead of the input, stops
-//! after `max_entries` entries, and runs in time linear in the input.
+//! once the tree would hold more than `max_nodes` files, symlinks and
+//! directories, and runs in time linear in the input.
+//!
+//! The node cap counts the directories an entry implies, not only the
+//! entries: a directory costs two bytes of input (`a/`), so one entry can
+//! imply as many directories as half its path length, and only a cap on
+//! both bounds what [`materialize`](crate::materialize) creates on the
+//! host.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -24,11 +31,12 @@ use boneli_domain::CitationProblem;
 /// The first bytes of every encoded workspace.
 pub const MAGIC: &[u8] = b"boneli-workspace 1\n";
 
-/// The default entry cap of a decoded workspace (ADR-010, D2): about five
-/// times the largest base tree measured. Every entry takes at least 18
-/// bytes, so without a cap a 200 MB workspace could ask the host for about
-/// 11 million files.
-pub const DEFAULT_MAX_ENTRIES: usize = 200_000;
+/// The default node cap of a decoded workspace (ADR-010, D2): files,
+/// symlinks and the directories they imply, together. About 3.6 times the
+/// largest base tree measured (55,025 files and directories); without it
+/// a 200 MB workspace could ask the host for about 100 million
+/// directories.
+pub const DEFAULT_MAX_NODES: usize = 200_000;
 
 /// What an entry is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,8 +157,8 @@ pub enum DecodeError {
         /// The invariant.
         problem: EntryProblem,
     },
-    /// More entries than the cap.
-    TooManyEntries {
+    /// More files, symlinks and implied directories than the cap.
+    TooManyNodes {
         /// The cap.
         max: usize,
     },
@@ -183,9 +191,10 @@ impl fmt::Display for DecodeError {
                 write!(f, "entry {entry}: the path sorts before the previous one")
             }
             DecodeError::Entry { entry, problem } => write!(f, "entry {entry} {problem}"),
-            DecodeError::TooManyEntries { max } => {
-                write!(f, "more than {max} entries (the entry cap)")
-            }
+            DecodeError::TooManyNodes { max } => write!(
+                f,
+                "more than {max} files, symlinks and directories (the node cap)"
+            ),
         }
     }
 }
@@ -231,7 +240,10 @@ impl Workspace {
     }
 
     /// Adds or replaces the entry at `path`, unless that breaks an
-    /// invariant.
+    /// invariant. It looks every ancestor up, so it costs O(depth * length)
+    /// per path: meant for trees from git, whose paths are short.
+    /// Agent-written bytes go through [`Workspace::decode`], which is
+    /// linear.
     pub fn insert(
         &mut self,
         path: RelativePath,
@@ -249,20 +261,41 @@ impl Workspace {
         if beneath {
             return Err(EntryProblem::BeneathEntry);
         }
-        // Paths beneath `path` all start with `path/`, so they sort
-        // together, and `path/\u{1}` is the least valid one: NUL is the only
-        // smaller byte, and no path holds it. It always parses; were it
-        // refused, the insert fails closed.
-        let least_child = RelativePath::parse(&format!("{text}/\u{1}"))
-            .map_err(|_| EntryProblem::HasEntriesBeneath)?;
-        let prefix = format!("{text}/");
-        if let Some((next, _)) = self.entries.range(least_child..).next() {
-            if next.as_str().starts_with(&prefix) {
-                return Err(EntryProblem::HasEntriesBeneath);
-            }
+        if self.implies_directory(text) {
+            return Err(EntryProblem::HasEntriesBeneath);
         }
         self.entries.insert(path, (kind, data));
         Ok(())
+    }
+
+    /// Whether some entry lies beneath `dir`, which makes it a directory.
+    pub(crate) fn implies_directory(&self, dir: &str) -> bool {
+        // Paths beneath `dir` all start with `dir/`, so they sort together,
+        // and `dir/\u{1}` is the least valid one: NUL is the only smaller
+        // byte, and no path holds it. It always parses; were it refused,
+        // the answer is yes, which fails closed for every caller.
+        let Ok(least_child) = RelativePath::parse(&format!("{dir}/\u{1}")) else {
+            return true;
+        };
+        let prefix = format!("{dir}/");
+        self.entries
+            .range(least_child..)
+            .next()
+            .is_some_and(|(next, _)| next.as_str().starts_with(&prefix))
+    }
+
+    /// The files, symlinks and directories the workspace makes on disk:
+    /// every entry and every distinct directory an entry implies. Linear in
+    /// the path bytes.
+    pub fn nodes(&self) -> usize {
+        let mut previous = None;
+        let mut nodes = 0usize;
+        for path in self.entries.keys() {
+            let text = path.as_str();
+            nodes = nodes.saturating_add(1 + new_directories(previous, text));
+            previous = Some(text);
+        }
+        nodes
     }
 
     /// Removes the entry at `path` and returns it.
@@ -289,8 +322,9 @@ impl Workspace {
         out
     }
 
-    /// Decodes an encoded workspace of at most `max_entries` entries,
-    /// refusing every encoding [`Workspace::encode`] would not produce.
+    /// Decodes an encoded workspace of at most `max_nodes` files, symlinks
+    /// and implied directories ([`Workspace::nodes`]), refusing every
+    /// encoding [`Workspace::encode`] would not produce.
     ///
     /// The ancestor check runs in linear time over a stack: the earlier
     /// entries that are a string prefix of the previous path. Paths that
@@ -299,15 +333,18 @@ impl Workspace {
     /// path lies beneath one of them exactly when the byte after it is
     /// `/`. Looking every ancestor up in the map instead costs quadratic
     /// time on a deep path next to a sibling that shares its prefixes.
-    pub fn decode(bytes: &[u8], max_entries: usize) -> Result<Workspace, DecodeError> {
+    pub fn decode(bytes: &[u8], max_nodes: usize) -> Result<Workspace, DecodeError> {
+        let too_many = DecodeError::TooManyNodes { max: max_nodes };
         let rest = bytes.strip_prefix(MAGIC).ok_or(DecodeError::Magic)?;
         let mut reader = Reader { rest, entry: 0 };
         let mut entries = Vec::new();
         let mut prefixes: Vec<&str> = Vec::new();
+        let mut nodes = 0usize;
         while !reader.rest.is_empty() {
             let entry = reader.entry;
-            if entry == max_entries {
-                return Err(DecodeError::TooManyEntries { max: max_entries });
+            // Every entry adds at least itself.
+            if nodes >= max_nodes {
+                return Err(too_many);
             }
             let byte = reader.bytes("kind", 1)?[0];
             let kind = Kind::from_byte(byte).ok_or(DecodeError::UnknownKind { entry, byte })?;
@@ -322,6 +359,10 @@ impl Workspace {
                     Ordering::Less => return Err(DecodeError::Unsorted { entry }),
                     Ordering::Greater => {}
                 }
+            }
+            nodes = nodes.saturating_add(1 + new_directories(prefixes.last().copied(), text));
+            if nodes > max_nodes {
+                return Err(too_many);
             }
             while prefixes.last().is_some_and(|top| !text.starts_with(top)) {
                 prefixes.pop();
@@ -347,6 +388,25 @@ impl Workspace {
             entries: entries.into_iter().collect(),
         })
     }
+}
+
+/// The directories `path` implies that the previous path in sorted order
+/// did not. A directory `d` both imply sits inside their common prefix:
+/// everything between two paths that start with `d/` starts with it too,
+/// so no earlier path implies a directory the previous one does not. The
+/// new ones are therefore the `/` positions of `path` at or past the
+/// common prefix. Linear in `path`.
+pub(crate) fn new_directories(previous: Option<&str>, path: &str) -> usize {
+    let shared = previous.map_or(0, |p| common_prefix(p, path));
+    path.as_bytes()[shared..]
+        .iter()
+        .filter(|b| **b == b'/')
+        .count()
+}
+
+/// The length in bytes of the common prefix of `a` and `b`.
+pub(crate) fn common_prefix(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 /// What is wrong with a symlink's target, if `kind` is a symlink.
@@ -455,12 +515,12 @@ mod tests {
         for w in cases {
             let bytes = w.encode();
             assert_eq!(
-                Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES),
+                Workspace::decode(&bytes, DEFAULT_MAX_NODES),
                 Ok(w.clone()),
                 "{w:?}"
             );
             // Canonical: decoding and encoding again gives the same bytes.
-            let again = Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES)
+            let again = Workspace::decode(&bytes, DEFAULT_MAX_NODES)
                 .expect("decodes")
                 .encode();
             assert_eq!(again, bytes);
@@ -657,7 +717,7 @@ mod tests {
         ];
         for (name, bytes, expected) in rows {
             assert_eq!(
-                Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES),
+                Workspace::decode(&bytes, DEFAULT_MAX_NODES),
                 Err(expected),
                 "{name}"
             );
@@ -676,15 +736,15 @@ mod tests {
             Ok(4)
         );
         let refused = Workspace::decode(&raw(&entries), 4);
-        assert_eq!(refused, Err(DecodeError::TooManyEntries { max: 4 }));
+        assert_eq!(refused, Err(DecodeError::TooManyNodes { max: 4 }));
         let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(detail.contains("more than 4 entries"), "{detail}");
+        assert!(detail.contains("more than 4 files"), "{detail}");
         // The cap holds before the fifth entry is read, even a malformed one.
         let mut garbage = raw(&entries[..4]);
         garbage.push(b'?');
         assert_eq!(
             Workspace::decode(&garbage, 4),
-            Err(DecodeError::TooManyEntries { max: 4 })
+            Err(DecodeError::TooManyNodes { max: 4 })
         );
         assert_eq!(
             Workspace::decode(MAGIC, 0).map(|w| w.len()),
@@ -709,8 +769,10 @@ mod tests {
             (b'f', sibling.as_bytes(), b"1"),
             (b'f', child.as_bytes(), b"2"),
         ]);
+        // Time only: the node cap (about two million directories here) is
+        // lifted, so the decoder walks every byte.
         let start = std::time::Instant::now();
-        let decoded = Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES).map(|w| w.len());
+        let decoded = Workspace::decode(&bytes, usize::MAX).map(|w| w.len());
         assert_eq!(decoded, Ok(2));
         // The same shape with the deep path itself as a file is refused.
         let bytes = raw(&[
@@ -719,13 +781,82 @@ mod tests {
             (b'f', child.as_bytes(), b"2"),
         ]);
         assert_eq!(
-            Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES),
+            Workspace::decode(&bytes, usize::MAX),
             Err(DecodeError::Entry {
                 entry: 2,
                 problem: EntryProblem::BeneathEntry
             })
         );
         assert!(start.elapsed() < DEADLINE, "{:?}", start.elapsed());
+    }
+
+    /// The cap counts the directories an entry implies: one entry 3,837
+    /// bytes long once made 1,900 directories under a cap of 1 (review of
+    /// part 2).
+    #[test]
+    fn decode_node_cap_counts_directories() {
+        let f = b'f';
+        // One deep entry: ten directories and the file.
+        let deep = "a/".repeat(10) + "f";
+        let one = raw(&[(f, deep.as_bytes(), b"")]);
+        assert_eq!(
+            Workspace::decode(&one, 10),
+            Err(DecodeError::TooManyNodes { max: 10 })
+        );
+        assert_eq!(Workspace::decode(&one, 11).map(|w| w.nodes()), Ok(11));
+        // The review's shape (1,900 directories) under a cap of 1.
+        let probe = "a/".repeat(1900) + "f";
+        assert_eq!(
+            Workspace::decode(&raw(&[(f, probe.as_bytes(), b"")]), 1),
+            Err(DecodeError::TooManyNodes { max: 1 })
+        );
+        // Entries that share their parents count each directory once:
+        // `d`, `d/e` and 100 files.
+        let names: Vec<String> = (0..100).map(|n| format!("d/e/f{n:03}")).collect();
+        let shared: Vec<(u8, &[u8], &[u8])> =
+            names.iter().map(|n| (f, n.as_bytes(), &b""[..])).collect();
+        assert_eq!(
+            Workspace::decode(&raw(&shared), 102).map(|w| w.nodes()),
+            Ok(102)
+        );
+        assert_eq!(
+            Workspace::decode(&raw(&shared), 101),
+            Err(DecodeError::TooManyNodes { max: 101 })
+        );
+        // Branches: `a`, `a/b`, `a/c`, `a/c/d` and three entries.
+        let branches = raw(&[(f, b"a/b/x", b""), (f, b"a/c/d/y", b""), (f, b"a/c/z", b"")]);
+        assert_eq!(Workspace::decode(&branches, 7).map(|w| w.nodes()), Ok(7));
+        assert_eq!(
+            Workspace::decode(&branches, 6),
+            Err(DecodeError::TooManyNodes { max: 6 })
+        );
+    }
+
+    /// `nodes` agrees with a direct count of every entry and every
+    /// distinct ancestor directory.
+    #[test]
+    fn nodes_counts_entries_and_distinct_directories() {
+        let w = workspace(&[
+            ("Z", Kind::File, b""),
+            ("a b/c", Kind::File, b""),
+            ("a.txt", Kind::File, b""),
+            ("a/b/c/d", Kind::File, b""),
+            ("a/b/c/e", Kind::Symlink, b"/"),
+            ("a/b/x", Kind::Executable, b""),
+            ("a/bc/y", Kind::File, b""),
+            ("a/c", Kind::File, b""),
+            ("b/a/b/c", Kind::File, b""),
+        ]);
+        let mut directories = std::collections::BTreeSet::new();
+        for (p, _, _) in w.iter() {
+            let text = p.as_str();
+            for (i, _) in text.match_indices('/') {
+                directories.insert(&text[..i]);
+            }
+        }
+        assert_eq!(w.nodes(), w.len() + directories.len());
+        assert_eq!(w.nodes(), 9 + 8);
+        assert_eq!(Workspace::new().nodes(), 0);
     }
 
     #[test]
@@ -792,7 +923,7 @@ mod tests {
         assert_eq!(w.insert(path("a"), Kind::File, b"x".to_vec()), Ok(()));
         // Whatever insert accepts, decode accepts again.
         let bytes = w.encode();
-        assert_eq!(Workspace::decode(&bytes, DEFAULT_MAX_ENTRIES), Ok(w));
+        assert_eq!(Workspace::decode(&bytes, DEFAULT_MAX_NODES), Ok(w));
     }
 
     #[test]

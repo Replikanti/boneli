@@ -339,12 +339,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   past the end, a path the citation path rule refuses, unsorted or
   duplicate paths, an entry beneath a file or symlink entry (every
   ancestor, in linear time), an empty or NUL-holding link target and
-  more entries than the cap (200,000 by default). `without_metadata`
+  more nodes than the cap: files, symlinks and every directory they
+  imply, 200,000 by default (`Workspace::nodes`). `without_metadata`
   drops repository metadata. `materialize` writes a workspace into a
-  new, empty 0700 directory with `create_new` and explicit modes, never
-  writes through an existing symlink, creates an empty directory per
-  gitlink, and refuses metadata, entries at or under a gitlink and
-  gitlinks beneath an entry before it writes anything.
+  new, empty 0700 directory with `create_new` and explicit modes (also
+  under any umask), creates each directory once, never writes through an
+  existing symlink, creates an empty directory per gitlink, and refuses
+  metadata, entries at or under a gitlink, gitlinks beneath an entry and
+  more nodes than its cap, gitlink directories included, before it
+  writes anything.
 
 ### Changed
 

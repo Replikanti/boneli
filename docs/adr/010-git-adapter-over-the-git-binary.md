@@ -201,11 +201,11 @@ the sandbox hands back share one format, `boneli_git_cli::Workspace`.
     kept as written, absolute or with `..`: a link is never resolved on
     the host (D3), and which links a fix may add is the patch policy's
     question (#17);
-  - more entries than the cap.
+  - more nodes than the cap (below).
 - **Bounded on hostile input.** Every length is compared with the bytes
   left, as a `u64`, before anything is copied, so nothing is allocated
   ahead of the input: a decoded workspace holds at most the input's bytes
-  plus a fixed overhead per entry, and the cap bounds the entries. The
+  plus a fixed overhead per entry, and the node cap bounds the entries. The
   ancestor check runs in linear time over a stack of the earlier paths
   that are a string prefix of the current one. Paths that share a prefix
   sort together, so every earlier entry that is a prefix of the current
@@ -214,16 +214,37 @@ the sandbox hands back share one format, `boneli_git_cli::Workspace`.
   instead compares O(L^2) bytes for a path of length L next to a sibling
   that shares its prefixes; a test of a 4 MB path holds the decoder under
   a deadline that such a lookup misses.
-- **The entry cap** defaults to 200,000 (`DEFAULT_MAX_ENTRIES`). The
-  largest base tree measured on the candidate repositories of
-  docs/ARCHITECTURE.md has at least 37,835 files (GitHub API,
-  2026-11-17; the listing was truncated), so the cap is about five times
-  that. The cap bounds the inodes a hostile workspace can create in the
-  host's scratch directory: an entry takes at least 18 bytes (a kind
-  byte, two lengths and a one-byte path), so a 200 MB workspace could
-  otherwise ask for about 11 million files. A workspace that carries
-  `node_modules` may exceed it; that fails closed with a detail naming
-  the cap, and #8 decides what an export carries.
+- **The node cap.** `decode(bytes, max_nodes)` counts nodes, the files
+  and symlinks plus every distinct directory they imply
+  (`Workspace::nodes`), and refuses past `max_nodes`, which defaults to
+  200,000 (`DEFAULT_MAX_NODES`). That is the number of file system
+  objects `materialize` creates (D3), so the cap bounds the inodes a
+  hostile workspace can ask of the host, whatever its size.
+  - *Why directories count.* A directory costs two bytes of input (`a/`),
+    so one entry can imply as many directories as half its path length.
+    A cap on entries alone bounded nothing: in review one entry of 3,837
+    bytes made 1,900 directories under a cap of 1, and a 200 MB workspace
+    could ask for about 100 million directories (200 MB / 2 bytes),
+    about 380 million under 200,000 entries. Without any cap the bound
+    is that same input size / 2.
+  - *Counting is linear.* In path order, a directory two paths both imply
+    lies inside their common prefix, and everything between two paths
+    that start with `d/` starts with it too. So a path adds exactly the
+    directories at its `/` positions at or past its common prefix with
+    the previous path, and the count costs one pass over the bytes. The
+    cap is checked before each entry is read and after its path is
+    counted.
+  - *Derivation of 200,000.* The candidate repositories of
+    docs/ARCHITECTURE.md, counted with `git ls-tree -r -t` on their
+    default branch (2026-11-17, a tree-only shallow clone): 3,731,
+    10,291 and 55,025 nodes. The largest has 44,776 files and 10,249
+    directories, at most 12 directories deep and with paths of at most
+    242 bytes. The cap is about 3.6 times the largest, room for a
+    larger repository or a generated tree without letting a hostile
+    workspace grow the host's inode use past 200,000.
+  - A workspace that carries `node_modules` may exceed it; that fails
+    closed with a detail naming the cap, and #8 decides what an export
+    carries.
 - **`without_metadata`** drops every path `is_repository_metadata` names
   (D1), as a file, a directory's entries or a symlink. `insert` and
   `remove` keep the invariants `decode` checks, so a `Workspace` built in
@@ -231,7 +252,7 @@ the sandbox hands back share one format, `boneli_git_cli::Workspace`.
 
 ### D3. Writing a workspace onto the host
 
-`boneli_git_cli::materialize(workspace, dir, gitlinks)` writes a decoded
+`boneli_git_cli::materialize(workspace, dir, gitlinks, max_nodes)` writes a decoded
 workspace for `git add -A` (part 3). It runs as the runner user on
 agent-written entries, so it never trusts what is on disk and never
 follows a symlink.
@@ -244,7 +265,21 @@ follows a symlink.
   repository metadata. The gitlink lookups for an entry stop at the
   length of the longest gitlink, so a deep agent-written path costs no
   more than that.
-- **Parents** are created one component at a time with `create_dir`. One
+- **The node cap, again.** The workspace's nodes (D2) plus the
+  directories the gitlinks add (each gitlink and its parents, once,
+  unless an entry already implies them) must fit `max_nodes`, checked
+  before the first write. A decoded workspace already holds the cap;
+  this check also covers the gitlinks and a workspace built in code, and
+  what `materialize` creates is exactly what it counted.
+- **Parents** are created one component at a time with `create_dir`, and
+  each directory once: the parents an entry shares with the previous
+  entry lie inside their common prefix and were made for it, so only the
+  rest are created. Creating every parent again for every entry costs
+  O(depth^2) path lookups per entry; in review 500 entries under one
+  chain of 1,900 directories took 150 s that way. Every call is
+  path-based and the kernel refuses a path over `PATH_MAX` (4,096 bytes),
+  so each call walks at most that many bytes, and the work is linear in
+  the node count; a test holds the review's shape under a deadline. One
   that already exists must be a real directory by `symlink_metadata`;
   anything else is `NotADirectory`. D2 keeps every entry off the paths
   beneath another entry, so on a case-sensitive file system this check
@@ -253,8 +288,10 @@ follows a symlink.
   anything else on disk that the format rules out.
 - **Files** are opened with `create_new` (`O_CREAT | O_EXCL`, which also
   refuses a symlink at the final name) with mode 0600, written, and then
-  given 0644 or 0755 through the open file, so the umask does not matter.
-  Directories get 0755 after `create_dir` the same way.
+  given 0644 or 0755 through the open file (`fchmod`), so the umask does
+  not matter. A directory gets 0755 by a `chmod` of its path right after
+  `create_dir` made it, so the umask does not matter there either; a test
+  runs again in a child under `umask 077` to hold both.
 - **Symlinks** are created with `std::os::unix::fs::symlink`, their target
   passed as raw bytes through `OsStrExt`, and never resolved.
 - **Gitlinks.** Each gitlink of the base tree becomes an empty directory
@@ -264,6 +301,12 @@ follows a symlink.
   the directory may hold part of the workspace; the caller removes it
   (part 3 removes its scratch directory on every path). Errors name the
   entry or gitlink by index, never by its path.
+- **Same-user races.** The calls are path-based, so the kernel follows a
+  symlink in an intermediate component, and "never follows a symlink"
+  holds only while nothing else writes into the target during the call.
+  Inside the private 0700 target only a process with the runner's own uid
+  could plant one, and such a process already holds everything the
+  runner holds, so the race crosses no permission boundary.
 
 ### Later parts
 

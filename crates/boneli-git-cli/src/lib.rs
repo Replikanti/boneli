@@ -7,12 +7,14 @@
 //! - [`Workspace`] is the snapshot and workspace format (ADR-010, D2): a
 //!   magic line and canonical, length-prefixed entries, each a file, an
 //!   executable or a symlink. [`Workspace::decode`] refuses every
-//!   malformed or non-canonical encoding, bounds the entry count and
-//!   checks every length against what is left before it allocates.
+//!   malformed or non-canonical encoding, bounds the nodes (files,
+//!   symlinks and the directories they imply) and checks every length
+//!   against what is left before it allocates.
 //! - [`materialize`] writes a workspace into a new, empty, private
 //!   directory under the rules of ADR-010, D3: no symlink it created is
-//!   ever followed, modes are explicit, and repository metadata or an
-//!   entry at or under a gitlink is refused.
+//!   ever followed, modes are explicit, each directory is made once, and
+//!   repository metadata, an entry at or under a gitlink or more nodes
+//!   than the cap is refused.
 //!
 //! Part 3 adds the adapter that runs git.
 #![doc(test(attr(forbid(unsafe_code))))]
@@ -23,4 +25,4 @@ mod scratch;
 mod workspace;
 
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
-pub use workspace::{DEFAULT_MAX_ENTRIES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};
+pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};
