@@ -91,6 +91,46 @@ fn apply_refuses_lookalikes() {
     );
 }
 
+/// A new file at the C-quoted path `q`, in git's format.
+fn adds_quoted(q: &str) -> Vec<u8> {
+    format!(
+        "diff --git \"a/{q}\" \"b/{q}\"\nnew file mode 100644\n--- /dev/null\n+++ \"b/{q}\"\n@@ -0,0 +1 @@\n+x\n"
+    )
+    .into_bytes()
+}
+
+/// A diff that adds a path the workspace cannot carry (not UTF-8, a
+/// backslash, a blank name) is refused, as `snapshot` refuses such a
+/// path, so no checkout is issued that `snapshot` would refuse; git
+/// accepts all three (ADR-010, D6).
+#[test]
+fn apply_refuses_unrepresentable_paths() {
+    let tmp = TempDir::new("apply-unrepresentable");
+    let (source, base) = source(&tmp);
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let before = git.snapshot(&c).expect("snapshot");
+    for (i, (shown, diff)) in [
+        ("x\u{FFFD}", adds_quoted("x\\377")),
+        ("a\\b", adds_quoted("a\\\\b")),
+        (" ", adds_quoted(" ")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let detail = failed(git.apply(&c, &diff));
+        assert!(detail.contains(&format!("{shown:?}")), "{i}: {detail}");
+        assert!(detail.contains("cannot carry"), "{i}: {detail}");
+    }
+    assert_eq!(git.snapshot(&c), Ok(before));
+    assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+    // No id was spent on a refused diff.
+    assert_eq!(
+        git.apply(&c, &adds("new/x")),
+        Ok(CheckoutId::new("checkout-2".to_owned()))
+    );
+}
+
 /// A two-file diff whose second hunk does not apply changes nothing.
 #[test]
 fn apply_is_all_or_nothing() {

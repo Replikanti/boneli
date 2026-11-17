@@ -435,3 +435,84 @@ fn probe_that_cannot_start_is_failed() {
     assert_eq!(listing(&cli.root().join("stores")), Vec::<String>::new());
     assert_eq!(listing(&cli.root().join("tmp")), Vec::<String>::new());
 }
+
+/// A probe step that gives no answer from git is no evidence either way:
+/// a fetch or `cat-file` that cannot start (the wrapper makes itself
+/// unexecutable, EACCES, the stand-in for EAGAIN or ENOMEM on fork) and a
+/// fetch killed by a signal give the first fetch's `Failed`, never
+/// `UnknownCommit` (ADR-010, D6).
+#[test]
+fn probe_step_without_an_answer_is_failed() {
+    // What the wrapper does around the probe; `{real}` runs the call.
+    let cases = [
+        // The probe's `init` runs, then its fetch cannot start.
+        (
+            "fetch-cannot-start",
+            "init",
+            "'{real}' \"$@\"; rc=$?; chmod 000 '{git}'; exit $rc",
+        ),
+        // The probe's fetch runs, then its `cat-file` cannot start.
+        (
+            "cat-file-cannot-start",
+            "--filter=tree:0",
+            "'{real}' \"$@\"; rc=$?; chmod 000 '{git}'; exit $rc",
+        ),
+        // The probe's fetch dies by a signal.
+        ("fetch-killed", "--filter=tree:0", "kill -KILL $$"),
+    ];
+    for (name, trigger, action) in cases {
+        let tmp = TempDir::new(name);
+        let (source, a, _) = non_tip_source(&tmp, "src", true);
+        let git = tmp.path().join("probe-without-answer");
+        let marker = tmp.path().join("init-seen");
+        let real = crate::support::host_git();
+        let action = action
+            .replace("{real}", &real.display().to_string())
+            .replace("{git}", &git.display().to_string());
+        // The main fetch breaks on the file size limit; the second `init`
+        // is the probe's.
+        let script = format!(
+            "#!/bin/sh\n\
+             ulimit -f 512\n\
+             probe=no\n\
+             for a in \"$@\"; do\n\
+             if [ \"$a\" = init ]; then\n\
+             if [ -e '{marker}' ]; then probe=yes; fi\n\
+             : > '{marker}'\n\
+             fi\n\
+             if [ \"$a\" = --filter=tree:0 ]; then probe=yes; fi\n\
+             done\n\
+             if [ $probe = yes ]; then\n\
+             for a in \"$@\"; do\n\
+             if [ \"$a\" = '{trigger}' ]; then {action}; fi\n\
+             done\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            marker = marker.display(),
+            real = real.display(),
+        );
+        crate::support::write_executable(&git, script.as_bytes());
+        let cli = open(&tmp, &git, DEFAULT_MAX_NODES);
+        let detail = failed(cli.fetch_base(&source.url(), &sha(&a)));
+        assert!(!detail.trim().is_empty(), "{name}");
+        assert_eq!(
+            listing(&cli.root().join("stores")),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        assert_eq!(
+            listing(&cli.root().join("tmp")),
+            Vec::<String>::new(),
+            "{name}"
+        );
+        if name != "fetch-killed" {
+            // The step that could not start was the wrapper's own exec.
+            let mode = std::fs::metadata(&git).expect("wrapper").permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0,
+                "{name}"
+            );
+        }
+    }
+}

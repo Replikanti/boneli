@@ -18,7 +18,9 @@
 //!   deadlock against a full stdout pipe.
 //! - A failure's detail is git's stderr, or the exit status or signal when
 //!   stderr is blank (ADR-004, D4). git's messages are reported, never
-//!   parsed.
+//!   parsed. A failure also says whether git answered: it ran and exited
+//!   with a non-zero status, or it gave no answer at all (it could not
+//!   start, be waited for or read, or a signal ended it).
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -119,6 +121,26 @@ fn alternate(path: &Path) -> OsString {
     OsString::from_vec(out)
 }
 
+/// Why a call failed.
+#[derive(Debug)]
+pub(crate) struct RunError {
+    /// git's stderr, or the status, signal or error when that is blank.
+    pub detail: String,
+    /// git ran and exited with a non-zero status, its output read in full:
+    /// an answer from git. `false` when git could not start, be waited for
+    /// or read, or a signal ended it.
+    pub answered: bool,
+}
+
+impl RunError {
+    fn no_answer(detail: String) -> RunError {
+        RunError {
+            detail,
+            answered: false,
+        }
+    }
+}
+
 /// Starts git processes under the rules above.
 #[derive(Debug)]
 pub(crate) struct Runner {
@@ -148,9 +170,9 @@ impl Runner {
         config
     }
 
-    /// Runs `git <global options> <args>` and returns stdout, or the
-    /// failure's detail.
-    pub(crate) fn run(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Vec<u8>, String> {
+    /// Runs `git <global options> <args>` and returns stdout, or why it
+    /// failed.
+    pub(crate) fn run(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Vec<u8>, RunError> {
         let mut command = Command::new(&self.git);
         command.env_clear();
         let home = self.home.as_os_str();
@@ -178,9 +200,9 @@ impl Runner {
             command.env("GIT_INDEX_FILE", index);
         }
         if let Some(objects) = call.objects {
-            let store = call
-                .git_dir
-                .ok_or("a throwaway object directory needs a --git-dir")?;
+            let store = call.git_dir.ok_or_else(|| {
+                RunError::no_answer("a throwaway object directory needs a --git-dir".to_owned())
+            })?;
             command.env("GIT_OBJECT_DIRECTORY", objects).env(
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                 alternate(&store.join("objects")),
@@ -216,7 +238,7 @@ impl Runner {
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
-            .map_err(|e| format!("git {name}: cannot start git: {e}"))?;
+            .map_err(|e| RunError::no_answer(format!("git {name}: cannot start git: {e}")))?;
         let writer = match (call.stdin, child.stdin.take()) {
             (Some(bytes), Some(mut pipe)) => {
                 let bytes = bytes.to_vec();
@@ -242,20 +264,22 @@ impl Runner {
             .map(|mut pipe| pipe.read_to_end(&mut stdout));
         let status = child
             .wait()
-            .map_err(|e| format!("git {name}: cannot wait for git: {e}"))?;
+            .map_err(|e| RunError::no_answer(format!("git {name}: cannot wait for git: {e}")))?;
         if let Some(writer) = writer {
             let _ = writer.join();
         }
         let stderr = stderr_reader.join().unwrap_or_default();
         if let Some(Err(e)) = read {
-            return Err(format!("git {name}: cannot read its output: {e}"));
+            return Err(RunError::no_answer(format!(
+                "git {name}: cannot read its output: {e}"
+            )));
         }
         if status.success() {
             return Ok(stdout);
         }
         let text = String::from_utf8_lossy(&stderr);
         let text = text.trim();
-        Err(if !text.is_empty() {
+        let detail = if !text.is_empty() {
             format!("git {name}: {text}")
         } else if let Some(code) = status.code() {
             format!("git {name}: exit status {code}, no error output")
@@ -263,6 +287,10 @@ impl Runner {
             format!("git {name}: killed by signal {signal}, no error output")
         } else {
             format!("git {name}: failed, no error output and no status")
+        };
+        Err(RunError {
+            detail,
+            answered: status.code().is_some(),
         })
     }
 }

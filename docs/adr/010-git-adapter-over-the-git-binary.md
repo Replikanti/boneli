@@ -401,7 +401,10 @@ runner (`src/run.rs`), so no call can forget a rule.
 - **Failure details** are git's stderr, prefixed with the subcommand, or
   `git <cmd>: exit status N, no error output` / `killed by signal N`
   when stderr is blank (ADR-004, D4). git's English messages are
-  reported and never parsed.
+  reported and never parsed. A failure also records whether git
+  answered: it ran and exited with a non-zero status, or it gave no
+  answer (it could not start, be waited for or read, or a signal ended
+  it). Only the probe (D6) tells the two apart.
 - **The rule for #19.** The token reaches git only as
   `http.<url>.extraHeader` through `GIT_CONFIG_KEY_n` and
   `GIT_CONFIG_VALUE_n` in the environment of the one git process that
@@ -465,8 +468,12 @@ runner (`src/run.rs`), so no call can forget a rule.
      as a wrong SHA.
   3. Only a probe that fails too, or that gets a tree, blob or tag (the
      wanted object is sent despite the filter), leaves `UnknownCommit`.
-     A probe that cannot be set up (its `init` fails) is no evidence
-     either way and gives `Failed`.
+     A probe that cannot be set up (its `init` fails), or whose fetch or
+     `cat-file -t` gives no answer from git (it cannot start, as on
+     EAGAIN or ENOMEM at fork, or a signal ends it), is no evidence
+     either way and gives `Failed`. Only an observed answer counts: git
+     ran the fetch and refused it, or fetched an object that is not a
+     commit.
 
   A remote that does not serve filters (`uploadpack.allowFilter` off)
   ignores the filter with a warning, and the probe is a full depth-1
@@ -482,7 +489,9 @@ runner (`src/run.rs`), so no call can forget a rule.
   (literal pathspecs, so `*` and `:(top)x` are file names) and returns
   the blob for a regular or executable file, `None` for anything else.
 - **`snapshot`** is the tree's files from `ls-tree -r -z` and one
-  `cat-file --batch` (raw blobs, no smudge), gitlinks left out, plus the
+  `cat-file --batch` (raw blobs, no smudge), gitlinks left out (their
+  paths still get the path rule and the look-alike check below, since
+  `diff` reads them and `apply` checks them), plus the
   generated `.git`: exactly `HEAD` (`ref: refs/heads/main`), `config`
   (fixed text without remote, credential, URL, http, include or hooks
   path; SHA-256 adds `extensions.objectformat`), `index` (from
@@ -538,10 +547,13 @@ runner (`src/run.rs`), so no call can forget a rule.
   git refuses a path into `.git` (also nested, and its own look-alikes:
   the NTFS forms and its HFS list), `..`, an absolute path and a file
   beyond a symlink, and applies all hunks or none. Then every path of
-  the new tree (`ls-tree -r --name-only`) gets the look-alike check
-  `diff` makes: git accepts `.g<U+200B>it`, also as a rename target, and
-  without the check `apply` would issue a checkout that no `diff` can
-  read. Any failure is `Failed`, with no new checkout.
+  the new tree (`ls-tree -r`, gitlinks included) gets the path rule and
+  the look-alike check `snapshot` makes, and a refusal names the entry
+  by its index in that listing and by its path: git accepts
+  `.g<U+200B>it`, also as a rename target, and a non-UTF-8 name, a
+  backslash or a blank name, and without the checks `apply` would issue
+  a checkout that no `snapshot` or `diff` can read. Any failure is
+  `Failed`, with no new checkout.
 
 ### D7. The git version floor
 

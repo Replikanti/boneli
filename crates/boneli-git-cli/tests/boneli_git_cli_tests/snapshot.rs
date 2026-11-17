@@ -159,7 +159,8 @@ fn snapshot_refuses_base_metadata() {
 /// A base tree path with a component that is `.git` on another file system
 /// is refused by `snapshot`, as `diff` would refuse it, before anything is
 /// written: git and its fsck accept these names, so they pass `fetch_base`,
-/// and without the check every later `diff` of the run would fail.
+/// and without the check every later `diff` (a file) or `apply` (a
+/// gitlink) of the run would fail.
 #[test]
 fn snapshot_refuses_base_lookalikes() {
     for p in ["sub/.g\u{200B}it/x", ".g\u{2060}it/x", "a/\u{00AD}.GIT"] {
@@ -167,6 +168,21 @@ fn snapshot_refuses_base_lookalikes() {
         let source = Source::new(&tmp, "src", false);
         source.write("ok", b"ok", false);
         source.write(p, b"x", false);
+        let base = source.commit("base");
+        let git = cli(&tmp);
+        let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+        let detail = failed(git.snapshot(&c));
+        assert!(detail.contains(&format!("{p:?}")), "{p:?}: {detail}");
+        assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+    }
+    // A gitlink is not in the snapshot, but `apply` checks every path of
+    // its result, gitlinks included, so a gitlink at such a name would
+    // fail the apply of the run's own diff.
+    for p in ["sub/.g\u{200B}it", ".g\u{2060}it"] {
+        let tmp = TempDir::new("base-lookalike-gitlink");
+        let source = Source::new(&tmp, "src", false);
+        source.write("ok", b"ok", false);
+        source.gitlink(p, "1234567890123456789012345678901234567890");
         let base = source.commit("base");
         let git = cli(&tmp);
         let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");

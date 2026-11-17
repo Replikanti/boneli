@@ -16,10 +16,11 @@
 //!   keeps nothing of the workspace. Both directories are removed on every
 //!   path.
 //! - `apply` is `git apply --cached` on a throwaway index; a result that
-//!   holds a name `diff` refuses is refused.
+//!   holds a path `snapshot` refuses is refused.
 //! - `snapshot` is the tree's files plus a generated one-commit `.git`
-//!   with no remote, hook or credential; a tree that holds a name `diff`
-//!   refuses is refused.
+//!   with no remote, hook or credential; a tree that holds a path the
+//!   workspace cannot carry or a name `diff` refuses, gitlinks included,
+//!   is refused.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -223,6 +224,18 @@ fn lookalike(path: &str) -> bool {
     path.split('/').any(names_git_elsewhere)
 }
 
+/// `Failed` for a tree path with a component that is `.git` on another
+/// file system.
+fn refuse_lookalike(path: &RelativePath) -> Result<(), GitError> {
+    if lookalike(path.as_str()) {
+        return Err(failed(format!(
+            "the tree has a path that is .git on another file system: {:?}",
+            path.as_str()
+        )));
+    }
+    Ok(())
+}
+
 /// Whether `ls-remote` output, `<oid> TAB <ref>` lines, names `sha` as an
 /// object id.
 fn advertises(refs: &[u8], sha: &str) -> bool {
@@ -284,7 +297,9 @@ impl GitCli {
             objects: None,
             stdin: None,
         };
-        let out = runner.run(call, &[os("version")]).map_err(OpenError::Git)?;
+        let out = runner
+            .run(call, &[os("version")])
+            .map_err(|e| OpenError::Git(e.detail))?;
         let found = String::from_utf8_lossy(&out).trim().to_owned();
         match parse_version(&found) {
             Some(version) if version >= MIN_GIT_VERSION => {}
@@ -338,7 +353,19 @@ impl GitCli {
     }
 
     fn git(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Vec<u8>, GitError> {
-        self.runner.run(call, args).map_err(failed)
+        self.runner.run(call, args).map_err(|e| failed(e.detail))
+    }
+
+    /// Like [`Self::git`], for a call whose refusal is itself an answer:
+    /// `Ok(None)` when git ran and exited with a non-zero status, `Err`
+    /// when git gave no answer (it could not start, be waited for or read,
+    /// or a signal ended it).
+    fn answer(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Option<Vec<u8>>, GitError> {
+        match self.runner.run(call, args) {
+            Ok(out) => Ok(Some(out)),
+            Err(e) if e.answered => Ok(None),
+            Err(e) => Err(failed(e.detail)),
+        }
     }
 
     /// One line of output without its newline, as text.
@@ -372,14 +399,16 @@ impl GitCli {
     /// Whether the remote has `sha` as a commit: a fetch of that commit
     /// alone, `--depth=1 --filter=tree:0`, into a throwaway repository
     /// `<root>/tmp/<n>` that is removed on every path, so no store sees
-    /// it. `Ok(false)` when that fetch fails or gets something other than
-    /// a commit; `Err` when the probe could not be set up, which is no
-    /// evidence either way.
+    /// it. `Ok(false)` when git refuses that fetch (it ran and exited
+    /// non-zero) or the fetch gets something other than a commit; `Err`
+    /// when the probe could not be set up or a step gave no answer from git
+    /// (it could not start, or a signal ended it), which is no evidence
+    /// either way.
     fn remote_has_commit(&self, url: &str, sha: &str) -> Result<bool, GitError> {
         let tmp = self.fresh("tmp")?;
         self.init(&tmp.path, sha)?;
         let probe = Call::on(&tmp.path);
-        let fetched = self.git(
+        let fetched = self.answer(
             probe,
             &[
                 os("fetch"),
@@ -393,14 +422,16 @@ impl GitCli {
                 os(url),
                 os(sha),
             ],
-        );
-        if fetched.is_err() {
+        )?;
+        if fetched.is_none() {
             return Ok(false);
         }
-        Ok(matches!(
-            self.line(Call::on(&tmp.path), &[os("cat-file"), os("-t"), os(sha)]),
-            Ok(kind) if kind == "commit"
-        ))
+        let kind = self.answer(Call::on(&tmp.path), &[os("cat-file"), os("-t"), os(sha)])?;
+        Ok(
+            kind.is_some_and(|out| {
+                String::from_utf8_lossy(&out).trim_end_matches('\n') == "commit"
+            }),
+        )
     }
 
     fn fetch(&self, store: &Path, url: &str, sha: &str) -> Result<String, GitError> {
@@ -648,7 +679,13 @@ impl Git for GitCli {
         let mut oids = Vec::new();
         for entry in ls_tree(&out)? {
             let kind = match entry.mode.as_str() {
-                "160000" => continue,
+                // Not in the snapshot, but `diff` reads its path and
+                // `apply` checks it: the same refusals, before anything is
+                // written.
+                "160000" => {
+                    refuse_lookalike(&tree_path(&entry.path)?)?;
+                    continue;
+                }
                 "100644" => Kind::File,
                 "100755" => Kind::Executable,
                 "120000" => Kind::Symlink,
@@ -667,12 +704,7 @@ impl Git for GitCli {
             }
             // `diff` refuses these names, so a checkout that holds one
             // could never return a diff.
-            if lookalike(path.as_str()) {
-                return Err(failed(format!(
-                    "the tree has a path that is .git on another file system: {:?}",
-                    path.as_str()
-                )));
-            }
+            refuse_lookalike(&path)?;
             files.push((path, kind));
             oids.push(entry.oid);
         }
@@ -791,28 +823,33 @@ impl Git for GitCli {
             &[os("apply"), os("--cached"), os("--whitespace=nowarn")],
         )?;
         let tree = self.line(indexed(), &[os("write-tree")])?;
-        // git refuses its own look-alikes only. The applied tree gets the
-        // check `diff` and `snapshot` make, so no checkout holds a path
-        // that `diff` would refuse.
-        let paths = self.git(
+        // git refuses its own look-alikes only, and accepts paths a
+        // workspace cannot carry. Every path of the applied tree, gitlinks
+        // included, gets the checks `snapshot` makes, so no checkout holds
+        // a path that `snapshot` or `diff` would refuse.
+        let out = self.git(
             Call::on(store),
             &[
                 os("ls-tree"),
                 os("-r"),
                 os("-z"),
                 os("--full-tree"),
-                os("--name-only"),
                 os(&tree),
             ],
         )?;
-        if let Some(path) = paths
-            .split(|b| *b == 0)
-            .map(String::from_utf8_lossy)
-            .find(|p| lookalike(p))
-        {
-            return Err(failed(format!(
-                "the diff leaves a path that is .git on another file system: {path:?}"
-            )));
+        for (n, entry) in ls_tree(&out)?.into_iter().enumerate() {
+            let shown = String::from_utf8_lossy(&entry.path);
+            let path = tree_path(&entry.path).map_err(|_| {
+                failed(format!(
+                    "the diff leaves a path a workspace cannot carry: entry {n}, {shown:?}"
+                ))
+            })?;
+            if lookalike(path.as_str()) {
+                return Err(failed(format!(
+                    "the diff leaves a path that is .git on another file system: entry {n}, \
+                     {shown:?}"
+                )));
+            }
         }
         self.issue(Checkout {
             store: Arc::clone(&c.store),
