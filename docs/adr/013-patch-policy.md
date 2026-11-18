@@ -302,7 +302,13 @@ because JS allows escapes in identifiers.
 
 - **Markers**, counted per marker on both sides of every JS/TS file
   (in-source tests exist); more after than before is
-  `DisablesTests(Marker(m))`. Member names `skip`, `only`, `todo`,
+  `DisablesTests(Marker(m))`. A marker refuses as a net increase, so the
+  bounds run in mirror image of the declarations': the after side counts
+  every occurrence, comments and strings included (an upper bound), and
+  the base only occurrences that both readings of the lexer below put in
+  code, HTML-like comments read as comments (a lower bound). Deleting a
+  marker the base holds in a comment or a string therefore cannot offset
+  a new one (review round 1 of PR #70). Member names `skip`, `only`, `todo`,
   `fixme`, `skipIf`, `runIf`, `fails`, `failing`, and `fail` only when the
   receiver is `test` or `it` (`expect.fail` and `assert.fail` are
   assertions). A name counts when it stands as a whole identifier (ASCII
@@ -358,14 +364,15 @@ dynamic and belongs to #17: a test that was green on the base and is
 skipped, todo or missing after the fix must fail the "previously green"
 check. Residuals: computed names (`it['sk' + 'ip']`), destructuring
 (`const { skip } = test`), runtime configuration through environment
-variables, a lexer misread outside the one ambiguity it knows, markers
-counted everywhere on both sides (deleting a marker that the base holds
-in a comment or string offsets a new one), and every ecosystem other
-than JS/TS (Python and the in-source tests of `.vue` and `.svelte` files
+variables, a lexer misread outside the one ambiguity it knows (the one
+place a base marker in a comment could still count as code, and an after
+declaration in a string could still count; #17's dynamic check is the
+backstop for both), and every ecosystem other than JS/TS (Python and the in-source tests of `.vue` and `.svelte` files
 are #69). The cost of the bounds is over-refusal of an edit to a test file
-whose base holds a declaration in a string or template, which the base
-counts and the after side does not; the diffs of D8 hold only changed
-lines, so it was not measurable there.
+whose base holds a declaration in a string or template (the base counts
+it, the after side does not) or a marker in a comment or string (the
+after side counts it, the base does not); the diffs of D8 hold only
+changed lines, so neither was measurable there.
 
 ### D8. Measurement
 

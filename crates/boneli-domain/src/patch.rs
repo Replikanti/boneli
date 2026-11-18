@@ -17,7 +17,9 @@ use core::num::NonZeroU32;
 
 use crate::gate::{CitationProblem, path_problem};
 use crate::line_diff::{Cost, Over, cost, line_count};
-use crate::patch_js::{Marker, after_declarations, base_declarations, has_test_key, marker_counts};
+use crate::patch_js::{
+    Marker, after_declarations, base_declarations, base_marker_counts, has_test_key, marker_counts,
+};
 use crate::patch_path::{
     ForbiddenClass, alias_key, forbidden_class, is_js_ts, is_test_config, is_test_file,
 };
@@ -915,8 +917,10 @@ fn judge_change(
     let (before_text, after_text) = (text(before), text(after));
     if is_js_ts(&change.path) {
         let test_file = is_test_file(&change.path);
-        let count = |side: Option<&str>| side.map(|t| marker_counts(t, test_file));
-        let (was, now) = (count(before_text), count(after_text));
+        // A lower bound of the base's markers and an upper bound of the
+        // after side's: only a net increase refuses (ADR-013, D7).
+        let was = before_text.map(|t| base_marker_counts(t, test_file));
+        let now = after_text.map(|t| marker_counts(t, test_file));
         for marker in Marker::ALL {
             let at = |counts: Option<[u32; crate::patch_js::MARKERS]>| {
                 counts
@@ -2412,5 +2416,48 @@ mod tests {
             ]),
             over
         );
+    }
+
+    /// Markers count as a net increase, so the base's count is a lower
+    /// bound (markers in code under both readings only) and the after
+    /// side's an upper bound (every occurrence): deleting a marker the base
+    /// holds in a comment or a string cannot offset a real one.
+    #[test]
+    fn base_markers_outside_code_do_not_offset() {
+        let skip = one(disables(0, TestDisabling::Marker(Marker::Skip)));
+        for hidden in [
+            "// it.skip('a', f)",
+            "/* it.skip('a', f) */",
+            "const note = 'it.skip(a)'",
+            "const t = `it.skip('a', f)`",
+            "<!-- it.skip('a', f)",
+        ] {
+            assert_eq!(
+                judge(vec![change(
+                    "src/totals.test.ts",
+                    file(&with_line(hidden)),
+                    file(&with_line("it.skip('b', f)"))
+                )]),
+                skip,
+                "{hidden}"
+            );
+        }
+        // A real base marker in code still offsets, in every form.
+        for real in [
+            "it.skip('a', f)",
+            "it['skip']('a', f)",
+            "test('x', { skip: true }, f)",
+        ] {
+            assert!(
+                passes(&judge(vec![change(
+                    "src/totals.test.ts",
+                    file(&with_line(real)),
+                    file(&with_line(
+                        &real.replace("'a'", "'b'").replace("'x'", "'y'")
+                    ))
+                )])),
+                "{real}"
+            );
+        }
     }
 }

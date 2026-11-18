@@ -6,8 +6,10 @@
 //! verified, and refuses too much rather than too little.
 //!
 //! - Markers are found by identifiers and the significant characters
-//!   around them, everywhere in the file (comments and strings included),
-//!   on both sides.
+//!   around them. A marker counts as a net increase, so the after side
+//!   counts every occurrence, comments and strings included
+//!   ([`marker_counts`]), and the base only those in code under both
+//!   readings of the lexer below ([`base_marker_counts`]).
 //! - Test declarations are counted twice under different assumptions: the
 //!   base's count is an upper bound and the after side's a lower bound
 //!   ([`base_declarations`], [`after_declarations`]). A small lexer
@@ -383,8 +385,44 @@ fn bracketed(s: &str, start: usize, end: usize) -> Option<usize> {
 /// comments, `?.` and a TypeScript `!`.
 pub fn marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
     let s = decode_escapes(text);
-    let s = s.as_str();
+    tally(marker_hits(&s, is_test_file).into_iter().map(|(_, m)| m))
+}
+
+/// A lower bound of the base's markers (ADR-013, D7): the occurrences
+/// [`marker_counts`] counts that both readings of the lexer put in code,
+/// HTML-like comments read as comments. A marker counts as a net increase,
+/// so the base counts less and the after side ([`marker_counts`]) more
+/// under any ambiguity: deleting a marker the base holds in a comment or a
+/// string cannot offset a new one.
+pub fn base_marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
+    let s = decode_escapes(text);
+    let hits = marker_hits(&s, is_test_file);
+    let positions: Vec<usize> = hits.iter().map(|(at, _)| *at).collect();
+    let division = classify(&s, &positions, false, true);
+    let regex = classify(&s, &positions, true, true);
+    tally(
+        hits.into_iter()
+            .zip(division.into_iter().zip(regex))
+            .filter(|(_, (d, r))| *d == Region::Code && *r == Region::Code)
+            .map(|((_, m), _)| m),
+    )
+}
+
+fn tally(markers: impl Iterator<Item = Marker>) -> [u32; MARKERS] {
     let mut counts = [0u32; MARKERS];
+    for marker in markers {
+        if let Some(count) = counts.get_mut(marker.index()) {
+            *count = count.saturating_add(1);
+        }
+    }
+    counts
+}
+
+/// Every marker occurrence that counts, in text order, with the offset the
+/// lexer classifies it at: the name, or for the bracket form its opening
+/// quote, which stands in code when the bracket does.
+fn marker_hits(s: &str, is_test_file: bool) -> Vec<(usize, Marker)> {
+    let mut hits = Vec::new();
     for (start, end) in identifiers(s) {
         if end - start > 9 {
             continue;
@@ -396,7 +434,7 @@ pub fn marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
             continue;
         };
         let previous = scan_back(s, start);
-        let counted = if marker.is_member() {
+        let at = if marker.is_member() {
             let fail = marker == Marker::Fail;
             let member = match previous {
                 Some(('.', at)) => !fail || receiver_is_test(s, at),
@@ -409,16 +447,23 @@ pub fn marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
             let key = is_test_file
                 && matches!(marker, Marker::Skip | Marker::Only | Marker::Todo)
                 && next_significant(s, end) == Some(':');
-            member || quoted || key
+            if member || key {
+                Some(start)
+            } else if quoted {
+                char_before(s, start).map(|(_, open)| open)
+            } else {
+                None
+            }
         } else {
-            !matches!(previous, Some(('.', _)))
-                && matches!(next_after_separators(s, end), Some('(' | '.' | '`'))
+            (!matches!(previous, Some(('.', _)))
+                && matches!(next_after_separators(s, end), Some('(' | '.' | '`')))
+            .then_some(start)
         };
-        if counted && let Some(count) = counts.get_mut(marker.index()) {
-            *count = count.saturating_add(1);
+        if let Some(at) = at {
+            hits.push((at, marker));
         }
     }
-    counts
+    hits
 }
 
 /// Where a lexer is.
