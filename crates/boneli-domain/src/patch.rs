@@ -22,6 +22,7 @@ use crate::patch_js::{
 };
 use crate::patch_path::{
     ForbiddenClass, alias_key, forbidden_class, is_js_ts, is_test_config, is_test_file,
+    is_test_path,
 };
 
 /// What a git tree entry is: git's modes 100644, 100755, 120000 and 160000
@@ -606,6 +607,9 @@ impl<'a> LinkTree<'a> {
 enum Guard {
     Class(ForbiddenClass),
     TestConfig,
+    /// A link at a test file or in a test directory: what it reaches is a
+    /// test file (D7).
+    TestFile,
 }
 
 /// One resolution in progress: the directory reached, as alias keys and
@@ -618,14 +622,31 @@ struct State<'a> {
     hops: usize,
 }
 
+/// The readings of a link target, each as its components, last first:
+/// split at `/`, and when it holds a `\`, also split at both, as a Windows
+/// checkout reads it. A reading that is absolute (`/x`, `\\server`) is
+/// dropped: nothing in the patch can be there.
+fn readings(target: &str) -> Vec<Vec<&str>> {
+    let mut out = Vec::new();
+    if !target.starts_with('/') {
+        out.push(target.split('/').rev().collect());
+    }
+    if target.contains('\\') && !target.starts_with(['/', '\\']) {
+        out.push(target.split(['/', '\\']).rev().collect());
+    }
+    out
+}
+
 /// Every path a reader of the link at `path` may land on or pass, as alias
-/// keys: each link position the resolution follows and the final path,
-/// with links followed (several targets when names alias) up to
-/// [`MAX_HOPS`]. `None` when the resolution needs more than [`MAX_STATES`]
-/// states; the caller then protects every path. Outward and absolute
-/// targets end a branch: nothing in the patch can be there.
+/// keys: each link position the resolution passes and every path it may
+/// end on. At a component that aliases a link, both readings continue: the
+/// link is followed (every target of every aliasing link, in every reading
+/// of [`readings`]) up to [`MAX_HOPS`], and the name is also walked as the
+/// real directory a case-sensitive checkout may hold. `None` when the
+/// resolution needs more than [`MAX_STATES`] states; the caller then
+/// protects every path. Outward and absolute targets end a branch: nothing
+/// in the patch can be there.
 fn reach<'a>(tree: &LinkTree<'a>, path: &'a str, target: &'a [u8]) -> Option<Vec<Vec<String>>> {
-    let start_of = |text: &'a str| -> Vec<&'a str> { text.split('/').rev().collect() };
     let parents: Vec<&str> = path.split('/').collect();
     let mut first = State {
         dir: Vec::new(),
@@ -639,11 +660,16 @@ fn reach<'a>(tree: &LinkTree<'a>, path: &'a str, target: &'a [u8]) -> Option<Vec
         first.dir.push(alias_key(component));
     }
     let target = core::str::from_utf8(target).ok()?;
-    if target.starts_with('/') {
-        return Some(Vec::new());
+    let mut work = Vec::new();
+    for rest in readings(target) {
+        work.push(State {
+            dir: first.dir.clone(),
+            nodes: first.nodes.clone(),
+            rest,
+            hops: 0,
+        });
     }
-    first.rest = start_of(target);
-    let mut work = vec![first];
+    first.rest = Vec::new();
     let mut reached = Vec::new();
     let mut states = 0usize;
     while let Some(mut state) = work.pop() {
@@ -675,31 +701,27 @@ fn reach<'a>(tree: &LinkTree<'a>, path: &'a str, target: &'a [u8]) -> Option<Vec
             }
             reached.push(state.dir.clone());
             if state.hops >= MAX_HOPS {
-                outward = true;
-                break;
+                continue;
             }
             for next in targets {
-                let Ok(next) = core::str::from_utf8(next) else {
-                    continue;
-                };
-                if next.starts_with('/') {
-                    continue;
+                // A target that is not UTF-8 cannot be walked: protect all.
+                let next = core::str::from_utf8(next).ok()?;
+                for reading in readings(next) {
+                    let mut rest = state.rest.clone();
+                    rest.extend(reading);
+                    let mut dir = state.dir.clone();
+                    let mut nodes = state.nodes.clone();
+                    dir.pop();
+                    nodes.pop();
+                    work.push(State {
+                        dir,
+                        nodes,
+                        rest,
+                        hops: state.hops + 1,
+                    });
                 }
-                let mut rest = state.rest.clone();
-                rest.extend(start_of(next));
-                let mut dir = state.dir.clone();
-                let mut nodes = state.nodes.clone();
-                dir.pop();
-                nodes.pop();
-                work.push(State {
-                    dir,
-                    nodes,
-                    rest,
-                    hops: state.hops + 1,
-                });
             }
-            outward = true;
-            break;
+            // The directory reading goes on in this state.
         }
         if !outward {
             reached.push(state.dir);
@@ -727,16 +749,26 @@ impl<'a> Context<'a> {
         let mut everywhere = Vec::new();
         let mut forbidden = Vec::new();
         for &(path, target) in &tree.links {
-            let class = forbidden_class(path);
-            let guard = class
-                .map(Guard::Class)
-                .or_else(|| is_test_config(path, || true).then_some(Guard::TestConfig));
-            let Some(guard) = guard else {
+            let guards: Vec<Guard> = [
+                forbidden_class(path).map(Guard::Class),
+                is_test_config(path, || true).then_some(Guard::TestConfig),
+                is_test_path(path).then_some(Guard::TestFile),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if guards.is_empty() {
                 continue;
-            };
+            }
             match reach(&tree, path, target) {
-                Some(paths) => protected.extend(paths.into_iter().map(|p| (p, guard))),
-                None => everywhere.push(guard),
+                Some(paths) => {
+                    for p in paths {
+                        for guard in &guards {
+                            protected.push((p.clone(), *guard));
+                        }
+                    }
+                }
+                None => everywhere.extend(guards),
             }
         }
         for path in patch
@@ -891,7 +923,7 @@ fn judge_change(
         .iter()
         .filter_map(|g| match g {
             Guard::Class(class) => Some(*class),
-            Guard::TestConfig => None,
+            Guard::TestConfig | Guard::TestFile => None,
         })
         .min();
     if let Some(class) = forbidden_class(&change.path).or(guarded_class) {
@@ -915,8 +947,11 @@ fn judge_change(
     }
     let mut disables = |reason| out.push(PatchViolation::DisablesTests { index, reason });
     let (before_text, after_text) = (text(before), text(after));
-    if is_js_ts(&change.path) {
-        let test_file = is_test_file(&change.path);
+    // What a link at a test path reaches is a JS/TS test file, whatever its
+    // name (D7).
+    let reached_test = guards.contains(&Guard::TestFile);
+    if is_js_ts(&change.path) || reached_test {
+        let test_file = is_test_file(&change.path) || reached_test;
         // A lower bound of the base's markers and an upper bound of the
         // after side's: only a net increase refuses (ADR-013, D7).
         let was = before_text.map(|t| base_marker_counts(t, test_file));
@@ -2457,6 +2492,150 @@ mod tests {
                     ))
                 )])),
                 "{real}"
+            );
+        }
+    }
+
+    // Review round 2 of PR #70.
+
+    /// Item 1: a fake test inside an after-side string never counts, in
+    /// every string form JS defines, and `/` after any word is ambiguous.
+    #[test]
+    fn after_strings_hide_no_declarations() {
+        let before = "import { test } from 'vitest';\ntest('a', () => {});\ntest('b', () => {});\n";
+        let removed = one(disables(0, TestDisabling::TestsRemoved));
+        for extra in [
+            "const s = '\\u0027test(\"b\", () => {})\\u0027';\n",
+            "const s = '\\x27test(\"b\", () => {})\\x27';\n",
+            "const s = 'x\\\r\ntest(\"b\", () => {})';\n",
+            "const s = 'x\\\ntest(\"b\", () => {})';\n",
+            "const s = 'x\u{2028}test(\"b\", () => {})';\n",
+            "const s = 'x\u{2029}test(\"b\", () => {})';\n",
+            "function g() { return aw\u{61}it /'/ + 'test(\"b\", () => {})'; }\n",
+            "function* g() { yield /'/ + 'test(\"b\", () => {})'; }\n",
+            "const t = typeof /'/ + 'test(\"b\", () => {})';\n",
+            "const s = `\\u0060test(\"b\", () => {})\\u0060`;\n",
+            "const s = `\\`test(\"b\", () => {})\\``;\n",
+            "const s = 'test(\"b\", () => {})';\n",
+        ] {
+            let after =
+                format!("import {{ test }} from 'vitest';\ntest('a', () => {{}});\n{extra}");
+            assert_eq!(
+                judge(vec![change("src/a.test.ts", file(before), file(&after))]),
+                removed,
+                "{extra:?}"
+            );
+        }
+        // An escaped identifier in code is still a declaration.
+        let escaped =
+            "import { test } from 'vitest';\ntest('a', () => {});\n\\u0074est('b', () => {});\n";
+        assert!(passes(&judge(vec![change(
+            "src/a.test.ts",
+            file(before),
+            file(escaped)
+        )])));
+    }
+
+    /// Item 3: a name that aliases a link is also read as the real
+    /// directory of that name.
+    #[test]
+    fn protected_walk_keeps_the_directory_reading() {
+        let links = || {
+            vec![
+                base_link(".npmrc", "config/../real/npmrc"),
+                base_link("Config", "x/y"),
+            ]
+        };
+        assert_eq!(
+            judge_with(
+                vec![change("real/npmrc", file("a\n"), file("b\n"))],
+                links()
+            ),
+            one(PatchViolation::Forbidden {
+                index: 0,
+                class: ForbiddenClass::Dependencies
+            })
+        );
+        // The link reading still counts too.
+        let through = || {
+            vec![
+                base_link(".npmrc", "config/npmrc"),
+                base_link("Config", "x"),
+            ]
+        };
+        assert_eq!(
+            judge_with(vec![change("x/npmrc", file("a\n"), file("b\n"))], through()),
+            one(PatchViolation::Forbidden {
+                index: 0,
+                class: ForbiddenClass::Dependencies
+            })
+        );
+    }
+
+    /// Item 4: a link at a test file or test directory makes what it
+    /// reaches a test file.
+    #[test]
+    fn links_at_test_paths_protect_their_targets() {
+        let suite = "test('a', () => {});\ntest('b', () => {});\n";
+        let removed = one(disables(0, TestDisabling::TestsRemoved));
+        let edit = || {
+            vec![change(
+                "shared/cases.ts",
+                file(suite),
+                file("test('a', () => {});\n"),
+            )]
+        };
+        assert_eq!(
+            judge_with(
+                edit(),
+                vec![base_link("src/a.test.ts", "../shared/cases.ts")]
+            ),
+            removed
+        );
+        assert_eq!(
+            judge_with(edit(), vec![base_link("tests", "shared")]),
+            removed
+        );
+        assert_eq!(
+            judge_with(
+                vec![change(
+                    "shared/cases.ts",
+                    file(suite),
+                    file(&format!("{suite}it.skip('c', f)\n"))
+                )],
+                vec![base_link("tests", "shared")]
+            ),
+            one(disables(0, TestDisabling::Marker(Marker::Skip)))
+        );
+        assert_eq!(
+            judge_with(
+                vec![change("shared/cases.ts", file(suite), None)],
+                vec![base_link("tests", "shared")]
+            ),
+            one(disables(0, TestDisabling::DeletedTestFile))
+        );
+        // A link at an ordinary path protects nothing.
+        assert!(passes(&judge_with(
+            edit(),
+            vec![base_link("src/cases.ts", "../shared/cases.ts")]
+        )));
+    }
+
+    /// Item 5: a backslash in a protected link's target is also read as a
+    /// separator.
+    #[test]
+    fn protected_targets_split_on_backslash() {
+        for target in ["config\\npmrc", "config\\sub/..\\npmrc"] {
+            assert_eq!(
+                judge_with(
+                    vec![change("config/npmrc", file("a\n"), file("b\n"))],
+                    vec![base_link(".npmrc", target)]
+                ),
+                one(PatchViolation::Forbidden {
+                    index: 0,
+                    class: ForbiddenClass::Dependencies
+                }),
+                "{target:?}"
             );
         }
     }

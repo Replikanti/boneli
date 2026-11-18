@@ -225,6 +225,16 @@ pub fn is_test_file(path: &str) -> bool {
             .any(|suffix| stem.ends_with(suffix))
 }
 
+/// Whether a path is a test path for links (ADR-013, D6 and D7): a JS/TS
+/// test file, or any path with a folded component that names a test
+/// directory, the link's own name included (`tests -> shared`).
+pub fn is_test_path(path: &str) -> bool {
+    is_test_file(path)
+        || path
+            .split('/')
+            .any(|c| TEST_DIRECTORIES.contains(&fold_component(c).as_str()))
+}
+
 const TEST_CONFIG_PREFIXES: [&str; 7] = [
     "jest.config.",
     "vitest.config.",

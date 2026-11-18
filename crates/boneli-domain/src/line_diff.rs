@@ -9,11 +9,13 @@
 //! 1986), cut off at the line budget, with the edit script recovered from
 //! the furthest points of every step.
 //!
-//! Memory stays independent of the file size: nothing is collected per
-//! line. Common leading and trailing lines are stripped by walking both
-//! sides, the length differences cut the search off before it starts, each
-//! diagonal keeps a byte cursor into both sides instead of a line index,
-//! and the trace holds one entry per diagonal and step, at most
+//! Time is O(total bytes + (N + M) * D) and memory linear with a small
+//! constant. The line-count and byte-length differences cut the search off
+//! before anything is allocated; common leading and trailing lines are
+//! stripped by walking both sides; each remaining line is hashed once (8
+//! bytes per line), the search compares hashes, and the edit script it
+//! recovers is verified byte for byte once, so a hash collision can only
+//! refuse. The trace holds one entry per diagonal and step, at most
 //! (D + 1)(D + 2) / 2 for a distance of D.
 
 use alloc::vec;
@@ -38,7 +40,8 @@ pub struct Cost {
 /// Which budget a change crosses first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Over {
-    /// The line budget.
+    /// The line budget, or a hash collision the verification found (the
+    /// cost cannot be decided, so it refuses).
     Lines,
     /// The byte budget.
     Bytes,
@@ -58,13 +61,30 @@ fn line_start(s: &[u8], end: usize) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-fn line(s: &[u8], from: usize) -> &[u8] {
-    s.get(from..line_end(s, from)).unwrap_or(&[])
+/// Line `i` of `s`, by its start in `starts`.
+fn line_at<'s>(s: &'s [u8], starts: &[usize], i: usize) -> Option<&'s [u8]> {
+    starts
+        .get(i)
+        .and_then(|from| s.get(*from..line_end(s, *from)))
 }
 
-/// Above this many lines of budget, the edit script is not recovered and
-/// the bytes are bounded by both middles (D3): the trace would hold more
-/// than about 8.4 million entries.
+/// The lines of `s`, in order, without collecting them.
+fn lines(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+    s.split_inclusive(|b| *b == b'\n')
+}
+
+/// FNV-1a, 64 bits. Not collision resistant, and it need not be: equal
+/// hashes are verified byte for byte (traced) or compared directly.
+fn hash(line: &[u8]) -> u64 {
+    line.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Above this many lines of budget, the edit script is not recovered: the
+/// trace would pass 8.4 million entries. The search then compares lines
+/// byte for byte on equal hashes, and the bytes are bounded by both middles
+/// together, which refuses more, never less.
 const MAX_TRACED: usize = 4096;
 
 /// The cost of turning `a` into `b`, or the budget it crosses first.
@@ -72,8 +92,8 @@ pub fn cost(a: &[u8], b: &[u8], max_lines: usize, max_bytes: usize) -> Result<Co
     cost_counted(a, b, max_lines, max_bytes, &mut 0)
 }
 
-/// [`cost`], adding to `cells` every per-step cell it allocates, so a test
-/// can pin that memory does not grow with the file.
+/// [`cost`], adding to `cells` every per-line and per-step cell it
+/// allocates, so a test can pin how memory grows.
 pub(crate) fn cost_counted(
     a: &[u8],
     b: &[u8],
@@ -84,7 +104,11 @@ pub(crate) fn cost_counted(
     if line_count(a).abs_diff(line_count(b)) > max_lines {
         return Err(Over::Lines);
     }
-    // Strip common leading lines, then common trailing lines of the rest.
+    // Common lines are equal on both sides, so the length difference is a
+    // lower bound of the changed bytes.
+    if a.len().abs_diff(b.len()) > max_bytes {
+        return Err(Over::Bytes);
+    }
     let (mut pa, mut pb) = (0, 0);
     while pa < a.len() && pb < b.len() {
         let (ea, eb) = (line_end(a, pa), line_end(b, pb));
@@ -103,16 +127,39 @@ pub(crate) fn cost_counted(
     }
     let a = a.get(pa..sa).unwrap_or(&[]);
     let b = b.get(pb..sb).unwrap_or(&[]);
-    let (n, m) = (line_count(a), line_count(b));
-    // Matched lines are equal on both sides, so the byte difference of the
-    // middles is a lower bound of the changed bytes.
-    if a.len().abs_diff(b.len()) > max_bytes {
-        return Err(Over::Bytes);
-    }
-    let limit = max_lines.min(n.saturating_add(m));
-    let lines = myers(a, b, n, m, limit, cells).ok_or(Over::Lines)?;
-    let bytes = if lines.traced {
-        changed_bytes(a, &lines.deleted).saturating_add(changed_bytes(b, &lines.inserted))
+    let limit = max_lines.min(line_count(a).saturating_add(line_count(b)));
+    let traced = limit <= MAX_TRACED;
+    let ha: Vec<u64> = lines(a).map(hash).collect();
+    let hb: Vec<u64> = lines(b).map(hash).collect();
+    *cells = cells.saturating_add(ha.len() + hb.len());
+    // Untraced, an equal hash is checked against the bytes on the spot.
+    let starts = |s: &[u8]| -> Vec<usize> {
+        let mut at = 0;
+        lines(s)
+            .map(|l| {
+                let start = at;
+                at += l.len();
+                start
+            })
+            .collect()
+    };
+    let (sa_, sb_) = if traced {
+        (Vec::new(), Vec::new())
+    } else {
+        (starts(a), starts(b))
+    };
+    let same = |x: usize, y: usize| -> bool {
+        if ha.get(x) != hb.get(y) {
+            return false;
+        }
+        if traced {
+            return true;
+        }
+        line_at(a, &sa_, x) == line_at(b, &sb_, y)
+    };
+    let script = myers(ha.len(), hb.len(), limit, traced, &same, cells).ok_or(Over::Lines)?;
+    let bytes = if traced {
+        verified_bytes(a, b, &script).ok_or(Over::Lines)?
     } else {
         a.len().saturating_add(b.len())
     };
@@ -120,80 +167,57 @@ pub(crate) fn cost_counted(
         return Err(Over::Bytes);
     }
     Ok(Cost {
-        lines: lines.distance,
+        lines: script.distance,
         bytes,
     })
 }
 
-/// The bytes of the lines of `s` at the sorted `indices`.
-fn changed_bytes(s: &[u8], indices: &[usize]) -> usize {
+/// Walks both middles along the recovered script: the bytes of the
+/// deleted and inserted lines, or `None` when two lines the script matches
+/// differ (a hash collision).
+fn verified_bytes(a: &[u8], b: &[u8], script: &Script) -> Option<usize> {
+    let mut deleted = script.deleted.iter().peekable();
+    let mut inserted = script.inserted.iter().peekable();
+    let mut left = lines(a).enumerate();
+    let mut right = lines(b).enumerate();
     let mut total = 0usize;
-    let mut wanted = indices.iter().peekable();
-    let (mut at, mut index) = (0, 0usize);
-    while at < s.len() && wanted.peek().is_some() {
-        let end = line_end(s, at);
-        if wanted.peek() == Some(&&index) {
-            total = total.saturating_add(end - at);
-            wanted.next();
+    loop {
+        let next_left = left.next();
+        let mut keep_left = None;
+        if let Some((x, line)) = next_left {
+            if deleted.peek() == Some(&&x) {
+                deleted.next();
+                total = total.saturating_add(line.len());
+                continue;
+            }
+            keep_left = Some(line);
         }
-        (at, index) = (end, index + 1);
+        // Skip inserted lines of `b` up to the next kept one.
+        let mut keep_right = None;
+        for (y, line) in right.by_ref() {
+            if inserted.peek() == Some(&&y) {
+                inserted.next();
+                total = total.saturating_add(line.len());
+                continue;
+            }
+            keep_right = Some(line);
+            break;
+        }
+        match (keep_left, keep_right) {
+            (None, None) => return Some(total),
+            (Some(l), Some(r)) if l == r => {}
+            _ => return None,
+        }
     }
-    total
 }
 
 /// The result of the search.
 struct Script {
     distance: usize,
-    /// Whether `deleted` and `inserted` were recovered.
-    traced: bool,
-    /// Indices of deleted lines of `a`, ascending.
+    /// Indices of deleted lines of `a`, ascending (traced only).
     deleted: Vec<usize>,
-    /// Indices of inserted lines of `b`, ascending.
+    /// Indices of inserted lines of `b`, ascending (traced only).
     inserted: Vec<usize>,
-}
-
-/// The furthest point of a diagonal: its x and the byte offsets of line x
-/// of `a` and line y of `b`.
-#[derive(Clone, Copy)]
-struct Point {
-    x: usize,
-    a: usize,
-    b: usize,
-}
-
-/// The start of diagonal `k` at step `d` from the points of step `d - 1`:
-/// down from `k + 1` (an insertion) or right from `k - 1` (a deletion),
-/// whichever reaches further inside the grid; down on a tie. `true` means
-/// down.
-fn step(
-    down: Option<Point>,
-    right: Option<Point>,
-    k: isize,
-    n: usize,
-    m: usize,
-    a: &[u8],
-    b: &[u8],
-) -> Option<(Point, bool)> {
-    let down = down.filter(|p| fits_down(p.x, k, m));
-    let right = right.filter(|p| p.x < n);
-    let below = |p: Point| Point {
-        x: p.x,
-        a: p.a,
-        b: line_end(b, p.b),
-    };
-    match (down, right) {
-        (Some(p), Some(q)) if p.x > q.x => Some((below(p), true)),
-        (Some(p), None) => Some((below(p), true)),
-        (_, Some(q)) => Some((
-            Point {
-                x: q.x + 1,
-                a: line_end(a, q.a),
-                b: q.b,
-            },
-            false,
-        )),
-        (None, None) => None,
-    }
 }
 
 /// Whether a move down onto diagonal `k` from x on diagonal `k + 1` stays
@@ -205,19 +229,30 @@ fn fits_down(x: usize, k: isize, m: usize) -> bool {
     }
 }
 
+/// The start of diagonal `k` from step `d - 1`: down from `k + 1` (an
+/// insertion) or right from `k - 1` (a deletion), whichever reaches
+/// further inside the grid; down on a tie.
+fn start(down: Option<usize>, right: Option<usize>, k: isize, n: usize, m: usize) -> Option<usize> {
+    let down = down.filter(|x| fits_down(*x, k, m));
+    let right = right.filter(|x| *x < n).map(|x| x + 1);
+    match (down, right) {
+        (Some(p), Some(q)) => Some(p.max(q)),
+        (p, q) => p.or(q),
+    }
+}
+
 fn myers(
-    a: &[u8],
-    b: &[u8],
     n: usize,
     m: usize,
     limit: usize,
+    traced: bool,
+    same: &dyn Fn(usize, usize) -> bool,
     cells: &mut usize,
 ) -> Option<Script> {
-    let traced = limit <= MAX_TRACED;
     let width = limit.checked_mul(2)?.checked_add(3)?;
     let offset = isize::try_from(limit.checked_add(1)?).ok()?;
     let at = |k: isize| usize::try_from(k.checked_add(offset)?).ok();
-    let mut v: Vec<Option<Point>> = vec![None; width];
+    let mut v: Vec<Option<usize>> = vec![None; width];
     *cells = cells.saturating_add(width);
     // trace[d] holds the x of every diagonal of step d, from k = -d up.
     let mut trace: Vec<Vec<Option<usize>>> = Vec::new();
@@ -226,35 +261,30 @@ fn myers(
         let mut row = Vec::new();
         let mut k = -d_i;
         while k <= d_i {
-            let start = if d == 0 {
-                Some(Point { x: 0, a: 0, b: 0 })
+            let first = if d == 0 {
+                Some(0)
             } else {
                 let down = v.get(at(k + 1)?).copied().flatten();
                 let right = v.get(at(k - 1)?).copied().flatten();
-                step(down, right, k, n, m, a, b).map(|(p, _)| p)
+                start(down, right, k, n, m)
             };
             let mut found = None;
-            if let Some(mut p) = start {
-                let mut y = usize::try_from(isize::try_from(p.x).ok()?.checked_sub(k)?).ok()?;
-                while p.x < n && y < m && line(a, p.a) == line(b, p.b) {
-                    p = Point {
-                        x: p.x + 1,
-                        a: line_end(a, p.a),
-                        b: line_end(b, p.b),
-                    };
+            if let Some(mut x) = first {
+                let mut y = usize::try_from(isize::try_from(x).ok()?.checked_sub(k)?).ok()?;
+                while x < n && y < m && same(x, y) {
+                    x += 1;
                     y += 1;
                 }
-                found = Some(p);
-                if p.x == n && y == m {
+                found = Some(x);
+                if x == n && y == m {
                     if traced {
-                        row.push(Some(p.x));
                         trace.push(row);
                     }
                     return Some(backtrack(&trace, d, k, traced, n, m));
                 }
             }
             if traced {
-                row.push(found.map(|p| p.x));
+                row.push(found);
             }
             *v.get_mut(at(k)?)? = found;
             k += 2;
@@ -289,7 +319,6 @@ fn backtrack(
 ) -> Script {
     let mut script = Script {
         distance: d,
-        traced,
         deleted: Vec::new(),
         inserted: Vec::new(),
     };
@@ -300,7 +329,7 @@ fn backtrack(
         let previous = step_d - 1;
         let down = traced_x(trace, previous, k + 1).filter(|x| fits_down(*x, k, m));
         let right = traced_x(trace, previous, k - 1).filter(|x| *x < n);
-        // The same choice as the forward pass (`step`): down unless right
+        // The same choice as the forward pass (`start`): down unless right
         // reaches strictly further.
         let go_down = match (down, right) {
             (Some(p), Some(q)) => p > q,
@@ -313,8 +342,7 @@ fn backtrack(
             script.inserted.push(y);
             k += 1;
         } else {
-            let x = right.unwrap_or(0);
-            script.deleted.push(x);
+            script.deleted.push(right.unwrap_or(0));
             k -= 1;
         }
     }
@@ -489,9 +517,9 @@ mod tests {
         }
     }
 
-    /// Memory does not grow with the file: a one-line edit at each end of
-    /// a 2-million-line file allocates a few cells, and a 10 MB addition is
-    /// cut off by the line count before any search.
+    /// Memory is one hash per line of the middles plus cells sized by the
+    /// budget and the distance; a 10 MB addition is cut off by the line
+    /// count before anything is allocated.
     #[test]
     fn memory_is_independent_of_the_file_size() {
         let base: Vec<u8> = (0..2_000_000u32)
@@ -508,9 +536,10 @@ mod tests {
                 bytes: 11
             })
         );
-        // The cursor row is sized by the budget (2 * 1000 + 3), the trace by
-        // the distance: neither by the file.
-        assert!(cells < 2_010, "{cells} cells");
+        // One hash per line of the middles (both whole files here, since
+        // the edits sit at both ends), a row sized by the budget
+        // (2 * 1000 + 3) and a trace sized by the distance.
+        assert!(cells <= 4_000_002 + 2_010, "{cells} cells");
         let mut cells = 0;
         let added = vec![b'\n'; 10_000_000];
         assert_eq!(
@@ -531,6 +560,26 @@ mod tests {
         let mut cells = 0;
         let got = cost_counted(&base, &spread, 1000, usize::MAX, &mut cells).expect("in budget");
         assert_eq!(got.lines, 40);
-        assert!(cells < 2_003 + 41 * 42, "{cells} cells");
+        assert!(cells <= 4_000_000 + 2_003 + 41 * 42, "{cells} cells");
+    }
+
+    /// A script that matches two different lines (what a hash collision
+    /// would produce) fails the verification, so the cost refuses.
+    #[test]
+    fn verification_catches_a_false_match() {
+        let script = Script {
+            distance: 0,
+            deleted: Vec::new(),
+            inserted: Vec::new(),
+        };
+        assert_eq!(verified_bytes(b"a\n", b"a\n", &script), Some(0));
+        assert_eq!(verified_bytes(b"a\n", b"b\n", &script), None);
+        let script = Script {
+            distance: 2,
+            deleted: vec![0],
+            inserted: vec![1],
+        };
+        assert_eq!(verified_bytes(b"x\nk\n", b"k\nyy\n", &script), Some(5));
+        assert_eq!(verified_bytes(b"x\nk\n", b"j\nyy\n", &script), None);
     }
 }

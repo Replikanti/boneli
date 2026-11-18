@@ -133,13 +133,40 @@ impl Marker {
 /// U+10FFFF, no surrogates) and `\xHH` in one pass. Anything else,
 /// including an escape that does not decode, is kept as written.
 pub fn decode_escapes(text: &str) -> String {
+    decode(text).text
+}
+
+/// Decoded text and where each decoded escape came from, to map a decoded
+/// offset back to the raw text the lexer reads.
+struct Decoded {
+    text: String,
+    /// Per decoded escape: decoded start and length, raw start and length.
+    escapes: Vec<(usize, usize, usize, usize)>,
+}
+
+impl Decoded {
+    /// The raw offset of decoded offset `d`: inside an escape's output, the
+    /// escape's start; elsewhere, shifted by the escapes before it.
+    fn raw(&self, d: usize) -> usize {
+        let before = self.escapes.partition_point(|e| e.0 <= d);
+        match before.checked_sub(1).and_then(|k| self.escapes.get(k)) {
+            None => d,
+            Some(&(ds, dl, rs, _)) if d < ds + dl => rs,
+            Some(&(ds, dl, rs, rl)) => rs + rl + (d - ds - dl),
+        }
+    }
+}
+
+fn decode(text: &str) -> Decoded {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
+    let mut escapes = Vec::new();
     let mut k = 0;
     while k < bytes.len() {
         if bytes.get(k) == Some(&b'\\')
             && let Some((decoded, next)) = escape_at(bytes, k + 1)
         {
+            escapes.push((out.len(), decoded.len_utf8(), k, next - k));
             out.push(decoded);
             k = next;
             continue;
@@ -150,7 +177,22 @@ pub fn decode_escapes(text: &str) -> String {
         out.push(c);
         k += c.len_utf8();
     }
-    out
+    Decoded { text: out, escapes }
+}
+
+/// The regions of decoded-text offsets under both readings of the raw
+/// text: (division, regular expression).
+fn both_readings(
+    raw: &str,
+    decoded: &Decoded,
+    positions: &[usize],
+    html: bool,
+) -> (Vec<Region>, Vec<Region>) {
+    let raw_positions: Vec<usize> = positions.iter().map(|d| decoded.raw(*d)).collect();
+    (
+        classify(raw, &raw_positions, false, html),
+        classify(raw, &raw_positions, true, html),
+    )
 }
 
 /// The character an escape decodes to, for the escape whose letter is at
@@ -395,11 +437,10 @@ pub fn marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
 /// under any ambiguity: deleting a marker the base holds in a comment or a
 /// string cannot offset a new one.
 pub fn base_marker_counts(text: &str, is_test_file: bool) -> [u32; MARKERS] {
-    let s = decode_escapes(text);
-    let hits = marker_hits(&s, is_test_file);
+    let decoded = decode(text);
+    let hits = marker_hits(&decoded.text, is_test_file);
     let positions: Vec<usize> = hits.iter().map(|(at, _)| *at).collect();
-    let division = classify(&s, &positions, false, true);
-    let regex = classify(&s, &positions, true, true);
+    let (division, regex) = both_readings(text, &decoded, &positions, true);
     tally(
         hits.into_iter()
             .zip(division.into_iter().zip(regex))
@@ -495,30 +536,11 @@ impl Mode {
     }
 }
 
-/// Keywords after which `/` starts a regular expression. The keyword that
-/// awaits a promise is left out: the core token scan bans the word, and
-/// awaiting a regular expression literal is not code anyone writes, so
-/// both readings take `/` after it as a division.
-const REGEX_KEYWORDS: [&str; 13] = [
-    "return",
-    "typeof",
-    "instanceof",
-    "in",
-    "of",
-    "new",
-    "delete",
-    "void",
-    "throw",
-    "case",
-    "do",
-    "else",
-    "yield",
-];
-
+/// Whether a JS line terminator starts at byte `i`: LF, CR, U+2028 or
+/// U+2029 (E2 80 A8 and E2 80 A9).
 fn is_line_end(bytes: &[u8], i: usize) -> bool {
     match bytes.get(i) {
         Some(b'\n' | b'\r') => true,
-        // U+2028 and U+2029: E2 80 A8 and E2 80 A9.
         Some(0xE2) => {
             bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9))
         }
@@ -526,16 +548,41 @@ fn is_line_end(bytes: &[u8], i: usize) -> bool {
     }
 }
 
-/// The region of each of the sorted `positions` under one reading of the
-/// text: strings, template literals (with `${...}` code), regular
-/// expressions and comments. `regex_after_close` decides the one ambiguity
-/// the lexer knows: whether `/` after `)` or `}` starts a regular
-/// expression (`if (x) /re/`) or divides (`(a) / b`). With `html`, the
+/// The length in bytes of what a `\` at byte `i` escapes, the backslash
+/// included: the next code point, or CR LF as one line continuation.
+fn escaped_len(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i + 1) {
+        None => 1,
+        Some(b'\r') if bytes.get(i + 2) == Some(&b'\n') => 3,
+        Some(&b) => {
+            let width = match b {
+                0xF0..=0xF7 => 4,
+                0xE0..=0xEF => 3,
+                0xC0..=0xDF => 2,
+                _ => 1,
+            };
+            1 + width
+        }
+    }
+}
+
+/// The region of each of the sorted `positions` (byte offsets into the raw
+/// text, before any escape is decoded) under one reading of the text, by
+/// the JS rules for strings, template literals (with `${...}` code),
+/// regular expressions and comments: a `\` escapes the next code point in
+/// a literal, CR LF included as one line continuation, and only LF and CR
+/// end a quoted string (U+2028 and U+2029 are legal in one).
+///
+/// The lexer knows one ambiguity: `/` after a word, `)` or `}` divides
+/// (`a / b`, `(a) / b`) or starts a regular expression (`return /re/`,
+/// `if (x) /re/`). `regex_when_ambiguous` picks the reading; the callers
+/// run both and take the bound that refuses, so no keyword list is
+/// needed. After an operator or at the start, `/` starts a regular
+/// expression; after a closed literal it divides. With `html`, the
 /// HTML-like comments of script code, `<!--` and `-->`, run to the end of
-/// their line wherever they stand in code. All syntax is ASCII,
-/// so the lexer walks bytes; a multi-byte character never holds an ASCII
-/// byte.
-fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -> Vec<Region> {
+/// their line wherever they stand in code. All syntax is ASCII, so the
+/// lexer walks bytes; a multi-byte character never holds an ASCII byte.
+fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool) -> Vec<Region> {
     let bytes = s.as_bytes();
     let mut out = vec![Region::Code; positions.len()];
     let mut next = 0;
@@ -543,10 +590,9 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
     // The brace depth at each open `${`, innermost last.
     let mut substitutions: Vec<usize> = Vec::new();
     let mut depth = 0usize;
-    // The previous significant byte in code; `a` stands for an operand (an
-    // identifier, a number, a closed string or regular expression).
+    // The previous significant byte in code: `a` for a word (an
+    // identifier, a keyword or a number), `"` for a closed literal.
     let mut previous: Option<u8> = None;
-    let mut last_word = (0usize, 0usize);
     let mut i = 0;
     while i < bytes.len() {
         while let Some(&p) = positions.get(next) {
@@ -581,12 +627,8 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
                 b'/' => {
                     let regex = match previous {
                         None => true,
-                        Some(b'a') => {
-                            let word = s.get(last_word.0..last_word.1).unwrap_or("");
-                            let property = matches!(scan_back(s, last_word.0), Some(('.', _)));
-                            REGEX_KEYWORDS.contains(&word) && !property
-                        }
-                        Some(b')' | b'}') => regex_after_close,
+                        Some(b'a' | b')' | b'}') => regex_when_ambiguous,
+                        Some(b'"' | b']') => false,
                         Some(p) => b"(,=:[!&|?{};+-*%<>~^/".contains(&p),
                     };
                     if regex {
@@ -609,6 +651,11 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
                     mode = Mode::Template;
                     i += 1;
                 }
+                // An identifier escape (`it`) belongs to its word.
+                b'\\' => {
+                    i += escaped_len(bytes, i);
+                    previous = Some(b'a');
+                }
                 _ if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 => {
                     let start = i;
                     while bytes.get(i).is_some_and(|b| {
@@ -620,7 +667,6 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
                     if i == start {
                         i += 1;
                     }
-                    last_word = (start, i);
                     previous = Some(b'a');
                 }
                 _ => {
@@ -651,21 +697,21 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
             }
             Mode::Quoted(quote) => {
                 if c == b'\\' {
-                    i += 2;
+                    i += escaped_len(bytes, i);
                 } else {
-                    if c == quote || is_line_end(bytes, i) {
+                    if c == quote || c == b'\n' || c == b'\r' {
                         mode = Mode::Code;
-                        previous = Some(b'a');
+                        previous = Some(b'"');
                     }
                     i += 1;
                 }
             }
             Mode::Template => {
                 if c == b'\\' {
-                    i += 2;
+                    i += escaped_len(bytes, i);
                 } else if c == b'`' {
                     mode = Mode::Code;
-                    previous = Some(b'a');
+                    previous = Some(b'"');
                     i += 1;
                 } else if c == b'$' && c2 == Some(b'{') {
                     substitutions.push(depth);
@@ -677,12 +723,12 @@ fn classify(s: &str, positions: &[usize], regex_after_close: bool, html: bool) -
                 }
             }
             Mode::Regex { class } => {
-                if c == b'\\' {
-                    i += 2;
+                if c == b'\\' && !is_line_end(bytes, i + 1) {
+                    i += escaped_len(bytes, i);
                 } else {
                     if is_line_end(bytes, i) || (c == b'/' && !class) {
                         mode = Mode::Code;
-                        previous = Some(b'a');
+                        previous = Some(b'"');
                     } else if c == b'[' {
                         mode = Mode::Regex { class: true };
                     } else if c == b']' {
@@ -730,10 +776,9 @@ fn count(flags: impl Iterator<Item = bool>) -> u32 {
 /// `it?.(`), that not both readings of the lexer put in a comment.
 /// Declarations in strings count.
 pub fn base_declarations(text: &str) -> u32 {
-    let s = decode_escapes(text);
-    let positions = declarations(&s, true);
-    let division = classify(&s, &positions, false, false);
-    let regex = classify(&s, &positions, true, false);
+    let decoded = decode(text);
+    let positions = declarations(&decoded.text, true);
+    let (division, regex) = both_readings(text, &decoded, &positions, false);
     count(
         division
             .iter()
@@ -747,10 +792,9 @@ pub fn base_declarations(text: &str) -> u32 {
 /// HTML-like comments `<!--` and `-->` read as comments anywhere in code.
 /// Commenting a test out therefore counts as removing it.
 pub fn after_declarations(text: &str) -> u32 {
-    let s = decode_escapes(text);
-    let positions = declarations(&s, false);
-    let division = classify(&s, &positions, false, true);
-    let regex = classify(&s, &positions, true, true);
+    let decoded = decode(text);
+    let positions = declarations(&decoded.text, false);
+    let (division, regex) = both_readings(text, &decoded, &positions, true);
     count(
         division
             .iter()

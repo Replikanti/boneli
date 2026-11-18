@@ -443,3 +443,40 @@ fn policy_never_panics() {
     eprintln!("{passes} passed, {judged} judged past validation");
     assert!(passes > 100 && judged > 1000, "{passes} {judged}");
 }
+
+/// Review round 2 of PR #70 (item 2): the line cost hashes every line once,
+/// so long distinct lines cost their bytes once, not once per search step.
+/// 400 distinct lines of 25 KB per side (10 MB each), all different, take
+/// the full line budget of 800 steps.
+#[test]
+fn line_cost_is_linear_in_bytes() {
+    let side = |tag: char| -> String {
+        (0..400)
+            .map(|k| format!("{tag}{k:08}{}\n", "x".repeat(25_000)))
+            .collect()
+    };
+    let (before, after) = (side('a'), side('b'));
+    let (verdict, took) = judge(
+        vec![change("data.txt", file(&before), file(&after))],
+        Vec::new(),
+    );
+    assert_eq!(
+        verdict,
+        PatchVerdict::Reject(vec![PatchViolation::TooManyBytes { limit: 42_000 }])
+    );
+    eprintln!("400 + 400 lines of 25 KB: {took:?}");
+    assert!(took < Duration::from_secs(20), "took {took:?}");
+    // A length difference above the byte budget refuses before any search.
+    let (verdict, _) = judge(
+        vec![change(
+            "data.txt",
+            file("x\n"),
+            file(&format!("x\n{}", "y".repeat(42_001))),
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        verdict,
+        PatchVerdict::Reject(vec![PatchViolation::TooManyBytes { limit: 42_000 }])
+    );
+}

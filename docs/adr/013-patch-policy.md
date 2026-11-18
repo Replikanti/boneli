@@ -105,26 +105,34 @@ The cost of a change is the least number of inserted plus deleted lines
 and the bytes of those lines, newlines included: Myers' greedy forward
 pass, cut off at what is left of the line budget, with the edit script
 recovered from the furthest point of every diagonal and step. Before the
-search, the line counts and then the byte lengths of the two sides cut it
-off: a line-count difference above what is left is over the line budget,
-and once common leading and trailing lines are stripped, the byte-length
-difference of the middles is a lower bound of the changed bytes. The work
-for one file is O((N + M) * R) with R at most the remaining budget; a
-200,000-line file with 499 spread edits takes about 2.3 s in a debug build
-(an LCS table would need 4 * 10^10 cells). A multiset count of lines would
-cost 0 for reordered lines and so fail open.
+search, the line counts and the byte lengths of the two sides cut it off:
+a line-count difference above what is left is over the line budget, and a
+byte-length difference above what is left of the byte budget is over it
+(common lines are equal on both sides, so the difference is a lower bound
+of the changed bytes). A multiset count of lines would cost 0 for
+reordered lines and so fail open.
 
-**Memory does not grow with the file** (review round 1 of PR #70: the
-first version collected every line, 16 bytes each, before the cut-off, and
-a 100 MB added file peaked at 1.66 GB). Nothing is collected per line:
-lines are counted by scanning, the common prefix and suffix are stripped
-by walking both sides, each diagonal keeps a byte cursor into both sides
-instead of a line index, and the trace keeps one entry per diagonal and
-step, at most (D + 1)(D + 2) / 2 for a distance of D, about 0.5 million at
-the default budget. The same 100 MB file now peaks at the size of its own
-bytes (100 MB resident). Above a line budget of 4,096 the script is not
-recovered, because its trace would pass 8.4 million entries, and the bytes
-are bounded by both middles together, which refuses more, never less.
+**Time is O(total bytes + (N + M) * D) and memory linear with a small
+constant.** Common leading and trailing lines are stripped by walking both
+sides. Each remaining line is hashed once (FNV-1a, 8 bytes per line), the
+search compares hashes, and the recovered edit script is then verified
+byte for byte in one pass, which also sums the changed bytes. A hash
+collision could only make two different lines look equal; the
+verification finds it and the change is refused (`TooManyLines`), so the
+hash need not resist collisions. The trace keeps one entry per diagonal
+and step, at most (D + 1)(D + 2) / 2 for a distance of D, about 0.5
+million at the default budget. Above a line budget of 4,096 the script is
+not recovered (its trace would pass 8.4 million entries): the search then
+compares the bytes of lines with equal hashes on the spot, keeping each
+line's start (8 more bytes per line), and the bytes are bounded by both
+middles together, which refuses more, never less. Measured in a debug
+build: a 200,000-line file with 499 spread edits takes about 1.6 s (an LCS
+table would need 4 * 10^10 cells); 400 distinct 25 KB lines per side, all
+different, take about 1.7 s. Reviews of PR #70 found two earlier forms:
+the first collected every line before the cut-off (a 100 MB added file
+peaked at 1.66 GB, now about 100 MB resident, the file itself), and the
+second rescanned whole lines at every search step (500 distinct 100 KB
+lines per side took 36 s in a release build, now 0.7 s).
 
 **The byte budget** closes what a line count cannot see: a one-line file of
 several megabytes, minified or generated, costs one line.
@@ -255,21 +263,29 @@ components alias. That refuses a file beneath `ü/` next to a link at
 `ö`, which no fix needs, and never lets an alias through (review round 1
 of PR #70: `Ä -> .github` with `ä/workflows/ci.yml` passed).
 
-**Links at forbidden paths protect what they point to.** A link of the
-tree after the fix whose own path is forbidden (D4) or a test runner's
-configuration (D7) is resolved like a reader would: from its parent
-directory, through every link it meets (all targets of aliasing links),
-up to 40 links deep, Linux's ELOOP limit. Every link position the
-resolution passes and the path it ends on are protected, and a change at,
-above or beneath a protected path takes the link's class (`Forbidden`, or
-`TestConfigChanged` for a test runner's configuration). So editing
+**Links at protected paths protect what they point to.** A link of the
+tree after the fix whose own path is forbidden (D4), a test runner's
+configuration, a JS/TS test file or inside a test directory (D7; the
+link's own name counts, so `tests -> shared` is one) is resolved like any
+reader would: from its parent directory, in every reading at once. At a
+name that aliases a link, both the link (all targets of all aliasing
+links, up to 40 links deep, Linux's ELOOP limit) and the real directory a
+case-sensitive checkout may hold under that name are followed. A target
+holding a `\` is read twice, split at `/` only and split at `/` and `\`,
+as a Windows checkout reads it. Every link position the resolutions pass
+and every path they end on are protected, and a change at, above or
+beneath a protected path takes the link's class: `Forbidden`,
+`TestConfigChanged` for a test runner's configuration, and for a test path
+the test-file rules of D7 (markers with the key form, `TestsRemoved`,
+`DeletedTestFile`), whatever the reached file's name. So editing
 `config/npmrc` behind a base link `.npmrc -> config/npmrc` is a
 dependency change (review round 1 of PR #70: npm reads the registry
 through the link). Outward and absolute targets protect nothing, because
 nothing in the patch is there. A resolution that needs more than 256
 states (a state is one resolution in progress; each alias of a followed
-link adds one) gives up and protects every path, which refuses the whole
-patch. A natural chain needs one state per link it follows, at most 41,
+link and each reading adds one) gives up and protects every path, which
+refuses the whole patch. A natural chain needs one state per link it
+follows, at most 41,
 so the cap is reached only by trees built to branch, and it bounds the
 work to 256 walks of at most 4,095 bytes each.
 
@@ -286,7 +302,7 @@ and unchained. Base links the patch does not touch are not judged, except
 as protectors of what they point to. The link tree is a flat trie keyed by
 node and alias key, so a deep path costs no recursion and each step is one
 lookup: 24 links with 4,095-byte targets past 25 base links 2,047
-components deep, plus a file 50,000 directories deep, take about 1 s in a
+components deep, plus a file 50,000 directories deep, take under 1 s in a
 debug build.
 
 ### D7. Disabled tests, JS/TS in v1
@@ -331,24 +347,6 @@ because JS allows escapes in identifiers.
   not text cannot be counted, so a base or after side that is not text
   counts as a removal. Commenting a test out counts as removing it.
 
-**Counting under ambiguity: the base's count is an upper bound and the
-after side's a lower bound.** Whatever the scanner cannot decide must
-make the base count more and the after side less, so an ambiguity can
-only refuse. A small lexer tracks strings, template literals (with
-`${...}` code), regular expressions and comments. It knows one ambiguity,
-`/` after `)` or `}`, which is a division (`(a) / b`) or starts a regular
-expression (`if (x) /re/`), and runs once with each reading. The base
-counts every declaration that not both readings put in a comment, strings
-included, with the wider call forms (`it!(`, `it?.(`); the after side
-counts a declaration only when both readings put it in code, and reads
-the HTML-like comments of script code, `<!--` and `-->`, as comments
-anywhere in code, which the base ignores. Review round 1 of PR #70 found
-the three skews this closes: a `/*` in a base string (`'/api/*'`) hid
-every later base test, a test inside an after string offset a deleted
-one, and a `-->` line comment hid a test without lowering the count.
-The first version masked every comment opener, a string's included, on
-both sides; it now masks only what the lexer reads as a comment, so an
-edit next to a glob string such as `'**/*.ts'` passes.
 - **`DeletedTestFile`**: a test file whose after side is absent or not a
   regular file. Moving a test file (a delete plus an add) is refused.
 - **`TestConfigChanged`**: any change to `jest.config.*`,
@@ -358,16 +356,44 @@ edit next to a glob string such as `'**/*.ts'` passes.
   `'test':` or `['test']:`, or the shorthand `{ test }`), where Vitest
   reads its options when there is no `vitest.config`.
 
+**Counting under ambiguity: the base's declaration count is an upper
+bound and the after side's a lower bound** (markers run in mirror image,
+above). Whatever the scanner cannot decide must make the base count more
+and the after side less, so an ambiguity can only refuse. A small lexer
+reads the raw text, before any escape is decoded, by the JS rules for
+strings, template literals (with `${...}` code), regular expressions and
+comments: a `\` escapes the next code point inside a literal, CR LF
+included as one line continuation, and U+2028 and U+2029 do not end a
+string. Declarations and markers are found in the decoded text and mapped
+back to raw offsets. The lexer knows one ambiguity, `/` after a word, `)`
+or `}`, which divides (`a / b`) or starts a regular expression
+(`return /re/`, `if (x) /re/`); it runs once with each reading, so no
+keyword list is needed. The base counts every declaration that not both
+readings put in a comment, strings included, with the wider call forms
+(`it!(`, `it?.(`); the after side counts a declaration only when both
+readings put it in code, and reads the HTML-like comments of script code,
+`<!--` and `-->`, as comments anywhere in code, which the base ignores.
+Reviews of PR #70 found the skews this closes: a `/*` in a base string
+(`'/api/*'`) hid every later base test; a test inside an after string
+offset a deleted one, also through an escaped quote (`\u0027`, `\x27`,
+`\u0060` decoded before lexing), a line continuation over CR LF, U+2028
+inside a string, and a regular expression after a keyword missing from
+the old list; and a `-->` line comment hid a test without lowering the
+count. The first version masked every comment opener, a string's
+included, on both sides; the lexer masks only what it reads as a
+comment, so an edit next to a glob string such as `'**/*.ts'` passes.
+
 **Layering.** This is a lexical first layer that refuses too much rather
 than too little, like the token scan of ADR-001. The authoritative check is
 dynamic and belongs to #17: a test that was green on the base and is
 skipped, todo or missing after the fix must fail the "previously green"
 check. Residuals: computed names (`it['sk' + 'ip']`), destructuring
 (`const { skip } = test`), runtime configuration through environment
-variables, a lexer misread outside the one ambiguity it knows (the one
-place a base marker in a comment could still count as code, and an after
-declaration in a string could still count; #17's dynamic check is the
-backstop for both), and every ecosystem other than JS/TS (Python and the in-source tests of `.vue` and `.svelte` files
+variables, JSX, which the lexer does not model and reads as code, so a
+test written as JSX text in a `.jsx` or `.tsx` file still counts on the
+after side (telling JSX from a TypeScript generic or a comparison needs a
+parser; #17's dynamic check is the backstop), and every ecosystem other
+than JS/TS (Python and the in-source tests of `.vue` and `.svelte` files
 are #69). The cost of the bounds is over-refusal of an edit to a test file
 whose base holds a declaration in a string or template (the base counts
 it, the after side does not) or a marker in a comment or string (the
