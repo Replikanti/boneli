@@ -814,11 +814,11 @@ fn io_write() {
     // with compress=zstd, the dev host's) would write zeros as a few
     // hundred KiB and never reach the limit (measured).
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-    for word in chunk.chunks_exact_mut(8) {
+    for word in chunk.as_chunks_mut::<8>().0 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        word.copy_from_slice(&x.to_ne_bytes());
+        *word = x.to_ne_bytes();
     }
     let start = std::time::Instant::now();
     let mut written = 0;

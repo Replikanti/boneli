@@ -634,17 +634,16 @@ impl Writer {
 
     /// A member of an inline table, dotted in the dotted layout.
     fn inline_member(&mut self, path: &mut Vec<String>, v: &Value, first: &mut bool) {
-        if self.style.layout == Layout::Dotted {
-            if let Value::Table(t) = v {
-                if !t.is_empty() {
-                    for (k, item) in t {
-                        path.push(k.to_owned());
-                        self.inline_member(path, item, first);
-                        path.pop();
-                    }
-                    return;
-                }
+        if self.style.layout == Layout::Dotted
+            && let Value::Table(t) = v
+            && !t.is_empty()
+        {
+            for (k, item) in t {
+                path.push(k.to_owned());
+                self.inline_member(path, item, first);
+                path.pop();
             }
+            return;
         }
         self.out.push_str(if *first { " " } else { ", " });
         *first = false;
@@ -657,15 +656,14 @@ impl Writer {
     fn member(&mut self, prefix: &[String], key: &str, v: &Value) {
         let mut path = prefix.to_vec();
         path.push(key.to_owned());
-        if self.style.layout != Layout::Inline {
-            if let Value::Table(t) = v {
-                if !t.is_empty() {
-                    for (k, item) in t {
-                        self.member(&path, k, item);
-                    }
-                    return;
-                }
+        if self.style.layout != Layout::Inline
+            && let Value::Table(t) = v
+            && !t.is_empty()
+        {
+            for (k, item) in t {
+                self.member(&path, k, item);
             }
+            return;
         }
         self.path(&path);
         self.out.push_str(" = ");

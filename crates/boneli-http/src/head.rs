@@ -317,10 +317,10 @@ pub(crate) fn parse_request(bytes: &[u8], limits: &Limits) -> Result<ParsedReque
     if method.is_connect() && headers.has_any(&["content-length", "transfer-encoding"]) {
         return Err(Error::Malformed("CONNECT with body framing"));
     }
-    if let Framing::Length(n) = framing {
-        if n > limits.max_body_bytes() {
-            return Err(Error::BodyTooLarge);
-        }
+    if let Framing::Length(n) = framing
+        && n > limits.max_body_bytes()
+    {
+        return Err(Error::BodyTooLarge);
     }
     let mut expect_continue = false;
     for value in headers.get_all("expect") {

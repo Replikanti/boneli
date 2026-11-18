@@ -392,9 +392,37 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ADR-011: the TOML subset, the encoding and table definition rules, the
   limits with their memory measurements (peak at most about 65 times the
   input), and the depth ceiling with its stack measurements.
+- `boneli-store-fs` (ADR-012): `FsStore`, the `EventStore` and `Evidence`
+  adapter on one private root. A run's log is `runs/<sha256 of the id>.log`,
+  newline-delimited JSON through `boneli-json`: a versioned header with the
+  run id, then one line per accepted event, each synced before `append`
+  returns. Decoding is strict and requires the store's own encoding of
+  every line; an unacknowledged tail after the last line end is ignored by
+  `load` and truncated by `append`, anything else malformed fails closed
+  without touching the file. Lines are limited to 8 MiB, depth 3 and
+  65,536 values. Blobs are `evidence/sha256/<hex>`, referenced as
+  `sha256:<hex>`; `get` reads only regular files and re-hashes the bytes
+  it returns, so content changed on disk is `Corrupted`; a `put` of bytes
+  already stored syncs that blob and its directory before it returns. The
+  root follows `boneli-oci`'s rules (copied; extraction is #66) and is
+  held with an exclusive lock, so `open` sweeps temporary files. Passes the
+  `EventStore` and `Evidence` contract suites; the domain corpus and
+  `DebugTicket` on the file store replay after a reopen.
+- ADR-012: the log format and its limits, durability, the unacknowledged
+  tail, evidence I/O, the root rules and the lock.
 
 ### Changed
 
+- The workspace `rust-version` is 1.89 (was 1.87), for `File::try_lock`,
+  the lock of `boneli-store-fs` (ADR-012, D1). Clippy's let-chain and
+  `as_chunks` suggestions apply from that MSRV: 14 nested `if let`s and 2
+  `chunks_exact` loops across the workspace are rewritten, with no change
+  in behavior.
+- `OciImageStore::open` and `FsStore::open` refuse a root with a `.` or
+  `..` component before they check or create anything (ADR-012, D1).
+  Before, `<d>/missing/../gw/store` had its existing ancestors checked on
+  the text (`<d>`) while creating it resolved `..`, so it made directories
+  under an ancestor that fails the root rules before `open` refused it.
 - `sha2` leaves the dependency allowlist and docs/ARCHITECTURE.md:
   content addressing uses `boneli_https::Sha256` (ADR-009, D6). `adler2`,
   which `miniz_oxide` pulls, joins it (ADR-009, D5).

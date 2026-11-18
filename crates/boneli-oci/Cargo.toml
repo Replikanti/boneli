@@ -38,7 +38,8 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # No `hash` feature (it would pull `twox-hash`; the diff_id covers every
 # decoded byte), so it pulls nothing. At least 0.9.1, which fixes
 # RUSTSEC-2026-0344 (one block could expand to gigabytes); 0.9 declares
-# rust-version 1.87, the workspace's MSRV since ADR-009.
+# rust-version 1.87, which the workspace MSRV covers (1.87 since ADR-009,
+# 1.89 since ADR-012).
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]

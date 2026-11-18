@@ -226,10 +226,10 @@ pub fn cgroup_parent() -> &'static crate::Parent {
             .find_map(|l| l.strip_prefix("0::"))
             .expect("a cgroup v2 line");
         let own = std::path::Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/'));
-        if own.file_name().is_some_and(|n| n == "leaf") {
-            if let Ok(parent) = crate::Parent::open(own.parent().expect("leaf/ has a parent")) {
-                return parent;
-            }
+        if own.file_name().is_some_and(|n| n == "leaf")
+            && let Ok(parent) = crate::Parent::open(own.parent().expect("leaf/ has a parent"))
+        {
+            return parent;
         }
         crate::Parent::vacate_and_delegate(&own)
             .unwrap_or_else(|e| panic!("delegate {}: {e}", own.display()))

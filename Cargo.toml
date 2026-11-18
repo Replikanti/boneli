@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/Replikanti/boneli"
 publish = false
@@ -37,4 +37,5 @@ boneli-https = { path = "crates/boneli-https" }
 boneli-json = { path = "crates/boneli-json" }
 boneli-toml = { path = "crates/boneli-toml" }
 boneli-oci = { path = "crates/boneli-oci" }
+boneli-store-fs = { path = "crates/boneli-store-fs" }
 boneli-sys = { path = "crates/boneli-sys" }

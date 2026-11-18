@@ -95,10 +95,10 @@ impl From<io::Error> for Error {
     /// timeouts and early ends of the stream to their own variants.
     fn from(e: io::Error) -> Self {
         if e.get_ref().is_some_and(|inner| inner.is::<Error>()) {
-            if let Some(inner) = e.into_inner() {
-                if let Ok(ours) = inner.downcast::<Error>() {
-                    return *ours;
-                }
+            if let Some(inner) = e.into_inner()
+                && let Ok(ours) = inner.downcast::<Error>()
+            {
+                return *ours;
             }
             return Error::Malformed("lost error");
         }

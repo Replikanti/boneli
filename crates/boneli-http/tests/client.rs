@@ -45,10 +45,10 @@ impl Write for Replies {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.current.is_empty() {
-            if let Some(next) = self.queue.pop_front() {
-                self.current = pieces(&next, 7);
-            }
+        if self.current.is_empty()
+            && let Some(next) = self.queue.pop_front()
+        {
+            self.current = pieces(&next, 7);
         }
         Ok(())
     }
