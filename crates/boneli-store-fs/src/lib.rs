@@ -224,6 +224,9 @@ mod tests {
                 .join(format!("boneli-store-fs-unit-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
+            // Resolved, because `open` refuses a root with dot components
+            // (ADR-012 D1) and `TMPDIR` may hold some.
+            let dir = dir.canonicalize().expect("resolve the scratch dir");
             let store = FsStore::open(&dir.join("store")).expect("open");
             Scratch {
                 store: Some(store),

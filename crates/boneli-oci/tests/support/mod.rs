@@ -18,13 +18,17 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    /// Creates `<CARGO_TARGET_TMPDIR>/<tag>-<pid>-<counter>`.
+    /// Creates `<CARGO_TARGET_TMPDIR>/<tag>-<pid>-<counter>` and returns it
+    /// resolved: a relative `CARGO_TARGET_DIR` such as `../target` puts
+    /// `..` into `CARGO_TARGET_TMPDIR`, and `open` refuses a root with dot
+    /// components (ADR-012 D1).
     pub fn new(tag: &str) -> TempDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("oci-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create the test's temp dir");
+        let path = path.canonicalize().expect("resolve the test's temp dir");
         TempDir { path }
     }
 

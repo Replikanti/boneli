@@ -289,8 +289,13 @@ justified):
   part only: `dedup_put_syncs_the_existing_blob` makes the directory
   unreadable so its `fsync` cannot open it, which catches a missing
   directory sync; a missing `sync_data` of the blob is not caught by
-  any test, because neither power loss nor a failing `fdatasync` on a
-  readable regular file can be produced here.
+  any test today. Power loss cannot be produced in a test, and a
+  failing `fdatasync` on a readable regular file needs fault injection
+  the workspace does not have yet: an unprivileged per-thread seccomp
+  filter that returns `EIO` for `fdatasync` produces it (shown outside
+  the workspace in the review of #67), and a test that pins the blob
+  sync with it becomes possible once `boneli-sys` can install seccomp
+  filters (#6).
 - Why every acknowledgement is durable: `DebugTicket` logs a reference
   right after `put`, so a blob that is not yet durable could leave a
   durable event pointing at nothing; a lost `PullRequestOpened` or
