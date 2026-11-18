@@ -5,12 +5,12 @@
 //! before it opens it, reads at most one byte more than the file's size,
 //! and hashes the buffer it returns, so a blob changed on disk after
 //! verification is `Corrupted` and never reaches the forge (ADR-004, D9).
-//! `put` returns the reference when the existing blob verifies and
-//! otherwise writes the bytes through a temporary name, syncs them and
-//! renames them onto the name, which also repairs a tampered blob: the
-//! new bytes hash to the name.
+//! `put` returns the reference when the existing blob verifies, after it
+//! syncs that blob and its directory, and otherwise writes the bytes
+//! through a temporary name, syncs them and renames them onto the name,
+//! which also repairs a tampered blob: the new bytes hash to the name.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -42,8 +42,8 @@ fn blob_dir(store: &FsStore) -> PathBuf {
     store.root.join(EVIDENCE).join(SHA256)
 }
 
-/// The verified bytes of the blob named `hex` (D6).
-fn read_blob(store: &FsStore, hex_digest: &str) -> Result<Vec<u8>, EvidenceError> {
+/// The blob named `hex`, open for reading, and its verified bytes (D6).
+fn read_blob(store: &FsStore, hex_digest: &str) -> Result<(File, Vec<u8>), EvidenceError> {
     let path = blob_dir(store).join(hex_digest);
     let label = format!("{EVIDENCE}/{SHA256}/{hex_digest}");
     let (file, meta) = match open_regular(&path, OpenOptions::new().read(true)) {
@@ -54,7 +54,8 @@ fn read_blob(store: &FsStore, hex_digest: &str) -> Result<Vec<u8>, EvidenceError
     };
     let len = meta.len();
     let mut content = Vec::new();
-    file.take(len.saturating_add(1))
+    (&file)
+        .take(len.saturating_add(1))
         .read_to_end(&mut content)
         .map_err(|e| unavailable(format!("{label}: {e}")))?;
     if u64::try_from(content.len()).ok() != Some(len) {
@@ -63,24 +64,33 @@ fn read_blob(store: &FsStore, hex_digest: &str) -> Result<Vec<u8>, EvidenceError
     if hex(&Sha256::digest(&content)) != hex_digest {
         return Err(EvidenceError::Corrupted);
     }
-    Ok(content)
+    Ok((file, content))
 }
 
 pub(crate) fn get(store: &FsStore, reference: &EvidenceRef) -> Result<Vec<u8>, EvidenceError> {
     let hex_digest = digest_of(reference.as_str()).ok_or(EvidenceError::InvalidReference)?;
-    read_blob(store, hex_digest)
+    read_blob(store, hex_digest).map(|(_, content)| content)
 }
 
 pub(crate) fn put(store: &FsStore, content: &[u8]) -> Result<EvidenceRef, EvidenceError> {
     let hex_digest = hex(&Sha256::digest(content));
     let reference = EvidenceRef::parse(&format!("{PREFIX}{hex_digest}"))
         .map_err(|e| unavailable(format!("reference: {e}")))?;
+    let dir = blob_dir(store);
     match read_blob(store, &hex_digest) {
-        Ok(_) => return Ok(reference),
+        // The writer that renamed this blob into place may have died
+        // before it synced the directory, so the blob is synced again
+        // before its reference is acknowledged (D4).
+        Ok((file, _)) => {
+            let label = format!("{EVIDENCE}/{SHA256}/{hex_digest}");
+            file.sync_data()
+                .map_err(|e| unavailable(format!("{label}: sync: {e}")))?;
+            sync_dir(&dir).map_err(|e| unavailable(format!("{label}: sync the directory: {e}")))?;
+            return Ok(reference);
+        }
         Err(EvidenceError::NotFound | EvidenceError::Corrupted) => {}
         Err(e) => return Err(e),
     }
-    let dir = blob_dir(store);
     let temp = store.temp_path(&dir);
     let result = write_blob(&temp, &dir.join(&hex_digest), &dir, &hex_digest, content);
     if result.is_err() {

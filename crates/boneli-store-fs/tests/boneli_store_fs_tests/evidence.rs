@@ -1,6 +1,6 @@
 //! The evidence store (ADR-012, D2, D4 and D6).
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -70,6 +70,36 @@ fn put_repairs_a_tampered_blob() {
         .filter(|n| n.starts_with('.'))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A `put` of bytes already stored syncs the blob and `evidence/sha256/`
+/// before it returns the reference, so an earlier writer that died between
+/// its rename and its directory sync cannot leave an acknowledged reference
+/// to a blob that is not durable (ADR-012, D4). The directory is made
+/// unreadable (`0o300`): the blob still opens and verifies through it, but
+/// the directory cannot be opened for its `fsync`, so the dedup `put` must
+/// fail. Root reads any directory, so the check does not apply there.
+#[test]
+fn dedup_put_syncs_the_existing_blob() {
+    let fresh = Fresh::new("dedup-sync");
+    let reference = fresh.put(b"stored once").expect("put");
+    if std::fs::metadata("/proc/self").expect("self").uid() == 0 {
+        println!("skipped: root reads an unreadable directory");
+        return;
+    }
+    let dir = fresh.store.root().join("evidence").join("sha256");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    let dedup = fresh.put(b"stored once");
+    let get = fresh.get(&reference);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    match dedup {
+        Err(EvidenceError::Unavailable { detail }) => {
+            assert!(detail.contains("sync the directory"), "{detail}")
+        }
+        other => panic!("a dedup put without a directory sync gave {other:?}"),
+    }
+    assert_eq!(get.as_deref(), Ok(&b"stored once"[..]), "the blob verifies");
+    assert_eq!(fresh.put(b"stored once"), Ok(reference));
 }
 
 /// A blob replaced by a symlink (to the genuine bytes or to `/dev/zero`),
