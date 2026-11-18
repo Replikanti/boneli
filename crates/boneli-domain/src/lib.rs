@@ -16,6 +16,9 @@
 //! returns the next run and its [`RunCommand`]s. [`scenarios`] is the event
 //! corpus the unit tests and the two-process replay gate fold.
 //!
+//! [`patch_policy`] judges a fix diff before it is verified: size,
+//! forbidden paths, binaries, symlinks and disabled tests (ADR-013).
+//!
 //! # Doctests in this crate cannot use `unsafe` (ADR-001)
 //!
 //! The workspace lints do not reach doctests, so the crate root forbids
@@ -36,6 +39,11 @@ pub mod command;
 pub mod error;
 pub mod event;
 pub mod gate;
+pub mod line_diff;
+pub mod patch;
+pub mod patch_corpus;
+pub mod patch_js;
+pub mod patch_path;
 pub mod run;
 pub mod scenarios;
 pub mod values;
@@ -48,5 +56,11 @@ pub use gate::{
     CheckStatus, CitationProblem, CitationStatus, FixCheck, FixChecks, GateFailure, GateOutcome,
     TestStatus,
 };
+pub use patch::{
+    BaseLink, Change, ChangeProblem, Entry, EntryKind, LinkProblem, NotText, Patch, PatchLimits,
+    PatchVerdict, PatchViolation, TestDisabling, patch_policy,
+};
+pub use patch_js::Marker;
+pub use patch_path::ForbiddenClass;
 pub use run::{AgentOutputProblem, Outcome, Run, Stage};
 pub use values::{Citation, CommitSha, EvidenceRef, RunId, Ticket, TicketField, TicketSource};
