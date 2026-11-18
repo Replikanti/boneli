@@ -412,14 +412,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tail, evidence I/O, the root rules and the lock.
 - The patch policy (ADR-013): `boneli_domain::patch_policy` judges a fix
   diff, given as the full before and after entries of every changed path
-  and the base tree's symlinks, against size limits (25 files and 1,000
-  lines by default, Myers' line edit distance cut off at the budget),
+  and the base tree's symlinks, against size limits (25 files, 1,000
+  lines and 42,000 bytes by default, Myers' line edit distance cut off at
+  the budget, memory independent of the file size),
   forbidden paths matched on folded components (CI, container builds,
   CODEOWNERS, git configuration, dependency files, repository metadata),
   gitlinks, binaries and bidi controls, symlinks that leave the repository,
-  pass through a link or land on a forbidden path, and disabled JS/TS
-  tests (markers, deleted or emptied test files, test runner
-  configuration). Not yet wired into the run (#68).
+  pass through a link, land on or above a forbidden path, edits behind a
+  link at a forbidden path, and disabled JS/TS tests (markers, deleted or
+  emptied test files counted with bounds, test runner configuration). Not
+  yet wired into the run (#68).
 - `boneli_domain::patch_corpus`: named patches that reach every violation
   and reason variant; the replay gate renders their verdicts in two
   processes and its own.

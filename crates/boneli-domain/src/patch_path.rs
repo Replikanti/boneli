@@ -69,6 +69,21 @@ pub fn fold_component(component: &str) -> String {
     out
 }
 
+/// The key under which a component aliases another on some file system,
+/// for links (ADR-013, D6): the folded component when it is ASCII, and one
+/// shared key for every component that is not. The domain has no Unicode
+/// case folding or normalization tables, so a non-ASCII component is taken
+/// to alias every other non-ASCII component (`Ä` and `ä`, `é` and `e` with
+/// U+0301), which refuses too much rather than too little.
+pub fn alias_key(component: &str) -> String {
+    let folded = fold_component(component);
+    if folded.is_ascii() {
+        folded
+    } else {
+        String::from("\u{FFFD}")
+    }
+}
+
 const CI_DIRECTORIES: [&str; 6] = [
     ".github",
     ".gitlab",
@@ -249,6 +264,16 @@ mod tests {
             (".g\u{131}thub", ".github"),
             (".G\u{130}THUB", ".github"),
             ("Docker\u{FB01}le", "dockerfile"),
+            // Every full case folding of D4, one entry each (review round 1).
+            ("\u{DF}", "ss"),
+            ("\u{1E9E}", "ss"),
+            ("\u{1DF95}", "ss"),
+            ("\u{FB00}", "ff"),
+            ("\u{FB02}", "fl"),
+            ("\u{FB03}", "ffi"),
+            ("\u{FB04}", "ffl"),
+            ("\u{FB05}", "st"),
+            ("\u{FB06}", "st"),
             ("Dockerfile:x", "dockerfile"),
             (".git::$INDEX_ALLOCATION", ".git"),
             (":x", ""),
@@ -258,6 +283,15 @@ mod tests {
         ] {
             assert_eq!(fold_component(raw), folded, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn alias_keys() {
+        assert_eq!(alias_key("Docs."), "docs");
+        assert_eq!(alias_key("\u{C4}"), alias_key("\u{E4}"));
+        assert_eq!(alias_key("caf\u{E9}"), alias_key("cafe\u{301}"));
+        assert_eq!(alias_key("\u{212A}"), "k");
+        assert_ne!(alias_key("a"), alias_key("\u{E4}"));
     }
 
     #[test]

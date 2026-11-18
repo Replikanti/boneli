@@ -95,6 +95,7 @@ pub fn cases() -> Vec<PatchCase> {
     tight.limits = PatchLimits {
         max_changed_files: NonZeroU32::MIN,
         max_changed_lines: NonZeroU32::MIN,
+        max_changed_bytes: NonZeroU32::MIN,
     };
     vec![
         case(
@@ -183,6 +184,25 @@ pub fn cases() -> Vec<PatchCase> {
             "too-many-lines",
             vec![add("a.ts", file(&lines(1001)))],
             Vec::new(),
+        ),
+        case(
+            "too-many-bytes",
+            vec![add("dist/app.js", file(&"x".repeat(42_001)))],
+            Vec::new(),
+        ),
+        case(
+            "links-to-protected-paths",
+            vec![
+                change("config/npmrc", file("registry=a\n"), file("registry=b\n")),
+                add("x", link(".")),
+                add("y", link("apps/web")),
+                add("\u{E4}/workflows/ci.yml", file("x\n")),
+            ],
+            vec![
+                base_link(".npmrc", "config/npmrc"),
+                base_link("apps/web/package.json", "../../package.base.json"),
+                base_link("\u{C4}", ".github"),
+            ],
         ),
         case(
             "forbidden-classes",
@@ -360,6 +380,19 @@ mod tests {
                 reject(vec![PatchViolation::TooManyLines { limit: 1000 }]),
             ),
             (
+                "too-many-bytes",
+                reject(vec![PatchViolation::TooManyBytes { limit: 42_000 }]),
+            ),
+            (
+                "links-to-protected-paths",
+                reject(vec![
+                    forbidden(0, Dependencies),
+                    link(1, LinkProblem::Encloses(RepositoryMetadata)),
+                    link(2, LinkProblem::Encloses(Dependencies)),
+                    link(3, LinkProblem::ThroughLink),
+                ]),
+            ),
+            (
                 "forbidden-classes",
                 reject(vec![
                     forbidden(0, RepositoryMetadata),
@@ -484,6 +517,7 @@ mod tests {
                 vec!["base-link-malformed", problem(p)]
             }
             PatchViolation::TooManyLines { .. } => vec!["too-many-lines"],
+            PatchViolation::TooManyBytes { .. } => vec!["too-many-bytes"],
             PatchViolation::Forbidden { class: c, .. } => vec!["forbidden", class(c)],
             PatchViolation::Gitlink { .. } => vec!["gitlink"],
             PatchViolation::NotText { reason, .. } => vec![
@@ -504,6 +538,7 @@ mod tests {
                     LinkProblem::Escapes => "escapes",
                     LinkProblem::ThroughLink => "through-link",
                     LinkProblem::Into(_) => "into",
+                    LinkProblem::Encloses(_) => "encloses",
                 },
             ],
             PatchViolation::DisablesTests { reason, .. } => vec![
@@ -518,7 +553,7 @@ mod tests {
         }
     }
 
-    const EVERY_LABEL: [&str; 35] = [
+    const EVERY_LABEL: [&str; 37] = [
         "too-many-files",
         "empty",
         "malformed",
@@ -530,6 +565,7 @@ mod tests {
         "nul-in-link-target",
         "base-link-mismatch",
         "too-many-lines",
+        "too-many-bytes",
         "forbidden",
         "repository-metadata",
         "ci",
@@ -550,6 +586,7 @@ mod tests {
         "escapes",
         "through-link",
         "into",
+        "encloses",
         "disables-tests",
         "deleted-test-file",
         "tests-removed",

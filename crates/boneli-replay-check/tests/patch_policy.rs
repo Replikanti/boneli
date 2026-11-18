@@ -36,12 +36,20 @@ fn change(path: &str, before: Option<Entry>, after: Option<Entry>) -> Change {
 }
 
 fn judge(changes: Vec<Change>, base_links: Vec<BaseLink>) -> (PatchVerdict, Duration) {
+    judge_within(changes, base_links, PatchLimits::DEFAULT)
+}
+
+fn judge_within(
+    changes: Vec<Change>,
+    base_links: Vec<BaseLink>,
+    limits: PatchLimits,
+) -> (PatchVerdict, Duration) {
     let patch = Patch {
         changes,
         base_links,
     };
     let start = Instant::now();
-    let verdict = patch_policy(&patch, &PatchLimits::DEFAULT);
+    let verdict = patch_policy(&patch, &limits);
     (verdict, start.elapsed())
 }
 
@@ -84,9 +92,10 @@ fn line_distance_is_linear_in_size_times_budget() {
     }
 }
 
-/// 25 links whose 4,095-byte targets walk 2,047 components deep along the
-/// shared prefix of 25 base links, plus a file 50,000 directories deep:
-/// the walk is one trie step per component.
+/// 24 links plus the deep file (25 changes, the file limit): the links'
+/// 4,095-byte targets walk 2,047 components deep along the shared prefix
+/// of 25 base links, and the file is 50,000 directories deep. The walk is
+/// one trie step per component.
 #[test]
 fn link_walk_is_bounded() {
     let prefix = "a/".repeat(2047);
@@ -110,7 +119,12 @@ fn link_walk_is_bounded() {
             entry(EntryKind::Symlink, target.as_bytes()),
         )
     }));
-    let (verdict, took) = judge(changes, base_links);
+    // The targets add 98 KB; the byte budget is not what this measures.
+    let limits = PatchLimits {
+        max_changed_bytes: NonZeroU32::MAX,
+        ..PatchLimits::DEFAULT
+    };
+    let (verdict, took) = judge_within(changes, base_links, limits);
     assert_eq!(
         verdict,
         PatchVerdict::Pass {
@@ -363,11 +377,13 @@ fn random_patch(rng: &mut Rng) -> (Patch, PatchLimits) {
         2 => changes.reverse(),
         _ => {}
     }
-    let limit =
-        |rng: &mut Rng| NonZeroU32::new([1, 2, 5, 25, 1000][rng.below(5)]).expect("non-zero");
+    let limit = |rng: &mut Rng| {
+        NonZeroU32::new([1, 2, 5, 25, 1000, 42_000][rng.below(6)]).expect("non-zero")
+    };
     let limits = PatchLimits {
         max_changed_files: limit(rng),
         max_changed_lines: limit(rng),
+        max_changed_bytes: limit(rng),
     };
     (
         Patch {

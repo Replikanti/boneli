@@ -16,10 +16,10 @@ use alloc::vec::Vec;
 use core::num::NonZeroU32;
 
 use crate::gate::{CitationProblem, path_problem};
-use crate::line_diff::{distance, lines};
-use crate::patch_js::{Marker, active_declarations, has_test_key, marker_counts};
+use crate::line_diff::{Cost, Over, cost, line_count};
+use crate::patch_js::{Marker, after_declarations, base_declarations, has_test_key, marker_counts};
 use crate::patch_path::{
-    ForbiddenClass, fold_component, forbidden_class, is_js_ts, is_test_config, is_test_file,
+    ForbiddenClass, alias_key, forbidden_class, is_js_ts, is_test_config, is_test_file,
 };
 
 /// What a git tree entry is: git's modes 100644, 100755, 120000 and 160000
@@ -83,14 +83,18 @@ pub struct PatchLimits {
     pub max_changed_files: NonZeroU32,
     /// At most this many inserted plus deleted lines.
     pub max_changed_lines: NonZeroU32,
+    /// At most this many bytes in those lines.
+    pub max_changed_bytes: NonZeroU32,
 }
 
 impl PatchLimits {
-    /// 25 files and 1,000 lines: the 97th percentile of human bug fixes in
-    /// the first stack's repositories (ADR-013, D3 and D8).
+    /// 25 files, 1,000 lines and 42,000 bytes: the 97th percentile of
+    /// human bug fixes in the first stack's repositories, rounded up
+    /// (ADR-013, D3 and D8).
     pub const DEFAULT: PatchLimits = PatchLimits {
         max_changed_files: NonZeroU32::MIN.saturating_add(24),
         max_changed_lines: NonZeroU32::MIN.saturating_add(999),
+        max_changed_bytes: NonZeroU32::MIN.saturating_add(41_999),
     };
 }
 
@@ -144,6 +148,9 @@ pub enum LinkProblem {
     ThroughLink,
     /// The target resolves into a forbidden path.
     Into(ForbiddenClass),
+    /// The target resolves to the root, which holds `.git`, or to a
+    /// directory above a forbidden path the patch or its links name.
+    Encloses(ForbiddenClass),
 }
 
 /// Why a change disables tests (ADR-013, D7).
@@ -191,7 +198,13 @@ pub enum PatchViolation {
         /// The limit.
         limit: u32,
     },
-    /// The change touches a forbidden path.
+    /// More bytes in the changed lines than the limit.
+    TooManyBytes {
+        /// The limit.
+        limit: u32,
+    },
+    /// The change touches a forbidden path, or a path a link at a
+    /// forbidden path reaches.
     Forbidden {
         /// The change.
         index: usize,
@@ -248,7 +261,8 @@ pub enum PatchVerdict {
 /// 3. Validation of the changes, then of the base links; every problem is
 ///    reported and nothing else runs, so an inconsistent patch is never
 ///    judged.
-/// 4. Lines: `TooManyLines`, first in the list.
+/// 4. Size: `TooManyLines` or `TooManyBytes`, whichever budget the count
+///    crosses first, first in the list.
 /// 5. Per change, in index order, each family once: `Forbidden`,
 ///    `Gitlink`, `NotText`, `Link`, then `DisablesTests` for each marker
 ///    in [`Marker`] order, `DeletedTestFile`, `TestsRemoved` and
@@ -278,13 +292,21 @@ pub fn patch_policy(patch: &Patch, limits: &PatchLimits) -> PatchVerdict {
     }
     let mut violations = Vec::new();
     let line_limit = limits.max_changed_lines.get();
-    let lines = changed_lines(&patch.changes, line_limit);
-    if lines.is_none() {
-        violations.push(PatchViolation::TooManyLines { limit: line_limit });
-    }
-    let tree = LinkTree::after(patch);
+    let byte_limit = limits.max_changed_bytes.get();
+    let lines = match changed_size(&patch.changes, line_limit, byte_limit) {
+        Ok(lines) => Some(lines),
+        Err(Over::Lines) => {
+            violations.push(PatchViolation::TooManyLines { limit: line_limit });
+            None
+        }
+        Err(Over::Bytes) => {
+            violations.push(PatchViolation::TooManyBytes { limit: byte_limit });
+            None
+        }
+    };
+    let context = Context::new(patch);
     for (index, change) in patch.changes.iter().enumerate() {
-        judge_change(index, change, &tree, &mut violations);
+        judge_change(index, change, &context, &mut violations);
     }
     match lines {
         Some(lines) if violations.is_empty() => PatchVerdict::Pass {
@@ -392,7 +414,7 @@ fn base_link_mismatch(patch: &Patch, change: &Change) -> bool {
     }
 }
 
-/// What a side contributes to the line count.
+/// What a side contributes to the size.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
     Absent,
@@ -410,47 +432,57 @@ fn text(entry: Option<&Entry>) -> Option<&str> {
     core::str::from_utf8(&entry.data).ok()
 }
 
-/// A side's lines (ADR-013, D3): a text file's lines, one line for a
-/// symlink or a gitlink, none for a binary or an absent side.
-fn side_lines(entry: Option<&Entry>) -> (Vec<&[u8]>, Category) {
+/// What a side contributes (ADR-013, D3): a text file's content, a
+/// symlink's target or a gitlink's id (one line), nothing for a binary or
+/// an absent side.
+fn side(entry: Option<&Entry>) -> (&[u8], Category) {
     match entry {
-        None => (Vec::new(), Category::Absent),
+        None => (&[], Category::Absent),
         Some(e) => match e.kind {
             EntryKind::File | EntryKind::Executable => (
-                text(Some(e))
-                    .map(|t| lines(t.as_bytes()))
-                    .unwrap_or_default(),
+                text(Some(e)).map_or(&[][..], str::as_bytes),
                 Category::Regular,
             ),
-            EntryKind::Symlink => (vec![e.data.as_slice()], Category::Link),
-            EntryKind::Gitlink => (vec![e.data.as_slice()], Category::Gitlink),
+            EntryKind::Symlink => (e.data.as_slice(), Category::Link),
+            EntryKind::Gitlink => (e.data.as_slice(), Category::Gitlink),
         },
     }
 }
 
-/// A change's inserted plus deleted lines, or `None` above `max`. A type
-/// change (a file to a symlink, say) shares no lines, as git shows it as a
-/// deletion and an addition.
-fn change_cost(change: &Change, max: usize) -> Option<usize> {
-    let (before, from) = side_lines(change.before.as_ref());
-    let (after, to) = side_lines(change.after.as_ref());
+/// A change's lines and bytes, or the budget it crosses. A type change (a
+/// file to a symlink, say) shares no lines, as git shows it as a deletion
+/// and an addition.
+fn change_cost(change: &Change, max_lines: usize, max_bytes: usize) -> Result<Cost, Over> {
+    let (before, from) = side(change.before.as_ref());
+    let (after, to) = side(change.after.as_ref());
     if from == to || from == Category::Absent || to == Category::Absent {
-        distance(&before, &after, max)
+        return cost(before, after, max_lines, max_bytes);
+    }
+    let lines = line_count(before).saturating_add(line_count(after));
+    let bytes = before.len().saturating_add(after.len());
+    if lines > max_lines {
+        Err(Over::Lines)
+    } else if bytes > max_bytes {
+        Err(Over::Bytes)
     } else {
-        Some(before.len().checked_add(after.len())?).filter(|cost| *cost <= max)
+        Ok(Cost { lines, bytes })
     }
 }
 
-/// Step 4 of [`patch_policy`]: the total, or `None` once it passes the
-/// limit. Each change's search is cut off at what is left of the limit.
-fn changed_lines(changes: &[Change], limit: u32) -> Option<u32> {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut total = 0usize;
+/// Step 4 of [`patch_policy`]: the total lines, or the budget the count
+/// crosses first. Each change's search is cut off at what is left.
+fn changed_size(changes: &[Change], line_limit: u32, byte_limit: u32) -> Result<u32, Over> {
+    let max_lines = usize::try_from(line_limit).unwrap_or(usize::MAX);
+    let max_bytes = usize::try_from(byte_limit).unwrap_or(usize::MAX);
+    let (mut lines, mut bytes) = (0usize, 0usize);
     for change in changes {
-        let cost = change_cost(change, limit.checked_sub(total)?)?;
-        total = total.checked_add(cost)?;
+        let left_lines = max_lines.checked_sub(lines).ok_or(Over::Lines)?;
+        let left_bytes = max_bytes.checked_sub(bytes).ok_or(Over::Bytes)?;
+        let cost = change_cost(change, left_lines, left_bytes)?;
+        lines = lines.saturating_add(cost.lines);
+        bytes = bytes.saturating_add(cost.bytes);
     }
-    u32::try_from(total).ok()
+    u32::try_from(lines).map_err(|_| Over::Lines)
 }
 
 /// The explicit bidi formatting characters (Trojan Source, CVE-2021-42574).
@@ -478,22 +510,43 @@ fn not_text(data: &[u8]) -> Option<NotText> {
 /// ENAMETOOLONG (ADR-013, D6).
 const MAX_TARGET: usize = 4095;
 
-/// The symlinks of the tree after the fix, by folded path: the base links
+/// The most links one resolution follows, as Linux's ELOOP limit (40).
+const MAX_HOPS: usize = 40;
+
+/// The most walk states one protected link's resolution visits before the
+/// policy gives up and protects every path (ADR-013, D6).
+const MAX_STATES: usize = 256;
+
+/// The alias keys of a path's components ([`alias_key`]).
+fn keys(path: &str) -> Vec<String> {
+    path.split('/').map(alias_key).collect()
+}
+
+/// Whether one key path is a component prefix of the other, or equal.
+fn overlaps(a: &[String], b: &[String]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x == y)
+}
+
+/// The symlinks of the tree after the fix, by alias key: the base links
 /// the patch does not change plus the after-side links. A flat trie, so a
-/// deep path costs no recursion: node 0 is the root, and `children` maps a
-/// node and a folded component to the child node.
-struct LinkTree {
+/// deep path costs no recursion: node 0 is the root, `children` maps a
+/// node and an alias key to the child node, and `targets` holds the
+/// targets of the links at a node (several when names alias).
+struct LinkTree<'a> {
     children: BTreeMap<(usize, String), usize>,
-    links: Vec<bool>,
+    targets: Vec<Vec<&'a [u8]>>,
+    /// Every link, path and target.
+    links: Vec<(&'a str, &'a [u8])>,
 }
 
 const ROOT: usize = 0;
 
-impl LinkTree {
-    fn after(patch: &Patch) -> LinkTree {
+impl<'a> LinkTree<'a> {
+    fn after(patch: &'a Patch) -> LinkTree<'a> {
         let mut tree = LinkTree {
             children: BTreeMap::new(),
-            links: vec![false],
+            targets: vec![Vec::new()],
+            links: Vec::new(),
         };
         let changed = |path: &str| {
             patch
@@ -503,59 +556,230 @@ impl LinkTree {
         };
         for link in &patch.base_links {
             if !changed(&link.path) {
-                tree.insert(&link.path);
+                tree.insert(&link.path, &link.target);
             }
         }
         for change in &patch.changes {
-            if is_link(change.after.as_ref()) {
-                tree.insert(&change.path);
+            if let Some(after) = change.after.as_ref().filter(|e| is_link(Some(e))) {
+                tree.insert(&change.path, &after.data);
             }
         }
         tree
     }
 
-    fn insert(&mut self, path: &str) {
+    fn insert(&mut self, path: &'a str, target: &'a [u8]) {
         let mut node = ROOT;
         for component in path.split('/') {
-            let next = self.links.len();
+            let next = self.targets.len();
             let child = *self
                 .children
-                .entry((node, fold_component(component)))
+                .entry((node, alias_key(component)))
                 .or_insert(next);
             if child == next {
-                self.links.push(false);
+                self.targets.push(Vec::new());
             }
             node = child;
         }
-        if let Some(flag) = self.links.get_mut(node) {
-            *flag = true;
+        if let Some(targets) = self.targets.get_mut(node) {
+            targets.push(target);
         }
+        self.links.push((path, target));
     }
 
     /// The child of `node` at `component`; `None` off the trie, where no
     /// link can be.
     fn child(&self, node: Option<usize>, component: &str) -> Option<usize> {
-        self.children
-            .get(&(node?, fold_component(component)))
-            .copied()
+        self.children.get(&(node?, alias_key(component))).copied()
     }
 
-    fn is_link(&self, node: Option<usize>) -> bool {
-        node.is_some_and(|n| self.links.get(n) == Some(&true))
+    /// The targets of the links at `node`; empty where there is none.
+    fn targets(&self, node: Option<usize>) -> &[&'a [u8]] {
+        node.and_then(|n| self.targets.get(n))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// What a link at a protected path protects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    Class(ForbiddenClass),
+    TestConfig,
+}
+
+/// One resolution in progress: the directory reached, as alias keys and
+/// trie nodes, the target components still to apply (last first), and
+/// the links followed so far.
+struct State<'a> {
+    dir: Vec<String>,
+    nodes: Vec<Option<usize>>,
+    rest: Vec<&'a str>,
+    hops: usize,
+}
+
+/// Every path a reader of the link at `path` may land on or pass, as alias
+/// keys: each link position the resolution follows and the final path,
+/// with links followed (several targets when names alias) up to
+/// [`MAX_HOPS`]. `None` when the resolution needs more than [`MAX_STATES`]
+/// states; the caller then protects every path. Outward and absolute
+/// targets end a branch: nothing in the patch can be there.
+fn reach<'a>(tree: &LinkTree<'a>, path: &'a str, target: &'a [u8]) -> Option<Vec<Vec<String>>> {
+    let start_of = |text: &'a str| -> Vec<&'a str> { text.split('/').rev().collect() };
+    let parents: Vec<&str> = path.split('/').collect();
+    let mut first = State {
+        dir: Vec::new(),
+        nodes: Vec::new(),
+        rest: Vec::new(),
+        hops: 0,
+    };
+    for component in parents.iter().take(parents.len().saturating_sub(1)) {
+        let top = first.nodes.last().copied().unwrap_or(Some(ROOT));
+        first.nodes.push(tree.child(top, component));
+        first.dir.push(alias_key(component));
+    }
+    let target = core::str::from_utf8(target).ok()?;
+    if target.starts_with('/') {
+        return Some(Vec::new());
+    }
+    first.rest = start_of(target);
+    let mut work = vec![first];
+    let mut reached = Vec::new();
+    let mut states = 0usize;
+    while let Some(mut state) = work.pop() {
+        states += 1;
+        if states > MAX_STATES {
+            return None;
+        }
+        let mut outward = false;
+        while let Some(component) = state.rest.pop() {
+            match component {
+                "" | "." => continue,
+                ".." => {
+                    if state.dir.pop().is_none() {
+                        outward = true;
+                        break;
+                    }
+                    state.nodes.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            let top = state.nodes.last().copied().unwrap_or(Some(ROOT));
+            let node = tree.child(top, component);
+            state.dir.push(alias_key(component));
+            state.nodes.push(node);
+            let targets = tree.targets(node);
+            if targets.is_empty() {
+                continue;
+            }
+            reached.push(state.dir.clone());
+            if state.hops >= MAX_HOPS {
+                outward = true;
+                break;
+            }
+            for next in targets {
+                let Ok(next) = core::str::from_utf8(next) else {
+                    continue;
+                };
+                if next.starts_with('/') {
+                    continue;
+                }
+                let mut rest = state.rest.clone();
+                rest.extend(start_of(next));
+                let mut dir = state.dir.clone();
+                let mut nodes = state.nodes.clone();
+                dir.pop();
+                nodes.pop();
+                work.push(State {
+                    dir,
+                    nodes,
+                    rest,
+                    hops: state.hops + 1,
+                });
+            }
+            outward = true;
+            break;
+        }
+        if !outward {
+            reached.push(state.dir);
+        }
+    }
+    Some(reached)
+}
+
+/// What the whole patch tells about paths, built once: the link tree, the
+/// paths links at protected paths reach, and the forbidden paths it names.
+struct Context<'a> {
+    tree: LinkTree<'a>,
+    /// Paths reached from a link at a forbidden or test-config path.
+    protected: Vec<(Vec<String>, Guard)>,
+    /// Guards whose resolution gave up: they protect every path.
+    everywhere: Vec<Guard>,
+    /// Forbidden paths the changes and links name, with their class.
+    forbidden: Vec<(Vec<String>, ForbiddenClass)>,
+}
+
+impl<'a> Context<'a> {
+    fn new(patch: &'a Patch) -> Context<'a> {
+        let tree = LinkTree::after(patch);
+        let mut protected = Vec::new();
+        let mut everywhere = Vec::new();
+        let mut forbidden = Vec::new();
+        for &(path, target) in &tree.links {
+            let class = forbidden_class(path);
+            let guard = class
+                .map(Guard::Class)
+                .or_else(|| is_test_config(path, || true).then_some(Guard::TestConfig));
+            let Some(guard) = guard else {
+                continue;
+            };
+            match reach(&tree, path, target) {
+                Some(paths) => protected.extend(paths.into_iter().map(|p| (p, guard))),
+                None => everywhere.push(guard),
+            }
+        }
+        for path in patch
+            .changes
+            .iter()
+            .map(|c| c.path.as_str())
+            .chain(tree.links.iter().map(|l| l.0))
+        {
+            if let Some(class) = forbidden_class(path) {
+                forbidden.push((keys(path), class));
+            }
+        }
+        Context {
+            tree,
+            protected,
+            everywhere,
+            forbidden,
+        }
+    }
+
+    /// The guards that protect a change at `path`: a protected path at,
+    /// above or beneath it.
+    fn guards(&self, path: &str) -> impl Iterator<Item = Guard> + '_ {
+        let path = keys(path);
+        let reached: Vec<Guard> = self
+            .protected
+            .iter()
+            .filter(|(p, _)| overlaps(p, &path))
+            .map(|(_, guard)| *guard)
+            .collect();
+        reached.into_iter().chain(self.everywhere.iter().copied())
     }
 }
 
 /// A lexical walk over a path's components that refuses every position
 /// that is a link of the tree after the fix.
-struct Walk<'a> {
-    tree: &'a LinkTree,
+struct Walk<'t, 'a> {
+    tree: &'t LinkTree<'a>,
     nodes: Vec<Option<usize>>,
-    components: Vec<&'a str>,
+    components: Vec<&'t str>,
 }
 
-impl<'a> Walk<'a> {
+impl<'t, 'a> Walk<'t, 'a> {
     /// Starts at the parent directory of `path`, checking every prefix.
-    fn at_parent_of(tree: &'a LinkTree, path: &'a str) -> Result<Walk<'a>, LinkProblem> {
+    fn at_parent_of(tree: &'t LinkTree<'a>, path: &'t str) -> Result<Walk<'t, 'a>, LinkProblem> {
         let mut walk = Walk {
             tree,
             nodes: Vec::new(),
@@ -569,10 +793,10 @@ impl<'a> Walk<'a> {
         Ok(walk)
     }
 
-    fn push(&mut self, component: &'a str) -> Result<(), LinkProblem> {
+    fn push(&mut self, component: &'t str) -> Result<(), LinkProblem> {
         let top = self.nodes.last().copied().unwrap_or(Some(ROOT));
         let node = self.tree.child(top, component);
-        if self.tree.is_link(node) {
+        if !self.tree.targets(node).is_empty() {
             return Err(LinkProblem::ThroughLink);
         }
         self.nodes.push(node);
@@ -594,7 +818,7 @@ fn windows_dots(component: &str) -> bool {
 }
 
 /// The first problem of a symlink at `path` with `target` (ADR-013, D6).
-fn symlink_problem(path: &str, target: &[u8], tree: &LinkTree) -> Option<LinkProblem> {
+fn symlink_problem(path: &str, target: &[u8], context: &Context<'_>) -> Option<LinkProblem> {
     let Ok(target) = core::str::from_utf8(target) else {
         return Some(LinkProblem::NotUtf8);
     };
@@ -607,7 +831,7 @@ fn symlink_problem(path: &str, target: &[u8], tree: &LinkTree) -> Option<LinkPro
     if target.contains(['\\', ':']) || target.split('/').any(windows_dots) {
         return Some(LinkProblem::WindowsForm);
     }
-    let walked = Walk::at_parent_of(tree, path).and_then(|mut walk| {
+    let walked = Walk::at_parent_of(&context.tree, path).and_then(|mut walk| {
         for component in target.split('/') {
             match component {
                 "" | "." => {}
@@ -617,28 +841,58 @@ fn symlink_problem(path: &str, target: &[u8], tree: &LinkTree) -> Option<LinkPro
         }
         Ok(walk.components.join("/"))
     });
-    match walked {
-        Err(problem) => Some(problem),
-        Ok(resolved) => forbidden_class(&resolved).map(LinkProblem::Into),
+    let resolved = match walked {
+        Err(problem) => return Some(problem),
+        Ok(resolved) => resolved,
+    };
+    if let Some(class) = forbidden_class(&resolved) {
+        return Some(LinkProblem::Into(class));
     }
+    // The root holds `.git`; a directory above a forbidden path holds it.
+    if resolved.is_empty() {
+        return Some(LinkProblem::Encloses(ForbiddenClass::RepositoryMetadata));
+    }
+    let resolved = keys(&resolved);
+    context
+        .forbidden
+        .iter()
+        .filter(|(path, _)| path.len() > resolved.len() && overlaps(path, &resolved))
+        .map(|(_, class)| *class)
+        .min()
+        .map(LinkProblem::Encloses)
 }
 
 /// The link family of one change: a symlink's own problem, or a regular
 /// file beneath a link of the tree after the fix.
-fn link_problem(change: &Change, tree: &LinkTree) -> Option<LinkProblem> {
+fn link_problem(change: &Change, context: &Context<'_>) -> Option<LinkProblem> {
     let after = change.after.as_ref()?;
     match after.kind {
-        EntryKind::Symlink => symlink_problem(&change.path, &after.data, tree),
-        EntryKind::File | EntryKind::Executable => Walk::at_parent_of(tree, &change.path).err(),
+        EntryKind::Symlink => symlink_problem(&change.path, &after.data, context),
+        EntryKind::File | EntryKind::Executable => {
+            Walk::at_parent_of(&context.tree, &change.path).err()
+        }
         EntryKind::Gitlink => None,
     }
 }
 
 /// Step 5 of [`patch_policy`] for one change.
-fn judge_change(index: usize, change: &Change, tree: &LinkTree, out: &mut Vec<PatchViolation>) {
+fn judge_change(
+    index: usize,
+    change: &Change,
+    context: &Context<'_>,
+    out: &mut Vec<PatchViolation>,
+) {
     let before = change.before.as_ref();
     let after = change.after.as_ref();
-    if let Some(class) = forbidden_class(&change.path) {
+    let guards: Vec<Guard> = context.guards(&change.path).collect();
+    let guarded_class = guards
+        .iter()
+        .filter_map(|g| match g {
+            Guard::Class(class) => Some(*class),
+            Guard::TestConfig => None,
+        })
+        .min();
+    if let Some(class) = forbidden_class(&change.path).or(guarded_class) {
         out.push(PatchViolation::Forbidden { index, class });
     }
     let gitlink = [before, after]
@@ -654,7 +908,7 @@ fn judge_change(index: usize, change: &Change, tree: &LinkTree, out: &mut Vec<Pa
     {
         out.push(PatchViolation::NotText { index, reason });
     }
-    if let Some(problem) = link_problem(change, tree) {
+    if let Some(problem) = link_problem(change, context) {
         out.push(PatchViolation::Link { index, problem });
     }
     let mut disables = |reason| out.push(PatchViolation::DisablesTests { index, reason });
@@ -677,8 +931,14 @@ fn judge_change(index: usize, change: &Change, tree: &LinkTree, out: &mut Vec<Pa
             if !is_regular(after) {
                 disables(TestDisabling::DeletedTestFile);
             } else if is_regular(before) {
-                let declarations = |side: Option<&str>| side.map_or(0, active_declarations);
-                if declarations(after_text) < declarations(before_text) {
+                // The base's count is an upper bound and the after side's a
+                // lower bound; a side that is not text cannot be counted,
+                // so it counts as a removal.
+                let removed = match (before_text, after_text) {
+                    (Some(was), Some(now)) => after_declarations(now) < base_declarations(was),
+                    _ => true,
+                };
+                if removed {
                     disables(TestDisabling::TestsRemoved);
                 }
             }
@@ -690,7 +950,7 @@ fn judge_change(index: usize, change: &Change, tree: &LinkTree, out: &mut Vec<Pa
             .flatten()
             .any(has_test_key)
     };
-    if is_test_config(&change.path, test_key) {
+    if is_test_config(&change.path, test_key) || guards.contains(&Guard::TestConfig) {
         disables(TestDisabling::TestConfigChanged);
     }
 }
@@ -767,6 +1027,7 @@ mod tests {
         PatchLimits {
             max_changed_files: NonZeroU32::new(files).expect("non-zero"),
             max_changed_lines: NonZeroU32::new(lines).expect("non-zero"),
+            max_changed_bytes: PatchLimits::DEFAULT.max_changed_bytes,
         }
     }
 
@@ -1353,7 +1614,6 @@ mod tests {
         for (path, target) in [
             ("docs/README.md", "../README.md"),
             ("a", "b"),
-            ("a", "."),
             ("x/l", "../y/z"),
             ("x/l", "./"),
             ("x/l", "..//y/./z/"),
@@ -1850,5 +2110,307 @@ mod tests {
         ]);
         assert_eq!(patch_policy(&patch, &limits(25, 1)), expected);
         assert_eq!(patch_policy(&patch, &limits(25, 1)), expected);
+    }
+
+    // Review round 1 of PR #70.
+
+    /// Item 1: a link at a forbidden path protects what it points to.
+    #[test]
+    fn links_at_forbidden_paths_protect_their_targets() {
+        use ForbiddenClass::*;
+        let edit = |path: &str| change(path, file("a\n"), file("b\n"));
+        for (link, target, edited, class) in [
+            (".npmrc", "config/npmrc", "config/npmrc", Dependencies),
+            (".dockerignore", ".gitignore", ".gitignore", ContainerBuild),
+            ("Jenkinsfile", "ci/build.groovy", "ci/build.groovy", Ci),
+            (".github", "ci", "ci/workflows/x.yml", Ci),
+            ("docs/CODEOWNERS", "../owners.txt", "owners.txt", CodeOwners),
+        ] {
+            assert_eq!(
+                judge_with(vec![edit(edited)], vec![base_link(link, target)]),
+                one(PatchViolation::Forbidden { index: 0, class }),
+                "{link} -> {target}, edit {edited}"
+            );
+        }
+        assert_eq!(
+            judge_with(
+                vec![edit("config/vitest.ts")],
+                vec![base_link("vitest.config.ts", "config/vitest.ts")]
+            ),
+            one(disables(0, TestDisabling::TestConfigChanged))
+        );
+        // Through a chain of links, and at every link the chain passes.
+        let chain = || vec![base_link(".npmrc", "cfg"), base_link("cfg", "config/npmrc")];
+        for edited in ["config/npmrc", "config"] {
+            assert_eq!(
+                judge_with(vec![edit(edited)], chain()),
+                one(PatchViolation::Forbidden {
+                    index: 0,
+                    class: Dependencies
+                }),
+                "{edited}"
+            );
+        }
+        assert_eq!(
+            judge_with(
+                vec![change("cfg", link("config/npmrc"), link("elsewhere"))],
+                chain()
+            ),
+            one(PatchViolation::Forbidden {
+                index: 0,
+                class: Dependencies
+            }),
+            "retargeting a link the chain passes"
+        );
+        // A link the patch adds at a forbidden path protects its target too.
+        assert_eq!(
+            judge(vec![add(".npmrc", link("npmrc.txt")), edit("npmrc.txt")]),
+            reject(vec![
+                PatchViolation::Forbidden {
+                    index: 0,
+                    class: Dependencies
+                },
+                PatchViolation::Forbidden {
+                    index: 1,
+                    class: Dependencies
+                },
+            ])
+        );
+        // Unrelated paths, loops and outward links protect nothing.
+        assert!(passes(&judge_with(
+            vec![edit("src/a.ts")],
+            vec![
+                base_link(".npmrc", "loop"),
+                base_link("Dockerfile", "/etc/x"),
+                base_link("Jenkinsfile", "../x"),
+                base_link("loop", ".npmrc"),
+            ]
+        )));
+    }
+
+    /// Item 1: a resolution that branches past the state cap protects
+    /// every path.
+    #[test]
+    fn protected_resolution_gives_up_closed() {
+        // Twenty non-ASCII links share one alias key, and each points back
+        // through it: the resolution branches twenty ways per hop.
+        let mut links = vec![base_link(".npmrc", "\u{E0}/x")];
+        for k in 0..20u32 {
+            let name = char::from_u32(0xE0 + k).expect("a letter");
+            links.push(base_link(&format!("{name}"), "\u{E0}/x"));
+        }
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            judge_with(vec![change("src/a.ts", file("a\n"), file("b\n"))], links),
+            one(PatchViolation::Forbidden {
+                index: 0,
+                class: ForbiddenClass::Dependencies
+            })
+        );
+    }
+
+    /// Item 2: non-ASCII components alias each other for links.
+    #[test]
+    fn non_ascii_components_alias_links() {
+        let through = link_problem(0, LinkProblem::ThroughLink);
+        for (link, file_path) in [
+            ("\u{C4}", "\u{E4}/workflows/ci.yml"),
+            ("\u{E4}", "\u{C4}/workflows/ci.yml"),
+            ("caf\u{E9}", "cafe\u{301}/workflows/ci.yml"),
+            ("cafe\u{301}", "caf\u{E9}/workflows/ci.yml"),
+        ] {
+            assert_eq!(
+                judge_with(
+                    vec![add(file_path, file("x\n"))],
+                    vec![base_link(link, ".github")]
+                ),
+                through,
+                "{link:?} {file_path:?}"
+            );
+        }
+        // ASCII names still alias by case only.
+        assert!(passes(&judge_with(
+            vec![add("docs2/x.ts", file("x\n"))],
+            vec![base_link("docs", "src")]
+        )));
+    }
+
+    /// Items 3, 4 and 6: the base counts an upper bound of its tests, the
+    /// after side a lower bound.
+    #[test]
+    fn declaration_counts_are_bounded() {
+        let removed = one(disables(0, TestDisabling::TestsRemoved));
+        let edit = |before: &str, after: &str| {
+            judge(vec![change("e2e/x.spec.ts", file(before), file(after))])
+        };
+        let three = "test('a', f)\ntest('b', f)\ntest('c', f)\n";
+        // A comment opener in a base string hides no base test.
+        let api = format!("const api = '/api/*'\n{three}");
+        assert_eq!(edit(&api, "const api = '/api/*'\ntest('a', f)\n"), removed);
+        // A test inside a string or template does not offset a deletion.
+        assert_eq!(
+            edit(
+                three,
+                "test('a', f)\ntest('b', f)\nconst s = \"test('c', f)\"\n"
+            ),
+            removed
+        );
+        assert_eq!(
+            edit(
+                three,
+                "test('a', f)\ntest('b', f)\nconst s = `\ntest('c', f)\n`\n"
+            ),
+            removed
+        );
+        // HTML-like comments comment a test out.
+        for hidden in ["--> test('c', f)", "<!-- test('c', f)"] {
+            assert_eq!(
+                edit(three, &format!("test('a', f)\ntest('b', f)\n{hidden}\n")),
+                removed,
+                "{hidden}"
+            );
+        }
+        // An unrelated edit next to such strings passes.
+        assert!(passes(&edit(&api, &format!("{api}// note\n"))));
+    }
+
+    /// Item 6: a test file whose base or after side is not text cannot be
+    /// counted, so it counts as a removal.
+    #[test]
+    fn test_files_that_are_not_text_count_as_removed() {
+        let removed = disables(0, TestDisabling::TestsRemoved);
+        assert_eq!(
+            judge(vec![change(
+                "src/a.test.ts",
+                bytes(b"test('a', f)\ntest('b', f)\n// caf\xE9\n"),
+                file("test('a', f)\n")
+            )]),
+            one(removed.clone())
+        );
+        assert_eq!(
+            judge(vec![change(
+                "src/a.test.ts",
+                file("test('a', f)\n"),
+                bytes(b"test('a', f)\0")
+            )]),
+            reject(vec![
+                PatchViolation::NotText {
+                    index: 0,
+                    reason: NotText::Nul
+                },
+                removed,
+            ])
+        );
+    }
+
+    /// Item 5: the shorthand `{ test }` is a Vitest key.
+    #[test]
+    fn vite_shorthand_test_key_counts() {
+        assert_eq!(
+            judge(vec![change(
+                "vite.config.ts",
+                file(
+                    "const test = { include: ['src'] }\nexport default defineConfig({ plugins: [], test })\n"
+                ),
+                file(
+                    "const test = { include: ['none'] }\nexport default defineConfig({ plugins: [], test })\n"
+                )
+            )]),
+            one(disables(0, TestDisabling::TestConfigChanged))
+        );
+    }
+
+    /// Item 8: call markers accept the member rule's separators.
+    #[test]
+    fn call_markers_accept_separators() {
+        for line in [
+            "fit?.('b', f)",
+            "fit/**/('b', f)",
+            "fit!('b', f)",
+            "xit?.('b', f)",
+        ] {
+            let marker = if line.starts_with('x') {
+                Marker::Xit
+            } else {
+                Marker::Fit
+            };
+            assert_eq!(
+                marker_verdict("src/totals.test.ts", line),
+                one(disables(0, TestDisabling::Marker(marker))),
+                "{line}"
+            );
+        }
+    }
+
+    /// Item 9: a link to the root or above a known forbidden path.
+    #[test]
+    fn links_enclosing_forbidden_paths_are_rejected() {
+        use ForbiddenClass::*;
+        for (path, target) in [
+            ("x", "."),
+            ("docs/x", ".."),
+            ("x", ".github/.."),
+            ("a/b/l", "../.."),
+        ] {
+            assert_eq!(
+                judge(vec![add(path, link(target))]),
+                link_problem(0, LinkProblem::Encloses(RepositoryMetadata)),
+                "{path} -> {target}"
+            );
+        }
+        assert_eq!(
+            judge(vec![
+                add("apps/web/Dockerfile", file("x\n")),
+                add("l", link("apps"))
+            ]),
+            reject(vec![
+                PatchViolation::Forbidden {
+                    index: 0,
+                    class: ContainerBuild
+                },
+                PatchViolation::Link {
+                    index: 1,
+                    problem: LinkProblem::Encloses(ContainerBuild)
+                },
+            ])
+        );
+        assert_eq!(
+            judge_with(
+                vec![add("l", link("apps/web"))],
+                vec![base_link("apps/web/package.json", "../p.json")]
+            ),
+            link_problem(0, LinkProblem::Encloses(Dependencies))
+        );
+        // A directory above nothing forbidden that the patch names passes.
+        assert!(passes(&judge(vec![add("l", link("src/lib"))])));
+    }
+
+    /// Item 10: a byte budget next to the line budget.
+    #[test]
+    fn byte_budget_bounds_long_lines() {
+        let over = one(PatchViolation::TooManyBytes { limit: 42_000 });
+        assert_eq!(
+            judge(vec![add("dist/app.js", file(&"x".repeat(42_001)))]),
+            over
+        );
+        assert_eq!(
+            judge(vec![add("dist/app.js", file(&"x".repeat(42_000)))]),
+            PatchVerdict::Pass { files: 1, lines: 1 }
+        );
+        // Across files, and only the changed lines count.
+        let base: String = (0..2_000).map(|k| format!("line {k:05}\n")).collect();
+        let edited = base.replacen("line 01000\n", "line 01000 edited\n", 1);
+        assert!(passes(&judge(vec![change(
+            "big.txt",
+            file(&base),
+            file(&edited)
+        )])));
+        assert_eq!(
+            judge(vec![
+                add("a.js", file(&"x".repeat(21_000))),
+                add("b.js", file(&"y".repeat(21_001)))
+            ]),
+            over
+        );
     }
 }
