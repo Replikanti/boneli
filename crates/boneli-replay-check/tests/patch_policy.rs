@@ -480,3 +480,34 @@ fn line_cost_is_linear_in_bytes() {
         PatchVerdict::Reject(vec![PatchViolation::TooManyBytes { limit: 42_000 }])
     );
 }
+
+/// Review round 3 of PR #70 (item 2): agent links that would make the
+/// protected-link walk branch and grow. Two links with 40 KB targets once
+/// aborted the process at 8 GB; 23 guard links over two legal 4,094-byte
+/// targets took 45 s and 1.35 GB in a release build.
+#[test]
+fn protected_walk_is_bounded() {
+    for (k, guards) in [(20_000, 1), (2_047, 23)] {
+        let target = "x/".repeat(k);
+        let mut changes = vec![
+            change("X", None, entry(EntryKind::Symlink, target.as_bytes())),
+            change("x", None, entry(EntryKind::Symlink, target.as_bytes())),
+        ];
+        for g in 0..guards {
+            changes.push(change(
+                &format!("p{g:02}/package.json"),
+                None,
+                entry(EntryKind::Symlink, b"../x"),
+            ));
+        }
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        let limits = PatchLimits {
+            max_changed_bytes: NonZeroU32::MAX,
+            ..PatchLimits::DEFAULT
+        };
+        let (verdict, took) = judge_within(changes, Vec::new(), limits);
+        assert!(matches!(verdict, PatchVerdict::Reject(_)), "{verdict:?}");
+        eprintln!("{guards} guards over {k}-component targets: {took:?}");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+    }
+}

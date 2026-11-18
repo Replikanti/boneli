@@ -612,132 +612,288 @@ enum Guard {
     TestFile,
 }
 
-/// One resolution in progress: the directory reached, as alias keys and
-/// trie nodes, the target components still to apply (last first), and
-/// the links followed so far.
-struct State<'a> {
-    dir: Vec<String>,
-    nodes: Vec<Option<usize>>,
-    rest: Vec<&'a str>,
-    hops: usize,
-}
-
-/// The readings of a link target, each as its components, last first:
-/// split at `/`, and when it holds a `\`, also split at both, as a Windows
+/// The readings of a link target, each as its components in order: split
+/// at `/`, and when it holds a `\`, also split at both, as a Windows
 /// checkout reads it. A reading that is absolute (`/x`, `\\server`) is
 /// dropped: nothing in the patch can be there.
 fn readings(target: &str) -> Vec<Vec<&str>> {
     let mut out = Vec::new();
     if !target.starts_with('/') {
-        out.push(target.split('/').rev().collect());
+        out.push(target.split('/').collect());
     }
     if target.contains('\\') && !target.starts_with(['/', '\\']) {
-        out.push(target.split(['/', '\\']).rev().collect());
+        out.push(target.split(['/', '\\']).collect());
     }
     out
 }
 
-/// Every path a reader of the link at `path` may land on or pass, as alias
-/// keys: each link position the resolution passes and every path it may
-/// end on. At a component that aliases a link, both readings continue: the
-/// link is followed (every target of every aliasing link, in every reading
-/// of [`readings`]) up to [`MAX_HOPS`], and the name is also walked as the
-/// real directory a case-sensitive checkout may hold. `None` when the
-/// resolution needs more than [`MAX_STATES`] states; the caller then
-/// protects every path. Outward and absolute targets end a branch: nothing
-/// in the patch can be there.
-fn reach<'a>(tree: &LinkTree<'a>, path: &'a str, target: &'a [u8]) -> Option<Vec<Vec<String>>> {
-    let parents: Vec<&str> = path.split('/').collect();
-    let mut first = State {
-        dir: Vec::new(),
-        nodes: Vec::new(),
-        rest: Vec::new(),
-        hops: 0,
-    };
-    for component in parents.iter().take(parents.len().saturating_sub(1)) {
-        let top = first.nodes.last().copied().unwrap_or(Some(ROOT));
-        first.nodes.push(tree.child(top, component));
-        first.dir.push(alias_key(component));
+/// The work budget of all protected-link resolutions of one patch
+/// together, in bytes walked: each component costs its length plus one.
+/// It is 256 walks ([`MAX_STATES`]) of one longest target (4,095 bytes,
+/// [`MAX_TARGET`]) each, rounded to 2^20. It bounds the time, the places
+/// the arena holds and the key bytes they store; past it, every path is
+/// protected (ADR-013, D6).
+const MAX_STEPS: usize = 1 << 20;
+
+/// One directory a resolution reached, in an arena shared by every
+/// resolution of a patch: its parent, its trie node in the link tree, and
+/// the guards of the protected paths at it and beneath it.
+struct Place {
+    parent: usize,
+    node: Option<usize>,
+    at: u8,
+    beneath: u8,
+}
+
+/// The guard bits of a [`Guard`]: one per forbidden class, then test
+/// configuration, then test file.
+fn guard_bit(guard: Guard) -> u8 {
+    match guard {
+        Guard::Class(class) => 1 << (class as u8),
+        Guard::TestConfig => 1 << 6,
+        Guard::TestFile => 1 << 7,
     }
-    let target = core::str::from_utf8(target).ok()?;
-    let mut work = Vec::new();
-    for rest in readings(target) {
-        work.push(State {
-            dir: first.dir.clone(),
-            nodes: first.nodes.clone(),
-            rest,
-            hops: 0,
-        });
-    }
-    first.rest = Vec::new();
-    let mut reached = Vec::new();
-    let mut states = 0usize;
-    while let Some(mut state) = work.pop() {
-        states += 1;
-        if states > MAX_STATES {
-            return None;
+}
+
+fn guards_of(bits: u8) -> impl Iterator<Item = Guard> {
+    const CLASSES: [ForbiddenClass; 6] = [
+        ForbiddenClass::RepositoryMetadata,
+        ForbiddenClass::Ci,
+        ForbiddenClass::ContainerBuild,
+        ForbiddenClass::CodeOwners,
+        ForbiddenClass::GitConfig,
+        ForbiddenClass::Dependencies,
+    ];
+    let mut all: Vec<Guard> = CLASSES.into_iter().map(Guard::Class).collect();
+    all.push(Guard::TestConfig);
+    all.push(Guard::TestFile);
+    all.into_iter().filter(move |g| bits & guard_bit(*g) != 0)
+}
+
+/// One resolution in progress: its place, its stack of (parts index, next
+/// component), innermost last, and the links it followed.
+type State = (usize, Vec<(usize, usize)>, usize);
+
+/// The paths every protected link reaches, as places in an arena (the
+/// root is place 0), so a branch copies a place index instead of a path,
+/// and a path is stored once however often it is reached.
+struct Reached<'a> {
+    places: Vec<Place>,
+    children: BTreeMap<(usize, String), usize>,
+    /// Target components, one entry per (link node, target, reading)
+    /// followed, shared by every branch.
+    parts: Vec<Vec<&'a str>>,
+    followed: BTreeMap<(usize, usize, usize), usize>,
+    /// Work left for the whole patch, in bytes walked ([`MAX_STEPS`]).
+    steps: usize,
+}
+
+const PLACE_ROOT: usize = 0;
+
+impl<'a> Reached<'a> {
+    fn new() -> Reached<'a> {
+        Reached {
+            places: vec![Place {
+                parent: PLACE_ROOT,
+                node: Some(ROOT),
+                at: 0,
+                beneath: 0,
+            }],
+            children: BTreeMap::new(),
+            parts: Vec::new(),
+            followed: BTreeMap::new(),
+            steps: MAX_STEPS,
         }
-        let mut outward = false;
-        while let Some(component) = state.rest.pop() {
-            match component {
-                "" | "." => continue,
-                ".." => {
-                    if state.dir.pop().is_none() {
-                        outward = true;
-                        break;
+    }
+
+    /// The child place of `place` at `component`, made on first use.
+    fn child(&mut self, tree: &LinkTree<'a>, place: usize, component: &str) -> usize {
+        let key = (place, alias_key(component));
+        if let Some(&child) = self.children.get(&key) {
+            return child;
+        }
+        let node = self
+            .places
+            .get(place)
+            .and_then(|p| tree.child(p.node, component));
+        let child = self.places.len();
+        self.places.push(Place {
+            parent: place,
+            node,
+            at: 0,
+            beneath: 0,
+        });
+        self.children.insert(key, child);
+        child
+    }
+
+    fn parent(&self, place: usize) -> usize {
+        self.places.get(place).map_or(PLACE_ROOT, |p| p.parent)
+    }
+
+    /// Marks `place` protected by `bits` and every ancestor as having a
+    /// protected path beneath it.
+    fn mark(&mut self, place: usize, bits: u8) {
+        if let Some(p) = self.places.get_mut(place) {
+            p.at |= bits;
+        }
+        let mut current = place;
+        while current != PLACE_ROOT {
+            current = self.parent(current);
+            match self.places.get_mut(current) {
+                Some(p) if p.beneath & bits != bits => p.beneath |= bits,
+                _ => break,
+            }
+        }
+    }
+
+    /// The parts index of one reading of one target of the links at a
+    /// trie node, stored once.
+    fn parts_of(&mut self, key: (usize, usize, usize), reading: Vec<&'a str>) -> usize {
+        if let Some(&index) = self.followed.get(&key) {
+            return index;
+        }
+        let index = self.parts.len();
+        self.parts.push(reading);
+        self.followed.insert(key, index);
+        index
+    }
+
+    /// Marks every place a reader of the link at `path` with `target` may
+    /// land on or pass. At a component that aliases a link, both readings
+    /// continue: the link is followed (every target of every aliasing
+    /// link, in every reading of [`readings`]) up to [`MAX_HOPS`], and the
+    /// name is also walked as the real directory a case-sensitive checkout
+    /// may hold. `false` when a resolution needs more than [`MAX_STATES`]
+    /// states, meets a target over [`MAX_TARGET`] bytes or that is not
+    /// UTF-8, or the patch runs out of [`MAX_STEPS`]; the caller then
+    /// protects every path. Outward and absolute targets end a branch:
+    /// nothing in the patch can be there.
+    fn resolve(&mut self, tree: &LinkTree<'a>, path: &'a str, target: &'a [u8], bits: u8) -> bool {
+        if target.len() > MAX_TARGET {
+            return false;
+        }
+        let Ok(target) = core::str::from_utf8(target) else {
+            return false;
+        };
+        let mut start = PLACE_ROOT;
+        let mut parents: Vec<&str> = path.split('/').collect();
+        parents.pop();
+        for component in parents {
+            if !self.charge(component) {
+                return false;
+            }
+            start = self.child(tree, start, component);
+        }
+        // A branch copies at most MAX_HOPS + 1 frames.
+        // States are counted when they are made, so at most MAX_STATES
+        // wait at any time.
+        let mut work: Vec<State> = Vec::new();
+        for reading in readings(target) {
+            let index = self.parts.len();
+            self.parts.push(reading);
+            work.push((start, vec![(index, 0)], 0));
+        }
+        let mut states = work.len();
+        while let Some((mut place, mut frames, hops)) = work.pop() {
+            let mut outward = false;
+            while let Some(&(index, next)) = frames.last() {
+                let Some(component) = self.parts.get(index).and_then(|p| p.get(next)).copied()
+                else {
+                    frames.pop();
+                    continue;
+                };
+                if let Some(top) = frames.last_mut() {
+                    top.1 += 1;
+                }
+                if !self.charge(component) {
+                    return false;
+                }
+                match component {
+                    "" | "." => continue,
+                    ".." => {
+                        if place == PLACE_ROOT {
+                            outward = true;
+                            break;
+                        }
+                        place = self.parent(place);
+                        continue;
                     }
-                    state.nodes.pop();
+                    _ => {}
+                }
+                place = self.child(tree, place, component);
+                let node = self.places.get(place).and_then(|p| p.node);
+                let targets = tree.targets(node);
+                if targets.is_empty() {
                     continue;
                 }
-                _ => {}
-            }
-            let top = state.nodes.last().copied().unwrap_or(Some(ROOT));
-            let node = tree.child(top, component);
-            state.dir.push(alias_key(component));
-            state.nodes.push(node);
-            let targets = tree.targets(node);
-            if targets.is_empty() {
-                continue;
-            }
-            reached.push(state.dir.clone());
-            if state.hops >= MAX_HOPS {
-                continue;
-            }
-            for next in targets {
-                // A target that is not UTF-8 cannot be walked: protect all.
-                let next = core::str::from_utf8(next).ok()?;
-                for reading in readings(next) {
-                    let mut rest = state.rest.clone();
-                    rest.extend(reading);
-                    let mut dir = state.dir.clone();
-                    let mut nodes = state.nodes.clone();
-                    dir.pop();
-                    nodes.pop();
-                    work.push(State {
-                        dir,
-                        nodes,
-                        rest,
-                        hops: state.hops + 1,
-                    });
+                self.mark(place, bits);
+                if hops >= MAX_HOPS {
+                    continue;
                 }
+                for (t, next_target) in targets.iter().enumerate() {
+                    if next_target.len() > MAX_TARGET {
+                        return false;
+                    }
+                    let Ok(text) = core::str::from_utf8(next_target) else {
+                        return false;
+                    };
+                    for (r, reading) in readings(text).into_iter().enumerate() {
+                        states += 1;
+                        if states > MAX_STATES {
+                            return false;
+                        }
+                        let key = (node.unwrap_or(ROOT), t, r);
+                        let index = self.parts_of(key, reading);
+                        let mut branch = frames.clone();
+                        branch.push((index, 0));
+                        work.push((self.parent(place), branch, hops + 1));
+                    }
+                }
+                // The directory reading goes on in this state.
             }
-            // The directory reading goes on in this state.
+            if !outward {
+                self.mark(place, bits);
+            }
         }
-        if !outward {
-            reached.push(state.dir);
+        true
+    }
+
+    /// Takes one component's cost from the budget: its length plus one.
+    fn charge(&mut self, component: &str) -> bool {
+        match self.steps.checked_sub(component.len() + 1) {
+            Some(left) => {
+                self.steps = left;
+                true
+            }
+            None => false,
         }
     }
-    Some(reached)
+
+    /// The guard bits that protect a change at `path`: a protected place
+    /// at or above it, or beneath it.
+    fn bits_for(&self, path: &str) -> u8 {
+        let mut place = PLACE_ROOT;
+        let mut bits = 0u8;
+        for component in path.split('/') {
+            match self.children.get(&(place, alias_key(component))) {
+                Some(&child) => place = child,
+                None => return bits,
+            }
+            bits |= self.places.get(place).map_or(0, |p| p.at);
+        }
+        bits | self.places.get(place).map_or(0, |p| p.beneath)
+    }
 }
 
 /// What the whole patch tells about paths, built once: the link tree, the
 /// paths links at protected paths reach, and the forbidden paths it names.
 struct Context<'a> {
     tree: LinkTree<'a>,
-    /// Paths reached from a link at a forbidden or test-config path.
-    protected: Vec<(Vec<String>, Guard)>,
+    /// Paths reached from a link at a protected path.
+    reached: Reached<'a>,
     /// Guards whose resolution gave up: they protect every path.
-    everywhere: Vec<Guard>,
+    everywhere: u8,
     /// Forbidden paths the changes and links name, with their class.
     forbidden: Vec<(Vec<String>, ForbiddenClass)>,
 }
@@ -745,30 +901,20 @@ struct Context<'a> {
 impl<'a> Context<'a> {
     fn new(patch: &'a Patch) -> Context<'a> {
         let tree = LinkTree::after(patch);
-        let mut protected = Vec::new();
-        let mut everywhere = Vec::new();
+        let mut reached = Reached::new();
+        let mut everywhere = 0u8;
         let mut forbidden = Vec::new();
         for &(path, target) in &tree.links {
-            let guards: Vec<Guard> = [
+            let bits = [
                 forbidden_class(path).map(Guard::Class),
                 is_test_config(path, || true).then_some(Guard::TestConfig),
                 is_test_path(path).then_some(Guard::TestFile),
             ]
             .into_iter()
             .flatten()
-            .collect();
-            if guards.is_empty() {
-                continue;
-            }
-            match reach(&tree, path, target) {
-                Some(paths) => {
-                    for p in paths {
-                        for guard in &guards {
-                            protected.push((p.clone(), *guard));
-                        }
-                    }
-                }
-                None => everywhere.extend(guards),
+            .fold(0u8, |bits, g| bits | guard_bit(g));
+            if bits != 0 && !reached.resolve(&tree, path, target, bits) {
+                everywhere |= bits;
             }
         }
         for path in patch
@@ -783,23 +929,16 @@ impl<'a> Context<'a> {
         }
         Context {
             tree,
-            protected,
+            reached,
             everywhere,
             forbidden,
         }
     }
 
     /// The guards that protect a change at `path`: a protected path at,
-    /// above or beneath it.
-    fn guards(&self, path: &str) -> impl Iterator<Item = Guard> + '_ {
-        let path = keys(path);
-        let reached: Vec<Guard> = self
-            .protected
-            .iter()
-            .filter(|(p, _)| overlaps(p, &path))
-            .map(|(_, guard)| *guard)
-            .collect();
-        reached.into_iter().chain(self.everywhere.iter().copied())
+    /// above or beneath it, or a resolution that gave up.
+    fn guards(&self, path: &str) -> impl Iterator<Item = Guard> + use<> {
+        guards_of(self.reached.bits_for(path) | self.everywhere)
     }
 }
 
@@ -2638,5 +2777,78 @@ mod tests {
                 "{target:?}"
             );
         }
+    }
+
+    // Review round 3 of PR #70.
+
+    /// Item 1: `/` after any token that can end an expression is ambiguous,
+    /// and a hashbang line is a comment on the after side.
+    #[test]
+    fn slash_after_any_expression_end_is_ambiguous() {
+        let before = "import { test } from 'vitest';\ntest('a', () => {});\ntest('b', () => {});\n";
+        let removed = one(disables(0, TestDisabling::TestsRemoved));
+        let head = "import { test } from 'vitest';\ntest('a', () => {});\n";
+        let fake = "const s = '/test(\"b\", () => {})//';";
+        for line in [
+            format!("let x = 0; x++ / 2; {fake}"),
+            format!("let x = 0; x-- / 2; {fake}"),
+            format!("let x: number | undefined = 4; const y = x! / 2; {fake}"),
+            format!("const y = [1][0] / 2; {fake}"),
+            format!("const y = 'a'.length / 2; {fake}"),
+            format!("const y = `a` / 2; {fake}"),
+        ] {
+            assert_eq!(
+                judge(vec![change(
+                    "src/a.test.ts",
+                    file(before),
+                    file(&format!("{head}{line}\n"))
+                )]),
+                removed,
+                "{line}"
+            );
+        }
+        let hashbang = format!("#!/x/ test(\"b\", () => {{}})\n{head}");
+        assert_eq!(
+            judge(vec![change("src/a.test.ts", file(before), file(&hashbang))]),
+            removed
+        );
+        // The base reads a hashbang line as code: its count stays an upper
+        // bound, so keeping the line passes.
+        let base = format!("#!/usr/bin/node\n{before}");
+        assert!(passes(&judge(vec![change(
+            "src/a.test.ts",
+            file(&base),
+            file(&format!("{base}// note\n"))
+        )])));
+    }
+
+    /// Item 2: the protected-link walk has a per-patch budget of
+    /// components; past it, or at a target over 4,095 bytes, every path is
+    /// protected.
+    #[test]
+    fn protected_walk_budget_fails_closed() {
+        let deps = |index| PatchViolation::Forbidden {
+            index,
+            class: ForbiddenClass::Dependencies,
+        };
+        // A guard link through an over-long target.
+        let long = "x/".repeat(2048);
+        assert_eq!(
+            judge_with(
+                vec![change("src/a.ts", file("a\n"), file("b\n"))],
+                vec![base_link(".npmrc", "x"), base_link("x", &long)]
+            ),
+            one(deps(0))
+        );
+        // Guard links whose walks together pass the budget.
+        let deep = format!("{}npmrc", "d/".repeat(2040));
+        let mut links: Vec<BaseLink> = (0..600)
+            .map(|k| base_link(&format!("p{k:03}/.npmrc"), &format!("../{deep}")))
+            .collect();
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            judge_with(vec![change("src/a.ts", file("a\n"), file("b\n"))], links),
+            one(deps(0))
+        );
     }
 }

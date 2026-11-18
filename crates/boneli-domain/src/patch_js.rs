@@ -186,12 +186,12 @@ fn both_readings(
     raw: &str,
     decoded: &Decoded,
     positions: &[usize],
-    html: bool,
+    lower: bool,
 ) -> (Vec<Region>, Vec<Region>) {
     let raw_positions: Vec<usize> = positions.iter().map(|d| decoded.raw(*d)).collect();
     (
-        classify(raw, &raw_positions, false, html),
-        classify(raw, &raw_positions, true, html),
+        classify(raw, &raw_positions, false, lower),
+        classify(raw, &raw_positions, true, lower),
     )
 }
 
@@ -573,16 +573,19 @@ fn escaped_len(bytes: &[u8], i: usize) -> usize {
 /// a literal, CR LF included as one line continuation, and only LF and CR
 /// end a quoted string (U+2028 and U+2029 are legal in one).
 ///
-/// The lexer knows one ambiguity: `/` after a word, `)` or `}` divides
-/// (`a / b`, `(a) / b`) or starts a regular expression (`return /re/`,
-/// `if (x) /re/`). `regex_when_ambiguous` picks the reading; the callers
-/// run both and take the bound that refuses, so no keyword list is
-/// needed. After an operator or at the start, `/` starts a regular
-/// expression; after a closed literal it divides. With `html`, the
-/// HTML-like comments of script code, `<!--` and `-->`, run to the end of
-/// their line wherever they stand in code. All syntax is ASCII, so the
+/// The lexer knows one ambiguity: `/` after any token that can end an
+/// expression (a word, keywords and numbers included, a closed literal,
+/// `)`, `]`, `}`, a postfix `++` or `--`, a TypeScript non-null `!`)
+/// divides (`a / b`, `x++ / 2`) or starts a regular expression
+/// (`return /re/`, `if (x) /re/`, `!/re/`). `regex_when_ambiguous` picks
+/// the reading; the callers run both and take the bound that refuses, so
+/// no keyword list is needed. After any other operator or at the start,
+/// `/` starts a regular expression. With `lower`, the reading for a lower
+/// bound, the HTML-like comments of script code, `<!--` and `-->`, run to
+/// the end of their line wherever they stand in code, and a first line
+/// that starts with `#!` (a hashbang) is a comment. All syntax is ASCII, so the
 /// lexer walks bytes; a multi-byte character never holds an ASCII byte.
-fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool) -> Vec<Region> {
+fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, lower: bool) -> Vec<Region> {
     let bytes = s.as_bytes();
     let mut out = vec![Region::Code; positions.len()];
     let mut next = 0;
@@ -593,7 +596,13 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
     // The previous significant byte in code: `a` for a word (an
     // identifier, a keyword or a number), `"` for a closed literal.
     let mut previous: Option<u8> = None;
+    // The significant byte before `previous`, to tell `++` and `--`.
+    let mut earlier: Option<u8> = None;
     let mut i = 0;
+    if lower && bytes.starts_with(b"#!") {
+        mode = Mode::LineComment;
+        i = 2;
+    }
     while i < bytes.len() {
         while let Some(&p) = positions.get(next) {
             if p > i {
@@ -608,11 +617,11 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
         let c2 = bytes.get(i + 1).copied();
         match mode {
             Mode::Code => match c {
-                b'<' if html && bytes.get(i..).is_some_and(|r| r.starts_with(b"<!--")) => {
+                b'<' if lower && bytes.get(i..).is_some_and(|r| r.starts_with(b"<!--")) => {
                     mode = Mode::LineComment;
                     i += 4;
                 }
-                b'-' if html && bytes.get(i..).is_some_and(|r| r.starts_with(b"-->")) => {
+                b'-' if lower && bytes.get(i..).is_some_and(|r| r.starts_with(b"-->")) => {
                     mode = Mode::LineComment;
                     i += 3;
                 }
@@ -627,13 +636,14 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                 b'/' => {
                     let regex = match previous {
                         None => true,
-                        Some(b'a' | b')' | b'}') => regex_when_ambiguous,
-                        Some(b'"' | b']') => false,
-                        Some(p) => b"(,=:[!&|?{};+-*%<>~^/".contains(&p),
+                        Some(b'a' | b'"' | b')' | b']' | b'}' | b'!') => regex_when_ambiguous,
+                        Some(p @ (b'+' | b'-')) if earlier == Some(p) => regex_when_ambiguous,
+                        Some(_) => true,
                     };
                     if regex {
                         mode = Mode::Regex { class: false };
                     } else {
+                        earlier = previous;
                         previous = Some(b'/');
                     }
                     i += 1;
@@ -654,6 +664,7 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                 // An identifier escape (`it`) belongs to its word.
                 b'\\' => {
                     i += escaped_len(bytes, i);
+                    earlier = previous;
                     previous = Some(b'a');
                 }
                 _ if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 => {
@@ -667,6 +678,7 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                     if i == start {
                         i += 1;
                     }
+                    earlier = previous;
                     previous = Some(b'a');
                 }
                 _ => {
@@ -676,6 +688,7 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                         _ => {}
                     }
                     if !c.is_ascii_whitespace() {
+                        earlier = previous;
                         previous = Some(c);
                     }
                     i += 1;
@@ -701,6 +714,7 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                 } else {
                     if c == quote || c == b'\n' || c == b'\r' {
                         mode = Mode::Code;
+                        earlier = previous;
                         previous = Some(b'"');
                     }
                     i += 1;
@@ -711,11 +725,13 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                     i += escaped_len(bytes, i);
                 } else if c == b'`' {
                     mode = Mode::Code;
+                    earlier = previous;
                     previous = Some(b'"');
                     i += 1;
                 } else if c == b'$' && c2 == Some(b'{') {
                     substitutions.push(depth);
                     mode = Mode::Code;
+                    earlier = previous;
                     previous = None;
                     i += 2;
                 } else {
@@ -728,6 +744,7 @@ fn classify(s: &str, positions: &[usize], regex_when_ambiguous: bool, html: bool
                 } else {
                     if is_line_end(bytes, i) || (c == b'/' && !class) {
                         mode = Mode::Code;
+                        earlier = previous;
                         previous = Some(b'"');
                     } else if c == b'[' {
                         mode = Mode::Regex { class: true };

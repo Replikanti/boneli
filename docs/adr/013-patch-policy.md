@@ -281,13 +281,37 @@ the test-file rules of D7 (markers with the key form, `TestsRemoved`,
 `config/npmrc` behind a base link `.npmrc -> config/npmrc` is a
 dependency change (review round 1 of PR #70: npm reads the registry
 through the link). Outward and absolute targets protect nothing, because
-nothing in the patch is there. A resolution that needs more than 256
-states (a state is one resolution in progress; each alias of a followed
-link and each reading adds one) gives up and protects every path, which
-refuses the whole patch. A natural chain needs one state per link it
-follows, at most 41,
-so the cap is reached only by trees built to branch, and it bounds the
-work to 256 walks of at most 4,095 bytes each.
+nothing in the patch is there.
+
+**The resolutions are bounded, and every bound fails closed** (review
+round 3 of PR #70: an agent's links with 40 KB targets made the walk
+grab memory until the process aborted at 8 GB, and 23 guard links over
+two legal 4,094-byte targets took 45 s and 1.35 GB in a release build).
+Each bound, once crossed, makes the policy protect every path, which
+refuses the whole patch:
+
+- A target over 4,095 bytes (`MAX_TARGET`, the Linux limit of this
+  section) or not UTF-8 is never walked, whether it is the protected
+  link's own or one met on the way.
+- One resolution makes at most 256 states (a state is one resolution in
+  progress; each alias of a followed link and each reading adds one),
+  counted when they are made, so at most 256 wait at any time. A natural
+  chain needs one state per link it follows, at most 41, so only trees
+  built to branch reach the cap.
+- All resolutions of one patch together walk at most 2^20 bytes: each
+  component costs its length plus one. That is 256 walks of one longest
+  target each (256 x 4,096), the bound the state cap gives one
+  resolution, now for the whole patch, however many protected links the
+  tree holds.
+
+Memory follows the work: every reached directory is a place in one arena
+shared by all resolutions (a path is stored once, however often it is
+reached), a place is made only by a step and stores its component, so
+the arena holds at most 2^20 places and 2^20 key bytes. A branch copies a
+place index and at most 41 frames that point into target components
+stored once per followed target, never the components themselves. With
+these bounds the two inputs above take under 1 ms and 3 MB, and 74 ms and
+9 MB.
 
 The same parent-prefix check applies to every regular file of the after
 side: a file beneath a link of the tree after the fix is `ThroughLink`.
@@ -365,10 +389,17 @@ strings, template literals (with `${...}` code), regular expressions and
 comments: a `\` escapes the next code point inside a literal, CR LF
 included as one line continuation, and U+2028 and U+2029 do not end a
 string. Declarations and markers are found in the decoded text and mapped
-back to raw offsets. The lexer knows one ambiguity, `/` after a word, `)`
-or `}`, which divides (`a / b`) or starts a regular expression
-(`return /re/`, `if (x) /re/`); it runs once with each reading, so no
-keyword list is needed. The base counts every declaration that not both
+back to raw offsets. The lexer knows one ambiguity: `/` after any token
+that can end an expression (a word, keywords and numbers included, a
+closed literal, `)`, `]`, `}`, a postfix `++` or `--`, a TypeScript
+non-null `!`) divides (`a / b`, `x++ / 2`, `x! / 2`) or starts a regular
+expression (`return /re/`, `if (x) /re/`, `!/re/`); after any other
+token, or at the start, it starts one. The lexer runs once with each
+reading, so no keyword list is needed. A first line that starts with
+`#!` (a hashbang) is a comment on the after side and in the base's
+marker count, and code in the base's declaration count, which keeps all
+three bounds (review round 3 of PR #70 found the
+postfix, non-null and hashbang forms reading a string as code). The base counts every declaration that not both
 readings put in a comment, strings included, with the wider call forms
 (`it!(`, `it?.(`); the after side counts a declaration only when both
 readings put it in code, and reads the HTML-like comments of script code,
