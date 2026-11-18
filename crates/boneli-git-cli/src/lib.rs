@@ -20,11 +20,14 @@
 //!   its repository explicitly, so nothing in a workspace or in the host's
 //!   environment steers it; [`Transports`] limits the URLs `fetch_base`
 //!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
+//! - [`patch_between`] describes the change between two workspaces as the
+//!   patch policy's input (ADR-013, D1).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod cli;
 mod lookalike;
 mod materialize;
+mod patch;
 mod run;
 #[cfg(test)]
 mod scratch;
@@ -33,6 +36,7 @@ mod workspace;
 
 pub use cli::{GitCli, GitCliConfig, OpenError};
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
+pub use patch::patch_between;
 pub use run::MIN_GIT_VERSION;
 pub use url::{Transports, UrlProblem};
 pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};

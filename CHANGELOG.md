@@ -410,6 +410,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DebugTicket` on the file store replay after a reopen.
 - ADR-012: the log format and its limits, durability, the unacknowledged
   tail, evidence I/O, the root rules and the lock.
+- The patch policy (ADR-013): `boneli_domain::patch_policy` judges a fix
+  diff, given as the full before and after entries of every changed path
+  and the base tree's symlinks, against size limits (25 files and 1,000
+  lines by default, Myers' line edit distance cut off at the budget),
+  forbidden paths matched on folded components (CI, container builds,
+  CODEOWNERS, git configuration, dependency files, repository metadata),
+  gitlinks, binaries and bidi controls, symlinks that leave the repository,
+  pass through a link or land on a forbidden path, and disabled JS/TS
+  tests (markers, deleted or emptied test files, test runner
+  configuration). Not yet wired into the run (#68).
+- `boneli_domain::patch_corpus`: named patches that reach every violation
+  and reason variant; the replay gate renders their verdicts in two
+  processes and its own.
+- `boneli_git_cli::patch_between`: the patch policy's input from two
+  workspaces, a lossless merge join that drops repository metadata.
 
 ### Changed
 
