@@ -402,9 +402,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without touching the file. Lines are limited to 8 MiB, depth 3 and
   65,536 values. Blobs are `evidence/sha256/<hex>`, referenced as
   `sha256:<hex>`; `get` reads only regular files and re-hashes the bytes
-  it returns, so content changed on disk is `Corrupted`. The root follows
-  `boneli-oci`'s rules (copied; extraction is #66) and is held with an
-  exclusive lock, so `open` sweeps temporary files. Passes the
+  it returns, so content changed on disk is `Corrupted`; a `put` of bytes
+  already stored syncs that blob and its directory before it returns. The
+  root follows `boneli-oci`'s rules (copied; extraction is #66) and is
+  held with an exclusive lock, so `open` sweeps temporary files. Passes the
   `EventStore` and `Evidence` contract suites; the domain corpus and
   `DebugTicket` on the file store replay after a reopen.
 - ADR-012: the log format and its limits, durability, the unacknowledged
@@ -417,6 +418,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `as_chunks` suggestions apply from that MSRV: 14 nested `if let`s and 2
   `chunks_exact` loops across the workspace are rewritten, with no change
   in behavior.
+- `OciImageStore::open` and `FsStore::open` refuse a root with a `.` or
+  `..` component before they check or create anything (ADR-012, D1).
+  Before, `<d>/missing/../gw/store` had its existing ancestors checked on
+  the text (`<d>`) while creating it resolved `..`, so it made directories
+  under an ancestor that fails the root rules before `open` refused it.
 - `sha2` leaves the dependency allowlist and docs/ARCHITECTURE.md:
   content addressing uses `boneli_https::Sha256` (ADR-009, D6). `adler2`,
   which `miniz_oxide` pulls, joins it (ADR-009, D5).

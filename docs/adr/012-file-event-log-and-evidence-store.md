@@ -38,9 +38,10 @@ plan; all six as recommended).
 
 `FsStore::open(root)` applies the root rules of ADR-009 D8 ("The store
 root"), without the overlay rule that forbids `,`, `:` and `\`: no mount
-option is built from this root. The root must be absolute; a missing root
-is created `0o700`, but only after its existing ancestors pass the check,
-and then resolved. It must be a directory owned by the uid of
+option is built from this root. The root must be absolute and must not
+have a `.` or `..` component; a missing root is created `0o700`, but only
+after its existing ancestors pass the check, and then resolved. It must
+be a directory owned by the uid of
 `/proc/self` with no group or other permission bits, and its ancestors
 must pass sshd's `StrictModes` rule: each owned by root or the caller and
 not writable by its group or others unless it is sticky; the filesystem
@@ -51,6 +52,20 @@ store's lifetime; `WouldBlock` is `OpenError::InUse`), creates `runs/` and
 directories (a symlink to another directory, for example), removes every
 file in them whose name starts with `.tmp-` (a removal that fails is
 skipped), and `fsync`s the root and the three directories.
+
+Why no `.` or `..`: the check before creation finds the existing
+ancestors by walking the root's text, and creation resolves `..` against
+the filesystem, so the two can disagree. `<d>/missing/../gw/store` checks
+`<d>`, the deepest existing ancestor of the text, while creation makes
+`<d>/missing` and `<d>/gw/store`, under `gw` whatever its mode; the check
+of the resolved root then refuses it, but the directories stay (review
+of #67). The rule is lexical and runs before any filesystem access, on
+the path's bytes split at `/`, because `Path::components` drops every `.`
+but a leading one. Refusing `.` as well costs nothing (a root never needs
+one) and keeps the rule one sentence. Rejected: resolving the deepest
+existing ancestor and checking each component before creating it, which
+is longer and still has to define what `..` means past a component that
+does not exist yet.
 
 Why the rules matter here: the log has no integrity check of its own
 (D7), so whoever can rename an entry of an ancestor can swap the root
@@ -66,7 +81,11 @@ cannot depend on another adapter (`tools/check_architecture.py`, rule
 crates and a role change in `tools/architecture.toml` into a medium issue
 (decision 6). A fix to one copy goes into the other; a comment at each
 copy names the other. Extracting them into a shared support crate is
-#66.
+#66. The `.` and `..` rule above is the first such fix: this PR adds it
+to `boneli-oci`'s `check_root_text` too, with the same test
+(`root_dot_components_refused` in both crates). It narrows ADR-009 D8's
+root rules for that crate; ADR-009 is accepted and keeps its text, so
+this ADR is the record of the change.
 
 **The lock and the MSRV.** `File::try_lock` is stable since Rust 1.89.0,
 and clippy's `incompatible_msrv` refuses it under `-D warnings` while the
@@ -256,6 +275,22 @@ justified):
   is an accepted event and the log still replays.
 - `put`: write `evidence/sha256/.tmp-<n>`, `sync_data`, rename it onto the
   final name, `fsync` `evidence/sha256/`, then return the reference.
+- `put` of bytes already stored (D6): `sync_data` the existing blob
+  through the descriptor it was verified on and `fsync`
+  `evidence/sha256/`, then return the reference; a failed sync is
+  `Unavailable`. Why: the writer that renamed the blob into place may
+  have died before its directory sync (or that sync failed and its `put`
+  returned an error), and the runner restarted without a reboot. The
+  blob then reads and verifies from the page cache while its directory
+  entry is not durable, and a run that logs its reference after the
+  dedup `put` could leave a durable event pointing at a blob that power
+  loss removes (review of #67). The cost is one file sync and one
+  directory sync per dedup `put`, the same as a fresh one. Pinned in
+  part only: `dedup_put_syncs_the_existing_blob` makes the directory
+  unreadable so its `fsync` cannot open it, which catches a missing
+  directory sync; a missing `sync_data` of the blob is not caught by
+  any test, because neither power loss nor a failing `fdatasync` on a
+  readable regular file can be produced here.
 - Why every acknowledgement is durable: `DebugTicket` logs a reference
   right after `put`, so a blob that is not yet durable could leave a
   durable event pointing at nothing; a lost `PullRequestOpened` or
@@ -313,7 +348,8 @@ exactly its size, and hashes the buffer it returns, not the file. A
 mismatch is `Corrupted`. The logs are opened the same way.
 
 `put` returns the reference when the existing file under that name
-verifies, and otherwise writes it again (D4). Rewriting is always safe,
+verifies, after syncing it and its directory, and otherwise writes it
+again (D4). Rewriting is always safe,
 because the new bytes hash to the name, so a tampered blob is repaired by
 the next `put` of the genuine bytes, and concurrent puts of the same
 bytes rename equal files onto one name.
