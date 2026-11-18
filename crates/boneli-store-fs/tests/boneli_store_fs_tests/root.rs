@@ -133,6 +133,47 @@ fn root_ancestor_rules() {
     }
 }
 
+/// A root with a `.` or `..` component is refused on its text, before
+/// `open` checks or creates anything, whether the directory it names would
+/// pass or not. Without the rule, `<d>/missing/../gw/store` checks `<d>`,
+/// the existing ancestor of the text, and creating it makes `<d>/missing`
+/// and `<d>/gw/store` under a group-writable `gw` before the check of the
+/// resolved root refuses it (review of #67).
+#[test]
+fn root_dot_components_refused() {
+    let tmp = TempDir::new("root-dots");
+    let gw = tmp.path().join("gw");
+    std::fs::create_dir(&gw).expect("dir");
+    chmod(&gw, 0o777);
+    let ok = tmp.path().join("ok");
+    std::fs::create_dir(&ok).expect("dir");
+    chmod(&ok, 0o700);
+    for dotted in [
+        "missing/../gw/store",
+        "missing/./../gw/store",
+        "ok/../ok/store",
+        "ok/./store",
+        "ok/store/.",
+        "ok/store/..",
+        "ok/store/../store",
+        "./ok/store",
+    ] {
+        let root = tmp.path().join(dotted);
+        match FsStore::open(&root) {
+            Err(OpenError::Root { path, reason }) => {
+                assert_eq!(path, root, "{dotted}");
+                assert!(reason.contains("`..`"), "{dotted}: {reason}");
+            }
+            other => panic!("{dotted}: {root:?} gave {other:?}"),
+        }
+        assert_eq!(names_in(tmp.path()), vec!["gw", "ok"], "{dotted}");
+        assert!(names_in(&gw).is_empty(), "{dotted}: created under gw");
+        assert!(names_in(&ok).is_empty(), "{dotted}: created under ok");
+    }
+    // The same roots without the dots open.
+    FsStore::open(&ok.join("store")).expect("the plain root");
+}
+
 /// A root owned by someone else is refused before anything is written:
 /// `/usr`, which is root's on every Linux host and CI runner. A run as root
 /// would own it, so the check does not apply there.

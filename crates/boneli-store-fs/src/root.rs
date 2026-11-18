@@ -123,6 +123,15 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
     }
 }
 
+/// Whether `path` has a `.` or `..` component. Decided on the bytes:
+/// `Path::components` drops every `.` but a leading one.
+fn has_dot_component(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .split(|&b| b == b'/')
+        .any(|c| c == b"." || c == b"..")
+}
+
 /// Checks the root, takes the lock, prepares the directories and sweeps
 /// them; returns the resolved root and the locked file.
 pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
@@ -130,6 +139,14 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
         return Err(OpenError::Root {
             path: root.to_path_buf(),
             reason: "must be an absolute path",
+        });
+    }
+    // The check before creation walks the root's text, which `..` makes
+    // name an ancestor other than the one creation resolves to (D1).
+    if has_dot_component(root) {
+        return Err(OpenError::Root {
+            path: root.to_path_buf(),
+            reason: "must not have a `.` or `..` component",
         });
     }
     let uid = own_uid(root)?;

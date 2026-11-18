@@ -194,8 +194,13 @@ fn own_uid(at: &Path) -> Result<u32, Error> {
 }
 
 /// The text rules of a root, before and after it is resolved: absolute,
-/// UTF-8, and none of `,`, `:` and `\`, which overlay mount options use as
-/// separators and escapes (ADR-007, D7).
+/// no `.` or `..` component, UTF-8, and none of `,`, `:` and `\`, which
+/// overlay mount options use as separators and escapes (ADR-007, D7).
+/// `open` checks the existing ancestors of a missing root on its text
+/// before it creates it, and `..` would make that text name an ancestor
+/// other than the one creation resolves to (ADR-012, D1). The components
+/// are split on the bytes: `Path::components` drops every `.` but a
+/// leading one.
 fn check_root_text(path: &Path) -> Result<(), Error> {
     let refuse = |reason| {
         Err(Error::Root {
@@ -205,6 +210,14 @@ fn check_root_text(path: &Path) -> Result<(), Error> {
     };
     if !path.is_absolute() {
         return refuse("must be an absolute path");
+    }
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|&b| b == b'/')
+        .any(|c| c == b"." || c == b"..")
+    {
+        return refuse("must not have a `.` or `..` component");
     }
     let Some(text) = path.to_str() else {
         return refuse("must be UTF-8");
@@ -338,9 +351,10 @@ fn probe_overlay_format(dir: &Path) -> Result<(), Error> {
 impl OciImageStore {
     /// Opens the store at `root`:
     ///
-    /// - `root` must be absolute, UTF-8 and free of `,`, `:` and `\`; it is
-    ///   created with mode `0o700` where it is missing, once its existing
-    ///   ancestors pass the check below, resolved, and checked again;
+    /// - `root` must be absolute, without a `.` or `..` component, UTF-8
+    ///   and free of `,`, `:` and `\`; it is created with mode `0o700`
+    ///   where it is missing, once its existing ancestors pass the check
+    ///   below, resolved, and checked again;
     /// - it must be a directory owned by the caller with no group or other
     ///   permission bits;
     /// - each of its ancestors must be owned by root or the caller and not

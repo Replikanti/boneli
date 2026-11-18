@@ -101,9 +101,10 @@ pub struct FsStore {
 impl FsStore {
     /// Opens the store at `root`, creating it `0o700` where it is missing.
     ///
-    /// The root must be absolute, a directory owned by the caller with no
-    /// group or other permission bits, and its ancestors must pass sshd's
-    /// `StrictModes` rule; a symlinked root is resolved first. `open` takes
+    /// The root must be absolute without a `.` or `..` component, a
+    /// directory owned by the caller with no group or other permission
+    /// bits, and its ancestors must pass sshd's `StrictModes` rule; a
+    /// symlinked root is resolved first. `open` takes
     /// the exclusive lock (`InUse` while another store holds it), removes
     /// the temporary files a crashed store left, and syncs the directories
     /// (ADR-012, D1).
