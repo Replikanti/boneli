@@ -80,7 +80,9 @@ fn assert_inert(markdown: &str) {
             assert!(!line.starts_with(marker), "{line:?}");
         }
         assert!(!line.starts_with(' '), "{line:?}");
-        assert!(!line.contains('@'), "{line:?}");
+        // The reader's note names `@` and `#` in inline code; outside code
+        // only the generated `Fixes #N` line references anything.
+        assert!(line == "Fixes #7" || !has_reference(line), "{line:?}");
     }
     for c in markdown.chars() {
         assert!(
@@ -652,4 +654,46 @@ fn questions_comment_caps_at_65536_bytes() {
             .contains('\r')
     );
     let _ = render::MAX_LINK;
+}
+
+#[test]
+fn reader_note_lists_every_substitution() {
+    use std::collections::BTreeSet;
+    let note = render::substitutions_note();
+    for s in render::SUBSTITUTIONS {
+        let shown = render::neutralize(s.sample);
+        assert!(shown.contains(s.replacement), "{s:?}: {shown:?}");
+        assert!(!shown.contains(s.original), "{s:?}: {shown:?}");
+        let entry = format!(
+            "`{}`{} as `{}` (U+{:04X})",
+            s.original,
+            s.context,
+            s.replacement,
+            u32::from(s.replacement)
+        );
+        assert!(note.contains(&entry), "the note misses {entry}: {note}");
+    }
+    // Every character `neutralize` can introduce is in the table: run it
+    // over all printable ASCII and every trigger, and collect what is new.
+    let mut input: String = (0x20u8..=0x7e).map(char::from).collect();
+    input.push_str(" github.com GITHUB.COM GitHub.Com gh-1 GH-9 #1 @a ");
+    for s in render::SUBSTITUTIONS {
+        input.push_str(s.sample);
+        input.push(' ');
+    }
+    let introduced: BTreeSet<char> = render::neutralize(&input)
+        .chars()
+        .filter(|c| !input.contains(*c))
+        .collect();
+    let listed: BTreeSet<char> = render::SUBSTITUTIONS
+        .iter()
+        .map(|s| s.replacement)
+        .collect();
+    assert_eq!(introduced, listed);
+    // Every body and comment carries the note, and it forms no reference.
+    let body = pull_request_body(&request(), &repository()).text;
+    assert!(body.contains(&note), "{body}");
+    assert!(questions_comment(&["q".to_owned()]).text.contains(&note));
+    assert!(!has_reference(&note), "{note}");
+    assert!(note.contains("`\\u{XXXX}` escapes"), "{note}");
 }

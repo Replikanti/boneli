@@ -110,24 +110,99 @@ fn starts_with_ci(text: &str, prefix: &str) -> bool {
 /// case) before a digit → `‑` (U+2011). GitHub recognises none of these
 /// as a reference, mention or URL, in Markdown or in a commit message.
 pub fn neutralize(text: &str) -> String {
+    let [hash, at, dot, hyphen] = &SUBSTITUTIONS;
     let mut out = String::with_capacity(text.len());
     for (i, c) in text.char_indices() {
         let (before, after) = (&text[..i], &text[i + c.len_utf8()..]);
-        match c {
-            '#' => out.push('\u{FF03}'),
-            '@' => out.push('\u{FF20}'),
-            '.' if ends_with_ci(before, "github") && starts_with_ci(after, "com") => {
-                out.push('\u{2024}')
-            }
-            '-' if ends_with_ci(before, "gh")
-                && after.as_bytes().first().is_some_and(u8::is_ascii_digit) =>
-            {
-                out.push('\u{2011}')
-            }
-            _ => out.push(c),
-        }
+        let replacement = if c == hash.original {
+            hash.replacement
+        } else if c == at.original {
+            at.replacement
+        } else if c == dot.original
+            && ends_with_ci(before, "github")
+            && starts_with_ci(after, "com")
+        {
+            dot.replacement
+        } else if c == hyphen.original
+            && ends_with_ci(before, "gh")
+            && after.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            hyphen.replacement
+        } else {
+            c
+        };
+        out.push(replacement);
     }
     out
+}
+
+/// One substitution of [`neutralize`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Substitution {
+    /// The character replaced.
+    pub original: char,
+    /// What replaces it.
+    pub replacement: char,
+    /// Where it is replaced, as the reader's note says it: empty for
+    /// everywhere.
+    pub context: &'static str,
+    /// An input that triggers it, for the test that keeps the note and the
+    /// function in step.
+    pub sample: &'static str,
+}
+
+/// Every substitution [`neutralize`] makes, in the order the reader's note
+/// lists them. The function reads its characters from here, and the note
+/// in every body and comment ([`substitutions_note`]) is built from here,
+/// so a reader can undo each one (ADR-014, D8).
+pub const SUBSTITUTIONS: [Substitution; 4] = [
+    Substitution {
+        original: '#',
+        replacement: '\u{FF03}',
+        context: "",
+        sample: "#1",
+    },
+    Substitution {
+        original: '@',
+        replacement: '\u{FF20}',
+        context: "",
+        sample: "@user",
+    },
+    Substitution {
+        original: '.',
+        replacement: '\u{2024}',
+        context: " in `github.com`",
+        sample: "github.com",
+    },
+    Substitution {
+        original: '-',
+        replacement: '\u{2011}',
+        context: " in `GH-` before a digit",
+        sample: "GH-1",
+    },
+];
+
+/// The reader's note on what [`escape`] and [`neutralize`] change, built
+/// from [`SUBSTITUTIONS`]: each character, its replacement and the
+/// replacement's code point, so a reader who searches for a quoted line
+/// can undo them.
+pub fn substitutions_note() -> String {
+    let listed: Vec<String> = SUBSTITUTIONS
+        .iter()
+        .map(|s| {
+            format!(
+                "`{}`{} as `{}` (U+{:04X})",
+                s.original,
+                s.context,
+                s.replacement,
+                u32::from(s.replacement)
+            )
+        })
+        .collect();
+    format!(
+        "control and invisible characters in it are shown as `\\u{{XXXX}}` escapes, and so that it cannot link to an issue or mention anyone, {}; undo these to search the repository for a quoted line",
+        listed.join(", ")
+    )
 }
 
 /// Agent or reporter text as it is shown: escaped, then neutralized.
@@ -459,8 +534,6 @@ fn assemble(parts: Vec<Part>) -> Rendered {
     }
 }
 
-const ESCAPES: &str = "control and invisible characters in it are shown as `\\u{XXXX}`";
-
 fn cut_marker(reference: &str) -> String {
     match shown_id(reference) {
         Some(r) => format!(
@@ -589,7 +662,8 @@ pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -
 
     assemble(vec![
         Part::Fixed(format!(
-            "{ticket_line}\n\nBoneli reproduced this bug with a failing test, traced it to the cited lines and verified this fix in a clean sandbox. Text written by the agent or the reporter is shown as code; {ESCAPES} escapes.\n\n### Root cause\n\n"
+            "{ticket_line}\n\nBoneli reproduced this bug with a failing test, traced it to the cited lines and verified this fix in a clean sandbox. Text written by the agent or the reporter is shown as code; {}.\n\n### Root cause\n\n",
+            substitutions_note()
         )),
         Part::Block(Block {
             units: citations,
@@ -621,7 +695,8 @@ pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -
 pub fn questions_comment(questions: &[String]) -> Rendered {
     let n = questions.len();
     let mut parts = vec![Part::Fixed(format!(
-        "Boneli needs more information before it can reproduce this bug. The questions below were written by its agent and are shown as code; {ESCAPES} escapes.\n\n"
+        "Boneli needs more information before it can reproduce this bug. The questions below were written by its agent and are shown as code; {}.\n\n",
+        substitutions_note()
     ))];
     for (k, question) in questions.iter().take(MAX_QUESTIONS).enumerate() {
         parts.push(Part::Fixed(format!("### Question {} of {n}\n\n", k + 1)));

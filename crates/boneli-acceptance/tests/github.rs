@@ -295,6 +295,67 @@ fn trace2_data(trace: &Path, key: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Every connected, cross-referenced and referenced event on issue `n`'s
+/// timeline, through every page, as (type, the linking pull request's or
+/// issue's node id, or the referencing commit's SHA).
+fn link_events(rest: &Rest, repository: &GitHubRepository, n: u64) -> Vec<(String, String)> {
+    const QUERY: &str = "query($o:String!,$n:String!,$i:Int!,$c:String){repository(owner:$o,name:$n){issue(number:$i){timelineItems(first:100,after:$c,itemTypes:[CONNECTED_EVENT,CROSS_REFERENCED_EVENT,REFERENCED_EVENT]){pageInfo{hasNextPage endCursor} nodes{__typename ... on ConnectedEvent{subject{... on PullRequest{id} ... on Issue{id}}} ... on CrossReferencedEvent{source{... on PullRequest{id} ... on Issue{id}}} ... on ReferencedEvent{commit{oid}}}}}}}";
+    use boneli_json::{Number, Object, Value};
+    let mut items = Vec::new();
+    let mut cursor = Value::Null;
+    for page in 0.. {
+        assert!(page < 100, "issue {n}'s timeline has more than 100 pages");
+        let mut variables = Object::new();
+        variables.insert("o", Value::String(repository.owner().to_owned()));
+        variables.insert("n", Value::String(repository.name().to_owned()));
+        variables.insert("i", Value::Number(Number::from(n)));
+        variables.insert("c", cursor.clone());
+        let mut body = Object::new();
+        body.insert("query", Value::String(QUERY.to_owned()));
+        body.insert("variables", Value::Object(variables));
+        let body = boneli_json::to_vec(&Value::Object(body)).expect("the query");
+        let (status, answer) = rest.call("POST", "/graphql", "application/json", Some(&body));
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+        let answer = json(&answer);
+        let timeline = answer
+            .get("data")
+            .and_then(|d| d.get("repository"))
+            .and_then(|r| r.get("issue"))
+            .and_then(|i| i.get("timelineItems"))
+            .unwrap_or_else(|| panic!("no timeline for issue {n}: {answer:?}"));
+        for node in timeline
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .expect("timeline nodes")
+        {
+            let kind = node
+                .get("__typename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id = ["subject", "source"]
+                .iter()
+                .find_map(|k| {
+                    node.get(k)
+                        .and_then(|v| v.get("id"))
+                        .and_then(|v| v.as_str())
+                })
+                .or_else(|| {
+                    node.get("commit")
+                        .and_then(|c| c.get("oid"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("");
+            items.push((kind.to_owned(), id.to_owned()));
+        }
+        let info = timeline.get("pageInfo").expect("pageInfo");
+        if info.get("hasNextPage").and_then(|v| v.as_bool()) != Some(true) {
+            break;
+        }
+        cursor = info.get("endCursor").cloned().expect("endCursor");
+    }
+    items
+}
+
 #[test]
 #[ignore = "network: needs the operator's GitHub App, docs/forge-github.md"]
 fn opens_a_pull_request_on_the_test_repository() {
@@ -317,12 +378,9 @@ fn opens_a_pull_request_on_the_test_repository() {
     let decoy: u64 = decoy
         .parse()
         .expect("BONELI_GITHUB_DECOY_ISSUE is a number");
-    assert_ne!(decoy, issue_number, "the decoy must be another issue");
-    let started = boneli_forge_github::time::format_rfc3339(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("a clock after 1970")
-            .as_secs(),
+    assert_ne!(
+        decoy, issue_number,
+        "BONELI_GITHUB_DECOY_ISSUE must be another issue than BONELI_GITHUB_ISSUE"
     );
     let decoys = decoy_forms(&repo, decoy);
     let base = CommitSha::parse(&base).expect("BONELI_GITHUB_BASE is a full SHA");
@@ -351,6 +409,31 @@ fn opens_a_pull_request_on_the_test_repository() {
     let accept = "application/vnd.github+json";
     let full = "application/vnd.github.full+json";
     let repo_path = format!("/repos/{}", repository.full_name());
+    // Both issues exist, are open and are issues, not pull requests:
+    // otherwise the closing-reference and timeline checks below would
+    // check nothing (a pull request cannot be closed by a reference).
+    for (variable, n) in [
+        ("BONELI_GITHUB_ISSUE", issue_number),
+        ("BONELI_GITHUB_DECOY_ISSUE", decoy),
+    ] {
+        let (status, answer) = rest.call(
+            "GET",
+            &format!("{repo_path}/issues/{n}"),
+            "application/vnd.github+json",
+            None,
+        );
+        assert_eq!(status, 200, "{variable}: issue {n} cannot be read");
+        let answer = json(&answer);
+        assert!(
+            answer.get("pull_request").is_none(),
+            "{variable}: {n} is a pull request, not an issue"
+        );
+        assert_eq!(
+            answer.get("state").and_then(|v| v.as_str()),
+            Some("open"),
+            "{variable}: issue {n} is not open"
+        );
+    }
 
     // A token exchange of the test's own, to measure its answer (D10).
     let key = load_key(Path::new(&key_file)).expect("the key file");
@@ -588,37 +671,38 @@ fn opens_a_pull_request_on_the_test_repository() {
     println!("closing references: {closes:?}");
     assert_eq!(closes, [issue_number], "the closing references");
 
-    // The decoy's timeline: no cross-reference from this pull request, and
-    // no connected or referenced event since the test started.
-    let (status, timeline) = rest.call(
-        "GET",
-        &format!("{repo_path}/issues/{decoy}/timeline?per_page=100"),
-        accept,
-        None,
+    // The timelines, read in full through GraphQL, where every link
+    // event names its pull request or commit: identified by the pull
+    // request's node id and the pushed commit, not by the clock. The
+    // target must show the pull request's link (a positive control: the
+    // query sees links at all; GitHub records them asynchronously, so it
+    // is retried for up to a minute), and the decoy must show none.
+    let pull_id = get_str(&pull_json, &["node_id"]).to_owned();
+    let pushed = get_str(&pull_json, &["head", "sha"]).to_owned();
+    let from_this_pull = |item: &(String, String)| item.1 == pull_id || item.1 == pushed;
+    let mut target_items = Vec::new();
+    for _ in 0..6 {
+        target_items = link_events(&rest, &repository, issue_number);
+        if target_items.iter().any(from_this_pull) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    }
+    assert!(
+        target_items.iter().any(from_this_pull),
+        "the target issue's timeline shows no link from the pull request: {target_items:?}"
     );
-    assert_eq!(status, 200, "the decoy's timeline");
-    let timeline = json(&timeline);
-    for event in timeline.as_array().expect("timeline events") {
-        let kind = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
-        let at = event
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let from_this_pull = event
-            .get("source")
-            .and_then(|s| s.get("issue"))
-            .and_then(|i| i.get("number"))
-            .and_then(|v| v.as_number())
-            .and_then(|v| v.as_u64())
-            == Some(number);
+    let decoy_items = link_events(&rest, &repository, decoy);
+    println!(
+        "timelines: target {} link events, decoy {}",
+        target_items.len(),
+        decoy_items.len()
+    );
+    for item in &decoy_items {
         assert!(
-            !(kind == "cross-referenced" && from_this_pull),
-            "the decoy got a cross-reference from the pull request"
-        );
-        assert!(
-            !(matches!(kind, "connected" | "referenced" | "cross-referenced")
-                && at >= started.as_str()),
-            "the decoy got a {kind} event at {at}"
+            !from_this_pull(item),
+            "the decoy got a {} from the pull request",
+            item.0
         );
     }
     let head_sha = get_str(&pull_json, &["head", "sha"]).to_owned();

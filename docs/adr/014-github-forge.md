@@ -552,9 +552,28 @@ the adapter (`render`), because the format depends on the forge (ADR-004).
   a zero-width joiner or an escape: an invisible character is exactly
   what the escape rule shows as `\u{XXXX}`, and a reader should see that
   the text was changed; the fullwidth forms read as the original.
+  **The reader is told.** U+2024 and U+2011 look like `.` and `-`, so a
+  quoted line (a Go `import "github.com/x/y"`) would look verbatim and
+  not be found by a search (review round 2 of #73). The intro of every
+  body and comment therefore names each substitution with its
+  replacement and code point, `` `#` as `＃` (U+FF03), `@` as `＠`
+  (U+FF20), `.` in `github.com` as `․` (U+2024), `-` in `GH-` before a
+  digit as `‑` (U+2011) ``, and says to undo them before searching. The
+  function and the note read the same table, `render::SUBSTITUTIONS`
+  (`reader_note_lists_every_substitution`: every entry is in the note,
+  and every character `neutralize` introduces over all printable ASCII
+  and every trigger is in the table).
   The citation permalink is generated, but its path is the agent's, so
   the same two dots and hyphens are percent-encoded there too (`#` and
   `@` are encoded anyway); the link still resolves to the same path.
+  Measured on 2026-11-19 against github.com, on this repository's public
+  commit `25b0800`: `blob/25b0800/crates/boneli%2Dhttps/Cargo%2Etoml`
+  answered HTTP 200 and the page's resolved `"path"` was
+  `crates/boneli-https/Cargo.toml`; lower-case `%2d`/`%2e` also answered
+  200; a path that does not exist answered 404 encoded and unencoded
+  alike (`curl` status plus the resolved path in the page). Assumed, not
+  measured: private repositories go through the same web routing, so
+  their permalinks decode alike.
   `references_never_form_in_free_text` checks all nine keywords in three
   cases, with and without a colon, before `#5`, `owner/repo#5`, another
   repository's `#5`, `GH-5`, `gh-5`, issue and pull URLs (`http`, `www`,
@@ -736,10 +755,16 @@ only GitHub's rendering, the test also checks GitHub's own linkage
 `#D`, `owner/repo#D`, `GH-D` and its issue and pull URLs in the ticket
 title, the questions and every block of agent text. The pull request's
 `closingIssuesReferences` (GraphQL) must be exactly the target issue, no
-anchor may point at the decoy, and the decoy's timeline must hold no
-`cross-referenced` event from the pull request and no `connected`,
-`referenced` or `cross-referenced` event since the test started
-(`issues: write` covers reading it). A target issue numbered like a
+anchor may point at the decoy, and the decoy's whole timeline (GraphQL
+`timelineItems`, every page) must hold no `ConnectedEvent`,
+`CrossReferencedEvent` or `ReferencedEvent` whose pull request is the
+test's (by node id) or whose commit is the pushed one; events are
+identified by those ids, not by the runner's clock, and the same query
+on the target issue must find the pull request's link, a positive
+control that the query sees links at all (review round 2 of #73). Before
+anything is created, both issues must be open issues, not pull requests,
+and different, or the test fails naming the variable
+(`issues: write` covers reading them). A target issue numbered like a
 hostile reference can no longer make the anchor check pass vacuously,
 since the decoy is a different issue the test names.
 

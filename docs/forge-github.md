@@ -118,29 +118,32 @@ cargo test -p boneli-acceptance --test github -- --ignored --nocapture
 
 The test:
 
-1. measures a token exchange and the repository object of its own;
-2. posts a comment of hostile questions on the target issue (mentions of
+1. checks that `BONELI_GITHUB_ISSUE` and `BONELI_GITHUB_DECOY_ISSUE` are
+   two different open issues, not pull requests, and fails naming the
+   variable otherwise;
+2. measures a token exchange and the repository object of its own;
+3. posts a comment of hostile questions on the target issue (mentions of
    the `ghost` placeholder account, closing keywords before `#D`,
    `owner/repo#D`, `GH-D` and the decoy's issue and pull URLs, markup, CR,
    U+202E) and checks in GitHub's `body_html` that none of it became a
    mention or a link;
-3. fetches the base through the git adapter with the App's token, makes a
+4. fetches the base through the git adapter with the App's token, makes a
    one-line change to `README.md`, and opens a pull request through the
    forge whose ticket title, analysis, test and citation quote carry the
    same hostile text (a 70 KB analysis, a title cut to 256 bytes, a
    citation path with a space);
-4. checks the result: the head is a `boneli/` branch whose one parent is
+5. checks the result: the head is a `boneli/` branch whose one parent is
    the base and which changes `README.md` only, the base is the default
    branch, the pull request is not a draft, the body is at most 65,536
    bytes, its only issue link is the `Fixes` line, nothing links to the
    decoy, GitHub's closing references (GraphQL
-   `closingIssuesReferences`) are exactly the target issue, and the
-   decoy's timeline has no cross-reference from the pull request and no
-   `connected`, `referenced` or `cross-referenced` event since the test
-   started;
-5. prints the response sizes (`size ...` lines) and what the push sent
+   `closingIssuesReferences`) are exactly the target issue, the target's
+   timeline shows the pull request's link (a positive control), and the
+   decoy's whole timeline has no connected, cross-referenced or
+   referenced event from the pull request or its commit;
+6. prints the response sizes (`size ...` lines) and what the push sent
    (`push: pack-objects wrote [...] objects`);
-6. cleans up: closes the pull request and deletes the branch and the
+7. cleans up: closes the pull request and deletes the branch and the
    comment, also when an assertion failed.
 
 Record the printed sizes and the push line in ADR-014 (D10 and D2) when
