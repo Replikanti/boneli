@@ -1,0 +1,32 @@
+[package]
+name = "boneli-acceptance"
+description = "Test-only composition root: live acceptance tests that wire real adapters against real services, gated behind #[ignore] (ADR-014, D12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Test-only composition root (ADR-014, D12): nothing depends on it, and it
+# is the one place that wires boneli-git-cli and boneli-forge-github
+# together. The edges are regular dependencies, not dev-dependencies, so
+# the architecture check sees them and holds the crate to the root rules.
+[dependencies]
+# The run's values the live test builds a pull request from.
+boneli-domain.workspace = true
+# The `Git` and `Forge` ports, and the pull-request request.
+boneli-app.workspace = true
+# The git adapter that fetches the private test repository and pushes the
+# fix branch with the App's token (ADR-014, D1 and D3).
+boneli-git-cli.workspace = true
+# The adapter under test (ADR-014).
+boneli-forge-github.workspace = true
+# The live test's own reads and its cleanup on GitHub: the HTTP client,
+# TLS to api.github.com and JSON. Support crates, no new external edge.
+boneli-http.workspace = true
+boneli-https.workspace = true
+boneli-json.workspace = true

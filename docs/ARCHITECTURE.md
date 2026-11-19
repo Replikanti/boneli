@@ -126,7 +126,7 @@ The states, events, commands and terminal outcomes of the run, the budget units 
 - **Judgment parts** are checked by a second agent in a review step. Every finding cites a specific paragraph of the standard, and the citation is verified the same way as in the root cause analysis. Findings go into the pull request; only the checkable part blocks.
 - The pull request states which version of the standards the run used.
 
-**Git.** The runner holds a short-lived token (GitHub App, GitLab project token without merge rights). The sandbox gets a snapshot without remotes, hooks or credential helpers: the files of the base tree plus a generated one-commit `.git` (depth 1, only the base commit and its tree). Only the diff comes back, and the host's git reads it with a cleared environment, command-scope config and an explicit `--git-dir`, so nothing in the workspace, its `.git` included, steers it (ADR-010).
+**Git.** The runner holds a short-lived token (GitHub App, GitLab project token without merge rights). The sandbox gets a snapshot without remotes, hooks or credential helpers: the files of the base tree plus a generated one-commit `.git` (depth 1, only the base commit and its tree). Only the diff comes back, and the host's git reads it with a cleared environment, command-scope config and an explicit `--git-dir`, so nothing in the workspace, its `.git` included, steers it (ADR-010). The fix reaches the customer's repository as a new `boneli/` branch, committed on the base alone and pushed create-only through the `Git` port with the GitHub App's installation token, which lives only in that git process's environment; the GitHub forge then opens the pull request, ready for review, with the agent's and the reporter's text only in code blocks (ADR-014).
 
 ## Environment and data
 
@@ -232,6 +232,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 - **Support crates** (`boneli-sys`, `boneli-http`, `boneli-https`, ...): generic plumbing that adapters use, without any knowledge of the domain. `boneli-https` is the only place for TLS.
 - **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
 - **Replay check** (`boneli-replay-check`, test only): a composition root that nothing depends on. It folds the domain's scenario corpus and plays its own app corpus (`DebugTicket` end to end on the in-memory adapters, with every fault kind injected at every port call of every hand-written scenario) in two child processes and in its own and compares the `Debug` output byte for byte, the gate for address leaks from the core (ADR-001, ADR-002, ADR-004).
+- **Acceptance** (`boneli-acceptance`, test only): a composition root that nothing depends on, for live tests that wire real adapters against real services: today `boneli-git-cli` and `boneli-forge-github` on the operator's private GitHub test repository. Its tests are ignored in CI and run by hand (ADR-014, D12; `docs/forge-github.md`).
 
 **Use cases** cover every part on top of one core: `BuildEnvironment`, `OnboardRepo`, `DebugTicket`, `BuildCase`, `RunBench`.
 
