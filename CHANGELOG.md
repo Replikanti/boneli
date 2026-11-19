@@ -463,9 +463,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   600 s of it remain, at most an hour, refreshed once on a `401`.
   `open_pull_request` pushes the fix to a new `boneli/<run>-<nonce>`
   branch through the `Git` port and opens the pull request ready for
-  review, with `Fixes #N` for a GitHub ticket; an ambiguous creation is
-  looked up once by its branch. Agent and reporter text appears only in
-  indented code blocks with control and invisible characters escaped;
+  review, with `Fixes #N` for a GitHub ticket `owner/name#N` of the
+  configured repository; an ambiguous creation is looked up once by its
+  branch. Agent and reporter text appears only in indented code blocks
+  with control and invisible characters escaped, and in the title, the
+  body and the commit message it can form no issue reference or mention
+  (`#` and `@` shown fullwidth, `github.com` and `GH-N` broken);
   bodies and comments are capped at 65,536 bytes, titles at 256. Five
   endpoints, GET or POST only; responses parsed under limits; failures
   cost nothing and never carry a body, token, JWT or key bytes.

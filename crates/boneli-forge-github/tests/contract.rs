@@ -11,11 +11,11 @@ use support::*;
 
 #[test]
 fn github_forge_passes_contract() {
-    // Only an issue number of the configured repository can take a
-    // comment, so the suite's ticket is GitHub issue 1.
+    // Only an issue of the configured repository can take a comment, so
+    // the suite's ticket is `owner/name#1` of that repository.
     let ticket = Ticket {
         source: TicketSource::GitHub,
-        key: "1".to_owned(),
+        key: "octo-org/demo.repo#1".to_owned(),
         title: "Contract suite ticket".to_owned(),
         body: String::new(),
     };

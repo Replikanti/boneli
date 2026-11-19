@@ -80,7 +80,7 @@ fn pull_request_request_is_exact() {
     let (_, commit) = git.pushed.lock().expect("pushed")[0].clone();
     assert_eq!(
         commit.message(),
-        "boneli: fix for GitHub ticket 7\n\nRun run-1\n"
+        "boneli: fix for GitHub ticket octo-org/demo.repo\u{ff03}7\n\nRun run-1\n"
     );
     assert_eq!(commit.name(), "boneli-test[bot]");
     let create = &calls[2];
@@ -306,7 +306,7 @@ fn post_with(
     let fake = hub.fake(move |seen| seen.target.contains("/issues/").then(&reply));
     let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
     (
-        github.post_questions(&ticket("7"), &["Which version?".to_owned()]),
+        github.post_questions(&ticket(KEY), &["Which version?".to_owned()]),
         fake,
     )
 }
@@ -609,7 +609,7 @@ fn failure_details_never_carry_secrets() {
         let fake = Fake::new(echo(status));
         let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
         let failure = github
-            .post_questions(&ticket("7"), &["q".to_owned()])
+            .post_questions(&ticket(KEY), &["q".to_owned()])
             .expect_err("refused");
         assert!(failure.detail().contains("[redacted]"), "{failure:?}");
         check(&failure, &fake);
@@ -624,7 +624,7 @@ fn failure_details_never_carry_secrets() {
             let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
             let failure = if target == "/issues/" {
                 github
-                    .post_questions(&ticket("7"), &["q".to_owned()])
+                    .post_questions(&ticket(KEY), &["q".to_owned()])
                     .expect_err("refused")
             } else {
                 github.open_pull_request(&request()).expect_err("refused")
@@ -660,7 +660,8 @@ fn debug_output_redacts() {
 
 #[test]
 fn github_issue_key_forms() {
-    for (key, ok) in [
+    // The number's rules, on their own.
+    for (number, ok) in [
         ("1", true),
         ("18446744073709551615", true),
         ("0", false),
@@ -674,21 +675,59 @@ fn github_issue_key_forms() {
         ("CONTRACT-1", false),
         ("", false),
     ] {
-        assert_eq!(render::github_issue_number(key).is_some(), ok, "{key:?}");
+        assert_eq!(
+            render::github_issue_number(number).is_some(),
+            ok,
+            "{number:?}"
+        );
+    }
+    // Whole keys: `owner/name#N` of the configured repository only.
+    for (key, issue) in [
+        ("octo-org/demo.repo#1", Some(1)),
+        ("octo-org/demo.repo#18446744073709551615", Some(u64::MAX)),
+        // GitHub compares names without regard to ASCII case.
+        ("OCTO-ORG/Demo.Repo#7", Some(7)),
+        // Another repository, a fork, another owner: no comment, ever.
+        ("octo-org/tracker#7", None),
+        ("other-org/demo.repo#7", None),
+        ("octo-org/demo.repo.git#7", None),
+        // A confusable or non-ASCII owner (Cyrillic о, fullwidth o).
+        ("\u{043e}cto-org/demo.repo#7", None),
+        ("\u{ff4f}cto-org/demo.repo#7", None),
+        ("octo-org/demo.repo#0", None),
+        ("octo-org/demo.repo#07", None),
+        ("octo-org/demo.repo#7 ", None),
+        ("octo-org/demo.repo# 7", None),
+        ("octo-org/demo.repo", None),
+        ("demo.repo#7", None),
+        ("#7", None),
+        ("7", None),
+        ("", None),
+    ] {
         let clock = FakeClock::at(T0);
         let hub = Hub::new(clock.clone());
         let fake = hub.fake(|_| None);
         let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
         let result = github.post_questions(&ticket(key), &["q".to_owned()]);
-        assert_eq!(result.is_ok(), ok, "{key:?}: {result:?}");
-        if ok {
-            let comment = fake.api_calls().pop().expect("posted");
-            assert_eq!(
-                comment.target,
-                format!("/repos/octo-org/demo.repo/issues/{key}/comments")
-            );
-        } else {
-            assert!(fake.seen().is_empty(), "{key:?}: no request");
+        assert_eq!(result.is_ok(), issue.is_some(), "{key:?}: {result:?}");
+        match issue {
+            Some(n) => {
+                let comment = fake.api_calls().pop().expect("posted");
+                assert_eq!(
+                    comment.target,
+                    format!("/repos/octo-org/demo.repo/issues/{n}/comments")
+                );
+            }
+            None => {
+                assert!(fake.seen().is_empty(), "{key:?}: no request");
+                assert!(
+                    result
+                        .expect_err("refused")
+                        .detail()
+                        .contains("is not owner/name#N of octo-org/demo.repo"),
+                    "{key:?}"
+                );
+            }
         }
     }
     // Another tracker: refused before any request.
@@ -701,7 +740,7 @@ fn github_issue_key_forms() {
         let hub = Hub::new(clock.clone());
         let fake = hub.fake(|_| None);
         let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
-        let mut ticket = ticket("7");
+        let mut ticket = ticket(KEY);
         ticket.source = source;
         let failure = github
             .post_questions(&ticket, &["q".to_owned()])
@@ -720,11 +759,11 @@ fn no_questions_no_comment() {
     let hub = Hub::new(clock.clone());
     let fake = hub.fake(|_| None);
     let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
-    let failure = github.post_questions(&ticket("7"), &[]).expect_err("empty");
+    let failure = github.post_questions(&ticket(KEY), &[]).expect_err("empty");
     assert!(failure.detail().contains("no questions"), "{failure:?}");
     assert!(fake.seen().is_empty());
     let reference = github
-        .post_questions(&ticket("7"), &["Which version?".to_owned()])
+        .post_questions(&ticket(KEY), &["Which version?".to_owned()])
         .expect("one question");
     assert_eq!(reference.as_str(), "comment/9001");
     let posted = fake.api_calls().pop().expect("posted");

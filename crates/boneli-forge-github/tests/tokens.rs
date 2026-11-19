@@ -429,7 +429,7 @@ fn unauthorized_refreshes_once() {
     let git = Arc::new(FakeGit::default());
     let github = forge(tokens(&fake, &clock), git);
     let failure = github
-        .post_questions(&ticket("7"), &["Which version?".to_owned()])
+        .post_questions(&ticket(KEY), &["Which version?".to_owned()])
         .expect_err("401 twice");
     assert_eq!(fake.exchanges(), 2);
     assert_eq!(fake.api_calls().len(), 2);
@@ -452,7 +452,7 @@ fn unauthorized_refreshes_once() {
         hub.fake(move |seen| (seen.bearer() == Some(refused.as_str())).then(|| Reply::status(401)));
     let github = forge(tokens(&fake, &clock), Arc::new(FakeGit::default()));
     let reference = github
-        .post_questions(&ticket("7"), &["Which version?".to_owned()])
+        .post_questions(&ticket(KEY), &["Which version?".to_owned()])
         .expect("the retry succeeds");
     assert_eq!(reference.as_str(), "comment/9001");
     assert_eq!(fake.exchanges(), 2);

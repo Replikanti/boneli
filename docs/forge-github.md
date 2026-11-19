@@ -61,6 +61,17 @@ The adapter refuses the key file unless (ADR-014, D6):
 The key is read once, when the adapter starts. It never goes into an
 environment variable, a log, an error message or the run store.
 
+## GitHub ticket keys
+
+The forge reads a GitHub ticket's key as `owner/name#N`: the repository
+and the issue number. Only a key that names the configured repository
+(compared without regard to ASCII case, as GitHub compares names) gets
+the `Fixes #N` line, so the merge closes the issue, and only such a
+ticket can take a questions comment. A ticket of any other repository
+is shown as `Ticket: GitHub` with its key made inert, and posting
+questions on it fails before any request (ADR-014, D7). An intake
+adapter that reads GitHub issues must hand the forge keys in this form.
+
 ## The live acceptance test
 
 CI runs the forge's tests against a fake GitHub. The live test runs the
@@ -76,7 +87,10 @@ merges. It is in `crates/boneli-acceptance/tests/github.rs`.
 - **Two commits at least:** the base the test starts from (`BONELI_GITHUB_BASE`)
   must not be the tip of the default branch, so the push runs with the
   default branch moved past the base, the case ADR-014 D2 measures.
-- An **open issue** for the questions comment and the `Fixes` line.
+- An **open issue** for the questions comment and the `Fixes` line (the
+  target), and a **second open issue** that the test's hostile text
+  references with closing keywords (the decoy), which must stay
+  untouched.
 - Branch protection on the default branch as above, and the App
   installed on this repository only.
 
@@ -90,7 +104,8 @@ Every variable is required; a missing one fails the test and names it.
 | `BONELI_GITHUB_INSTALLATION_ID` | the installation id |
 | `BONELI_GITHUB_KEY` | the absolute path of the key file |
 | `BONELI_GITHUB_REPO` | the test repository, `owner/name` |
-| `BONELI_GITHUB_ISSUE` | the open issue's number |
+| `BONELI_GITHUB_ISSUE` | the target issue's number |
+| `BONELI_GITHUB_DECOY_ISSUE` | the decoy issue's number, another open issue |
 | `BONELI_GITHUB_BASE` | a full 40-hex commit on the default branch, with `README.md`, not the tip |
 | `BONELI_GITHUB_COMMIT_NAME` | `<app-slug>[bot]` |
 | `BONELI_GITHUB_COMMIT_EMAIL` | `<id>+<app-slug>[bot]@users.noreply.github.com` |
@@ -104,18 +119,25 @@ cargo test -p boneli-acceptance --test github -- --ignored --nocapture
 The test:
 
 1. measures a token exchange and the repository object of its own;
-2. posts a comment of hostile questions on the issue (mentions of the
-   `ghost` placeholder account, references, closing keywords, markup, CR,
+2. posts a comment of hostile questions on the target issue (mentions of
+   the `ghost` placeholder account, closing keywords before `#D`,
+   `owner/repo#D`, `GH-D` and the decoy's issue and pull URLs, markup, CR,
    U+202E) and checks in GitHub's `body_html` that none of it became a
-   mention or an issue link;
+   mention or a link;
 3. fetches the base through the git adapter with the App's token, makes a
    one-line change to `README.md`, and opens a pull request through the
-   forge with a 70 KB hostile analysis, a 256-byte title and a citation
-   path with a space;
+   forge whose ticket title, analysis, test and citation quote carry the
+   same hostile text (a 70 KB analysis, a title cut to 256 bytes, a
+   citation path with a space);
 4. checks the result: the head is a `boneli/` branch whose one parent is
    the base and which changes `README.md` only, the base is the default
    branch, the pull request is not a draft, the body is at most 65,536
-   bytes, and its only issue link is the `Fixes` line;
+   bytes, its only issue link is the `Fixes` line, nothing links to the
+   decoy, GitHub's closing references (GraphQL
+   `closingIssuesReferences`) are exactly the target issue, and the
+   decoy's timeline has no cross-reference from the pull request and no
+   `connected`, `referenced` or `cross-referenced` event since the test
+   started;
 5. prints the response sizes (`size ...` lines) and what the push sent
    (`push: pack-objects wrote [...] objects`);
 6. cleans up: closes the pull request and deletes the branch and the

@@ -353,7 +353,15 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
 
 `InstallationTokens` exchanges the App's JWT (D4) for an installation
 token and caches it; `GitHubForge` and the git credentials bridge
-(D3, in a composition root) share one instance.
+(D3, in a composition root) share one instance. It is built with
+`InstallationTokens::open(app, repository, dial, clock, limits)`: the
+`Dial` (D4) and the `limits` (D10, `Limits::GITHUB` in production) live
+here because the token exchange is the first request on them and the
+forge reuses both, so one value configures every request the adapter
+makes. `limits` is an argument rather than a constant so that the tests
+can shorten the 30 s deadline to provoke a timeout
+(`timeout_on_create_looks_up_by_head`, 300 ms); the plan's signature had
+no such argument.
 
 - **The request** is `POST /app/installations/{id}/access_tokens` with
   `{"repositories":["<name>"],"permissions":{"contents":"write","issues":"write","pull_requests":"write"}}`.
@@ -458,19 +466,45 @@ requests fail on private repositories of plans without them, and a human
 merges anyway). The head is the bare branch name, which GitHub reads in
 the repository itself.
 
+`GitHubForge::new(tokens, git, config)` takes a `ForgeConfig`: the
+commit's author name and email (the App's bot identity), checked at
+construction under `CommitInfo`'s rules (D2), so a misconfigured identity
+fails at start instead of at the first push; and an optional base branch.
 `open_pull_request` composes `fetch_base` → `apply` → `push` through the
 `Git` port (D1) between reading the base branch and creating the pull
-request. The base branch is a configured one or the repository's
+request. The base branch is the configured one or the repository's
 `default_branch`, checked against `git check-ref-format --branch`'s rules
 and at most 255 bytes (`default_branch_rules`); it goes into the request
-as JSON only. `post_questions` takes only a GitHub ticket whose key is an
-issue number of the configured repository (D8) and a non-empty list;
-anything else fails before any request (`github_issue_key_forms`,
-`no_questions_no_comment`). References are `pull/<number>` and
-`comment/<id>`, from GitHub's `number` and `id`
-(`reference_comes_from_number`), each a JSON integer from 1 to
-`u64::MAX`: `0`, `-1`, `1.0`, `1e3`, `"42"` and `u64::MAX + 1` are refused
-(`number_forms`).
+as JSON only.
+
+**GitHub ticket keys are `owner/name#N`.** `Ticket` carries no
+repository, so the key carries it: the repository under GitHub's name
+rules (the owner 1 to 39 bytes of `[A-Za-z0-9-]` not starting with `-`,
+the name 1 to 100 bytes of `[A-Za-z0-9._-]`, so a confusable or
+non-ASCII owner is refused) and the issue number `[1-9][0-9]*` up to
+`u64::MAX`. The ticket is "of the same repository" (STOP 1 decision 3)
+when that repository equals the configured one, compared without regard
+to ASCII case as GitHub compares names. Only then does the body carry
+`Fixes #N` (D8) and may `post_questions` comment; a ticket of any other
+repository (another tracker repository, a fork) gets neither, and
+`post_questions` fails before any request, as it does for another
+tracker's ticket or an empty list (`github_issue_key_forms`: a mismatch,
+a case-only difference, a Cyrillic and a fullwidth owner;
+`no_questions_no_comment`). A bare number is refused: it cannot say which
+repository it means, and guessing the configured one is how a ticket of
+`org/tracker#12` would close or comment on `org/app#12`. No domain change
+is needed; an intake adapter for GitHub must produce this form.
+
+**References are `pull/<number>` and `comment/<id>`**, from GitHub's
+`number` and `id` (`reference_comes_from_number`), each a JSON integer
+from 1 to `u64::MAX`: `0`, `-1`, `1.0`, `1e3`, `"42"` and `u64::MAX + 1`
+are refused (`number_forms`). Why a kind prefix and not the bare number:
+pull-request numbers and comment ids are separate number spaces on
+GitHub (numbers count per repository, comment ids globally), so a bare
+`5` could name either, and the `Forge` contract's `distinct-references`
+clause would fail the day a pull request and a comment share a number.
+The prefix also tells a later reader of the run log (retries in #33, the
+transcript link in #20) which endpoint the reference belongs to.
 
 ### D8. Rendering: agent text stays inert
 
@@ -494,6 +528,41 @@ the adapter (`render`), because the format depends on the forge (ADR-004).
   over the output: mentions, `@org/team`, `#1`, `Closes #1`,
   `owner/repo#1`, fences, `</pre>`, HTML, links, task lists, quotes and
   table rows appear only on code lines).
+- **No references in free text, even outside Markdown** (review round 1
+  of #73). A code block is inert only where GitHub renders Markdown. The
+  title is plain text, GitHub's default squash and merge commit messages
+  carry the pull request's title (and, with the repository setting "pull
+  request title and description", its body) verbatim, and GitHub reads a
+  commit message on the default branch as plain text for closing keywords
+  and references, across repositories the merger can write to. So every
+  piece of reporter or agent text (the title, every code block: the
+  analysis, the test, the questions, citation paths and quotes; and the
+  ticket keys, run ids and evidence references shown) also passes through
+  `neutralize`, which breaks every reference form visibly: `#` becomes the
+  fullwidth `＃` (U+FF03) and `@` the fullwidth `＠` (U+FF20), so no `#N`,
+  `owner/repo#N`, `@user` or `@org/team` can form; the dot of
+  `github.com` (any case) becomes U+2024 `․`, so no issue or pull URL
+  can form; and the hyphen of `GH-` (any case) before a digit becomes
+  U+2011 `‑`, so no `GH-N` can form. A closing keyword (close, closes,
+  closed, fix, fixes, fixed, resolve, resolves, resolved, in any case,
+  with or without a colon) closes only through a reference that follows
+  it, so with every reference broken it is plain prose, and it is left as
+  written: rewriting the words would garble ordinary text ("this fixes
+  the parser") and protect nothing more. Why visible substitutes and not
+  a zero-width joiner or an escape: an invisible character is exactly
+  what the escape rule shows as `\u{XXXX}`, and a reader should see that
+  the text was changed; the fullwidth forms read as the original.
+  The citation permalink is generated, but its path is the agent's, so
+  the same two dots and hyphens are percent-encoded there too (`#` and
+  `@` are encoded anyway); the link still resolves to the same path.
+  `references_never_form_in_free_text` checks all nine keywords in three
+  cases, with and without a colon, before `#5`, `owner/repo#5`, another
+  repository's `#5`, `GH-5`, `gh-5`, issue and pull URLs (`http`, `www`,
+  upper case) and the two mentions, in the title, in each code block of
+  the body and in the comment, with a plain-text detector that also
+  reads the generated parts; the only reference left in a body is the
+  generated `Fixes #N` line. The live test checks GitHub's own view
+  (D12).
 - **Escaping.** Before it is indented, every character that is Cc except
   LF and TAB, U+2028, U+2029 or `Default_Ignorable_Code_Point` (the
   domain's table, now public) becomes the text `\u{XXXX}` (`escape_rule`).
@@ -502,19 +571,29 @@ the adapter (`render`), because the format depends on the forge (ADR-004).
   too.
 - **Invalid UTF-8** in the analysis or the test is shown lossily (U+FFFD)
   under a generated note (`non_utf8_is_shown_lossily_with_note`).
-- **The ticket line.** For a GitHub ticket whose key is `[1-9][0-9]*` up to
-  `u64::MAX` (`0`, `0123`, `+1`, fullwidth digits, `12 ` and `1` before
-  U+00A0 are not), the body starts with `Fixes #N`, so the human's merge
-  closes the issue (STOP 1 decision 3). Any other ticket gets
-  `Ticket: <Source> \`<key>\``, or the source alone when the key is
-  outside the safe set (`fixes_line_only_for_github_ticket`). An empty
+- **The ticket line.** For a GitHub ticket `owner/name#N` of the
+  configured repository (D7; the number `[1-9][0-9]*` up to `u64::MAX`, so
+  `0`, `0123`, `+1`, fullwidth digits, `12 ` and `1` before U+00A0 are
+  not), the body starts with `Fixes #N`, so the human's merge closes the
+  issue (STOP 1 decision 3). Any other ticket gets
+  `Ticket: <Source> \`<key>\`` with the key neutralized
+  (`octo-org/tracker＃12`, `GH‑12`), or the source alone when the key is
+  outside its safe form (`fixes_line_only_for_github_ticket`). An empty
   analysis or test shows a generated `(empty)`.
 - **Layout:** the ticket line, a generated intro, the root cause (each
   citation as a permalink
   `https://github.com/<o>/<r>/blob/<base>/<path>#L<line>` with every path
   byte outside `[A-Za-z0-9._~/-]` percent-encoded, then `path:line` and
   the quote as code; `citation_permalinks`; a link longer than 1,024 bytes
-  is left out and the path still shows as code), the analysis, the
+  is left out and the path still shows as code. Why 1,024: the fixed
+  part of a permalink is at most about 240 bytes (`https://github.com/`,
+  a 39-byte owner, a 100-byte name, `/blob/`, a 64-hex SHA, `#L` and ten
+  digits), and 1,024 leaves 780 bytes for the path, a 260-byte path fully
+  percent-encoded; 260 is Windows' classic `MAX_PATH`, which repositories
+  with Windows contributors keep their paths under. A longer cap would
+  let one link, which is placed whole or not at all, take a larger part
+  of the citations block's share; a shorter one would drop links to
+  ordinary deep paths), the analysis, the
   reproduction test, a results table (before the fix the reproduction
   gate's "fails on an assertion"; with the fix every `TestStatus` and
   `CheckStatus` through an exhaustive match, `every_status_has_a_distinct_label`),
@@ -523,13 +602,14 @@ the adapter (`render`), because the format depends on the forge (ADR-004).
   saturated total reading "at least" (`cost_and_overrun_render_exactly`,
   `saturated_overrun_says_at_least`), and a footer with the run id, the
   evidence references and "a human reviews and merges".
-- **Title:** `Fix: <ticket title>`, escaped, at most 256 bytes; a longer
+- **Title:** `Fix: <ticket title>`, escaped and neutralized, at most 256 bytes; a longer
   one is cut at a char boundary to 253 bytes plus `…`
   (`title_cap_arithmetic`: 251 ASCII bytes give 256, 252 give `Fix: ` + 248
   + `…`, 85 × `€` give 254). 256 is GitHub's title limit.
 - **Commit message:** `boneli: fix for <Source> ticket <key>`, a blank
-  line and `Run <id>`, generated, with no closing keyword, so the commit
-  closes nothing on its own.
+  line and `Run <id>`, generated, with no closing keyword and the key and
+  id neutralized (`octo-org/demo.repo＃7`), so the commit closes and
+  references nothing on its own.
 - **Caps.** A body or comment is at most 65,536 bytes, GitHub's documented
   limit of 65,536 characters: bytes are at least as many as UTF-16 units
   and as scalar values, so the cap holds however GitHub counts. The live
@@ -649,7 +729,19 @@ pull request from a one-file fix with a 70 KB hostile analysis, a 256-byte
 title and a citation path with a space, checks the branch, its parent,
 the changed file, the base and the absence of mention and issue-link
 anchors in `body_html` (only the `Fixes` line may link), prints the
-response sizes and what the push sent, and cleans up.
+response sizes and what the push sent, and cleans up. Because anchors are
+only GitHub's rendering, the test also checks GitHub's own linkage
+(review round 1 of #73): a second open issue, the decoy
+(`BONELI_GITHUB_DECOY_ISSUE`), is referenced after closing keywords as
+`#D`, `owner/repo#D`, `GH-D` and its issue and pull URLs in the ticket
+title, the questions and every block of agent text. The pull request's
+`closingIssuesReferences` (GraphQL) must be exactly the target issue, no
+anchor may point at the decoy, and the decoy's timeline must hold no
+`cross-referenced` event from the pull request and no `connected`,
+`referenced` or `cross-referenced` event since the test started
+(`issues: write` covers reading it). A target issue numbered like a
+hostile reference can no longer make the anchor check pass vacuously,
+since the decoy is a different issue the test names.
 
 `boneli-acceptance` is the one crate that wires `boneli-git-cli` and
 `boneli-forge-github` together: an adapter must not depend on another
@@ -700,6 +792,11 @@ gets the same ten lines.
   request. Revoking tokens after use, cleaning up stale `boneli/*`
   branches, retries (#33), GitHub Enterprise Server and the transcript
   link (#20) are out of scope.
+- A GitHub ticket's key is `owner/name#N` (D7); an intake adapter for
+  GitHub must produce that form, or its tickets get no `Fixes` line and
+  no questions comment.
+- Reporter and agent text on GitHub shows `＃`, `＠`, `github․com` and
+  `GH‑N` where the original had `#`, `@`, `github.com` and `GH-N` (D8).
 - `own_uid` is now in three crates (`boneli-oci`, `boneli-store-fs`, this
   one); #66's extraction should take this copy too.
 
@@ -766,4 +863,6 @@ head is a `boneli/` branch whose one parent is the base and which changes
 exactly the fixed file, fetched and pushed with the App's token through
 `Credentials`; the body is at most 65,536 bytes, the title 256; and
 GitHub's `body_html` of the pull request and the comment holds no mention
-and no issue link but the `Fixes` line.
+and no issue link but the `Fixes` line; the pull request's closing
+references are exactly the target issue; and the decoy issue gets no
+link, no closing reference and no timeline event.

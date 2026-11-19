@@ -120,7 +120,8 @@ fn hostile_text_stays_in_code_blocks() {
         .map(|(_, l)| l)
         .collect();
     for token in HOSTILE {
-        assert!(code.iter().any(|l| l.contains(token)), "{token}");
+        let shown = render::neutralize(token);
+        assert!(code.iter().any(|l| l.contains(&shown)), "{shown}");
     }
     let comment = questions_comment(&[hostile_text(), "@user Closes #1".to_owned()]);
     assert_inert(&comment.text);
@@ -286,42 +287,192 @@ fn fixes_line_only_for_github_ticket() {
         request.ticket.key = key.to_owned();
         pull_request_body(&request, &repository()).text
     };
-    assert!(body(TicketSource::GitHub, "7").starts_with("Fixes #7\n\n"));
+    assert!(body(TicketSource::GitHub, KEY).starts_with("Fixes #7\n\n"));
+    // Case-only difference: the same repository.
+    assert!(body(TicketSource::GitHub, "Octo-Org/DEMO.repo#7").starts_with("Fixes #7\n\n"));
     for (source, key, line) in [
         (TicketSource::Jira, "PROJ-12", "Ticket: Jira `PROJ-12`"),
         (TicketSource::GitLab, "7", "Ticket: GitLab `7`"),
+        (TicketSource::Jira, "GH-12", "Ticket: Jira `GH\u{2011}12`"),
         (
             TicketSource::Sentry,
             "abc.def_1",
             "Ticket: Sentry `abc.def_1`",
         ),
+        // A GitHub ticket of another repository: shown, never linked.
         (
             TicketSource::GitHub,
-            "0123",
+            "octo-org/tracker#12",
+            "Ticket: GitHub `octo-org/tracker\u{ff03}12`",
+        ),
+        (
+            TicketSource::GitHub,
+            "other-org/demo.repo#7",
+            "Ticket: GitHub `other-org/demo.repo\u{ff03}7`",
+        ),
+        (
+            TicketSource::GitHub,
+            "\u{043e}cto-org/demo.repo#7",
             "Ticket: GitHub (its key is not shown)",
         ),
         (
             TicketSource::GitHub,
-            "owner/repo#1",
+            "7",
+            "Ticket: GitHub (its key is not shown)",
+        ),
+        (
+            TicketSource::GitHub,
+            "octo-org/demo.repo#0123",
             "Ticket: GitHub (its key is not shown)",
         ),
     ] {
         let text = body(source, key);
         assert!(text.starts_with(&format!("{line}\n\n")), "{text}");
         assert!(!text.contains("Fixes"), "{text}");
+        assert!(!has_reference(&text), "{text}");
     }
-    // The commit message never closes anything.
-    let mut ticket = ticket("7");
+    // The commit message never closes or references anything.
+    let mut ticket = ticket(KEY);
     let run = RunId::new("run-1".to_owned());
     assert_eq!(
         commit_message(&ticket, &run),
-        "boneli: fix for GitHub ticket 7\n\nRun run-1\n"
+        "boneli: fix for GitHub ticket octo-org/demo.repo\u{ff03}7\n\nRun run-1\n"
     );
     ticket.source = TicketSource::Jira;
     ticket.key = "Closes #1".to_owned();
     assert_eq!(
         commit_message(&ticket, &RunId::new("../x".to_owned())),
         "boneli: fix for a Jira ticket\n"
+    );
+    ticket.key = "GH-1".to_owned();
+    let message = commit_message(&ticket, &RunId::new("GH-2".to_owned()));
+    assert!(!has_reference(&message), "{message}");
+}
+
+/// Whether `text`, read as plain text, holds a GitHub reference or
+/// mention: `#` or `GH-` before a digit, `@` before a name character, or
+/// a github.com issue or pull URL. Permalinks (`.../blob/...#L12`) are not
+/// references.
+fn has_reference(text: &str) -> bool {
+    let b = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    for i in 0..b.len() {
+        let next = b.get(i + 1).copied().unwrap_or(b' ');
+        if b[i] == b'#' && next.is_ascii_digit() {
+            return true;
+        }
+        if b[i] == b'@' && (next.is_ascii_alphanumeric() || next == b'-') {
+            return true;
+        }
+        if lower.as_bytes()[i..].starts_with(b"gh-") && b.get(i + 3).is_some_and(u8::is_ascii_digit)
+        {
+            return true;
+        }
+    }
+    // `github.com/<owner>/<repo>/issues/<digit>` or `/pull/<digit>`.
+    lower.match_indices("github.com/").any(|(at, host)| {
+        let mut segments = lower[at + host.len()..].split('/');
+        let (owner, repo, kind, number) = (
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+        );
+        !owner.is_empty()
+            && !repo.is_empty()
+            && matches!(kind, "issues" | "pull")
+            && number.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    })
+}
+
+/// Every closing keyword GitHub reads, in three cases, with and without a
+/// colon, before every reference form.
+fn closing_forms() -> Vec<String> {
+    let references = [
+        "#5",
+        "octo-org/demo.repo#5",
+        "other-org/other-repo#5",
+        "GH-5",
+        "gh-5",
+        "https://github.com/octo-org/demo.repo/issues/5",
+        "https://github.com/octo-org/demo.repo/pull/5",
+        "http://www.GitHub.COM/other-org/other-repo/issues/5",
+        "github.com/octo-org/demo.repo/issues/5",
+        "@user",
+        "@org/team",
+    ];
+    let mut forms = Vec::new();
+    for keyword in [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ] {
+        let title_case = format!("{}{}", keyword[..1].to_ascii_uppercase(), &keyword[1..]);
+        for word in [keyword.to_owned(), keyword.to_ascii_uppercase(), title_case] {
+            for colon in ["", ":"] {
+                for reference in references {
+                    forms.push(format!("{word}{colon} {reference}"));
+                }
+            }
+        }
+    }
+    for reference in references {
+        forms.push(reference.to_owned());
+        forms.push(format!("x{reference}y"));
+    }
+    forms
+}
+
+#[test]
+fn references_never_form_in_free_text() {
+    let forms = closing_forms();
+    assert!(
+        forms.iter().all(|f| has_reference(f)),
+        "the detector misses a form"
+    );
+    // The title, one form at a time.
+    for form in &forms {
+        let shown = title(form);
+        assert!(!has_reference(&shown), "{form:?} -> {shown:?}");
+    }
+    // Every form in every free-text place of a body: the analysis, the
+    // test, a citation's path and quote. The generated `Fixes #7` line is
+    // the only reference.
+    let all = forms.join("\n");
+    for place in 0..4 {
+        let mut request = request();
+        match place {
+            0 => request.analysis.content = all.clone().into_bytes(),
+            1 => request.test.content = all.clone().into_bytes(),
+            2 => request.citations[0].quote = all.clone(),
+            _ => {
+                request.citations[0].path =
+                    "docs/#5 @user GH-5 github.com/o/r/issues/5.md".to_owned()
+            }
+        }
+        let body = pull_request_body(&request, &repository());
+        assert!(body.cut.is_empty(), "place {place}: the forms fit uncut");
+        let rest = body
+            .text
+            .strip_prefix("Fixes #7\n")
+            .expect("the Fixes line");
+        assert!(
+            !has_reference(rest),
+            "place {place}: a reference formed in the body"
+        );
+    }
+    let comment = questions_comment(&[all.clone(), "Closes #5 @user".to_owned()]);
+    assert!(
+        !has_reference(&comment.text),
+        "a reference formed in the comment"
+    );
+    assert!(!has_reference(&title(&all)));
+    // Neutralized, still readable.
+    assert_eq!(
+        render::neutralize("Closes #5, see https://GitHub.com/o/r/issues/5 and GH-5 @user"),
+        "Closes \u{ff03}5, see https://GitHub\u{2024}com/o/r/issues/5 and GH\u{2011}5 \u{ff20}user"
+    );
+    assert_eq!(
+        render::neutralize("sigh-x github-com no.github"),
+        "sigh-x github-com no.github"
     );
 }
 
@@ -335,6 +486,8 @@ fn citation_permalinks() {
         ("a/(x)[y]<z>.rs", "a/%28x%29%5By%5D%3Cz%3E.rs"),
         ("a-b_c.d~e/f", "a-b_c.d~e/f"),
         ("%41", "%2541"),
+        ("docs/GH-5/github.com/x", "docs/GH%2D5/github%2Ecom/x"),
+        ("gh-x/github-com", "gh-x/github-com"),
     ] {
         let link = permalink(&repo, base, path, 12);
         assert_eq!(

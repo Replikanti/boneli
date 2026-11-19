@@ -188,17 +188,55 @@ fn anchors_with_class<'h>(html: &'h str, class: &str) -> Vec<&'h str> {
         .collect()
 }
 
+/// Every form of a reference to the decoy issue `decoy` of `repo`
+/// (`owner/name`), each after a closing keyword: `#D`, `owner/repo#D`,
+/// `GH-D` and the issue and pull URLs, in several cases, with and without
+/// a colon.
+fn decoy_forms(repo: &str, decoy: u64) -> String {
+    format!(
+        "Closes #{decoy} fixes: {repo}#{decoy} RESOLVED https://github.com/{repo}/issues/{decoy} \
+         Fixed: GH-{decoy} close https://github.com/{repo}/pull/{decoy} resolves: #{decoy} "
+    )
+}
+
 /// Text written to be hostile on GitHub: mentions of the `ghost`
 /// placeholder account (a mention that escaped would notify no one real),
-/// references, closing keywords, markup, fences and invisible characters.
-fn hostile(n: usize) -> String {
-    let unit = "@ghost @ghost/team Closes #1 owner/repo#1 ``` ~~~ </pre> <img src=x onerror=alert(1)> \
-                <!-- [x](javascript:alert(1)) - [ ] task > quote\r lone CR\r\nCRLF \u{202e}rlo \u{200b}zwsp \u{2028}\n";
+/// closing references to the decoy issue, markup, fences and invisible
+/// characters, repeated to `n` bytes.
+fn hostile(n: usize, decoys: &str) -> String {
+    let unit = format!(
+        "@ghost @ghost/team {decoys}``` ~~~ </pre> <img src=x onerror=alert(1)> \
+         <!-- [x](javascript:alert(1)) - [ ] task > quote\r lone CR\r\nCRLF \u{202e}rlo \u{200b}zwsp \u{2028}\n"
+    );
     let mut text = String::new();
     while text.len() < n {
-        text.push_str(unit);
+        text.push_str(&unit);
     }
     text
+}
+
+/// The `href` of every anchor in `html`.
+fn hrefs(html: &str) -> Vec<&str> {
+    html.split("<a ")
+        .skip(1)
+        .filter_map(|tag| tag.split('>').next())
+        .filter_map(|attrs| {
+            attrs
+                .split("href=\"")
+                .nth(1)
+                .and_then(|h| h.split('"').next())
+        })
+        .collect()
+}
+
+/// No anchor in `html` points at the decoy issue or a pull request of
+/// that number.
+fn assert_no_decoy_link(html: &str, decoy: u64) {
+    for href in hrefs(html) {
+        let issue = href.ends_with(&format!("/issues/{decoy}"));
+        let pull = href.ends_with(&format!("/pull/{decoy}"));
+        assert!(!issue && !pull, "a link to the decoy: {href}");
+    }
 }
 
 /// What the test created, removed when it ends, also when it fails.
@@ -265,6 +303,7 @@ fn opens_a_pull_request_on_the_test_repository() {
     let key_file = var("BONELI_GITHUB_KEY");
     let repo = var("BONELI_GITHUB_REPO");
     let issue = var("BONELI_GITHUB_ISSUE");
+    let decoy = var("BONELI_GITHUB_DECOY_ISSUE");
     let base = var("BONELI_GITHUB_BASE");
     let commit_name = var("BONELI_GITHUB_COMMIT_NAME");
     let commit_email = var("BONELI_GITHUB_COMMIT_EMAIL");
@@ -275,6 +314,17 @@ fn opens_a_pull_request_on_the_test_repository() {
         .expect("BONELI_GITHUB_INSTALLATION_ID is a positive number");
     let repository = GitHubRepository::parse(&repo).expect("BONELI_GITHUB_REPO is owner/name");
     let issue_number: u64 = issue.parse().expect("BONELI_GITHUB_ISSUE is a number");
+    let decoy: u64 = decoy
+        .parse()
+        .expect("BONELI_GITHUB_DECOY_ISSUE is a number");
+    assert_ne!(decoy, issue_number, "the decoy must be another issue");
+    let started = boneli_forge_github::time::format_rfc3339(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs(),
+    );
+    let decoys = decoy_forms(&repo, decoy);
     let base = CommitSha::parse(&base).expect("BONELI_GITHUB_BASE is a full SHA");
 
     let roots = Roots::mozilla();
@@ -389,9 +439,9 @@ fn opens_a_pull_request_on_the_test_repository() {
     .expect("the forge");
     let ticket = Ticket {
         source: TicketSource::GitHub,
-        key: issue.clone(),
-        // 251 bytes, so the title is exactly 256.
-        title: "Closes #1 owner/repo#1 ".repeat(11)[..251].to_owned(),
+        key: format!("{}#{issue_number}", repository.full_name()),
+        // Closing references to the decoy, cut by the adapter to 256 bytes.
+        title: decoys.repeat(4),
         body: String::new(),
     };
     let mut cleanup = Cleanup {
@@ -404,7 +454,14 @@ fn opens_a_pull_request_on_the_test_repository() {
 
     // The questions comment.
     let comment = forge
-        .post_questions(&ticket, &[hostile(2_000), "Which version?".to_owned()])
+        .post_questions(
+            &ticket,
+            &[
+                hostile(2_000, &decoys),
+                decoys.clone(),
+                "Which version?".to_owned(),
+            ],
+        )
         .expect("the comment");
     let comment_id: u64 = comment
         .as_str()
@@ -426,6 +483,7 @@ fn opens_a_pull_request_on_the_test_repository() {
         "{html}"
     );
     assert!(anchors_with_class(&html, "issue-link").is_empty(), "{html}");
+    assert_no_decoy_link(&html, decoy);
 
     // The pull request.
     let evidence = |r: &str, content: Vec<u8>| Attached {
@@ -437,13 +495,13 @@ fn opens_a_pull_request_on_the_test_repository() {
         ticket: ticket.clone(),
         base: base.clone(),
         diff: evidence("live-diff", diff),
-        test: evidence("live-test", hostile(3_000).into_bytes()),
-        analysis: evidence("live-analysis", hostile(70_000).into_bytes()),
+        test: evidence("live-test", hostile(3_000, &decoys).into_bytes()),
+        analysis: evidence("live-analysis", hostile(70_000, &decoys).into_bytes()),
         citations: vec![Citation {
             path: "docs/a b.md".to_owned(),
             line: 1,
             sha: base.clone(),
-            quote: hostile(200),
+            quote: hostile(200, &decoys),
         }],
         checks: FixChecks {
             reproduction_test: TestStatus::Passed,
@@ -479,7 +537,8 @@ fn opens_a_pull_request_on_the_test_repository() {
         Some(false)
     );
     let title = get_str(&pull_json, &["title"]);
-    assert_eq!(title.len(), 256, "{title}");
+    assert!(title.len() <= 256, "{title}");
+    assert!(title.ends_with('…'), "the title was cut: {title}");
     let body = get_str(&pull_json, &["body"]);
     assert!(body.len() <= 65_536, "{}", body.len());
     println!(
@@ -494,6 +553,73 @@ fn opens_a_pull_request_on_the_test_repository() {
     );
     for href in anchors_with_class(html, "issue-link") {
         assert!(href.ends_with(&format!("/issues/{issue_number}")), "{href}");
+    }
+    assert_no_decoy_link(html, decoy);
+
+    // GitHub's own closing references: exactly the ticket's issue, so the
+    // generated `Fixes` line is the only one and no hostile text formed
+    // another. GitHub computes them asynchronously, hence the wait.
+    std::thread::sleep(Duration::from_secs(10));
+    let query = format!(
+        r#"{{"query":"query($o:String!,$n:String!,$p:Int!){{repository(owner:$o,name:$n){{pullRequest(number:$p){{closingIssuesReferences(first:20){{nodes{{number}}}}}}}}}}","variables":{{"o":"{}","n":"{}","p":{number}}}}}"#,
+        repository.owner(),
+        repository.name()
+    );
+    let (status, closing) = rest.call("POST", "/graphql", accept, Some(query.as_bytes()));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&closing));
+    let closing = json(&closing);
+    let nodes = closing
+        .get("data")
+        .and_then(|d| d.get("repository"))
+        .and_then(|r| r.get("pullRequest"))
+        .and_then(|p| p.get("closingIssuesReferences"))
+        .and_then(|c| c.get("nodes"))
+        .and_then(|n| n.as_array())
+        .expect("closingIssuesReferences");
+    let mut closes: Vec<u64> = nodes
+        .iter()
+        .filter_map(|n| {
+            n.get("number")
+                .and_then(|v| v.as_number())
+                .and_then(|v| v.as_u64())
+        })
+        .collect();
+    closes.sort_unstable();
+    println!("closing references: {closes:?}");
+    assert_eq!(closes, [issue_number], "the closing references");
+
+    // The decoy's timeline: no cross-reference from this pull request, and
+    // no connected or referenced event since the test started.
+    let (status, timeline) = rest.call(
+        "GET",
+        &format!("{repo_path}/issues/{decoy}/timeline?per_page=100"),
+        accept,
+        None,
+    );
+    assert_eq!(status, 200, "the decoy's timeline");
+    let timeline = json(&timeline);
+    for event in timeline.as_array().expect("timeline events") {
+        let kind = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let at = event
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let from_this_pull = event
+            .get("source")
+            .and_then(|s| s.get("issue"))
+            .and_then(|i| i.get("number"))
+            .and_then(|v| v.as_number())
+            .and_then(|v| v.as_u64())
+            == Some(number);
+        assert!(
+            !(kind == "cross-referenced" && from_this_pull),
+            "the decoy got a cross-reference from the pull request"
+        );
+        assert!(
+            !(matches!(kind, "connected" | "referenced" | "cross-referenced")
+                && at >= started.as_str()),
+            "the decoy got a {kind} event at {at}"
+        );
     }
     let head_sha = get_str(&pull_json, &["head", "sha"]).to_owned();
     let (status, commit) = rest.call(

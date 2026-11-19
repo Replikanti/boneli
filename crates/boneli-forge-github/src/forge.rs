@@ -326,12 +326,13 @@ impl GitHubForge {
                 ),
             ));
         }
-        let issue = render::github_issue_number(&ticket.key).ok_or_else(|| {
+        let issue = render::issue_in(ticket, repository).ok_or_else(|| {
             Failure::new(
                 what,
                 format!(
-                    "the GitHub ticket key {:?} is not an issue number",
-                    crate::api::cut(&ticket.key, 64)
+                    "the GitHub ticket key {:?} is not owner/name#N of {}",
+                    crate::api::cut(&ticket.key, 64),
+                    repository.full_name()
                 ),
             )
         })?;
@@ -380,9 +381,9 @@ fn pull_ref(number: u64) -> Result<ForgeRef, Failure> {
 
 impl Forge for GitHubForge {
     /// Posts the questions as one comment on the ticket's issue; the
-    /// reference is `comment/<id>`. Only a GitHub ticket whose key is an
-    /// issue number of this repository qualifies, and an empty list is
-    /// refused; either fails before any request.
+    /// reference is `comment/<id>`. Only a GitHub ticket whose key is
+    /// `owner/name#N` of this repository qualifies (ASCII case-insensitive),
+    /// and an empty list is refused; either fails before any request.
     fn post_questions(
         &self,
         ticket: &Ticket,

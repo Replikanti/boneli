@@ -16,7 +16,10 @@
 //!   `message`, never a body or a secret (D9).
 //! - [`render`]: the title, the body, the questions comment and the
 //!   commit message, with agent and reporter text only in indented code
-//!   blocks (D8).
+//!   blocks and never able to form an issue reference or mention, even
+//!   read as plain text ([`render::neutralize`], D8). A GitHub ticket's
+//!   key is `owner/name#N`; only one of the configured repository gets
+//!   `Fixes #N` and a questions comment ([`render::issue_in`], D7).
 //! - [`GitHubForge`]: `fetch_base` → `apply` → `push` through the `Git`
 //!   port to a new `boneli/` branch ([`branch_name`]), then the pull
 //!   request, ready for review; an ambiguous creation is looked up once by

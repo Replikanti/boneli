@@ -12,6 +12,18 @@
 //! `Default_Ignorable_Code_Point` as `\u{XXXX}`, so a lone CR cannot end
 //! a line inside the block and invisible text cannot hide.
 //!
+//! **No references in free text.** A code block is inert only where GitHub
+//! renders Markdown. The title is plain text, and a squash or merge commit
+//! can carry the title and the body verbatim into the default branch,
+//! where GitHub reads closing keywords and references as plain text. So
+//! every piece of free text (the title, every code block, and the keys and
+//! ids shown) also goes through [`neutralize`]: `#` and `@` become the
+//! visible fullwidth `＃` and `＠`, the dot of `github.com` becomes U+2024
+//! and the hyphen of `GH-<digit>` becomes U+2011, so no `#N`,
+//! `owner/repo#N`, `GH-N`, issue or pull URL, `@user` or `@org/team` can
+//! form, and a closing keyword without a reference closes nothing. The one
+//! reference the adapter writes is the generated `Fixes #N` line.
+//!
 //! Every code block follows a blank line and is followed by one, and no
 //! list item is ever open before one: an indented line after a list item
 //! continues the item instead of starting a code block.
@@ -80,11 +92,54 @@ pub fn escape(text: &str) -> String {
     escape_with(text, true)
 }
 
+/// Whether `text` ends with `suffix`, ignoring ASCII case.
+fn ends_with_ci(text: &str, suffix: &str) -> bool {
+    let (t, s) = (text.as_bytes(), suffix.as_bytes());
+    t.len() >= s.len() && t[t.len() - s.len()..].eq_ignore_ascii_case(s)
+}
+
+/// Whether `text` starts with `prefix`, ignoring ASCII case.
+fn starts_with_ci(text: &str, prefix: &str) -> bool {
+    let (t, p) = (text.as_bytes(), prefix.as_bytes());
+    t.len() >= p.len() && t[..p.len()].eq_ignore_ascii_case(p)
+}
+
+/// Free text with every GitHub reference and mention broken, visibly
+/// (ADR-014, D8): `#` → `＃` (U+FF03), `@` → `＠` (U+FF20), the dot of
+/// `github.com` (any case) → `․` (U+2024), and the hyphen of `GH-` (any
+/// case) before a digit → `‑` (U+2011). GitHub recognises none of these
+/// as a reference, mention or URL, in Markdown or in a commit message.
+pub fn neutralize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        let (before, after) = (&text[..i], &text[i + c.len_utf8()..]);
+        match c {
+            '#' => out.push('\u{FF03}'),
+            '@' => out.push('\u{FF20}'),
+            '.' if ends_with_ci(before, "github") && starts_with_ci(after, "com") => {
+                out.push('\u{2024}')
+            }
+            '-' if ends_with_ci(before, "gh")
+                && after.as_bytes().first().is_some_and(u8::is_ascii_digit) =>
+            {
+                out.push('\u{2011}')
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Agent or reporter text as it is shown: escaped, then neutralized.
+fn free(text: &str, keep_lines: bool) -> String {
+    neutralize(&escape_with(text, keep_lines))
+}
+
 /// The pull request's title: `Fix: ` and the ticket's title, escaped (LF
-/// and TAB too), at most [`MAX_TITLE`] bytes; a longer one is cut at a
-/// char boundary and ends with `…`.
+/// and TAB too) and neutralized, at most [`MAX_TITLE`] bytes; a longer one
+/// is cut at a char boundary and ends with `…`.
 pub fn title(ticket_title: &str) -> String {
-    let full = format!("Fix: {}", escape_with(ticket_title, false));
+    let full = format!("Fix: {}", free(ticket_title, false));
     if full.len() <= MAX_TITLE {
         return full;
     }
@@ -111,6 +166,30 @@ pub fn github_issue_number(key: &str) -> Option<u64> {
     if ok { key.parse().ok() } else { None }
 }
 
+/// A GitHub ticket key, `owner/name#N`: the repository under
+/// [`GitHubRepository::parse`]'s rules (ASCII only, so a confusable or
+/// non-ASCII owner is refused) and the issue number under
+/// [`github_issue_number`]'s.
+pub fn github_ticket(key: &str) -> Option<(GitHubRepository, u64)> {
+    let (repository, number) = key.rsplit_once('#')?;
+    Some((
+        GitHubRepository::parse(repository)?,
+        github_issue_number(number)?,
+    ))
+}
+
+/// The issue number of `ticket` in `repository`: a GitHub ticket whose key
+/// names this repository (ASCII case-insensitive, as GitHub compares
+/// names), or `None`. Only such a ticket gets `Fixes #N` and a questions
+/// comment (ADR-014, D7 and D8).
+pub fn issue_in(ticket: &Ticket, repository: &GitHubRepository) -> Option<u64> {
+    if ticket.source != TicketSource::GitHub {
+        return None;
+    }
+    let (named, number) = github_ticket(&ticket.key)?;
+    repository.is(&named.full_name()).then_some(number)
+}
+
 /// The tracker's name.
 pub fn source_label(source: TicketSource) -> &'static str {
     match source {
@@ -121,13 +200,20 @@ pub fn source_label(source: TicketSource) -> &'static str {
     }
 }
 
-/// The ticket's key as shown: the issue number for GitHub, a [`safe_id`]
-/// of at most [`MAX_KEY`] bytes otherwise.
+/// The ticket's key as shown, neutralized: `owner/name＃N` for a GitHub
+/// key of that form, a [`safe_id`] of at most [`MAX_KEY`] bytes otherwise.
 fn shown_key(ticket: &Ticket) -> Option<String> {
     match ticket.source {
-        TicketSource::GitHub => github_issue_number(&ticket.key).map(|n| n.to_string()),
-        _ => safe_id(&ticket.key, MAX_KEY).map(str::to_owned),
+        TicketSource::GitHub => github_ticket(&ticket.key)
+            .map(|(repository, n)| neutralize(&format!("{}#{n}", repository.full_name()))),
+        _ => safe_id(&ticket.key, MAX_KEY).map(neutralize),
     }
+}
+
+/// A run id or evidence reference as shown: a [`safe_id`] of at most
+/// [`MAX_ID`] bytes, neutralized (`GH-1` is a safe id).
+fn shown_id(text: &str) -> Option<String> {
+    safe_id(text, MAX_ID).map(neutralize)
 }
 
 /// The pushed commit's message, generated with no closing keyword:
@@ -139,18 +225,33 @@ pub fn commit_message(ticket: &Ticket, run: &RunId) -> String {
         Some(key) => format!("boneli: fix for {source} ticket {key}\n"),
         None => format!("boneli: fix for a {source} ticket\n"),
     };
-    if let Some(id) = safe_id(run.as_str(), MAX_ID) {
+    if let Some(id) = shown_id(run.as_str()) {
         message.push_str(&format!("\nRun {id}\n"));
     }
     message
 }
 
 /// The permalink of `path` at `line` on `base`: every byte of the path
-/// outside `[A-Za-z0-9._~/-]` percent-encoded.
+/// outside `[A-Za-z0-9._~/-]` percent-encoded, and so are the dot of
+/// `github.com` and the hyphen of `GH-<digit>` (any case), the two
+/// reference forms the agent-chosen path could still spell inside the URL
+/// ([`neutralize`]'s rule; `#` and `@` are encoded anyway). The URL
+/// decodes to the same path.
 pub fn permalink(repository: &GitHubRepository, base: &str, path: &str, line: u32) -> String {
     let mut encoded = String::with_capacity(path.len());
-    for b in path.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'/' | b'-') {
+    for (i, b) in path.bytes().enumerate() {
+        let (before, after) = (&path.as_bytes()[..i], &path.as_bytes()[i + 1..]);
+        let ci_end = |s: &[u8]| {
+            before.len() >= s.len() && before[before.len() - s.len()..].eq_ignore_ascii_case(s)
+        };
+        let reference = (b == b'.'
+            && ci_end(b"github")
+            && after.len() >= 3
+            && after[..3].eq_ignore_ascii_case(b"com"))
+            || (b == b'-' && ci_end(b"gh") && after.first().is_some_and(u8::is_ascii_digit));
+        if !reference
+            && (b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'/' | b'-'))
+        {
             encoded.push(char::from(b));
         } else {
             encoded.push_str(&format!("%{b:02X}"));
@@ -252,7 +353,7 @@ fn agent_text(text: &str) -> Unit {
     if text.is_empty() {
         Unit::Generated("_(empty)_".to_owned())
     } else {
-        Unit::Code(escape(text))
+        Unit::Code(free(text, true))
     }
 }
 
@@ -361,7 +462,7 @@ fn assemble(parts: Vec<Part>) -> Rendered {
 const ESCAPES: &str = "control and invisible characters in it are shown as `\\u{XXXX}`";
 
 fn cut_marker(reference: &str) -> String {
-    match safe_id(reference, MAX_ID) {
+    match shown_id(reference) {
         Some(r) => format!(
             "_Cut here to fit GitHub's limit of 65,536 bytes; the full text is the run's evidence `{r}`._"
         ),
@@ -387,10 +488,10 @@ fn utf8_note(what: &str, content: &[u8]) -> String {
 pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -> Rendered {
     let ticket = &request.ticket;
     let source = source_label(ticket.source);
-    let ticket_line = match (ticket.source, shown_key(ticket)) {
-        (TicketSource::GitHub, Some(number)) => format!("Fixes #{number}"),
-        (_, Some(key)) => format!("Ticket: {source} `{key}`"),
-        (_, None) => format!("Ticket: {source} (its key is not shown)"),
+    let ticket_line = match (issue_in(ticket, repository), shown_key(ticket)) {
+        (Some(number), _) => format!("Fixes #{number}"),
+        (None, Some(key)) => format!("Ticket: {source} `{key}`"),
+        (None, None) => format!("Ticket: {source} (its key is not shown)"),
     };
     let base = request.base.as_str();
     let n = request.citations.len();
@@ -405,10 +506,10 @@ pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -
                 k + 1
             )
         }));
-        citations.push(Unit::Code(escape(&format!(
-            "{}:{}\n{}",
-            citation.path, citation.line, citation.quote
-        ))));
+        citations.push(Unit::Code(free(
+            &format!("{}:{}\n{}", citation.path, citation.line, citation.quote),
+            true,
+        )));
     }
     if citations.is_empty() {
         citations.push(Unit::Generated("_(no citations)_".to_owned()));
@@ -470,7 +571,7 @@ pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -
     }
 
     let mut footer = "---\n\n".to_owned();
-    if let Some(run) = safe_id(request.run.as_str(), MAX_ID) {
+    if let Some(run) = shown_id(request.run.as_str()) {
         footer.push_str(&format!("Run `{run}`. "));
     }
     let evidence: Vec<String> = [
@@ -479,7 +580,7 @@ pub fn pull_request_body(request: &PullRequest, repository: &GitHubRepository) -
         ("analysis", &request.analysis.reference),
     ]
     .iter()
-    .filter_map(|(what, r)| safe_id(r.as_str(), MAX_ID).map(|r| format!("{what} `{r}`")))
+    .filter_map(|(what, r)| shown_id(r.as_str()).map(|r| format!("{what} `{r}`")))
     .collect();
     if !evidence.is_empty() {
         footer.push_str(&format!("Evidence: {}. ", evidence.join(", ")));

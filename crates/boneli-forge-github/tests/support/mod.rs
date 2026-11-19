@@ -46,6 +46,9 @@ pub const INSTALLATION: u64 = 4242;
 /// The client id the tests use.
 pub const CLIENT_ID: &str = "Iv23liTestOnly0000";
 
+/// The GitHub ticket key of the sample request: issue 7 of [`REPO`].
+pub const KEY: &str = "octo-org/demo.repo#7";
+
 /// The base commit of the sample request.
 pub const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -496,7 +499,7 @@ pub fn request() -> PullRequest {
     let base = CommitSha::parse(BASE).expect("sha");
     PullRequest {
         run: RunId::new("run-1".to_owned()),
-        ticket: ticket("7"),
+        ticket: ticket(KEY),
         base: base.clone(),
         diff: attached("sha256-diff", b"the diff"),
         test: attached("sha256-test", b"#[test]\nfn empty() { parse(\"\"); }\n"),
