@@ -3,14 +3,16 @@
 //! The forge posts triage questions on the ticket and opens the pull
 //! request. Forge calls spend no agent budget and carry no usage (ADR-002,
 //! D3). Rendering the comment and the pull-request body, including the
-//! overrun statement, is the adapter's job (#19), because the format depends
-//! on the forge; the port hands it structured data.
+//! overrun statement and the verified citations, is the adapter's job
+//! (#19, ADR-014), because the format depends on the forge; the port hands
+//! it structured data. An adapter pushes the fix's branch through the `Git`
+//! port ([`crate::Git::push`]).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use boneli_domain::values::is_blank;
-use boneli_domain::{CommitSha, EvidenceRef, FixChecks, Overrun, RunId, Ticket, Usage};
+use boneli_domain::{Citation, CommitSha, EvidenceRef, FixChecks, Overrun, RunId, Ticket, Usage};
 
 use crate::job::JobFailure;
 
@@ -62,6 +64,9 @@ pub struct PullRequest {
     pub test: Attached,
     /// The verified root-cause analysis.
     pub analysis: Attached,
+    /// The analysis's citations, every one `Verified` by the root-cause
+    /// gate, for the pull request's root-cause section.
+    pub citations: Vec<Citation>,
     /// The fix gate's observations, for the before and after results.
     pub checks: FixChecks,
     /// The run's total consumption.

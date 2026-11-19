@@ -22,9 +22,14 @@
 //!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
 //! - [`patch_between`] describes the change between two workspaces as the
 //!   patch policy's input (ADR-013, D1).
+//! - `push` (ADR-014, D1 and D2) commits a checkout's tree on its base and
+//!   creates a branch with it, never moving one that exists; with
+//!   [`Credentials`] every network call gets an `Authorization` header
+//!   scoped to the repository URL, in its environment only (D3).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod cli;
+mod credentials;
 mod lookalike;
 mod materialize;
 mod patch;
@@ -35,6 +40,7 @@ mod url;
 mod workspace;
 
 pub use cli::{GitCli, GitCliConfig, OpenError};
+pub use credentials::{Credentials, MAX_AUTHORIZATION};
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
 pub use patch::patch_between;
 pub use run::MIN_GIT_VERSION;

@@ -920,6 +920,7 @@ mod tests {
             diff: diff_ref(),
             test: test_ref(),
             analysis: analysis_ref(),
+            citations: citations(),
             checks,
             spent,
             overrun,

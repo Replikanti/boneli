@@ -427,9 +427,36 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   processes and its own.
 - `boneli_git_cli::patch_between`: the patch policy's input from two
   workspaces, a lossless merge join that drops repository metadata.
+- Branch push, part 1 of #19 (ADR-014 D1 to D3, proposed): `Git::push`
+  commits a checkout's tree with its base as the only parent and creates
+  a branch with it on the repository the base came from, create-only
+  (`GitError::BranchExists`). `BranchName` is `boneli/` plus 1 to 100
+  bytes of `[a-z0-9._-]` (a strict subset of `git check-ref-format`),
+  `CommitInfo` the checked identity and message. The `Git` suite gains
+  `push-reads-back`, `push-parent-is-base`, `push-never-overwrites` and
+  `push-unknown-checkout`, read through a new `Remote` fixture hook, each
+  with a mutant (54 clauses, 66 mutant cases). `MemoryGit` pushes with
+  counter commit ids and refuses a taken one.
+- `boneli-git-cli`: `push` (`commit-tree`, an exact `ls-remote` check,
+  then a push whose empty lease refuses a branch created in between) and
+  `Credentials`: an `Authorization` value per network process (`fetch`,
+  `ls-remote`, `push`), checked (1 to 8,192 bytes of printable ASCII, no
+  outer space) before the process starts, passed only as
+  `http.<url>.extraHeader` in its command-scope config and redacted from
+  failure details. The command scope adds `push.recurseSubmodules=no`,
+  `push.followTags=false`, `push.gpgSign=false` and
+  `push.negotiate=true`: from the depth-1 store, without negotiation, a
+  push after the remote's `main` moved sent the base's whole tree (309
+  objects for a one-file change in a 300-file fixture, 4 with it).
 
 ### Changed
 
+- `RunCommand::OpenPullRequest` and `PullRequest` carry the run's
+  citations, all verified by the root-cause gate, for the forge (#19).
+  `boneli_domain::values::is_default_ignorable` is public.
+- `contract::forge::run` takes the ticket fixture every call names; the
+  old sample ticket is `contract::sample_ticket()`. `GitCliConfig` gains
+  `credentials` and loses `PartialEq` and `Eq`.
 - The workspace `rust-version` is 1.89 (was 1.87), for `File::try_lock`,
   the lock of `boneli-store-fs` (ADR-012, D1). Clippy's let-chain and
   `as_chunks` suggestions apply from that MSRV: 14 nested `if let`s and 2

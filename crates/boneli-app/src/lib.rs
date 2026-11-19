@@ -49,7 +49,7 @@ pub use debug_ticket::{
 };
 pub use evidence::{Evidence, EvidenceError};
 pub use forge::{Attached, Forge, ForgeRef, PullRequest};
-pub use git::{CheckoutId, Git, GitError, RepoUrl};
+pub use git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
 pub use ids::Ids;
 pub use image::{ImageError, ImageRef, ImageStore, RootfsRef};
 pub use job::JobFailure;

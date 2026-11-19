@@ -541,6 +541,7 @@ fn advance(
                         diff: v.fixed.diff.clone(),
                         test: a.reproduced.test.clone(),
                         analysis: a.analysis.clone(),
+                        citations: a.citations.clone(),
                         checks,
                         spent,
                         overrun,

@@ -14,10 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use boneli_app::contract::git::{Repository, Tripwire};
-use boneli_app::{GitError, RelativePath, RepoUrl};
+use std::sync::Arc;
+
+use boneli_app::contract::git::{Remote, Repository, Tripwire};
+use boneli_app::{BranchName, GitError, RelativePath, RepoUrl};
 use boneli_domain::CommitSha;
-use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Kind, Transports, Workspace};
+use boneli_git_cli::{
+    Credentials, DEFAULT_MAX_NODES, GitCli, GitCliConfig, Kind, Transports, Workspace,
+};
 
 /// A directory under `CARGO_TARGET_TMPDIR`, unique per process and call,
 /// removed on drop.
@@ -228,6 +232,16 @@ impl Source {
 /// A `GitCli` on its own root under `tmp`, with the file transport, and the
 /// directory that holds the root.
 pub fn open(tmp: &TempDir, git: &Path, max_nodes: usize) -> GitCli {
+    open_with(tmp, git, max_nodes, None)
+}
+
+/// [`open`] with credentials.
+pub fn open_with(
+    tmp: &TempDir,
+    git: &Path,
+    max_nodes: usize,
+    credentials: Option<Arc<dyn Credentials>>,
+) -> GitCli {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     GitCli::open(GitCliConfig {
@@ -235,8 +249,68 @@ pub fn open(tmp: &TempDir, git: &Path, max_nodes: usize) -> GitCli {
         root: tmp.path().join(format!("root-{n}")),
         transports: Transports::HttpsAndFile,
         max_workspace_nodes: max_nodes,
+        credentials,
     })
     .expect("open the adapter")
+}
+
+/// The directory of a `file://` fixture URL.
+pub fn url_dir(repo: &RepoUrl) -> Result<PathBuf, String> {
+    repo.as_str()
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("not a fixture URL: {:?}", repo.as_str()))
+}
+
+/// The tip of `refs/heads/<branch>` in the fixture repository at `dir` and
+/// its parents, read with the test's own git; `None` when it is absent.
+pub fn branch_at(dir: &Path, branch: &str) -> Option<(String, Vec<String>)> {
+    let refname = format!("refs/heads/{branch}");
+    let out = fgit(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)%09%(parent)",
+            &refname,
+        ],
+    );
+    out.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        (fields.next()? == refname).then(|| {
+            let tip = fields.next().unwrap_or_default().to_owned();
+            let parents = fields
+                .next()
+                .unwrap_or_default()
+                .split(' ')
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect();
+            (tip, parents)
+        })
+    })
+}
+
+/// The suite's `Remote` hook for `file://` fixtures: the repository read
+/// with the test's own git, so nothing the adapter does can colour it.
+pub struct HostRemote;
+
+impl<G> Remote<G> for HostRemote {
+    fn branch(
+        &self,
+        _adapter: &G,
+        repo: &RepoUrl,
+        branch: &BranchName,
+    ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, String> {
+        let dir = url_dir(repo)?;
+        let Some((tip, parents)) = branch_at(&dir, branch.as_str()) else {
+            return Ok(None);
+        };
+        let parse = |s: &str| CommitSha::parse(s).map_err(|e| format!("{s:?}: {e}"));
+        Ok(Some((
+            parse(&tip)?,
+            parents.iter().map(|p| parse(p)).collect::<Result<_, _>>()?,
+        )))
+    }
 }
 
 /// A `GitCli` over the test's own git, with the default node cap.
@@ -457,4 +531,24 @@ pub fn failed<T: std::fmt::Debug>(result: Result<T, GitError>) -> String {
         Err(GitError::Failed { detail }) => detail,
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// A git that runs the real one with `GIT_TRACE2_EVENT` set to `trace`
+/// and the `http.*` config keys logged, so the test sees what the push's
+/// `pack-objects` wrote and which config each process read. The adapter
+/// clears the environment; the wrapper adds the variables after that.
+pub fn tracing_git(tmp: &TempDir, trace: &std::path::Path) -> std::path::PathBuf {
+    let git = tmp.path().join("tracing-git");
+    write_executable(
+        &git,
+        format!(
+            "#!/bin/sh\n\
+             GIT_TRACE2_EVENT='{trace}' GIT_TRACE2_CONFIG_PARAMS='http.*' \
+             exec '{real}' \"$@\"\n",
+            trace = trace.display(),
+            real = host_git().display()
+        )
+        .as_bytes(),
+    );
+    git
 }

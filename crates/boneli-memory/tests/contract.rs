@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
-    Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase, RelativePath, RepoUrl,
-    RootCauseReport, RootfsRef, SandboxId, SandboxSpec, SnapshotSource, TriageReport, Written,
+    BranchName, Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase,
+    RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId, SandboxSpec, SnapshotSource,
+    TriageReport, Written,
 };
 use boneli_domain::{CitationStatus, CommitSha, FixChecks, TriageVerdict};
 use boneli_memory::{
@@ -122,7 +123,10 @@ fn in_memory_verifier_passes_contract() {
 
 #[test]
 fn in_memory_forge_passes_contract() {
-    assert_eq!(contract::forge::run(MemoryForge::new, silent_forge), Ok(()));
+    assert_eq!(
+        contract::forge::run(MemoryForge::new, silent_forge, &contract::sample_ticket()),
+        Ok(())
+    );
 }
 
 /// The scripts answer in order and an exhausted queue fails with the
@@ -299,6 +303,20 @@ impl contract::git::Tripwire<MemoryGit> for NothingRuns {
     }
 }
 
+/// The remote of `MemoryGit` is its own state.
+pub struct MemoryRemote;
+
+impl contract::git::Remote<MemoryGit> for MemoryRemote {
+    fn branch(
+        &self,
+        adapter: &MemoryGit,
+        repo: &RepoUrl,
+        branch: &BranchName,
+    ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, String> {
+        Ok(adapter.branch(repo, branch))
+    }
+}
+
 /// One field of `MemoryGit`'s formats; `None` when it runs past the end.
 fn take_field<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
     let length: [u8; 8] = rest.get(..8)?.try_into().ok()?;
@@ -356,7 +374,7 @@ pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Ve
 #[test]
 fn in_memory_git_passes_contract() {
     assert_eq!(
-        contract::git::run(repository, edit, retarget, &NothingRuns),
+        contract::git::run(repository, edit, retarget, &NothingRuns, &MemoryRemote),
         Ok(())
     );
 }
@@ -377,7 +395,13 @@ fn metadata_fixture_must_be_metadata() {
         r.metadata.push((path("src/x.rs"), b"fn x() {}\n".to_vec()));
         r
     };
-    let (clause, detail) = git_clause(contract::git::run(content, edit, retarget, &NothingRuns));
+    let (clause, detail) = git_clause(contract::git::run(
+        content,
+        edit,
+        retarget,
+        &NothingRuns,
+        &MemoryRemote,
+    ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
     assert!(detail.contains("src/x.rs"), "{detail}");
@@ -399,6 +423,7 @@ fn metadata_fixture_must_reach_the_workspace() {
         skipping,
         retarget,
         &NothingRuns,
+        &MemoryRemote,
     ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
@@ -412,8 +437,8 @@ fn retarget_must_make_a_diff_that_applies() {
     let garbage = |_: &[u8], _: &RelativePath, _: &RelativePath| b"garbage".to_vec();
     let ignores = |d: &[u8], _: &RelativePath, _: &RelativePath| d.to_vec();
     for result in [
-        contract::git::run(repository, edit, garbage, &NothingRuns),
-        contract::git::run(repository, edit, ignores, &NothingRuns),
+        contract::git::run(repository, edit, garbage, &NothingRuns, &MemoryRemote),
+        contract::git::run(repository, edit, ignores, &NothingRuns, &MemoryRemote),
     ] {
         let (clause, detail) = git_clause(result);
         assert_eq!(clause, "workspace-metadata-inert", "{detail}");
@@ -443,6 +468,7 @@ fn retarget_must_make_a_diff_that_applies() {
         edit,
         retarget,
         &NothingRuns,
+        &MemoryRemote,
     ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
@@ -474,8 +500,20 @@ fn metadata_fixture_entries_each_reach_the_workspace() {
         }
     };
     for result in [
-        contract::git::run(repository, skip_nested, retarget, &NothingRuns),
-        contract::git::run(repository, drop_nested_later, retarget, &NothingRuns),
+        contract::git::run(
+            repository,
+            skip_nested,
+            retarget,
+            &NothingRuns,
+            &MemoryRemote,
+        ),
+        contract::git::run(
+            repository,
+            drop_nested_later,
+            retarget,
+            &NothingRuns,
+            &MemoryRemote,
+        ),
     ] {
         let (clause, detail) = git_clause(result);
         assert_eq!(clause, "workspace-metadata-inert", "{detail}");
@@ -501,6 +539,7 @@ fn retarget_must_round_trip_through_metadata_paths() {
         edit,
         garbles_metadata,
         &NothingRuns,
+        &MemoryRemote,
     ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
@@ -521,7 +560,13 @@ fn metadata_fixture_must_not_be_empty() {
         metadata: vec![],
         ..repository()
     };
-    let (clause, detail) = git_clause(contract::git::run(empty, edit, retarget, &NothingRuns));
+    let (clause, detail) = git_clause(contract::git::run(
+        empty,
+        edit,
+        retarget,
+        &NothingRuns,
+        &MemoryRemote,
+    ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
 }
@@ -540,6 +585,7 @@ fn tripped_before_the_clause_is_a_violation() {
         edit,
         retarget,
         &AlwaysTripped,
+        &MemoryRemote,
     ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.starts_with("fixture:"), "{detail}");
@@ -550,7 +596,13 @@ fn tripped_before_the_clause_is_a_violation() {
             Err(String::from("cannot read the sentinel directory"))
         }
     }
-    let (clause, detail) = git_clause(contract::git::run(repository, edit, retarget, &Blind));
+    let (clause, detail) = git_clause(contract::git::run(
+        repository,
+        edit,
+        retarget,
+        &Blind,
+        &MemoryRemote,
+    ));
     assert_eq!(clause, "workspace-metadata-inert", "{detail}");
     assert!(detail.contains("cannot read"), "{detail}");
 }
@@ -700,7 +752,13 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(
-        clause(contract::git::run(unchanged, edit, retarget, &NothingRuns)),
+        clause(contract::git::run(
+            unchanged,
+            edit,
+            retarget,
+            &NothingRuns,
+            &MemoryRemote
+        )),
         "apply-then-read"
     );
     let own_base = || {
@@ -711,7 +769,13 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(
-        clause(contract::git::run(own_base, edit, retarget, &NothingRuns)),
+        clause(contract::git::run(
+            own_base,
+            edit,
+            retarget,
+            &NothingRuns,
+            &MemoryRemote
+        )),
         "unknown-commit"
     );
     let same_digest = || contract::image::Images {
@@ -822,5 +886,51 @@ fn unknown_program_and_hostile_workspace() {
     assert_eq!(
         r.adapter.read(&base, &path("README")),
         Ok(Some(b"app".to_vec()))
+    );
+}
+
+/// Pushed commit ids come from a counter, as long as the base's id, so a
+/// replayed run gets the same ids; an id that a fixed commit of the
+/// repository already has is refused rather than shadowed.
+#[test]
+fn memory_git_push_ids() {
+    use boneli_app::{BranchName, CommitInfo, Git, GitError};
+    let taken = format!("{:040x}", 2);
+    let mut r = repository();
+    let tree = unpack_tree(
+        &r.adapter
+            .snapshot(&r.adapter.fetch_base(&r.repo, &r.base).expect("fetch"))
+            .expect("snapshot"),
+    )
+    .expect("tree");
+    r.adapter = MemoryGit::new(vec![
+        GitCommit {
+            repo: r.repo.clone(),
+            sha: r.base.clone(),
+            files: tree.clone(),
+        },
+        GitCommit {
+            repo: r.repo.clone(),
+            sha: CommitSha::parse(&taken).expect("valid SHA"),
+            files: tree,
+        },
+    ]);
+    let info = CommitInfo::new("t", "t@example.invalid", "m").expect("valid");
+    let branch = |n: &str| BranchName::parse(n).expect("valid");
+    let c = r.adapter.fetch_base(&r.repo, &r.base).expect("fetch");
+    let first = r
+        .adapter
+        .push(&c, &branch("boneli/a"), &info)
+        .expect("push");
+    assert_eq!(first.as_str(), format!("{:040x}", 1));
+    let got = r.adapter.push(&c, &branch("boneli/b"), &info);
+    assert!(
+        matches!(&got, Err(GitError::Failed { detail }) if detail.contains("taken")),
+        "{got:?}"
+    );
+    assert_eq!(r.adapter.branch(&r.repo, &branch("boneli/b")), None);
+    assert_eq!(
+        r.adapter.branch(&r.repo, &branch("boneli/a")),
+        Some((first, vec![r.base.clone()]))
     );
 }

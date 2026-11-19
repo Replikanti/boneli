@@ -5,13 +5,13 @@
 use std::process::Command;
 
 use boneli_app::contract::{self, git::run};
-use boneli_app::{CheckoutId, Git, GitError, RelativePath, RepoUrl};
+use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
 use boneli_domain::CommitSha;
 use boneli_git_cli::GitCli;
 
 use crate::support::{
-    Source, TempDir, Trip, cli, contract_source, decode, edit, encode, host_git, repository,
-    retarget, unpack_all,
+    HostRemote, Source, TempDir, Trip, cli, contract_source, decode, edit, encode, host_git,
+    repository, retarget, unpack_all,
 };
 
 #[test]
@@ -20,7 +20,7 @@ fn git_cli_passes_contract() {
     let (source, base) = contract_source(&tmp);
     let trip = Trip::new(&tmp);
     let make = || repository(cli(&tmp), &source, &base, trip.metadata());
-    assert_eq!(run(make, edit, retarget, &trip), Ok(()));
+    assert_eq!(run(make, edit, retarget, &trip, &HostRemote), Ok(()));
     assert_eq!(trip.tripped(), Vec::<String>::new());
 }
 
@@ -68,6 +68,9 @@ impl Git for Discovering {
     fn apply(&self, c: &CheckoutId, d: &[u8]) -> Result<CheckoutId, GitError> {
         self.inner.apply(c, d)
     }
+    fn push(&self, c: &CheckoutId, b: &BranchName, i: &CommitInfo) -> Result<CommitSha, GitError> {
+        self.inner.push(c, b, i)
+    }
 }
 
 /// Which metadata a case plants.
@@ -101,7 +104,7 @@ fn metadata_fixture_trips_a_discovering_git() {
                 metadata(&trip),
             )
         };
-        let got = run(make, edit, retarget, &trip);
+        let got = run(make, edit, retarget, &trip, &HostRemote);
         let Err(contract::Violation { clause, detail, .. }) = got else {
             panic!("{which}: the discovering git passed: {got:?}");
         };
@@ -142,12 +145,20 @@ fn nested_metadata_is_dropped() {
         fn apply(&self, c: &CheckoutId, d: &[u8]) -> Result<CheckoutId, GitError> {
             self.0.apply(c, d)
         }
+        fn push(
+            &self,
+            c: &CheckoutId,
+            b: &BranchName,
+            i: &CommitInfo,
+        ) -> Result<CommitSha, GitError> {
+            self.0.push(c, b, i)
+        }
     }
     let tmp = TempDir::new("nested");
     let (source, base) = contract_source(&tmp);
     let trip = Trip::new(&tmp);
     let make = || repository(TopLevelOnly(cli(&tmp)), &source, &base, trip.metadata());
-    let got = run(make, edit, retarget, &trip);
+    let got = run(make, edit, retarget, &trip, &HostRemote);
     let Err(contract::Violation { clause, detail, .. }) = got else {
         panic!("the top-level-only adapter passed: {got:?}");
     };

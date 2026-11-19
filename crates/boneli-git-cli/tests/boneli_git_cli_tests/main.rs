@@ -1,6 +1,7 @@
-//! Integration tests of `boneli-git-cli` (#30, ADR-010): the `Git`
-//! contract on `GitCli` over fixture repositories, the acceptance tests,
-//! and the environment and steering tests of the git runner.
+//! Integration tests of `boneli-git-cli` (#30, ADR-010; #19, ADR-014): the
+//! `Git` contract on `GitCli` over fixture repositories, the acceptance
+//! tests, the environment and steering tests of the git runner, and branch
+//! push and credentials.
 //!
 //! The tests run the first `git` on `PATH`, which must be at least the
 //! adapter's floor (2.39.1). Fixture repositories are built by that git
@@ -15,10 +16,12 @@ mod support;
 
 mod apply;
 mod contract;
+mod credentials;
 mod diff;
 mod environment;
 mod fetch;
 mod network;
 mod open;
+mod push;
 mod read;
 mod snapshot;
