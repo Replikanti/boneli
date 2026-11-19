@@ -296,6 +296,7 @@ fn diff_under_a_root_with_a_colon() {
         root: parent.join("root"),
         transports: boneli_git_cli::Transports::HttpsAndFile,
         max_workspace_nodes: boneli_git_cli::DEFAULT_MAX_NODES,
+        credentials: None,
     })
     .expect("open");
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");

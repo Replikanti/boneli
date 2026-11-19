@@ -127,7 +127,11 @@ fn sample_base(port: &'static str, clause: &'static str) -> Result<CommitSha, Vi
     fixed(port, clause, CommitSha::parse(BASE))
 }
 
-fn sample_ticket() -> Ticket {
+/// The ticket the suites use where the adapter does not supply one: a
+/// GitHub ticket with key `CONTRACT-1`. The `Forge` suite takes its ticket
+/// from the adapter's test instead, because only the adapter knows which
+/// keys its forge can post on; an in-memory forge passes this one.
+pub fn sample_ticket() -> Ticket {
     Ticket {
         source: TicketSource::GitHub,
         key: String::from("CONTRACT-1"),
@@ -963,17 +967,19 @@ pub mod forge {
     /// detail starts with one of them.
     pub const OPERATIONS: &[&str] = &["post_questions", "open_pull_request"];
 
-    fn sample_request(clause: &'static str) -> Result<PullRequest, Violation> {
+    fn sample_request(clause: &'static str, ticket: &Ticket) -> Result<PullRequest, Violation> {
         let attached = |reference: &str, content: &[u8]| {
             fixed(PORT, clause, EvidenceRef::parse(reference)).map(|reference| Attached {
                 reference,
                 content: content.to_vec(),
             })
         };
+        let base = sample_base(PORT, clause)?;
         Ok(PullRequest {
             run: RunId::new(String::from("contract-run")),
-            ticket: sample_ticket(),
-            base: sample_base(PORT, clause)?,
+            ticket: ticket.clone(),
+            citations: sample_citations(&base),
+            base,
             diff: attached("contract-diff", b"diff")?,
             test: attached("contract-test", b"test")?,
             analysis: attached("contract-analysis", b"analysis")?,
@@ -988,20 +994,34 @@ pub mod forge {
 
     /// Checks every clause. `working` gives an adapter on which every call
     /// succeeds; `silent` one on which every call fails with no error
-    /// output.
+    /// output. `ticket` is the ticket every call names: only the adapter's
+    /// own test knows which ticket keys its forge can post on
+    /// ([`sample_ticket`] for a forge that takes any). A ticket with a
+    /// blank key or title is a fixture violation, because the domain never
+    /// hands a forge such a ticket.
     pub fn run<F: Forge>(
         working: impl Fn() -> F,
         silent: impl Fn() -> SilentFailure<F>,
+        ticket: &Ticket,
     ) -> Result<(), Violation> {
         let clause = "distinct-references";
+        if let Some(field) = ticket.blank_field() {
+            return Err(violation(
+                PORT,
+                clause,
+                format!(
+                    "fixture: the ticket's {field:?} is blank, and the domain never hands a \
+                     forge such a ticket"
+                ),
+            ));
+        }
         let forge = working();
-        let ticket = sample_ticket();
         let questions = [String::from("Which version?")];
-        let request = sample_request(clause)?;
+        let request = sample_request(clause, ticket)?;
         let mut references = Vec::new();
         for k in 0..4 {
             let result = if k % 2 == 0 {
-                forge.post_questions(&ticket, &questions)
+                forge.post_questions(ticket, &questions)
             } else {
                 forge.open_pull_request(&request)
             };
@@ -1022,10 +1042,10 @@ pub mod forge {
         })?;
 
         let fixture = silent();
-        let result = fixture.adapter.post_questions(&ticket, &questions);
+        let result = fixture.adapter.post_questions(ticket, &questions);
         silent_detail(PORT, "post_questions", result, &fixture.status)?;
         let fixture = silent();
-        let request = sample_request("silent-failure-detail")?;
+        let request = sample_request("silent-failure-detail", ticket)?;
         let result = fixture.adapter.open_pull_request(&request);
         silent_detail(PORT, "open_pull_request", result, &fixture.status)
     }
@@ -1259,7 +1279,7 @@ pub mod sandbox {
 /// The `Git` suite.
 pub mod git {
     use super::*;
-    use crate::git::{CheckoutId, Git, GitError, RepoUrl};
+    use crate::git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
     use crate::path::RelativePath;
 
     const PORT: &str = "Git";
@@ -1277,6 +1297,10 @@ pub mod git {
         "removed-file",
         "apply-mismatch-fails",
         "workspace-metadata-inert",
+        "push-reads-back",
+        "push-parent-is-base",
+        "push-never-overwrites",
+        "push-unknown-checkout",
     ];
 
     /// The sub-checks of `workspace-metadata-inert`, each with its own
@@ -1332,6 +1356,23 @@ pub mod git {
         fn tripped(&self, adapter: &G) -> Result<Vec<String>, String>;
     }
 
+    /// What the remote holds after a push, as only the adapter's own test
+    /// can see it: for the git binary, the fixture repository read with the
+    /// test's own git; for an in-memory adapter, its state. The push
+    /// clauses use one branch each, `boneli/contract-<clause>`, which must
+    /// not exist on the fixture's remote before the suite runs.
+    pub trait Remote<G> {
+        /// The tip of `branch` in `repo` and the tip's parents, in order;
+        /// `None` when the branch does not exist. An error is reported as
+        /// the clause's detail.
+        fn branch(
+            &self,
+            adapter: &G,
+            repo: &RepoUrl,
+            branch: &BranchName,
+        ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, String>;
+    }
+
     /// Checks every clause; each clause gets a fresh adapter from `make`.
     ///
     /// `edit` takes a workspace in the adapter's snapshot format, a path
@@ -1341,12 +1382,14 @@ pub mod git {
     /// diff in the adapter's format and two paths and returns the diff with
     /// every change of the first path moved to the second; the suite proves
     /// on a content path that the result applies. `tripwire` reports what
-    /// the planted metadata of `workspace-metadata-inert` made run.
+    /// the planted metadata of `workspace-metadata-inert` made run, and
+    /// `remote` what the push clauses left on the remote.
     pub fn run<G: Git>(
         make: impl Fn() -> Repository<G>,
         edit: impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
         retarget: impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         tripwire: &impl Tripwire<G>,
+        remote: &impl Remote<G>,
     ) -> Result<(), Violation> {
         read_at_base(&make())?;
         read_missing(&make())?;
@@ -1358,7 +1401,11 @@ pub mod git {
         added_file(&make(), &edit)?;
         removed_file(&make(), &edit)?;
         apply_mismatch_fails(&make(), &edit)?;
-        workspace_metadata_inert(&make(), &edit, &retarget, tripwire)
+        workspace_metadata_inert(&make(), &edit, &retarget, tripwire)?;
+        push_reads_back(&make(), &edit, remote)?;
+        push_parent_is_base(&make(), &edit, remote)?;
+        push_never_overwrites(&make(), &edit, remote)?;
+        push_unknown_checkout(&make(), remote)
     }
 
     fn call<T>(
@@ -1863,6 +1910,182 @@ pub mod git {
             format!("apply-refuses: {base:?} changed when diffs that write metadata were refused")
         })?;
         nothing_ran(r, tripwire, "the refused applies")
+    }
+
+    /// The clause's own branch, `boneli/contract-<clause>`.
+    fn contract_branch(clause: &'static str) -> Result<BranchName, Violation> {
+        let name = format!("boneli/contract-{clause}");
+        BranchName::parse(&name).ok_or_else(|| {
+            violation(
+                PORT,
+                clause,
+                format!("suite fixture rejected: {name:?} is not a branch name"),
+            )
+        })
+    }
+
+    /// The clause's commit identity and message.
+    fn contract_commit(clause: &'static str) -> Result<CommitInfo, Violation> {
+        let message = format!("contract: {clause}\n");
+        CommitInfo::new("Boneli contract", "contract@example.invalid", &message).ok_or_else(|| {
+            violation(
+                PORT,
+                clause,
+                String::from("suite fixture rejected: the commit identity"),
+            )
+        })
+    }
+
+    /// What `remote` reports for the clause's branch; an error is the
+    /// clause's detail, so a remote hook that cannot look never passes.
+    fn remote_branch<G: Git>(
+        r: &Repository<G>,
+        remote: &impl Remote<G>,
+        clause: &'static str,
+        branch: &BranchName,
+    ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, Violation> {
+        remote
+            .branch(&r.adapter, &r.repo, branch)
+            .map_err(|error| violation(PORT, clause, format!("the remote hook failed: {error}")))
+    }
+
+    /// The clause's branch, checked absent on the remote before anything is
+    /// pushed: a branch left over from another run would let a push that
+    /// never happened read back.
+    fn absent_branch<G: Git>(
+        r: &Repository<G>,
+        remote: &impl Remote<G>,
+        clause: &'static str,
+    ) -> Result<BranchName, Violation> {
+        let branch = contract_branch(clause)?;
+        let before = remote_branch(r, remote, clause, &branch)?;
+        ensure(before.is_none(), PORT, clause, || {
+            format!(
+                "fixture: {:?} exists on the remote before the clause pushed it: {before:?}",
+                branch.as_str()
+            )
+        })?;
+        Ok(branch)
+    }
+
+    /// Fetches the base, edits the path, applies the diff and pushes the
+    /// result to the clause's branch; returns the base checkout, the
+    /// applied one, the branch and the pushed commit.
+    fn pushed<G: Git>(
+        r: &Repository<G>,
+        clause: &'static str,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        remote: &impl Remote<G>,
+    ) -> Result<(CheckoutId, CheckoutId, BranchName, CommitSha), Violation> {
+        let branch = absent_branch(r, remote, clause)?;
+        let commit = contract_commit(clause)?;
+        let (base, after) = applied(r, clause, edit)?;
+        let sha = call(clause, "push", r.adapter.push(&after, &branch, &commit))?;
+        Ok((base, after, branch, sha))
+    }
+
+    /// A pushed commit is the branch's tip on the remote, and checked out
+    /// again it holds the applied tree, not the base's: the pull request
+    /// shows the verified fix.
+    fn push_reads_back<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        remote: &impl Remote<G>,
+    ) -> Result<(), Violation> {
+        let clause = "push-reads-back";
+        let (_, _, branch, sha) = pushed(r, clause, edit, remote)?;
+        let tip = remote_branch(r, remote, clause, &branch)?;
+        ensure(
+            tip.as_ref().map(|(tip, _)| tip) == Some(&sha),
+            PORT,
+            clause,
+            || {
+                format!(
+                    "push returned {sha:?}, and the remote's {:?} is {tip:?}",
+                    branch.as_str()
+                )
+            },
+        )?;
+        let fetched = call(clause, "fetch_base", r.adapter.fetch_base(&r.repo, &sha))?;
+        expect_read(r, clause, &fetched, &r.path, Some(&r.edited))
+    }
+
+    /// The pushed commit's only parent is the base commit, so the pull
+    /// request shows the fix and nothing else.
+    fn push_parent_is_base<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        remote: &impl Remote<G>,
+    ) -> Result<(), Violation> {
+        let clause = "push-parent-is-base";
+        let (_, _, branch, sha) = pushed(r, clause, edit, remote)?;
+        let tip = remote_branch(r, remote, clause, &branch)?;
+        let want = Some((sha, vec![r.base.clone()]));
+        ensure(tip == want, PORT, clause, || {
+            format!(
+                "the remote's {:?} is {tip:?}, expected the pushed commit with the base as its \
+                 only parent: {want:?}",
+                branch.as_str()
+            )
+        })
+    }
+
+    /// A push to a branch that exists is `BranchExists`, and the branch
+    /// keeps its tip: a run never moves a branch, its own earlier one
+    /// included (ADR-014, D2).
+    fn push_never_overwrites<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        remote: &impl Remote<G>,
+    ) -> Result<(), Violation> {
+        let clause = "push-never-overwrites";
+        let (base, _, branch, first) = pushed(r, clause, edit, remote)?;
+        let commit = contract_commit(clause)?;
+        let again = r.adapter.push(&base, &branch, &commit);
+        ensure(again == Err(GitError::BranchExists), PORT, clause, || {
+            format!(
+                "a second push to {:?}, which the first push created, gave {again:?}, expected \
+                 BranchExists",
+                branch.as_str()
+            )
+        })?;
+        let tip = remote_branch(r, remote, clause, &branch)?;
+        ensure(
+            tip.as_ref().map(|(tip, _)| tip) == Some(&first),
+            PORT,
+            clause,
+            || {
+                format!(
+                    "after the refused push the remote's {:?} is {tip:?}, expected its first tip \
+                     {first:?}",
+                    branch.as_str()
+                )
+            },
+        )
+    }
+
+    /// A push from a checkout the adapter never issued is
+    /// `UnknownCheckout`, and creates no branch.
+    fn push_unknown_checkout<G: Git>(
+        r: &Repository<G>,
+        remote: &impl Remote<G>,
+    ) -> Result<(), Violation> {
+        let clause = "push-unknown-checkout";
+        let branch = absent_branch(r, remote, clause)?;
+        let commit = contract_commit(clause)?;
+        let issued = checkout(r, clause)?;
+        let unknown = CheckoutId::new(format!("{}-unknown", issued.as_str()));
+        let got = r.adapter.push(&unknown, &branch, &commit);
+        ensure(got == Err(GitError::UnknownCheckout), PORT, clause, || {
+            format!("push from {unknown:?}, which was never issued, gave {got:?}")
+        })?;
+        let after = remote_branch(r, remote, clause, &branch)?;
+        ensure(after.is_none(), PORT, clause, || {
+            format!(
+                "a refused push created {:?} on the remote: {after:?}",
+                branch.as_str()
+            )
+        })
     }
 
     fn unchanged_snapshot_empty_diff<G: Git>(r: &Repository<G>) -> Result<(), Violation> {

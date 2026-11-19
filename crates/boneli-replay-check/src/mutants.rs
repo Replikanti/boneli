@@ -16,12 +16,12 @@ use std::sync::Mutex;
 
 use boneli_app::contract::{self, SilentFailure, Violation};
 use boneli_app::{
-    Agent, CheckoutId, Clock, Command as SandboxCommand, DataError, DataSnapshot, DatabaseCopy,
-    EventStore, Evidence, EvidenceError, ExecResult, ExitStatus, FixRequest, Forge, ForgeRef, Git,
-    GitError, Ids, ImageError, ImageRef, ImageStore, JobFailure, Limits, Phase, PullRequest,
-    RelativePath, RepoUrl, ReproductionRequest, RootCauseReport, RootCauseRequest, RootfsRef,
-    RunLog, RunStart, Sandbox, SandboxError, SandboxId, SandboxSpec, SnapshotId, SnapshotSource,
-    StoreError, TriageReport, TriageRequest, Verifier, Written,
+    Agent, BranchName, CheckoutId, Clock, Command as SandboxCommand, CommitInfo, DataError,
+    DataSnapshot, DatabaseCopy, EventStore, Evidence, EvidenceError, ExecResult, ExitStatus,
+    FixRequest, Forge, ForgeRef, Git, GitError, Ids, ImageError, ImageRef, ImageStore, JobFailure,
+    Limits, Phase, PullRequest, RelativePath, RepoUrl, ReproductionRequest, RootCauseReport,
+    RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox, SandboxError, SandboxId, SandboxSpec,
+    SnapshotId, SnapshotSource, StoreError, TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, Citation, CitationStatus, CommitSha, EvidenceRef, FixChecks, RunEvent, RunId,
@@ -811,6 +811,17 @@ enum GitBug {
     /// `diff` drops only the top-level `.git` and encodes nested
     /// repository metadata as content (review round 2 of #61).
     NestedIsContent,
+    /// `push` commits the base's tree instead of the checkout's, as an
+    /// adapter that commits the store's base would.
+    PushesBase,
+    /// `push` creates a commit with no parent, as `commit-tree` without
+    /// `-p` would.
+    PushesOrphan,
+    /// `push` to an existing branch moves it to the new commit, as a
+    /// forced push would.
+    Overwrites,
+    /// `push` from an unknown checkout is `Failed`.
+    UnknownCheckoutFails,
 }
 
 const HEADER: &[u8] = b"diff\n";
@@ -874,6 +885,36 @@ struct GitMutant {
     /// `RunsOnRediff`) or that were fetched after one did
     /// (`AdoptsIntoNewCheckouts`).
     tainted: Mutex<Vec<CheckoutId>>,
+    /// The repository and base of every checkout issued (`PushesBase`).
+    origins: Mutex<Vec<(CheckoutId, RepoUrl, CommitSha)>>,
+    /// What the remote shows for a branch instead of `MemoryGit`'s state:
+    /// the tip and its parents that `PushesOrphan` and `Overwrites` left.
+    remote: Mutex<Vec<ShownBranch>>,
+}
+
+/// A branch as a mutant's remote shows it: repository, name, tip and the
+/// tip's parents.
+type ShownBranch = (RepoUrl, BranchName, CommitSha, Vec<CommitSha>);
+
+/// Reads a mutant's remote: what its push left in place of `MemoryGit`'s
+/// own state, or that state.
+struct MutantRemote;
+
+impl contract::git::Remote<GitMutant> for MutantRemote {
+    fn branch(
+        &self,
+        adapter: &GitMutant,
+        repo: &RepoUrl,
+        branch: &BranchName,
+    ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, String> {
+        let remote = adapter.remote.lock().expect("not poisoned");
+        let shown = remote
+            .iter()
+            .rev()
+            .find(|(r, b, _, _)| r == repo && b == branch)
+            .map(|(_, _, tip, parents)| (tip.clone(), parents.clone()));
+        Ok(shown.or_else(|| adapter.inner.branch(repo, branch)))
+    }
 }
 
 /// Reports a hook run that [`GitBug::RunsMetadata`] recorded.
@@ -891,18 +932,29 @@ impl contract::git::Tripwire<GitMutant> for MutantTripwire {
 }
 
 impl GitMutant {
-    fn resolve(&self, checkout: &CheckoutId) -> CheckoutId {
-        let moved = self.moved.lock().expect("not poisoned");
-        moved
+    /// The repository and base a checkout was fetched from.
+    fn origin(&self, checkout: &CheckoutId) -> Option<(RepoUrl, CommitSha)> {
+        let origins = self.origins.lock().expect("not poisoned");
+        origins
             .iter()
-            .rev()
-            .find(|(from, _)| from == checkout)
-            .map_or_else(|| checkout.clone(), |(_, to)| to.clone())
+            .find(|(c, _, _)| c == checkout)
+            .map(|(_, repo, base)| (repo.clone(), base.clone()))
     }
-}
 
-impl Git for GitMutant {
-    fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
+    /// Notes that `checkout` came from `repo` at `base`.
+    fn record(&self, checkout: &CheckoutId, repo: RepoUrl, base: CommitSha) {
+        let mut origins = self.origins.lock().expect("not poisoned");
+        origins.push((checkout.clone(), repo, base));
+    }
+
+    /// What the remote shows for `branch` instead of `MemoryGit`'s state.
+    fn show(&self, repo: RepoUrl, branch: &BranchName, tip: CommitSha, parents: Vec<CommitSha>) {
+        let mut remote = self.remote.lock().expect("not poisoned");
+        remote.push((repo, branch.clone(), tip, parents));
+    }
+
+    /// `fetch_base` with the bugs that change it.
+    fn fetch(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
         if let GitBug::PoisonsBase = self.bug {
             let fetched = self.inner.fetch_base(repo, base)?;
             let last = self.last_diff.lock().expect("not poisoned").clone();
@@ -923,6 +975,23 @@ impl Git for GitMutant {
             }
             (_, got) => got,
         }
+    }
+
+    fn resolve(&self, checkout: &CheckoutId) -> CheckoutId {
+        let moved = self.moved.lock().expect("not poisoned");
+        moved
+            .iter()
+            .rev()
+            .find(|(from, _)| from == checkout)
+            .map_or_else(|| checkout.clone(), |(_, to)| to.clone())
+    }
+}
+
+impl Git for GitMutant {
+    fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
+        let fetched = self.fetch(repo, base)?;
+        self.record(&fetched, repo.clone(), base.clone());
+        Ok(fetched)
     }
 
     fn read(
@@ -1004,6 +1073,59 @@ impl Git for GitMutant {
     }
 
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
+        let applied = self.apply_with_bug(checkout, diff)?;
+        if let Some((repo, base)) = self.origin(checkout) {
+            self.record(&applied, repo, base);
+        }
+        Ok(applied)
+    }
+
+    fn push(
+        &self,
+        checkout: &CheckoutId,
+        branch: &BranchName,
+        commit: &CommitInfo,
+    ) -> Result<CommitSha, GitError> {
+        let from = self.resolve(checkout);
+        match self.bug {
+            GitBug::PushesBase => {
+                let (repo, base) = self.origin(checkout).ok_or(GitError::UnknownCheckout)?;
+                let fresh = self.inner.fetch_base(&repo, &base)?;
+                self.inner.push(&fresh, branch, commit)
+            }
+            GitBug::PushesOrphan => {
+                let sha = self.inner.push(&from, branch, commit)?;
+                let (repo, _) = self.origin(checkout).ok_or(GitError::UnknownCheckout)?;
+                self.show(repo, branch, sha.clone(), Vec::new());
+                Ok(sha)
+            }
+            GitBug::Overwrites => match self.inner.push(&from, branch, commit) {
+                Err(GitError::BranchExists) => {
+                    // The new commit, made on a branch of its own, then
+                    // shown as the tip of the one it overwrote.
+                    let (repo, base) = self.origin(checkout).ok_or(GitError::UnknownCheckout)?;
+                    let name = format!("{}-overwrite", branch.as_str());
+                    let side = BranchName::parse(&name).ok_or(GitError::BranchExists)?;
+                    let sha = self.inner.push(&from, &side, commit)?;
+                    self.show(repo, branch, sha.clone(), vec![base]);
+                    Ok(sha)
+                }
+                other => other,
+            },
+            GitBug::UnknownCheckoutFails => match self.inner.push(&from, branch, commit) {
+                Err(GitError::UnknownCheckout) => Err(GitError::Failed {
+                    detail: String::from("no such checkout"),
+                }),
+                other => other,
+            },
+            _ => self.inner.push(&from, branch, commit),
+        }
+    }
+}
+
+impl GitMutant {
+    /// `apply` with the bugs that change it.
+    fn apply_with_bug(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
         *self.last_diff.lock().expect("not poisoned") = Some(diff.to_vec());
         let from = self.resolve(checkout);
         match self.bug {
@@ -1074,6 +1196,8 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
             ran: Mutex::new(false),
             adopted: Mutex::new(false),
             tainted: Mutex::new(Vec::new()),
+            origins: Mutex::new(Vec::new()),
+            remote: Mutex::new(Vec::new()),
         },
         repo,
         base,
@@ -1450,6 +1574,7 @@ pub fn mutants() -> Vec<Mutant> {
                     adapter: ForgeMutant(ForgeBug::SameReference, silent_forge()),
                     status: String::from(STATUS),
                 },
+                &contract::sample_ticket(),
             )
         }),
     ];
@@ -1500,6 +1625,10 @@ pub fn mutants() -> Vec<Mutant> {
         git_metadata("fresh-checkout", GitBug::AdoptsIntoNewCheckouts),
         git_metadata("same-apply", GitBug::AdoptsOnApply),
         git_metadata("apply-refuses", GitBug::AppliesMetadata),
+        git("push-reads-back", GitBug::PushesBase),
+        git("push-parent-is-base", GitBug::PushesOrphan),
+        git("push-never-overwrites", GitBug::Overwrites),
+        git("push-unknown-checkout", GitBug::UnknownCheckoutFails),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
@@ -1539,6 +1668,7 @@ pub fn mutants() -> Vec<Mutant> {
                     adapter: ForgeMutant(bug, silent_forge()),
                     status: String::from(STATUS),
                 },
+                &contract::sample_ticket(),
             )
         }));
     }
@@ -1551,6 +1681,7 @@ fn git_suite(bug: GitBug) -> Result<(), Violation> {
         git_edit,
         git_retarget,
         &MutantTripwire,
+        &MutantRemote,
     )
 }
 
@@ -1604,6 +1735,7 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
             skipping,
             git_retarget,
             &MutantTripwire,
+            &MutantRemote,
         )
     };
     // Review round 2 of #61: an `edit` that skips only the nested entry,
@@ -1632,6 +1764,7 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
             edit,
             git_retarget,
             &MutantTripwire,
+            &MutantRemote,
         )
     };
     // Review round 2 of #61: a `retarget` that breaks diffs pointed at
@@ -1655,6 +1788,7 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
                 git_edit,
                 garbles_metadata,
                 &MutantTripwire,
+                &MutantRemote,
             ),
         ),
     ]
@@ -1693,13 +1827,17 @@ pub fn blank_status_violations() -> Vec<(&'static str, Result<(), Violation>)> {
             status: String::from("\u{200B}"),
         },
     );
-    let forge = contract::forge::run(MemoryForge::new, || SilentFailure {
-        adapter: MemoryForge::scripted(ForgeScript {
-            post_questions: vec![Response::Fail(blank(" "))],
-            open_pull_request: vec![Response::Fail(blank(" "))],
-        }),
-        status: String::from(" "),
-    });
+    let forge = contract::forge::run(
+        MemoryForge::new,
+        || SilentFailure {
+            adapter: MemoryForge::scripted(ForgeScript {
+                post_questions: vec![Response::Fail(blank(" "))],
+                open_pull_request: vec![Response::Fail(blank(" "))],
+            }),
+            status: String::from(" "),
+        },
+        &contract::sample_ticket(),
+    );
     vec![("Agent", agent), ("Verifier", verifier), ("Forge", forge)]
 }
 

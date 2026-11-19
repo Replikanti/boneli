@@ -75,6 +75,7 @@ fn url_policy() {
         root: root.clone(),
         transports: Transports::Https,
         max_workspace_nodes: DEFAULT_MAX_NODES,
+        credentials: None,
     })
     .expect("open");
     recorder.clear();

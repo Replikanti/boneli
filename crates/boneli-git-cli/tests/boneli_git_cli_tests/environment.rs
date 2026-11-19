@@ -11,7 +11,8 @@ use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Transports};
 
 use crate::support::record::{Call, Recorder, silent_failure};
 use crate::support::{
-    Source, TempDir, Trip, contract_source, edit, failed, host_git, open, repository, retarget, sha,
+    HostRemote, Source, TempDir, Trip, contract_source, edit, failed, host_git, open, repository,
+    retarget, sha,
 };
 
 /// The variables every call gets, besides the command-scope config.
@@ -51,6 +52,9 @@ const CONFIG: &[(&str, &str)] = &[
     ("transfer.fsckObjects", "true"),
     ("fetch.recurseSubmodules", "false"),
     ("submodule.recurse", "false"),
+    ("push.recurseSubmodules", "no"),
+    ("push.followTags", "false"),
+    ("push.gpgSign", "false"),
     ("http.followRedirects", "false"),
     ("http.lowSpeedLimit", "1"),
     ("http.lowSpeedTime", "300"),
@@ -58,6 +62,14 @@ const CONFIG: &[(&str, &str)] = &[
     ("maintenance.auto", "false"),
     ("pack.threads", "1"),
     ("pack.writeReverseIndex", "false"),
+];
+
+/// The identity variables, which only `commit-tree` gets.
+const IDENTITY: &[&str] = &[
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_NAME",
 ];
 
 /// The subcommands that work on a throwaway index.
@@ -101,7 +113,7 @@ fn recorded_suite(tmp: &TempDir) -> (Vec<Call>, std::path::PathBuf) {
             trip.metadata(),
         )
     };
-    assert_eq!(run(make, edit, retarget, &trip), Ok(()));
+    assert_eq!(run(make, edit, retarget, &trip, &HostRemote), Ok(()));
     let calls = recorder.calls();
     assert!(calls.len() > 100, "only {} calls", calls.len());
     (calls, tmp.path().to_path_buf())
@@ -119,9 +131,18 @@ fn every_call_has_the_fixed_environment() {
     want.sort();
     let mut seen_indexed = false;
     let mut seen_objects = false;
+    let mut seen_identity = false;
     for call in &calls {
         let mut keys = call.keys();
         let sub = call.subcommand().unwrap_or("");
+        for key in IDENTITY {
+            let at = keys.iter().position(|k| k == key);
+            assert_eq!(at.is_some(), sub == "commit-tree", "{key}: {call:?}");
+            if let Some(at) = at {
+                keys.remove(at);
+                seen_identity = true;
+            }
+        }
         let indexed = INDEXED.contains(&sub);
         if indexed {
             let at = keys
@@ -194,6 +215,7 @@ fn every_call_has_the_fixed_environment() {
     }
     assert!(seen_indexed);
     assert!(seen_objects);
+    assert!(seen_identity);
 }
 
 /// Whether `call` belongs to the probe of a failed fetch (ADR-010, D6):
@@ -339,7 +361,7 @@ fn host_environment_cannot_steer_git() {
         let (source, base) = contract_source(&tmp);
         let trip = Trip::new(&tmp);
         let make = || repository(crate::support::cli(&tmp), &source, &base, trip.metadata());
-        assert_eq!(run(make, edit, retarget, &trip), Ok(()));
+        assert_eq!(run(make, edit, retarget, &trip, &HostRemote), Ok(()));
         assert_eq!(
             crate::support::listing(std::path::Path::new(&sentinel)),
             Vec::<String>::new()
@@ -408,6 +430,7 @@ fn https_only_has_no_file_protocol() {
         root: tmp.path().join("root"),
         transports: Transports::Https,
         max_workspace_nodes: DEFAULT_MAX_NODES,
+        credentials: None,
     })
     .expect("open");
     let source = Source::new(&tmp, "src", false);

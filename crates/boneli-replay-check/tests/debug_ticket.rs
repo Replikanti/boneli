@@ -909,6 +909,58 @@ fn forge_gets_the_bytes_the_verifier_checked() {
     assert!(opened > 0);
 }
 
+/// Every pull request carries the citations the verifier checked in that
+/// run, all of them `Verified` (the root-cause gate let the run on), at
+/// the base the pull request names (#19).
+#[test]
+fn pull_request_carries_the_verified_citations() {
+    let mut opened = 0;
+    for scenario in scenarios() {
+        let played = play(&scenario);
+        let checked: Vec<&Vec<boneli_domain::Citation>> = played
+            .verifier
+            .iter()
+            .filter_map(|request| match request {
+                VerifierRequest::VerifyCitations { citations, .. } => Some(citations),
+                _ => None,
+            })
+            .collect();
+        for request in played.forge.iter().filter_map(|request| match request {
+            ForgeRequest::OpenPullRequest(request) => Some(request),
+            ForgeRequest::PostQuestions { .. } => None,
+        }) {
+            opened += 1;
+            assert!(!request.citations.is_empty(), "{}", scenario.name);
+            assert!(
+                checked.contains(&&request.citations),
+                "{}: {:?} was never checked",
+                scenario.name,
+                request.citations
+            );
+            assert!(
+                request.citations.iter().all(|c| c.sha == request.base),
+                "{}",
+                scenario.name
+            );
+        }
+    }
+    assert!(opened > 0);
+    // On the default path, exactly the one set the verifier checked.
+    let played = played("delivered");
+    let checked: Vec<&VerifierRequest> = played
+        .verifier
+        .iter()
+        .filter(|r| matches!(r, VerifierRequest::VerifyCitations { .. }))
+        .collect();
+    let [VerifierRequest::VerifyCitations { citations, .. }] = checked.as_slice() else {
+        panic!("one citation check expected: {:?}", played.verifier);
+    };
+    let [ForgeRequest::OpenPullRequest(request)] = played.forge.as_slice() else {
+        panic!("one pull request expected: {:?}", played.forge);
+    };
+    assert_eq!(&request.citations, citations);
+}
+
 fn played(name: &str) -> Played {
     let scenario: AppScenario = scenarios()
         .into_iter()

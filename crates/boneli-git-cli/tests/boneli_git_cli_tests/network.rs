@@ -19,6 +19,7 @@ fn fetches_this_repository() {
         root: tmp.path().join("root"),
         transports: Transports::Https,
         max_workspace_nodes: DEFAULT_MAX_NODES,
+        credentials: None,
     })
     .expect("open");
     let repo = RepoUrl::new("https://github.com/Replikanti/boneli.git".to_owned());

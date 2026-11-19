@@ -21,6 +21,11 @@
 //!   parsed. A failure also says whether git answered: it ran and exited
 //!   with a non-zero status, or it gave no answer at all (it could not
 //!   start, be waited for or read, or a signal ended it).
+//! - Only a network call (`fetch`, `ls-remote`, `push`) carries an
+//!   `Authorization` value, as one more command-scope pair
+//!   `http.<url>.extraHeader`, and the detail of its failure has the value
+//!   redacted (ADR-014, D3). Only `commit-tree` carries an identity, as
+//!   `GIT_AUTHOR_*` and `GIT_COMMITTER_*`.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -29,6 +34,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use boneli_app::CommitInfo;
+
+use crate::credentials::redact;
 use crate::url::Transports;
 
 /// The oldest git the adapter runs: 2.39.1, the first release of the 2.39
@@ -64,6 +72,11 @@ const CONFIG: &[(&str, &str)] = &[
     ("transfer.fsckObjects", "true"),
     ("fetch.recurseSubmodules", "false"),
     ("submodule.recurse", "false"),
+    // A push sends the one ref it names: no submodules, no tags, no
+    // signed-push negotiation (ADR-014, D3).
+    ("push.recurseSubmodules", "no"),
+    ("push.followTags", "false"),
+    ("push.gpgSign", "false"),
     ("http.followRedirects", "false"),
     // Under 1 byte per second for 5 minutes is a stalled transfer.
     ("http.lowSpeedLimit", "1"),
@@ -89,6 +102,20 @@ pub(crate) struct Call<'a> {
     pub objects: Option<&'a Path>,
     /// Bytes for stdin; stdin is empty without them.
     pub stdin: Option<&'a [u8]>,
+    /// The author and committer of `commit-tree`.
+    pub identity: Option<&'a CommitInfo>,
+    /// The `Authorization` value of a network call and the URL it is
+    /// scoped to; checked before the call is made.
+    pub authorization: Option<Authorization<'a>>,
+}
+
+/// An `Authorization` header value scoped to one repository URL.
+#[derive(Clone, Copy)]
+pub(crate) struct Authorization<'a> {
+    /// The repository URL, exactly as passed to git.
+    pub url: &'a str,
+    /// The header value, for example `Basic <base64>`.
+    pub value: &'a str,
 }
 
 impl Call<'_> {
@@ -100,6 +127,8 @@ impl Call<'_> {
             index: None,
             objects: None,
             stdin: None,
+            identity: None,
+            authorization: None,
         }
     }
 }
@@ -171,8 +200,19 @@ impl Runner {
     }
 
     /// Runs `git <global options> <args>` and returns stdout, or why it
-    /// failed.
+    /// failed. The detail of a call that carried an `Authorization` value
+    /// has that value, and its part after the scheme, redacted.
     pub(crate) fn run(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Vec<u8>, RunError> {
+        let value = call.authorization.map(|a| a.value);
+        self.start(call, args).map_err(|mut e| {
+            if let Some(value) = value {
+                e.detail = redact(&e.detail, value);
+            }
+            e
+        })
+    }
+
+    fn start(&self, call: Call<'_>, args: &[&OsStr]) -> Result<Vec<u8>, RunError> {
         let mut command = Command::new(&self.git);
         command.env_clear();
         let home = self.home.as_os_str();
@@ -190,11 +230,31 @@ impl Runner {
             .env("LC_ALL", "C")
             .env("TZ", "UTC");
         let config = self.config();
-        command.env("GIT_CONFIG_COUNT", config.len().to_string());
+        let extra = usize::from(call.authorization.is_some());
+        command.env("GIT_CONFIG_COUNT", (config.len() + extra).to_string());
         for (n, (key, value)) in config.iter().enumerate() {
             command
                 .env(format!("GIT_CONFIG_KEY_{n}"), key)
                 .env(format!("GIT_CONFIG_VALUE_{n}"), value);
+        }
+        if let Some(auth) = call.authorization {
+            let n = config.len();
+            command
+                .env(
+                    format!("GIT_CONFIG_KEY_{n}"),
+                    format!("http.{}.extraHeader", auth.url),
+                )
+                .env(
+                    format!("GIT_CONFIG_VALUE_{n}"),
+                    format!("Authorization: {}", auth.value),
+                );
+        }
+        if let Some(identity) = call.identity {
+            command
+                .env("GIT_AUTHOR_NAME", identity.name())
+                .env("GIT_AUTHOR_EMAIL", identity.email())
+                .env("GIT_COMMITTER_NAME", identity.name())
+                .env("GIT_COMMITTER_EMAIL", identity.email());
         }
         if let Some(index) = call.index {
             command.env("GIT_INDEX_FILE", index);

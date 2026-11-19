@@ -15,6 +15,7 @@ fn config(git: PathBuf, root: PathBuf) -> GitCliConfig {
         root,
         transports: Transports::Https,
         max_workspace_nodes: DEFAULT_MAX_NODES,
+        credentials: None,
     }
 }
 

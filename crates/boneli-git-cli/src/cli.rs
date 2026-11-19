@@ -21,6 +21,15 @@
 //!   with no remote, hook or credential; a tree that holds a path the
 //!   workspace cannot carry or a name `diff` refuses, gitlinks included,
 //!   is refused.
+//! - `push` (ADR-014, D1 and D2) is `commit-tree` of the checkout's tree
+//!   with the base as the only parent, then `ls-remote` of the branch,
+//!   where an existing branch is `BranchExists` and nothing is pushed,
+//!   then a push whose empty lease means "must not exist", so a branch
+//!   created in between is refused by the remote too. The URL is the one
+//!   the base was fetched from.
+//! - With [`Credentials`], every network call (`fetch`, `ls-remote`,
+//!   `push`) gets a fresh `Authorization` value, checked before the
+//!   process starts (ADR-014, D3).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -32,17 +41,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use boneli_app::{CheckoutId, Git, GitError, RelativePath, RepoUrl};
+use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
 use boneli_domain::CommitSha;
 
+use crate::credentials::{Credentials, refused};
 use crate::lookalike::names_git_elsewhere;
 use crate::materialize::materialize;
-use crate::run::{Call, MIN_GIT_VERSION, Runner, parse_version};
+use crate::run::{Authorization, Call, MIN_GIT_VERSION, Runner, parse_version};
 use crate::url::Transports;
 use crate::workspace::{Kind, Workspace};
 
 /// What `GitCli::open` needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct GitCliConfig {
     /// The git binary, an absolute path; `PATH` is never searched.
     pub git: PathBuf,
@@ -54,6 +64,32 @@ pub struct GitCliConfig {
     /// The node cap of a workspace and of a snapshot (ADR-010, D2):
     /// [`DEFAULT_MAX_NODES`](crate::DEFAULT_MAX_NODES) in production.
     pub max_workspace_nodes: usize,
+    /// Where the network calls get their `Authorization` value; `None` for
+    /// repositories that need none (ADR-014, D3).
+    pub credentials: Option<Arc<dyn Credentials>>,
+}
+
+impl fmt::Debug for GitCliConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitCliConfig")
+            .field("git", &self.git)
+            .field("root", &self.root)
+            .field("transports", &self.transports)
+            .field("max_workspace_nodes", &self.max_workspace_nodes)
+            .field("credentials", &CredentialSource(self.credentials.clone()))
+            .finish()
+    }
+}
+
+/// The credentials of a `GitCli`; its `Debug` shows only whether there are
+/// any.
+#[derive(Clone)]
+struct CredentialSource(Option<Arc<dyn Credentials>>);
+
+impl fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
 }
 
 /// Why `GitCli::open` refused.
@@ -102,6 +138,8 @@ impl std::error::Error for OpenError {}
 #[derive(Debug)]
 struct Store {
     dir: PathBuf,
+    /// The repository it was fetched from; `push` pushes there.
+    url: RepoUrl,
     base: String,
     base_tree: String,
     sha256: bool,
@@ -127,6 +165,7 @@ pub struct GitCli {
     runner: Runner,
     transports: Transports,
     max_nodes: usize,
+    credentials: CredentialSource,
     state: Mutex<State>,
     next_dir: AtomicU64,
 }
@@ -218,6 +257,11 @@ fn tree_path(raw: &[u8]) -> Result<RelativePath, GitError> {
     })
 }
 
+/// The `Authorization` of a call to `url`, when there is a value.
+fn scoped<'a>(url: &'a str, value: Option<&'a str>) -> Option<Authorization<'a>> {
+    value.map(|value| Authorization { url, value })
+}
+
 /// Whether some component of `path` is `.git` on another file system
 /// (`src/lookalike.rs`).
 fn lookalike(path: &str) -> bool {
@@ -234,6 +278,14 @@ fn refuse_lookalike(path: &RelativePath) -> Result<(), GitError> {
         )));
     }
     Ok(())
+}
+
+/// The object id `ls-remote` output gives for exactly `refname`.
+fn tip_of(refs: &[u8], refname: &str) -> Option<String> {
+    refs.split(|b| *b == b'\n').find_map(|line| {
+        let (oid, name) = line.split_at(line.iter().position(|b| *b == b'\t')?);
+        (&name[1..] == refname.as_bytes()).then(|| String::from_utf8_lossy(oid).into_owned())
+    })
 }
 
 /// Whether `ls-remote` output, `<oid> TAB <ref>` lines, names `sha` as an
@@ -292,10 +344,7 @@ impl GitCli {
         let runner = Runner::new(config.git, home, config.transports);
         let call = Call {
             git_dir: None,
-            work_tree: None,
-            index: None,
-            objects: None,
-            stdin: None,
+            ..Call::on(Path::new("/"))
         };
         let out = runner
             .run(call, &[os("version")])
@@ -311,6 +360,7 @@ impl GitCli {
             runner,
             transports: config.transports,
             max_nodes: config.max_workspace_nodes,
+            credentials: CredentialSource(config.credentials),
             state: Mutex::new(State::default()),
             next_dir: AtomicU64::new(0),
         })
@@ -375,6 +425,24 @@ impl GitCli {
         Ok(text.trim_end_matches('\n').to_owned())
     }
 
+    /// The `Authorization` value for one network call to `url`, fresh from
+    /// the credentials and checked (ADR-014, D3); `None` without
+    /// credentials or when they give none. Never quoted in an error.
+    fn authorization(&self, url: &RepoUrl) -> Result<Option<String>, GitError> {
+        let Some(credentials) = &self.credentials.0 else {
+            return Ok(None);
+        };
+        let value = credentials
+            .authorization(url)
+            .map_err(|e| failed(format!("the credentials failed: {e}")))?;
+        if let Some(problem) = value.as_deref().and_then(refused) {
+            return Err(failed(format!(
+                "the credentials' authorization value is refused: {problem}"
+            )));
+        }
+        Ok(value)
+    }
+
     /// `init --bare` of an empty repository at `dir` for objects of `sha`'s
     /// format.
     fn init(&self, dir: &Path, sha: &str) -> Result<(), GitError> {
@@ -404,10 +472,15 @@ impl GitCli {
     /// when the probe could not be set up or a step gave no answer from git
     /// (it could not start, or a signal ended it), which is no evidence
     /// either way.
-    fn remote_has_commit(&self, url: &str, sha: &str) -> Result<bool, GitError> {
+    fn remote_has_commit(&self, repo: &RepoUrl, sha: &str) -> Result<bool, GitError> {
+        let url = repo.as_str();
+        let value = self.authorization(repo)?;
         let tmp = self.fresh("tmp")?;
         self.init(&tmp.path, sha)?;
-        let probe = Call::on(&tmp.path);
+        let probe = Call {
+            authorization: scoped(url, value.as_deref()),
+            ..Call::on(&tmp.path)
+        };
         let fetched = self.answer(
             probe,
             &[
@@ -434,7 +507,16 @@ impl GitCli {
         )
     }
 
-    fn fetch(&self, store: &Path, url: &str, sha: &str) -> Result<String, GitError> {
+    /// Fetches `sha` alone into a new store; `value` is the `Authorization`
+    /// of the fetch, taken before any process started.
+    fn fetch(
+        &self,
+        store: &Path,
+        repo: &RepoUrl,
+        sha: &str,
+        value: Option<&str>,
+    ) -> Result<String, GitError> {
+        let url = repo.as_str();
         self.init(store, sha)?;
         // Attributes are neutral, so `add` stores bytes as written and no
         // agent-written `.gitattributes` converts or filters content.
@@ -448,7 +530,10 @@ impl GitCli {
             .and_then(|mut f| f.write_all(b"* -text -eol -filter -ident -working-tree-encoding\n"))
             .map_err(|e| failed(format!("cannot write info/attributes: {e}")))?;
         let fetched = self.git(
-            Call::on(store),
+            Call {
+                authorization: scoped(url, value),
+                ..Call::on(store)
+            },
             &[
                 os("fetch"),
                 os("-q"),
@@ -468,12 +553,19 @@ impl GitCli {
             // for another reason (the network, a full disk, a broken
             // remote). Only a remote that answers, does not advertise the
             // SHA and fails the probe too leaves `UnknownCommit`.
-            let advertised = self.git(
-                Call::on(store),
-                &[os("ls-remote"), os("-q"), os("--"), os(url)],
-            );
+            // A credentials failure here is no evidence either way.
+            let advertised = match self.authorization(repo) {
+                Ok(value) => self.git(
+                    Call {
+                        authorization: scoped(url, value.as_deref()),
+                        ..Call::on(store)
+                    },
+                    &[os("ls-remote"), os("-q"), os("--"), os(url)],
+                ),
+                Err(e) => Err(e),
+            };
             return Err(match advertised {
-                Ok(refs) if !advertises(&refs, sha) => match self.remote_has_commit(url, sha) {
+                Ok(refs) if !advertises(&refs, sha) => match self.remote_has_commit(repo, sha) {
                     Ok(false) => GitError::UnknownCommit,
                     Ok(true) | Err(_) => error,
                 },
@@ -489,6 +581,32 @@ impl GitCli {
             Call::on(store),
             &[os("rev-parse"), os("--verify"), os("-q"), os(&tree)],
         )
+    }
+
+    /// The tip of `refname` on the remote, from `ls-remote --refs` with a
+    /// fresh `Authorization`; `None` when the remote has no such ref.
+    fn remote_tip(
+        &self,
+        repo: &RepoUrl,
+        store: &Path,
+        refname: &str,
+    ) -> Result<Option<String>, GitError> {
+        let url = repo.as_str();
+        let value = self.authorization(repo)?;
+        let refs = self.git(
+            Call {
+                authorization: scoped(url, value.as_deref()),
+                ..Call::on(store)
+            },
+            &[
+                os("ls-remote"),
+                os("--refs"),
+                os("--"),
+                os(url),
+                os(refname),
+            ],
+        )?;
+        Ok(tip_of(&refs, refname))
     }
 
     /// The gitlinks of a tree.
@@ -623,11 +741,14 @@ impl Git for GitCli {
             .check(url)
             .map_err(|problem| failed(format!("the repository URL is refused: {problem}")))?;
         let sha = base.as_str();
+        // Before any process starts: a credentials failure starts none.
+        let value = self.authorization(repo)?;
         let mut store = self.fresh("stores")?;
-        let base_tree = self.fetch(&store.path, url, sha)?;
+        let base_tree = self.fetch(&store.path, repo, sha, value.as_deref())?;
         let id = self.issue(Checkout {
             store: Arc::new(Store {
                 dir: store.path.clone(),
+                url: repo.clone(),
                 base: sha.to_owned(),
                 base_tree: base_tree.clone(),
                 sha256: sha.len() == 64,
@@ -856,6 +977,91 @@ impl Git for GitCli {
             tree,
         })
     }
+
+    fn push(
+        &self,
+        id: &CheckoutId,
+        branch: &BranchName,
+        commit: &CommitInfo,
+    ) -> Result<CommitSha, GitError> {
+        let c = self.checkout(id)?;
+        let store = &c.store;
+        let repo = &store.url;
+        let url = repo.as_str();
+        // Checked again, as at `fetch_base`: the URL reaches git after `--`
+        // only.
+        self.transports
+            .check(url)
+            .map_err(|problem| failed(format!("the repository URL is refused: {problem}")))?;
+        let refname = format!("refs/heads/{}", branch.as_str());
+        // Before any process starts: a credentials failure starts none.
+        let first = self.authorization(repo)?;
+        let new = self.line(
+            Call {
+                stdin: Some(commit.message().as_bytes()),
+                identity: Some(commit),
+                ..Call::on(&store.dir)
+            },
+            &[
+                os("commit-tree"),
+                os(&c.tree),
+                os("-p"),
+                os(&store.base),
+                os("-F"),
+                os("-"),
+            ],
+        )?;
+        let sha = CommitSha::parse(&new)
+            .map_err(|_| failed("git commit-tree printed something other than a commit id"))?;
+        let refs = self.git(
+            Call {
+                authorization: scoped(url, first.as_deref()),
+                ..Call::on(&store.dir)
+            },
+            &[
+                os("ls-remote"),
+                os("--refs"),
+                os("--"),
+                os(url),
+                os(&refname),
+            ],
+        )?;
+        if tip_of(&refs, &refname).is_some() {
+            return Err(GitError::BranchExists);
+        }
+        // The empty lease means "must not exist": a branch created since
+        // `ls-remote` is refused by the remote, never overwritten.
+        let lease = format!("--force-with-lease={refname}:");
+        let refspec = format!("{new}:{refname}");
+        let value = self.authorization(repo)?;
+        let pushed = self.git(
+            Call {
+                authorization: scoped(url, value.as_deref()),
+                ..Call::on(&store.dir)
+            },
+            &[
+                os("push"),
+                os("--porcelain"),
+                os("--no-verify"),
+                os(&lease),
+                os("--"),
+                os(url),
+                os(&refspec),
+            ],
+        );
+        if let Err(error) = pushed {
+            // Evidence decides, as in `fetch_base`: the branch now holds
+            // another commit (it was created in between) or ours (the push
+            // landed and only its answer was lost). Anything else, a failed
+            // lookup included, is the push's own error.
+            return match self.remote_tip(repo, &store.dir, &refname) {
+                Ok(Some(tip)) if tip == new => Ok(sha),
+                Ok(Some(_)) => Err(GitError::BranchExists),
+                _ => Err(error),
+            };
+        }
+        Ok(sha)
+    }
 }
 
 #[cfg(test)]
@@ -877,6 +1083,24 @@ mod tests {
         ] {
             assert!(ls_tree(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn tip_of_matches_the_whole_ref() {
+        let a = "0123456789abcdef0123456789abcdef01234567";
+        let refs = format!(
+            "{a}\trefs/heads/boneli/ab\n1111111111111111111111111111111111111111\trefs/heads/boneli/a\n"
+        );
+        assert_eq!(
+            tip_of(refs.as_bytes(), "refs/heads/boneli/a").as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(tip_of(refs.as_bytes(), "refs/heads/boneli/a/b"), None);
+        assert_eq!(tip_of(refs.as_bytes(), "heads/boneli/a"), None);
+        // A tail match of `ls-remote`'s pattern is not the ref.
+        let tail = format!("{a}\trefs/x/refs/heads/boneli/a\n");
+        assert_eq!(tip_of(tail.as_bytes(), "refs/heads/boneli/a"), None);
+        assert_eq!(tip_of(b"", "refs/heads/boneli/a"), None);
     }
 
     #[test]

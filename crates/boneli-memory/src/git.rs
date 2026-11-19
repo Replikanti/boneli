@@ -12,11 +12,17 @@
 //! ([`RelativePath::is_repository_metadata`]) is not content: `diff` drops
 //! it from the workspace and `apply` refuses a diff that writes or removes
 //! it, as `git apply` refuses an invalid path (ADR-010, D1).
+//!
+//! `push` (ADR-014, D1) records a commit of the checkout's tree with its
+//! base as the only parent and creates the branch; its commit ids are
+//! `0...0<n>` in hex from a counter, as long as the base's id, so a run
+//! replays to the same ids. A branch that exists is `BranchExists`, and a
+//! pushed commit can be fetched like a fixed one.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use boneli_app::{CheckoutId, Git, GitError, RelativePath, RepoUrl};
+use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
 use boneli_domain::CommitSha;
 
 use crate::lock;
@@ -159,16 +165,35 @@ fn apply_diff(tree: &Tree, diff: &[u8]) -> Result<Tree, String> {
     Ok(tree)
 }
 
+/// A checkout: the repository and base commit it came from, and its tree.
+#[derive(Clone, Debug)]
+struct Checkout {
+    repo: RepoUrl,
+    base: CommitSha,
+    tree: Tree,
+}
+
+/// A pushed commit: its tree and parents.
+#[derive(Clone, Debug)]
+struct Pushed {
+    tree: Tree,
+    parents: Vec<CommitSha>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// The number of the next checkout, starting at 1; never reused.
     next: u64,
-    checkouts: BTreeMap<CheckoutId, Tree>,
+    checkouts: BTreeMap<CheckoutId, Checkout>,
+    /// The number of pushes so far; the next commit id comes from it.
+    pushes: u64,
+    pushed: BTreeMap<(RepoUrl, CommitSha), Pushed>,
+    branches: BTreeMap<(RepoUrl, BranchName), CommitSha>,
 }
 
-/// A `Git` over fixed commits. Checkouts are `checkout-<n>` from a counter
-/// starting at 1; applying a diff makes a new checkout and leaves the old
-/// one as it was.
+/// A `Git` over fixed commits and the commits pushed to it. Checkouts are
+/// `checkout-<n>` from a counter starting at 1; applying a diff makes a
+/// new checkout and leaves the old one as it was.
 #[derive(Debug, Default)]
 pub struct MemoryGit {
     commits: BTreeMap<(RepoUrl, CommitSha), Tree>,
@@ -191,21 +216,43 @@ impl MemoryGit {
         }
     }
 
-    fn checkout(&self, tree: Tree) -> CheckoutId {
+    fn checkout(&self, checkout: Checkout) -> CheckoutId {
         let mut state = lock(&self.state);
         let n = state.next;
         state.next = n.saturating_add(1);
         let id = CheckoutId::new(format!("checkout-{n}"));
-        state.checkouts.insert(id.clone(), tree);
+        state.checkouts.insert(id.clone(), checkout);
         id
     }
 
-    fn tree(&self, checkout: &CheckoutId) -> Result<Tree, GitError> {
+    fn get(&self, checkout: &CheckoutId) -> Result<Checkout, GitError> {
         lock(&self.state)
             .checkouts
             .get(checkout)
             .cloned()
             .ok_or(GitError::UnknownCheckout)
+    }
+
+    fn tree(&self, checkout: &CheckoutId) -> Result<Tree, GitError> {
+        self.get(checkout).map(|c| c.tree)
+    }
+
+    /// The tip of `branch` in `repo` and its parents, or `None` when no
+    /// push created it: what a remote would show, for the `Remote` hook of
+    /// the `Git` suite.
+    pub fn branch(
+        &self,
+        repo: &RepoUrl,
+        branch: &BranchName,
+    ) -> Option<(CommitSha, Vec<CommitSha>)> {
+        let state = lock(&self.state);
+        let tip = state.branches.get(&(repo.clone(), branch.clone()))?;
+        let parents = state
+            .pushed
+            .get(&(repo.clone(), tip.clone()))
+            .map(|p| p.parents.clone())
+            .unwrap_or_default();
+        Some((tip.clone(), parents))
     }
 }
 
@@ -216,9 +263,24 @@ fn failed(detail: String) -> GitError {
 impl Git for MemoryGit {
     fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
         let key = (repo.clone(), base.clone());
-        match self.commits.get(&key) {
-            Some(tree) => Ok(self.checkout(tree.clone())),
-            None if self.commits.keys().any(|(r, _)| r == repo) => Err(GitError::UnknownCommit),
+        let (tree, known) = {
+            let state = lock(&self.state);
+            let tree = self
+                .commits
+                .get(&key)
+                .or_else(|| state.pushed.get(&key).map(|p| &p.tree))
+                .cloned();
+            let known = self.commits.keys().any(|(r, _)| r == repo)
+                || state.pushed.keys().any(|(r, _)| r == repo);
+            (tree, known)
+        };
+        match tree {
+            Some(tree) => Ok(self.checkout(Checkout {
+                repo: repo.clone(),
+                base: base.clone(),
+                tree,
+            })),
+            None if known => Err(GitError::UnknownCommit),
             None => Err(failed(format!("unknown repository {:?}", repo.as_str()))),
         }
     }
@@ -243,8 +305,48 @@ impl Git for MemoryGit {
     }
 
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
-        let tree = self.tree(checkout)?;
-        let applied = apply_diff(&tree, diff).map_err(|e| failed(format!("the diff: {e}")))?;
-        Ok(self.checkout(applied))
+        let from = self.get(checkout)?;
+        let tree = apply_diff(&from.tree, diff).map_err(|e| failed(format!("the diff: {e}")))?;
+        Ok(self.checkout(Checkout { tree, ..from }))
+    }
+
+    fn push(
+        &self,
+        checkout: &CheckoutId,
+        branch: &BranchName,
+        _commit: &CommitInfo,
+    ) -> Result<CommitSha, GitError> {
+        let from = self.get(checkout)?;
+        let mut state = lock(&self.state);
+        if state
+            .branches
+            .contains_key(&(from.repo.clone(), branch.clone()))
+        {
+            return Err(GitError::BranchExists);
+        }
+        let n = state.pushes.saturating_add(1);
+        let width = from.base.as_str().len();
+        let sha = CommitSha::parse(&format!("{n:0width$x}"))
+            .map_err(|e| failed(format!("commit id {n}: {e}")))?;
+        let key = (from.repo.clone(), sha.clone());
+        if self.commits.contains_key(&key) || state.pushed.contains_key(&key) {
+            return Err(failed(format!(
+                "the next commit id {:?} is taken in {:?}",
+                sha.as_str(),
+                from.repo.as_str()
+            )));
+        }
+        state.pushes = n;
+        state.pushed.insert(
+            key,
+            Pushed {
+                tree: from.tree,
+                parents: vec![from.base],
+            },
+        );
+        state
+            .branches
+            .insert((from.repo, branch.clone()), sha.clone());
+        Ok(sha)
     }
 }

@@ -91,6 +91,9 @@ pub enum RunCommand {
         test: EvidenceRef,
         /// The verified analysis.
         analysis: EvidenceRef,
+        /// The analysis's citations, every one `Verified` by the root-cause
+        /// gate; the pull request quotes them (#19).
+        citations: Vec<Citation>,
         /// The fix gate's observations, for the before and after results.
         checks: FixChecks,
         /// The run's total consumption.
