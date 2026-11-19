@@ -412,6 +412,9 @@ fn opens_a_pull_request_on_the_test_repository() {
     // Both issues exist, are open and are issues, not pull requests:
     // otherwise the closing-reference and timeline checks below would
     // check nothing (a pull request cannot be closed by a reference).
+    // The target's node id identifies a link from the questions comment,
+    // which is posted on the target.
+    let mut target_id = String::new();
     for (variable, n) in [
         ("BONELI_GITHUB_ISSUE", issue_number),
         ("BONELI_GITHUB_DECOY_ISSUE", decoy),
@@ -433,6 +436,9 @@ fn opens_a_pull_request_on_the_test_repository() {
             Some("open"),
             "{variable}: issue {n} is not open"
         );
+        if n == issue_number {
+            target_id = get_str(&answer, &["node_id"]).to_owned();
+        }
     }
 
     // A token exchange of the test's own, to measure its answer (D10).
@@ -698,10 +704,12 @@ fn opens_a_pull_request_on_the_test_repository() {
         target_items.len(),
         decoy_items.len()
     );
+    // On the decoy, a link from the target issue (the questions comment)
+    // counts as coming from this run too.
     for item in &decoy_items {
         assert!(
-            !from_this_pull(item),
-            "the decoy got a {} from the pull request",
+            !from_this_pull(item) && item.1 != target_id,
+            "the decoy got a {} from this run's pull request or questions comment",
             item.0
         );
     }

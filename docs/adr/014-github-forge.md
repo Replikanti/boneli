@@ -758,7 +758,8 @@ title, the questions and every block of agent text. The pull request's
 anchor may point at the decoy, and the decoy's whole timeline (GraphQL
 `timelineItems`, every page) must hold no `ConnectedEvent`,
 `CrossReferencedEvent` or `ReferencedEvent` whose pull request is the
-test's (by node id) or whose commit is the pushed one; events are
+test's (by node id), whose source is the target issue (the questions
+comment is posted there), or whose commit is the pushed one; events are
 identified by those ids, not by the runner's clock, and the same query
 on the target issue must find the pull request's link, a positive
 control that the query sees links at all (review round 2 of #73). Before
