@@ -1,7 +1,8 @@
 //! `TlsDial` against a local rustls server on 127.0.0.1 (ADR-009, D10 and
-//! D12): the request deadline holds below TLS, and a host outside the
-//! ADR-003 grammar is refused before anything is resolved or dialed. The
-//! server and its certificates are boneli-https's TLS test fixtures.
+//! D12; moved here from boneli-oci by ADR-014, D4): the request deadline
+//! holds below TLS, and a host outside the ADR-003 grammar is refused
+//! before anything is resolved or dialed. The server and its certificates
+//! are this crate's TLS test fixtures.
 
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -9,15 +10,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boneli_https::{ConnectOptions, Roots, TlsConfig};
-use boneli_oci::{Dial, TlsDial};
+use boneli_https::{ConnectOptions, Dial, Roots, TlsConfig, TlsDial};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 
-const CA: &[u8] = include_bytes!("../../boneli-https/tests/data/ca.pem");
-const LEAF: &[u8] = include_bytes!("../../boneli-https/tests/data/leaf.pem");
-const LEAF_KEY: &[u8] = include_bytes!("../../boneli-https/tests/data/leaf.key");
+const CA: &[u8] = include_bytes!("data/ca.pem");
+const LEAF: &[u8] = include_bytes!("data/leaf.pem");
+const LEAF_KEY: &[u8] = include_bytes!("data/leaf.key");
 
 /// Bounds every blocking call of the server, so that a bug ends in a
 /// failure instead of a hang; far above any local delivery time.

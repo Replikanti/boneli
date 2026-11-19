@@ -21,10 +21,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use boneli_http::{Connection, Method, RequestBody, RequestHead, ResponseHead, Target};
-use boneli_https::Sha256;
+use boneli_https::{Dial, Sha256, Timed};
 
 use crate::auth::{self, Challenge};
-use crate::dial::{Dial, Timed};
 use crate::error::{Error, PullError, failed};
 use crate::manifest::{self, Descriptor, Document, ImageConfig, Manifest};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};

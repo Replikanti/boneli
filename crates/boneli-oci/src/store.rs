@@ -23,9 +23,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
-use boneli_https::{ConnectOptions, Roots, Sha256, TlsConfig};
+use boneli_https::{ConnectOptions, Dial, Roots, Sha256, TlsConfig, TlsDial};
 
-use crate::dial::{Dial, TlsDial};
 use crate::error::{Error, PullError, failed};
 use crate::layers::{self, Judge, LayerCache, Liveness, Owner};
 use crate::limits::{Budget, Limits};

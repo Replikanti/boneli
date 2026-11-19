@@ -27,7 +27,8 @@ pushes it are where this ADR starts:
 #19 is delivered in three PRs. Part 1 (this ADR's D1 to D3) adds branch
 push to the `Git` port and to `boneli-git-cli`, with the credential path,
 and carries the verified citations into the pull-request request. Part 2
-adds RS256 signing and a random source to `boneli-https` (D4). Part 3 adds
+adds RS256 signing and a random source to `boneli-https` and moves the
+`Dial` seam there from `boneli-oci` (D4). Part 3 adds
 the forge crate, its token cache, endpoints, rendering and limits (D5 to
 D11) and the gated live test (D12), and settles this ADR.
 
@@ -245,6 +246,98 @@ source. The ADR-010 D4 rule applies, plus these choices:
   App key, part 3), so the environment discloses nothing they lack; argv,
   which every user can read in `/proc`, never holds it.
 
+### D4. Signing, randomness and the `Dial` seam live in `boneli-https`
+
+A GitHub App authenticates by signing a JWT with its RSA private key
+(RS256), and part 3 needs random bytes for the branch nonce (D2) and an
+HTTPS connection to `api.github.com` with a deadline. All three come from
+`boneli-https`, because ARCHITECTURE keeps ring in that crate only
+(ADR-005) and ring already does each of them there.
+
+- **`RsaSha256Key`** signs RSASSA-PKCS1-v1_5 with SHA-256 through rustls'
+  public API: `rustls::crypto::ring::default_provider().key_provider`
+  loads the key, and `choose_scheme(&[RSA_PKCS1_SHA256])` gives the
+  signer. That is ring's RSA, already linked for TLS, so no crate and no
+  dependency edge is added. `rs256_known_answer` compares a signature byte
+  for byte with OpenSSL's over a JWT signing input (the scheme is
+  deterministic), and `pkcs1_and_pkcs8_sign_alike` with the same key in
+  both encodings.
+- **The key rules** (`from_pem`, pinned by `key_rules`):
+  - exactly one PEM section, counted from the `-----BEGIN ` lines
+    themselves, because rustls' PEM parser skips sections it does not
+    know. Two keys, a key with its certificate, or a certificate alone
+    are refused: a file that holds more than one thing is a
+    misconfiguration, and picking one of them would hide it;
+  - the section is `RSA PRIVATE KEY` (PKCS#1) or `PRIVATE KEY` (PKCS#8).
+    An encrypted, SEC1 or OpenSSH key, a public key and a certificate are
+    refused with their own error (`UnsupportedSection`);
+  - ring must accept the key, which means a consistent RSA key with a
+    modulus of 2048 to 4096 bits (ring 0.17's limits for RSA signing
+    keys).
+    A 1024-bit key is refused (`Rejected`); a P-256 key, which ring
+    accepts, is `NotRsa`;
+  - the input is at most 16,384 bytes, checked before any parsing
+    (`pem_size_cap`). The largest key ring signs with, 4096 bits, is
+    about 3,270 bytes of PEM (3,268 and 3,272 in two keys), and 11,125
+    bytes with OpenSSL's text dump in front (`openssl pkey -text`,
+    measured with OpenSSL 3.5), so a
+    key file printed with its parameters still loads. A cap below about
+    3,300 bytes would refuse a valid key; a higher one only admits more
+    text around the one section. The key file is read once at start
+    (part 3), so the cap bounds that read, not a hot path.
+- **One signature at load.** `from_pem` signs an empty message before it
+  returns the key: a key that cannot sign fails at start, not at the
+  first token exchange, and the signature's length is the modulus size,
+  which rustls does not expose. It must be 256 to 512 bytes (2048 to 4096
+  bits); `sign` checks every later signature against it. The cost is one
+  RSA signature per start.
+- **Key material stays out of output** (D6 extends this to the forge).
+  `Debug` shows `RsaSha256Key { modulus_bits: 2048 }` and nothing else;
+  every `KeyError` is a fixed sentence with no source, so no parser
+  message can quote key bytes (`debug_has_no_key_material` checks every
+  16-byte window of the test keys' base64 against all of them).
+- **Wiping, best effort.** `from_pem` takes `&mut [u8]` and fills it with
+  zeros before it returns, on success and on every refusal
+  (`input_is_wiped`), so the caller's copy of the key file does not stay
+  in memory. The DER that rustls decodes is wiped by rustls itself
+  (`Zeroizing` around `load_private_key`), and a DER refused for its
+  label is wiped here. Not wiped: the base64 copy rustls' PEM parser
+  makes while it decodes, and ring's in-memory key, which lives as long
+  as the `RsaSha256Key`. The fill uses `std::hint::black_box` against the
+  optimizer, without `unsafe` and without a new edge to `zeroize`. That
+  is enough for the threat of D6: what reads this process's memory is
+  the same uid or root, which can read the key file anyway.
+- **The JWT** (built in part 3) has `iat = now - 60` and
+  `exp = now + 540`. It tolerates a runner clock up to 60 s ahead of
+  GitHub's, so `iat` is not in the future, while `exp` stays within
+  GitHub's documented 10-minute maximum (540 + 60 = 600); and a clock up
+  to 540 s behind, so `exp` has not passed yet. A larger back-dating
+  would push `exp` past GitHub's maximum for a correct clock. One JWT is
+  signed per token exchange and never cached or stored.
+- **`fill_random`** fills a buffer from the provider's `secure_random`,
+  ring's `SystemRandom`, which reads the `getrandom` system call on Linux
+  through the `getrandom` crate (ADR-005 lists both); rustls
+  draws its handshake randomness from the same source. A failure is
+  `RandomFailed`, never a fallback to a weaker source
+  (`fill_random_fills`).
+- **The `Dial` seam moves here from `boneli-oci`.** `Dial`, `Stream`,
+  `TlsDial` and `Timed` move unchanged, with the socket under TLS that
+  holds the request's deadline (ADR-009, D10): a TLS read returns only
+  once a whole record has arrived, so a peer that drips a record a byte
+  at a time would hold a read above TLS open past any deadline set there.
+  The forge needs exactly that socket, and a second copy would put the
+  same deadline logic under review twice and let the copies drift. The
+  forge cannot import it from `boneli-oci`, because an adapter must not
+  depend on another adapter (invariant 1). The seam knows nothing of
+  registries or forges, so it fits a support crate. ADR-009's decision is
+  unchanged; only the crate holding it changes:
+  - `boneli-oci` re-exports `Dial`, `Stream` and `TlsDial`, so its
+    callers keep their paths, and its registry client uses
+    `boneli_https::Timed`, which becomes public (it was crate-private);
+  - the `TlsDial` tests move with it and keep their names; `boneli-oci`
+    no longer needs `rustls` as a dev-dependency, so the edge
+    `boneli-oci -> rustls` leaves `tools/architecture.toml`.
+
 ## Consequences
 
 - Every `Git` adapter must implement `push`; `MemoryGit`, `GitCli` and
@@ -266,6 +359,14 @@ source. The ADR-010 D4 rule applies, plus these choices:
 - A branch pushed by a run that then fails to open a pull request stays
   on the remote. Its name carries the run, so a cleanup can find it; the
   cleanup itself is out of scope (#19 plan).
+- `boneli-https` grows from a TLS client and a hash into the crate for
+  every use of ring: TLS, SHA-256, RS256 and randomness, plus the `Dial`
+  seam over its TLS client. A new use of ring goes there too, and ring
+  stays out of every other crate's graph.
+- `RsaSha256Key::from_pem` wipes the buffer it is given, so a caller that
+  needs the PEM afterwards passes a copy.
+- `boneli_https::Timed` is public API now; ADR-009's text still calls the
+  seam crate-local, and this ADR is where it moved.
 
 ## Alternatives considered
 
@@ -284,10 +385,26 @@ source. The ADR-010 D4 rule applies, plus these choices:
   helper is a program named by config, which ADR-010 D4 shuts off
   (`credential.helper=` empty); a file is something a later process or a
   snapshot could read.
+- **RustCrypto `rsa` for the JWT signature** (D4). `rsa` 0.10.0 with its
+  default features resolves 28 crates with itself, 24 of them new to the
+  workspace (`crypto-bigint`, `crypto-primes`, `pkcs1`/`pkcs8`/`der`/
+  `spki`, `digest`, `sha2`, `signature`, `rand_core` and their helpers;
+  counted with `cargo tree` on 2026-11-19), each a new name with edges
+  that need records and review (ADR-001). The 0.9 series (0.9.10, 32
+  crates with `std` and `sha2`) carries RUSTSEC-2023-0071,
+  a timing side channel that leaks the private key and is patched only
+  from 0.10. ring is vetted and linked already (ADR-005).
+- **`jsonwebtoken`.** It needs `serde`, which `deny.toml` bans.
+- **A copy of the `Dial` seam in the forge** (D4). Two copies of the
+  deadline-under-TLS socket to review and keep in step, for no gain.
+- **A `zeroize` edge from `boneli-https`** for the wipe (D4). `zeroize` is
+  in the graph already, under rustls; a direct edge would need its own
+  record for a guarantee `black_box` gives on a best-effort basis too,
+  and the residuals above (the parser's copy, ring's key) would stay.
 
 ## Accept when
 
-Part 3 of #19 adds D4 to D12 and the live test passes on the operator's
+Part 3 of #19 adds D5 to D12 and the live test passes on the operator's
 private test repository: the pull request's head is a `boneli/` branch
 whose parent is the base and which changes exactly the fixed file, both
 pushed and fetched with the App's token through `Credentials`; and the

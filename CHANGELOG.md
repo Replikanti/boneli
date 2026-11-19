@@ -448,9 +448,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `push.negotiate=true`: from the depth-1 store, without negotiation, a
   push after the remote's `main` moved sent the base's whole tree (309
   objects for a one-file change in a 300-file fixture, 4 with it).
+- `boneli-https`, part 2 of #19 (ADR-014 D4): `RsaSha256Key`, RS256
+  signatures through ring's key provider (one PEM section, `RSA PRIVATE
+  KEY` or `PRIVATE KEY`, an RSA key of 2048 to 4096 bits, at most 16,384
+  bytes of input, wiped after parsing, no key material in `Debug` or
+  errors), checked against an OpenSSL signature; and `fill_random`, the
+  provider's system random source. Test-only keys in `tests/data/`.
 
 ### Changed
 
+- The `Dial` seam (`Dial`, `Stream`, `TlsDial`, and `Timed`, now public)
+  moves from `boneli-oci` to `boneli-https`, unchanged, so the GitHub
+  forge shares the deadline-under-TLS socket (ADR-014, D4). `boneli-oci`
+  re-exports it, and its `rustls` dev-dependency and that edge in
+  `tools/architecture.toml` are gone.
 - `RunCommand::OpenPullRequest` and `PullRequest` carry the run's
   citations, all verified by the root-cause gate, for the forge (#19).
   `boneli_domain::values::is_default_ignorable` is public.
