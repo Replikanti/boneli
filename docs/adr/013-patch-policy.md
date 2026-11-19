@@ -1,7 +1,7 @@
 # ADR-013: The patch policy
 
 - Status: accepted
-- Date: 2026-11-18
+- Date: 2026-11-19
 
 ## Context
 
