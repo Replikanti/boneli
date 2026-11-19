@@ -1,8 +1,11 @@
-# Test certificates
+# Test certificates and keys
 
-Fixtures for `tests/tls.rs`, read with `include_bytes!`. The keys protect
-nothing: they exist only so that a local test server can complete a TLS
-handshake, and no system trusts these CAs.
+Fixtures for `tests/tls.rs`, `tests/dial.rs` and `tests/rsa.rs`, read with
+`include_bytes!`. The keys protect nothing: they exist only so that a local
+test server can complete a TLS handshake and so that `RsaSha256Key` can be
+checked against OpenSSL. No system trusts these CAs, and no GitHub App or
+other account has any of these keys. The signing keys say so in their
+names (`test-only-`).
 
 | File | What |
 | --- | --- |
@@ -48,3 +51,33 @@ rm ca.key other-ca.key leaf.ext
 Rust was weighed for the generator and lost: it needs `rcgen`, a crate the
 dependency policy does not list, or about 150 lines of hand-written DER to
 review, for files that are generated once and never in CI.
+
+## Signing keys (`tests/rsa.rs`, ADR-014 D4)
+
+| File | What |
+| --- | --- |
+| `test-only-rsa-2048-pkcs8.key` | 2048-bit RSA key, PKCS#8 (`PRIVATE KEY`) |
+| `test-only-rsa-2048-pkcs1.key` | the same key in PKCS#1 (`RSA PRIVATE KEY`) |
+| `test-only-rsa-1024.key` | 1024-bit RSA key, PKCS#8, below ring's 2048-bit minimum |
+| `test-only-rsa-2304.key` | 2304-bit RSA key, PKCS#8: inside ring's 2048 to 4096 bits, but its primes are not a multiple of 512 bits long, which ring refuses |
+| `test-only-p256.key` | ECDSA P-256 key, PKCS#8: a key ring accepts that is not RSA |
+| `rs256-message.txt` | a JWT signing input: header `{"alg":"RS256","typ":"JWT"}`, claims `iat` 1699999940, `exp` 1700000540 and a made-up `iss`, base64url without padding, no newline |
+| `rs256-test-only.sig` | OpenSSL's RS256 signature of `rs256-message.txt` with the 2048-bit key, 256 bytes |
+
+Generated once with OpenSSL 3.5, from this directory:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out test-only-rsa-2048-pkcs8.key
+openssl pkey -in test-only-rsa-2048-pkcs8.key -traditional -out test-only-rsa-2048-pkcs1.key
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:1024 -out test-only-rsa-1024.key
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2304 -out test-only-rsa-2304.key
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out test-only-p256.key
+printf '%s' 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE2OTk5OTk5NDAsImV4cCI6MTcwMDAwMDU0MCwiaXNzIjoiSXYxLjAxMjM0NTY3ODlhYmNkZWYifQ' > rs256-message.txt
+openssl dgst -sha256 -sign test-only-rsa-2048-pkcs1.key -out rs256-test-only.sig rs256-message.txt
+```
+
+RSASSA-PKCS1-v1_5 is deterministic, so the signature is a known answer:
+regenerating the 2048-bit key changes it, so the two 2048-bit files and
+the signature change together; the other keys stand alone. `openssl pkey -in test-only-rsa-2048-pkcs8.key -pubout | openssl
+dgst -sha256 -verify /dev/stdin -signature rs256-test-only.sig
+rs256-message.txt` checks it independently of Boneli.

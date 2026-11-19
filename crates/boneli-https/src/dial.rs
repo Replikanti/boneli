@@ -1,8 +1,11 @@
 //! The `Dial` seam (ADR-009, D10): one connection per request to an
-//! allowlisted host. Crate-local, not a `boneli-app` port, modeled on
+//! allowlisted host. Not a `boneli-app` port, modeled on
 //! `boneli-egress`'s `Upstream` (ADR-006, D11): no use case drives it, so
-//! it has no in-memory adapter or contract suite; the tests replace it
-//! with a fake registry served over `UnixStream::pair`.
+//! it has no in-memory adapter or contract suite; the tests of its users
+//! replace it with a fake server over `UnixStream::pair`. It lives here,
+//! next to the TLS client, so that every HTTPS client of the runner (the
+//! OCI registry client, the GitHub forge) shares one deadline-under-TLS
+//! socket instead of a copy each (ADR-014, D4).
 //!
 //! Every request has a deadline. The client enforces it on whatever
 //! stream a `Dial` returns ([`Timed`]), and [`TlsDial`] enforces it again
@@ -16,7 +19,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use boneli_http::{IdleCheck, Target, Transport};
-use boneli_https::{ConnectOptions, Nonblocking, TlsConfig};
+
+use crate::{ConnectOptions, Nonblocking, TlsConfig};
 
 /// A stream the client can send a request over: timeouts and the idle
 /// check of ADR-003, item 12.
@@ -27,17 +31,17 @@ impl<T: Transport + IdleCheck> Stream for T {}
 /// Where requests go.
 pub trait Dial {
     /// A connection to `host:port`, for a request that must complete by
-    /// `deadline`. The client calls it only for hosts on the registry's
-    /// allowlist, one connection per request.
+    /// `deadline`. A client calls it only for hosts on its allowlist, one
+    /// connection per request.
     fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>>;
 }
 
 /// The real dial: the host checked against the grammar of ADR-003, then
 /// TCP to each address of the host in turn, then a TLS handshake with
-/// `boneli_https::connect_over`, certificates always verified against the
-/// caller's `TlsConfig` (ADR-005), and the timeouts of the caller's
-/// `ConnectOptions`. The deadline holds on the socket under TLS for the
-/// handshake and every later read and write.
+/// [`connect_over`](crate::connect_over), certificates always verified
+/// against the caller's `TlsConfig` (ADR-005), and the timeouts of the
+/// caller's `ConnectOptions`. The deadline holds on the socket under TLS
+/// for the handshake and every later read and write.
 #[derive(Clone, Debug)]
 pub struct TlsDial {
     config: TlsConfig,
@@ -65,10 +69,10 @@ impl Dial for TlsDial {
                         read_cap: Cell::new(None),
                         write_cap: Cell::new(None),
                     };
-                    return boneli_https::connect_over(socket, host, &self.config, &self.options)
+                    return crate::connect_over(socket, host, &self.config, &self.options)
                         .map(|tls| Box::new(tls) as Box<dyn Stream>)
                         .map_err(|e| match e {
-                            boneli_https::Error::Io(e) => e,
+                            crate::Error::Io(e) => e,
                             other => io::Error::other(other.to_string()),
                         });
                 }
@@ -84,9 +88,9 @@ impl Dial for TlsDial {
 /// (`Target::parse_authority`: LDH labels in lowercase, no numeric forms
 /// like `127.1` or `0x7f000001` that `getaddrinfo` would read as
 /// addresses, an IPv6 address without brackets, no port 0).
-/// `boneli_https::connect` checks the server name before it resolves
+/// [`connect`](crate::connect) checks the server name before it resolves
 /// (ADR-003, item 3); `connect_over` checks it only once TCP is
-/// connected, so the dial checks first (D10).
+/// connected, so the dial checks first (ADR-009, D10).
 fn check_host(host: &str, port: u16) -> io::Result<()> {
     let authority = if host.contains(':') {
         format!("[{host}]:{port}")
@@ -171,15 +175,17 @@ impl Nonblocking for DeadlineSocket {
 /// A dialed stream under the request's deadline: before each read and
 /// write the stream's timeout is set to what is left of the deadline, at
 /// most `io`, and once the deadline has passed every call fails with
-/// `TimedOut`.
-pub(crate) struct Timed {
+/// `TimedOut`. A client wraps every stream a [`Dial`] returns in it, so the
+/// deadline holds whatever stream a test's `Dial` returns.
+pub struct Timed {
     inner: Box<dyn Stream>,
     deadline: Instant,
     io: Duration,
 }
 
 impl Timed {
-    pub(crate) fn new(inner: Box<dyn Stream>, deadline: Instant, io: Duration) -> Timed {
+    /// `inner` under `deadline`, each read and write bounded by `io` too.
+    pub fn new(inner: Box<dyn Stream>, deadline: Instant, io: Duration) -> Timed {
         Timed {
             inner,
             deadline,

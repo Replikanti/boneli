@@ -21,11 +21,24 @@
 //!
 //! The crate also exports ring's SHA-256 as [`Sha256`], the one content
 //! hash of the runner (ADR-009, D6): ring is linked here for TLS already,
-//! so content addressing adds no crate and ring stays in this crate.
+//! so content addressing adds no crate and ring stays in this crate. For
+//! the same reason it exports ring's RS256 signatures as [`RsaSha256Key`]
+//! and the system's random source as [`fill_random`], for GitHub App
+//! tokens and branch names (ADR-014, D4).
+//!
+//! [`Dial`] is the seam HTTPS clients connect through, one connection per
+//! request under a deadline that holds below TLS; [`TlsDial`] is the real
+//! one (ADR-009, D10; moved here from `boneli-oci` by ADR-014, D4).
 #![doc(test(attr(forbid(unsafe_code))))]
 
+mod dial;
+mod random;
+mod rsa;
 mod sha256;
 
+pub use dial::{Dial, Stream, Timed, TlsDial};
+pub use random::{RandomFailed, fill_random};
+pub use rsa::{KeyError, RsaSha256Key};
 pub use sha256::Sha256;
 
 use std::fmt;

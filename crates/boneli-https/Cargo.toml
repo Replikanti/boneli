@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, for boneli-http, and ring's SHA-256 for content addressing."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,9 @@ boneli-http.workspace = true
 #   speak TLS 1.3. It adds no crate.
 # - No `logging`: it would pull `log`; Boneli writes its own structured logs.
 # `ring` also provides the runner's content hash, SHA-256 through
-# `rustls::crypto::hash` (`Sha256`, ADR-009); that needs no feature.
+# `rustls::crypto::hash` (`Sha256`, ADR-009), and RS256 signatures and
+# random bytes through the provider's `key_provider` and `secure_random`
+# (`RsaSha256Key`, `fill_random`, ADR-014); none of them needs a feature.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Mozilla's root certificates, compiled in, so trust does not depend on the
 # host's CA bundle (ADR-005).

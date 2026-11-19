@@ -282,7 +282,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 | --- | --- | --- |
 | `libc` | syscall declarations (namespaces, mount, seccomp, Landlock) | `boneli-sys`; inside the TLS stack `getrandom` and `ring` (ADR-005); every further edge needs its own ADR (ADR-001) |
 | `httparse` | HTTP/1.x parsing without further dependencies | `boneli-http` |
-| `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries; ring's SHA-256 for content addressing (ADR-009) | only `boneli-https`; their transitive crates (`rustls-webpki`, `rustls-pki-types`, `untrusted`, `subtle`, `zeroize`, `once_cell`, `getrandom`, `cfg-if`, and `cc`, `shlex`, `find-msvc-tools` for ring's build) are listed in ADR-005 |
+| `rustls`, `webpki-roots`, `ring` | TLS to LLM providers, forges and registries; ring's SHA-256 for content addressing (ADR-009); RS256 signatures for GitHub App JWTs and the system random source (ADR-014) | only `boneli-https`; their transitive crates (`rustls-webpki`, `rustls-pki-types`, `untrusted`, `subtle`, `zeroize`, `once_cell`, `getrandom`, `cfg-if`, and `cc`, `shlex`, `find-msvc-tools` for ring's build) are listed in ADR-005 |
 | `miniz_oxide`, `ruzstd` | unpacking OCI image layers; `miniz_oxide` pulls `adler2` (ADR-009) | `boneli-oci` |
 
 **We write ourselves:** an HTTP/1.1 server over a Unix socket and a client over TLS (ADR-003), a JSON parser and serializer without derive (ADR-008), a parser for a TOML subset for configuration (ADR-011), tar reading and gzip framing (ADR-009), argument parsing, structured logging, error types, RFC 3339 and ID generation.
@@ -295,7 +295,7 @@ All code is Rust. Dependencies are guarded by an allowlist of edges in `tools/ar
 
 **Exceptions where pure Rust is not possible:**
 
-- **TLS and content hashing:** there is no production-ready cryptographic backend in pure Rust, and `ring` contains assembly and C. We isolate it in a single support crate, `boneli-https` (ADR-005). `boneli-https` also exports ring's SHA-256 as the runner's one content hash (`boneli_https::Sha256`, ADR-009).
+- **TLS and content hashing:** there is no production-ready cryptographic backend in pure Rust, and `ring` contains assembly and C. We isolate it in a single support crate, `boneli-https` (ADR-005). `boneli-https` also exports ring's SHA-256 as the runner's one content hash (`boneli_https::Sha256`, ADR-009), and ring's RS256 signatures and random source for GitHub App tokens (`RsaSha256Key`, `fill_random`, ADR-014).
 - **Git:** in the MVP we call `git` as an external binary through an adapter. A native implementation (smart HTTP, packfiles) can come later behind the same port.
 - **Agent:** Claude Code is a Node binary inside the sandbox, not part of our code. Our own harness in Rust will come as another adapter.
 - **Control plane:** multi-tenant Postgres and many connections. We will choose the async runtime and the Postgres client when we get there.

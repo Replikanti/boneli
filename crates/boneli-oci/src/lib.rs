@@ -33,7 +33,6 @@
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
-mod dial;
 mod error;
 mod gzip;
 mod layers;
@@ -49,7 +48,9 @@ mod unpack;
 mod url;
 mod zstd;
 
-pub use dial::{Dial, Stream, TlsDial};
+// The `Dial` seam lives in boneli-https since ADR-014 (D4); re-exported so
+// the registry client's callers keep their paths.
+pub use boneli_https::{Dial, Stream, TlsDial};
 pub use error::{Error, PullError};
 pub use layers::LayerCache;
 pub use limits::{Budget, Limits};
