@@ -268,14 +268,25 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
     know. Two keys, a key with its certificate, or a certificate alone
     are refused: a file that holds more than one thing is a
     misconfiguration, and picking one of them would hide it;
-  - the section is `RSA PRIVATE KEY` (PKCS#1) or `PRIVATE KEY` (PKCS#8).
-    An encrypted, SEC1 or OpenSSH key, a public key and a certificate are
-    refused with their own error (`UnsupportedSection`);
+  - the section is `RSA PRIVATE KEY` (PKCS#1) or `PRIVATE KEY` (PKCS#8),
+    unencrypted. An encrypted key, under the PKCS#8 label `ENCRYPTED
+    PRIVATE KEY` or in OpenSSL's traditional form (`RSA PRIVATE KEY`
+    with `Proc-Type:` and `DEK-Info:` header lines, from `openssl genrsa
+    -traditional -aes128`), a SEC1 or OpenSSH key, a public key and a
+    certificate are refused with their own error
+    (`UnsupportedSection`). The traditional headers are checked before
+    the rustls parser runs, because it would feed them to base64 and
+    report corrupt PEM for a file that is only encrypted (review round 1
+    of #72);
   - ring must accept the key, which means a consistent RSA key with a
-    modulus of 2048 to 4096 bits (ring 0.17's limits for RSA signing
-    keys).
-    A 1024-bit key is refused (`Rejected`); a P-256 key, which ring
-    accepts, is `NotRsa`;
+    modulus of 2048, 3072 or 4096 bits. ring 0.17 signs with moduli of
+    2048 to 4096 bits (`rsa/keypair.rs`, `from_bits(2048)` and
+    `PRIVATE_KEY_PUBLIC_MODULUS_MAX_BITS`) and refuses a prime whose
+    length is not a multiple of 512 bits
+    (`private_modulus_len_not_multiple_of_512_bits`), so a 2304-bit key
+    inside that range is refused too. A 1024-bit and a 2304-bit key are
+    refused (`Rejected`, `rejected_names_the_accepted_sizes`); a P-256
+    key, which ring accepts, is `NotRsa`;
   - the input is at most 16,384 bytes, checked before any parsing
     (`pem_size_cap`). The largest key ring signs with, 4096 bits, is
     about 3,270 bytes of PEM (3,268 and 3,272 in two keys), and 11,125
@@ -288,8 +299,8 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
 - **One signature at load.** `from_pem` signs an empty message before it
   returns the key: a key that cannot sign fails at start, not at the
   first token exchange, and the signature's length is the modulus size,
-  which rustls does not expose. It must be 256 to 512 bytes (2048 to 4096
-  bits); `sign` checks every later signature against it. The cost is one
+  which rustls does not expose. It must be 256 to 512 bytes (ring's 2048
+  to 4096 bits, of which it loads 2048, 3072 and 4096); `sign` checks every later signature against it. The cost is one
   RSA signature per start.
 - **Key material stays out of output** (D6 extends this to the forge).
   `Debug` shows `RsaSha256Key { modulus_bits: 2048 }` and nothing else;

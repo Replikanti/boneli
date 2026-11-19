@@ -450,9 +450,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   objects for a one-file change in a 300-file fixture, 4 with it).
 - `boneli-https`, part 2 of #19 (ADR-014 D4): `RsaSha256Key`, RS256
   signatures through ring's key provider (one PEM section, `RSA PRIVATE
-  KEY` or `PRIVATE KEY`, an RSA key of 2048 to 4096 bits, at most 16,384
-  bytes of input, wiped after parsing, no key material in `Debug` or
-  errors), checked against an OpenSSL signature; and `fill_random`, the
+  KEY` or `PRIVATE KEY`, unencrypted, an RSA key of 2048, 3072 or 4096
+  bits, at most 16,384 bytes of input, wiped after parsing, no key
+  material in `Debug` or errors), checked against an OpenSSL signature; and `fill_random`, the
   provider's system random source. Test-only keys in `tests/data/`.
 
 ### Changed

@@ -8,6 +8,7 @@ use boneli_https::{KeyError, RsaSha256Key, fill_random};
 const PKCS1: &[u8] = include_bytes!("data/test-only-rsa-2048-pkcs1.key");
 const PKCS8: &[u8] = include_bytes!("data/test-only-rsa-2048-pkcs8.key");
 const RSA_1024: &[u8] = include_bytes!("data/test-only-rsa-1024.key");
+const RSA_2304: &[u8] = include_bytes!("data/test-only-rsa-2304.key");
 const P256: &[u8] = include_bytes!("data/test-only-p256.key");
 const CA: &[u8] = include_bytes!("data/ca.pem");
 const MESSAGE: &[u8] = include_bytes!("data/rs256-message.txt");
@@ -98,6 +99,25 @@ fn key_rules() {
         section("RSA PRIVATE KEY", &lines[..lines.len() / 2])
     };
     let garbage = section("PRIVATE KEY", &[&b"QUFB".repeat(100)]);
+    // OpenSSL's traditional encryption (`openssl genrsa -traditional
+    // -aes128`) keeps the PKCS#1 label and adds RFC 1421 headers. The body
+    // here is the plain key: the headers alone must refuse it.
+    let traditional_encrypted = {
+        let lines = body_lines(PKCS1);
+        let mut with_headers: Vec<&[u8]> = vec![
+            b"Proc-Type: 4,ENCRYPTED",
+            b"DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF",
+            b"",
+        ];
+        with_headers.extend(lines);
+        section("RSA PRIVATE KEY", &with_headers)
+    };
+    let dek_info_only = {
+        let mut with_header: Vec<&[u8]> =
+            vec![b"DEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF"];
+        with_header.extend(body_lines(PKCS8));
+        section("PRIVATE KEY", &with_header)
+    };
     // A BEGIN marker with four trailing dashes instead of five.
     let short_marker = {
         let mut out = PKCS1.to_vec();
@@ -160,7 +180,20 @@ fn key_rules() {
             relabel(PKCS1, "PRIVATE KEY"),
             KeyError::Rejected,
         ),
+        (
+            "traditional encrypted PKCS#1",
+            traditional_encrypted,
+            KeyError::UnsupportedSection,
+        ),
+        (
+            "DEK-Info header",
+            dek_info_only,
+            KeyError::UnsupportedSection,
+        ),
         ("1024-bit RSA", RSA_1024.to_vec(), KeyError::Rejected),
+        // ring loads primes in multiples of 512 bits only, so a 2304-bit
+        // key, between the accepted sizes, is refused.
+        ("2304-bit RSA", RSA_2304.to_vec(), KeyError::Rejected),
         ("P-256", P256.to_vec(), KeyError::NotRsa),
         ("garbage DER", garbage, KeyError::Rejected),
         ("truncated DER", truncated, KeyError::Rejected),
@@ -264,7 +297,7 @@ fn debug_has_no_key_material() {
         ));
     }
     let mut windows = Vec::new();
-    for pem in [PKCS1, PKCS8, RSA_1024, P256] {
+    for pem in [PKCS1, PKCS8, RSA_1024, RSA_2304, P256] {
         let body = body_lines(pem).concat();
         for window in body.windows(16) {
             windows.push(String::from_utf8(window.to_vec()).expect("base64 is ASCII"));
@@ -304,4 +337,19 @@ fn fill_random_fills() {
 fn key_is_send_and_sync() {
     fn check<T: Send + Sync>() {}
     check::<RsaSha256Key>();
+}
+
+/// The refusal names the sizes ring loads: 2048, 3072 and 4096 bits (ring
+/// 0.17 refuses primes that are not a multiple of 512 bits), not a range
+/// that a refused 2304-bit key lies inside.
+#[test]
+fn rejected_names_the_accepted_sizes() {
+    for pem in [RSA_1024, RSA_2304] {
+        let err = load(pem).expect_err("refused");
+        assert_eq!(err, KeyError::Rejected);
+        assert_eq!(
+            err.to_string(),
+            "not an RSA private key of 2048, 3072 or 4096 bits"
+        );
+    }
 }

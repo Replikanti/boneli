@@ -21,13 +21,15 @@ pub enum KeyError {
     TooLarge,
     /// The input does not hold exactly one PEM section.
     NotOneSection,
-    /// The one section is not `RSA PRIVATE KEY` or `PRIVATE KEY`: a
-    /// certificate, a public key, an encrypted, SEC1 or OpenSSH key.
+    /// The one section is not an unencrypted `RSA PRIVATE KEY` or
+    /// `PRIVATE KEY`: a certificate, a public key, a SEC1 or OpenSSH key,
+    /// or an encrypted key, under its PKCS#8 label or in OpenSSL's
+    /// traditional form (`Proc-Type` and `DEK-Info` headers).
     UnsupportedSection,
     /// The PEM framing or its base64 is corrupt.
     CorruptPem,
     /// ring did not accept the DER as an RSA key: corrupt, inconsistent, or
-    /// a modulus outside 2048 to 4096 bits.
+    /// a modulus other than 2048, 3072 or 4096 bits.
     Rejected,
     /// A key ring accepts, but not an RSA key (ECDSA, Ed25519).
     NotRsa,
@@ -44,7 +46,7 @@ impl fmt::Display for KeyError {
                 "the PEM section must be an unencrypted RSA PRIVATE KEY or PRIVATE KEY"
             }
             KeyError::CorruptPem => "the PEM section is corrupt",
-            KeyError::Rejected => "not an RSA private key of 2048 to 4096 bits",
+            KeyError::Rejected => "not an RSA private key of 2048, 3072 or 4096 bits",
             KeyError::NotRsa => "the private key is not an RSA key",
             KeyError::SignFailed => "the RSA signature failed",
         })
@@ -74,9 +76,11 @@ impl RsaSha256Key {
     pub const MAX_PEM_LEN: usize = 16_384;
 
     /// Reads the one PEM section in `pem`: `RSA PRIVATE KEY` (PKCS#1) or
-    /// `PRIVATE KEY` (PKCS#8) holding an RSA key that ring accepts, 2048 to
-    /// 4096 bits. Text outside the section is ignored; a second section
-    /// of any kind, a certificate included, is refused.
+    /// `PRIVATE KEY` (PKCS#8) holding an unencrypted RSA key that ring
+    /// accepts: 2048, 3072 or 4096 bits, because ring 0.17 signs with
+    /// moduli of 2048 to 4096 bits whose primes are a multiple of 512 bits
+    /// long. Text outside the section is ignored; a second section of any
+    /// kind, a certificate included, is refused.
     ///
     /// `pem` is wiped (filled with zeros) before this returns, on success
     /// and on every refusal, so the caller's copy of the key file does not
@@ -122,10 +126,27 @@ fn wipe(buf: &mut [u8]) {
     std::hint::black_box(buf);
 }
 
-/// Whether `line` opens a PEM section. Lines end at LF or CR, as in the
-/// rustls PEM parser, so both count the same sections.
+/// The lines of `pem`, ending at LF or CR as in the rustls PEM parser, so
+/// both see the same lines.
+fn lines(pem: &[u8]) -> impl Iterator<Item = &[u8]> {
+    pem.split(|b| *b == b'\n' || *b == b'\r')
+}
+
+/// Whether `line` opens a PEM section.
 fn begins_section(line: &[u8]) -> bool {
     line.starts_with(b"-----BEGIN ")
+}
+
+/// Whether the section carries the RFC 1421 headers of OpenSSL's
+/// traditional encryption, which keeps the `RSA PRIVATE KEY` label. The
+/// rustls parser would feed them to base64 and report corrupt PEM; the
+/// file is not corrupt, it is encrypted.
+fn has_encryption_headers(pem: &[u8]) -> bool {
+    lines(pem)
+        .skip_while(|line| !begins_section(line))
+        .skip(1)
+        .take_while(|line| !line.starts_with(b"-----END "))
+        .any(|line| line.starts_with(b"Proc-Type:") || line.starts_with(b"DEK-Info:"))
 }
 
 fn parse(pem: &[u8]) -> Result<RsaSha256Key, KeyError> {
@@ -134,12 +155,12 @@ fn parse(pem: &[u8]) -> Result<RsaSha256Key, KeyError> {
     }
     // The rustls parser skips sections it does not know (an encrypted or
     // OpenSSH key), so the count comes from the markers themselves.
-    let sections = pem
-        .split(|b| *b == b'\n' || *b == b'\r')
-        .filter(|line| begins_section(line))
-        .count();
+    let sections = lines(pem).filter(|line| begins_section(line)).count();
     if sections != 1 {
         return Err(KeyError::NotOneSection);
+    }
+    if has_encryption_headers(pem) {
+        return Err(KeyError::UnsupportedSection);
     }
     let mut iter = pem::SliceIter::<(SectionKind, Vec<u8>)>::new(pem);
     let (kind, mut der) = match iter.next() {
@@ -170,8 +191,8 @@ fn parse(pem: &[u8]) -> Result<RsaSha256Key, KeyError> {
         .ok_or(KeyError::NotRsa)?;
     // One signature at load: it proves the signer works before the key is
     // handed out, and its length is the modulus size, which rustls does not
-    // expose. ring signs with 2048 to 4096 bits only; the check keeps that
-    // true if ring's limits change.
+    // expose. ring signs with 2048, 3072 and 4096 bits only; the check
+    // keeps the bounds true if ring's limits change.
     let probe = signer.sign(b"").map_err(|_| KeyError::Rejected)?;
     if !(256..=512).contains(&probe.len()) {
         return Err(KeyError::Rejected);
