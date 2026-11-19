@@ -454,8 +454,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bits, at most 16,384 bytes of input, wiped after parsing, no key
   material in `Debug` or errors), checked against an OpenSSL signature; and `fill_random`, the
   provider's system random source. Test-only keys in `tests/data/`.
-- `boneli-forge-github`, part 3 of #19 (ADR-014 D5 to D12): the `Forge`
-  port over the GitHub REST API as a GitHub App. The App key is read once
+- `boneli-forge-github`, part 3 of #19 (ADR-014 D5 to D12; ADR-014
+  accepted after the live test): the `Forge` port over the GitHub REST
+  API as a GitHub App. The App key is read once
   from a private file (absolute, regular, not a symlink, owned by the
   process's uid, mode `0600` or `0400`); an RS256 JWT is exchanged for an
   installation token scoped to one repository with exactly `contents`,

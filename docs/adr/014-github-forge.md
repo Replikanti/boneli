@@ -1,6 +1,6 @@
 # ADR-014: GitHub forge: App tokens, create-only branch push through the Git port, inert pull-request bodies
 
-- Status: proposed
+- Status: accepted (2026-11-19, after the live test of part 3)
 - Date: 2026-11-19
 
 ## Context
@@ -163,10 +163,13 @@ base came from.
     v0, which `--negotiate-only` refuses), git warns "push negotiation
     failed; proceeding anyway with push" and sends the full set as
     without negotiation. The push still lands; it only costs bandwidth.
-  - **Open item:** whether GitHub answers the negotiation of a shallow
-    client, so that a push from the depth-1 store sends 4 objects there
-    too, is not verified yet. The live test of part 3 checks it ("Accept when");
-    the fallback above keeps the push correct either way.
+  - **On GitHub** (live test of part 3, 2026-11-19): GitHub answers the
+    negotiation of the shallow client. With the test repository's default
+    branch moved past the base, the push from the depth-1 store wrote 3
+    objects, the blob, tree and commit of a one-line change to a file at
+    the repository root (trace2 `write_pack_file/wrote` printed `[3, 3]`),
+    and the negotiation child ran. The fallback above keeps the push
+    correct if a server ever declines.
 - **`CommitInfo`** is the author and committer of the pushed commit and
   its message, set through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` on
   `commit-tree` only, with the message on stdin (`-F -`):
@@ -874,15 +877,24 @@ The live test (D12) passes on the operator's private test repository,
 run once before this ADR's PR merges, and its output settles the two
 items still open:
 
-- **Pending: measured live sizes (D10).** The token, repository, comment,
-  pull-request and lookup answers the live test prints (`size ...`) are
-  within D10's limits and are recorded here.
-- **Pending: shallow negotiation (D2).** With the default branch moved
-  past the base, the push from the depth-1 store sends only the new
-  objects (the push's trace2 `write_pack_file/wrote`, printed as
-  `push: pack-objects wrote [...]`, recorded here), or this ADR records
-  that GitHub does not negotiate with a shallow client and what that
-  costs.
+- **Done: measured live sizes (D10).** Live test, 2026-11-19, on the
+  operator's private test repository:
+
+  | Answer | Bytes | Values | Depth |
+  |--------|------:|-------:|------:|
+  | installation token | 6,058 | 111 | 4 |
+  | repository | 7,139 | 142 | 2 |
+  | questions comment | 16,663 | 81 | 3 |
+  | pull request (body near the 65,536-byte cap) | 286,127 | 334 | 4 |
+  | pull-request lookup | 83,394 | 321 | 5 |
+
+  The largest answer is 27 % of the 1,048,576-byte body limit and below
+  the 413,925-byte worst case D10 derives for one pull request; the most
+  values are 8 % of 4,096 and the deepest answer is 5 of 16.
+- **Done: shallow negotiation (D2).** GitHub negotiates with the shallow
+  client: with the default branch moved past the base, the push wrote 3
+  objects (`push: pack-objects wrote [3, 3] objects; negotiation child
+  ran: true; main moved past the base: true`), recorded in D2.
 
 The rest of the check is the test's own assertions: the pull request's
 head is a `boneli/` branch whose one parent is the base and which changes
