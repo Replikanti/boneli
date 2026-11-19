@@ -77,6 +77,10 @@ const CONFIG: &[(&str, &str)] = &[
     ("push.recurseSubmodules", "no"),
     ("push.followTags", "false"),
     ("push.gpgSign", "false"),
+    // The store has the base at depth 1 and no refs, so without a
+    // negotiation round git cannot tell what the remote already has and
+    // sends the base's whole tree (ADR-014, D2).
+    ("push.negotiate", "true"),
     ("http.followRedirects", "false"),
     // Under 1 byte per second for 5 minutes is a stalled transfer.
     ("http.lowSpeedLimit", "1"),

@@ -55,6 +55,7 @@ const CONFIG: &[(&str, &str)] = &[
     ("push.recurseSubmodules", "no"),
     ("push.followTags", "false"),
     ("push.gpgSign", "false"),
+    ("push.negotiate", "true"),
     ("http.followRedirects", "false"),
     ("http.lowSpeedLimit", "1"),
     ("http.lowSpeedTime", "300"),

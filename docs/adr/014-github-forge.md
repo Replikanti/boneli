@@ -133,11 +133,39 @@ base came from.
   `push.recurseSubmodules=no`, `push.followTags=false` and
   `push.gpgSign=false`, so a push sends the one ref it names and asks for
   no signing that the remote could demand.
-- **What it sends.** Measured on git 2.56.0 by
-  `push_sends_only_new_objects_when_main_moved`: from a depth-1 store,
-  after the remote's `main` moved past the base, a one-file change sent
-  4 objects (the commit, the root and `src` trees, the blob). No
-  negotiation setting is needed.
+- **What it sends: `push.negotiate=true`.** The store holds the base at
+  depth 1 and has no refs. Without negotiation, `git push` leaves out
+  only what the remote's advertised tips reach and the store has; once
+  the remote's `main` has moved past the base (or the base is no tip),
+  the store has none of them, and git sends the base commit and its
+  whole tree. With `push.negotiate=true` the push first runs a child
+  `git fetch --negotiate-only` that finds the base as a common commit,
+  and sends only what is new. Measured on git 2.56.0 by
+  `push_sends_only_new_objects`, a base with 300 files beside the edited
+  one and a one-file change:
+
+  | `main` on the remote | without negotiation | with negotiation |
+  | --- | --- | --- |
+  | at the base | 4 objects | 4 objects |
+  | moved past the base | 309 objects | 4 objects |
+
+  The 4 are the commit, the root and `src` trees and the blob. The test
+  measures what the push's `pack-objects` wrote (git's trace2 data
+  `write_pack_file/wrote`), not the remote's object count, which cannot
+  see objects the remote already had; it also reads the pack the remote
+  kept (`receive.unpackLimit=1`): exactly 4 objects new to the remote,
+  plus at most one delta base per delta sent, which the remote appends
+  from its own objects to complete a thin pack (`index-pack
+  --fix-thin`). The first version of this ADR measured the remote's
+  object growth and missed the 309 (review round 1 of #71).
+  - **When negotiation fails** (checked on git 2.56.0 by forcing protocol
+    v0, which `--negotiate-only` refuses), git warns "push negotiation
+    failed; proceeding anyway with push" and sends the full set as
+    without negotiation. The push still lands; it only costs bandwidth.
+  - **Open item:** whether GitHub answers the negotiation of a shallow
+    client, so that a push from the depth-1 store sends 4 objects there
+    too, is not verified yet. The live test of part 3 checks it ("Accept when");
+    the fallback above keeps the push correct either way.
 - **`CommitInfo`** is the author and committer of the pushed commit and
   its message, set through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` on
   `commit-tree` only, with the message on stdin (`-F -`):
@@ -184,7 +212,12 @@ source. The ADR-010 D4 rule applies, plus these choices:
   ADR-010 D6), `ls-remote` and `push`. `init`, `read-tree`, `add`,
   `write-tree`, `ls-tree`, `cat-file`, `apply`, `commit-tree` and
   `pack-objects` get none (`authorization_only_on_network_calls`), and
-  no argv ever holds it.
+  no argv ever holds it. The push's own children inherit its
+  environment, so they read the same pair: the negotiation fetch
+  (`push.negotiate`, D2), which talks to the same URL and needs it
+  (`negotiation_fetch_carries_the_scoped_header`, from git's trace2
+  log of the config each process read), and the push's `pack-objects`,
+  which reads it and makes no request.
 - **Fetched fresh for each process.** A source that mints tokens with an
   hour's life can refresh between the calls of one operation; the value
   for the first network call of `fetch_base` and `push` is taken before
@@ -257,4 +290,8 @@ source. The ADR-010 D4 rule applies, plus these choices:
 Part 3 of #19 adds D4 to D12 and the live test passes on the operator's
 private test repository: the pull request's head is a `boneli/` branch
 whose parent is the base and which changes exactly the fixed file, both
-pushed and fetched with the App's token through `Credentials`.
+pushed and fetched with the App's token through `Credentials`; and the
+push from the depth-1 store, with the repository's default branch moved
+past the base, sends only the new objects (the push's trace2
+`write_pack_file/wrote`, recorded here), or this ADR records that
+GitHub does not negotiate with a shallow client and what that costs.

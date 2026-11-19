@@ -444,7 +444,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   outer space) before the process starts, passed only as
   `http.<url>.extraHeader` in its command-scope config and redacted from
   failure details. The command scope adds `push.recurseSubmodules=no`,
-  `push.followTags=false` and `push.gpgSign=false`.
+  `push.followTags=false`, `push.gpgSign=false` and
+  `push.negotiate=true`: from the depth-1 store, without negotiation, a
+  push after the remote's `main` moved sent the base's whole tree (309
+  objects for a one-file change in a 300-file fixture, 4 with it).
 
 ### Changed
 

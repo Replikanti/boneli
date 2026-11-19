@@ -1,12 +1,14 @@
 //! `push`: create-only branches on the repository the base came from,
 //! with the base as the only parent (ADR-014, D1 and D2).
 
+use std::collections::BTreeSet;
+
 use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError};
 use boneli_git_cli::GitCli;
 
 use crate::support::{
     EDITED, LIB, Source, TempDir, branch_at, cli, contract_source, edit, fgit, host_git, open,
-    path, sha, write_executable,
+    path, sha, tracing_git, write_executable,
 };
 
 fn branch(name: &str) -> BranchName {
@@ -31,16 +33,6 @@ fn edited(git: &GitCli, source: &Source, base: &str) -> (CheckoutId, CheckoutId)
     let diff = git.diff(&c, &workspace).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     (c, after)
-}
-
-/// The object count of a repository: loose objects plus packed ones.
-fn objects(dir: &std::path::Path) -> u64 {
-    let out = fgit(dir, &["count-objects", "-v"]);
-    out.lines()
-        .filter_map(|line| line.split_once(": "))
-        .filter(|(key, _)| *key == "count" || *key == "in-pack")
-        .map(|(_, n)| n.parse::<u64>().expect("a number"))
-        .sum()
 }
 
 #[test]
@@ -181,21 +173,120 @@ fn push_from_depth_one_store() {
     assert_eq!(parents, vec![base]);
 }
 
-/// The remote's `main` moved past the base after the fetch; a one-file
-/// change still sends 4 objects: the commit, the root and `src` trees and
-/// the blob (ADR-014, D2).
+/// Every object id of the repository at `dir`.
+fn all_objects(dir: &std::path::Path) -> BTreeSet<String> {
+    fgit(
+        dir,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// The pack indexes under `<dir>/.git/objects/pack`.
+fn packs(dir: &std::path::Path) -> BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(dir.join(".git/objects/pack"))
+        .map(|entries| {
+            entries
+                .map(|e| e.expect("entry").path())
+                .filter(|p| p.extension().is_some_and(|x| x == "idx"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The objects of the pack whose index is `idx`, from `verify-pack -v`.
+fn pack_objects(dir: &std::path::Path, idx: &std::path::Path) -> BTreeSet<String> {
+    let idx = idx.to_str().expect("a UTF-8 path");
+    fgit(dir, &["verify-pack", "-v", idx])
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .filter(|id| id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The values of the trace2 data event `pack-objects` / `key` in a
+/// `GIT_TRACE2_EVENT` file, in order.
+fn trace2_data(trace: &std::path::Path, key: &str) -> Vec<u64> {
+    let needle = format!("\"category\":\"pack-objects\",\"key\":\"{key}\",\"value\":\"");
+    std::fs::read_to_string(trace)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let rest = &line[line.find(&needle)? + needle.len()..];
+            rest[..rest.find('"')?].parse().ok()
+        })
+        .collect()
+}
+
+/// What a push sends (ADR-014, D2). The base has 300 more files beside
+/// the edited one, and the store holds the base at depth 1 with no refs,
+/// so without push negotiation git cannot tell what the remote has and
+/// sends the base commit and its whole tree; with it, a one-file change
+/// sends 4 objects: the commit, the root and `src` trees and the blob.
+/// Checked with `main` still at the base and with `main` moved past it,
+/// where no advertised tip is a commit the store has. Measured twice:
+/// what the push's `pack-objects` wrote (trace2), and the pack the
+/// remote kept (`receive.unpackLimit=1`), which also holds the delta
+/// bases the remote appends to complete a thin pack
+/// (`index-pack --fix-thin`), objects it had already.
 #[test]
-fn push_sends_only_new_objects_when_main_moved() {
-    let tmp = TempDir::new("push-objects");
-    let (source, base) = contract_source(&tmp);
-    let git = cli(&tmp);
-    let (_, after) = edited(&git, &source, &base);
-    source.write("docs/later.md", b"later\n", false);
-    source.commit("later");
-    let before = objects(&source.dir);
-    git.push(&after, &branch("boneli/objects"), &info())
-        .expect("push");
-    assert_eq!(objects(&source.dir) - before, 4);
+fn push_sends_only_new_objects() {
+    for moved in [false, true] {
+        let tmp = TempDir::new("push-objects");
+        let source = Source::new(&tmp, "src", false);
+        source.write("src/lib.rs", LIB, false);
+        for n in 0..300 {
+            source.write(
+                &format!("src/data/f{n}"),
+                format!("{n}\n").as_bytes(),
+                false,
+            );
+        }
+        let base = source.commit("base");
+        for (key, value) in [
+            ("receive.unpackLimit", "1"),
+            ("receive.autogc", "false"),
+            ("gc.auto", "0"),
+        ] {
+            fgit(&source.dir, &["config", key, value]);
+        }
+        let trace = tmp.path().join("trace2.json");
+        let git = open(
+            &tmp,
+            &tracing_git(&tmp, &trace),
+            boneli_git_cli::DEFAULT_MAX_NODES,
+        );
+        let (_, after) = edited(&git, &source, &base);
+        if moved {
+            source.write("docs/later.md", b"later\n", false);
+            source.commit("later");
+        }
+        let had = all_objects(&source.dir);
+        let old_packs = packs(&source.dir);
+        let _ = std::fs::remove_file(&trace);
+        git.push(&after, &branch("boneli/objects"), &info())
+            .expect("push");
+        assert_eq!(
+            trace2_data(&trace, "write_pack_file/wrote"),
+            vec![4],
+            "moved: {moved}"
+        );
+        let deltas: u64 = trace2_data(&trace, "written/delta").iter().sum();
+        let new_packs: Vec<_> = packs(&source.dir).difference(&old_packs).cloned().collect();
+        assert_eq!(new_packs.len(), 1, "moved: {moved}");
+        let kept = pack_objects(&source.dir, &new_packs[0]);
+        let fresh: Vec<&String> = kept.iter().filter(|id| !had.contains(*id)).collect();
+        assert_eq!(fresh.len(), 4, "moved: {moved}");
+        let appended = (kept.len() - fresh.len()) as u64;
+        assert!(appended <= deltas, "moved: {moved}: {appended} > {deltas}");
+    }
 }
 
 #[test]

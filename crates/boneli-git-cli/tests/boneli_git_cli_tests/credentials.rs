@@ -11,7 +11,7 @@ use boneli_git_cli::{Credentials, DEFAULT_MAX_NODES, MAX_AUTHORIZATION};
 use crate::support::record::{Call, Recorder};
 use crate::support::{
     EDITED, TempDir, contract_source, decode, edit, failed, host_git, open_with, path, sha,
-    write_executable,
+    tracing_git, write_executable,
 };
 
 /// The secret part of [`VALUE`].
@@ -331,4 +331,58 @@ fn snapshot_never_carries_authorization() {
             assert!(!text.contains("http"), "{text}");
         }
     }
+}
+
+/// `push.negotiate` (ADR-014, D2) makes the push run a child
+/// `git fetch --negotiate-only` against the same URL. That child inherits
+/// the push's environment, so it reads the same scoped header, once;
+/// trace2 logs the `http.*` config every process read.
+#[test]
+fn negotiation_fetch_carries_the_scoped_header() {
+    let tmp = TempDir::new("cred-negotiate");
+    let (source, base) = contract_source(&tmp);
+    let trace = tmp.path().join("trace2.json");
+    let creds = Fixed::new(Ok(Some(VALUE.to_owned())));
+    let git = open_with(
+        &tmp,
+        &tracing_git(&tmp, &trace),
+        DEFAULT_MAX_NODES,
+        Some(creds),
+    );
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let snapshot = git.snapshot(&c).expect("snapshot");
+    let workspace = edit(&snapshot, &path("src/lib.rs"), Some(EDITED));
+    let after = git
+        .apply(&c, &git.diff(&c, &workspace).expect("diff"))
+        .expect("apply");
+    source.write("docs/later.md", b"later\n", false);
+    source.commit("later");
+    let _ = std::fs::remove_file(&trace);
+    git.push(&after, &branch("boneli/negotiate"), &info())
+        .expect("push");
+    let text = std::fs::read_to_string(&trace).expect("a trace");
+    let field = |line: &str, name: &str| -> Option<String> {
+        let key = format!("\"{name}\":\"");
+        let rest = &line[line.find(&key)? + key.len()..];
+        Some(rest[..rest.find('"')?].to_owned())
+    };
+    let negotiating: Vec<String> = text
+        .lines()
+        .filter(|l| l.contains("\"event\":\"start\"") && l.contains("\"--negotiate-only\""))
+        .filter_map(|l| field(l, "sid"))
+        .collect();
+    assert_eq!(negotiating.len(), 1, "no negotiation ran: {text}");
+    let param = format!("http.{}.extraheader", source.url().as_str());
+    let read: Vec<(String, String)> = text
+        .lines()
+        .filter(|l| l.contains("\"event\":\"def_param\""))
+        .filter(|l| field(l, "sid").as_deref() == Some(negotiating[0].as_str()))
+        .filter_map(|l| Some((field(l, "param")?, field(l, "value")?)))
+        .filter(|(p, _)| p.ends_with(".extraheader"))
+        .collect();
+    assert_eq!(
+        read,
+        vec![(param, format!("Authorization: {VALUE}"))],
+        "{text}"
+    );
 }

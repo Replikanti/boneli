@@ -532,3 +532,23 @@ pub fn failed<T: std::fmt::Debug>(result: Result<T, GitError>) -> String {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+/// A git that runs the real one with `GIT_TRACE2_EVENT` set to `trace`
+/// and the `http.*` config keys logged, so the test sees what the push's
+/// `pack-objects` wrote and which config each process read. The adapter
+/// clears the environment; the wrapper adds the variables after that.
+pub fn tracing_git(tmp: &TempDir, trace: &std::path::Path) -> std::path::PathBuf {
+    let git = tmp.path().join("tracing-git");
+    write_executable(
+        &git,
+        format!(
+            "#!/bin/sh\n\
+             GIT_TRACE2_EVENT='{trace}' GIT_TRACE2_CONFIG_PARAMS='http.*' \
+             exec '{real}' \"$@\"\n",
+            trace = trace.display(),
+            real = host_git().display()
+        )
+        .as_bytes(),
+    );
+    git
+}
