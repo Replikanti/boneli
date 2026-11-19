@@ -1,0 +1,33 @@
+[package]
+name = "boneli-forge-github"
+description = "Boneli adapter: the Forge port over the GitHub REST API as a GitHub App, with installation tokens, create-only branch push through the Git port and inert pull-request bodies (ADR-014)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Adapter crate: the core and support crates only, no external edge
+# (ADR-014). git is reached through the `Git` port, never through
+# boneli-git-cli: an adapter does not depend on another adapter.
+[dependencies]
+# The pull request's values (ticket, citations, checks, usage, overrun)
+# that the body renders (ADR-002). An adapter depends on the core.
+boneli-domain.workspace = true
+# The `Forge` port this crate adapts and the `Git` port it pushes the fix
+# branch through (ADR-004, ADR-014 D1). An adapter depends on the core.
+boneli-app.workspace = true
+# The HTTP/1.1 client the REST calls run on (ADR-003). A support crate, no
+# new external edge.
+boneli-http.workspace = true
+# TLS to api.github.com through the `Dial` seam, RS256 for the App's JWT and
+# the random source for branch nonces (ADR-005, ADR-014 D4). A support
+# crate, no new external edge.
+boneli-https.workspace = true
+# Strict parsing of GitHub's responses under limits, and request bodies
+# (ADR-008, ADR-014 D10). A support crate, no new external edge.
+boneli-json.workspace = true

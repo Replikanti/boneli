@@ -1,6 +1,6 @@
 # ADR-014: GitHub forge: App tokens, create-only branch push through the Git port, inert pull-request bodies
 
-- Status: proposed
+- Status: accepted (2026-11-19, after the live test of part 3)
 - Date: 2026-11-19
 
 ## Context
@@ -163,10 +163,13 @@ base came from.
     v0, which `--negotiate-only` refuses), git warns "push negotiation
     failed; proceeding anyway with push" and sends the full set as
     without negotiation. The push still lands; it only costs bandwidth.
-  - **Open item:** whether GitHub answers the negotiation of a shallow
-    client, so that a push from the depth-1 store sends 4 objects there
-    too, is not verified yet. The live test of part 3 checks it ("Accept when");
-    the fallback above keeps the push correct either way.
+  - **On GitHub** (live test of part 3, 2026-11-19): GitHub answers the
+    negotiation of the shallow client. With the test repository's default
+    branch moved past the base, the push from the depth-1 store wrote 3
+    objects, the blob, tree and commit of a one-line change to a file at
+    the repository root (trace2 `write_pack_file/wrote` printed `[3, 3]`),
+    and the negotiation child ran. The fallback above keeps the push
+    correct if a server ever declines.
 - **`CommitInfo`** is the author and committer of the pushed commit and
   its message, set through `GIT_AUTHOR_*` and `GIT_COMMITTER_*` on
   `commit-tree` only, with the message on stdin (`-F -`):
@@ -349,6 +352,435 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
     no longer needs `rustls` as a dev-dependency, so the edge
     `boneli-oci -> rustls` leaves `tools/architecture.toml`.
 
+### D5. Installation tokens
+
+`InstallationTokens` exchanges the App's JWT (D4) for an installation
+token and caches it; `GitHubForge` and the git credentials bridge
+(D3, in a composition root) share one instance. It is built with
+`InstallationTokens::open(app, repository, dial, clock, limits)`: the
+`Dial` (D4) and the `limits` (D10, `Limits::GITHUB` in production) live
+here because the token exchange is the first request on them and the
+forge reuses both, so one value configures every request the adapter
+makes. `limits` is an argument rather than a constant so that the tests
+can shorten the 30 s deadline to provoke a timeout
+(`timeout_on_create_looks_up_by_head`, 300 ms); the plan's signature had
+no such argument.
+
+- **The request** is `POST /app/installations/{id}/access_tokens` with
+  `{"repositories":["<name>"],"permissions":{"contents":"write","issues":"write","pull_requests":"write"}}`.
+  A token never covers more than the one repository and the three
+  permissions the forge uses, whatever the installation allows.
+- **The answer is checked** before the token is used: the permissions
+  are exactly the three requested, plus optionally `metadata: read`,
+  which GitHub always adds (`permissions_must_equal_request`: an extra
+  `administration: write` or a `contents: read` is refused);
+  `repository_selection` is `selected`, and `repositories` holds exactly
+  one entry whose `full_name` is ours, compared without regard to ASCII
+  case as GitHub compares it (`repository_scope_is_checked`). An
+  installation that was widened by mistake therefore fails closed instead
+  of handing the runner a broader token.
+- **The token** is 1 to 4,096 bytes of `0x21`-`0x7E`
+  (`token_value_rules`). Today's tokens are 40 characters; 4,096 is 100
+  times that, room for a format change, and it is what bounds the git
+  `Authorization` value (D3). A lower cap risks refusing a valid future
+  token; a higher one only admits larger headers.
+- **Reuse margin: 600 s.** A token is reused while more than 600 s of it
+  remain, and refreshed at 600 s left (`token_is_cached_until_margin`:
+  minted at t0 for an hour, reused at t0+2,999, new at t0+3,000). Why
+  600: the runner's clock may be 60 s off GitHub's (D4), and one git
+  process takes the value once and may use it for its last request up to
+  the 300 s stall bound of a transfer later (`http.lowSpeedTime`, ADR-010
+  D4), so 60 + 300 = 360, rounded up. A smaller margin risks a token
+  expiring inside a slow push; a larger one costs one more exchange per
+  hour at most (at 600 s, one per 50 minutes).
+- **Lifetime cap: 3,600 s,** GitHub's documented hour: `expires_at` is
+  clamped to the mint time plus an hour, so a clock or an answer that
+  claims more cannot extend the cache (`expires_at_beyond_an_hour_is_clamped`).
+- **An `expires_at` at most 600 s away is refused**
+  (`token_expiring_within_margin_is_refused`): t0+600 is refused, t0+601
+  taken. Such a token could not be reused at all.
+- **`expires_at`** is an RFC 3339 `date-time` (section 5.6) with `T` or
+  `t`, an optional fraction of 1 to 9 digits, and `Z`, `z` or an offset
+  that is applied; a leap second, a day the month lacks, a year before
+  1970 and a time before the epoch are refused (`expires_at_forms`,
+  `rfc3339_round_trips_every_day` over 1970-01-01 to 2100-12-31). The
+  civil-date arithmetic is Hinnant's `days_from_civil`.
+- **A clock that went back** since the mint forces a new token
+  (`clock_going_back_refreshes`): the cache cannot tell how much of the
+  token is left.
+- **A `401`** on any request made with the token drops the cached token if
+  it is still the refused one, and the request is sent once more with a
+  new token (`unauthorized_refreshes_once`: 401 twice is exactly two
+  exchanges and a failure). A `401` on the exchange itself is not
+  retried: a refused JWT does not get better on a second try.
+- **Concurrency.** The cache's lock is held through an exchange, so
+  callers that need a token at the same time wait for one exchange and
+  share its token (`concurrent_callers_share_one_exchange`). An exchange
+  is bounded by the request deadline (D10).
+- **The wall clock** is a seam (`WallClock`, `SystemClock`); the core has
+  no clock (invariant 2), this adapter needs one because a JWT and a
+  token carry absolute times.
+
+### D6. The private key file
+
+The App key is read once, at start, from a file path (`App::open`,
+`load_key`); never from an environment variable, which every child
+process would inherit. The file must be an absolute path to a regular
+file, not a symlink, owned by the process's uid (the owner of
+`/proc/self`), with no permission bit for group or others
+(`mode & 0o077 == 0`: `0600` and `0400` pass, `0640` does not). That is
+the ssh client's rule for private keys, and for the same reason:
+disclosure is the threat. Replacement is not, because a swapped key only
+signs JWTs that GitHub refuses, so no ancestor directory is checked (unlike
+ADR-012's store root, where a swapped log is the threat). The file is
+inspected with `lstat`, opened, and its `fstat` must name the same device
+and inode and pass the rules again, so a file swapped between the two is
+`Replaced`; a FIFO is refused by `lstat` before an open could block on
+it. At most 16,384 bytes are read (D4's cap), and the buffer is wiped on
+every path (`key_file_rules`; the owner rule is tested on synthetic
+metadata, because no test user can own a file as another uid). No error,
+`Debug` output or failure detail carries key bytes; the tests check every
+16-byte window of the test key's base64 against them.
+
+### D7. Endpoints
+
+The adapter can make five requests, a closed enum (`Endpoint`), and
+nothing else:
+
+| Endpoint | Auth | For |
+| --- | --- | --- |
+| `POST /app/installations/{id}/access_tokens` | JWT | a token (D5) |
+| `GET /repos/{o}/{r}` | token | `default_branch`, when no base branch is configured |
+| `POST /repos/{o}/{r}/pulls` | token | the pull request |
+| `GET /repos/{o}/{r}/pulls?head={o}:{branch}&state=all&per_page=2` | token | the lookup of an ambiguous creation (D9) |
+| `POST /repos/{o}/{r}/issues/{n}/comments` | token | the questions comment |
+
+There is no merge, `PATCH`, `PUT` or `DELETE`, so the adapter cannot
+merge, edit or delete anything (`endpoints_are_a_closed_set`). Every value
+in a target comes from a checked type (the repository, D2's
+`BranchName`, a number) whose characters need no percent-encoding. Every
+request sends `Accept: application/vnd.github+json`,
+`X-GitHub-Api-Version: 2022-11-28`, `User-Agent: boneli-forge-github` and
+`Authorization: Bearer <jwt or token>`, and `Content-Type:
+application/json` with a body (`token_request_is_scoped`,
+`pull_request_request_is_exact`). A pull request is created with
+`"draft": false`, ready for review (STOP 1 decision 4: draft pull
+requests fail on private repositories of plans without them, and a human
+merges anyway). The head is the bare branch name, which GitHub reads in
+the repository itself.
+
+`GitHubForge::new(tokens, git, config)` takes a `ForgeConfig`: the
+commit's author name and email (the App's bot identity), checked at
+construction under `CommitInfo`'s rules (D2), so a misconfigured identity
+fails at start instead of at the first push; and an optional base branch.
+`open_pull_request` composes `fetch_base` → `apply` → `push` through the
+`Git` port (D1) between reading the base branch and creating the pull
+request. The base branch is the configured one or the repository's
+`default_branch`, checked against `git check-ref-format --branch`'s rules
+and at most 255 bytes (`default_branch_rules`); it goes into the request
+as JSON only.
+
+**GitHub ticket keys are `owner/name#N`.** `Ticket` carries no
+repository, so the key carries it: the repository under GitHub's name
+rules (the owner 1 to 39 bytes of `[A-Za-z0-9-]` not starting with `-`,
+the name 1 to 100 bytes of `[A-Za-z0-9._-]`, so a confusable or
+non-ASCII owner is refused) and the issue number `[1-9][0-9]*` up to
+`u64::MAX`. The ticket is "of the same repository" (STOP 1 decision 3)
+when that repository equals the configured one, compared without regard
+to ASCII case as GitHub compares names. Only then does the body carry
+`Fixes #N` (D8) and may `post_questions` comment; a ticket of any other
+repository (another tracker repository, a fork) gets neither, and
+`post_questions` fails before any request, as it does for another
+tracker's ticket or an empty list (`github_issue_key_forms`: a mismatch,
+a case-only difference, a Cyrillic and a fullwidth owner;
+`no_questions_no_comment`). A bare number is refused: it cannot say which
+repository it means, and guessing the configured one is how a ticket of
+`org/tracker#12` would close or comment on `org/app#12`. No domain change
+is needed; an intake adapter for GitHub must produce this form.
+
+**References are `pull/<number>` and `comment/<id>`**, from GitHub's
+`number` and `id` (`reference_comes_from_number`), each a JSON integer
+from 1 to `u64::MAX`: `0`, `-1`, `1.0`, `1e3`, `"42"` and `u64::MAX + 1`
+are refused (`number_forms`). Why a kind prefix and not the bare number:
+pull-request numbers and comment ids are separate number spaces on
+GitHub (numbers count per repository, comment ids globally), so a bare
+`5` could name either, and the `Forge` contract's `distinct-references`
+clause would fail the day a pull request and a comment share a number.
+The prefix also tells a later reader of the run log (retries in #33, the
+transcript link in #20) which endpoint the reference belongs to.
+
+### D8. Rendering: agent text stays inert
+
+The title, the body, the comment and the commit message are rendered by
+the adapter (`render`), because the format depends on the forge (ADR-004).
+
+- **The inert rule.** Outside code blocks there is only text the adapter
+  generates from validated values: numbers, enum labels, SHAs inside
+  URLs, and keys, run ids and evidence references of 1 to 64 (keys) or
+  128 bytes of `[A-Za-z0-9._-]`, in inline code; a value outside that set
+  is left out and a generated phrase says so. Agent and reporter text (the
+  analysis, the reproduction test, citation paths and quotes, the
+  questions) goes into **indented code blocks**, where GitHub's Markdown
+  creates no mention, no issue reference, no closing keyword and no
+  markup. Indented, not fenced: a fence can be closed by the text inside
+  it (a longer fence, `~~~`), an indented block only by a line the adapter
+  writes. Every block follows a blank line and is followed by one, and no
+  list item is ever open before one, because an indented line after a
+  list item continues the item instead of starting code
+  (`hostile_text_stays_in_code_blocks` runs a CommonMark block scanner
+  over the output: mentions, `@org/team`, `#1`, `Closes #1`,
+  `owner/repo#1`, fences, `</pre>`, HTML, links, task lists, quotes and
+  table rows appear only on code lines).
+- **No references in free text, even outside Markdown** (review round 1
+  of #73). A code block is inert only where GitHub renders Markdown. The
+  title is plain text, GitHub's default squash and merge commit messages
+  carry the pull request's title (and, with the repository setting "pull
+  request title and description", its body) verbatim, and GitHub reads a
+  commit message on the default branch as plain text for closing keywords
+  and references, across repositories the merger can write to. So every
+  piece of reporter or agent text (the title, every code block: the
+  analysis, the test, the questions, citation paths and quotes; and the
+  ticket keys, run ids and evidence references shown) also passes through
+  `neutralize`, which breaks every reference form visibly: `#` becomes the
+  fullwidth `＃` (U+FF03) and `@` the fullwidth `＠` (U+FF20), so no `#N`,
+  `owner/repo#N`, `@user` or `@org/team` can form; the dot of
+  `github.com` (any case) becomes U+2024 `․`, so no issue or pull URL
+  can form; and the hyphen of `GH-` (any case) before a digit becomes
+  U+2011 `‑`, so no `GH-N` can form. A closing keyword (close, closes,
+  closed, fix, fixes, fixed, resolve, resolves, resolved, in any case,
+  with or without a colon) closes only through a reference that follows
+  it, so with every reference broken it is plain prose, and it is left as
+  written: rewriting the words would garble ordinary text ("this fixes
+  the parser") and protect nothing more. Why visible substitutes and not
+  a zero-width joiner or an escape: an invisible character is exactly
+  what the escape rule shows as `\u{XXXX}`, and a reader should see that
+  the text was changed; the fullwidth forms read as the original.
+  **The reader is told.** U+2024 and U+2011 look like `.` and `-`, so a
+  quoted line (a Go `import "github.com/x/y"`) would look verbatim and
+  not be found by a search (review round 2 of #73). The intro of every
+  body and comment therefore names each substitution with its
+  replacement and code point, `` `#` as `＃` (U+FF03), `@` as `＠`
+  (U+FF20), `.` in `github.com` as `․` (U+2024), `-` in `GH-` before a
+  digit as `‑` (U+2011) ``, and says to undo them before searching. The
+  function and the note read the same table, `render::SUBSTITUTIONS`
+  (`reader_note_lists_every_substitution`: every entry is in the note,
+  and every character `neutralize` introduces over all printable ASCII
+  and every trigger is in the table).
+  The citation permalink is generated, but its path is the agent's, so
+  the same two dots and hyphens are percent-encoded there too (`#` and
+  `@` are encoded anyway); the link still resolves to the same path.
+  Measured on 2026-11-19 against github.com, on this repository's public
+  commit `25b0800`: `blob/25b0800/crates/boneli%2Dhttps/Cargo%2Etoml`
+  answered HTTP 200 and the page's resolved `"path"` was
+  `crates/boneli-https/Cargo.toml`; lower-case `%2d`/`%2e` also answered
+  200; a path that does not exist answered 404 encoded and unencoded
+  alike (`curl` status plus the resolved path in the page). Assumed, not
+  measured: private repositories go through the same web routing, so
+  their permalinks decode alike.
+  `references_never_form_in_free_text` checks all nine keywords in three
+  cases, with and without a colon, before `#5`, `owner/repo#5`, another
+  repository's `#5`, `GH-5`, `gh-5`, issue and pull URLs (`http`, `www`,
+  upper case) and the two mentions, in the title, in each code block of
+  the body and in the comment, with a plain-text detector that also
+  reads the generated parts; the only reference left in a body is the
+  generated `Fixes #N` line. The live test checks GitHub's own view
+  (D12).
+- **Escaping.** Before it is indented, every character that is Cc except
+  LF and TAB, U+2028, U+2029 or `Default_Ignorable_Code_Point` (the
+  domain's table, now public) becomes the text `\u{XXXX}` (`escape_rule`).
+  CR is Cc, so a lone CR cannot end a line inside the block; U+202E and
+  zero-width characters cannot hide text. The title escapes LF and TAB
+  too.
+- **Invalid UTF-8** in the analysis or the test is shown lossily (U+FFFD)
+  under a generated note (`non_utf8_is_shown_lossily_with_note`).
+- **The ticket line.** For a GitHub ticket `owner/name#N` of the
+  configured repository (D7; the number `[1-9][0-9]*` up to `u64::MAX`, so
+  `0`, `0123`, `+1`, fullwidth digits, `12 ` and `1` before U+00A0 are
+  not), the body starts with `Fixes #N`, so the human's merge closes the
+  issue (STOP 1 decision 3). Any other ticket gets
+  `Ticket: <Source> \`<key>\`` with the key neutralized
+  (`octo-org/tracker＃12`, `GH‑12`), or the source alone when the key is
+  outside its safe form (`fixes_line_only_for_github_ticket`). An empty
+  analysis or test shows a generated `(empty)`.
+- **Layout:** the ticket line, a generated intro, the root cause (each
+  citation as a permalink
+  `https://github.com/<o>/<r>/blob/<base>/<path>#L<line>` with every path
+  byte outside `[A-Za-z0-9._~/-]` percent-encoded, then `path:line` and
+  the quote as code; `citation_permalinks`; a link longer than 1,024 bytes
+  is left out and the path still shows as code. Why 1,024: the fixed
+  part of a permalink is at most about 240 bytes (`https://github.com/`,
+  a 39-byte owner, a 100-byte name, `/blob/`, a 64-hex SHA, `#L` and ten
+  digits), and 1,024 leaves 780 bytes for the path, a 260-byte path fully
+  percent-encoded; 260 is Windows' classic `MAX_PATH`, which repositories
+  with Windows contributors keep their paths under. A longer cap would
+  let one link, which is placed whole or not at all, take a larger part
+  of the citations block's share; a shorter one would drop links to
+  ordinary deep paths), the analysis, the
+  reproduction test, a results table (before the fix the reproduction
+  gate's "fails on an assertion"; with the fix every `TestStatus` and
+  `CheckStatus` through an exhaustive match, `every_status_has_a_distinct_label`),
+  the cost as `$<µUSD / 10^6>.<6 digits>` and the job time as
+  `<s>.<ms> s`, the overrun statement of ADR-002 D3 when there is one, a
+  saturated total reading "at least" (`cost_and_overrun_render_exactly`,
+  `saturated_overrun_says_at_least`), and a footer with the run id, the
+  evidence references and "a human reviews and merges".
+- **Title:** `Fix: <ticket title>`, escaped and neutralized, at most 256 bytes; a longer
+  one is cut at a char boundary to 253 bytes plus `…`
+  (`title_cap_arithmetic`: 251 ASCII bytes give 256, 252 give `Fix: ` + 248
+  + `…`, 85 × `€` give 254). 256 is GitHub's title limit.
+- **Commit message:** `boneli: fix for <Source> ticket <key>`, a blank
+  line and `Run <id>`, generated, with no closing keyword and the key and
+  id neutralized (`octo-org/demo.repo＃7`), so the commit closes and
+  references nothing on its own.
+- **Caps.** A body or comment is at most 65,536 bytes, GitHub's documented
+  limit of 65,536 characters: bytes are at least as many as UTF-16 units
+  and as scalar values, so the cap holds however GitHub counts. The live
+  test sends a body cut to the cap and a 256-byte title (D12).
+- **Sharing the space.** The generated parts take at most 4,096 bytes
+  (`fixed_parts_bound`, measured with every id at its longest, both UTF-8
+  notes and a saturated overrun: about 2.2 KB). The rest is water-filled
+  over the blocks (citations, analysis, test; or the questions): each
+  block, smallest need first, gets the smaller of its need and an equal
+  share of what is left, so what a small block leaves passes on to the
+  larger ones (`body_cap_arithmetic`: 60,000 bytes over needs 2,000,
+  50,000 and 30,000 give 2,000, 29,000 and 29,000; a body whose needs fit
+  exactly is 65,536 bytes, and one byte more cuts exactly one block). A
+  cut block ends with a generated marker that names the evidence
+  reference holding the full text.
+- **Questions.** A comment shows at most 64 questions, each under its own
+  heading; a generated line counts the rest. 64 keeps the headings inside
+  the 4,096 fixed bytes and leaves each question at least 960 bytes
+  (`questions_comment_caps_at_65536_bytes`).
+- **Transcript link.** `PullRequest` carries no transcript reference, so
+  the link waits for #20.
+
+### D9. Errors and rate limits
+
+- **Every failure** is a `JobFailure` with cost 0, whose status is
+  `<what>: GitHub answered <code>` plus ` (request <id>)` when
+  `x-github-request-id` is 1 to 64 bytes of `[A-Za-z0-9:]`, and whose
+  error output is GitHub's `message`, at most 256 bytes cut at a char
+  boundary and quoted with Rust's `{:?}` escaping, so a control character
+  in it cannot forge a line (`status_mapping_table`). 256: the longest
+  common message, the secondary rate limit's, is about 170 characters.
+  A failure never carries a response body, a request header, a token, a
+  JWT or key bytes: the `Authorization` value of the request is redacted
+  where the failure is built, and a final pass redacts the 16 most recent
+  tokens and JWTs before it leaves the adapter
+  (`failure_details_never_carry_secrets`: a server that echoes the
+  `Authorization` value in `message` for every endpoint and status).
+  `Debug` of the adapter's types shows no token and no key
+  (`debug_output_redacts`).
+- **`3xx` is a failure;** no redirect is followed, so a token can never
+  follow one to another host.
+- **A rate limit** is a 403 or 429 with `x-ratelimit-remaining: 0` or a
+  `retry-after`. It is reported with the retry delay or the reset time and
+  never retried (`rate_limit_is_reported_not_retried`). Why no retry: one
+  run makes at most four REST requests (token, repository, pull request,
+  lookup), and GitHub's documented limits are at least 5,000 requests per
+  hour per installation, and 80 per minute and 500 per hour for content
+  creation. Even the content limit allows 500 pull requests or comments
+  per hour against "dozens of runs per runner" (ARCHITECTURE), so a rate
+  limit means a fault, not load, and retries belong to #33.
+- **An ambiguous creation** is a 5xx, a network error, a deadline, or a
+  2xx that is not a `201` with a usable `number`. GitHub may have created
+  the pull request, so the adapter looks it up once by its head branch,
+  which is unique per call (D2's nonce): exactly one pull request found
+  is success; none or two, or a failed lookup, is a failure that carries
+  both errors (`ambiguous_creation_looks_up_by_head`,
+  `timeout_on_create_looks_up_by_head`). Every other answer (a 4xx, a
+  rate limit) is a plain failure: GitHub did not create anything.
+
+### D10. Limits
+
+Measured on 2026-11-19 on public REST objects: a repository object is
+7,171 B with 164 values and depth 4; a pull request 26,679 B and 361
+values with a 9,856 B body; a large public pull request 20,709 B and 468
+values with a 186 B body; a comment 2,562 B and 44 values; response heads
+1,448 to 1,493 B in 28 or 29 lines. The limits (`Limits::GITHUB`,
+`response_limits` at each boundary and one past it):
+
+- **Body: at most 1,048,576 B.** The pull request's answer echoes its
+  body, and GitHub's JSON encoder writes `<`, `>` and `&` as `\u003c` and
+  the like, six bytes for one, so the worst echo of a 65,536-byte body is
+  6 × 65,536 = 393,216 B.
+  With the measured non-body part, about 20,709 B, the lookup's two pull
+  requests need 2 × 413,925 = 827,850 B ≤ 1,048,576. A lower cap could
+  turn a successful creation into a failure.
+- **Depth: at most 16,** 3.2 times the measured 5 (the lookup's array
+  around a pull request).
+- **Values: at most 4,096,** 4.4 times the 936 values of two pull
+  requests; at about 136 B per value (ADR-008) that is about 557 KB of
+  memory.
+- **Head: at most 16,384 B and 64 fields,** 11 and 2.2 times the measured
+  heads.
+- **Deadline: 30 s per request,** GitHub's documented 10 s processing cap
+  plus connect, TLS and transfer, through the `Timed` socket under TLS
+  (D4). The JSON is parsed with `boneli-json` under these limits; a
+  duplicate key, a BOM, trailing bytes or invalid UTF-8 fail
+  (`malformed_json_refused`).
+
+### D11. Network
+
+The adapter talks to `api.github.com:443` directly through `TlsDial`, with
+Mozilla's roots (ADR-005), not through `boneli-egress`: the egress proxy
+is the sandbox's broker and its log is the sandbox's evidence, while the
+adapter runs in the runner, the trusted side. That is why the egress
+proxy (#10) is no dependency of this one. Only github.com is supported;
+GitHub Enterprise Server and HTTP proxies in customer networks are a
+follow-up, like #55.
+
+### D12. Acceptance
+
+CI runs everything against fakes: a fake GitHub over `UnixStream::pair`
+through the `Dial` seam (every test above), a `Git` double for the forge,
+and `file://` remotes for the git adapter's push (D1 to D3). The
+`Forge` contract suite runs on `GitHubForge`
+(`github_forge_passes_contract`; `silent-failure-detail` with every answer
+a 503 with an empty body).
+
+The live test, `opens_a_pull_request_on_the_test_repository` in the
+test-only composition root `boneli-acceptance`, runs the real `GitCli`
+and `GitHubForge` against the operator's GitHub App and private test
+repository (setup and variables: `docs/forge-github.md`). It is
+`#[ignore]`d, run by hand before a change to the forge or to the git push
+and credential path merges (STOP 1 decision 2: no scheduled workflow and
+no App key in this repository's secrets), and a missing variable fails it,
+naming the variable; it never skips. It posts hostile questions, opens a
+pull request from a one-file fix with a 70 KB hostile analysis, a 256-byte
+title and a citation path with a space, checks the branch, its parent,
+the changed file, the base and the absence of mention and issue-link
+anchors in `body_html` (only the `Fixes` line may link), prints the
+response sizes and what the push sent, and cleans up. Because anchors are
+only GitHub's rendering, the test also checks GitHub's own linkage
+(review round 1 of #73): a second open issue, the decoy
+(`BONELI_GITHUB_DECOY_ISSUE`), is referenced after closing keywords as
+`#D`, `owner/repo#D`, `GH-D` and its issue and pull URLs in the ticket
+title, the questions and every block of agent text. The pull request's
+`closingIssuesReferences` (GraphQL) must be exactly the target issue, no
+anchor may point at the decoy, and the decoy's whole timeline (GraphQL
+`timelineItems`, every page) must hold no `ConnectedEvent`,
+`CrossReferencedEvent` or `ReferencedEvent` whose pull request is the
+test's (by node id), whose source is the target issue (the questions
+comment is posted there), or whose commit is the pushed one; events are
+identified by those ids, not by the runner's clock, and the same query
+on the target issue must find the pull request's link, a positive
+control that the query sees links at all (review round 2 of #73). Before
+anything is created, both issues must be open issues, not pull requests,
+and different, or the test fails naming the variable
+(`issues: write` covers reading them). A target issue numbered like a
+hostile reference can no longer make the anchor check pass vacuously,
+since the decoy is a different issue the test names.
+
+`boneli-acceptance` is the one crate that wires `boneli-git-cli` and
+`boneli-forge-github` together: an adapter must not depend on another
+(invariant 1), and the architecture check skips dev-dependencies, so the
+root declares both as regular dependencies and holds a `roles.roots`
+entry. The bridge that gives the git adapter the forge's tokens
+(`Credentials` from `InstallationTokens::git_authorization`, for the
+repository's own URL only) lives in the test; the runner's root (#32)
+gets the same ten lines.
+
 ## Consequences
 
 - Every `Git` adapter must implement `push`; `MemoryGit`, `GitCli` and
@@ -378,6 +810,24 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
   needs the PEM afterwards passes a copy.
 - `boneli_https::Timed` is public API now; ADR-009's text still calls the
   seam crate-local, and this ADR is where it moved.
+- `boneli-forge-github` holds the App key, mints tokens with
+  `contents: write` and renders agent text into pull requests, so it is
+  on the list of crates that always get an adversarial review (STOP 1
+  decision 1).
+- A forge call can block for up to the request deadline (D10) per
+  request, and a caller waiting for a token waits for one exchange.
+- The base branch is the default branch or a configured one; a base
+  commit outside that branch's history shows extra commits in the pull
+  request. Revoking tokens after use, cleaning up stale `boneli/*`
+  branches, retries (#33), GitHub Enterprise Server and the transcript
+  link (#20) are out of scope.
+- A GitHub ticket's key is `owner/name#N` (D7); an intake adapter for
+  GitHub must produce that form, or its tickets get no `Fixes` line and
+  no questions comment.
+- Reporter and agent text on GitHub shows `＃`, `＠`, `github․com` and
+  `GH‑N` where the original had `#`, `@`, `github.com` and `GH-N` (D8).
+- `own_uid` is now in three crates (`boneli-oci`, `boneli-store-fs`, this
+  one); #66's extraction should take this copy too.
 
 ## Alternatives considered
 
@@ -412,14 +862,45 @@ HTTPS connection to `api.github.com` with a deadline. All three come from
   in the graph already, under rustls; a direct edge would need its own
   record for a guarantee `black_box` gives on a best-effort basis too,
   and the residuals above (the parser's copy, ring's key) would stay.
+- **Fenced code blocks** for agent text (D8). A fence is closed by any
+  longer fence or `~~~` line inside the text, so the text would need
+  rewriting; an indented block ends only at a line the adapter writes.
+- **Retrying a rate limit or a 5xx** in the adapter (D9). One run makes
+  four requests; a retry policy belongs to the job layer (#33), which
+  sees the whole run.
+- **The App key in an environment variable** (D6). Every child process,
+  git included, would inherit it.
 
 ## Accept when
 
-Part 3 of #19 adds D5 to D12 and the live test passes on the operator's
-private test repository: the pull request's head is a `boneli/` branch
-whose parent is the base and which changes exactly the fixed file, both
-pushed and fetched with the App's token through `Credentials`; and the
-push from the depth-1 store, with the repository's default branch moved
-past the base, sends only the new objects (the push's trace2
-`write_pack_file/wrote`, recorded here), or this ADR records that
-GitHub does not negotiate with a shallow client and what that costs.
+The live test (D12) passes on the operator's private test repository,
+run once before this ADR's PR merges, and its output settles the two
+items still open:
+
+- **Done: measured live sizes (D10).** Live test, 2026-11-19, on the
+  operator's private test repository:
+
+  | Answer | Bytes | Values | Depth |
+  |--------|------:|-------:|------:|
+  | installation token | 6,058 | 111 | 4 |
+  | repository | 7,139 | 142 | 2 |
+  | questions comment | 16,663 | 81 | 3 |
+  | pull request (body near the 65,536-byte cap) | 286,127 | 334 | 4 |
+  | pull-request lookup | 83,394 | 321 | 5 |
+
+  The largest answer is 27 % of the 1,048,576-byte body limit and below
+  the 413,925-byte worst case D10 derives for one pull request; the most
+  values are 8 % of 4,096 and the deepest answer is 5 of 16.
+- **Done: shallow negotiation (D2).** GitHub negotiates with the shallow
+  client: with the default branch moved past the base, the push wrote 3
+  objects (`push: pack-objects wrote [3, 3] objects; negotiation child
+  ran: true; main moved past the base: true`), recorded in D2.
+
+The rest of the check is the test's own assertions: the pull request's
+head is a `boneli/` branch whose one parent is the base and which changes
+exactly the fixed file, fetched and pushed with the App's token through
+`Credentials`; the body is at most 65,536 bytes, the title 256; and
+GitHub's `body_html` of the pull request and the comment holds no mention
+and no issue link but the `Fixes` line; the pull request's closing
+references are exactly the target issue; and the decoy issue gets no
+link, no closing reference and no timeline event.

@@ -27,7 +27,12 @@ support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-t
 # replay gate for address leaks. As a root it is a leaf, so no production
 # crate can depend on it, and it may later depend on the in-memory adapters
 # that the application replay (#3) needs.
-roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check"]
+# boneli-acceptance is the test-only root of ADR-014 D12: live acceptance
+# tests that wire real adapters (boneli-git-cli and boneli-forge-github)
+# against real services. It declares those adapters as regular
+# dependencies, so this check holds it to the root rules, and as a leaf no
+# crate can depend on it.
+roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check", "boneli-acceptance"]
 # The only crates that may contain `unsafe`.
 unsafe = ["boneli-sys"]
 # The only crates that may have a build script (and with it a `links` key,

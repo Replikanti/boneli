@@ -1,0 +1,699 @@
+//! The title, the body, the comment and the commit message (ADR-014, D8).
+
+mod support;
+
+use boneli_domain::{
+    Budget, BudgetDimension, CheckStatus, Citation, CommitSha, EvidenceRef, Overrun, RunId,
+    TestStatus, TicketSource, Usage,
+};
+use boneli_forge_github::render::{
+    self, MAX_BODY, MAX_FIXED, MAX_QUESTIONS, MAX_TITLE, check_status_label, commit_message,
+    escape, permalink, pull_request_body, questions_comment, seconds, test_status_label, title,
+    usd, water_fill,
+};
+use support::*;
+
+/// The lines of `markdown` that CommonMark reads as indented code: four
+/// spaces, after a blank line or another code line (an indented line
+/// after a paragraph line continues the paragraph). Returns, per line,
+/// whether it is code.
+fn code_lines(markdown: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut previous_blank = true;
+    let mut in_code = false;
+    for line in markdown.split('\n') {
+        let blank = line.trim().is_empty();
+        let code = line.starts_with("    ") && !blank && (previous_blank || in_code);
+        if code {
+            in_code = true;
+        } else if !blank {
+            in_code = false;
+        }
+        out.push((code, line));
+        previous_blank = blank;
+    }
+    out
+}
+
+/// Text that must never be live outside a code block.
+const HOSTILE: [&str; 14] = [
+    "```",
+    "~~~",
+    "</pre>",
+    "<img src=x onerror=alert(1)>",
+    "@user",
+    "@org/team",
+    "#1",
+    "Closes #1",
+    "owner/repo#1",
+    "<!--",
+    "[x](javascript:alert(1))",
+    "- [ ] task",
+    "> quote",
+    "| a | b |",
+];
+
+fn hostile_text() -> String {
+    let mut text = String::new();
+    for token in HOSTILE {
+        text.push_str(token);
+        text.push('\n');
+        text.push_str(&format!("prefix {token} suffix\n"));
+    }
+    text.push_str("lone\rcarriage return\r\nCRLF\u{2028}ls\u{2029}ps\u{202e}rlo\u{200b}zwsp\u{0}nul\u{1b}[31mesc\n");
+    text.push_str("\n\n    indented\n\ttab\n");
+    text
+}
+
+/// Every hostile token appears only on code lines, no list or block quote
+/// is opened outside code, and no raw control or invisible character is
+/// left anywhere.
+fn assert_inert(markdown: &str) {
+    for (code, line) in code_lines(markdown) {
+        if code || line.trim().is_empty() {
+            continue;
+        }
+        for token in HOSTILE {
+            assert!(!line.contains(token), "{token:?} outside code: {line:?}");
+        }
+        for marker in ["- ", "* ", "+ ", "> ", "1. ", "<"] {
+            assert!(!line.starts_with(marker), "{line:?}");
+        }
+        assert!(!line.starts_with(' '), "{line:?}");
+        // The reader's note names `@` and `#` in inline code; outside code
+        // only the generated `Fixes #N` line references anything.
+        assert!(line == "Fixes #7" || !has_reference(line), "{line:?}");
+    }
+    for c in markdown.chars() {
+        assert!(
+            c == '\n'
+                || c == '\t'
+                || !(c.is_control()
+                    || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202e}' | '\u{200b}')),
+            "raw {c:?} in the output"
+        );
+    }
+}
+
+fn hostile_request() -> boneli_app::PullRequest {
+    let mut request = request();
+    request.analysis.content = hostile_text().into_bytes();
+    request.test.content = hostile_text().into_bytes();
+    let base = request.base.clone();
+    request.citations.push(Citation {
+        path: "src/a b#c?.rs".to_owned(),
+        line: 9,
+        sha: base,
+        quote: hostile_text(),
+    });
+    request.ticket.title = "Closes #1 @user\n<b>x</b>".to_owned();
+    request
+}
+
+#[test]
+fn hostile_text_stays_in_code_blocks() {
+    let body = pull_request_body(&hostile_request(), &repository());
+    assert!(body.cut.is_empty());
+    assert_inert(&body.text);
+    // The hostile text is there, as code.
+    let code: Vec<&str> = code_lines(&body.text)
+        .into_iter()
+        .filter(|(c, _)| *c)
+        .map(|(_, l)| l)
+        .collect();
+    for token in HOSTILE {
+        let shown = render::neutralize(token);
+        assert!(code.iter().any(|l| l.contains(&shown)), "{shown}");
+    }
+    let comment = questions_comment(&[hostile_text(), "@user Closes #1".to_owned()]);
+    assert_inert(&comment.text);
+    // Empty agent text: a generated line, not an empty code block.
+    let mut empty = request();
+    empty.analysis.content.clear();
+    empty.test.content.clear();
+    let text = pull_request_body(&empty, &repository()).text;
+    assert_eq!(text.matches("_(empty)_").count(), 2, "{text}");
+    assert_inert(&questions_comment(&[String::new()]).text);
+    // A cut block stays inert too.
+    let mut huge = hostile_request();
+    huge.analysis.content = hostile_text().repeat(2_000).into_bytes();
+    let cut = pull_request_body(&huge, &repository());
+    assert_eq!(cut.cut, [1]);
+    assert_inert(&cut.text);
+}
+
+#[test]
+fn escape_rule() {
+    for (input, expected) in [
+        ("a\rb", "a\\u{000D}b"),
+        ("a\r\nb", "a\\u{000D}\nb"),
+        ("\u{0}", "\\u{0000}"),
+        ("\u{1b}[31m", "\\u{001B}[31m"),
+        ("\u{7f}", "\\u{007F}"),
+        ("\u{85}", "\\u{0085}"),
+        ("\u{2028}\u{2029}", "\\u{2028}\\u{2029}"),
+        ("\u{202e}x", "\\u{202E}x"),
+        ("\u{200b}", "\\u{200B}"),
+        ("\u{feff}", "\\u{FEFF}"),
+        ("\u{ad}", "\\u{00AD}"),
+        ("\u{e0041}", "\\u{E0041}"),
+        ("\u{2024}", "\u{2024}"),
+        ("a\tb\nc", "a\tb\nc"),
+        ("\u{17e}\u{3164}", "\u{17e}\\u{3164}"),
+        ("```@x #1", "```@x #1"),
+    ] {
+        assert_eq!(escape(input), expected, "{input:?}");
+    }
+    // The title escapes LF and TAB too.
+    assert_eq!(title("a\nb\tc\rd"), "Fix: a\\u{000A}b\\u{0009}c\\u{000D}d");
+}
+
+#[test]
+fn non_utf8_is_shown_lossily_with_note() {
+    let mut request = request();
+    request.analysis.content = b"bad \xff byte".to_vec();
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(text.contains("_The analysis is not valid UTF-8;"), "{text}");
+    assert!(text.contains("    bad \u{fffd} byte\n"), "{text}");
+    assert!(!text.contains("_The test is not valid UTF-8;"));
+}
+
+#[test]
+fn body_cap_arithmetic() {
+    assert_eq!(
+        water_fill(60_000, &[2_000, 50_000, 30_000]),
+        [2_000, 29_000, 29_000]
+    );
+    assert_eq!(
+        water_fill(60_000, &[20_000, 20_000, 20_001]),
+        [20_000, 20_000, 20_000]
+    );
+    assert_eq!(water_fill(60_000, &[0, 0, 0]), [0, 0, 0]);
+    assert_eq!(water_fill(10, &[100, 100, 100]), [3, 3, 4]);
+    assert_eq!(water_fill(0, &[1]), [0]);
+    let cap = 1_000;
+    for need in [0, 1, cap - 1, cap, cap + 1] {
+        let shares = water_fill(cap, &[need]);
+        assert_eq!(shares, [need.min(cap)], "{need}");
+    }
+    assert_eq!(
+        water_fill(3 * cap, &[cap - 1, cap, cap + 1]),
+        [cap - 1, cap, cap + 1]
+    );
+    assert_eq!(
+        water_fill(3 * cap - 1, &[cap - 1, cap, cap + 1]),
+        [cap - 1, cap, cap]
+    );
+    assert!(water_fill(5, &[]).is_empty());
+
+    // The whole body: exactly 65,536 bytes when the needs fit exactly, and
+    // one byte more cuts exactly one block.
+    let body_for = |k: usize| {
+        let mut request = request();
+        request.analysis.content = vec![b'a'; k];
+        pull_request_body(&request, &repository())
+    };
+    let one = body_for(1).text.len();
+    let k = MAX_BODY - one + 1;
+    let exact = body_for(k);
+    assert_eq!(exact.text.len(), MAX_BODY);
+    assert!(exact.cut.is_empty());
+    let over = body_for(k + 1);
+    assert_eq!(over.cut, [1]);
+    assert!(over.text.len() <= MAX_BODY);
+    assert!(
+        over.text
+            .contains("the full text is the run's evidence `sha256-analysis`")
+    );
+}
+
+#[test]
+fn title_cap_arithmetic() {
+    let t = title(&"a".repeat(251));
+    assert_eq!(t.len(), 256);
+    assert!(!t.ends_with('…'));
+    let t = title(&"a".repeat(252));
+    assert_eq!(t, format!("Fix: {}…", "a".repeat(248)));
+    assert_eq!(t.len(), MAX_TITLE);
+    let t = title(&"\u{20ac}".repeat(85));
+    assert_eq!(t.len(), 254);
+    assert_eq!(t, format!("Fix: {}…", "\u{20ac}".repeat(82)));
+    // Escapes count after they are expanded.
+    let t = title(&"\n".repeat(100));
+    assert!(t.len() <= MAX_TITLE && t.ends_with('…'));
+}
+
+#[test]
+fn fixed_parts_bound() {
+    let mut request = request();
+    let id = "r".repeat(128);
+    request.run = RunId::new(id.clone());
+    request.ticket.source = TicketSource::Jira;
+    request.ticket.key = "K".repeat(64);
+    for attached in [&mut request.diff, &mut request.test, &mut request.analysis] {
+        attached.reference = EvidenceRef::parse(&"e".repeat(128)).expect("ref");
+        attached.content = b"\xff".to_vec();
+    }
+    request.spent = Usage {
+        cost_micro_usd: u64::MAX,
+        duration_ms: u64::MAX,
+    };
+    request.overrun = Some(Overrun {
+        dimension: BudgetDimension::Duration,
+        spent: request.spent,
+        budget: Budget {
+            cost_micro_usd: u64::MAX,
+            duration_ms: u64::MAX,
+        },
+    });
+    let body = pull_request_body(&request, &repository());
+    assert!(body.fixed <= MAX_FIXED, "{}", body.fixed);
+    assert!(body.text.contains(&format!("Run `{id}`")));
+    let comment = questions_comment(&vec!["q".to_owned(); 10_000]);
+    assert!(comment.fixed <= MAX_FIXED, "{}", comment.fixed);
+    assert_eq!(comment.text.matches("### Question").count(), MAX_QUESTIONS);
+    assert!(comment.text.contains("_9936 more questions are not shown"));
+    // Ids outside the safe form are left out, never shown.
+    request.run = RunId::new("r`un @x".to_owned());
+    request.ticket.key = "K-1 @x".to_owned();
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(!text.contains("@x"), "{text}");
+    assert!(text.contains("Ticket: Jira (its key is not shown)"));
+}
+
+#[test]
+fn fixes_line_only_for_github_ticket() {
+    let body = |source, key: &str| {
+        let mut request = request();
+        request.ticket.source = source;
+        request.ticket.key = key.to_owned();
+        pull_request_body(&request, &repository()).text
+    };
+    assert!(body(TicketSource::GitHub, KEY).starts_with("Fixes #7\n\n"));
+    // Case-only difference: the same repository.
+    assert!(body(TicketSource::GitHub, "Octo-Org/DEMO.repo#7").starts_with("Fixes #7\n\n"));
+    for (source, key, line) in [
+        (TicketSource::Jira, "PROJ-12", "Ticket: Jira `PROJ-12`"),
+        (TicketSource::GitLab, "7", "Ticket: GitLab `7`"),
+        (TicketSource::Jira, "GH-12", "Ticket: Jira `GH\u{2011}12`"),
+        (
+            TicketSource::Sentry,
+            "abc.def_1",
+            "Ticket: Sentry `abc.def_1`",
+        ),
+        // A GitHub ticket of another repository: shown, never linked.
+        (
+            TicketSource::GitHub,
+            "octo-org/tracker#12",
+            "Ticket: GitHub `octo-org/tracker\u{ff03}12`",
+        ),
+        (
+            TicketSource::GitHub,
+            "other-org/demo.repo#7",
+            "Ticket: GitHub `other-org/demo.repo\u{ff03}7`",
+        ),
+        (
+            TicketSource::GitHub,
+            "\u{043e}cto-org/demo.repo#7",
+            "Ticket: GitHub (its key is not shown)",
+        ),
+        (
+            TicketSource::GitHub,
+            "7",
+            "Ticket: GitHub (its key is not shown)",
+        ),
+        (
+            TicketSource::GitHub,
+            "octo-org/demo.repo#0123",
+            "Ticket: GitHub (its key is not shown)",
+        ),
+    ] {
+        let text = body(source, key);
+        assert!(text.starts_with(&format!("{line}\n\n")), "{text}");
+        assert!(!text.contains("Fixes"), "{text}");
+        assert!(!has_reference(&text), "{text}");
+    }
+    // The commit message never closes or references anything.
+    let mut ticket = ticket(KEY);
+    let run = RunId::new("run-1".to_owned());
+    assert_eq!(
+        commit_message(&ticket, &run),
+        "boneli: fix for GitHub ticket octo-org/demo.repo\u{ff03}7\n\nRun run-1\n"
+    );
+    ticket.source = TicketSource::Jira;
+    ticket.key = "Closes #1".to_owned();
+    assert_eq!(
+        commit_message(&ticket, &RunId::new("../x".to_owned())),
+        "boneli: fix for a Jira ticket\n"
+    );
+    ticket.key = "GH-1".to_owned();
+    let message = commit_message(&ticket, &RunId::new("GH-2".to_owned()));
+    assert!(!has_reference(&message), "{message}");
+}
+
+/// Whether `text`, read as plain text, holds a GitHub reference or
+/// mention: `#` or `GH-` before a digit, `@` before a name character, or
+/// a github.com issue or pull URL. Permalinks (`.../blob/...#L12`) are not
+/// references.
+fn has_reference(text: &str) -> bool {
+    let b = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    for i in 0..b.len() {
+        let next = b.get(i + 1).copied().unwrap_or(b' ');
+        if b[i] == b'#' && next.is_ascii_digit() {
+            return true;
+        }
+        if b[i] == b'@' && (next.is_ascii_alphanumeric() || next == b'-') {
+            return true;
+        }
+        if lower.as_bytes()[i..].starts_with(b"gh-") && b.get(i + 3).is_some_and(u8::is_ascii_digit)
+        {
+            return true;
+        }
+    }
+    // `github.com/<owner>/<repo>/issues/<digit>` or `/pull/<digit>`.
+    lower.match_indices("github.com/").any(|(at, host)| {
+        let mut segments = lower[at + host.len()..].split('/');
+        let (owner, repo, kind, number) = (
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+            segments.next().unwrap_or(""),
+        );
+        !owner.is_empty()
+            && !repo.is_empty()
+            && matches!(kind, "issues" | "pull")
+            && number.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    })
+}
+
+/// Every closing keyword GitHub reads, in three cases, with and without a
+/// colon, before every reference form.
+fn closing_forms() -> Vec<String> {
+    let references = [
+        "#5",
+        "octo-org/demo.repo#5",
+        "other-org/other-repo#5",
+        "GH-5",
+        "gh-5",
+        "https://github.com/octo-org/demo.repo/issues/5",
+        "https://github.com/octo-org/demo.repo/pull/5",
+        "http://www.GitHub.COM/other-org/other-repo/issues/5",
+        "github.com/octo-org/demo.repo/issues/5",
+        "@user",
+        "@org/team",
+    ];
+    let mut forms = Vec::new();
+    for keyword in [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ] {
+        let title_case = format!("{}{}", keyword[..1].to_ascii_uppercase(), &keyword[1..]);
+        for word in [keyword.to_owned(), keyword.to_ascii_uppercase(), title_case] {
+            for colon in ["", ":"] {
+                for reference in references {
+                    forms.push(format!("{word}{colon} {reference}"));
+                }
+            }
+        }
+    }
+    for reference in references {
+        forms.push(reference.to_owned());
+        forms.push(format!("x{reference}y"));
+    }
+    forms
+}
+
+#[test]
+fn references_never_form_in_free_text() {
+    let forms = closing_forms();
+    assert!(
+        forms.iter().all(|f| has_reference(f)),
+        "the detector misses a form"
+    );
+    // The title, one form at a time.
+    for form in &forms {
+        let shown = title(form);
+        assert!(!has_reference(&shown), "{form:?} -> {shown:?}");
+    }
+    // Every form in every free-text place of a body: the analysis, the
+    // test, a citation's path and quote. The generated `Fixes #7` line is
+    // the only reference.
+    let all = forms.join("\n");
+    for place in 0..4 {
+        let mut request = request();
+        match place {
+            0 => request.analysis.content = all.clone().into_bytes(),
+            1 => request.test.content = all.clone().into_bytes(),
+            2 => request.citations[0].quote = all.clone(),
+            _ => {
+                request.citations[0].path =
+                    "docs/#5 @user GH-5 github.com/o/r/issues/5.md".to_owned()
+            }
+        }
+        let body = pull_request_body(&request, &repository());
+        assert!(body.cut.is_empty(), "place {place}: the forms fit uncut");
+        let rest = body
+            .text
+            .strip_prefix("Fixes #7\n")
+            .expect("the Fixes line");
+        assert!(
+            !has_reference(rest),
+            "place {place}: a reference formed in the body"
+        );
+    }
+    let comment = questions_comment(&[all.clone(), "Closes #5 @user".to_owned()]);
+    assert!(
+        !has_reference(&comment.text),
+        "a reference formed in the comment"
+    );
+    assert!(!has_reference(&title(&all)));
+    // Neutralized, still readable.
+    assert_eq!(
+        render::neutralize("Closes #5, see https://GitHub.com/o/r/issues/5 and GH-5 @user"),
+        "Closes \u{ff03}5, see https://GitHub\u{2024}com/o/r/issues/5 and GH\u{2011}5 \u{ff20}user"
+    );
+    assert_eq!(
+        render::neutralize("sigh-x github-com no.github"),
+        "sigh-x github-com no.github"
+    );
+}
+
+#[test]
+fn citation_permalinks() {
+    let repo = repository();
+    let base = BASE;
+    for (path, encoded) in [
+        ("src/a b#c?.rs", "src/a%20b%23c%3F.rs"),
+        ("src/\u{17e}.rs", "src/%C5%BE.rs"),
+        ("a/(x)[y]<z>.rs", "a/%28x%29%5By%5D%3Cz%3E.rs"),
+        ("a-b_c.d~e/f", "a-b_c.d~e/f"),
+        ("%41", "%2541"),
+        ("docs/GH-5/github.com/x", "docs/GH%2D5/github%2Ecom/x"),
+        ("gh-x/github-com", "gh-x/github-com"),
+    ] {
+        let link = permalink(&repo, base, path, 12);
+        assert_eq!(
+            link,
+            format!("https://github.com/octo-org/demo.repo/blob/{base}/{encoded}#L12")
+        );
+        // Decoding gives the path back.
+        let mut bytes = Vec::new();
+        let raw = encoded.as_bytes();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' {
+                let hex = std::str::from_utf8(&raw[i + 1..i + 3]).expect("hex");
+                bytes.push(u8::from_str_radix(hex, 16).expect("hex"));
+                i += 3;
+            } else {
+                bytes.push(raw[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(bytes, path.as_bytes());
+    }
+    let text = pull_request_body(&request(), &repo).text;
+    assert!(text.contains(&format!(
+        "[Citation 1 of 2](https://github.com/octo-org/demo.repo/blob/{BASE}/src/parse.rs#L12)\n\n    src/parse.rs:12\n    let first = input[0];\n"
+    )), "{text}");
+    // A path too long for a link still shows, as code.
+    let mut long = request();
+    long.citations[0].path = format!("src/{}", " ".repeat(400));
+    let text = pull_request_body(&long, &repo).text;
+    assert!(text.contains("Citation 1 of 2 (its path is too long for a link)"));
+    let _ = CommitSha::parse(BASE).expect("sha");
+}
+
+#[test]
+fn every_status_has_a_distinct_label() {
+    let tests = [
+        TestStatus::Passed,
+        TestStatus::FailedOnAssertion,
+        TestStatus::FailedToBuild,
+        TestStatus::Errored,
+        TestStatus::TimedOut,
+        TestStatus::Unknown,
+    ];
+    let checks = [
+        CheckStatus::Passed,
+        CheckStatus::Failed,
+        CheckStatus::NotConfigured,
+        CheckStatus::Unknown,
+    ];
+    let mut labels: Vec<&str> = tests.iter().map(|s| test_status_label(*s)).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), tests.len());
+    let mut labels: Vec<&str> = checks.iter().map(|s| check_status_label(*s)).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), checks.len());
+    let mut request = request();
+    request.checks.reproduction_test = TestStatus::TimedOut;
+    request.checks.lint = CheckStatus::Failed;
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(text.contains("| Reproduction test | fails on an assertion | times out |"));
+    assert!(text.contains("| Lint | not run | failed |"));
+}
+
+#[test]
+fn cost_and_overrun_render_exactly() {
+    for (micro, shown) in [
+        (0, "$0.000000"),
+        (1, "$0.000001"),
+        (1_234_567, "$1.234567"),
+        (u64::MAX, "$18446744073709.551615"),
+    ] {
+        assert_eq!(usd(micro), shown);
+    }
+    assert_eq!(seconds(3_723_456), "3723.456 s");
+    assert_eq!(seconds(0), "0.000 s");
+    assert_eq!(seconds(1), "0.001 s");
+    let mut request = request();
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(text.contains("The run cost $1.234567 and took 3723.456 s of job time."));
+    assert!(!text.contains("Over budget"));
+    request.overrun = Some(Overrun {
+        dimension: BudgetDimension::Cost,
+        spent: Usage {
+            cost_micro_usd: 1_500_000,
+            duration_ms: 10,
+        },
+        budget: Budget {
+            cost_micro_usd: 1_000_000,
+            duration_ms: 60_000,
+        },
+    });
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(text.contains(
+        "**Over budget.** The verify job took the run past its cost limit: it used $1.500000 against a limit of $1.000000."
+    ), "{text}");
+    request.overrun = Some(Overrun {
+        dimension: BudgetDimension::Duration,
+        spent: Usage {
+            cost_micro_usd: 1,
+            duration_ms: 61_001,
+        },
+        budget: Budget {
+            cost_micro_usd: 10,
+            duration_ms: 60_000,
+        },
+    });
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(
+        text.contains("past its job time limit: it used 61.001 s against a limit of 60.000 s."),
+        "{text}"
+    );
+}
+
+#[test]
+fn saturated_overrun_says_at_least() {
+    let mut request = request();
+    request.spent = Usage {
+        cost_micro_usd: u64::MAX,
+        duration_ms: 5,
+    };
+    request.overrun = Some(Overrun {
+        dimension: BudgetDimension::Cost,
+        spent: request.spent,
+        budget: Budget {
+            cost_micro_usd: u64::MAX,
+            duration_ms: 10,
+        },
+    });
+    let text = pull_request_body(&request, &repository()).text;
+    assert!(text.contains("The run cost at least $18446744073709.551615 and took 0.005 s"));
+    assert!(
+        text.contains(
+            "it used at least $18446744073709.551615 against a limit of $18446744073709.551615."
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn questions_comment_caps_at_65536_bytes() {
+    let one = questions_comment(&["x".repeat(100_000)]);
+    assert!(one.text.len() <= MAX_BODY);
+    assert_eq!(one.cut, [0]);
+    assert!(
+        one.text
+            .ends_with("_Cut here to fit GitHub's limit of 65,536 bytes._\n\n")
+    );
+    let many = questions_comment(&vec!["y".repeat(5_000); 20]);
+    assert!(many.text.len() <= MAX_BODY);
+    assert_eq!(many.cut.len(), 20);
+    let small = questions_comment(&["short".to_owned(), "z".repeat(100_000)]);
+    assert_eq!(small.cut, [1]);
+    assert!(small.text.contains("\n    short\n"));
+    assert!(small.text.len() <= MAX_BODY);
+    // A comment with CRLF text has no raw CR.
+    assert!(
+        !questions_comment(&["a\r\nb".to_owned()])
+            .text
+            .contains('\r')
+    );
+    let _ = render::MAX_LINK;
+}
+
+#[test]
+fn reader_note_lists_every_substitution() {
+    use std::collections::BTreeSet;
+    let note = render::substitutions_note();
+    for s in render::SUBSTITUTIONS {
+        let shown = render::neutralize(s.sample);
+        assert!(shown.contains(s.replacement), "{s:?}: {shown:?}");
+        assert!(!shown.contains(s.original), "{s:?}: {shown:?}");
+        let entry = format!(
+            "`{}`{} as `{}` (U+{:04X})",
+            s.original,
+            s.context,
+            s.replacement,
+            u32::from(s.replacement)
+        );
+        assert!(note.contains(&entry), "the note misses {entry}: {note}");
+    }
+    // Every character `neutralize` can introduce is in the table: run it
+    // over all printable ASCII and every trigger, and collect what is new.
+    let mut input: String = (0x20u8..=0x7e).map(char::from).collect();
+    input.push_str(" github.com GITHUB.COM GitHub.Com gh-1 GH-9 #1 @a ");
+    for s in render::SUBSTITUTIONS {
+        input.push_str(s.sample);
+        input.push(' ');
+    }
+    let introduced: BTreeSet<char> = render::neutralize(&input)
+        .chars()
+        .filter(|c| !input.contains(*c))
+        .collect();
+    let listed: BTreeSet<char> = render::SUBSTITUTIONS
+        .iter()
+        .map(|s| s.replacement)
+        .collect();
+    assert_eq!(introduced, listed);
+    // Every body and comment carries the note, and it forms no reference.
+    let body = pull_request_body(&request(), &repository()).text;
+    assert!(body.contains(&note), "{body}");
+    assert!(questions_comment(&["q".to_owned()]).text.contains(&note));
+    assert!(!has_reference(&note), "{note}");
+    assert!(note.contains("`\\u{XXXX}` escapes"), "{note}");
+}

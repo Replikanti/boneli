@@ -22,7 +22,8 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `boneli-http`, `boneli-https`, ...) stay generic; composition roots
    (`boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`,
    `boneli-cli`) wire adapters and nothing depends on them. The test-only
-   root `boneli-replay-check` (ADR-002) is a leaf too.
+   roots `boneli-replay-check` (ADR-002) and `boneli-acceptance` (live
+   tests, ADR-014 D12) are leaves too.
    `tools/check-architecture.sh` enforces it.
 2. **Core purity** (domain, app): no external dependencies, no wall clock,
    filesystem, network, environment, threads, processes, async or
@@ -226,6 +227,19 @@ if [ "${ENABLE_LINGER:-0}" = 1 ]; then
 fi
 ```
 <!-- host-setup:end -->
+
+### Live test (boneli-forge-github)
+
+`boneli-acceptance`'s `tests/github.rs` runs the real git adapter and the
+GitHub forge against the operator's GitHub App and private test
+repository (ADR-014, D12). It is `#[ignore = "network: ..."]`, runs by
+hand before a change to `boneli-forge-github` or to the git push and
+credential path merges, and fails, naming the variable, when one of the
+`BONELI_GITHUB_*` variables is missing. Setup: `docs/forge-github.md`.
+
+```sh
+cargo test -p boneli-acceptance --test github -- --ignored --nocapture
+```
 
 ## Conventions
 

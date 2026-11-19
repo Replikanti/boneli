@@ -454,6 +454,27 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bits, at most 16,384 bytes of input, wiped after parsing, no key
   material in `Debug` or errors), checked against an OpenSSL signature; and `fill_random`, the
   provider's system random source. Test-only keys in `tests/data/`.
+- `boneli-forge-github`, part 3 of #19 (ADR-014 D5 to D12; ADR-014
+  accepted after the live test): the `Forge` port over the GitHub REST
+  API as a GitHub App. The App key is read once
+  from a private file (absolute, regular, not a symlink, owned by the
+  process's uid, mode `0600` or `0400`); an RS256 JWT is exchanged for an
+  installation token scoped to one repository with exactly `contents`,
+  `issues` and `pull_requests` write, checked and cached while more than
+  600 s of it remain, at most an hour, refreshed once on a `401`.
+  `open_pull_request` pushes the fix to a new `boneli/<run>-<nonce>`
+  branch through the `Git` port and opens the pull request ready for
+  review, with `Fixes #N` for a GitHub ticket `owner/name#N` of the
+  configured repository; an ambiguous creation is looked up once by its
+  branch. Agent and reporter text appears only in indented code blocks
+  with control and invisible characters escaped, and in the title, the
+  body and the commit message it can form no issue reference or mention
+  (`#` and `@` shown fullwidth, `github.com` and `GH-N` broken);
+  bodies and comments are capped at 65,536 bytes, titles at 256. Five
+  endpoints, GET or POST only; responses parsed under limits; failures
+  cost nothing and never carry a body, token, JWT or key bytes.
+- `boneli-acceptance`: a test-only composition root for live tests, with
+  the gated GitHub test (`docs/forge-github.md`, the operator guide).
 
 ### Changed
 
