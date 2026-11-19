@@ -3,7 +3,9 @@
 //!
 //! The binary prints a probe line with a heap and a code address, then the
 //! pretty `Debug` output of every domain scenario folded through
-//! [`boneli_domain::scenarios::fold`], then of every app scenario played
+//! [`boneli_domain::scenarios::fold`], then the verdict of every case of
+//! the patch corpus ([`render_patch_cases`], ADR-013), then of every app
+//! scenario played
 //! through `DebugTicket` on in-memory adapters ([`app`]), then the
 //! `Display` and `Debug` of every `boneli-app` error variant, then the
 //! violation every contract mutant produces ([`mutants`]). The domain and
@@ -25,9 +27,11 @@ use std::fmt::Write as _;
 pub mod app;
 pub mod mutants;
 
+use boneli_domain::patch_corpus::PatchCase;
 use boneli_domain::scenarios::{Scenario, all, fold};
 use boneli_domain::{
-    Budget, CommitSha, DomainError, EvidenceRef, Run, RunCommand, RunEvent, RunId,
+    Budget, CommitSha, DomainError, EvidenceRef, Run, RunCommand, RunEvent, RunId, patch_corpus,
+    patch_policy,
 };
 
 /// The first line of the binary's output.
@@ -145,12 +149,28 @@ pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
     "store.rs: impl fmt::Display for StoreError {",
 ];
 
+/// For each case, in the given order: `patch-case <name>` and the pretty
+/// `Debug` of the patch policy's verdict (ADR-013). Every violation is a
+/// derived `Debug` of indices, counts and enum values, so the policy adds
+/// no hand-written formatting impl.
+pub fn render_patch_cases(cases: &[PatchCase]) -> String {
+    let mut out = String::new();
+    for case in cases {
+        let verdict = patch_policy(&case.patch, &case.limits);
+        // Writing to a String cannot fail.
+        let _ = write!(out, "patch-case {}\n{verdict:#?}\n", case.name);
+    }
+    out
+}
+
 /// The domain section ([`render_scenarios`] over the whole corpus, in
-/// [`all`] order), then the app section ([`app::render_app`] over
+/// [`all`] order, then [`render_patch_cases`] over
+/// [`patch_corpus::cases`]), then the app section ([`app::render_app`] over
 /// [`app::scenarios`]), then [`app::render_app_errors`], then the
 /// violation of every contract mutant ([`mutants::render_violations`]).
 pub fn render() -> Result<String, DomainError> {
     let mut out = render_scenarios(&all())?;
+    out.push_str(&render_patch_cases(&patch_corpus::cases()));
     out.push_str(&app::render_app(&app::scenarios()));
     out.push_str(&app::render_app_errors());
     out.push_str(&mutants::render_violations());

@@ -3,6 +3,7 @@
 
 use std::process::Command;
 
+use boneli_domain::patch_corpus::cases;
 use boneli_domain::scenarios::all;
 use boneli_replay_check::{
     Probe, RENDERED_APP_FMT_IMPLS, RENDERED_FMT_IMPLS, app, first_difference, mutants, parse_probe,
@@ -52,6 +53,16 @@ fn two_processes_produce_identical_debug_output() {
         .collect();
     let names: Vec<&str> = all().iter().map(|s| s.name).collect();
     assert_eq!(headers, names, "the harness skipped or reordered scenarios");
+    let patch_headers: Vec<&str> = out_a
+        .lines()
+        .filter_map(|line| line.strip_prefix("patch-case "))
+        .collect();
+    let patch_cases = cases();
+    let patch_names: Vec<&str> = patch_cases.iter().map(|c| c.name).collect();
+    assert_eq!(
+        patch_headers, patch_names,
+        "the harness skipped or reordered patch cases"
+    );
     let app_headers: Vec<&str> = out_a
         .lines()
         .filter_map(|line| line.strip_prefix("app-scenario "))

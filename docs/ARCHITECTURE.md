@@ -117,7 +117,7 @@ The line is a state machine. Every step is a job in a sandbox and every gate is 
 
 The states, events, commands and terminal outcomes of the run, the budget units and the gate rules are fixed in ADR-002. A run whose verify job crossed the budget still opens the pull request and states the overrun; the forge adapter renders the pull request and that statement, because the body format depends on the forge (ADR-004). The `DebugTicket` use case executes the run's commands one at a time through the ports (ADR-004). A run that ends with triage questions is followed, once the reporter answers, by a new run that names it as `previous`: that run's triage gets the previous run's questions comment and questions, so it does not start from scratch.
 
-**Patch policy** checks diff size, forbidden paths (CI, Dockerfile, CODEOWNERS), binaries, symlinks pointing outside and disabled tests.
+**Patch policy** checks diff size (25 files, 1,000 changed lines and 42,000 changed bytes by default), forbidden paths (CI configuration, container builds and compose files, CODEOWNERS, `.gitattributes` and `.gitmodules`, dependency manifests and lockfiles, repository metadata), gitlinks, binaries and bidi controls, symlinks that point outside, through another link or to a directory above a forbidden path, edits behind a link that sits at a forbidden path, and disabled tests (JS/TS markers, deleted or emptied test files, test runner configuration). It is a pure domain function over the full before and after entries of every changed path, decided in ADR-013; the dynamic "previously green" check of the fix gate backstops its lexical test rules.
 
 **Customer standards** (a hypothesis to validate in customer interviews):
 

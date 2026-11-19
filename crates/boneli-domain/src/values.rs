@@ -167,7 +167,8 @@ const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
     (0xE0000, 0xE0FFF),
 ];
 
-fn is_default_ignorable(c: char) -> bool {
+/// Whether `c` is a Unicode `Default_Ignorable_Code_Point`.
+pub(crate) fn is_default_ignorable(c: char) -> bool {
     let code = u32::from(c);
     DEFAULT_IGNORABLE
         .iter()
