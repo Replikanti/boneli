@@ -3,9 +3,11 @@
 //! sandbox is killed, reading the sandbox's own `memory.stat`; none for a
 //! parent.
 //!
-//! Every test takes `support::exclusive()` and counts this process's
-//! `memcg-keeper` threads and descriptors as a difference, so no other
-//! test's sandbox is counted.
+//! Every test takes `support::exclusive()` and follows its own cgroups'
+//! keepers through the descriptor each holds on its sandbox's
+//! `memory.stat` for exactly its thread's life: other tests create
+//! cgroups, and with them keepers, at any time, so threads are counted
+//! only in the unit tests, which run alone.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -22,17 +24,6 @@ use crate::support::{self, dev_null, ids, report, wait_bounded};
 /// How long a test waits for something the keeper does every period or
 /// once at its stop: 1 s, 200 periods of 5 ms.
 const KEEPER_WAIT: Duration = Duration::from_secs(1);
-
-/// The keeper threads of this process.
-fn keepers() -> usize {
-    std::fs::read_dir("/proc/self/task")
-        .expect("read /proc/self/task")
-        .flatten()
-        .filter(|t| {
-            std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim() == "memcg-keeper")
-        })
-        .count()
-}
 
 /// Waits up to [`KEEPER_WAIT`] for `done`.
 fn within(mut done: impl FnMut() -> bool) -> bool {
@@ -90,29 +81,40 @@ fn keeper_reads_its_own_sandbox() {
 #[test]
 #[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids)"]
 fn keeper_runs_while_cgroup_lives() {
+    // Other tests create cgroups (and with them keepers) at any time, so
+    // threads are not counted here (the unit tests count them, alone).
+    // A keeper holds its sandbox's memory.stat from its start to the end
+    // of its thread, and its reads grow only while it runs, so those are
+    // followed per cgroup.
     let _alone = support::exclusive();
-    let before = keepers();
+    let parent_stat = cgroup::parent().path().join("memory.stat");
+    let parent_before = descriptors_of(&parent_stat);
     let parent = Parent::open(cgroup::parent().path()).expect("open the harness's parent");
-    assert_eq!(keepers(), before, "Parent::open started a keeper");
-    let a = cgroup::sandbox("keeper-life");
-    // A new thread takes its name a moment after the spawn returns.
-    assert!(
-        within(|| keepers() == before + 1),
-        "create starts one keeper"
+    assert_eq!(
+        descriptors_of(&parent_stat),
+        parent_before,
+        "Parent::open started a keeper"
     );
+    let a = cgroup::sandbox("keeper-life");
     let b = Cgroup::create(
         &parent,
         &cgroup::unique_name("keeper-life"),
         &cgroup::default_limits(),
     )
     .expect("create");
-    assert!(within(|| keepers() == before + 2), "one keeper per cgroup");
+    let a_stat = a.path().join("memory.stat");
+    let b_stat = b.path().join("memory.stat");
+    assert_eq!(descriptors_of(&a_stat), 1, "create starts one keeper");
+    assert_eq!(descriptors_of(&b_stat), 1, "one keeper per cgroup");
     let first = a.stats_keeper();
     assert!(first.reads >= 1, "the first read is synchronous: {first:?}");
+    let b_first = b.stats_keeper();
     assert!(
-        within(|| a.stats_keeper().reads >= first.reads + 2),
-        "the keeper did not read twice within {KEEPER_WAIT:?}: {:?}",
-        a.stats_keeper()
+        within(|| a.stats_keeper().reads >= first.reads + 2
+            && b.stats_keeper().reads >= b_first.reads + 2),
+        "a keeper did not read twice within {KEEPER_WAIT:?}: {:?} {:?}",
+        a.stats_keeper(),
+        b.stats_keeper()
     );
     let r = a.stats_keeper();
     assert_eq!(r.failed, None, "{r:?}");
@@ -120,14 +122,11 @@ fn keeper_runs_while_cgroup_lives() {
         "keeper_runs_while_cgroup_lives: period {STATS_KEEPER_PERIOD:?}, {r:?}"
     ));
     a.destroy().expect("destroy");
-    assert!(
-        within(|| keepers() == before + 1),
-        "the keeper outlived destroy"
-    );
-    let at_drop = b.stats_keeper();
-    assert!(at_drop.reads >= 1, "{at_drop:?}");
+    // Joined in destroy: its descriptor is closed when destroy returns.
+    assert_eq!(descriptors_of(&a_stat), 0, "the keeper outlived destroy");
+    assert_eq!(descriptors_of(&b_stat), 1, "destroy stopped another keeper");
     drop(b);
-    assert!(within(|| keepers() == before), "the keeper outlived a drop");
+    assert_eq!(descriptors_of(&b_stat), 0, "the keeper outlived a drop");
     drop(parent);
 }
 
