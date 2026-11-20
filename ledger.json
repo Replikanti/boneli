@@ -10,11 +10,11 @@
    "title": "Release workflow and versioning",
    "epic": null,
    "order": 33,
-   "state": "pr-review",
-   "owner": "7e33749a",
+   "state": "done",
+   "owner": null,
    "pr": 83,
    "note": "PR #83 open",
-   "updated_at": "2026-11-20T13:54:16+00:00",
+   "updated_at": "2026-11-20T15:06:39+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -25,8 +25,8 @@
     "ci"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df"
+   "user": null,
+   "machine": null
   },
   {
    "issue": 21,
@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "plan-review",
+   "state": "pr-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR 2 (#78 draft, bdf3e59): fix in place (per-sandbox keeper 5 ms), stopped on R-S6: parent-read mutant 0/70 kills; operator decides proof",
-   "updated_at": "2026-11-20T15:02:35+00:00",
+   "note": "PR #78 open",
+   "updated_at": "2026-11-20T15:06:41+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,22 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T18:31:00+00:00",
-   "issue": 19,
-   "from": "pr-review",
-   "to": "done",
-   "by": "cbec3aa3",
-   "note": "3 PRs merged: #71 cb3d3f0, #72 25b0800, #73 0e29ca7; ADR-014 accepted after live test 2026-11-19; live-test App boneli-forge-test + private repo Replikanti/boneli-forge-test, env in ~/.config/boneli/forge-test.env"
-  },
-  {
-   "at": "2026-11-19T18:38:08+00:00",
-   "issue": 35,
-   "from": "ready",
-   "to": "claimed",
-   "by": "9db267e1",
-   "note": ""
-  },
   {
    "at": "2026-11-19T19:03:59+00:00",
    "issue": 35,
@@ -1496,6 +1480,22 @@
    "to": "plan-review",
    "by": "98fa59e8",
    "note": "PR 2 (#78 draft, bdf3e59): fix in place (per-sandbox keeper 5 ms), stopped on R-S6: parent-read mutant 0/70 kills; operator decides proof"
+  },
+  {
+   "at": "2026-11-20T15:06:39+00:00",
+   "issue": 22,
+   "from": "pr-review",
+   "to": "done",
+   "by": "7e33749a",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T15:06:41+00:00",
+   "issue": 54,
+   "from": "plan-review",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #78 open"
   }
  ],
  "open": [
@@ -1511,7 +1511,6 @@
   17,
   20,
   21,
-  22,
   23,
   24,
   25,
@@ -1533,7 +1532,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:02:35+00:00",
+ "updated_at": "2026-11-20T15:06:41+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
