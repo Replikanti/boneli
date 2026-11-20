@@ -273,7 +273,8 @@ enum Verdict {
 
 /// What one distribution point gave.
 enum Outcome {
-    Settled(RevocationStatus),
+    /// Not revoked, by this list.
+    Settled(RevocationStatus, Arc<WebPkiServerVerifier>),
     Failed(CrlFailure),
 }
 
@@ -373,38 +374,84 @@ impl Revocation {
             secs: now.as_secs(),
             deadline,
         };
+        let urls: Vec<&CrlUrl> = candidates
+            .iter()
+            .filter_map(|c| match c {
+                Candidate::Fetch(url) => Some(url),
+                _ => None,
+            })
+            .collect();
         let mut failures = Vec::new();
-        for candidate in candidates {
+        for candidate in &candidates {
             let url = match candidate {
                 Candidate::Fetch(url) => url,
                 Candidate::Bad(why) => {
                     failures.push(CrlFailure::new(
                         None,
                         CrlFailureKind::BadDistributionPoint,
-                        why,
+                        *why,
                     ));
                     continue;
                 }
                 Candidate::Skip => continue,
             };
-            match self.check_url(&url, &leaf)? {
-                Outcome::Settled(status) => return Ok(status),
+            match self.check_url(url, &leaf)? {
+                Outcome::Settled(status, used) => {
+                    self.cached_revocation(&urls, &used, &leaf)?;
+                    return Ok(status);
+                }
                 Outcome::Failed(failure) => failures.push(failure),
             }
         }
         Err(Error::RevocationUnknown(failures))
     }
 
+    /// A revocation the cache holds for any of the leaf's points wins over
+    /// the list that just passed it (ADR-017, item 8): every cached list
+    /// of those points still before its `nextUpdate`, fresh or stale, is
+    /// consulted, so neither an older list from a mirror nor a list with
+    /// the same `thisUpdate` can undo a revocation already seen.
+    fn cached_revocation(
+        &self,
+        urls: &[&CrlUrl],
+        used: &Arc<WebPkiServerVerifier>,
+        leaf: &Leaf<'_>,
+    ) -> crate::Result<()> {
+        let Mode::On { cache, .. } = &self.mode else {
+            return Ok(());
+        };
+        // Collected under the lock, verified outside it.
+        let cached: Vec<(&CrlUrl, Arc<WebPkiServerVerifier>)> = {
+            let cache = lock(cache);
+            urls.iter()
+                .filter_map(|url| cache.peek(url.as_str(), leaf.secs).map(|v| (*url, v)))
+                .collect()
+        };
+        for (url, verifier) in cached {
+            if Arc::ptr_eq(&verifier, used) {
+                continue;
+            }
+            if let Verdict::Revoked = verify(&verifier, leaf) {
+                return Err(revoked(url));
+            }
+        }
+        Ok(())
+    }
+
     /// One distribution point: the cache, then a fetch where it says so
     /// (ADR-017, items 4 and 8). `Revoked` is an error at once.
     fn check_url(&self, url: &CrlUrl, leaf: &Leaf<'_>) -> crate::Result<Outcome> {
         let Mode::On { cache, .. } = &self.mode else {
-            return Ok(Outcome::Settled(RevocationStatus::NoDistributionPoint));
+            return Ok(Outcome::Failed(CrlFailure::new(
+                Some(url),
+                CrlFailureKind::NotSettled,
+                "no revocation check",
+            )));
         };
         let lookup = lock(cache).lookup(url.as_str(), leaf.secs);
         match lookup {
-            Lookup::Fresh(verifier) => decide(url, &verifier, leaf, false),
-            Lookup::Stale(verifier) => decide(url, &verifier, leaf, true),
+            Lookup::Fresh(verifier) => decide(url, verifier, leaf, false),
+            Lookup::Stale(verifier) => decide(url, verifier, leaf, true),
             Lookup::Refresh(verifier, cached_this_update) => {
                 // A refresh succeeds only with a list that passes every
                 // check, settles the leaf and is not older than the cached
@@ -414,19 +461,23 @@ impl Revocation {
                 {
                     match verify(&fetched.verifier, leaf) {
                         Verdict::Good => {
-                            self.store(url, fetched, leaf.secs);
-                            return Ok(Outcome::Settled(RevocationStatus::Checked {
-                                url: url.as_str().to_owned(),
-                            }));
+                            let used = Arc::clone(&fetched.verifier);
+                            self.store(url, fetched, leaf.secs, false);
+                            return Ok(Outcome::Settled(
+                                RevocationStatus::Checked {
+                                    url: url.as_str().to_owned(),
+                                },
+                                used,
+                            ));
                         }
                         Verdict::Revoked => {
-                            self.store(url, fetched, leaf.secs);
+                            self.store(url, fetched, leaf.secs, true);
                             return Err(revoked(url));
                         }
                         Verdict::Expired(_) | Verdict::NotSettled(_) => {}
                     }
                 }
-                decide(url, &verifier, leaf, true)
+                decide(url, verifier, leaf, true)
             }
             Lookup::Missing => {
                 let fetched = match self.fetch(url, leaf) {
@@ -435,13 +486,17 @@ impl Revocation {
                 };
                 match verify(&fetched.verifier, leaf) {
                     Verdict::Good => {
-                        self.store(url, fetched, leaf.secs);
-                        Ok(Outcome::Settled(RevocationStatus::Checked {
-                            url: url.as_str().to_owned(),
-                        }))
+                        let used = Arc::clone(&fetched.verifier);
+                        self.store(url, fetched, leaf.secs, false);
+                        Ok(Outcome::Settled(
+                            RevocationStatus::Checked {
+                                url: url.as_str().to_owned(),
+                            },
+                            used,
+                        ))
                     }
                     Verdict::Revoked => {
-                        self.store(url, fetched, leaf.secs);
+                        self.store(url, fetched, leaf.secs, true);
                         Err(revoked(url))
                     }
                     Verdict::Expired(detail) => Ok(Outcome::Failed(CrlFailure::new(
@@ -512,7 +567,8 @@ impl Revocation {
         })
     }
 
-    fn store(&self, url: &CrlUrl, fetched: Fetched, now: u64) {
+    /// Caches a list that settled the leaf; `revokes` when it listed it.
+    fn store(&self, url: &CrlUrl, fetched: Fetched, now: u64, revokes: bool) {
         if let Mode::On { cache, .. } = &self.mode {
             let entry = Entry::new(
                 fetched.verifier,
@@ -521,7 +577,7 @@ impl Revocation {
                 fetched.der_len,
                 now,
             );
-            lock(cache).insert(url.as_str(), entry, now);
+            lock(cache).insert(url.as_str(), entry, now, revokes);
         }
     }
 }
@@ -548,18 +604,20 @@ fn validity_failure(
 /// A cached list's answer; `stale` when it is past its maximum age.
 fn decide(
     url: &CrlUrl,
-    verifier: &WebPkiServerVerifier,
+    verifier: Arc<WebPkiServerVerifier>,
     leaf: &Leaf<'_>,
     stale: bool,
 ) -> crate::Result<Outcome> {
-    let url_text = url.as_str().to_owned();
-    match verify(verifier, leaf) {
-        Verdict::Good if stale => Ok(Outcome::Settled(RevocationStatus::CheckedStale {
-            url: url_text,
-        })),
-        Verdict::Good => Ok(Outcome::Settled(RevocationStatus::Checked {
-            url: url_text,
-        })),
+    let text = url.as_str().to_owned();
+    match verify(&verifier, leaf) {
+        Verdict::Good if stale => Ok(Outcome::Settled(
+            RevocationStatus::CheckedStale { url: text },
+            verifier,
+        )),
+        Verdict::Good => Ok(Outcome::Settled(
+            RevocationStatus::Checked { url: text },
+            verifier,
+        )),
         Verdict::Revoked => Err(revoked(url)),
         Verdict::Expired(detail) => Ok(Outcome::Failed(CrlFailure::new(
             Some(url),
@@ -1178,5 +1236,66 @@ pub(crate) mod tests {
                 "http://crl.boneli.test/e.crl"
             ]
         );
+    }
+
+    // A CA can sign two different lists with the same `thisUpdate`
+    // (`crl-ca-empty.crl` and `crl-ca-fresh.crl` share their dates; the
+    // fresh one lists 0x01, 0x20, 0x40 and 0x80). A revocation seen in
+    // either must stick (ADR-017, item 8).
+
+    #[test]
+    fn equal_this_update_revoking_list_replaces_cached() {
+        let script = Script::new(vec![ok(EMPTY), ok(FRESH)]);
+        let r = revocation(script.clone());
+        assert_eq!(check(&r, REVOKED, T0).expect("check"), checked());
+        assert_revoked(check(&r, REVOKED, T0 + 86_400));
+        assert_revoked(check(&r, REVOKED, T0 + 86_401));
+        assert_revoked(check(&r, REVOKED, T0 + 172_000));
+        assert_eq!(script.calls(), 2, "the revoking list is cached");
+    }
+
+    #[test]
+    fn equal_this_update_list_cannot_unrevoke_cached() {
+        let script = Script::new(vec![ok(FRESH), ok(EMPTY)]);
+        let r = revocation(script.clone());
+        assert_revoked(check(&r, REVOKED, T0));
+        // The refresh returns a list with the same `thisUpdate` that does
+        // not list the leaf: the cached revocation still decides.
+        assert_revoked(check(&r, REVOKED, T0 + 86_400));
+        assert_revoked(check(&r, REVOKED, T0 + 86_401));
+        assert_eq!(script.calls(), 2);
+    }
+
+    const CRL1: &str = "http://crl1.boneli.test/ca.crl";
+    const CRL2: &str = "http://crl2.boneli.test/ca.crl";
+
+    fn assert_revoked_by(result: crate::Result<RevocationStatus>, url: &str) {
+        match result {
+            Err(Error::Revoked { url: by }) => assert_eq!(by, url),
+            other => panic!("expected Revoked by {url}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mirror_revocation_is_not_undone_by_first_url() {
+        // crl-two-dp.pem (0x40), points crl1 then crl2. The first check
+        // finds crl1 unreachable and crl2's list revoking the leaf; the
+        // next gets an older list without it from crl1.
+        let script = Script::new(vec![unreachable(), ok(FRESH), ok(WEEK1)]);
+        let r = revocation(script.clone());
+        assert_revoked_by(check(&r, TWO_DP, T0 + 3_600), CRL2);
+        assert_revoked_by(check(&r, TWO_DP, T0 + 7_200), CRL2);
+        assert_eq!(script.asked(), [CRL1, CRL2, CRL1]);
+    }
+
+    #[test]
+    fn stale_mirror_revocation_still_wins() {
+        // The revocation sits in crl2's list past its maximum age, while
+        // crl1 serves a list without it: the cached revocation decides.
+        let script = Script::new(vec![unreachable(), ok(FRESH), ok(WEEK1), ok(WEEK1)]);
+        let r = revocation(script.clone());
+        assert_revoked_by(check(&r, TWO_DP, T0 + 3_600), CRL2);
+        assert_revoked_by(check(&r, TWO_DP, T0 + 3_600 + 86_400), CRL2);
+        assert_revoked_by(check(&r, TWO_DP, T0 + 3_600 + 86_401), CRL2);
     }
 }

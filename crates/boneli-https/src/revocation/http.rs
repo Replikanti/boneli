@@ -88,6 +88,9 @@ impl HttpCrlSource {
 impl CrlSource for HttpCrlSource {
     fn fetch(&self, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError> {
         time_left(deadline).map_err(io_error)?;
+        // std's resolver takes no timeout, so the lookup itself is not
+        // bounded by the deadline, as for `TlsDial`'s own host (ADR-017,
+        // known limits); everything after it is.
         let addrs = (url.host(), url.port())
             .to_socket_addrs()
             .map_err(|e| CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")))?;

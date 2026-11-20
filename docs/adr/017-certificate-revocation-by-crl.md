@@ -177,7 +177,11 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
      one all leave the decision to the cached list. `Revoked` returns
      `Error::Revoked { url }` at once; no mirror is asked to overrule it.
      Any other outcome is recorded and the next candidate is tried. The
-     first success returns `RevocationStatus::Checked { url }`, or
+     first success is checked against the cache before it is returned:
+     every list cached for any of the leaf's points and still before its
+     `nextUpdate`, fresh or stale, verifies the leaf too, and a revocation
+     there returns `Error::Revoked` with that list's URL (item 8). Only
+     then does the check return `RevocationStatus::Checked { url }`, or
      `CheckedStale { url }` when a list past its maximum age decided it.
    - No candidate settled the leaf: `Error::RevocationUnknown(failures)`,
      each failure with its URL and kind: unreachable, timeout, non-200,
@@ -207,8 +211,7 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
    write` token, gets no revocation check from this ADR; webpki has no
    OCSP, so checking such leaves needs a request and response codec of
    its own. The follow-up issue for OCSP on such leaves is filed at #38
-   STOP 2: Replikanti/boneli#TBD-OCSP (number added before this ADR
-   merges).
+   STOP 2: Replikanti/boneli#79.
 
 6. **Fetching and bootstrapping.** HTTP/1.1 `GET` through `boneli-http`,
    `Host` only (served without `User-Agent` in every probe), no
@@ -263,7 +266,8 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
      hold a connect longer.
    - `CRL_CHECK_DEADLINE`, one deadline per check shared by all its URLs:
      30 s + 33,554,432 / 1,048,576 s = 62 s, and never past `TlsDial`'s
-     request deadline. The honest worst case at the minimum rate is 30 +
+     request deadline, except the CRL host's name resolution (Known
+     limits). The honest worst case at the minimum rate is 30 +
      10.5 = 40.5 s; measured 0.59 s.
    - `CRL_MAX_HEAD_BYTES` 16,384 B and `CRL_MAX_HEADERS` 64 fields: 15.8
      and 2.8 times the measured 1,036 B and 23 fields. Lower refuses a CDN
@@ -340,12 +344,27 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
    - **Insert rules.** A list already expired when fetched is not cached,
      nor one that does not settle the leaf. Entries at or past their
      `nextUpdate` are dropped first. Among entries before their
-     `nextUpdate` the later `thisUpdate` wins, an equal one keeps the
-     existing verifier and restarts its maximum age, an earlier one changes
+     `nextUpdate` the later `thisUpdate` wins and an earlier one changes
      nothing (Microsoft's mirrors served lists 4 h apart in the same 10 s,
-     so an older list on a refresh happens without an attacker, and a
-     replayed older list cannot undo a revocation the cache holds); an
-     expired entry is always replaced. Least recently used entries go past
+     so an older list on a refresh happens without an attacker). An equal
+     `thisUpdate` keeps the existing verifier and restarts its maximum
+     age, unless the new list revokes the leaf it settled: then the
+     revoking list replaces the entry. A CA may sign two different lists
+     with the same `thisUpdate` (the review of the first implementation
+     found that the equal case had assumed equal contents), and the
+     revoking one is the one that must stick. An expired entry is always
+     replaced.
+   - **A revocation the cache holds is never undone** by an equal or older
+     list, from the same point or from a mirror. Besides the insert rules,
+     before any list's pass is returned the leaf is verified against
+     every cached list of its other points still before its `nextUpdate`
+     (item 4), so a mirror that was unreachable when another point's list
+     revoked the leaf cannot later pass it with an older list. Cost: one
+     more verify per cached mirror list (up to 11.5 ms for the largest
+     measured list), only for leaves with more than one point. Revocation
+     is final for this purpose: a certificate on hold that its CA releases
+     stays refused until the list that held it reaches its `nextUpdate`,
+     unless a newer list from the same point replaces it. Least recently used entries go past
      64 MiB. The mutex is never held while fetching or parsing; a poisoned
      one is recovered and the cache cleared, because the cache only saves
      fetches.
@@ -431,9 +450,9 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
   week.
 - **Known limits**, each with where it closes:
   - Leaves without a point, GitHub's, GHCR's and GitLab's among them, get
-    no check (D2): Replikanti/boneli#TBD-OCSP, filed at #38 STOP 2.
+    no check (D2): Replikanti/boneli#79, filed at #38 STOP 2.
   - Intermediates are not checked (D3):
-    Replikanti/boneli#TBD-INTERMEDIATES, filed at #38 STOP 2.
+    Replikanti/boneli#80, filed at #38 STOP 2.
   - No CRL fetch through a proxy: the `CrlSource` seam, when a customer
     needs it.
   - Staleness: at most about 48 h after the CA records a revocation while
@@ -445,6 +464,11 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
     deadline; if the request deadline passes, that one request fails.
   - Clock skew larger than a list's remaining validity fails closed, as an
     expired certificate already does.
+  - The name resolution of a CRL host is not bounded by the check's or
+    `TlsDial`'s request deadline: std's resolver takes no timeout, so a
+    resolver whose answers are dropped holds the check for its own
+    timeout per URL. It is the same gap `TlsDial` has for its own target,
+    and everything after the lookup is bounded.
   - A cold cache adds one fetch per URL per process; a slow fetch could
     outlast a server's idle timeout on the open TLS connection
     (assumption, not measured: servers wait well over the measured 0.59

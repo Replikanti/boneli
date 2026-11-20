@@ -65,8 +65,9 @@ impl Dial for TlsDial {
                 Ok(tcp) => {
                     let socket = DeadlineSocket::new(tcp, deadline);
                     // The request's deadline bounds the revocation check
-                    // too, so a CRL fetch never outlives the request
-                    // (ADR-017, item 7).
+                    // too, so a CRL fetch never outlives the request,
+                    // except its name resolution, which std cannot bound,
+                    // as for the dial's own host (ADR-017, item 7).
                     return crate::connect_over_until(
                         socket,
                         host,

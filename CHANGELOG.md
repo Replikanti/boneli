@@ -506,7 +506,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   verified again with rustls' `WebPkiServerVerifier`, leaf only. A
   listed leaf fails with `Error::Revoked`, a leaf whose points yield no
   list that settles it with `Error::RevocationUnknown` (fail closed, no
-  opt-out); a leaf without a point passes unchecked.
+  opt-out); a leaf without a point passes unchecked. A revocation the
+  cache holds for any of the leaf's points is never undone by an equal or
+  older list, from the same point or a mirror.
   `TlsStream::revocation` reports what the check found, resumed sessions
   are checked again, `TlsDial` bounds the fetch by its request deadline,
   and `TlsConfig::with_crl_source` takes a `CrlSource` of the caller's.

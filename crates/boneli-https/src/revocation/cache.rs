@@ -113,6 +113,15 @@ impl CrlCache {
         self.clock
     }
 
+    /// The list cached for `url` while `now` is before its `nextUpdate`,
+    /// fresh or stale, without claiming a refresh or counting a use.
+    pub(crate) fn peek(&self, url: &str, now: u64) -> Option<Arc<WebPkiServerVerifier>> {
+        self.entries
+            .get(url)
+            .filter(|e| now < e.next_update)
+            .map(|e| Arc::clone(&e.verifier))
+    }
+
     pub(crate) fn lookup(&mut self, url: &str, now: u64) -> Lookup {
         let tick = self.tick();
         let Some(entry) = self.entries.get_mut(url) else {
@@ -143,10 +152,13 @@ impl CrlCache {
     /// Stores a list that settled a leaf, by the insert rules of ADR-017,
     /// item 8: entries at or past their `nextUpdate` go first; against an
     /// entry still before its `nextUpdate` a later `thisUpdate` replaces
-    /// it, an equal one keeps its verifier and restarts its maximum age,
-    /// an earlier one changes nothing. Least recently used entries go
-    /// until the new one fits under `CRL_CACHE_MAX_BYTES`.
-    pub(crate) fn insert(&mut self, url: &str, mut entry: Entry, now: u64) {
+    /// it, an earlier one changes nothing, and an equal one keeps its
+    /// verifier and restarts its maximum age, unless the new list
+    /// `revokes` the leaf it settled: then it replaces the entry, so that
+    /// a list with the same `thisUpdate` but different contents cannot
+    /// hide a revocation. Least recently used entries go until the new one
+    /// fits under `CRL_CACHE_MAX_BYTES`.
+    pub(crate) fn insert(&mut self, url: &str, mut entry: Entry, now: u64, revokes: bool) {
         let tick = self.tick();
         let mut freed = 0;
         self.entries.retain(|_, e| {
@@ -164,7 +176,7 @@ impl CrlCache {
             if entry.this_update < existing.this_update {
                 return;
             }
-            if entry.this_update == existing.this_update {
+            if entry.this_update == existing.this_update && !revokes {
                 existing.confirmed_at = now;
                 existing.claimed_at = None;
                 existing.last_used = tick;
@@ -239,7 +251,7 @@ mod tests {
     #[test]
     fn fresh_until_next_update_exclusive() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0, WEEK1_END, 10), 1_767_787_200);
+        cache.insert("u", entry(T0, WEEK1_END, 10), 1_767_787_200, false);
         assert_eq!(at(&mut cache, WEEK1_END - 1), "fresh");
         assert_eq!(at(&mut cache, WEEK1_END), "missing");
         assert_eq!(cache.total(), 0, "the expired entry is dropped");
@@ -248,7 +260,7 @@ mod tests {
     #[test]
     fn max_age_and_retry_bounds_exclusive() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0, WEEK1_END, 10), T0);
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0, false);
         assert_eq!(at(&mut cache, T0 + 86_399), "fresh");
         assert_eq!(at(&mut cache, T0 + 86_400), "refresh");
         assert_eq!(at(&mut cache, T0 + 86_400), "stale", "claimed");
@@ -260,10 +272,10 @@ mod tests {
     #[test]
     fn time_arithmetic_saturates() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0, u64::MAX, 10), u64::MAX - 1);
+        cache.insert("u", entry(T0, u64::MAX, 10), u64::MAX - 1, false);
         assert_eq!(at(&mut cache, u64::MAX - 1), "fresh");
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(0, u64::MAX, 10), 0);
+        cache.insert("u", entry(0, u64::MAX, 10), 0, false);
         assert_eq!(at(&mut cache, u64::MAX - 1), "refresh");
         assert_eq!(at(&mut cache, u64::MAX - 1), "stale");
     }
@@ -271,7 +283,7 @@ mod tests {
     #[test]
     fn clock_moved_back_refreshes() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 86_400);
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 86_400, false);
         assert_eq!(
             at(&mut cache, T0),
             "refresh",
@@ -289,10 +301,15 @@ mod tests {
         let mut cache = CrlCache::new();
         let first = entry(T0, WEEK1_END, 10);
         let kept = Arc::clone(&first.verifier);
-        cache.insert("u", first, T0);
+        cache.insert("u", first, T0, false);
         assert_eq!(at(&mut cache, T0 + 86_400), "refresh");
         let other = verifier_for(include_bytes!("../../tests/data/crl-ca-week1.crl"));
-        cache.insert("u", Entry::new(other, T0, WEEK1_END, 10, 0), T0 + 86_400);
+        cache.insert(
+            "u",
+            Entry::new(other, T0, WEEK1_END, 10, 0),
+            T0 + 86_400,
+            false,
+        );
         let e = cache.get("u").expect("entry");
         assert!(Arc::ptr_eq(&e.verifier, &kept));
         assert_eq!((e.confirmed_at, e.claimed_at), (T0 + 86_400, None));
@@ -303,8 +320,13 @@ mod tests {
     #[test]
     fn overlapping_newer_list_replaces() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0, WEEK1_END, 10), T0);
-        cache.insert("u", entry(T0 + 86_400, WEEK1_END + 86_400, 20), T0 + 3);
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0, false);
+        cache.insert(
+            "u",
+            entry(T0 + 86_400, WEEK1_END + 86_400, 20),
+            T0 + 3,
+            false,
+        );
         let e = cache.get("u").expect("entry");
         assert_eq!((e.this_update, e.confirmed_at), (T0 + 86_400, T0 + 3));
         assert_eq!(cache.total(), 20);
@@ -314,9 +336,14 @@ mod tests {
     #[test]
     fn older_list_does_not_replace_fresh() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0 + 86_400, WEEK1_END + 86_400, 20), T0 + 86_400);
+        cache.insert(
+            "u",
+            entry(T0 + 86_400, WEEK1_END + 86_400, 20),
+            T0 + 86_400,
+            false,
+        );
         assert_eq!(at(&mut cache, T0 + 172_800), "refresh");
-        cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 172_801);
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 172_801, false);
         let e = cache.get("u").expect("entry");
         assert_eq!(e.this_update, T0 + 86_400);
         assert_eq!(
@@ -329,25 +356,25 @@ mod tests {
     #[test]
     fn expired_entry_is_replaced_even_by_older_list() {
         let mut cache = CrlCache::new();
-        cache.insert("u", entry(T0 + 86_400, WEEK1_END, 20), T0 + 86_400);
+        cache.insert("u", entry(T0 + 86_400, WEEK1_END, 20), T0 + 86_400, false);
         // At WEEK1_END the cached entry has expired; an older list that is
         // still valid then replaces it.
-        cache.insert("u", entry(T0, WEEK1_END + 1, 10), WEEK1_END);
+        cache.insert("u", entry(T0, WEEK1_END + 1, 10), WEEK1_END, false);
         let e = cache.get("u").expect("entry");
         assert_eq!(e.this_update, T0);
         assert_eq!(cache.total(), 10);
         // A list already expired is never stored.
-        cache.insert("v", entry(T0, WEEK1_END, 10), WEEK1_END);
+        cache.insert("v", entry(T0, WEEK1_END, 10), WEEK1_END, false);
         assert!(cache.get("v").is_none());
     }
 
     #[test]
     fn lru_eviction_over_64_mib() {
         let mut cache = CrlCache::new();
-        cache.insert("first", entry(T0, WEEK1_END, 30 * MIB), T0);
-        cache.insert("second", entry(T0, WEEK1_END, 30 * MIB), T0);
+        cache.insert("first", entry(T0, WEEK1_END, 30 * MIB), T0, false);
+        cache.insert("second", entry(T0, WEEK1_END, 30 * MIB), T0, false);
         assert_eq!(kind(&cache.lookup("first", T0)), "fresh");
-        cache.insert("third", entry(T0, WEEK1_END, 5 * MIB), T0);
+        cache.insert("third", entry(T0, WEEK1_END, 5 * MIB), T0, false);
         assert!(cache.get("first").is_some());
         assert!(cache.get("second").is_none());
         assert!(cache.get("third").is_some());
@@ -357,12 +384,57 @@ mod tests {
     #[test]
     fn single_entry_at_cap_fits() {
         let mut cache = CrlCache::new();
-        cache.insert("a", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0);
-        cache.insert("b", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0);
+        cache.insert("a", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0, false);
+        cache.insert("b", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0, false);
         assert_eq!(cache.total(), CRL_CACHE_MAX_BYTES);
-        cache.insert("c", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0);
+        cache.insert("c", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0, false);
         assert!(cache.get("a").is_none());
         assert!(cache.get("c").is_some());
         assert_eq!(cache.total(), CRL_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn tie_with_revoking_list_replaces() {
+        let mut cache = CrlCache::new();
+        let first = entry(T0, WEEK1_END, 10);
+        let kept = Arc::clone(&first.verifier);
+        cache.insert("u", first, T0, false);
+        let revoking = verifier_for(include_bytes!("../../tests/data/crl-ca-fresh.crl"));
+        cache.insert(
+            "u",
+            Entry::new(Arc::clone(&revoking), T0, WEEK1_END, 30, 0),
+            T0 + 5,
+            true,
+        );
+        let e = cache.get("u").expect("entry");
+        assert!(Arc::ptr_eq(&e.verifier, &revoking));
+        assert!(!Arc::ptr_eq(&e.verifier, &kept));
+        assert_eq!((e.der_len, e.confirmed_at), (30, T0 + 5));
+        assert_eq!(cache.total(), 30);
+        // A later non-revoking list at the same `thisUpdate` keeps it.
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 9, false);
+        let e = cache.get("u").expect("entry");
+        assert!(Arc::ptr_eq(&e.verifier, &revoking));
+        assert_eq!(e.confirmed_at, T0 + 9);
+        // An older revoking list still changes nothing.
+        cache.insert("u", entry(T0 - 1, WEEK1_END, 10), T0 + 10, true);
+        assert!(Arc::ptr_eq(
+            &cache.get("u").expect("entry").verifier,
+            &revoking
+        ));
+    }
+
+    #[test]
+    fn peek_neither_claims_nor_outlives_next_update() {
+        let mut cache = CrlCache::new();
+        cache.insert("u", entry(T0, WEEK1_END, 10), T0, false);
+        assert!(
+            cache.peek("u", T0 + 86_400).is_some(),
+            "stale entries count"
+        );
+        assert_eq!(cache.get("u").expect("entry").claimed_at, None);
+        assert!(cache.peek("u", WEEK1_END - 1).is_some());
+        assert!(cache.peek("u", WEEK1_END).is_none());
+        assert!(cache.peek("v", T0).is_none());
     }
 }
