@@ -28,7 +28,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 21,
@@ -53,7 +54,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 20,
@@ -80,7 +82,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 19,
@@ -108,7 +111,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 18,
@@ -133,7 +137,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 17,
@@ -162,7 +167,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 16,
@@ -189,7 +195,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 15,
@@ -214,7 +221,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 14,
@@ -240,7 +248,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 13,
@@ -270,7 +279,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 12,
@@ -301,7 +311,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 11,
@@ -328,7 +339,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 10,
@@ -354,7 +366,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 9,
@@ -380,7 +393,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 8,
@@ -407,7 +421,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 7,
@@ -434,7 +449,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 6,
@@ -459,7 +475,8 @@
    "user": "ylohnitram",
    "machine": "df82df",
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 5,
@@ -484,7 +501,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 4,
@@ -509,7 +527,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 3,
@@ -534,7 +553,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 2,
@@ -559,7 +579,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 1,
@@ -582,7 +603,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 28,
@@ -607,7 +629,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 33,
@@ -634,7 +657,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 32,
@@ -661,7 +685,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 31,
@@ -688,7 +713,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 30,
@@ -713,7 +739,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 29,
@@ -738,7 +765,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 35,
@@ -765,7 +793,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 34,
@@ -790,7 +819,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 38,
@@ -815,7 +845,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 37,
@@ -840,7 +871,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 45,
@@ -865,7 +897,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 49,
@@ -891,7 +924,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 52,
@@ -914,7 +948,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 54,
@@ -937,7 +972,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 57,
@@ -947,8 +983,8 @@
    "state": "plan-review",
    "owner": "b6fae515",
    "pr": null,
-   "note": "",
-   "updated_at": "2026-11-20T19:11:42+00:00",
+   "note": "parked: one large task too many for its holder's profile; opens again when there is a place",
+   "updated_at": "2026-11-20T21:43:54+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -961,8 +997,9 @@
    "manual": false,
    "user": "ylohnitram",
    "machine": "df82df",
-   "session": true,
-   "dispatched": true
+   "session": false,
+   "dispatched": true,
+   "parked": true
   },
   {
    "issue": 56,
@@ -987,7 +1024,8 @@
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
-   "dispatched": true
+   "dispatched": true,
+   "parked": null
   },
   {
    "issue": 55,
@@ -1012,7 +1050,8 @@
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
-   "dispatched": true
+   "dispatched": true,
+   "parked": null
   },
   {
    "issue": 64,
@@ -1035,7 +1074,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 66,
@@ -1060,7 +1100,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 69,
@@ -1085,7 +1126,8 @@
    "user": null,
    "machine": null,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 68,
@@ -1110,7 +1152,8 @@
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
-   "dispatched": true
+   "dispatched": true,
+   "parked": null
   },
   {
    "issue": 81,
@@ -1135,7 +1178,8 @@
    ],
    "manual": false,
    "session": true,
-   "dispatched": true
+   "dispatched": true,
+   "parked": null
   },
   {
    "issue": 80,
@@ -1160,7 +1204,8 @@
    ],
    "manual": false,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 79,
@@ -1185,7 +1230,8 @@
    ],
    "manual": false,
    "session": null,
-   "dispatched": null
+   "dispatched": null,
+   "parked": null
   },
   {
    "issue": 85,
@@ -1210,18 +1256,11 @@
    ],
    "manual": false,
    "session": true,
-   "dispatched": true
+   "dispatched": true,
+   "parked": null
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:27:24+00:00",
-   "issue": 68,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "47331c5b",
-   "note": null
-  },
   {
    "at": "2026-11-20T13:28:18+00:00",
    "issue": 22,
@@ -1613,6 +1652,14 @@
    "to": "pr-review",
    "by": "03af0ec4",
    "note": null
+  },
+  {
+   "at": "2026-11-20T21:43:54+00:00",
+   "issue": 57,
+   "from": "plan-review",
+   "to": "plan-review",
+   "by": "dispatch",
+   "note": "parked: one large task too many for its holder's profile; opens again when there is a place"
   }
  ],
  "open": [
@@ -1647,7 +1694,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T21:39:10+00:00",
+ "updated_at": "2026-11-20T21:43:54+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
