@@ -53,6 +53,26 @@ jobs:
           targets: x86_64-unknown-none, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # The entry point runs the checker from target/arch-check, so build
+      # output must never come from the checkout (ADR-015, D2).
+      - name: No build output in the checkout
+        run: test -z "$(git ls-files -- target)"
+      # The gate runs before clippy and the tests, so no build script or
+      # test outside the checker's own crates (boneli-arch-check,
+      # boneli-json, boneli-toml) runs before it (ADR-015).
+      - name: Architecture rules
+        run: ./tools/check-architecture.sh
+      # Parity stage of ADR-015 (D7): the former checker on the same tree.
+      - name: Architecture rules (Python)
+        run: python3 -I tools/check_architecture.py
+      # Every rule has fail cases; a weakened rule turns this step red. With
+      # BONELI_ARCH_PARITY every fixture run also runs the former checker,
+      # and the run fails unless exit codes, summary counts and the
+      # (rule, path, line) of every FAIL line agree (ADR-015, D7).
+      - name: Architecture rule fixtures
+        env:
+          BONELI_ARCH_PARITY: tools/check_architecture.py
+        run: ./tools/check-architecture.sh --fixtures
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       # The shim (#9) ships as a static musl binary, and libc's constants
@@ -62,11 +82,31 @@ jobs:
         run: |
           cargo check -p boneli-sys --all-targets --target x86_64-unknown-linux-musl
           cargo check -p boneli-sys --all-targets --target aarch64-unknown-linux-musl
-      - name: Architecture rules
-        run: ./tools/check-architecture.sh
-      # Every rule has fail cases; a weakened rule turns this step red.
-      - name: Architecture rule fixtures
-        run: ./tools/check-architecture.sh --fixtures
+      # The entry point builds the checker from `/`, so a cargo config
+      # committed in the checkout cannot wrap the compiler of the gate
+      # itself; the check still reports the file (ADR-015, D2). The wrapper
+      # logs every compiler call it sees: the checker's own cargo calls go
+      # through it, its build must not.
+      - name: Architecture check builds outside committed cargo config
+        run: |
+          log="$RUNNER_TEMP/rustc-wrapper.log"
+          wrapper="$RUNNER_TEMP/rustc-wrapper.sh"
+          printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "$@"\n' "$log" > "$wrapper"
+          chmod +x "$wrapper"
+          mkdir .cargo
+          printf '[build]\nrustc-wrapper = "%s"\n' "$wrapper" > .cargo/config.toml
+          touch crates/boneli-arch-check/src/lib.rs
+          code=0
+          ./tools/check-architecture.sh > "$RUNNER_TEMP/arch.out" || code=$?
+          rm -r .cargo
+          cat "$RUNNER_TEMP/arch.out"
+          test "$code" = 1
+          grep -q '^FAIL \[cargo-config\] \.cargo/config\.toml: ' "$RUNNER_TEMP/arch.out"
+          test -s "$log"
+          if grep -q -- '--crate-name boneli_arch_check' "$log"; then
+            echo "the checker was built through the committed rustc-wrapper"
+            exit 1
+          fi
 
   # The boneli-sys and boneli-oci host tests create user namespaces, so
   # they need a prepared host (ADR-007, D5; ADR-009). The job proves what

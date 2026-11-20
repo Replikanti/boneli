@@ -233,6 +233,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 - **Composition roots** (binaries `boneli-runner`, `boneli-gw`, `boneli-egress`, `boneli-shim`, `boneli-cli`): wire the adapters together and start a driving adapter.
 - **Replay check** (`boneli-replay-check`, test only): a composition root that nothing depends on. It folds the domain's scenario corpus and plays its own app corpus (`DebugTicket` end to end on the in-memory adapters, with every fault kind injected at every port call of every hand-written scenario) in two child processes and in its own and compares the `Debug` output byte for byte, the gate for address leaks from the core (ADR-001, ADR-002, ADR-004).
 - **Acceptance** (`boneli-acceptance`, test only): a composition root that nothing depends on, for live tests that wire real adapters against real services: today `boneli-git-cli` and `boneli-forge-github` on the operator's private GitHub test repository. Its tests are ignored in CI and run by hand (ADR-014, D12; `docs/forge-github.md`).
+- **Architecture check** (`boneli-arch-check`, tooling): a root that nothing depends on. It enforces the crate graph, purity, `unsafe` and dependency rules of `tools/architecture.toml` on the workspace it belongs to, and is held to them itself; `tools/check-architecture.sh` builds and runs it, and runs its fixtures (ADR-001, ADR-015).
 
 **Use cases** cover every part on top of one core: `BuildEnvironment`, `OnboardRepo`, `DebugTicket`, `BuildCase`, `RunBench`.
 

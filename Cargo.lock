@@ -29,6 +29,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-arch-check"
+version = "0.0.0"
+dependencies = [
+ "boneli-json",
+ "boneli-toml",
+]
+
+[[package]]
 name = "boneli-domain"
 version = "0.0.0"
 

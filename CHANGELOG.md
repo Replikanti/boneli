@@ -478,6 +478,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The architecture check is the Rust crate `boneli-arch-check`, a tool
+  root in `roles.roots` that is held to every rule it enforces (ADR-015).
+  `tools/check-architecture.sh` builds it from `/` with the committed
+  lockfile into `target/arch-check`, so no cargo config or toolchain file
+  in the checkout applies to the gate's own build, and then runs it. The
+  rules, their ids, the output format, the flags and the fixture format
+  are unchanged; it reads TOML through `boneli-toml` and `cargo metadata`
+  through `boneli-json`, under limits. CI runs the architecture steps
+  before clippy and the tests, rejects committed build output and proves
+  that a committed `rustc-wrapper` does not reach the checker's build.
+  For the parity stage CI also runs the former Python checker on the
+  workspace and on every fixture run.
 - The `Dial` seam (`Dial`, `Stream`, `TlsDial`, and `Timed`, now public)
   moves from `boneli-oci` to `boneli-https`, unchanged, so the GitHub
   forge shares the deadline-under-TLS socket (ADR-014, D4). `boneli-oci`
