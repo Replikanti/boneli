@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "pr-review",
+   "state": "plan-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR #78 open",
-   "updated_at": "2026-11-20T13:30:10+00:00",
+   "note": "PR 2 (#78 draft, bdf3e59): fix in place (per-sandbox keeper 5 ms), stopped on R-S6: parent-read mutant 0/70 kills; operator decides proof",
+   "updated_at": "2026-11-20T15:02:35+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T17:13:36+00:00",
-   "issue": 19,
-   "from": "pr-review",
-   "to": "pr-review",
-   "by": "cbec3aa3",
-   "note": "PR 3 #73 head 12b7200: QA + 3 review rounds closed; waiting on operator GitHub App for the live test (test repo Replikanti/boneli-forge-test ready: issue #1 target, #2 decoy, base 6f200dc)"
-  },
   {
    "at": "2026-11-19T18:31:00+00:00",
    "issue": 19,
@@ -1496,6 +1488,14 @@
    "to": "pr-review",
    "by": "0d47f612",
    "note": null
+  },
+  {
+   "at": "2026-11-20T15:02:35+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "plan-review",
+   "by": "98fa59e8",
+   "note": "PR 2 (#78 draft, bdf3e59): fix in place (per-sandbox keeper 5 ms), stopped on R-S6: parent-read mutant 0/70 kills; operator decides proof"
   }
  ],
  "open": [
@@ -1533,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T14:46:03+00:00",
+ "updated_at": "2026-11-20T15:02:35+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
