@@ -994,11 +994,11 @@
    "title": "boneli-oci: private-registry credentials and an HTTP proxy for customer networks",
    "epic": null,
    "order": 39,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "ae67d3e8",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T20:06:15+00:00",
+   "updated_at": "2026-11-20T20:32:42+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:12:13+00:00",
-   "issue": 22,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "7e33749a",
-   "note": null
-  },
   {
    "at": "2026-11-20T13:16:13+00:00",
    "issue": 54,
@@ -1613,6 +1605,14 @@
    "to": "claimed",
    "by": "ae67d3e8",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T20:32:43+00:00",
+   "issue": 55,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "ae67d3e8",
+   "note": null
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T20:06:47+00:00",
+ "updated_at": "2026-11-20T20:32:43+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
