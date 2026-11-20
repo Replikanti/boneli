@@ -83,6 +83,16 @@ those of the Context; each constant in the code cites its section.
 - **Wiping.** The seed buffer and the ML-KEM shared secret are wiped
   (`zeroize`); the decapsulation key is wiped on drop by `ml-kem`'s
   `zeroize` feature; rustls wipes the combined secret (`SharedSecret`).
+  That feature wipes only the copy that is dropped, so the key is never
+  moved out of the heap block rustls holds it in: `complete` uses it
+  through the box and moves only the X25519 half out, and the key sits in
+  a wrapper with a `Drop` impl (`PinnedKey`), which Rust does not let a
+  field be moved out of. A unit test checks that the key is dropped at
+  its address in the box after `complete` (success, wrong length,
+  all-zero X25519), `complete_hybrid_component` and an unused drop.
+  Review of #37 found the first version moving the whole state out of
+  the box in `complete`, which left d and z in freed heap memory on every
+  hybrid handshake.
   Nothing implements a `Debug` that prints key material: the group
   prints its name, the key exchange in progress has no `Debug`.
 
@@ -219,7 +229,8 @@ RUSTSEC-2026-0012 (below 0.1.6).
   the concatenation order in share and secret; that the error of the
   X25519 half is propagated; the refusal of the server role; TLS 1.3
   only; the seed source (`fill_random`, no fallback); the wiping of the
-  seed and of the ML-KEM secret; that no `Debug` prints key material; the
+  seed and of the ML-KEM secret; that the decapsulation key is never
+  moved out of its box; that no `Debug` prints key material; the
   explicit group lists; the 49 policy records against the measured
   graph; that neither CI step can pass without running.
 

@@ -120,11 +120,32 @@ fn split_server_share(share: &[u8]) -> Option<(&[u8], &[u8])> {
     Some(share.split_at(CT_LEN))
 }
 
-/// One key exchange in progress: the ML-KEM decapsulation key (wiped on
-/// drop by `ml-kem`'s `zeroize` feature), the X25519 half and the share
-/// sent. No `Debug`: nothing here is for logs.
+/// The ML-KEM decapsulation key where `ActiveHybrid` holds it, on the
+/// heap inside rustls' `Box<dyn ActiveKeyExchange>`. `ml-kem`'s `zeroize`
+/// feature wipes the key, d and z (the whole seed) included, in the copy
+/// that is dropped and nowhere else: a key moved out of the box first is
+/// wiped on the stack, and the heap copy stays in freed memory. Two guards
+/// keep it in place. This type has a `Drop`, so the key can never be moved
+/// out of it (E0509). The unit tests check that it is dropped at the
+/// address it has in the box, on every path that ends a key exchange.
+struct PinnedKey {
+    key: DecapsulationKey768,
+}
+
+impl Drop for PinnedKey {
+    /// The key itself is wiped by its own `Drop`, which runs right after
+    /// this one, in the same place.
+    fn drop(&mut self) {
+        #[cfg(test)]
+        tests::dropped_at(self as *const PinnedKey as usize);
+    }
+}
+
+/// One key exchange in progress: the ML-KEM decapsulation key, pinned
+/// (`PinnedKey`), the X25519 half and the share sent. No `Debug`: nothing
+/// here is for logs.
 struct ActiveHybrid {
-    mlkem: DecapsulationKey768,
+    mlkem: PinnedKey,
     classical: Box<dyn ActiveKeyExchange>,
     share: Vec<u8>,
 }
@@ -147,7 +168,7 @@ impl ActiveHybrid {
         share.extend_from_slice(&ek);
         share.extend_from_slice(x25519);
         Ok(ActiveHybrid {
-            mlkem,
+            mlkem: PinnedKey { key: mlkem },
             classical,
             share,
         })
@@ -162,13 +183,16 @@ impl ActiveKeyExchange for ActiveHybrid {
     /// right length always decapsulates: a tampered one yields a secret
     /// the server does not have (FIPS 203 implicit rejection), so the
     /// handshake fails when its Finished does not verify.
+    ///
+    /// The key is used through the box and never moved out of it: only
+    /// `classical` is moved, so the key is dropped and wiped where the box
+    /// holds it (`PinnedKey`).
     fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, rustls::Error> {
-        let this = *self;
         let (ct, x25519) = split_server_share(peer).ok_or(PeerMisbehaved::InvalidKeyShare)?;
         let ct: Ciphertext<MlKem768> =
             Array::try_from(ct).map_err(|_| PeerMisbehaved::InvalidKeyShare)?;
-        let k = Zeroizing::new(this.mlkem.decapsulate(&ct));
-        let x = this.classical.complete(x25519)?;
+        let k = Zeroizing::new(self.mlkem.key.decapsulate(&ct));
+        let x = self.classical.complete(x25519)?;
         let mut secret = Vec::with_capacity(SECRET_LEN);
         secret.extend_from_slice(&k[..]);
         secret.extend_from_slice(x.secret_bytes());
@@ -181,8 +205,8 @@ impl ActiveKeyExchange for ActiveHybrid {
         Some((NamedGroup::X25519, self.classical.pub_key()))
     }
 
-    /// The server picked the X25519 share: the ML-KEM half is dropped
-    /// (and wiped) unused.
+    /// The server picked the X25519 share: only `classical` is moved out,
+    /// and the ML-KEM half is dropped (and wiped) unused, in the box.
     fn complete_hybrid_component(
         self: Box<Self>,
         peer: &[u8],
@@ -206,6 +230,25 @@ impl ActiveKeyExchange for ActiveHybrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Where each `PinnedKey` of this test thread was dropped.
+        static DROPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn dropped_at(address: usize) {
+        DROPS.with(|drops| drops.borrow_mut().push(address));
+    }
+
+    fn take_drops() -> Vec<usize> {
+        DROPS.with(|drops| std::mem::take(&mut *drops.borrow_mut()))
+    }
+
+    /// The address of the key inside the box.
+    fn slot(hybrid: &ActiveHybrid) -> usize {
+        &hybrid.mlkem as *const PinnedKey as usize
+    }
 
     /// Known-answer values: Wycheproof for ML-KEM-768, RFC 7748 for
     /// X25519; their sources are recorded in the file.
@@ -429,6 +472,60 @@ mod tests {
         let (a, b) = (real(), real());
         assert_ne!(&a.pub_key()[..1184], &b.pub_key()[..1184], "ML-KEM half");
         assert_ne!(&a.pub_key()[1184..], &b.pub_key()[1184..], "X25519 half");
+    }
+
+    #[test]
+    fn key_is_dropped_in_place() {
+        // Each path that ends a key exchange must drop the key where the
+        // box holds it, so that `ml-kem` wipes that copy; a key moved out
+        // of the box first is dropped somewhere else.
+        let good = concat(&kat("tc2.c"), &kat("rfc7748.bob_public"));
+        let zero_x25519 = concat(&kat("tc2.c"), &[0u8; 32]);
+        let ring_hybrid = || {
+            let mlkem = DecapsulationKey768::from_seed(seed("tc2"));
+            let classical = kx_group::X25519.start().expect("X25519");
+            Box::new(ActiveHybrid::new(mlkem, classical).expect("hybrid"))
+        };
+        type End = Box<dyn Fn(Box<ActiveHybrid>) -> bool>;
+        let cases: Vec<(&str, Box<ActiveHybrid>, End)> = vec![
+            (
+                "complete",
+                kat_hybrid("tc2"),
+                Box::new(move |h| h.complete(&good).is_ok()),
+            ),
+            (
+                "complete, wrong length",
+                kat_hybrid("tc2"),
+                Box::new(|h| invalid_key_share(h.complete(&[0x5a; 1119]))),
+            ),
+            (
+                "complete, all-zero X25519",
+                ring_hybrid(),
+                Box::new(move |h| invalid_key_share(h.complete(&zero_x25519))),
+            ),
+            (
+                "complete_hybrid_component",
+                kat_hybrid("tc2"),
+                Box::new(|h| {
+                    h.complete_hybrid_component(&kat("rfc7748.bob_public"))
+                        .is_ok()
+                }),
+            ),
+            (
+                "dropped unused",
+                kat_hybrid("tc2"),
+                Box::new(|h| {
+                    drop(h);
+                    true
+                }),
+            ),
+        ];
+        for (name, hybrid, end) in cases {
+            take_drops();
+            let address = slot(&hybrid);
+            assert!(end(hybrid), "{name}: the expected result");
+            assert_eq!(take_drops(), [address], "{name}: dropped once, in the box");
+        }
     }
 
     #[test]
