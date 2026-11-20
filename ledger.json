@@ -921,11 +921,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "pr-review",
-   "owner": "98fa59e8",
+   "state": "done",
+   "owner": null,
    "pr": 78,
-   "note": "PR #78 open",
-   "updated_at": "2026-11-20T17:27:18+00:00",
+   "note": "PR 1 #76 + PR 2 #78 (dccbbdc) merged; upstream memcg report draft for the operator",
+   "updated_at": "2026-11-20T17:52:10+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -934,10 +934,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null
   },
   {
    "issue": 57,
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T11:44:29+00:00",
-   "issue": 38,
-   "from": "pr-review",
-   "to": "done",
-   "by": "14f36a32",
-   "note": null
-  },
   {
    "at": "2026-11-20T11:44:34+00:00",
    "issue": 81,
@@ -1613,6 +1605,14 @@
    "to": "implementing",
    "by": "f7d29cb8",
    "note": null
+  },
+  {
+   "at": "2026-11-20T17:52:10+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "done",
+   "by": "98fa59e8",
+   "note": "PR 1 #76 + PR 2 #78 (dccbbdc) merged; upstream memcg report draft for the operator"
   }
  ],
  "open": [
@@ -1637,7 +1637,6 @@
   33,
   45,
   49,
-  54,
   55,
   56,
   57,
@@ -1648,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T17:51:26+00:00",
+ "updated_at": "2026-11-20T17:52:12+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
