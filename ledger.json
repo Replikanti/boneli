@@ -1289,16 +1289,16 @@
    "title": "boneli-https: std lookup scan misses turbofish, qualified-path and alias forms",
    "epic": null,
    "order": 49,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "17f7a4ac",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 95,
    "note": "",
-   "updated_at": "2026-11-20T22:18:18+00:00",
+   "updated_at": "2026-11-20T22:42:44+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1312,14 +1312,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T16:36:14+00:00",
-   "issue": 66,
-   "from": "pr-review",
-   "to": "done",
-   "by": "373fe023",
-   "note": null
-  },
   {
    "at": "2026-11-20T16:36:16+00:00",
    "issue": 85,
@@ -1711,6 +1703,14 @@
    "to": "plan-review",
    "by": "f11746bb",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:42:44+00:00",
+   "issue": 93,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "17f7a4ac",
+   "note": null
   }
  ],
  "open": [
@@ -1744,7 +1744,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:33:38+00:00",
+ "updated_at": "2026-11-20T22:42:44+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
