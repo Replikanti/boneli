@@ -1,0 +1,241 @@
+//! The memory statistics keeper of a sandbox cgroup (ADR-007, D8, #54):
+//! one thread per sandbox, from the end of `Cgroup::create` until the
+//! sandbox is killed, reading the sandbox's own `memory.stat`; none for a
+//! parent.
+//!
+//! Every test takes `support::exclusive()` and counts this process's
+//! `memcg-keeper` threads and descriptors as a difference, so no other
+//! test's sandbox is counted.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use boneli_sys::{
+    Cgroup, ExitStatus, KeeperReport, Mount, Parent, Root, STATS_KEEPER_PERIOD, Spec, Stdio, spawn,
+};
+
+use crate::support::cgroup;
+use crate::support::rootfs::{Fixture, inside};
+use crate::support::{self, dev_null, ids, report, wait_bounded};
+
+/// How long a test waits for something the keeper does every period or
+/// once at its stop: 1 s, 200 periods of 5 ms.
+const KEEPER_WAIT: Duration = Duration::from_secs(1);
+
+/// The keeper threads of this process.
+fn keepers() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .flatten()
+        .filter(|t| {
+            std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim() == "memcg-keeper")
+        })
+        .count()
+}
+
+/// Waits up to [`KEEPER_WAIT`] for `done`.
+fn within(mut done: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + KEEPER_WAIT;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The descriptors of this process that point at `path`, also once the
+/// file is gone (`<path> (deleted)`).
+fn descriptors_of(path: &Path) -> usize {
+    let deleted = PathBuf::from(format!("{} (deleted)", path.display()));
+    std::fs::read_dir("/proc/self/fd")
+        .expect("read /proc/self/fd")
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|target| *target == path || *target == deleted)
+        .count()
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids)"]
+fn keeper_reads_its_own_sandbox() {
+    // H4 (ADR-007 D8): a read of the parent's memory.stat stops flushing
+    // once a sandbox below it is flushable, so each keeper must hold its
+    // own sandbox's file and never the parent's.
+    let _alone = support::exclusive();
+    let parent_stat = cgroup::parent().path().join("memory.stat");
+    let parent_before = descriptors_of(&parent_stat);
+    let a = cgroup::sandbox("keeper-own");
+    let b = cgroup::sandbox("keeper-own");
+    let a_stat = a.path().join("memory.stat");
+    let b_stat = b.path().join("memory.stat");
+    assert_eq!(descriptors_of(&a_stat), 1, "{}", a_stat.display());
+    assert_eq!(descriptors_of(&b_stat), 1, "{}", b_stat.display());
+    assert_eq!(
+        descriptors_of(&parent_stat),
+        parent_before,
+        "a keeper holds the parent's memory.stat"
+    );
+    a.destroy().expect("destroy");
+    assert_eq!(descriptors_of(&a_stat), 0, "left after destroy");
+    assert_eq!(descriptors_of(&b_stat), 1);
+    drop(b);
+    assert_eq!(descriptors_of(&b_stat), 0, "left after a drop");
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids)"]
+fn keeper_runs_while_cgroup_lives() {
+    let _alone = support::exclusive();
+    let before = keepers();
+    let parent = Parent::open(cgroup::parent().path()).expect("open the harness's parent");
+    assert_eq!(keepers(), before, "Parent::open started a keeper");
+    let a = cgroup::sandbox("keeper-life");
+    // A new thread takes its name a moment after the spawn returns.
+    assert!(
+        within(|| keepers() == before + 1),
+        "create starts one keeper"
+    );
+    let b = Cgroup::create(
+        &parent,
+        &cgroup::unique_name("keeper-life"),
+        &cgroup::default_limits(),
+    )
+    .expect("create");
+    assert!(within(|| keepers() == before + 2), "one keeper per cgroup");
+    let first = a.stats_keeper();
+    assert!(first.reads >= 1, "the first read is synchronous: {first:?}");
+    assert!(
+        within(|| a.stats_keeper().reads >= first.reads + 2),
+        "the keeper did not read twice within {KEEPER_WAIT:?}: {:?}",
+        a.stats_keeper()
+    );
+    let r = a.stats_keeper();
+    assert_eq!(r.failed, None, "{r:?}");
+    report(&format!(
+        "keeper_runs_while_cgroup_lives: period {STATS_KEEPER_PERIOD:?}, {r:?}"
+    ));
+    a.destroy().expect("destroy");
+    assert!(
+        within(|| keepers() == before + 1),
+        "the keeper outlived destroy"
+    );
+    let at_drop = b.stats_keeper();
+    assert!(at_drop.reads >= 1, "{at_drop:?}");
+    drop(b);
+    assert!(within(|| keepers() == before), "the keeper outlived a drop");
+    drop(parent);
+}
+
+fn root_with_cgroup(fixture: &Fixture) -> Root {
+    let mut mounts = fixture.mounts();
+    mounts.push(Mount::Cgroup2 {
+        target: inside("/sys/fs/cgroup"),
+    });
+    fixture.root_with(vec![fixture.layer.clone()], mounts)
+}
+
+/// The buffered writers of the cost report: 16 MiB each, `never` mode.
+const COST_WRITE: &str = "16777216";
+
+/// How long the cost report watches the keepers per count.
+const COST_WINDOW: Duration = Duration::from_secs(3);
+
+/// Runs `n` buffered writers, each in its own cgroup, for [`COST_WINDOW`]
+/// and returns each keeper's report at its end and how many writers
+/// exited 0.
+fn cost_window(n: usize) -> (Vec<KeeperReport>, usize) {
+    let fixtures: Vec<Fixture> = (0..n).map(|_| Fixture::new("keeper-cost")).collect();
+    let cgs: Vec<Cgroup> = (0..n).map(|_| cgroup::sandbox("keeper-cost")).collect();
+    let start = Instant::now();
+    let mut children = Vec::new();
+    for (f, cg) in fixtures.iter().zip(&cgs) {
+        let s = Spec {
+            program: crate::support::rootfs::PROBE.into(),
+            args: ["--exact", "probe", "--nocapture", "--quiet"]
+                .iter()
+                .map(OsString::from)
+                .collect(),
+            env: [
+                (support::probe::ACTION_VAR, "io-write"),
+                ("BONELI_PROBE_FILE", "/workspace/cost"),
+                ("BONELI_PROBE_SIZE", COST_WRITE),
+                ("BONELI_PROBE_DIRECT", "never"),
+            ]
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect(),
+            stdio: Stdio {
+                stdin: dev_null(),
+                stdout: dev_null(),
+                stderr: dev_null(),
+            },
+            ids: ids(0, 0),
+            setup_timeout: support::SETUP_TIMEOUT,
+            // The probe reads its own cgroup after its loop, through a
+            // cgroup2 mount of its own.
+            root: root_with_cgroup(f),
+            cgroup: cg,
+        };
+        children.push(spawn(&s).expect("spawn a writer"));
+    }
+    let ok = children
+        .iter_mut()
+        .map(|c| wait_bounded(c, support::PROBE_HANG_BOUND))
+        .filter(|s| *s == ExitStatus::Exited(0))
+        .count();
+    std::thread::sleep(COST_WINDOW.saturating_sub(start.elapsed()));
+    let reports = cgs.iter().map(Cgroup::stats_keeper).collect();
+    for cg in cgs {
+        cg.destroy().expect("destroy");
+    }
+    drop(fixtures);
+    (reports, ok)
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids); cost report"]
+fn keeper_cost_report() {
+    // Each keeper's CPU per read with 1 and 8 sandboxes writing. The CPU
+    // is the keeper thread's whole CPU time, so its wake-ups count; CPU
+    // time, not wall time, because a busy runner stretches wall time by
+    // preemption, not the CPU a read takes. The bound is a tenth of the
+    // period (R-S5's ratio, ADR-007 D8). The rest is reported, for #8.
+    let _alone = support::exclusive();
+    let bound = STATS_KEEPER_PERIOD / 10;
+    for n in [1, 8] {
+        let (reports, ok) = cost_window(n);
+        assert_eq!(ok, n, "a writer failed");
+        let mut per_read_max = Duration::ZERO;
+        let mut cpu_total = Duration::ZERO;
+        let mut late = 0;
+        let mut max_gap = Duration::ZERO;
+        let mut max_read = Duration::ZERO;
+        for r in &reports {
+            assert_eq!(r.failed, None, "{r:?}");
+            assert!(r.reads >= 2, "a keeper did not read: {r:?}");
+            let per_read = r.cpu / u32::try_from(r.reads).unwrap_or(u32::MAX);
+            per_read_max = per_read_max.max(per_read);
+            cpu_total += r.cpu;
+            late += r.late;
+            max_gap = max_gap.max(r.max_gap);
+            max_read = max_read.max(r.max_read);
+        }
+        let reads: u64 = reports.iter().map(|r| r.reads).sum();
+        report(&format!(
+            "keeper_cost_report: {n} sandboxes, {reads} reads in {COST_WINDOW:?}, cpu {cpu_total:?} \
+             ({:.2} ms per second per sandbox, {:.2} in total), up to {per_read_max:?} per read \
+             (bound {bound:?}), max_read {max_read:?}, max_gap {max_gap:?}, late {late}",
+            cpu_total.as_secs_f64() * 1000.0 / COST_WINDOW.as_secs_f64() / n as f64,
+            cpu_total.as_secs_f64() * 1000.0 / COST_WINDOW.as_secs_f64(),
+        ));
+        assert!(
+            per_read_max <= bound,
+            "a keeper's CPU per read {per_read_max:?} is over {bound:?} with {n} sandboxes"
+        );
+    }
+}
