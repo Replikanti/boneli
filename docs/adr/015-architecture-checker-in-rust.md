@@ -60,24 +60,55 @@ Rejected:
   `path = ...` ran a fake `cargo`. The check reports both files, but only
   if it runs.
 
-### D2. The entry point builds from `/`, then executes
+### D2. The entry point runs no code from the checkout before the check
 
 `tools/check-architecture.sh` stays the entry point (POSIX sh, CI runs it
 under dash and bash). It takes the repository root from `$0` with
-`pwd -P`, runs
-`(cd / && cargo build --quiet --locked --manifest-path "$root/Cargo.toml" -p boneli-arch-check --target-dir "$root/target/arch-check")`
-and then `exec`s `$root/target/arch-check/debug/boneli-arch-check` from the
-caller's working directory, with the caller's arguments.
+`pwd -P`, runs every cargo call from `/` with
+`--manifest-path "$root/Cargo.toml"`, and in this order:
+
+1. **The build closure** (`cargo tree --locked -p boneli-arch-check -e
+   normal,build --prefix none --format '{p}'`) must be exactly
+   `boneli-arch-check`, `boneli-json` and `boneli-toml`, each at its path
+   under this checkout's `crates/`. Anything else, a crates.io crate, a
+   git crate or another member, is a tool error (exit 2) before anything
+   is compiled: building it could run its build script or proc macro.
+2. **No workspace member has a build script or is a proc macro**
+   (`cargo metadata --no-deps --offline`, which runs no code): a
+   `custom-build` target is `FAIL [build-script] Cargo.toml: ...`, a
+   `proc-macro` target `FAIL [proc-macro] Cargo.toml: ...`, exit 1, the
+   rules the checker would report. Found in round 1 of the review: a
+   `build.rs` added to `boneli-toml` ran during the checker's build,
+   deleted itself, and the check then printed OK. `roles.build-script` is
+   empty, so a member with a build script is a violation anyway; a PR that
+   lists one there has to scope this step to the three crates of the
+   closure.
+3. **The host triple** from `rustc -vV`, and the build for it:
+   `rm -f "$root/target/arch-check/<host>/debug/boneli-arch-check"`, then
+   `cargo build --quiet --locked -p boneli-arch-check --target <host> --target-dir "$root/target/arch-check"`,
+   and a missing binary afterwards is a tool error. With the target
+   explicit, `CARGO_BUILD_TARGET` or a user's `build.target` cannot move
+   the build elsewhere, and with the old binary deleted first, a stale
+   binary can never run: cargo puts back its own artifact for the current
+   sources. The artifacts under `target/arch-check` are trusted as far as
+   cargo's fingerprints are; in CI the directory does not exist yet when
+   the gate runs, because nothing before it builds and rust-cache restores
+   after it. Found in round 1: with `build.target` set, the
+   fresh build went to `<triple>/debug/` while an older binary at the
+   fixed `debug/` path ran, with the older rules.
+4. **`exec`** of that binary from the caller's working directory, with the
+   caller's arguments.
+
+Why each part:
 
 - **From `/`:** cargo and rustup look for config and toolchain files from
   the working directory upwards. Measured while planning: with `/` as the
   working directory and `--manifest-path`, neither the committed
   `.cargo/config.toml` nor the `rust-toolchain.toml` above applied.
 - **`--locked`:** the build uses the committed `Cargo.lock`; a stale one is
-  a build failure, as it is a check failure (ADR-001).
+  a failure, as it is a check failure (ADR-001).
 - **Its own target directory:** `target/arch-check` is not shared with the
-  workspace build, whose flags and environment the caller controls, and
-  the binary's path is fixed.
+  workspace build, whose flags and environment the caller controls.
 - **A failed build** (a stale lockfile, no cargo) prints one line,
   `FAIL [tool-error] Cargo.toml: cannot build the architecture checker (cargo output on stderr)`,
   then `1 violation(s)`, and exits 2, as any tool error does.
@@ -85,22 +116,50 @@ caller's working directory, with the caller's arguments.
   before, and the checker's own cargo and rustc calls get the caller's
   environment, without the variables `cargo run` adds.
 
-What building from `/` does not cover: the checker's own cargo calls
+What the entry point does not cover: the checker's own cargo calls
 (`cargo metadata`, the no-std `cargo check`) still run from the root and
 see a committed cargo config, as they did under Python; `cargo metadata`
-calls `build.rustc-wrapper` for `rustc -vV`. The config walk reports the
-file before any of those calls, and the run fails.
+calls `build.rustc-wrapper` for `rustc -vV`. The config walk records the
+file before any of those calls, so the run fails with `cargo-config`
+whatever the wrapper does afterwards, short of the exit code, which only
+the checker sets.
 
-CI proves the property in its last `check` step: it commits nothing but
-writes `.cargo/config.toml` with `build.rustc-wrapper` set to a script that
-logs its arguments and then runs rustc, touches the checker's `lib.rs` and
-runs the entry point. The step requires exit 1, a
-`FAIL [cargo-config] .cargo/config.toml` line, a non-empty log (the
-wrapper did run, for the checker's own cargo calls) and no
-`--crate-name boneli_arch_check` in it. A mutant of the entry point that
-builds from the repository fails the step (checked by hand while building
-it). A step right after `cargo fmt` fails if anything under `target/` is
-tracked, since the gate now runs a binary from there.
+**In CI, the gate runs first.** In the `check` job only git (the issue
+link, the grep of D10, the tracked-`target/` check), the toolchain action
+(rustup and version queries; the job's `RUSTUP_TOOLCHAIN` outranks a
+committed toolchain file) and the bash step that hides Python run before
+the "Architecture rules" step. `Swatinem/rust-cache` and `cargo fmt`
+come after it, because both read the checkout's cargo config: found in
+round 1, a committed `[alias] fmt` ran PR code as `cargo fmt`, which
+deleted the config and itself, and the gate then printed OK. The gate step
+also fails if `git status --porcelain --untracked-files=all` is not empty
+afterwards, so anything that changed the checkout while it ran turns it
+red. The fixtures run next; they execute fixture code in temporary
+directories, after the gate has judged the real tree.
+
+**What proves it in CI:**
+
+- "Architecture check builds outside committed cargo config" writes
+  `.cargo/config.toml` with `build.rustc-wrapper` set to a script that
+  logs its arguments and then runs rustc, touches the checker's `lib.rs`
+  and runs the entry point. It requires exit 1, a
+  `FAIL [cargo-config] .cargo/config.toml` line, a non-empty log (the
+  wrapper did run, for the checker's own cargo calls) and no
+  `--crate-name boneli_arch_check` in it. A mutant of the entry point that
+  builds from the repository fails it (checked by hand).
+- "Architecture check refuses code that runs before it" runs the three
+  round-1 attacks on fresh exports of HEAD: a self-deleting `build.rs` in
+  `boneli-toml` (exit 1, the `build-script` line, the file still there and
+  nothing built), a new member in the checker's closure (exit 2, nothing
+  built), and stale binaries at the host path and at the old `debug/`
+  path with `CARGO_BUILD_TARGET` set (the real checker runs). It also
+  requires that no step before the gate in the `check` job uses cargo or
+  rust-cache. Each part fails on the code before round 1 (run by hand on
+  6abcd3a: OK and exit 0 after the build script deleted itself; exit 1
+  from the old checker after compiling the extra crate; the stale `OK`;
+  rust-cache and `cargo fmt` before the gate).
+- "No build output in the checkout" fails if anything under `target/` is
+  tracked.
 
 ### D3. The contract does not change
 
@@ -138,8 +197,9 @@ the process, about 3.8 MiB before the parse): an object of 1,048,575
 members with 11-digit keys, 16,777,201 bytes, peaks at 159,056 KiB (155.3
 MiB); 1,048,575 zeros in an array (2 MiB) at 71,192 KiB; 1,048,575
 16-byte strings (16 MiB) at 85,324 KiB; 524,287 one-member objects at
-89,304 KiB. The planning estimate from ADR-008's 136 bytes per value plus
-the input was about 170 MiB; the measured worst is below it.
+89,304 KiB. The planning estimate was 2 × `max_bytes` plus ADR-008's
+worst case of 136 bytes per value × `max_values`, 32 MiB + 136 MiB = 168
+MiB; the measured worst is below it.
 
 `CHECK_STACK`: the check runs on one spawned thread whose stack is the
 smallest power of two on which the deepest operation uses at most 75% in
@@ -357,8 +417,10 @@ a hang bound of 10 s, not a target), prints its thread id from
 and reaps it; a helper that ends early, prints no id or never sees a
 zombie leader fails the test without a hang (a helper with the call
 delayed past the bound failed in 10.9 s, checked by hand). Both tests
-ignore the arguments cargo passes and need no host preparation, so they
-run in `check` and in the `sandbox` job's `boneli-sys` run.
+ignore the arguments cargo passes and need no host preparation, so both
+run in `check` (`cargo test --workspace`); the `boneli-sys` one also runs
+in the `sandbox` job, whose `boneli-oci` step runs only the
+`boneli_oci_tests` target.
 
 - `crates/boneli-sys/tests/exit_main_thread.rs`: the leader is `Z`, the
   running thread is neither `Z` nor `X`, and the helper still runs until
@@ -387,10 +449,16 @@ The step globs `[p]ython*`, so the workflow itself has no hit of the
 grep below. The last step of
 each job, "No Python was called", fails if `calls.log` exists, so a call
 whose error some script swallows still turns the job red. The stub sees
-only calls through PATH; a hard-coded `/usr/bin/python3` gets past it, and
-the acceptance grep catches that instead:
+only calls through PATH; a `#!/usr/bin/python3` shebang or a call by
+absolute path gets past it (round 1 of the review ran both). The step
+"No Python in tracked files", git only and before the toolchain, catches
+those in what the repository holds: it fails unless
 `git grep -n -I -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'`
-prints nothing. Without the exclusions it finds only the vendored
+prints nothing (checked by hand: a tracked `#!/usr/bin/python3` script
+fails it). Making the runner's interpreters non-executable was rejected:
+the runner's own system tools may need them, and a name built at run time
+from pieces would still pass both; D10 is a policy, and review owns what
+a grep cannot see. Without the exclusions it finds only the vendored
 toml-test pair `valid/inline-table/end-in-bool` (a `python` key) and ADR
 history. Mentions of the language that stay, none an invocation, are
 the stacks Boneli debugs in `docs/ARCHITECTURE.md`, the Python test
@@ -402,13 +470,12 @@ ADR-007 (proposed, owned by #6) is not edited.
 ## Consequences
 
 - The gate's trusted base now includes `boneli-json`, `boneli-toml`, the
-  checker crate and their compilation, instead of a Python interpreter. A
-  build script added to those crates would run once, at the first build of
-  the checker, before the checker could flag it, the same way any build
-  script already runs in `cargo test` before the gate. CI now runs the
-  architecture steps right after `cargo fmt`, so they run before clippy
-  and the tests build anything else, and all three crates are reviewed on
-  every change (the always-review list).
+  checker crate and their compilation, instead of a Python interpreter.
+  The entry point refuses to build them when the build could run code
+  (a build script, a proc macro, another crate in the closure; D2), so
+  what runs before the check is rustc compiling those three crates. In
+  CI the gate is the first step of `check` that runs cargo (D2), and all
+  three crates are reviewed on every change (the always-review list).
 - A float, date or non-decimal integer in a manifest's
   `[package.metadata]` blocks the check (D6), where cargo would accept it.
   The message names the file and the feature.

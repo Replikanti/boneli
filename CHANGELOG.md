@@ -485,20 +485,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The architecture check is the Rust crate `boneli-arch-check`, a tool
   root in `roles.roots` that is held to every rule it enforces (ADR-015).
-  `tools/check-architecture.sh` builds it from `/` with the committed
-  lockfile into `target/arch-check`, so no cargo config or toolchain file
-  in the checkout applies to the gate's own build, and then runs it. The
-  rules, their ids, the output format, the flags and the fixture format
-  are unchanged; it reads TOML through `boneli-toml` and `cargo metadata`
-  through `boneli-json`, under limits. CI runs the architecture steps
-  before clippy and the tests, rejects committed build output and proves
-  that a committed `rustc-wrapper` does not reach the checker's build.
+  `tools/check-architecture.sh` runs every cargo call from `/`, so no
+  cargo config or toolchain file in the checkout applies; it refuses to
+  build when the checker's build closure holds any crate but its three, or
+  a workspace member has a build script or is a proc macro, and it builds
+  for the host triple with the committed lockfile into `target/arch-check`
+  after deleting the old binary, then runs it. The rules, their ids, the
+  output format, the flags and the fixture format are unchanged; it reads
+  TOML through `boneli-toml` and `cargo metadata` through `boneli-json`,
+  under limits. In CI the gate is the first step of `check` that runs
+  cargo (before rust-cache and `cargo fmt`) and fails if the checkout
+  changed while it ran; CI also rejects committed build output, proves
+  that a committed `rustc-wrapper` does not reach the checker's build and
+  replays the review's attacks on the entry point.
   During the parity stage CI ran the former Python checker on the
   workspace and on every fixture run, and both agreed on all 202 runs.
 - Nothing in the repository runs Python: `tools/check_architecture.py` is
-  removed, and CI's `check` and `sandbox` jobs shadow every Python
-  executable on PATH with a stub that logs the call and exits 127, and
-  fail if any step called one (ADR-015 D10). Two fixtures pin TOML the checker refuses
+  removed, CI's `check` and `sandbox` jobs shadow every Python executable
+  on PATH with a stub that logs the call and exits 127 and fail if any step
+  called one, and `check` fails if a tracked file names the interpreter
+  (ADR-015 D10). Two fixtures pin TOML the checker refuses
   where the former checker read it: a float in `[package.metadata]` and a
   date in the policy (ADR-015 D6).
 - The `boneli-oci` test that ran a Python helper to observe a process
@@ -506,6 +512,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a `harness = false` test on `boneli_sys::exit_main_thread` that asserts
   the kernel facts the store's liveness rule reads (ADR-009 D8, ADR-015
   D10).
+- The unused workspace dependency `boneli-oci` is gone from
+  `[workspace.dependencies]` (cargo warned about it on every build).
 - The `Dial` seam (`Dial`, `Stream`, `TlsDial`, and `Timed`, now public)
   moves from `boneli-oci` to `boneli-https`, unchanged, so the GitHub
   forge shares the deadline-under-TLS socket (ADR-014, D4). `boneli-oci`

@@ -36,7 +36,6 @@ boneli-memory = { path = "crates/boneli-memory" }
 boneli-https = { path = "crates/boneli-https" }
 boneli-json = { path = "crates/boneli-json" }
 boneli-toml = { path = "crates/boneli-toml" }
-boneli-oci = { path = "crates/boneli-oci" }
 boneli-store-fs = { path = "crates/boneli-store-fs" }
 boneli-sys = { path = "crates/boneli-sys" }
 boneli-git-cli = { path = "crates/boneli-git-cli" }
