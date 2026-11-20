@@ -180,9 +180,7 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
      so a certificate error surfaces there, not on the first read. `connect`
      resolves with std, tries each address with the connect timeout, sets
      the read and write timeouts on the socket and does not try another
-     address after a TLS failure. Changed by ADR-022
-     (Replikanti/boneli#81): `connect` resolves with the crate's own
-     resolver within the connect timeout, not with std.
+     address after a TLS failure.
    - The server name is checked before any I/O. rustls refuses names whose
      last label is a number (`127.1`, `0x7f000001`), the same rule ADR-003
      item 3 applies to hosts, so such a form never reaches `getaddrinfo`.

@@ -1065,18 +1065,25 @@ fn resolver_module_spawns_nothing_and_uses_no_std_lookup() {
     assert!(hits.is_empty(), "{hits:#?}");
 }
 
-/// The std calls that take `impl ToSocketAddrs`: given a name, each runs
-/// `getaddrinfo`, without a deadline. `TcpStream::connect_timeout` takes a
-/// `&SocketAddr` and is not one of them.
-const STD_LOOKUP_CALLS: [&str; 5] = [
-    "TcpStream::connect(",
-    "TcpListener::bind(",
-    "UdpSocket::bind(",
-    ".connect(",
-    ".send_to(",
+/// The std functions that take `impl ToSocketAddrs`, by path: given a
+/// name, each runs `getaddrinfo`, without a deadline. Every mention
+/// counts, not only a call: the UFCS form with the socket as the first
+/// argument (`UdpSocket::connect(s, addr)`) and the function passed as a
+/// value (`.map(TcpStream::connect)`) look up too.
+/// `TcpStream::connect_timeout` takes a `&SocketAddr` and is not one of
+/// them.
+const STD_LOOKUP_PATHS: [&str; 5] = [
+    "TcpStream::connect",
+    "TcpListener::bind",
+    "UdpSocket::bind",
+    "UdpSocket::connect",
+    "UdpSocket::send_to",
 ];
 
-/// Call sites of `STD_LOOKUP_CALLS` whose argument is a `SocketAddr`
+/// The method forms of the same lookups (`socket.connect(addr)`).
+const STD_LOOKUP_METHODS: [&str; 2] = [".connect(", ".send_to("];
+
+/// Call sites of the std lookups whose argument is a `SocketAddr`
 /// variable: the file under `src/` and the argument. The resolver's UDP
 /// socket binds the unspecified address of the server's family and
 /// connects to the server.
@@ -1100,7 +1107,7 @@ fn call_argument(rest: &str) -> &str {
     rest
 }
 
-/// Whether a `STD_LOOKUP_CALLS` argument cannot be a name: a string
+/// Whether a std lookup's argument cannot be a name: a string
 /// literal that parses as a socket address (std parses it before it would
 /// look anything up), or a `SocketAddr` variable of `SOCKET_ADDR_ARGS`.
 fn is_socket_addr(file: &str, argument: &str) -> bool {
@@ -1112,11 +1119,56 @@ fn is_socket_addr(file: &str, argument: &str) -> bool {
     literal || SOCKET_ADDR_ARGS.contains(&(file, argument))
 }
 
+/// The std lookups on one source line of `file`: the ones that may take
+/// a name, and the count of those whose argument is a socket address.
+/// A path followed by `(` is a call, and its argument is checked; for
+/// the UFCS forms the argument holds the socket too and never passes. A
+/// path followed by anything else (a value, a turbofish) is a lookup
+/// whose argument the scan cannot see.
+fn std_lookups(file: &str, line: &str) -> (Vec<String>, usize) {
+    // Calls as (name, the text after their `(`), and the hits that are
+    // no call.
+    let mut calls = Vec::new();
+    let mut hits = Vec::new();
+    for path in STD_LOOKUP_PATHS {
+        for (start, _) in line.match_indices(path) {
+            let rest = &line[start + path.len()..];
+            if path == "TcpStream::connect"
+                && rest
+                    .strip_prefix("_timeout")
+                    .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+            {
+                continue;
+            }
+            match rest.trim_start().strip_prefix('(') {
+                Some(rest) => calls.push((path, rest)),
+                None => hits.push(format!("{path}{rest}")),
+            }
+        }
+    }
+    for method in STD_LOOKUP_METHODS {
+        for (start, _) in line.match_indices(method) {
+            calls.push((&method[..method.len() - 1], &line[start + method.len()..]));
+        }
+    }
+    let mut allowed = 0;
+    for (name, rest) in calls {
+        let argument = call_argument(rest);
+        if is_socket_addr(file, argument) {
+            allowed += 1;
+        } else {
+            hits.push(format!("{name}({argument})"));
+        }
+    }
+    (hits, allowed)
+}
+
 /// No call site of the crate resolves with std any more (ADR-022, D7):
 /// `TlsDial`, `connect` and the CRL and OCSP fetches go through
 /// `Resolver`, so no `getaddrinfo` runs outside a deadline. Neither
-/// `ToSocketAddrs` nor a std call that takes it may appear, unless its
-/// argument is a socket address. Comment lines may name them.
+/// `ToSocketAddrs` nor a std function that takes it may appear, in any
+/// form, except in a call whose argument is a socket address. Comment
+/// lines may name them.
 #[test]
 fn crate_has_no_std_lookup() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1139,16 +1191,9 @@ fn crate_has_no_std_lookup() {
                     hits.push(format!("{at}: {token}"));
                 }
             }
-            for call in STD_LOOKUP_CALLS {
-                for (start, _) in line.match_indices(call) {
-                    let argument = call_argument(&line[start + call.len()..]);
-                    if is_socket_addr(relative, argument) {
-                        allowed += 1;
-                    } else {
-                        hits.push(format!("{at}: {call}{argument})"));
-                    }
-                }
-            }
+            let (found, socket_addrs) = std_lookups(relative, line);
+            hits.extend(found.into_iter().map(|hit| format!("{at}: {hit}")));
+            allowed += socket_addrs;
         }
     }
     assert!(hits.is_empty(), "{hits:#?}");
@@ -1174,17 +1219,31 @@ fn std_lookup_scan_rule() {
         ("dial.rs", "socket.send_to(&query, (name, 53))"),
         ("dial.rs", "socket.connect(server)"),
         ("resolve/exchange.rs", "UdpSocket::bind(\"localhost:0\")"),
+        // UFCS: the socket is the first argument.
+        (
+            "revocation/http.rs",
+            "std::net::UdpSocket::connect(s, (url.host(), url.port()))",
+        ),
+        ("revocation/http.rs", "UdpSocket::send_to(&s, buf, host)"),
+        ("resolve/exchange.rs", "UdpSocket::connect(&socket, server)"),
+        // The function as a value, and a turbofish.
+        ("revocation/http.rs", ".map(TcpStream::connect)"),
+        ("revocation/http.rs", "addrs.map(UdpSocket::bind)"),
+        ("revocation/http.rs", "TcpStream::connect::<&str>(host)"),
+        ("revocation/http.rs", "TcpStream::connect (host)"),
     ];
     for (file, line) in caught {
-        let call = STD_LOOKUP_CALLS
-            .into_iter()
-            .find(|c| line.contains(c))
-            .expect("a call");
-        let start = line.find(call).expect("call") + call.len();
-        assert!(
-            !is_socket_addr(file, call_argument(&line[start..])),
-            "{file}: {line}"
-        );
+        let (hits, allowed) = std_lookups(file, line);
+        assert_eq!((hits.len(), allowed), (1, 0), "{file}: {line}: {hits:?}");
+    }
+    for (file, line) in [
+        ("resolve/exchange.rs", "let socket = UdpSocket::bind(local)"),
+        ("resolve/exchange.rs", ".and_then(|s| s.connect(server))"),
+        ("revocation/http.rs", "TcpListener::bind(\"127.0.0.1:0\")"),
+        ("dial.rs", "TcpStream::connect_timeout(&addr, left)"),
+    ] {
+        let (hits, _) = std_lookups(file, line);
+        assert!(hits.is_empty(), "{file}: {line}: {hits:?}");
     }
     for (file, argument) in [
         ("resolve/exchange.rs", "local"),

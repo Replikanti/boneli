@@ -361,18 +361,21 @@ in resolv.conf(5).
 - In CI, through the call sites, against a name server that receives
   every query and never answers (deadline 300 ms; 250 ms tries, 3.75 s
   of them, so a lookup left running would send its next query at 500
-  ms): `TlsDial`, the CRL and the OCSP fetch end within 1 s, the fetches
-  with `TimedOut`, and no query arrives in the 600 ms after they
-  returned (`dial_fails_at_the_deadline_on_a_stalled_resolver`,
+  ms): `TlsDial`, `connect` (at a 300 ms `connect_timeout`), the CRL
+  and the OCSP fetch end within 1 s with `TimedOut` (the fetches
+  inside a revocation failure), and no query arrives in the 600 ms
+  after they returned (`dial_fails_at_the_deadline_on_a_stalled_resolver`,
+  `connect_lookup_stops_at_the_connect_timeout`,
   `crl_lookup_stops_at_the_request_deadline`,
   `ocsp_lookup_stops_at_the_request_deadline`; each fails against a
   lookup moved to a detached thread, run 2026-11-20), nor after a
-  direct lookup returned (`no_query_after_the_lookup_returns`);
-  `connect` ends at a 300 ms `connect_timeout` (try timeout 10 s); and
+  direct lookup returned (`no_query_after_the_lookup_returns`); and
   no source file of the crate outside comments names `to_socket_addrs`
-  or `ToSocketAddrs` or calls a std function that takes them
+  or `ToSocketAddrs`, or names a std function that takes them
   (`TcpStream::connect`, `TcpListener::bind`, `UdpSocket::bind`,
-  `connect` and `send_to`) with anything but a socket address
+  `UdpSocket::connect`, `UdpSocket::send_to`, in any form: a call, UFCS
+  or the function as a value; and the methods `connect` and `send_to`)
+  except in a call whose argument is a socket address
   (`crate_has_no_std_lookup`).
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte

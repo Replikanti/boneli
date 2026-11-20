@@ -1147,12 +1147,13 @@ fn tls_stream_is_a_transport() {
 // ------------------------------------------------- name resolution
 
 /// `connect`'s lookup ends at `connect_timeout` against a name server
-/// that never answers, not at the resolver's 10 s try timeout (ADR-022,
-/// D7).
+/// that never answers, not after the resolver's 3.75 s of tries
+/// (ADR-022, D7), and no query is sent once it returned: a lookup left
+/// running would send one at 500 ms (`Stalled::call_site_resolver`).
 #[test]
 fn connect_lookup_stops_at_the_connect_timeout() {
     let stalled = common::Stalled::start();
-    let config = config(test_roots()).with_resolver(stalled.resolver(Duration::from_secs(10), 2));
+    let config = config(test_roots()).with_resolver(stalled.call_site_resolver());
     let options = ConnectOptions::new(Duration::from_millis(300), GUARD, GUARD).expect("options");
     let start = Instant::now();
     let err = connect("stalled.boneli.test", 443, &config, &options).expect_err("no answer");
@@ -1168,6 +1169,8 @@ fn connect_lookup_stops_at_the_connect_timeout() {
         sent.is_multiple_of(2) && (2..=6).contains(&sent),
         "{sent} queries"
     );
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(stalled.take(), 0, "a query after connect returned");
 }
 
 /// A `connect_timeout` too large to add to the clock (`Duration::MAX`,
