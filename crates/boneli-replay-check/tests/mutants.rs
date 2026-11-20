@@ -35,8 +35,8 @@ fn every_clause_is_killed() {
 
 /// Every clause has a mutant, and a clause with sub-checks has one per
 /// sub-check: `silent-failure-detail` per operation of its port,
-/// `tampered-refused` per pull, `workspace-metadata-inert` and
-/// `uncitable-paths-carried` per sub-check.
+/// `tampered-refused` per pull, `workspace-metadata-inert`,
+/// `uncitable-paths-carried` and `patch-uncitable-paths` per sub-check.
 #[test]
 fn mutant_table_covers_every_clause() {
     type SubChecks = &'static [(&'static str, &'static [&'static str])];
@@ -67,6 +67,10 @@ fn mutant_table_covers_every_clause() {
             &[
                 ("workspace-metadata-inert", contract::git::METADATA_CHECKS),
                 ("uncitable-paths-carried", contract::git::UNCITABLE_CHECKS),
+                (
+                    "patch-uncitable-paths",
+                    contract::git::PATCH_UNCITABLE_CHECKS,
+                ),
             ],
         ),
         (

@@ -79,6 +79,24 @@ pub struct Patch {
     pub base_links: Vec<BaseLink>,
 }
 
+/// Why two trees have no [`Patch`] the policy can read: a path the patch
+/// would carry is not UTF-8, so it has no text form (ADR-018, D5;
+/// ADR-023, D6). The first such path is reported, changes before base
+/// links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadablePath {
+    /// A changed path is not UTF-8.
+    Change {
+        /// The index the change would have in [`Patch::changes`].
+        index: usize,
+    },
+    /// The path of a symlink of the base is not UTF-8.
+    BaseLink {
+        /// The index the link would have in [`Patch::base_links`].
+        index: usize,
+    },
+}
+
 /// The size limits, inclusive (ADR-013, D3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PatchLimits {

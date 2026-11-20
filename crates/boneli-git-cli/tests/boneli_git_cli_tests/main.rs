@@ -22,6 +22,7 @@ mod environment;
 mod fetch;
 mod network;
 mod open;
+mod patch;
 mod push;
 mod read;
 mod snapshot;

@@ -6,14 +6,15 @@
 //! formats, both under the extension rule of ADR-004. #19 adds branch push
 //! (ADR-014, D1): [`Git::push`] commits a checkout's tree on top of its
 //! base and creates a [`BranchName`] under [`BRANCH_PREFIX`] with it,
-//! never moving a branch that exists.
+//! never moving a branch that exists. #68 adds [`Git::patch_between`], the
+//! patch policy's input from two checkouts (ADR-023, D4).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use boneli_domain::CommitSha;
 use boneli_domain::values::is_blank;
+use boneli_domain::{CommitSha, Patch, UnreadablePath};
 
 use crate::path::RelativePath;
 
@@ -230,6 +231,28 @@ pub trait Git {
     /// against. A tree path the citation rule refuses is carried here as
     /// in [`Git::snapshot`] (ADR-018, D4).
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError>;
+
+    /// The change from `base`'s tree to `after`'s tree as the patch
+    /// policy's input, without loss (ADR-013, D1; ADR-023, D4):
+    ///
+    /// - every path whose entry differs in kind or bytes is a change, with
+    ///   both full sides (`None` where the path is absent), in strictly
+    ///   ascending byte order of the paths;
+    /// - `base_links` holds every symlink of `base`'s tree, unchanged ones
+    ///   included, in the same order;
+    /// - a gitlink is an [`EntryKind::Gitlink`](boneli_domain::EntryKind)
+    ///   side whose data is the commit id in hex. Nothing is left out, not
+    ///   even repository metadata: the policy refuses what it must.
+    ///
+    /// The outer `Result` covers the adapter and the inner one the content:
+    /// `Ok(Err(_))` names the first path the patch would carry that is not
+    /// UTF-8, changes before base links (ADR-018, D5). An unknown handle on
+    /// either side is [`GitError::UnknownCheckout`].
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError>;
 
     /// Commits the checkout's tree with its base commit as the only parent
     /// and pushes that commit to a new branch of the repository the base

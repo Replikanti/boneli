@@ -58,7 +58,7 @@ pub use gate::{
 };
 pub use patch::{
     BaseLink, Change, ChangeProblem, Entry, EntryKind, LinkProblem, NotText, Patch, PatchLimits,
-    PatchVerdict, PatchViolation, TestDisabling, patch_policy,
+    PatchVerdict, PatchViolation, TestDisabling, UnreadablePath, patch_policy,
 };
 pub use patch_js::Marker;
 pub use patch_path::ForbiddenClass;

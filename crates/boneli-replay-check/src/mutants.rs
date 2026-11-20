@@ -25,14 +25,14 @@ use boneli_app::{
     Written,
 };
 use boneli_domain::{
-    Budget, Citation, CitationStatus, CommitSha, EvidenceRef, FixChecks, RunEvent, RunId,
-    TestStatus, Ticket,
+    Budget, Change, Citation, CitationStatus, CommitSha, Entry, EntryKind, EvidenceRef, FixChecks,
+    Patch, RunEvent, RunId, TestStatus, Ticket, UnreadablePath,
 };
 use boneli_memory::{
     AgentScript, ForgeScript, GitCommit, MemoryAgent, MemoryDataSnapshot, MemoryEventStore,
     MemoryEvidence, MemoryForge, MemoryGit, MemoryImageStore, MemorySandbox, MemoryVerifier,
     Program, Response, ScriptedFailure, SequentialIds, StepClock, Tree, VerifierScript, pack_tree,
-    unpack_tree,
+    tree_patch, unpack_tree,
 };
 
 const STATUS: &str = "exit status 3";
@@ -847,6 +847,23 @@ enum GitBug {
     /// `snapshot` renders a path that is not UTF-8 through U+FFFD, and
     /// `diff` reads the rendered name back as the base's.
     LossyUncitable,
+    /// `patch_between` reports a change with equal sides when the trees
+    /// are equal, which the policy would refuse as malformed.
+    PatchSpurious,
+    /// `patch_between` drops every before side, so an edit looks like an
+    /// add and the base's test declarations are hidden.
+    PatchDropsBefore,
+    /// `patch_between` leaves out changes with no after side, which hides
+    /// a deleted test file.
+    PatchDropsRemovals,
+    /// `patch_between` of an unknown handle is an empty patch.
+    PatchUnknownEmpty,
+    /// `patch_between` leaves out a change at a path the citation rule
+    /// refuses.
+    PatchDropsUncitable,
+    /// `patch_between` renders paths through U+FFFD, so a path that is not
+    /// UTF-8 reaches the policy as one it accepts.
+    PatchLossyPaths,
 }
 
 const HEADER: &[u8] = b"diff\n";
@@ -1155,6 +1172,66 @@ impl Git for GitMutant {
             self.record(&applied, repo, base);
         }
         Ok(applied)
+    }
+
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError> {
+        let (from, to) = (self.resolve(base), self.resolve(after));
+        let got = match self.bug {
+            GitBug::PatchUnknownEmpty => match self.inner.patch_between(&from, &to) {
+                Err(GitError::UnknownCheckout) => {
+                    return Ok(Ok(Patch {
+                        changes: Vec::new(),
+                        base_links: Vec::new(),
+                    }));
+                }
+                other => other?,
+            },
+            GitBug::PatchLossyPaths => {
+                let lossy_tree = |c: &CheckoutId| -> Result<Tree, GitError> {
+                    let tree = unpack_tree(&self.inner.snapshot(c)?).unwrap_or_default();
+                    Ok(tree.into_iter().map(|(p, d)| (lossy(&p), d)).collect())
+                };
+                tree_patch(&lossy_tree(&from)?, &lossy_tree(&to)?)
+            }
+            _ => self.inner.patch_between(&from, &to)?,
+        };
+        let Ok(mut patch) = got else {
+            return Ok(got);
+        };
+        match self.bug {
+            GitBug::PatchSpurious if patch.changes.is_empty() => {
+                let tree = unpack_tree(&self.inner.snapshot(&from)?).unwrap_or_default();
+                let first = tree
+                    .iter()
+                    .find_map(|(p, d)| Some((std::str::from_utf8(p.as_bytes()).ok()?, d)));
+                if let Some((path, data)) = first {
+                    let side = Some(Entry {
+                        kind: EntryKind::File,
+                        data: data.clone(),
+                    });
+                    patch.changes.push(Change {
+                        path: path.to_owned(),
+                        before: side.clone(),
+                        after: side,
+                    });
+                }
+            }
+            GitBug::PatchDropsBefore => {
+                for change in &mut patch.changes {
+                    change.before = None;
+                }
+            }
+            GitBug::PatchDropsRemovals => patch.changes.retain(|c| c.after.is_some()),
+            GitBug::PatchDropsUncitable => patch
+                .changes
+                .retain(|c| !TreePath::parse(c.path.as_bytes()).is_ok_and(|p| is_uncitable(&p))),
+            _ => {}
+        }
+        Ok(Ok(patch))
     }
 
     fn push(
@@ -1704,6 +1781,8 @@ pub fn mutants() -> Vec<Mutant> {
             git_suite(bug)
         })
     };
+    let git_patch_uncitable =
+        |sub, bug| sub_mutant("Git", "patch-uncitable-paths", sub, move || git_suite(bug));
     let image = |clause, bug| {
         mutant("ImageStore", clause, move || {
             contract::image::run(|| images(bug))
@@ -1748,6 +1827,12 @@ pub fn mutants() -> Vec<Mutant> {
         git_uncitable("edit-round-trip", GitBug::IgnoresUncitableEdits),
         git_uncitable("remove-round-trip", GitBug::KeepsUncitableRemovals),
         git_uncitable("add-round-trip", GitBug::DropsNewUncitable),
+        git("patch-unchanged-empty", GitBug::PatchSpurious),
+        git("patch-full-sides", GitBug::PatchDropsBefore),
+        git("patch-added-removed", GitBug::PatchDropsRemovals),
+        git("patch-unknown-checkout", GitBug::PatchUnknownEmpty),
+        git_patch_uncitable("uncitable-carried", GitBug::PatchDropsUncitable),
+        git_patch_uncitable("unreadable-refused", GitBug::PatchLossyPaths),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
