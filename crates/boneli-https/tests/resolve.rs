@@ -637,6 +637,34 @@ fn stalled_server_times_out_at_the_deadline() {
     assert_eq!(fake.count(), 2);
 }
 
+/// Nothing outlives the call (#81, second criterion): with a 200 ms try
+/// timeout, 5 attempts and a 500 ms deadline, tries start at 0, 200 and
+/// 400 ms and the third ends at the deadline, so no fourth starts. Every
+/// query arrived before `lookup` returned, and none comes later.
+#[test]
+fn no_query_after_the_lookup_returns() {
+    let fake = Fake::start(|_, _, _| Reply::Silence);
+    let resolver = Resolver::fixed(config(&[&fake], Duration::from_millis(200), 5));
+    let start = Instant::now();
+    let err = lookup(&resolver, "git.example", Duration::from_millis(500)).expect_err("deadline");
+    let returned = Instant::now();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    assert!(
+        returned - start < Duration::from_secs(1),
+        "{:?}",
+        returned - start
+    );
+    let arrivals = fake.arrivals();
+    // 3 tries of an A and an AAAA query; fewer when CI is slow.
+    assert!(
+        arrivals.len().is_multiple_of(2) && (2..=6).contains(&arrivals.len()),
+        "{arrivals:?}"
+    );
+    assert!(arrivals.iter().all(|a| a.at < returned), "{arrivals:?}");
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(fake.count(), arrivals.len(), "a query after the return");
+}
+
 #[test]
 fn partial_answer_after_the_try_timeout() {
     let fake = Fake::start(|_, qtype, _| match qtype {
@@ -1028,6 +1056,33 @@ fn resolver_module_spawns_nothing_and_uses_no_std_lookup() {
                 continue;
             }
             for token in forbidden {
+                if line.contains(token) {
+                    hits.push(format!("{}:{}: {token}", file.display(), number + 1));
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+/// No call site of the crate resolves with std any more (ADR-022, D7):
+/// `TlsDial`, `connect` and the CRL and OCSP fetches go through
+/// `Resolver`, so no `getaddrinfo` runs outside a deadline. Comment lines
+/// may name it.
+#[test]
+fn crate_has_no_std_lookup() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    assert!(files.len() >= 15, "{files:?}");
+    let mut hits = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("source");
+        for (number, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for token in ["to_socket_addrs", "ToSocketAddrs"] {
                 if line.contains(token) {
                     hits.push(format!("{}:{}: {token}", file.display(), number + 1));
                 }

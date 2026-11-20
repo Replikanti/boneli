@@ -1,7 +1,10 @@
 //! The TLS client against a local rustls server on 127.0.0.1 (ADR-005):
 //! verification, protocol versions, ALPN, truncation, timeouts, trust
-//! roots, the idle check of a reused connection, and HTTPS through a
-//! CONNECT tunnel of `boneli-http`.
+//! roots, the idle check of a reused connection, HTTPS through a
+//! CONNECT tunnel of `boneli-http`, and `connect`'s name resolution
+//! (ADR-022).
+
+mod common;
 
 use std::cell::Cell;
 use std::io::{self, Read, Write};
@@ -1139,4 +1142,73 @@ fn tls_stream_is_a_transport() {
     fn assert_transport<T: Transport>() {}
     assert_transport::<TlsStream<TcpStream>>();
     assert_transport::<TlsStream<UnixStream>>();
+}
+
+// ------------------------------------------------- name resolution
+
+/// `connect`'s lookup ends at `connect_timeout` against a name server
+/// that never answers, not at the resolver's 10 s try timeout (ADR-022,
+/// D7).
+#[test]
+fn connect_lookup_stops_at_the_connect_timeout() {
+    let stalled = common::Stalled::start();
+    let config = config(test_roots()).with_resolver(stalled.resolver(Duration::from_secs(10), 2));
+    let options = ConnectOptions::new(Duration::from_millis(300), GUARD, GUARD).expect("options");
+    let start = Instant::now();
+    let err = connect("stalled.boneli.test", 443, &config, &options).expect_err("no answer");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut),
+        "{err:?}"
+    );
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    let sent = stalled.take();
+    assert!(
+        sent.is_multiple_of(2) && (2..=6).contains(&sent),
+        "{sent} queries"
+    );
+}
+
+/// Names rustls takes as server names but ADR-003's grammar does not (an
+/// underscore, a trailing dot) are refused before any query is sent or
+/// connection made, as `TlsDial` refuses them (ADR-022, D7).
+#[test]
+fn connect_refuses_names_outside_the_grammar_before_any_query() {
+    let stalled = common::Stalled::start();
+    let config = config(test_roots()).with_resolver(stalled.resolver(GUARD, 1));
+    for name in ["under_score.test", "localhost.", "git.example."] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let err = connect(name, port, &config, &options()).expect_err("outside the grammar");
+        // Past the server name check: the resolver refused it.
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+            "{name:?}: {err:?}"
+        );
+        assert_eq!(stalled.take(), 0, "{name:?}: a query was sent");
+        assert_eq!(
+            listener.accept().err().map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock),
+            "{name:?}: nothing dialed"
+        );
+    }
+}
+
+/// Upper case passes the server name check and worked through
+/// `getaddrinfo`; the resolver lowercases it, so `LOCALHOST` connects as
+/// `localhost` does, as loopback without a query.
+#[test]
+fn connect_upper_case_host_behaves_as_lower_case() {
+    let stalled = common::Stalled::start();
+    let config = config(test_roots()).with_resolver(stalled.resolver(GUARD, 1));
+    for name in ["localhost", "LOCALHOST", "LocalHost"] {
+        let (addr, _server) = http_server(default_server());
+        let tls = connect(name, addr.port(), &config, &options())
+            .unwrap_or_else(|e| panic!("{name:?}: {e:?}"));
+        let mut conn = Connection::new(tls, "localhost", wide()).expect("connection");
+        assert_eq!(get(&mut conn), (200, b"hello".to_vec()), "{name:?}");
+    }
+    assert_eq!(stalled.take(), 0, "a query was sent");
 }

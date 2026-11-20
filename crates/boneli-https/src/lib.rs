@@ -40,6 +40,15 @@
 //! on top of the timeout of each read and write, so a peer that sends a
 //! byte now and then cannot hold `connect` open.
 //!
+//! Names are resolved by the crate's own stub [`Resolver`] (ADR-022), never
+//! by `getaddrinfo`, which takes no timeout: `TlsDial`'s target and the
+//! hosts of every CRL and OCSP fetch under the request's or the check's
+//! deadline, `connect`'s host within `ConnectOptions::connect_timeout`.
+//! It reads `/etc/hosts` and asks the name servers of `/etc/resolv.conf`
+//! on the caller's thread, so no lookup outlives its call; names that only
+//! another NSS source knows (mDNS, LDAP, split DNS behind uplink servers)
+//! do not resolve. [`TlsConfig::with_resolver`] sets another resolver.
+//!
 //! `TlsStream` is a `boneli_http::Transport` when its stream is one, and an
 //! `IdleCheck` that counts what rustls already holds: plaintext it has
 //! decrypted, records that have arrived, and the part of a record that has
@@ -87,7 +96,7 @@ pub use sha256::Sha256;
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,6 +271,7 @@ pub struct TlsConfig {
     client: Arc<ClientConfig>,
     roots: Arc<RootCertStore>,
     revocation: Arc<Revocation>,
+    resolver: Resolver,
 }
 
 impl TlsConfig {
@@ -323,14 +333,11 @@ impl TlsConfig {
         // `key_log` stays rustls' `NoKeyLog`.
         let client = Arc::new(client);
         // `https` distribution points and OCSP responders are fetched over
-        // the same client without a revocation check, which keeps the
-        // fetch from recursing (ADR-017, item 6; ADR-020, item 8).
-        let fetch = TlsConfig {
-            client: Arc::clone(&client),
-            roots: Arc::clone(&roots),
-            revocation: Arc::new(Revocation::off()),
-        };
-        let source = Arc::new(HttpSource::new(fetch));
+        // the same client without a revocation check (`fetch_config`).
+        let resolver = Resolver::system();
+        let source = Arc::new(HttpSource::new(TlsConfig::fetch_config(
+            &client, &roots, &resolver,
+        )));
         Ok(TlsConfig {
             revocation: Arc::new(Revocation::on(
                 Arc::clone(&roots),
@@ -340,7 +347,49 @@ impl TlsConfig {
             )),
             client,
             roots,
+            resolver,
         })
+    }
+
+    /// What an `https` CRL or OCSP fetch connects with: the same client and
+    /// roots without a revocation check, which keeps the fetch from
+    /// recursing (ADR-017, item 6; ADR-020, item 8), and `resolver` for the
+    /// hosts of every fetch (ADR-022).
+    fn fetch_config(
+        client: &Arc<ClientConfig>,
+        roots: &Arc<RootCertStore>,
+        resolver: &Resolver,
+    ) -> TlsConfig {
+        TlsConfig {
+            client: Arc::clone(client),
+            roots: Arc::clone(roots),
+            revocation: Arc::new(Revocation::off()),
+            resolver: resolver.clone(),
+        }
+    }
+
+    /// The same configuration with names resolved by `resolver` (ADR-022,
+    /// D7): `TlsDial`'s target, `connect`'s host and the hosts of every CRL
+    /// and OCSP fetch. The default is [`Resolver::system`]. It installs
+    /// fetch sources over the new resolver for both CRLs and OCSP, so it
+    /// replaces a source set earlier by [`TlsConfig::with_crl_source`] or
+    /// [`TlsConfig::with_ocsp_source`]: call those after it. Both caches
+    /// start empty.
+    pub fn with_resolver(&self, resolver: Resolver) -> TlsConfig {
+        let source = Arc::new(HttpSource::new(TlsConfig::fetch_config(
+            &self.client,
+            &self.roots,
+            &resolver,
+        )));
+        TlsConfig {
+            client: Arc::clone(&self.client),
+            roots: Arc::clone(&self.roots),
+            revocation: Arc::new(self.revocation.with_sources(
+                Some(Arc::clone(&source) as Arc<dyn CrlSource>),
+                Some(source),
+            )),
+            resolver,
+        }
     }
 
     /// The same configuration with CRLs from `source`, the OCSP source of
@@ -354,6 +403,7 @@ impl TlsConfig {
             client: Arc::clone(&self.client),
             roots: Arc::clone(&self.roots),
             revocation: Arc::new(self.revocation.with_sources(Some(source), None)),
+            resolver: self.resolver.clone(),
         }
     }
 
@@ -369,6 +419,7 @@ impl TlsConfig {
             client: Arc::clone(&self.client),
             roots: Arc::clone(&self.roots),
             revocation: Arc::new(self.revocation.with_sources(None, Some(source))),
+            resolver: self.resolver.clone(),
         }
     }
 
@@ -376,11 +427,7 @@ impl TlsConfig {
     /// CRL or OCSP fetch connects with.
     #[cfg(test)]
     pub(crate) fn without_revocation(&self) -> TlsConfig {
-        TlsConfig {
-            client: Arc::clone(&self.client),
-            roots: Arc::clone(&self.roots),
-            revocation: Arc::new(Revocation::off()),
-        }
+        TlsConfig::fetch_config(&self.client, &self.roots, &self.resolver)
     }
 }
 
@@ -402,13 +449,13 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
-    /// `connect_timeout` bounds each TCP connection attempt of `connect`;
-    /// `connect_over` gets a stream that is already connected and does not
-    /// use it. `handshake_timeout` bounds the whole TLS handshake, however
-    /// the peer spreads its bytes. `io_timeout` bounds each read and write,
-    /// during the handshake and after it, when it becomes the stream's
-    /// read and write timeout. A zero value is an error: std rejects a zero
-    /// timeout.
+    /// `connect_timeout` bounds the name lookup of `connect` (ADR-022) and
+    /// each of its TCP connection attempts; `connect_over` gets a stream
+    /// that is already connected and does not use it. `handshake_timeout`
+    /// bounds the whole TLS handshake, however the peer spreads its bytes.
+    /// `io_timeout` bounds each read and write, during the handshake and
+    /// after it, when it becomes the stream's read and write timeout. A
+    /// zero value is an error: std rejects a zero timeout.
     pub fn new(
         connect_timeout: Duration,
         handshake_timeout: Duration,
@@ -424,7 +471,8 @@ impl ConnectOptions {
         })
     }
 
-    /// The timeout of each TCP connection attempt.
+    /// The timeout of `connect`'s name lookup and of each TCP connection
+    /// attempt.
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
@@ -448,11 +496,17 @@ fn server_name(name: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(name.to_owned()).map_err(|_| Error::InvalidServerName)
 }
 
-/// Resolves `host` with std, connects to each address in turn with
+/// Resolves `host` with the `TlsConfig`'s resolver within
+/// `connect_timeout` (ADR-022, D7), connects to each address in turn with
 /// `connect_timeout`, and completes the TLS handshake with `host` as the
 /// server name within `handshake_timeout`; then `io_timeout` is the
 /// socket's read and write timeout. A handshake failure is returned at
 /// once, without trying further addresses.
+///
+/// A host must be a server name ([`Error::InvalidServerName`] otherwise)
+/// and, ASCII-lowercased, in ADR-003's grammar, as for [`TlsDial`]: a name
+/// rustls accepts but the grammar does not (an underscore, a trailing dot)
+/// is `Error::Io` of kind `InvalidInput`, before any query is sent.
 pub fn connect(
     host: &str,
     port: u16,
@@ -463,8 +517,11 @@ pub fn connect(
     if port == 0 {
         return Err(Error::InvalidInput("port is zero"));
     }
+    let lookup_deadline = Instant::now()
+        .checked_add(options.connect_timeout)
+        .ok_or(Error::InvalidInput("the connect timeout is too large"))?;
     let mut last = None;
-    for addr in (host, port).to_socket_addrs()? {
+    for addr in config.resolver.lookup(host, port, lookup_deadline)? {
         match TcpStream::connect_timeout(&addr, options.connect_timeout) {
             Ok(tcp) => return handshake(tcp, name, config, options, None),
             Err(e) => last = Some(e),

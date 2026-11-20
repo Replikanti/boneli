@@ -588,9 +588,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DNS_MAX_NAME_SERVERS` (3), `DNS_DEFAULT_NDOTS` (1), `DNS_MAX_NDOTS`
   (15), `DNS_DEFAULT_TRY_TIMEOUT` (5 s), `DNS_MAX_TRY_TIMEOUT` (30 s),
   `DNS_DEFAULT_ATTEMPTS` (2), `DNS_MAX_ATTEMPTS` (5) and
-  `DNS_UDP_MESSAGE_BYTES` (512). No call site uses it yet: `TlsDial`,
-  `connect` and the CRL and OCSP fetches still resolve with
-  `getaddrinfo` until part 2. No new crate.
+  `DNS_UDP_MESSAGE_BYTES` (512). Part 2 moves the call sites onto it
+  (Changed). No new crate.
 - `Git::patch_between(base, after)` (part 1 of #68, ADR-023 proposed):
   the patch policy's input from two checkouts, every changed path with
   both full sides in byte order and every symlink of the base, or a
@@ -631,6 +630,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DebugTicket` gets the `Git` port; `DebugRequest` gets `repo` and
   `patch_limits`. Domain corpus 70 scenarios, app corpus 2,978
   (40 hand-written), git calls in the fault matrix.
+- `boneli-https` (#81, ADR-022 accepted): `TlsConfig::with_resolver`
+  sets the resolver of `TlsDial`, `connect` and the CRL and OCSP fetches
+  (default `Resolver::system()`). It installs fetch sources over the new
+  resolver, so it replaces a source set earlier by `with_crl_source` or
+  `with_ocsp_source`; set those after it.
 
 - `boneli-sys`: a statistics keeper per sandbox cgroup (ADR-007 D8,
   #54). The last step of `Cgroup::create` starts the thread
@@ -669,6 +673,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   field `git` and `DebugRequest` the fields `repo` and `patch_limits`;
   `RunEvent`, `EventKind`, `RunCommand` and `GateFailure` have new
   variants (#68).
+- `boneli-https` (#81, ADR-022): name resolution no longer goes through
+  `getaddrinfo`, which takes no timeout. `TlsDial` and the CRL and OCSP
+  fetches resolve with the `TlsConfig`'s resolver under the request's or
+  the check's deadline, so a name server that never answers ends the
+  call at its deadline (a fetch fails as `TimedOut`) instead of after
+  glibc's 10 to 28 s, and no lookup outlives its call. `connect`'s
+  lookup is bounded by `ConnectOptions::connect_timeout`, and `connect`
+  now refuses hosts outside the ADR-003 grammar (an underscore, a
+  trailing dot) with `Error::Io` of kind `InvalidInput` before any
+  query; upper case still passes. Names that only another NSS source
+  knows (mDNS, LDAP, split DNS behind uplink servers), the `LOCALDOMAIN`,
+  `RES_OPTIONS` and `HOSTALIASES` variables, gai.conf and the
+  hostname-derived search domain are no longer used, and IPv6
+  addresses come first even without an IPv6 route (that connect fails
+  at once and the next address is tried).
 - The root rules of `boneli-oci` and `boneli-store-fs` live in
   `boneli-private-dir` (#66, ADR-021); the error variants and texts of both
   adapters are unchanged. A missing root is created at the path the

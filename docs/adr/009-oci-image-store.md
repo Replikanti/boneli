@@ -935,7 +935,8 @@ Hub, 2026-11-16):
   deadline, within one `io` of it (`slow_body_deadline`). `TlsDial` holds
   the deadline below TLS (D10). The TCP connect takes at most
   `connect_timeout` or what is left of the deadline. Weak spot: name
-  resolution uses `getaddrinfo`, which has no timeout. The values are
+  resolution uses `getaddrinfo`, which has no timeout. Closed by ADR-022
+  (Replikanti/boneli#81). The values are
   part 3's, from the acceptance pulls of node:22 and postgres:17
   (`network::node_and_postgres_run_in_sandbox`, which measures every
   connection of the production `TlsDial`; 2026-11-16, three runs on the

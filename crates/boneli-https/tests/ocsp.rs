@@ -2,12 +2,15 @@
 //! local rustls servers on 127.0.0.1, with answers from a fake
 //! `OcspSource`: good, revoked and unknown leaves, every way an answer can
 //! fail to settle a leaf, resumed sessions, CONNECT tunnels, `TlsDial`'s
-//! deadline, clones, stapling and the default source.
+//! deadline, clones, stapling, the default source and its name
+//! resolution (ADR-022).
 //!
 //! The fixtures are openssl 3.5 certificates of the "Boneli OCSP test CA"
 //! and answers of `openssl ocsp -index` (`tests/data/README.md`). These
 //! tests do not prove interoperability with real responders;
 //! `tests/network.rs` and the crate's `ocsp::live` tests do, by hand.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -581,6 +584,45 @@ fn default_config_checks_ocsp() {
     let config = TlsConfig::new(roots()).expect("config");
     let error = connect_to(serve(GOOD), &config).expect_err("unknown");
     assert!(matches!(error, Error::RevocationUnknown(_)), "{error:?}");
+}
+
+/// The real source resolves the responder's host through the
+/// configuration's resolver under the request's deadline: against a name
+/// server that never answers, `TlsDial` fails at its 300 ms deadline with
+/// a timed-out fetch, not at the resolver's 10 s try timeout.
+#[test]
+fn ocsp_lookup_stops_at_the_request_deadline() {
+    let stalled = common::Stalled::start();
+    let config = TlsConfig::new(roots())
+        .expect("config")
+        .with_resolver(stalled.resolver(Duration::from_secs(10), 2));
+    let addr = serve(GOOD);
+    let dial = TlsDial::new(config, options());
+    let start = Instant::now();
+    let error = match dial.dial("localhost", addr.port(), start + Duration::from_millis(300)) {
+        Ok(_) => panic!("the dial passed"),
+        Err(e) => e,
+    };
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    let inner = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<Error>())
+        .expect("the TLS client's error");
+    match inner {
+        Error::RevocationUnknown(list) => {
+            let found: Vec<_> = list.iter().map(|f| (f.url.as_deref(), f.kind)).collect();
+            assert_eq!(found, [(Some(URL), RevocationFailureKind::TimedOut)]);
+        }
+        other => panic!("expected RevocationUnknown, got {other:?}"),
+    }
+    let sent = stalled.take();
+    assert!(
+        sent.is_multiple_of(2) && (2..=6).contains(&sent),
+        "{sent} queries"
+    );
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(stalled.take(), 0, "a query after the dial returned");
 }
 
 #[test]

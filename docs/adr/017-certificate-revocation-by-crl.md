@@ -487,7 +487,7 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
     resolver whose answers are dropped holds the check for its own
     timeout per URL. It is the same gap `TlsDial` has for its own target,
     and everything after the lookup is bounded. Both close in
-    Replikanti/boneli#81.
+    Replikanti/boneli#81. Closed by ADR-022 (Replikanti/boneli#81).
   - A cold cache adds one fetch per URL per process; a slow fetch could
     outlast a server's idle timeout on the open TLS connection
     (assumption, not measured: servers wait well over the measured 0.59

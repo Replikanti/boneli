@@ -1,8 +1,11 @@
 //! `TlsDial` against a local rustls server on 127.0.0.1 (ADR-009, D10 and
 //! D12; moved here from boneli-oci by ADR-014, D4): the request deadline
 //! holds below TLS, and a host outside the ADR-003 grammar is refused
-//! before anything is resolved or dialed. The server and its certificates
-//! are this crate's TLS test fixtures.
+//! before anything is resolved or dialed. The name is resolved by the
+//! configuration's resolver under the same deadline (ADR-022). The server
+//! and its certificates are this crate's TLS test fixtures.
+
+mod common;
 
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -10,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boneli_https::{ConnectOptions, Dial, Roots, TlsConfig, TlsDial};
+use boneli_https::{ConnectOptions, Dial, Error, Resolver, Roots, TlsConfig, TlsDial};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
@@ -26,12 +29,24 @@ const GUARD: Duration = Duration::from_secs(10);
 /// A dial that trusts the test CA only, with `io` as its read and write
 /// timeout and connect and handshake timeouts that never fire first.
 fn dial(io: Duration) -> TlsDial {
+    TlsDial::new(
+        config(),
+        ConnectOptions::new(GUARD, GUARD, io).expect("options"),
+    )
+}
+
+/// The test CA as the only root.
+fn config() -> TlsConfig {
     let mut roots = Roots::empty();
     assert_eq!(roots.add_pem(CA).expect("test CA"), 1);
-    let config = TlsConfig::new(roots).expect("config");
+    TlsConfig::new(roots).expect("config")
+}
+
+/// A dial whose names resolve through `resolver`.
+fn dial_with(resolver: Resolver) -> TlsDial {
     TlsDial::new(
-        config,
-        ConnectOptions::new(GUARD, GUARD, io).expect("options"),
+        config().with_resolver(resolver),
+        ConnectOptions::new(GUARD, GUARD, GUARD).expect("options"),
     )
 }
 
@@ -158,4 +173,79 @@ fn invalid_hosts_rejected_before_dialing() {
         Err(e) => e,
     };
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
+}
+
+/// A name server that receives every query and never answers (ADR-006's
+/// measurement): the dial fails with `TimedOut` at the request deadline,
+/// not at the resolver's 10 s try timeout (#81, first criterion), and no
+/// query is sent once it returned (second criterion).
+#[test]
+fn dial_fails_at_the_deadline_on_a_stalled_resolver() {
+    let stalled = common::Stalled::start();
+    let dial = dial_with(stalled.resolver(Duration::from_secs(10), 2));
+    let start = Instant::now();
+    let err = match dial.dial(
+        "stalled.boneli.test",
+        443,
+        start + Duration::from_millis(300),
+    ) {
+        Ok(_) => panic!("dialed"),
+        Err(e) => e,
+    };
+    let elapsed = start.elapsed();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err:?}");
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    // One try: the A and the AAAA query; even counts up to three tries
+    // tolerate CI jitter.
+    let sent = stalled.take();
+    assert!(
+        sent.is_multiple_of(2) && (2..=6).contains(&sent),
+        "{sent} queries"
+    );
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(stalled.take(), 0, "a query after the dial returned");
+}
+
+/// The address the resolver found is the one dialed: `name.boneli.test`
+/// is 127.0.0.1 only through the fake name server, and the test server
+/// there presents a leaf for `localhost` and `127.0.0.1`, so the dial
+/// reaches it and fails on the certificate's name.
+#[test]
+fn dial_uses_the_resolvers_address() {
+    let names = common::Loopback::start();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut tcp, _) = listener.accept()?;
+        tcp.set_read_timeout(Some(GUARD))?;
+        tcp.set_write_timeout(Some(GUARD))?;
+        let mut conn = ServerConnection::new(server_config()).map_err(io::Error::other)?;
+        while conn.is_handshaking() {
+            conn.complete_io(&mut tcp)?;
+        }
+        Ok(())
+    });
+    let err =
+        match dial_with(names.resolver()).dial("name.boneli.test", port, Instant::now() + GUARD) {
+            Ok(_) => panic!("a leaf for another name passed"),
+            Err(e) => e,
+        };
+    let inner = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<Error>())
+        .expect("the TLS client's error");
+    assert!(
+        matches!(
+            inner,
+            Error::Tls(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+                    | rustls::CertificateError::NotValidForNameContext { .. }
+            ))
+        ),
+        "{inner:?}"
+    );
+    // Only the server on 127.0.0.1 has that leaf, so the handshake ran
+    // there; it ends with the client's alert.
+    let _ = server.join().expect("server thread");
 }
