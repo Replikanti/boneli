@@ -378,7 +378,11 @@ in resolv.conf(5).
   except in a call whose argument is a socket address
   (`crate_has_no_std_lookup`). The scan is a text match: it does not see
   a method turbofish (`socket.connect::<&str>(host)`), a qualified path
-  (`<TcpStream>::connect(host)`), an alias or a macro.
+  (`<TcpStream>::connect(host)`), an alias or a macro. Since #93 the
+  scan reads tokens and keys on the names `connect`, `bind` and
+  `send_to` whatever path or alias comes before them, so it catches the
+  turbofish, the qualified path and the alias, and it refuses
+  `macro_rules!`, `include!` and a `#[path]` module.
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte
   flip of a valid answer.
