@@ -45,12 +45,73 @@ jobs:
             echo "FAIL: PR body needs 'Closes #N' or a 'No-Issue: <reason>' line"
             exit 1
           fi
+      # Nothing in the repository runs Python (ADR-015, D10): no tracked
+      # file names the interpreter, which catches shebangs and absolute
+      # paths that the PATH stubs below cannot see. ADR history and the
+      # vendored toml-test corpus are the allowed hits. Git only; `-a`
+      # reads every file as text, so no `.gitattributes` line of the PR can
+      # hide one as binary.
+      - name: No Python in tracked files
+        run: |
+          if git grep -n -a -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'; then
+            echo "a tracked file names the interpreter (ADR-015, D10)"
+            exit 1
+          fi
+      # The entry point runs the checker from target/arch-check, so build
+      # output must never come from the checkout (ADR-015, D2). Git only.
+      - name: No build output in the checkout
+        run: test -z "$(git ls-files -- target)"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           # The core crates must build for a target without std (ADR-001);
           # boneli-sys is checked for both musl targets (ADR-007, D5).
           targets: x86_64-unknown-none, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      # Nothing in the repository runs Python (ADR-015, D10). Every Python
+      # executable on PATH is shadowed by a stub of the same name that logs
+      # its arguments and exits 127, for every later step of this job; the
+      # last step fails if anything called one, even if a script swallowed
+      # the error. The `[p]` keeps this file free of hits of the grep step
+      # above.
+      - name: Hide Python
+        run: |
+          stubs="$RUNNER_TEMP/no-py"
+          mkdir -p "$stubs"
+          IFS=:
+          for dir in $PATH; do
+            for exe in "$dir"/[p]ython*; do
+              name=${exe##*/}
+              if [ -f "$exe" ] && [ -x "$exe" ] && [ ! -e "$stubs/$name" ]; then
+                printf '#!/bin/sh\nprintf "%%s %%s\\n" "%s" "$*" >> "%s/calls.log"\nexit 127\n' "$name" "$stubs" > "$stubs/$name"
+                chmod +x "$stubs/$name"
+              fi
+            done
+          done
+          unset IFS
+          ls "$stubs"
+          echo "$stubs" >> "$GITHUB_PATH"
+      # The gate is the first step that runs cargo in this job: before it
+      # only git, rustup and the version queries of the toolchain action
+      # have run, and RUSTUP_TOOLCHAIN outranks a committed toolchain file.
+      # rust-cache and cargo fmt read the checkout's cargo config (an alias
+      # can replace `cargo fmt`), so they come after it. The entry point
+      # runs every cargo call from `/` and refuses to build the checker when
+      # the build could run code from the checkout; the checker reports a
+      # committed cargo config before its own cargo calls read it. The
+      # checkout must be unchanged afterwards, untracked files included
+      # (ADR-015, D2).
+      - name: Architecture rules
+        run: |
+          ./tools/check-architecture.sh
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            echo "the architecture check changed the checkout:"
+            echo "$dirty"
+            exit 1
+          fi
+      # Every rule has fail cases; a weakened rule turns this step red.
+      - name: Architecture rule fixtures
+        run: ./tools/check-architecture.sh --fixtures
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -62,11 +123,155 @@ jobs:
         run: |
           cargo check -p boneli-sys --all-targets --target x86_64-unknown-linux-musl
           cargo check -p boneli-sys --all-targets --target aarch64-unknown-linux-musl
-      - name: Architecture rules
-        run: ./tools/check-architecture.sh
-      # Every rule has fail cases; a weakened rule turns this step red.
-      - name: Architecture rule fixtures
-        run: ./tools/check-architecture.sh --fixtures
+      # The entry point builds the checker from `/`, so a cargo config
+      # committed in the checkout cannot wrap the compiler of the gate
+      # itself; the check still reports the file (ADR-015, D2). The wrapper
+      # logs every compiler call it sees: the checker's own cargo calls go
+      # through it, its build must not.
+      - name: Architecture check builds outside committed cargo config
+        run: |
+          log="$RUNNER_TEMP/rustc-wrapper.log"
+          wrapper="$RUNNER_TEMP/rustc-wrapper.sh"
+          printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "$@"\n' "$log" > "$wrapper"
+          chmod +x "$wrapper"
+          mkdir .cargo
+          printf '[build]\nrustc-wrapper = "%s"\n' "$wrapper" > .cargo/config.toml
+          touch crates/boneli-arch-check/src/lib.rs
+          code=0
+          ./tools/check-architecture.sh > "$RUNNER_TEMP/arch.out" || code=$?
+          rm -r .cargo
+          cat "$RUNNER_TEMP/arch.out"
+          test "$code" = 1
+          grep -q '^FAIL \[cargo-config\] \.cargo/config\.toml: ' "$RUNNER_TEMP/arch.out"
+          test -s "$log"
+          if grep -q -- '--crate-name boneli_arch_check' "$log"; then
+            echo "the checker was built through the committed rustc-wrapper"
+            exit 1
+          fi
+      # Regression attacks on the entry point (ADR-015, D2), each on a
+      # fresh export of HEAD: a build script that deletes itself and a
+      # foreign crate in the checker's build closure stop the check before
+      # anything is built, a stale binary never runs, also with
+      # CARGO_BUILD_TARGET set, and a checker crate taken out of the
+      # workspace (also with its manifest path planted in a metadata table)
+      # or reached through a symlink is refused before its build script can
+      # run. Last, the
+      # gate must be the first step of this job that runs cargo or
+      # rust-cache.
+      - name: Architecture check refuses code that runs before it
+        run: |
+          a="$RUNNER_TEMP/attack"
+          out="$RUNNER_TEMP/attack.out"
+          fresh() {
+            rm -rf "$a"
+            mkdir "$a"
+            git archive HEAD | tar -x -C "$a"
+          }
+          gate() {
+            code=0
+            "$a/tools/check-architecture.sh" > "$out" || code=$?
+            cat "$out"
+          }
+          # 1. A build script in a checker crate that would delete itself.
+          fresh
+          printf 'fn main() {\n    let _ = std::fs::remove_file(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"));\n}\n' \
+            > "$a/crates/boneli-toml/build.rs"
+          gate
+          test "$code" = 1
+          grep -q '^FAIL \[build-script\] Cargo.toml: ' "$out"
+          test -f "$a/crates/boneli-toml/build.rs"
+          test ! -e "$a/target/arch-check"
+          # 2. A member crate the checker's build would compile.
+          fresh
+          mkdir -p "$a/crates/boneli-extra/src"
+          printf '[package]\nname = "boneli-extra"\nversion = "0.0.0"\nedition = "2024"\n' > "$a/crates/boneli-extra/Cargo.toml"
+          : > "$a/crates/boneli-extra/src/lib.rs"
+          printf '\n[dependencies]\nboneli-extra = { path = "../boneli-extra" }\n' >> "$a/crates/boneli-toml/Cargo.toml"
+          (cd "$a" && cargo update --workspace --offline --quiet)
+          gate
+          test "$code" = 2
+          grep -q "^FAIL \[tool-error\] Cargo.toml: the architecture checker's build would compile a crate other than" "$out"
+          test ! -e "$a/target/arch-check"
+          # 3. A stale binary where the fresh one goes, with build.target set.
+          # The fresh binary is a hard link into deps/, so it is replaced,
+          # not written through.
+          fresh
+          gate
+          test "$code" = 0
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          for stale in "$a/target/arch-check/$host/debug/boneli-arch-check" "$a/target/arch-check/debug/boneli-arch-check"; do
+            mkdir -p "${stale%/*}"
+            rm -f "$stale"
+            printf '#!/bin/sh\necho "OK: STALE"\n' > "$stale"
+            chmod +x "$stale"
+          done
+          code=0
+          CARGO_BUILD_TARGET=$host "$a/tools/check-architecture.sh" > "$out" || code=$?
+          cat "$out"
+          test "$code" = 0
+          if grep -q STALE "$out"; then
+            echo "a stale checker binary ran"
+            exit 1
+          fi
+          # 4. A checker crate excluded from the workspace, with a build
+          # script that would leave a marker.
+          fresh
+          sed -i 's|^members = \["crates/\*"\]$|&\nexclude = ["crates/boneli-toml"]|' "$a/Cargo.toml"
+          grep -q '^exclude = \["crates/boneli-toml"\]$' "$a/Cargo.toml"
+          printf '[package]\nname = "boneli-toml"\nversion = "0.0.0"\nedition = "2024"\n' > "$a/crates/boneli-toml/Cargo.toml"
+          printf 'fn main() {\n    let _ = std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../BUILD_SCRIPT_RAN"), "");\n}\n' \
+            > "$a/crates/boneli-toml/build.rs"
+          (cd "$a" && cargo metadata --offline --format-version 1 > /dev/null)
+          gate
+          test "$code" = 2
+          grep -q '^FAIL \[tool-error\] Cargo.toml: boneli-toml, which the architecture checker.s build compiles, is not a member of this workspace$' "$out"
+          test ! -e "$a/BUILD_SCRIPT_RAN"
+          test ! -e "$a/target/arch-check"
+          # 5. A checker crate whose directory is a symlink.
+          fresh
+          mv "$a/crates/boneli-json" "$a/elsewhere-json"
+          ln -s ../elsewhere-json "$a/crates/boneli-json"
+          gate
+          test "$code" = 2
+          grep -q '^FAIL \[tool-error\] Cargo.toml: crates/boneli-json is not a directory of this checkout without symlinks$' "$out"
+          test ! -e "$a/target/arch-check"
+          # 6. The excluded crate of 4, with its manifest path written into
+          # [workspace.metadata], then into a member's [package.metadata]:
+          # cargo metadata echoes both verbatim.
+          for table in workspace package; do
+            fresh
+            sed -i 's|^members = \["crates/\*"\]$|&\nexclude = ["crates/boneli-toml"]|' "$a/Cargo.toml"
+            printf '[package]\nname = "boneli-toml"\nversion = "0.0.0"\nedition = "2024"\n' > "$a/crates/boneli-toml/Cargo.toml"
+            printf 'fn main() {\n    let _ = std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../BUILD_SCRIPT_RAN"), "");\n}\n' \
+              > "$a/crates/boneli-toml/build.rs"
+            if [ "$table" = workspace ]; then
+              where="$a/Cargo.toml"
+            else
+              where="$a/crates/boneli-json/Cargo.toml"
+            fi
+            printf '\n[%s.metadata]\nmanifest_path = "%s"\n' "$table" "$a/crates/boneli-toml/Cargo.toml" >> "$where"
+            (cd "$a" && cargo metadata --offline --format-version 1 > /dev/null)
+            gate
+            test "$code" = 2
+            grep -q '^FAIL \[tool-error\] Cargo.toml: boneli-toml, which the architecture checker.s build compiles, is not a member of this workspace$' "$out"
+            test ! -e "$a/BUILD_SCRIPT_RAN"
+            test ! -e "$a/target/arch-check"
+          done
+          # 7. Nothing before the gate runs cargo or rust-cache.
+          before=$(awk '/^  check:$/ { j = 1; next } j && /^  [^ ]/ { exit } j && /- name: Architecture rules$/ { exit } j' .github/workflows/ci.yml | grep -v '^ *#' || true)
+          if printf '%s\n' "$before" | grep -n -E 'cargo|rust-cache'; then
+            echo "a step before the gate runs cargo or rust-cache"
+            exit 1
+          fi
+      - name: No Python was called
+        if: always()
+        run: |
+          if [ -e "$RUNNER_TEMP/no-py/calls.log" ]; then
+            echo "Python was called:"
+            cat "$RUNNER_TEMP/no-py/calls.log"
+            exit 1
+          fi
+          echo "OK: no step called Python"
 
   # The boneli-sys and boneli-oci host tests create user namespaces, so
   # they need a prepared host (ADR-007, D5; ADR-009). The job proves what
@@ -99,6 +304,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Nothing in the repository runs Python (ADR-015, D10). Every Python
+      # executable on PATH is shadowed by a stub of the same name that logs
+      # its arguments and exits 127, for every later step of this job; the
+      # last step fails if anything called one, even if a script swallowed
+      # the error. Third-party actions run before. The `[p]` keeps this
+      # file free of hits of the acceptance grep in ADR-015 D10.
+      - name: Hide Python
+        run: |
+          stubs="$RUNNER_TEMP/no-py"
+          mkdir -p "$stubs"
+          IFS=:
+          for dir in $PATH; do
+            for exe in "$dir"/[p]ython*; do
+              name=${exe##*/}
+              if [ -f "$exe" ] && [ -x "$exe" ] && [ ! -e "$stubs/$name" ]; then
+                printf '#!/bin/sh\nprintf "%%s %%s\\n" "%s" "$*" >> "%s/calls.log"\nexit 127\n' "$name" "$stubs" > "$stubs/$name"
+                chmod +x "$stubs/$name"
+              fi
+            done
+          done
+          unset IFS
+          ls "$stubs"
+          echo "$stubs" >> "$GITHUB_PATH"
       - name: Host features
         run: |
           uname -srm
@@ -174,6 +402,15 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self \
             cargo test -p boneli-oci --test boneli_oci_tests -- --ignored host::
+      - name: No Python was called
+        if: always()
+        run: |
+          if [ -e "$RUNNER_TEMP/no-py/calls.log" ]; then
+            echo "Python was called:"
+            cat "$RUNNER_TEMP/no-py/calls.log"
+            exit 1
+          fi
+          echo "OK: no step called Python"
 
   audit:
     runs-on: ubuntu-latest

@@ -35,3 +35,10 @@ multiple_unsafe_ops_per_block = "forbid"
 # tools/architecture.toml (decision ADR-001, the strict libc edge). Its
 # build script is approved by ADR-005. No other dependency (ADR-007).
 libc = "0.2.191"
+
+# Its own `main`: only the main thread can end itself with
+# `exit_main_thread`, and libtest runs every test on a spawned thread
+# (#35, ADR-015 D10).
+[[test]]
+name = "exit_main_thread"
+harness = false

@@ -1,0 +1,5 @@
+# A float in a member's [package.metadata]: cargo accepts it, and the
+# former checker's TOML parser read it, but the checker's TOML subset has
+# no floats, so the manifest is a tool error that names the feature
+# (ADR-011 D1, ADR-015 D6).
+tool-error

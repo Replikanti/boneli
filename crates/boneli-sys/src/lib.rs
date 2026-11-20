@@ -8,8 +8,10 @@
 //! IPC, UTS and cgroup namespaces with a read-only root ([`Root`], ADR-007
 //! D7) inside a cgroup whose limits are in place before it starts
 //! ([`Cgroup`], ADR-007 D8), and it checks that a host has what the
-//! runtime needs ([`Features::probe`], ADR-007 D3). The kernel is reached
-//! through `libc` only.
+//! runtime needs ([`Features::probe`], ADR-007 D3). For tests that need a
+//! process whose main thread has exited while another thread runs, it can
+//! end the main thread alone ([`exit_main_thread`], ADR-015 D10). The
+//! kernel is reached through `libc` only.
 //!
 //! The crate builds only for little-endian Linux on x86_64 and aarch64:
 //! the syscall tables and the `seccomp_data` layout the runtime relies on
@@ -32,6 +34,7 @@ mod layer;
 mod mount;
 mod report;
 mod spawn;
+mod thread;
 
 pub use cgroup::{
     Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
@@ -43,6 +46,7 @@ pub use ids::Ids;
 pub use layer::{make_fifo, make_whiteout, mark_opaque, sync_filesystem, user_xattr};
 pub use mount::{DEV_ENTRIES, Hostname, InsidePath, Mount, OPTIONS_MAX, Root};
 pub use spawn::{Child, ExitStatus, Spec, Stdio, spawn};
+pub use thread::exit_main_thread;
 
 #[cfg(test)]
 mod test_guard;

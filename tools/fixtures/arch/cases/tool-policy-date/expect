@@ -1,0 +1,4 @@
+# A date in the policy: the former checker's TOML parser read it, but the
+# checker's TOML subset has no dates or times, so the policy is a tool
+# error that names the feature (ADR-011 D1, ADR-015 D6).
+tool-error

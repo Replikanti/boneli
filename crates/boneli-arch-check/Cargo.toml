@@ -1,0 +1,23 @@
+[package]
+name = "boneli-arch-check"
+description = "Tool root: the architecture and dependency rules of the workspace and their fixture runner, run by tools/check-architecture.sh (ADR-001, ADR-015)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# A tool root (ADR-015): it is listed in roles.roots of
+# tools/architecture.toml, so nothing may depend on it and it is held to
+# every rule it enforces. No external crate and no build script.
+[dependencies]
+# Parses the output of `cargo metadata` under limits (ADR-008, ADR-015 D4).
+# A root -> support edge, which the graph rules allow.
+boneli-json.workspace = true
+# Parses Cargo manifests and tools/architecture.toml under limits (ADR-011,
+# ADR-015 D4). A root -> support edge, which the graph rules allow.
+boneli-toml.workspace = true

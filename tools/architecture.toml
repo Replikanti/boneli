@@ -1,4 +1,5 @@
-# Architecture and dependency policy, read by tools/check_architecture.py.
+# Architecture and dependency policy, read by the architecture checker
+# (crates/boneli-arch-check, run by tools/check-architecture.sh).
 # Why each part exists: docs/adr/001-core-purity-and-dependency-allowlist.md.
 #
 # Format: only [table] headers, bare keys, basic strings and arrays of
@@ -32,7 +33,11 @@ support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-t
 # against real services. It declares those adapters as regular
 # dependencies, so this check holds it to the root rules, and as a leaf no
 # crate can depend on it.
-roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check", "boneli-acceptance"]
+# boneli-arch-check is the tool root of ADR-015: the architecture checker
+# itself, a binary that tools/check-architecture.sh builds and runs. As a
+# member it is held to every rule it enforces, and as a leaf no crate can
+# depend on it.
+roots = ["boneli-runner", "boneli-gw", "boneli-egress", "boneli-shim", "boneli-cli", "boneli-replay-check", "boneli-acceptance", "boneli-arch-check"]
 # The only crates that may contain `unsafe`.
 unsafe = ["boneli-sys"]
 # The only crates that may have a build script (and with it a `links` key,

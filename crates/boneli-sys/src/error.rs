@@ -73,6 +73,9 @@ pub enum Error {
     HostUnsupported(Vec<Missing>),
     /// The child was already waited for.
     AlreadyWaited,
+    /// `exit_main_thread` was called on a thread other than the main
+    /// thread; nothing changed (#35).
+    NotMainThread,
     /// A path inside the sandbox is not of the accepted form (ADR-007, D7).
     InvalidInsidePath {
         /// The path, lossily rendered.
@@ -210,6 +213,10 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::AlreadyWaited => write!(f, "the child was already waited for"),
+            Error::NotMainThread => write!(
+                f,
+                "exit_main_thread was called on a thread that is not the main thread"
+            ),
             Error::InvalidInsidePath { path, reason } => {
                 write!(f, "sandbox path {path:?} {reason}")
             }

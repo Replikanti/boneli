@@ -475,9 +475,49 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cost nothing and never carry a body, token, JWT or key bytes.
 - `boneli-acceptance`: a test-only composition root for live tests, with
   the gated GitHub test (`docs/forge-github.md`, the operator guide).
+- `boneli_sys::exit_main_thread` (ADR-015 D10): ends the calling thread
+  with `SYS_exit` when it is the main thread, so the process runs on with
+  a zombie leader; on any other thread it returns `Error::NotMainThread`
+  and changes nothing. `tests/exit_main_thread.rs` (`harness = false`)
+  runs it in a real process.
 
 ### Changed
 
+- The architecture check is the Rust crate `boneli-arch-check`, a tool
+  root in `roles.roots` that is held to every rule it enforces (ADR-015).
+  `tools/check-architecture.sh` runs every cargo call from `/`, so no
+  cargo config or toolchain file in the checkout applies; it refuses to
+  build when the checker's build closure holds any crate but its three,
+  when one of them is not a workspace member as cargo resolves it or its
+  directory is reached through a symlink, or when a workspace member has a
+  build script or is a proc macro, reading only cargo output the checkout
+  cannot fill with text or tests that added text can only make stricter,
+  and it builds
+  for the host triple with the committed lockfile into `target/arch-check`
+  after deleting the old binary, then runs it. The rules, their ids, the
+  output format, the flags and the fixture format are unchanged; it reads
+  TOML through `boneli-toml` and `cargo metadata` through `boneli-json`,
+  under limits. In CI the gate is the first step of `check` that runs
+  cargo (before rust-cache and `cargo fmt`) and fails if the checkout
+  changed while it ran; CI also rejects committed build output, proves
+  that a committed `rustc-wrapper` does not reach the checker's build and
+  replays the review's attacks on the entry point.
+  During the parity stage CI ran the former Python checker on the
+  workspace and on every fixture run, and both agreed on all 202 runs.
+- Nothing in the repository runs Python: `tools/check_architecture.py` is
+  removed, CI's `check` and `sandbox` jobs shadow every Python executable
+  on PATH with a stub that logs the call and exits 127 and fail if any step
+  called one, and `check` fails if a tracked file, read as text whatever
+  its attributes, names the interpreter (ADR-015 D10). Two fixtures pin TOML the checker refuses
+  where the former checker read it: a float in `[package.metadata]` and a
+  date in the policy (ADR-015 D6).
+- The `boneli-oci` test that ran a Python helper to observe a process
+  whose main thread has exited is replaced by `tests/exited_main_thread.rs`,
+  a `harness = false` test on `boneli_sys::exit_main_thread` that asserts
+  the kernel facts the store's liveness rule reads (ADR-009 D8, ADR-015
+  D10).
+- The unused workspace dependency `boneli-oci` is gone from
+  `[workspace.dependencies]` (cargo warned about it on every build).
 - The `Dial` seam (`Dial`, `Stream`, `TlsDial`, and `Timed`, now public)
   moves from `boneli-oci` to `boneli-https`, unchanged, so the GitHub
   forge shares the deadline-under-TLS socket (ADR-014, D4). `boneli-oci`

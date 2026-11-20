@@ -42,3 +42,10 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # 1.89 since ADR-012).
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 
+
+# Its own `main`: the process whose main thread has exited comes from
+# `boneli_sys::exit_main_thread`, which only a main thread can call, and
+# libtest runs every test on a spawned thread (#35, ADR-015 D10).
+[[test]]
+name = "exited_main_thread"
+harness = false
