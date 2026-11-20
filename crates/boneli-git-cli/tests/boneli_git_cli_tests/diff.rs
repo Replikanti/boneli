@@ -5,7 +5,8 @@ use boneli_app::{CheckoutId, Git};
 use boneli_git_cli::{GitCli, Kind, Workspace};
 
 use crate::support::{
-    Source, TempDir, Trip, cli, decode, edit, edit_kind, failed, host_git, listing, open, path, sha,
+    Source, TempDir, Trip, cli, decode, edit, edit_kind, failed, host_git, listing, open, path,
+    sha, tpath,
 };
 
 fn fetched(tmp: &TempDir, source: &Source, base: &str) -> (GitCli, CheckoutId, Vec<u8>) {
@@ -32,9 +33,9 @@ fn diff_follows_gitignore() {
         source.commit("base")
     };
     let (git, c, snapshot) = fetched(&tmp, &source, &base);
-    let w = edit(&snapshot, &path("dist/out.js"), Some(b"built"));
+    let w = edit(&snapshot, &tpath("dist/out.js"), Some(b"built"));
     assert_eq!(git.diff(&c, &w), Ok(vec![]));
-    let w = edit(&w, &path("tracked.log"), Some(b"two\n"));
+    let w = edit(&w, &tpath("tracked.log"), Some(b"two\n"));
     let diff = String::from_utf8(git.diff(&c, &w).expect("diff")).expect("utf8");
     assert!(diff.contains("b/tracked.log"), "{diff}");
     assert!(!diff.contains("dist/out.js"), "{diff}");
@@ -55,11 +56,11 @@ fn attributes_do_not_convert_content() {
     assert_eq!(git.diff(&c, &snapshot), Ok(vec![]));
     let w = edit(
         &snapshot,
-        &path(".gitattributes"),
+        &tpath(".gitattributes"),
         Some(b"* text=auto\n*.txt text eol=crlf\n"),
     );
-    let w = edit(&w, &path("a.txt"), Some(b"lf\n"));
-    let w = edit(&w, &path("b.txt"), Some(b"crlf\r\n"));
+    let w = edit(&w, &tpath("a.txt"), Some(b"lf\n"));
+    let w = edit(&w, &tpath("b.txt"), Some(b"crlf\r\n"));
     let diff = git.diff(&c, &w).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     assert_eq!(git.read(&after, &path("a.txt")), Ok(Some(b"lf\n".to_vec())));
@@ -82,7 +83,7 @@ fn mode_change_round_trip() {
     let (git, c, snapshot) = fetched(&tmp, &source, &base);
     let w = edit_kind(
         &snapshot,
-        &path("run.sh"),
+        &tpath("run.sh"),
         Some((Kind::Executable, b"#!/bin/sh\n")),
     );
     let diff = git.diff(&c, &w).expect("diff");
@@ -90,7 +91,7 @@ fn mode_change_round_trip() {
     let after = git.apply(&c, &diff).expect("apply");
     let applied = decode(&git.snapshot(&after).expect("snapshot"));
     assert_eq!(
-        applied.get(&path("run.sh")).map(|(k, _)| k),
+        applied.get(&tpath("run.sh")).map(|(k, _)| k),
         Some(Kind::Executable)
     );
 }
@@ -104,11 +105,11 @@ fn metadata_forms_are_dropped() {
     source.write("a", b"a", false);
     let base = source.commit("base");
     let (git, c, snapshot) = fetched(&tmp, &source, &base);
-    let plain = edit(&snapshot, &path("a"), Some(b"b"));
+    let plain = edit(&snapshot, &tpath("a"), Some(b"b"));
     let want = git.diff(&c, &plain).expect("diff");
     assert!(!want.is_empty());
     let trip = Trip::new(&tmp);
-    let without_git: Vec<(boneli_app::RelativePath, Kind, Vec<u8>)> = decode(&plain)
+    let without_git: Vec<(boneli_app::TreePath, Kind, Vec<u8>)> = decode(&plain)
         .iter()
         .filter(|(p, _, _)| !p.is_repository_metadata())
         .map(|(p, k, d)| (p.clone(), k, d.to_vec()))
@@ -116,23 +117,23 @@ fn metadata_forms_are_dropped() {
     let forms: Vec<Vec<u8>> = vec![
         edit(
             &plain,
-            &trip.fsmonitor_config().0,
+            &(&trip.fsmonitor_config().0).into(),
             Some(&trip.fsmonitor_config().1),
         ),
-        edit(&plain, &trip.nested().0, Some(&trip.nested().1)),
+        edit(&plain, &(&trip.nested().0).into(), Some(&trip.nested().1)),
         {
             let mut list = without_git.clone();
-            list.push((path(".git"), Kind::File, b"gitdir: /elsewhere\n".to_vec()));
+            list.push((tpath(".git"), Kind::File, b"gitdir: /elsewhere\n".to_vec()));
             crate::support::encode(list)
         },
         {
             let mut list = without_git.clone();
-            list.push((path(".git"), Kind::Symlink, b"/".to_vec()));
+            list.push((tpath(".git"), Kind::Symlink, b"/".to_vec()));
             crate::support::encode(list)
         },
         {
             let mut list = without_git.clone();
-            list.push((path("sub/.git"), Kind::Symlink, b"../..".to_vec()));
+            list.push((tpath("sub/.git"), Kind::Symlink, b"../..".to_vec()));
             crate::support::encode(list)
         },
     ];
@@ -160,8 +161,13 @@ fn lookalikes_are_refused() {
         ".git./x",
         ".git /x",
         ".g\u{200C}it/x",
+        // `\\` splits components too (ADR-018, D3).
+        "x\\.git",
+        ".git\\config",
+        "x\\GIT~1",
+        "x\\.g\u{200B}it",
     ] {
-        let w = edit(&snapshot, &path(p), Some(b"[core]\n"));
+        let w = edit(&snapshot, &tpath(p), Some(b"[core]\n"));
         failed(git.diff(&c, &w));
         scratch_is_empty(&git);
     }
@@ -183,7 +189,7 @@ fn workspace_entry_cap() {
     let own = git.snapshot(&c).expect("snapshot at the cap");
     assert_eq!(own, snapshot);
     assert_eq!(git.diff(&c, &own), Ok(vec![]));
-    let one_more = edit(&own, &path("z"), Some(b"z"));
+    let one_more = edit(&own, &tpath("z"), Some(b"z"));
     assert_eq!(decode(&one_more).nodes(), k + 1);
     let detail = failed(git.diff(&c, &one_more));
     assert!(detail.contains(&k.to_string()), "{detail}");
@@ -206,7 +212,7 @@ fn diff_cleans_scratch() {
         scratch_is_empty(&git);
     }
     // And after a good diff.
-    git.diff(&c, &edit(&snapshot, &path("a"), Some(b"b")))
+    git.diff(&c, &edit(&snapshot, &tpath("a"), Some(b"b")))
         .expect("diff");
     scratch_is_empty(&git);
     assert_eq!(Workspace::new().encode().len(), boneli_git_cli::MAGIC.len());
@@ -221,7 +227,7 @@ fn concurrent_diffs_do_not_share_scratch() {
     }
     let base = source.commit("base");
     let (git, c, snapshot) = fetched(&tmp, &source, &base);
-    let w = edit(&snapshot, &path("f7"), Some(b"y\n"));
+    let w = edit(&snapshot, &tpath("f7"), Some(b"y\n"));
     let (one, two) = std::thread::scope(|s| {
         let a = s.spawn(|| git.diff(&c, &w));
         let b = s.spawn(|| git.diff(&c, &w));
@@ -265,7 +271,7 @@ fn diff_leaves_the_store_unchanged() {
     for k in 0..200 {
         w = edit(
             &w,
-            &path(&format!("new/f{k}")),
+            &tpath(&format!("new/f{k}")),
             Some(format!("{k}\n").as_bytes()),
         );
     }
@@ -303,7 +309,7 @@ fn diff_under_a_root_with_a_colon() {
     let snapshot = git.snapshot(&c).expect("snapshot");
     assert_eq!(git.diff(&c, &snapshot), Ok(vec![]));
     let diff = git
-        .diff(&c, &edit(&snapshot, &path("a"), Some(b"b")))
+        .diff(&c, &edit(&snapshot, &tpath("a"), Some(b"b")))
         .expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     assert_eq!(git.read(&after, &path("a")), Ok(Some(b"b".to_vec())));
@@ -323,11 +329,11 @@ fn ident_and_encoding_are_not_applied() {
     let utf16: &[u8] = b"h\0i\0\n\0";
     let w = edit(
         &snapshot,
-        &path(".gitattributes"),
+        &tpath(".gitattributes"),
         Some(b"* ident\nu.txt working-tree-encoding=UTF-16LE\n"),
     );
-    let w = edit(&w, &path("id.txt"), Some(id));
-    let w = edit(&w, &path("u.txt"), Some(utf16));
+    let w = edit(&w, &tpath("id.txt"), Some(id));
+    let w = edit(&w, &tpath("u.txt"), Some(utf16));
     let diff = git.diff(&c, &w).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     assert_eq!(git.read(&after, &path("id.txt")), Ok(Some(id.to_vec())));
@@ -366,13 +372,41 @@ fn lookalikes_are_refused_before_git_runs() {
         // Default-ignorable, but not in git's HFS list.
         "sub/.g\u{200B}it",
         "sub/\u{FEFF}.GiT",
+        // `\\` splits components, as git's NTFS check splits them; the
+        // first three git refuses itself, the last it accepts (ADR-018,
+        // D3).
+        "sub/x\\.git",
+        "sub/.git\\config",
+        "sub/x\\GIT~1",
+        "sub/x\\.g\u{200B}it",
     ] {
-        let w = edit(&snapshot, &path(p), Some(gitfile.as_bytes()));
-        let w = edit(&w, &path("sub/x"), Some(b"x"));
+        let w = edit(&snapshot, &tpath(p), Some(gitfile.as_bytes()));
+        let w = edit(&w, &tpath("sub/x"), Some(b"x"));
         recorder.clear();
         let detail = failed(git.diff(&c, &w));
         assert!(detail.contains(&format!("{p:?}")), "{p:?}: {detail}");
         assert!(recorder.calls().is_empty(), "{p:?}: {:?}", recorder.calls());
+        scratch_is_empty(&git);
+    }
+    // A name that is `.git` once its bytes that are not UTF-8 are read is
+    // refused too, and the detail escapes them.
+    for (p, shown) in [
+        (&b"sub/.g\xffit"[..], "\"sub/.g\\xffit\""),
+        (b"sub/\xc0\xaegit", "\"sub/\\xc0\\xaegit\""),
+    ] {
+        let w = edit(
+            &snapshot,
+            &crate::support::bpath(p),
+            Some(gitfile.as_bytes()),
+        );
+        recorder.clear();
+        let detail = failed(git.diff(&c, &w));
+        assert!(detail.contains(shown), "{shown}: {detail}");
+        assert!(
+            recorder.calls().is_empty(),
+            "{shown}: {:?}",
+            recorder.calls()
+        );
         scratch_is_empty(&git);
     }
     // Names that only start like `.git` are content.
@@ -386,11 +420,41 @@ fn lookalikes_are_refused_before_git_runs() {
         ".git~1",
     ]
     .iter()
-    .fold(snapshot.clone(), |w, p| edit(&w, &path(p), Some(b"ok\n")));
+    .fold(snapshot.clone(), |w, p| edit(&w, &tpath(p), Some(b"ok\n")));
     let diff = git.diff(&c, &w).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     assert_eq!(
         git.read(&after, &path(".git~1")),
         Ok(Some(b"ok\n".to_vec()))
     );
+}
+
+/// Each class of path the citation rule refuses, and its twin, round-trips
+/// through `diff` and `apply`: changed, removed and added, the snapshot of
+/// the applied checkout is the edited workspace (ADR-018, D4).
+#[test]
+fn diff_carries_uncitable_changes() {
+    let tmp = TempDir::new("uncitable-changes");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"a", false);
+    for (p, data) in crate::support::uncitable() {
+        source.write_bytes(p.as_bytes(), &data, false);
+    }
+    let base = source.commit("base");
+    let (git, c, snapshot) = fetched(&tmp, &source, &base);
+    for (p, data) in crate::support::uncitable() {
+        let twin = crate::support::bpath(&[p.as_bytes(), "\u{200B}".as_bytes()].concat());
+        let changed = [data.as_slice(), b"+"].concat();
+        for w in [
+            edit(&snapshot, &p, Some(&changed)),
+            edit(&snapshot, &p, None),
+            edit(&snapshot, &twin, Some(&data)),
+        ] {
+            assert_ne!(w, snapshot);
+            let diff = git.diff(&c, &w).expect("diff");
+            let after = git.apply(&c, &diff).expect("apply");
+            assert_eq!(git.snapshot(&after), Ok(w), "{p:?}");
+        }
+    }
+    scratch_is_empty(&git);
 }

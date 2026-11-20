@@ -2,8 +2,8 @@
 //! once): the SHA fetch, the https transport without `PATH`, and the fixed
 //! environment against a real forge.
 
-use boneli_app::{Git, GitError, RepoUrl};
-use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Transports};
+use boneli_app::{Git, RepoUrl, TreePath};
+use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Kind, Transports, Workspace};
 
 use crate::support::{TempDir, host_git, path, sha};
 
@@ -30,11 +30,15 @@ fn fetches_this_repository() {
         .expect("a Cargo.toml");
     assert!(String::from_utf8_lossy(&manifest).contains("[workspace]"));
     // This tree holds an architecture-checker fixture whose name has a
-    // backslash, which the workspace path rule refuses (ADR-010, D2), so
-    // its snapshot fails closed and names the path.
-    let detail = match git.snapshot(&c) {
-        Err(GitError::Failed { detail }) => detail,
-        other => panic!("expected the backslash path to be refused: {other:?}"),
-    };
-    assert!(detail.contains("Backslash"), "{detail}");
+    // backslash. The citation rule refuses it, the workspace carries it
+    // (ADR-018, D4): the snapshot holds it as written, a file with the
+    // content `x` (blob c1b0730e).
+    let snapshot = git.snapshot(&c).expect("the snapshot");
+    let w = Workspace::decode(&snapshot, usize::MAX).expect("the adapter's own format");
+    let fixture = TreePath::parse(
+        b"tools/fixtures/arch/cases/core-token-include-backslash/overlay/crates/boneli-domain/src/a\\b.txt",
+    )
+    .expect("a tree path");
+    assert!(fixture.citable().is_err());
+    assert_eq!(w.get(&fixture), Some((Kind::File, &b"x"[..])));
 }

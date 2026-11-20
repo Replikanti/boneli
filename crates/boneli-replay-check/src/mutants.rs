@@ -21,7 +21,8 @@ use boneli_app::{
     FixRequest, Forge, ForgeRef, Git, GitError, Ids, ImageError, ImageRef, ImageStore, JobFailure,
     Limits, Phase, PullRequest, RelativePath, RepoUrl, ReproductionRequest, RootCauseReport,
     RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox, SandboxError, SandboxId, SandboxSpec,
-    SnapshotId, SnapshotSource, StoreError, TriageReport, TriageRequest, Verifier, Written,
+    SnapshotId, SnapshotSource, StoreError, TreePath, TriageReport, TriageRequest, Verifier,
+    Written,
 };
 use boneli_domain::{
     Budget, Citation, CitationStatus, CommitSha, EvidenceRef, FixChecks, RunEvent, RunId,
@@ -695,6 +696,10 @@ fn path(text: &str) -> RelativePath {
     RelativePath::parse(text).expect("a valid path")
 }
 
+fn tpath(bytes: &[u8]) -> TreePath {
+    TreePath::parse(bytes).expect("a valid tree path")
+}
+
 /// The sandbox fixture around `adapter`, built from the scripted programs.
 fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbox::Workspace<S> {
     let done = |code| ExecResult {
@@ -822,21 +827,52 @@ enum GitBug {
     Overwrites,
     /// `push` from an unknown checkout is `Failed`.
     UnknownCheckoutFails,
+    /// `snapshot` leaves out the paths the citation rule refuses, and
+    /// `diff` keeps the base's file where the workspace has none there:
+    /// the design that drops such files (ADR-018, alternatives).
+    HidesUncitable,
+    /// `diff` keeps the base's content of an uncitable path the workspace
+    /// changed.
+    IgnoresUncitableEdits,
+    /// `diff` keeps an uncitable path the workspace removed.
+    KeepsUncitableRemovals,
+    /// `diff` drops an uncitable path the base does not have.
+    DropsNewUncitable,
+    /// `snapshot` refuses a tree with an uncitable path, as `GitCli` did
+    /// before ADR-018.
+    RefusesUncitableSnapshot,
+    /// `apply` refuses a result with an uncitable path, as `GitCli` did
+    /// before ADR-018.
+    RefusesUncitableTrees,
+    /// `snapshot` renders a path that is not UTF-8 through U+FFFD, and
+    /// `diff` reads the rendered name back as the base's.
+    LossyUncitable,
 }
 
 const HEADER: &[u8] = b"diff\n";
 
 /// Repository metadata below the top level, such as `sub/.git/config`.
-fn is_nested_metadata(path: &RelativePath) -> bool {
-    path.is_repository_metadata() && !path.as_str().starts_with(".git/")
+fn is_nested_metadata(path: &TreePath) -> bool {
+    path.is_repository_metadata() && !path.as_bytes().starts_with(b".git/")
 }
 
 /// Whether some component of the path is `.git` and the next is `hooks`.
-fn is_hook(path: &RelativePath) -> bool {
-    let components: Vec<&str> = path.as_str().split('/').collect();
+fn is_hook(path: &TreePath) -> bool {
+    let components: Vec<&[u8]> = path.as_bytes().split(|b| *b == b'/').collect();
     components
         .windows(2)
-        .any(|pair| pair[0] == ".git" && pair[1] == "hooks")
+        .any(|pair| pair[0] == b".git" && pair[1] == b"hooks")
+}
+
+/// Whether the citation rule refuses the path.
+fn is_uncitable(path: &TreePath) -> bool {
+    path.citable().is_err()
+}
+
+/// The path with its bytes read as UTF-8 through U+FFFD.
+fn lossy(path: &TreePath) -> TreePath {
+    TreePath::parse(String::from_utf8_lossy(path.as_bytes()).as_bytes())
+        .unwrap_or_else(|_| path.clone())
 }
 
 /// The metadata entries of a workspace in `MemoryGit`'s diff format: each
@@ -846,7 +882,7 @@ fn metadata_as_changes(workspace: &Tree) -> Vec<u8> {
     let mut out = Vec::new();
     for (path, content) in workspace {
         if path.is_repository_metadata() {
-            put_field(&mut out, path.as_str().as_bytes());
+            put_field(&mut out, path.as_bytes());
             out.push(1);
             put_field(&mut out, content);
         }
@@ -1011,14 +1047,32 @@ impl Git for GitMutant {
     }
 
     fn snapshot(&self, checkout: &CheckoutId) -> Result<Vec<u8>, GitError> {
-        self.inner.snapshot(&self.resolve(checkout))
+        let packed = self.inner.snapshot(&self.resolve(checkout))?;
+        let tree = || unpack_tree(&packed).unwrap_or_default();
+        Ok(match self.bug {
+            GitBug::HidesUncitable => {
+                let mut tree = tree();
+                tree.retain(|path, _| !is_uncitable(path));
+                pack_tree(&tree)
+            }
+            GitBug::RefusesUncitableSnapshot if tree().keys().any(is_uncitable) => {
+                return Err(GitError::Failed {
+                    detail: String::from("the tree has a path a workspace cannot carry"),
+                });
+            }
+            GitBug::LossyUncitable => {
+                pack_tree(&tree().into_iter().map(|(p, c)| (lossy(&p), c)).collect())
+            }
+            _ => packed,
+        })
     }
 
     fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
         let from = self.resolve(checkout);
         let base = unpack_tree(&self.inner.snapshot(&from)?).unwrap_or_default();
         let mut tree = unpack_tree(workspace).unwrap_or_default();
-        let sees_metadata = tree.keys().any(RelativePath::is_repository_metadata);
+        let sees_metadata = tree.keys().any(TreePath::is_repository_metadata);
+        let mut changed = true;
         match self.bug {
             GitBug::RunsMetadata if tree.keys().any(is_hook) => {
                 *self.ran.lock().expect("not poisoned") = true;
@@ -1029,13 +1083,36 @@ impl Git for GitMutant {
                     tree.entry(path).or_insert(content);
                 }
             }
-            _ => {}
-        }
-        let diff = match self.bug {
-            GitBug::DropsNewFiles | GitBug::DropsRemovals => {
-                self.inner.diff(&from, &pack_tree(&tree))?
+            GitBug::HidesUncitable | GitBug::KeepsUncitableRemovals => {
+                for (path, content) in base.into_iter().filter(|(p, _)| is_uncitable(p)) {
+                    tree.entry(path).or_insert(content);
+                }
             }
-            _ => self.inner.diff(&from, workspace)?,
+            GitBug::IgnoresUncitableEdits => {
+                for (path, content) in base.into_iter().filter(|(p, _)| is_uncitable(p)) {
+                    if let Some(now) = tree.get_mut(&path) {
+                        *now = content;
+                    }
+                }
+            }
+            GitBug::DropsNewUncitable => {
+                tree.retain(|path, _| !is_uncitable(path) || base.contains_key(path));
+            }
+            GitBug::LossyUncitable => {
+                for path in base.keys().filter(|p| lossy(p) != **p) {
+                    if !tree.contains_key(path)
+                        && let Some(content) = tree.remove(&lossy(path))
+                    {
+                        tree.insert(path.clone(), content);
+                    }
+                }
+            }
+            _ => changed = false,
+        }
+        let diff = if changed {
+            self.inner.diff(&from, &pack_tree(&tree))?
+        } else {
+            self.inner.diff(&from, workspace)?
         };
         let adopted = {
             let mut adopted = self.adopted.lock().expect("not poisoned");
@@ -1060,7 +1137,7 @@ impl Git for GitMutant {
             GitBug::MetadataIsContent => [diff, metadata_as_changes(&tree)].concat(),
             GitBug::NestedIsContent => {
                 let mut nested = tree.clone();
-                nested.retain(|path, _| !path.as_str().starts_with(".git/"));
+                nested.retain(|path, _| !path.as_bytes().starts_with(b".git/"));
                 [diff, metadata_as_changes(&nested)].concat()
             }
             GitBug::AdoptsMetadata if adopted => [HEADER, &diff].concat(),
@@ -1169,6 +1246,16 @@ impl GitMutant {
                 moved.push((checkout.clone(), applied));
                 Ok(checkout.clone())
             }
+            GitBug::RefusesUncitableTrees => {
+                let applied = self.inner.apply(&from, diff)?;
+                let tree = unpack_tree(&self.inner.snapshot(&applied)?).unwrap_or_default();
+                if tree.keys().any(is_uncitable) {
+                    return Err(GitError::Failed {
+                        detail: String::from("the diff leaves a path a workspace cannot carry"),
+                    });
+                }
+                Ok(applied)
+            }
             _ => self.inner.apply(&from, diff),
         }
     }
@@ -1176,12 +1263,34 @@ impl GitMutant {
 
 const OTHER: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
+/// The base's files whose paths the citation rule refuses, one of each
+/// class (ADR-018, D6).
+fn git_uncitable() -> Vec<(TreePath, Vec<u8>)> {
+    vec![
+        (tpath(b"dir\\file"), b"backslash\n".to_vec()),
+        (tpath(b" "), b"blank\n".to_vec()),
+        (tpath(b"x\xff"), b"not UTF-8\n".to_vec()),
+    ]
+}
+
 fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
+    git_repository_with(bug, git_uncitable(), None)
+}
+
+/// [`git_repository`] with another list of uncitable paths and,
+/// optionally, one more file at the base.
+fn git_repository_with(
+    bug: GitBug,
+    uncitable: Vec<(TreePath, Vec<u8>)>,
+    extra: Option<(TreePath, Vec<u8>)>,
+) -> contract::git::Repository<GitMutant> {
     let repo = RepoUrl::new(String::from("https://example.invalid/app.git"));
     let base = CommitSha::parse(BASE).expect("valid SHA");
-    let files: Tree = [(path("src/lib.rs"), b"fn total() {}\n".to_vec())]
+    let mut files: Tree = [(tpath(b"src/lib.rs"), b"fn total() {}\n".to_vec())]
         .into_iter()
         .collect();
+    files.extend(git_uncitable());
+    files.extend(extra);
     let inner = MemoryGit::new(vec![GitCommit {
         repo: repo.clone(),
         sha: base.clone(),
@@ -1224,6 +1333,7 @@ fn git_repository(bug: GitBug) -> contract::git::Repository<GitMutant> {
                 b"[core]\n\tfsmonitor = touch /tmp/boneli-tripwire/tripped\n".to_vec(),
             ),
         ],
+        uncitable,
     }
 }
 
@@ -1257,7 +1367,7 @@ fn git_retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> 
     out
 }
 
-fn git_edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
+fn git_edit(workspace: &[u8], file: &TreePath, content: Option<&[u8]>) -> Vec<u8> {
     let mut tree = unpack_tree(workspace).unwrap_or_default();
     match content {
         Some(content) => tree.insert(file.clone(), content.to_vec()),
@@ -1589,6 +1699,11 @@ pub fn mutants() -> Vec<Mutant> {
             git_suite(bug)
         })
     };
+    let git_uncitable = |sub, bug| {
+        sub_mutant("Git", "uncitable-paths-carried", sub, move || {
+            git_suite(bug)
+        })
+    };
     let image = |clause, bug| {
         mutant("ImageStore", clause, move || {
             contract::image::run(|| images(bug))
@@ -1629,6 +1744,10 @@ pub fn mutants() -> Vec<Mutant> {
         git("push-parent-is-base", GitBug::PushesOrphan),
         git("push-never-overwrites", GitBug::Overwrites),
         git("push-unknown-checkout", GitBug::UnknownCheckoutFails),
+        git_uncitable("snapshot-carries", GitBug::HidesUncitable),
+        git_uncitable("edit-round-trip", GitBug::IgnoresUncitableEdits),
+        git_uncitable("remove-round-trip", GitBug::KeepsUncitableRemovals),
+        git_uncitable("add-round-trip", GitBug::DropsNewUncitable),
         image("pull-idempotent", ImageBug::NewRootfsPerPull),
         image("missing-image", ImageBug::MissingIsEmpty),
         image("digest-pinned", ImageBug::ByName),
@@ -1710,19 +1829,35 @@ pub fn regression_mutants() -> Vec<Mutant> {
         git_metadata("apply-refuses", GitBug::WritesThenRefuses),
         // Review round 2 of #61: nested metadata treated as content.
         git_metadata("same-diff", GitBug::NestedIsContent),
+        // #64: `GitCli` before ADR-018, whose `snapshot` and `apply`
+        // refused uncitable paths; `apply-then-read` is the first clause
+        // that snapshots and applies.
+        mutant("Git", "apply-then-read", || {
+            git_suite(GitBug::RefusesUncitableSnapshot)
+        }),
+        mutant("Git", "apply-then-read", || {
+            git_suite(GitBug::RefusesUncitableTrees)
+        }),
+        // #64: a snapshot that renders a path that is not UTF-8 lossily.
+        sub_mutant("Git", "uncitable-paths-carried", "snapshot-carries", || {
+            git_suite(GitBug::LossyUncitable)
+        }),
     ]
 }
 
 /// An `edit` fixture hook of the `Git` suite.
-type EditHook = dyn Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>;
+type EditHook = dyn Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>;
 
 /// The violations of `workspace-metadata-inert` with fixture hooks that
 /// review of #61 showed making it vacuous, each on a mutant it let
 /// through: an `edit` that never writes metadata (round 1), one that skips
 /// or later drops the nested entry, and a `retarget` that breaks diffs
-/// pointed at metadata (round 2). The suite rejects the fixture.
-pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)> {
-    let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+/// pointed at metadata (round 2). Then the same for
+/// `uncitable-paths-carried` (#64): an `edit` that skips uncitable paths,
+/// a list without one class and a base that has a twin. The suite rejects
+/// the fixture; each row names the clause it must reject it at.
+pub fn vacuous_fixture_violations() -> Vec<(&'static str, &'static str, Result<(), Violation>)> {
+    let skipping = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
         if p.is_repository_metadata() {
             w.to_vec()
         } else {
@@ -1740,18 +1875,18 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
     };
     // Review round 2 of #61: an `edit` that skips only the nested entry,
     // or drops it once the top-level `.git` is there.
-    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+    let skip_nested = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
         if is_nested_metadata(p) {
             w.to_vec()
         } else {
             git_edit(w, p, c)
         }
     };
-    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+    let drop_nested_later = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
         let top = unpack_tree(w)
             .unwrap_or_default()
             .keys()
-            .any(|k| k.as_str().starts_with(".git/"));
+            .any(|k| k.as_bytes().starts_with(b".git/"));
         if top && is_nested_metadata(p) {
             w.to_vec()
         } else {
@@ -1776,13 +1911,53 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
             git_retarget(d, from, to)
         }
     };
+    // #64: an `edit` that skips uncitable paths, so a snapshot that
+    // leaves them out looks complete.
+    let skips_uncitable = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
+        if is_uncitable(p) {
+            w.to_vec()
+        } else {
+            git_edit(w, p, c)
+        }
+    };
+    let uncitable_run = |make: &dyn Fn() -> contract::git::Repository<GitMutant>,
+                         edit: &EditHook| {
+        contract::git::run(make, edit, git_retarget, &MutantTripwire, &MutantRemote)
+    };
+    // A list without the non-UTF-8 path lets the lossy snapshot through,
+    // and a twin at the base lets the mutant that drops new uncitable
+    // paths through: adding the twin is then an edit.
+    let without_non_utf8 = || {
+        let mut list = git_uncitable();
+        list.retain(|(p, _)| p.citable() != Err(boneli_app::Uncitable::NotUtf8));
+        git_repository_with(GitBug::LossyUncitable, list, None)
+    };
+    let twin_at_base = || {
+        let twin = tpath("dir\\file\u{200B}".as_bytes());
+        git_repository_with(
+            GitBug::DropsNewUncitable,
+            git_uncitable(),
+            Some((twin, b"twin\n".to_vec())),
+        )
+    };
+    const METADATA: &str = "workspace-metadata-inert";
+    const UNCITABLE: &str = "uncitable-paths-carried";
     vec![
-        ("RunsMetadata", run(GitBug::RunsMetadata)),
-        ("MetadataIsContent", run(GitBug::MetadataIsContent)),
-        ("NestedIsContent skipped", nested(&skip_nested)),
-        ("NestedIsContent dropped later", nested(&drop_nested_later)),
+        ("RunsMetadata", METADATA, run(GitBug::RunsMetadata)),
+        (
+            "MetadataIsContent",
+            METADATA,
+            run(GitBug::MetadataIsContent),
+        ),
+        ("NestedIsContent skipped", METADATA, nested(&skip_nested)),
+        (
+            "NestedIsContent dropped later",
+            METADATA,
+            nested(&drop_nested_later),
+        ),
         (
             "AppliesMetadata garbled",
+            METADATA,
             contract::git::run(
                 || git_repository(GitBug::AppliesMetadata),
                 git_edit,
@@ -1790,6 +1965,21 @@ pub fn vacuous_fixture_violations() -> Vec<(&'static str, Result<(), Violation>)
                 &MutantTripwire,
                 &MutantRemote,
             ),
+        ),
+        (
+            "HidesUncitable skipped",
+            UNCITABLE,
+            uncitable_run(&|| git_repository(GitBug::HidesUncitable), &skips_uncitable),
+        ),
+        (
+            "LossyUncitable without the non-UTF-8 class",
+            UNCITABLE,
+            uncitable_run(&without_non_utf8, &git_edit),
+        ),
+        (
+            "DropsNewUncitable with a twin at the base",
+            UNCITABLE,
+            uncitable_run(&twin_at_base, &git_edit),
         ),
     ]
 }
@@ -1871,7 +2061,7 @@ pub fn render_violations() -> String {
     for (port, result) in blank_status_violations() {
         let _ = write!(out, "blank-status {port}\n{result:#?}\n");
     }
-    for (name, result) in vacuous_fixture_violations() {
+    for (name, _, result) in vacuous_fixture_violations() {
         let _ = write!(out, "vacuous-fixture Git {name}\n{result:#?}\n");
     }
     out

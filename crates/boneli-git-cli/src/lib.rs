@@ -9,7 +9,9 @@
 //!   executable or a symlink. [`Workspace::decode`] refuses every
 //!   malformed or non-canonical encoding, bounds the nodes (files,
 //!   symlinks and the directories they imply) and checks every length
-//!   against what is left before it allocates.
+//!   against what is left before it allocates. Its paths are
+//!   `TreePath`s, so a backslash, a blank name and a name that is not
+//!   UTF-8 are carried (ADR-018).
 //! - [`materialize`] writes a workspace into a new, empty, private
 //!   directory under the rules of ADR-010, D3: no symlink it created is
 //!   ever followed, modes are explicit, each directory is made once, and
@@ -21,7 +23,8 @@
 //!   environment steers it; [`Transports`] limits the URLs `fetch_base`
 //!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
 //! - [`patch_between`] describes the change between two workspaces as the
-//!   patch policy's input (ADR-013, D1).
+//!   patch policy's input (ADR-013, D1), or a [`PatchInputError`] when a
+//!   path it would carry is not UTF-8 (ADR-018, D5).
 //! - `push` (ADR-014, D1 and D2) commits a checkout's tree on its base and
 //!   creates a branch with it, never moving one that exists; with
 //!   [`Credentials`] every network call gets an `Authorization` header
@@ -42,7 +45,7 @@ mod workspace;
 pub use cli::{GitCli, GitCliConfig, OpenError};
 pub use credentials::{Credentials, MAX_AUTHORIZATION};
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
-pub use patch::patch_between;
+pub use patch::{PatchInputError, patch_between};
 pub use run::MIN_GIT_VERSION;
 pub use url::{Transports, UrlProblem};
 pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};

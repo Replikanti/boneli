@@ -32,6 +32,11 @@
 //! On an error the directory may hold part of the workspace; the caller
 //! removes it.
 //!
+//! Paths reach the kernel as raw bytes (`OsStr::from_bytes`), and only `/`
+//! splits them: a backslash, a blank name and bytes that are not UTF-8
+//! are name bytes, so `..\x` or an overlong `..` is one entry inside the
+//! target (ADR-018, D2).
+//!
 //! The calls are path-based, so the kernel follows a symlink in an
 //! intermediate component. Within the private 0700 target only a process
 //! of the runner's own uid could plant one while the write runs, and such
@@ -47,9 +52,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 
-use boneli_app::RelativePath;
+use boneli_app::TreePath;
 
-use crate::workspace::{Workspace, common_prefix};
+use crate::workspace::{Workspace, common_prefix, slashes};
 
 /// Why the target directory is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +150,7 @@ impl std::error::Error for MaterializeError {}
 pub fn materialize(
     workspace: &Workspace,
     dir: &Path,
-    gitlinks: &[RelativePath],
+    gitlinks: &[TreePath],
     max_nodes: usize,
 ) -> Result<(), MaterializeError> {
     check_target(dir)?;
@@ -153,8 +158,8 @@ pub fn materialize(
     write_entries(workspace, dir)?;
     for (n, gitlink) in gitlinks.iter().enumerate() {
         let item = Item::Gitlink(n);
-        create_parents(dir, gitlink.as_str(), 0, item)?;
-        create_directory(dir, gitlink.as_str(), item)?;
+        create_parents(dir, gitlink.as_bytes(), 0, item)?;
+        create_directory(dir, gitlink.as_bytes(), item)?;
     }
     Ok(())
 }
@@ -186,10 +191,10 @@ fn check_target(dir: &Path) -> Result<(), MaterializeError> {
 /// Everything that can be refused without touching the disk.
 fn check_items(
     workspace: &Workspace,
-    gitlinks: &[RelativePath],
+    gitlinks: &[TreePath],
     max_nodes: usize,
 ) -> Result<(), MaterializeError> {
-    let links: BTreeSet<&str> = gitlinks.iter().map(RelativePath::as_str).collect();
+    let links: BTreeSet<&[u8]> = gitlinks.iter().map(TreePath::as_bytes).collect();
     // No ancestor longer than the longest gitlink can be one, so a deep
     // agent-written path costs at most that many bytes of lookups.
     let longest = links.iter().map(|g| g.len()).max().unwrap_or(0);
@@ -197,12 +202,11 @@ fn check_items(
         if path.is_repository_metadata() {
             return Err(MaterializeError::Metadata(Item::Entry(n)));
         }
-        let text = path.as_str();
+        let text = path.as_bytes();
         let at = text.len() <= longest && links.contains(text);
-        let under = text
-            .match_indices('/')
-            .take_while(|(i, _)| *i <= longest)
-            .any(|(i, _)| links.contains(&text[..i]));
+        let under = slashes(text)
+            .take_while(|i| *i <= longest)
+            .any(|i| links.contains(&text[..i]));
         if at || under {
             return Err(MaterializeError::AtGitlink(Item::Entry(n)));
         }
@@ -212,11 +216,11 @@ fn check_items(
         if gitlink.is_repository_metadata() {
             return Err(MaterializeError::Metadata(Item::Gitlink(n)));
         }
-        let text = gitlink.as_str();
-        let beneath = text.match_indices('/').any(|(i, _)| {
-            // An ancestor that does not parse (a blank first component)
-            // is no entry's path.
-            RelativePath::parse(&text[..i]).is_ok_and(|p| workspace.get(&p).is_some())
+        let text = gitlink.as_bytes();
+        let beneath = slashes(text).any(|i| {
+            // A proper ancestor of a tree path always parses; were it
+            // refused, it would be no entry's path.
+            TreePath::parse(&text[..i]).is_ok_and(|p| workspace.get(&p).is_some())
         });
         if beneath {
             return Err(MaterializeError::GitlinkBeneathEntry(Item::Gitlink(n)));
@@ -227,8 +231,8 @@ fn check_items(
     // base tree, so this set stays small.
     let mut gitlink_directories = BTreeSet::new();
     for gitlink in gitlinks {
-        let text = gitlink.as_str();
-        let parents = text.match_indices('/').map(|(i, _)| &text[..i]);
+        let text = gitlink.as_bytes();
+        let parents = slashes(text).map(|i| &text[..i]);
         gitlink_directories.extend(parents.chain([text]));
     }
     let added = gitlink_directories
@@ -252,15 +256,15 @@ fn check_items(
 /// lookups per entry: 500 entries under one chain of 1,900 directories
 /// took 150 s (review of part 2).
 fn write_entries(workspace: &Workspace, dir: &Path) -> Result<(), MaterializeError> {
-    let mut previous: Option<&str> = None;
+    let mut previous: Option<&[u8]> = None;
     for (n, (path, kind, data)) in workspace.iter().enumerate() {
         let item = Item::Entry(n);
         let io = |e| MaterializeError::Io(Some(item), e);
-        let text = path.as_str();
+        let text = path.as_bytes();
         let shared = previous.map_or(0, |p| common_prefix(p, text));
         create_parents(dir, text, shared, item)?;
         previous = Some(text);
-        let target = dir.join(path.as_str());
+        let target = dir.join(OsStr::from_bytes(text));
         match kind.mode() {
             Some(mode) => {
                 let mut file = OpenOptions::new()
@@ -282,8 +286,8 @@ fn write_entries(workspace: &Workspace, dir: &Path) -> Result<(), MaterializeErr
 /// Creates the parents of `rel` inside `dir` whose `/` lies at or past
 /// byte `from`, one component at a time; an existing one must be a real
 /// directory.
-fn create_parents(dir: &Path, rel: &str, from: usize, item: Item) -> Result<(), MaterializeError> {
-    for (i, _) in rel.match_indices('/').filter(|(i, _)| *i >= from) {
+fn create_parents(dir: &Path, rel: &[u8], from: usize, item: Item) -> Result<(), MaterializeError> {
+    for i in slashes(rel).filter(|i| *i >= from) {
         create_directory(dir, &rel[..i], item)?;
     }
     Ok(())
@@ -291,8 +295,8 @@ fn create_parents(dir: &Path, rel: &str, from: usize, item: Item) -> Result<(), 
 
 /// Creates the directory `rel` inside `dir` with mode 0755, or accepts an
 /// existing real directory there.
-fn create_directory(dir: &Path, rel: &str, item: Item) -> Result<(), MaterializeError> {
-    let target = dir.join(rel);
+fn create_directory(dir: &Path, rel: &[u8], item: Item) -> Result<(), MaterializeError> {
+    let target = dir.join(OsStr::from_bytes(rel));
     match fs::create_dir(&target) {
         Ok(()) => fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
             .map_err(|e| MaterializeError::Io(Some(item), e)),
@@ -316,8 +320,8 @@ mod tests {
     use crate::scratch::ScratchDir;
     use crate::workspace::{DEFAULT_MAX_NODES, Kind};
 
-    fn path(text: &str) -> RelativePath {
-        RelativePath::parse(text).expect("a valid path")
+    fn path(text: &str) -> TreePath {
+        TreePath::parse(text.as_bytes()).expect("a valid path")
     }
 
     fn workspace(entries: &[(&str, Kind, &[u8])]) -> Workspace {
@@ -565,7 +569,7 @@ mod tests {
     fn materialize_never_writes_through_a_planted_parent() {
         let (_scratch, dir, outside) = target("planted");
         std::os::unix::fs::symlink(&outside, dir.join("p")).expect("plant");
-        let refused = create_parents(&dir, "p/x", 0, Item::Entry(0));
+        let refused = create_parents(&dir, b"p/x", 0, Item::Entry(0));
         assert!(
             matches!(
                 refused,
@@ -574,7 +578,7 @@ mod tests {
             "{refused:?}"
         );
         fs::write(dir.join("f"), b"").expect("plant a file");
-        let refused = create_parents(&dir, "f/x", 0, Item::Entry(1));
+        let refused = create_parents(&dir, b"f/x", 0, Item::Entry(1));
         assert!(
             matches!(
                 refused,
@@ -708,6 +712,61 @@ mod tests {
             "{refused:?}"
         );
         assert!(listing(&dir).is_empty());
+    }
+
+    /// Backslash traversal, overlong `/` and `..`, blank and non-UTF-8
+    /// names are name bytes: each becomes one entry inside the target, with
+    /// its bytes as written, and nothing appears outside (ADR-018, D2).
+    #[test]
+    fn materialize_writes_uncitable_names_literally() {
+        let (_scratch, dir, outside) = target("uncitable");
+        let names: [&[u8]; 8] = [
+            b" ",
+            b"..\\x",
+            b"\xc0\xae\xc0\xae",
+            b"\xc0\xaf",
+            b"a\\..\\b",
+            "\u{200B}".as_bytes(),
+            b"d\\e",
+            b"x\xff",
+        ];
+        let mut w = Workspace::new();
+        for name in names.iter().filter(|n| **n != b"d\\e") {
+            let p = TreePath::parse(name).expect("a tree path");
+            w.insert(p, Kind::File, name.to_vec()).expect("valid");
+        }
+        let link = TreePath::parse(b"l\\x").expect("a tree path");
+        w.insert(link, Kind::Symlink, b"x\xff".to_vec())
+            .expect("valid");
+        let nested = TreePath::parse(b"d\\e/f").expect("a tree path");
+        w.insert(nested, Kind::Executable, b"f".to_vec())
+            .expect("valid");
+        materialize(&w, &dir, &[], w.nodes()).expect("written");
+        let mut top: Vec<Vec<u8>> = fs::read_dir(&dir)
+            .expect("the target")
+            .map(|e| e.expect("entry").file_name().as_bytes().to_vec())
+            .collect();
+        top.sort();
+        let mut want: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
+        want.push(b"l\\x".to_vec());
+        want.sort();
+        assert_eq!(top, want);
+        for name in names.iter().filter(|n| **n != b"d\\e") {
+            let file = dir.join(OsStr::from_bytes(name));
+            assert_eq!(fs::read(&file).expect("a file"), *name, "{name:?}");
+        }
+        let link = fs::read_link(dir.join(OsStr::from_bytes(b"l\\x"))).expect("a symlink");
+        assert_eq!(link.as_os_str().as_bytes(), b"x\xff");
+        let nested = dir.join(OsStr::from_bytes(b"d\\e")).join("f");
+        assert_eq!(mode(&nested), 0o755);
+        assert_eq!(w.nodes(), 10);
+        assert!(fs::read_dir(&outside).expect("outside").next().is_none());
+        assert!(
+            fs::read_dir(dir.parent().expect("the scratch"))
+                .expect("scratch")
+                .count()
+                == 2
+        );
     }
 
     #[test]

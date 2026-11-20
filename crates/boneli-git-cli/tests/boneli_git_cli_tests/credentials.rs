@@ -10,7 +10,7 @@ use boneli_git_cli::{Credentials, DEFAULT_MAX_NODES, MAX_AUTHORIZATION};
 
 use crate::support::record::{Call, Recorder};
 use crate::support::{
-    EDITED, TempDir, contract_source, decode, edit, failed, host_git, open_with, path, sha,
+    EDITED, TempDir, contract_source, decode, edit, failed, host_git, open_with, path, sha, tpath,
     tracing_git, write_executable,
 };
 
@@ -102,7 +102,7 @@ fn authorization_only_on_network_calls() {
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     let snapshot = git.snapshot(&c).expect("snapshot");
     git.read(&c, &path("src/lib.rs")).expect("read");
-    let workspace = edit(&snapshot, &path("src/lib.rs"), Some(EDITED));
+    let workspace = edit(&snapshot, &tpath("src/lib.rs"), Some(EDITED));
     let diff = git.diff(&c, &workspace).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     git.push(&after, &branch("boneli/cred"), &info())
@@ -326,7 +326,7 @@ fn snapshot_never_carries_authorization() {
     assert!(!window(&snapshot, SECRET.as_bytes()));
     assert!(!window(&snapshot, b"extraHeader"));
     for (p, _, data) in decode(&snapshot).iter() {
-        if p.as_str() == ".git/config" {
+        if p.as_bytes() == b".git/config" {
             let text = String::from_utf8_lossy(data);
             assert!(!text.contains("http"), "{text}");
         }
@@ -351,7 +351,7 @@ fn negotiation_fetch_carries_the_scoped_header() {
     );
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     let snapshot = git.snapshot(&c).expect("snapshot");
-    let workspace = edit(&snapshot, &path("src/lib.rs"), Some(EDITED));
+    let workspace = edit(&snapshot, &tpath("src/lib.rs"), Some(EDITED));
     let after = git
         .apply(&c, &git.diff(&c, &workspace).expect("diff"))
         .expect("apply");

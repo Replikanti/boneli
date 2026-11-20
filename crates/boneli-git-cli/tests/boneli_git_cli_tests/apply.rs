@@ -2,7 +2,11 @@
 
 use boneli_app::{CheckoutId, Git};
 
-use crate::support::{Source, TempDir, cli, edit, failed, listing, path, sha};
+use boneli_git_cli::Kind;
+
+use crate::support::{
+    Source, TempDir, bpath, cli, decode, edit, failed, listing, path, sha, tpath, uncitable,
+};
 
 fn source(tmp: &TempDir) -> (Source, String) {
     let source = Source::new(tmp, "src", false);
@@ -99,28 +103,108 @@ fn adds_quoted(q: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A diff that adds a path the workspace cannot carry (not UTF-8, a
-/// backslash, a blank name) is refused, as `snapshot` refuses such a
-/// path, so no checkout is issued that `snapshot` would refuse; git
-/// accepts all three (ADR-010, D6).
+/// A diff that adds a path the citation rule refuses (not UTF-8, a
+/// backslash, a blank name), in git's C-quoted header form, applies, and
+/// the snapshot carries the file (ADR-018, D4). Diffs the adapter makes
+/// for such paths, git's quoting and the tab that ends a header name with
+/// a trailing space included, apply back to the edited tree.
 #[test]
-fn apply_refuses_unrepresentable_paths() {
-    let tmp = TempDir::new("apply-unrepresentable");
+fn apply_carries_uncitable_paths() {
+    let tmp = TempDir::new("apply-uncitable");
     let (source, base) = source(&tmp);
     let git = cli(&tmp);
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     let before = git.snapshot(&c).expect("snapshot");
-    for (i, (shown, diff)) in [
-        ("x\u{FFFD}", adds_quoted("x\\377")),
-        ("a\\b", adds_quoted("a\\\\b")),
-        (" ", adds_quoted(" ")),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (p, diff) in [
+        (&b"x\xff"[..], adds_quoted("x\\377")),
+        (b"a\\b", adds_quoted("a\\\\b")),
+        (b" ", adds_quoted(" ")),
+    ] {
+        let after = git.apply(&c, &diff).expect("applies");
+        let w = decode(&git.snapshot(&after).expect("snapshot"));
+        assert_eq!(w.get(&bpath(p)), Some((Kind::File, &b"x\n"[..])), "{p:?}");
+    }
+    assert_eq!(git.snapshot(&c), Ok(before.clone()));
+    // Round trips through the adapter's own diff.
+    let names: [&[u8]; 7] = [
+        b"x\xff",
+        b"a\\b",
+        b" ",
+        b"\t",
+        b"trailing ",
+        "\u{200B}".as_bytes(),
+        b"q\"uote",
+    ];
+    for p in names {
+        let w = edit(&before, &bpath(p), Some(b"content\n"));
+        let diff = git.diff(&c, &w).expect("diff");
+        assert!(!diff.is_empty(), "{p:?}");
+        let after = git.apply(&c, &diff).expect("applies");
+        assert_eq!(git.snapshot(&after), Ok(w), "{p:?}");
+    }
+    assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
+}
+
+/// An unrelated edit applies on a base that holds every class of path the
+/// citation rule refuses; before ADR-018 `apply`'s check of the result
+/// refused it.
+#[test]
+fn apply_on_a_tree_with_uncitable_paths() {
+    let tmp = TempDir::new("apply-on-uncitable");
+    let source = Source::new(&tmp, "src", false);
+    source.write("a", b"one\n", false);
+    for (p, data) in uncitable() {
+        source.write_bytes(p.as_bytes(), &data, false);
+    }
+    let base = source.commit("base");
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let snapshot = git.snapshot(&c).expect("snapshot");
+    let w = edit(&snapshot, &tpath("a"), Some(b"two\n"));
+    let diff = git.diff(&c, &w).expect("diff");
+    let after = git.apply(&c, &diff).expect("applies");
+    assert_eq!(git.read(&after, &path("a")), Ok(Some(b"two\n".to_vec())));
+    assert_eq!(git.snapshot(&after), Ok(w));
+}
+
+/// A diff that adds a path with a component that is `.git` on another file
+/// system once `\\` splits it is refused, also where git accepts it, and
+/// so is one that is not UTF-8; no checkout is issued (ADR-018, D3).
+#[test]
+fn apply_refuses_backslash_lookalikes() {
+    let tmp = TempDir::new("apply-backslash-lookalike");
+    let (source, base) = source(&tmp);
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let before = git.snapshot(&c).expect("snapshot");
+    for (shown, diff) in [
+        ("\"x\\\\.git\"", adds_quoted("x\\\\.git")),
+        ("\".git\\\\config\"", adds_quoted(".git\\\\config")),
+        ("\"x\\\\GIT~1\"", adds_quoted("x\\\\GIT~1")),
+        (
+            "\"x\\\\.g\\u{200b}it\"",
+            adds_quoted("x\\\\.g\\342\\200\\213it"),
+        ),
+        ("\".g\\xffit\"", adds_quoted(".g\\377it")),
+    ] {
         let detail = failed(git.apply(&c, &diff));
-        assert!(detail.contains(&format!("{shown:?}")), "{i}: {detail}");
-        assert!(detail.contains("cannot carry"), "{i}: {detail}");
+        // git refuses its own forms with its message; the adapter names
+        // the path for the forms git accepts.
+        assert!(
+            detail.contains(shown) || detail.contains("git apply"),
+            "{shown}: {detail}"
+        );
+    }
+    for (shown, diff) in [
+        (
+            "\"x\\\\.g\\u{200b}it\"",
+            adds_quoted("x\\\\.g\\342\\200\\213it"),
+        ),
+        ("\".g\\xffit\"", adds_quoted(".g\\377it")),
+    ] {
+        let detail = failed(git.apply(&c, &diff));
+        assert!(detail.contains(shown), "{shown}: {detail}");
+        assert!(detail.contains(".git on another file system"), "{detail}");
     }
     assert_eq!(git.snapshot(&c), Ok(before));
     assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
@@ -139,8 +223,8 @@ fn apply_is_all_or_nothing() {
     let git = cli(&tmp);
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     let before = git.snapshot(&c).expect("snapshot");
-    let w = edit(&before, &path("a"), Some(b"one\nTWO\nthree\n"));
-    let w = edit(&w, &path("b"), Some(b"alpha\nBETA\n"));
+    let w = edit(&before, &tpath("a"), Some(b"one\nTWO\nthree\n"));
+    let w = edit(&w, &tpath("b"), Some(b"alpha\nBETA\n"));
     let good = String::from_utf8(git.diff(&c, &w).expect("diff")).expect("utf8");
     // Break the second file's hunk: its context no longer matches.
     let broken = good.replacen(" alpha\n", " gamma\n", 1);
@@ -187,7 +271,7 @@ fn large_diff_applies() {
         .flat_map(|k| format!("line {k} of a large generated file\n").into_bytes())
         .collect();
     assert!(big.len() > 1 << 20);
-    let w = edit(&snapshot, &path("big.txt"), Some(&big));
+    let w = edit(&snapshot, &tpath("big.txt"), Some(&big));
     let diff = git.diff(&c, &w).expect("diff");
     assert!(diff.len() > 1 << 20, "{}", diff.len());
     let after = git.apply(&c, &diff).expect("apply");

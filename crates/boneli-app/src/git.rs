@@ -197,16 +197,23 @@ pub trait Git {
     fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError>;
 
     /// The content of a file in the checkout, or `None` when the checkout
-    /// has no file at that path.
+    /// has no file at that path. The path is a [`RelativePath`], so a file
+    /// whose path the citation rule refuses cannot be read here, and so
+    /// cannot be cited (ADR-018, D5).
     fn read(&self, checkout: &CheckoutId, path: &RelativePath)
     -> Result<Option<Vec<u8>>, GitError>;
 
     /// The checkout as a workspace for the sandbox, without remotes, hooks
-    /// or credentials.
+    /// or credentials. It carries every path of the tree that is a
+    /// [`TreePath`](crate::TreePath), paths the citation rule refuses (a
+    /// backslash, a blank name, a name that is not UTF-8) included
+    /// (ADR-018, D4).
     fn snapshot(&self, checkout: &CheckoutId) -> Result<Vec<u8>, GitError>;
 
     /// The diff from the checkout to a workspace in the snapshot format.
-    /// Empty when the workspace is the checkout's own snapshot.
+    /// Empty when the workspace is the checkout's own snapshot. Changes at
+    /// paths the citation rule refuses are carried like any other
+    /// (ADR-018, D4).
     ///
     /// The workspace comes from the sandbox, where the agent writes. Its
     /// repository metadata ([`RelativePath::is_repository_metadata`]) is
@@ -220,7 +227,8 @@ pub trait Git {
     /// this checkout (for example, one that removes a file the checkout
     /// does not have) is an error: no checkout is created and nothing
     /// changes, so a fix is never verified on a tree it was not written
-    /// against.
+    /// against. A tree path the citation rule refuses is carried here as
+    /// in [`Git::snapshot`] (ADR-018, D4).
     fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError>;
 
     /// Commits the checkout's tree with its base commit as the only parent

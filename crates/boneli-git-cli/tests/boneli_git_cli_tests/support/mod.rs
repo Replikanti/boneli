@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use boneli_app::contract::git::{Remote, Repository, Tripwire};
-use boneli_app::{BranchName, GitError, RelativePath, RepoUrl};
+use boneli_app::{BranchName, GitError, RelativePath, RepoUrl, TreePath};
 use boneli_domain::CommitSha;
 use boneli_git_cli::{
     Credentials, DEFAULT_MAX_NODES, GitCli, GitCliConfig, Kind, Transports, Workspace,
@@ -90,6 +90,16 @@ pub fn path(text: &str) -> RelativePath {
     RelativePath::parse(text).expect("a valid path")
 }
 
+/// A workspace path of UTF-8 text.
+pub fn tpath(text: &str) -> TreePath {
+    bpath(text.as_bytes())
+}
+
+/// A workspace path of any bytes.
+pub fn bpath(bytes: &[u8]) -> TreePath {
+    TreePath::parse(bytes).expect("a valid tree path")
+}
+
 pub fn sha(text: &str) -> CommitSha {
     CommitSha::parse(text).expect("a valid SHA")
 }
@@ -159,7 +169,12 @@ impl Source {
 
     /// Writes a file, with its parents; `executable` sets 0755.
     pub fn write(&self, rel: &str, data: &[u8], executable: bool) -> &Source {
-        let file = self.dir.join(OsStr::from_bytes(rel.as_bytes()));
+        self.write_bytes(rel.as_bytes(), data, executable)
+    }
+
+    /// [`Source::write`] at a path of any bytes; only `/` splits it.
+    pub fn write_bytes(&self, rel: &[u8], data: &[u8], executable: bool) -> &Source {
+        let file = self.dir.join(OsStr::from_bytes(rel));
         fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
         if executable {
             write_executable(&file, data);
@@ -172,9 +187,14 @@ impl Source {
 
     /// Creates a symlink.
     pub fn link(&self, rel: &str, target: &str) -> &Source {
-        let file = self.dir.join(rel);
+        self.link_bytes(rel.as_bytes(), target.as_bytes())
+    }
+
+    /// [`Source::link`] at a path and to a target of any bytes.
+    pub fn link_bytes(&self, rel: &[u8], target: &[u8]) -> &Source {
+        let file = self.dir.join(OsStr::from_bytes(rel));
         fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
-        symlink(target, &file).expect("symlink");
+        symlink(OsStr::from_bytes(target), &file).expect("symlink");
         self
     }
 
@@ -327,12 +347,15 @@ pub fn decode(bytes: &[u8]) -> Workspace {
 pub fn entries(bytes: &[u8]) -> Vec<(String, Kind, Vec<u8>)> {
     decode(bytes)
         .iter()
-        .map(|(p, kind, data)| (p.as_str().to_owned(), kind, data.to_vec()))
+        .map(|(p, kind, data)| {
+            let text = String::from_utf8_lossy(p.as_bytes()).into_owned();
+            (text, kind, data.to_vec())
+        })
         .collect()
 }
 
 /// Builds an encoded workspace from entries in any order.
-pub fn encode(mut list: Vec<(RelativePath, Kind, Vec<u8>)>) -> Vec<u8> {
+pub fn encode(mut list: Vec<(TreePath, Kind, Vec<u8>)>) -> Vec<u8> {
     list.sort_by(|a, b| a.0.cmp(&b.0));
     Workspace::from_sorted(list, usize::MAX)
         .expect("a valid workspace")
@@ -340,8 +363,8 @@ pub fn encode(mut list: Vec<(RelativePath, Kind, Vec<u8>)>) -> Vec<u8> {
 }
 
 /// Sets `file` to `content` with `kind`, or removes it for `None`.
-pub fn edit_kind(workspace: &[u8], file: &RelativePath, content: Option<(Kind, &[u8])>) -> Vec<u8> {
-    let mut list: Vec<(RelativePath, Kind, Vec<u8>)> = decode(workspace)
+pub fn edit_kind(workspace: &[u8], file: &TreePath, content: Option<(Kind, &[u8])>) -> Vec<u8> {
+    let mut list: Vec<(TreePath, Kind, Vec<u8>)> = decode(workspace)
         .iter()
         .filter(|(p, _, _)| *p != file)
         .map(|(p, kind, data)| (p.clone(), kind, data.to_vec()))
@@ -355,9 +378,9 @@ pub fn edit_kind(workspace: &[u8], file: &RelativePath, content: Option<(Kind, &
 /// The suite's `edit` hook: sets or removes a file and keeps its kind. A new
 /// file under a `hooks` directory of repository metadata is executable,
 /// because git ignores a hook that is not (ADR-010, "Accept when").
-pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
+pub fn edit(workspace: &[u8], file: &TreePath, content: Option<&[u8]>) -> Vec<u8> {
     let existing = decode(workspace).get(file).map(|(kind, _)| kind);
-    let hook = file.is_repository_metadata() && file.as_str().contains("/hooks/");
+    let hook = file.is_repository_metadata() && file.as_bytes().windows(7).any(|w| w == b"/hooks/");
     let kind = existing.unwrap_or(if hook { Kind::Executable } else { Kind::File });
     edit_kind(workspace, file, content.map(|c| (kind, c)))
 }
@@ -397,7 +420,7 @@ pub fn retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> 
 /// own snapshots and fixtures; the adapter writes with `materialize`.
 pub fn unpack_all(workspace: &[u8], dir: &Path) {
     for (p, kind, data) in decode(workspace).iter() {
-        let file = dir.join(OsStr::from_bytes(p.as_str().as_bytes()));
+        let file = dir.join(OsStr::from_bytes(p.as_bytes()));
         fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
         match kind {
             Kind::Symlink => symlink(OsStr::from_bytes(data), &file).expect("symlink"),
@@ -495,12 +518,25 @@ pub const LIB: &[u8] = b"fn total() {}\n";
 pub const EDITED: &[u8] = b"fn total() { 1 }\n";
 pub const ABSENT: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
-/// The contract's source repository: one commit with `src/lib.rs` and
-/// `README`.
+/// The base's files whose paths the citation rule refuses, one of each
+/// class: a backslash, a blank name, a name that is not UTF-8 (ADR-018).
+pub fn uncitable() -> Vec<(TreePath, Vec<u8>)> {
+    vec![
+        (bpath(b"dir\\file"), b"backslash\n".to_vec()),
+        (bpath(b" "), b"blank\n".to_vec()),
+        (bpath(b"x\xff"), b"not UTF-8\n".to_vec()),
+    ]
+}
+
+/// The contract's source repository: one commit with `src/lib.rs`,
+/// `README` and [`uncitable`].
 pub fn contract_source(tmp: &TempDir) -> (Source, String) {
     let source = Source::new(tmp, "contract-source", false);
     source.write("src/lib.rs", LIB, false);
     source.write("README", b"app", false);
+    for (p, data) in uncitable() {
+        source.write_bytes(p.as_bytes(), &data, false);
+    }
     let base = source.commit("base");
     (source, base)
 }
@@ -522,6 +558,7 @@ pub fn repository<G>(
         unknown: sha(ABSENT),
         edited: EDITED.to_vec(),
         metadata,
+        uncitable: uncitable(),
     }
 }
 

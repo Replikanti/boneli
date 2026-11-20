@@ -6,12 +6,14 @@
 //! bytes. A diff is a list of changes in path order: the path, then `1` and
 //! the new content, or `0` for a removed file. The formats are this
 //! adapter's own; the real adapter (#30) has its own. Unpacking checks
-//! every length against what is left and every path against the citation
-//! path rule ([`RelativePath`]), so a workspace from the sandbox cannot
-//! name a path outside the tree. Repository metadata
-//! ([`RelativePath::is_repository_metadata`]) is not content: `diff` drops
-//! it from the workspace and `apply` refuses a diff that writes or removes
-//! it, as `git apply` refuses an invalid path (ADR-010, D1).
+//! every length against what is left and every path against the tree path
+//! rule ([`TreePath`]), so a workspace from the sandbox cannot name a path
+//! outside the tree, and a path the citation rule refuses (a backslash, a
+//! blank name, a name that is not UTF-8) is carried like any other
+//! (ADR-018). Repository metadata ([`TreePath::is_repository_metadata`]) is
+//! not content: `diff` drops it from the workspace and `apply` refuses a
+//! diff that writes or removes it, as `git apply` refuses an invalid path
+//! (ADR-010, D1).
 //!
 //! `push` (ADR-014, D1) records a commit of the checkout's tree with its
 //! base as the only parent and creates the branch; its commit ids are
@@ -22,13 +24,15 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
+use boneli_app::{
+    BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl, TreePath,
+};
 use boneli_domain::CommitSha;
 
 use crate::lock;
 
 /// A tree: every file's content by path.
-pub type Tree = BTreeMap<RelativePath, Vec<u8>>;
+pub type Tree = BTreeMap<TreePath, Vec<u8>>;
 
 /// One commit a [`MemoryGit`] holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,10 +76,10 @@ impl<'a> Fields<'a> {
         self.bytes(n, what)
     }
 
-    fn path(&mut self) -> Result<RelativePath, String> {
+    fn path(&mut self) -> Result<TreePath, String> {
         let raw = self.field("path")?;
-        let text = std::str::from_utf8(raw).map_err(|_| String::from("a path is not UTF-8"))?;
-        RelativePath::parse(text).map_err(|problem| format!("path {text:?}: {problem:?}"))
+        TreePath::parse(raw)
+            .map_err(|problem| format!("path \"{}\": {problem:?}", raw.escape_ascii()))
     }
 }
 
@@ -83,14 +87,14 @@ impl<'a> Fields<'a> {
 pub fn pack_tree(tree: &Tree) -> Vec<u8> {
     let mut out = Vec::new();
     for (path, content) in tree {
-        put_field(&mut out, path.as_str().as_bytes());
+        put_field(&mut out, path.as_bytes());
         put_field(&mut out, content);
     }
     out
 }
 
 /// Unpacks a workspace in this adapter's snapshot format. A path given
-/// twice, a path the citation path rule rejects or a truncated field is an
+/// twice, a path the tree path rule rejects or a truncated field is an
 /// error.
 pub fn unpack_tree(packed: &[u8]) -> Result<Tree, String> {
     let mut fields = Fields { rest: packed };
@@ -99,7 +103,7 @@ pub fn unpack_tree(packed: &[u8]) -> Result<Tree, String> {
         let path = fields.path()?;
         let content = fields.field("content")?.to_vec();
         if tree.contains_key(&path) {
-            return Err(format!("path {:?} given twice", path.as_str()));
+            return Err(format!("path {path:?} given twice"));
         }
         tree.insert(path, content);
     }
@@ -108,7 +112,7 @@ pub fn unpack_tree(packed: &[u8]) -> Result<Tree, String> {
 
 /// The changes from `from` to `to`, in path order: `Some` is the new
 /// content, `None` a removed file.
-fn changes(from: &Tree, to: &Tree) -> Vec<(RelativePath, Option<Vec<u8>>)> {
+fn changes(from: &Tree, to: &Tree) -> Vec<(TreePath, Option<Vec<u8>>)> {
     let mut out = Vec::new();
     for (path, content) in to {
         if from.get(path) != Some(content) {
@@ -124,10 +128,10 @@ fn changes(from: &Tree, to: &Tree) -> Vec<(RelativePath, Option<Vec<u8>>)> {
     out
 }
 
-fn pack_diff(changes: &[(RelativePath, Option<Vec<u8>>)]) -> Vec<u8> {
+fn pack_diff(changes: &[(TreePath, Option<Vec<u8>>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (path, content) in changes {
-        put_field(&mut out, path.as_str().as_bytes());
+        put_field(&mut out, path.as_bytes());
         match content {
             Some(content) => {
                 out.push(1);
@@ -145,10 +149,7 @@ fn apply_diff(tree: &Tree, diff: &[u8]) -> Result<Tree, String> {
     while !fields.rest.is_empty() {
         let path = fields.path()?;
         if path.is_repository_metadata() {
-            return Err(format!(
-                "{:?} is repository metadata, not content",
-                path.as_str()
-            ));
+            return Err(format!("{path:?} is repository metadata, not content"));
         }
         match fields.bytes(1, "change")? {
             [1] => {
@@ -156,7 +157,7 @@ fn apply_diff(tree: &Tree, diff: &[u8]) -> Result<Tree, String> {
             }
             [0] => {
                 if tree.remove(&path).is_none() {
-                    return Err(format!("removes {:?}, which does not exist", path.as_str()));
+                    return Err(format!("removes {path:?}, which does not exist"));
                 }
             }
             other => return Err(format!("unknown change {other:?}")),
@@ -290,7 +291,7 @@ impl Git for MemoryGit {
         checkout: &CheckoutId,
         path: &RelativePath,
     ) -> Result<Option<Vec<u8>>, GitError> {
-        Ok(self.tree(checkout)?.get(path).cloned())
+        Ok(self.tree(checkout)?.get(&TreePath::from(path)).cloned())
     }
 
     fn snapshot(&self, checkout: &CheckoutId) -> Result<Vec<u8>, GitError> {
