@@ -580,7 +580,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   UDP, TCP when an answer is truncated (musl's semantics: no NSS). Hosts
   outside the ADR-003 grammar are refused before any query; addresses
   come back once each in the order of RFC 3484's default precedence
-  table. New public items: `Resolver` (`system`, `fixed`, `lookup`),
+  table. Name servers with an IPv6 zone are not used; when resolv.conf
+  lists only unusable ones, a lookup that needs DNS fails with
+  `Unsupported` instead of asking `127.0.0.1:53`. New public items: `Resolver` (`system`, `fixed`, `lookup`),
   `ResolverConfig` (`parse`, `new`, `with_search`, `with_ndots`,
   `with_use_vc`, `with_hosts`) and the constants `DNS_PORT`,
   `DNS_MAX_NAME_SERVERS` (3), `DNS_DEFAULT_NDOTS` (1), `DNS_MAX_NDOTS`

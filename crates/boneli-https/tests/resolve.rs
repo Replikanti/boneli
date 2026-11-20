@@ -722,17 +722,223 @@ fn mismatched_id_question_or_qr_is_ignored_not_malformed() {
     assert!(start.elapsed() < Duration::from_secs(1));
 }
 
+/// The query a resolver sends for `name` and `qtype`, id 0.
+fn query_for(name: &str, qtype: u16) -> Vec<u8> {
+    let mut query = vec![0, 0, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        query.push(u8::try_from(label.len()).expect("label"));
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&qtype.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query
+}
+
+/// The usual address of `qtype`.
+fn usual(qtype: u16) -> IpAddr {
+    if qtype == A {
+        ip("192.0.2.1")
+    } else {
+        ip("2001:db8::1")
+    }
+}
+
 #[test]
-fn garbage_fails_the_server() {
-    let first = Fake::start(|_, _, _| Reply::Raw(vec![(vec![0xFF; 7], false)]));
+fn unmatched_garbage_is_ignored_not_a_failure() {
+    // Before any answer, from the server's address: datagrams shorter than
+    // the header, a header with the right id and a broken question, and a
+    // header with the right id and the question cut off. None of them
+    // matches (id, question), so none fails the server (ADR-022, D4).
+    let fake = Fake::start(|name, qtype, _| {
+        let good = respond(&query_for(name, qtype), 0, false, &[usual(qtype)]);
+        let mut broken = good.clone();
+        broken[12] = 0x41;
+        let cut = good[..14].to_vec();
+        Reply::Raw(vec![
+            (vec![0xAB, 0xCD, 0x80], false),
+            (vec![0xFF; 7], false),
+            (broken, true),
+            (cut, true),
+            (good, true),
+        ])
+    });
     let second = Fake::start(both);
-    let resolver = Resolver::fixed(config(&[&first, &second], Duration::from_secs(5), 1));
+    let resolver = Resolver::fixed(config(&[&fake, &second], Duration::from_secs(5), 1));
+    let start = Instant::now();
+    assert_eq!(
+        lookup(&resolver, "git.example", FAR).expect("the only server's answer"),
+        addrs(&["2001:db8::1", "192.0.2.1"])
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(second.count(), 0);
+}
+
+#[test]
+fn malformed_matched_answer_fails_its_type_only() {
+    // A: the matched answer cut inside its record, so malformed. AAAA:
+    // the address 50 ms later, which still counts (ADR-022, D5).
+    let fake = Fake::start(|name, qtype, _| match qtype {
+        A => {
+            let mut bad = respond(&query_for(name, qtype), 0, false, &[usual(qtype)]);
+            bad.pop();
+            Reply::Raw(vec![(bad, true)])
+        }
+        _ => Reply::Later(Duration::from_millis(50), vec![usual(qtype)]),
+    });
+    let resolver = Resolver::fixed(config(&[&fake], Duration::from_secs(2), 1));
+    assert_eq!(
+        lookup(&resolver, "git.example", FAR).expect("aaaa"),
+        addrs(&["2001:db8::1"])
+    );
+    // Malformed for both types: the server failed, the next one is asked.
+    let bad = Fake::start(|name, qtype, _| {
+        let mut bad = respond(&query_for(name, qtype), 0, false, &[usual(qtype)]);
+        bad.pop();
+        Reply::Raw(vec![(bad, true)])
+    });
+    let second = Fake::start(both);
+    let resolver = Resolver::fixed(config(&[&bad, &second], Duration::from_secs(5), 1));
     let start = Instant::now();
     assert_eq!(
         lookup(&resolver, "git.example", FAR).expect("second server"),
         addrs(&["2001:db8::1", "192.0.2.1"])
     );
     assert!(start.elapsed() < Duration::from_secs(1));
+    let only = Resolver::fixed(config(&[&bad], Duration::from_secs(5), 1));
+    let err = lookup(&only, "git.example", FAR).expect_err("malformed");
+    assert_eq!(err.kind(), ErrorKind::Other, "{err}");
+    assert!(err.to_string().contains("malformed answer"), "{err}");
+}
+
+#[test]
+fn failure_of_one_type_does_not_lose_the_other_in_either_order() {
+    // ADR-022, D5: addresses for either type mean Found even when the
+    // other type fails, whichever arrives first.
+    // SERVFAIL, NOTIMP and REFUSED.
+    for rcode in [2u8, 4, 5] {
+        let failed = move |name: &str, qtype: u16| {
+            Reply::Raw(vec![(
+                respond(&query_for(name, qtype), rcode, false, &[]),
+                true,
+            )])
+        };
+        // AAAA fails at once, A answers 50 ms later.
+        let fail_first = Fake::start(move |name, qtype, _| match qtype {
+            A => Reply::Later(Duration::from_millis(50), vec![usual(qtype)]),
+            _ => failed(name, qtype),
+        });
+        let resolver = Resolver::fixed(config(&[&fail_first], Duration::from_secs(2), 2));
+        assert_eq!(
+            lookup(&resolver, "git.example", FAR).expect("failure first"),
+            addrs(&["192.0.2.1"]),
+            "rcode {rcode}"
+        );
+        assert_eq!(fail_first.count(), 2, "one try");
+        // A fails at once, AAAA answers 50 ms later.
+        let a_fails = Fake::start(move |name, qtype, _| match qtype {
+            A => failed(name, qtype),
+            _ => Reply::Later(Duration::from_millis(50), vec![usual(qtype)]),
+        });
+        let resolver = Resolver::fixed(config(&[&a_fails], Duration::from_secs(2), 2));
+        assert_eq!(
+            lookup(&resolver, "git.example", FAR).expect("a fails"),
+            addrs(&["2001:db8::1"]),
+            "rcode {rcode}"
+        );
+        // A answers at once, then AAAA fails.
+        let answer_first = Fake::start(move |name, qtype, _| match qtype {
+            A => Reply::Answer(vec![usual(qtype)]),
+            _ => failed(name, qtype),
+        });
+        let resolver = Resolver::fixed(config(&[&answer_first], Duration::from_secs(2), 2));
+        assert_eq!(
+            lookup(&resolver, "git.example", FAR).expect("answer first"),
+            addrs(&["192.0.2.1"]),
+            "rcode {rcode}"
+        );
+    }
+}
+
+#[test]
+fn failure_of_one_type_waits_for_the_other_until_the_try_ends() {
+    // AAAA fails, A stays silent: the try waits for A until its end, then
+    // the server counts as failed and the next one is asked.
+    let first = Fake::start(|_, qtype, _| match qtype {
+        A => Reply::Silence,
+        _ => Reply::ServFail,
+    });
+    let second = Fake::start(both);
+    let resolver = Resolver::fixed(config(&[&first, &second], Duration::from_millis(200), 1));
+    let start = Instant::now();
+    assert_eq!(
+        lookup(&resolver, "git.example", FAR).expect("second server"),
+        addrs(&["2001:db8::1", "192.0.2.1"])
+    );
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(second.count(), 2);
+}
+
+#[test]
+fn use_vc_failure_of_one_type_still_asks_the_other() {
+    let fake = Fake::start(|_, qtype, _| match qtype {
+        A => Reply::ServFail,
+        _ => Reply::Answer(vec![usual(qtype)]),
+    });
+    let resolver = Resolver::fixed(config(&[&fake], Duration::from_secs(2), 1).with_use_vc(true));
+    assert_eq!(
+        lookup(&resolver, "git.example", FAR).expect("aaaa over tcp"),
+        addrs(&["2001:db8::1"])
+    );
+    let arrivals = fake.arrivals();
+    assert_eq!(arrivals.len(), 2, "{arrivals:?}");
+    assert!(arrivals.iter().all(|a| a.tcp), "{arrivals:?}");
+}
+
+#[test]
+fn truncated_type_goes_to_tcp_beside_a_failed_one() {
+    // A truncated over UDP, AAAA SERVFAIL: A is asked over TCP and found.
+    let fake = Fake::start(|_, qtype, tcp| match (qtype, tcp) {
+        (A, false) => Reply::Truncated,
+        (A, true) => Reply::Answer(vec![usual(qtype)]),
+        _ => Reply::ServFail,
+    });
+    let resolver = Resolver::fixed(config(&[&fake], Duration::from_secs(2), 1));
+    assert_eq!(
+        lookup(&resolver, "git.example", FAR).expect("a over tcp"),
+        addrs(&["192.0.2.1"])
+    );
+    let tcp: Vec<u16> = fake
+        .arrivals()
+        .into_iter()
+        .filter(|a| a.tcp)
+        .map(|a| a.qtype)
+        .collect();
+    assert_eq!(tcp, [A]);
+}
+
+#[test]
+fn only_unusable_name_servers_fail_closed_not_on_loopback() {
+    // ADR-022, D3: resolv.conf lists name servers, none usable (a zone, a
+    // word that is not an address): the lookup fails naming the first,
+    // instead of asking 127.0.0.1:53, which nobody configured.
+    let resolver = Resolver::fixed(ResolverConfig::parse(
+        "nameserver fe80::1%eth0\nnameserver fe80::2%eth1\n",
+    ));
+    let err = lookup(&resolver, "git.example", FAR).expect_err("no usable server");
+    assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
+    assert!(err.to_string().contains("fe80::1%eth0"), "{err}");
+    assert!(!err.to_string().contains("127.0.0.1"), "{err}");
+    // IP literals and hosts entries need no name server.
+    let resolver = Resolver::fixed(
+        ResolverConfig::parse("nameserver fe80::1%eth0\n").with_hosts("192.0.2.9 git\n".into()),
+    );
+    assert_eq!(
+        lookup(&resolver, "git", FAR).expect("hosts"),
+        addrs(&["192.0.2.9"])
+    );
 }
 
 #[test]

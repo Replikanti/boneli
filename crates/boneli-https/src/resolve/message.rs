@@ -3,10 +3,11 @@
 //!
 //! The reader takes hostile input: whoever can send a datagram to the
 //! resolver's port from the name server's address. Every index is checked,
-//! so no input panics; a message is either ignored (not an answer to an
-//! outstanding query), an answer, or malformed. Only the answer section is
-//! read; the authority and additional sections never are, so a record a
-//! name server adds there cannot place an address.
+//! so no input panics; a message is either ignored (it does not get as far
+//! as matching the id and question of an outstanding query), an answer, or
+//! a malformed answer to a matched query. Only the answer section is read;
+//! the authority and additional sections never are, so a record a name
+//! server adds there cannot place an address.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -21,6 +22,17 @@ pub(crate) const MAX_WIRE_NAME: usize = 255;
 /// The longest label (RFC 1035, 2.3.4): the two high bits of a length
 /// octet are the label type, so 63 is also the format's own limit.
 const MAX_LABEL: usize = 63;
+
+/// The most compression pointers one name may follow (ADR-022, Numbers).
+/// A name has at most 127 labels (255 octets, each label at least 2), and
+/// a pointer that saves space leads to at least one label, because a
+/// pointer to a bare root octet or to another pointer is no shorter than
+/// what it replaces; so no space-saving encoding needs more jumps. Without
+/// a cap, a TCP answer of 65,532 bytes whose 4,096 owner names follow one
+/// chain of 8,169 pointers took about 145 ms to parse (release build,
+/// development host); at the cap the heaviest such answer, 5,436 owner
+/// names of 127 jumps, takes 3 to 5 ms.
+const MAX_POINTER_JUMPS: usize = 127;
 
 const CLASS_IN: u16 = 1;
 const TYPE_CNAME: u16 = 5;
@@ -62,13 +74,17 @@ pub(crate) struct Outstanding {
 /// What a received message is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
-    /// Not an answer to an outstanding query: a query (QR=0), another
-    /// opcode, another id, or another question. The wait goes on.
+    /// Not an answer to an outstanding query: shorter than the header, a
+    /// query (QR=0), another opcode, another id, a question that does not
+    /// parse, or another question. The wait goes on, as glibc's `send_dg`
+    /// drops such datagrams, so a sender who does not know the id cannot
+    /// fail the server.
     Ignored,
     /// The answer to the outstanding query `(id, qtype)`.
     Answer(Answer),
-    /// Not a DNS message the format allows: the server failed.
-    Malformed,
+    /// The answer to the outstanding query `(id, qtype)`, but not one the
+    /// format allows: that query failed.
+    Malformed { id: u16, qtype: QType },
 }
 
 /// An answer to an outstanding query.
@@ -120,19 +136,20 @@ pub(crate) fn encode_query(id: u16, name: &[u8], qtype: QType) -> Vec<u8> {
     query
 }
 
-/// Reads `msg` as the answer to one of `outstanding`.
+/// Reads `msg` as the answer to one of `outstanding`. Anything before the
+/// (id, question) match is ignored; only a matched answer can be malformed.
 pub(crate) fn parse_response(msg: &[u8], outstanding: &[Outstanding]) -> Parsed {
     let Some(header) = Header::read(msg) else {
-        return Parsed::Malformed;
+        return Parsed::Ignored;
     };
     if header.flags & FLAG_QR == 0 || (header.flags >> 11) & 0xF != 0 || header.qdcount != 1 {
         return Parsed::Ignored;
     }
     let Some((qname, pos)) = read_name(msg, HEADER_BYTES) else {
-        return Parsed::Malformed;
+        return Parsed::Ignored;
     };
     let (Some(qtype), Some(qclass)) = (be16(msg, pos), be16(msg, pos + 2)) else {
-        return Parsed::Malformed;
+        return Parsed::Ignored;
     };
     let Some(query) = outstanding.iter().find(|o| {
         o.id == header.id && o.qtype.code() == qtype && qclass == CLASS_IN && o.name == qname
@@ -156,7 +173,10 @@ pub(crate) fn parse_response(msg: &[u8], outstanding: &[Outstanding]) -> Parsed 
             answer.addrs = addrs;
             Parsed::Answer(answer)
         }
-        None => Parsed::Malformed,
+        None => Parsed::Malformed {
+            id: query.id,
+            qtype: query.qtype,
+        },
     }
 }
 
@@ -263,14 +283,16 @@ fn read_answers(
 /// it where it sits (after its first compression pointer, if any). `None`
 /// when malformed: a label type 0x40 or 0x80 (RFC 6891 and the retired
 /// binary labels), a label or pointer cut by the end of the message, more
-/// than 255 octets, or a compression pointer that does not point strictly
-/// before the labels it ends. Each pointer must point before the previous
-/// target, so reading always ends.
+/// than 255 octets, a compression pointer that does not point strictly
+/// before the labels it ends, or more than [`MAX_POINTER_JUMPS`] pointers.
+/// Each pointer must point before the previous target, so reading always
+/// ends; the cap bounds the work.
 fn read_name(msg: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     let mut name = Vec::new();
     let mut pos = start;
     let mut limit = start;
     let mut end = None;
+    let mut jumps = 0usize;
     loop {
         let len = *msg.get(pos)?;
         match len & 0xC0 {
@@ -293,7 +315,8 @@ fn read_name(msg: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
             0xC0 => {
                 let low = *msg.get(pos + 1)?;
                 let target = (usize::from(len & 0x3F) << 8) | usize::from(low);
-                if target >= limit {
+                jumps += 1;
+                if target >= limit || jumps > MAX_POINTER_JUMPS {
                     return None;
                 }
                 end.get_or_insert(pos + 2);
@@ -315,8 +338,8 @@ pub(crate) mod tests {
     use std::net::IpAddr;
 
     use super::{
-        HEADER_BYTES, MAX_WIRE_NAME, Outstanding, Parsed, QType, encode_query, parse_response,
-        read_name, wire_name,
+        HEADER_BYTES, MAX_POINTER_JUMPS, MAX_WIRE_NAME, Outstanding, Parsed, QType, encode_query,
+        parse_response, read_name, wire_name,
     };
 
     const ID: u16 = 0x1234;
@@ -377,6 +400,14 @@ pub(crate) mod tests {
         match parsed {
             Parsed::Answer(answer) => answer.addrs,
             other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    /// The matched A query `ID`, malformed.
+    fn malformed_a() -> Parsed {
+        Parsed::Malformed {
+            id: ID,
+            qtype: QType::A,
         }
     }
 
@@ -488,7 +519,7 @@ pub(crate) mod tests {
         let msg = Msg::answer(ID, "git.example", QType::A, 0, 1)
             .record_raw(&[0x41, b'a', 0], 1, 1, &[192, 0, 2, 1])
             .bytes;
-        assert_eq!(parse_response(&msg, &pending(QType::A)), Parsed::Malformed);
+        assert_eq!(parse_response(&msg, &pending(QType::A)), malformed_a());
     }
 
     #[test]
@@ -504,7 +535,7 @@ pub(crate) mod tests {
                 .bytes;
             assert_eq!(
                 parse_response(&msg, &pending(qtype)),
-                Parsed::Malformed,
+                Parsed::Malformed { id: ID, qtype },
                 "type {rtype} length {len}"
             );
         }
@@ -532,7 +563,7 @@ pub(crate) mod tests {
             ]
         );
         let short = &msg[..msg.len() - 1];
-        assert_eq!(parse_response(short, &pending(QType::A)), Parsed::Malformed);
+        assert_eq!(parse_response(short, &pending(QType::A)), malformed_a());
     }
 
     #[test]
@@ -549,7 +580,7 @@ pub(crate) mod tests {
             qtype: QType::A,
             name: a.clone(),
         }];
-        assert_eq!(parse_response(&msg, &outstanding), Parsed::Malformed);
+        assert_eq!(parse_response(&msg, &outstanding), malformed_a());
 
         // A chain a -> b -> c: only c's addresses count.
         let c = wire("c.example");
@@ -570,7 +601,7 @@ pub(crate) mod tests {
         let msg = Msg::answer(ID, "a.example", QType::A, 0, 1)
             .record_raw(&a, 5, 1, &padded)
             .bytes;
-        assert_eq!(parse_response(&msg, &outstanding), Parsed::Malformed);
+        assert_eq!(parse_response(&msg, &outstanding), malformed_a());
     }
 
     #[test]
@@ -626,21 +657,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn truncated_header_and_counts_beyond_the_message_are_malformed() {
+    fn unmatched_short_or_broken_messages_are_ignored() {
+        // Shorter than the header, or cut inside the question: no (id,
+        // question) match, so ignored, as glibc's `send_dg` drops them.
         let msg = two_records();
-        for len in 0..HEADER_BYTES {
+        let question_end = HEADER_BYTES + wire("git.example").len() + 4;
+        for len in 0..question_end {
             assert_eq!(
                 parse_response(&msg[..len], &pending(QType::A)),
-                Parsed::Malformed,
+                Parsed::Ignored,
                 "{len}"
             );
         }
+        // A question name with an extended label type, or a pointer.
+        let mut label = msg.clone();
+        label[HEADER_BYTES] = 0x41;
+        let mut pointer = msg;
+        pointer[HEADER_BYTES..HEADER_BYTES + 2].copy_from_slice(&[0xC0, 12]);
+        for bytes in [label, pointer] {
+            assert_eq!(parse_response(&bytes, &pending(QType::A)), Parsed::Ignored);
+        }
+    }
+
+    #[test]
+    fn counts_beyond_the_matched_message_are_malformed() {
+        let msg = two_records();
         let mut more = msg.clone();
         more[6..8].copy_from_slice(&3u16.to_be_bytes());
-        assert_eq!(parse_response(&more, &pending(QType::A)), Parsed::Malformed);
+        assert_eq!(parse_response(&more, &pending(QType::A)), malformed_a());
         let mut huge = msg;
         huge[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
-        assert_eq!(parse_response(&huge, &pending(QType::A)), Parsed::Malformed);
+        assert_eq!(parse_response(&huge, &pending(QType::A)), malformed_a());
     }
 
     #[test]
@@ -700,6 +747,84 @@ pub(crate) mod tests {
             Parsed::Answer(answer) => assert_eq!(answer.rcode, 2),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A message whose name at the returned offset is `jumps` compression
+    /// pointers, each pointing at the one before, ending at `a` (offset 12).
+    fn pointer_chain(jumps: usize) -> (Vec<u8>, usize) {
+        let mut msg = vec![0; HEADER_BYTES];
+        msg.extend_from_slice(&[1, b'a', 0]);
+        let mut last = HEADER_BYTES;
+        for _ in 0..jumps {
+            let at = msg.len();
+            let pointer = u16::try_from(last).expect("offset") | 0xC000;
+            msg.extend_from_slice(&pointer.to_be_bytes());
+            last = at;
+        }
+        (msg, last)
+    }
+
+    #[test]
+    fn pointer_jumps_per_name_are_capped() {
+        let (msg, at) = pointer_chain(MAX_POINTER_JUMPS);
+        assert_eq!(read_name(&msg, at), Some((wire("a"), at + 2)));
+        let (msg, at) = pointer_chain(MAX_POINTER_JUMPS + 1);
+        assert_eq!(read_name(&msg, at), None);
+    }
+
+    /// The most pointer work one message can ask for: an unknown record
+    /// whose RDATA holds a chain of `chain` pointers, then as many records
+    /// as fit in 65,535 bytes whose owner is the chain's head.
+    fn pointer_heavy_message(chain: usize) -> (Vec<u8>, u16) {
+        let mut msg = Msg::answer(ID, "git.example", QType::A, 0, 0).bytes;
+        msg.extend_from_slice(&[0xC0, 12, 0xFF, 0x00, 0, 1, 0, 0, 0, 0]);
+        let len_at = msg.len();
+        msg.extend_from_slice(&[0, 0]);
+        let start = msg.len();
+        msg.push(0);
+        let mut last = start;
+        for _ in 0..chain {
+            let at = msg.len();
+            let pointer = u16::try_from(last).expect("offset") | 0xC000;
+            msg.extend_from_slice(&pointer.to_be_bytes());
+            last = at;
+        }
+        let rdlength = u16::try_from(msg.len() - start).expect("rdlength");
+        msg[len_at..len_at + 2].copy_from_slice(&rdlength.to_be_bytes());
+        let owner = (u16::try_from(last).expect("offset") | 0xC000).to_be_bytes();
+        let mut count: u16 = 1;
+        while msg.len() + 12 <= usize::from(u16::MAX) {
+            msg.extend_from_slice(&owner);
+            msg.extend_from_slice(&[0xFF, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+            count += 1;
+        }
+        msg[6..8].copy_from_slice(&count.to_be_bytes());
+        (msg, count)
+    }
+
+    #[test]
+    fn pointer_chain_beyond_the_cap_is_malformed() {
+        // The review's message: a chain of 8,169 pointers that every
+        // owner name points at.
+        let (msg, _) = pointer_heavy_message(8_169);
+        assert_eq!(
+            parse_response(&msg, &pending(QType::A)),
+            Parsed::Malformed {
+                id: ID,
+                qtype: QType::A
+            }
+        );
+        // At the cap (the owner pointer is the first jump) the message is
+        // read; the time is ADR-022's number.
+        let (msg, count) = pointer_heavy_message(MAX_POINTER_JUMPS - 1);
+        let start = std::time::Instant::now();
+        let parsed = parse_response(&msg, &pending(QType::A));
+        eprintln!(
+            "{} bytes, {count} records, {MAX_POINTER_JUMPS} jumps each: {:?}",
+            msg.len(),
+            start.elapsed()
+        );
+        assert_eq!(addrs(parsed), Vec::<IpAddr>::new());
     }
 
     #[test]

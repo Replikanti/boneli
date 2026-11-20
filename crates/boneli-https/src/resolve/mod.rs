@@ -122,7 +122,9 @@ impl Resolver {
     /// be 0; otherwise `InvalidInput`, before any file is read or query
     /// sent. Errors: `TimedOut` once the deadline passed or when every
     /// name server timed out for a candidate name; `NotFound` when no
-    /// candidate has an address; `Other` when name servers failed.
+    /// candidate has an address; `Other` when name servers failed;
+    /// `Unsupported` when resolv.conf lists name servers and none of them
+    /// can be used (a zoned IPv6 address, a word that is not an address).
     pub fn lookup(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Vec<SocketAddr>> {
         let host = host.to_ascii_lowercase();
         check_host(&host, port)?;
@@ -149,6 +151,13 @@ impl Resolver {
             return Ok(from_hosts);
         }
         let config = self.config()?;
+        if config.servers.is_empty() {
+            let listed = config.unusable.as_deref().unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("resolv.conf lists no name server the resolver can use, first {listed:?}"),
+            ));
+        }
         let mut last = None;
         for candidate in candidates(name, &config) {
             let Some(wire) = message::wire_name(&candidate) else {

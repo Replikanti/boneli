@@ -23,6 +23,9 @@ pub(crate) enum Slot {
     Settled { addrs: Vec<IpAddr> },
     /// Answered with TC=1: ask again over TCP.
     Truncated,
+    /// Answered with a failing rcode or a malformed answer. The other
+    /// query is still waited for (ADR-022, D5), as glibc's `send_dg` does.
+    Failed,
 }
 
 /// Why a server failed a try.
@@ -32,7 +35,8 @@ pub(crate) enum Fail {
     Refused,
     /// An rcode other than 0 and 3: SERVFAIL, NOTIMP, REFUSED and the rest.
     Rcode(u8),
-    /// A message the format does not allow, or a truncated answer over TCP.
+    /// A matched answer the format does not allow, a truncated answer over
+    /// TCP, or a TCP frame of length 0.
     Malformed,
     /// A socket error.
     Io(io::Error),
@@ -59,7 +63,7 @@ pub(crate) enum Event {
     Settled,
     /// A pending query needs TCP.
     Truncated,
-    /// The server failed.
+    /// A pending query failed (its slot is `Failed`).
     Failed(Fail),
 }
 
@@ -79,20 +83,21 @@ pub(crate) enum TryResult {
 /// Applies `parsed` to the slot of the outstanding query it answers,
 /// matched by id and question type, so an A and an AAAA query with the
 /// same id are told apart. An answer to a slot that is no longer pending
-/// (a duplicate datagram) is ignored.
+/// (a duplicate datagram) is ignored. A failing rcode or a malformed
+/// answer fails that slot only.
 pub(crate) fn match_response(
     parsed: Parsed,
     outstanding: &[Outstanding],
     slots: &mut [Slot],
 ) -> Event {
-    let answer = match parsed {
+    let (id, qtype) = match &parsed {
         Parsed::Ignored => return Event::Ignored,
-        Parsed::Malformed => return Event::Failed(Fail::Malformed),
-        Parsed::Answer(answer) => answer,
+        Parsed::Malformed { id, qtype } => (*id, *qtype),
+        Parsed::Answer(answer) => (answer.id, answer.qtype),
     };
     let Some(index) = outstanding
         .iter()
-        .position(|o| o.id == answer.id && o.qtype == answer.qtype)
+        .position(|o| o.id == id && o.qtype == qtype)
     else {
         return Event::Ignored;
     };
@@ -102,11 +107,19 @@ pub(crate) fn match_response(
     if *slot != Slot::Pending {
         return Event::Ignored;
     }
+    let answer = match parsed {
+        Parsed::Answer(answer) => answer,
+        _ => {
+            *slot = Slot::Failed;
+            return Event::Failed(Fail::Malformed);
+        }
+    };
     if answer.truncated {
         *slot = Slot::Truncated;
         return Event::Truncated;
     }
     if answer.rcode != 0 && answer.rcode != RCODE_NXDOMAIN {
+        *slot = Slot::Failed;
         return Event::Failed(Fail::Rcode(answer.rcode));
     }
     *slot = Slot::Settled {
@@ -146,21 +159,22 @@ pub(crate) fn try_server(
         tcp_phase(server, &outstanding, &mut slots, try_end)
     } else {
         match udp_phase(server, &outstanding, &mut slots, try_end) {
-            Some(fail) => Some(fail),
-            None if slots.contains(&Slot::Truncated) => {
+            Err(fail) => Some(fail),
+            Ok(failed) if slots.contains(&Slot::Truncated) => {
                 let window = Instant::now()
                     .checked_add(try_timeout)
                     .map_or(deadline, |end| end.min(deadline));
-                tcp_phase(server, &outstanding, &mut slots, window)
+                tcp_phase(server, &outstanding, &mut slots, window).or(failed)
             }
-            None => None,
+            Ok(failed) => failed,
         }
     };
     Ok(evaluate(&slots, failure))
 }
 
 /// Addresses for either type win, even beside a failure or a silence;
-/// then a failure; then NODATA or NXDOMAIN for both; else the wait ended.
+/// then a failure (of a query or of the server); then NODATA or NXDOMAIN
+/// for both; else the wait ended.
 fn evaluate(slots: &[Slot], failure: Option<Fail>) -> TryResult {
     let addrs: Vec<IpAddr> = slots
         .iter()
@@ -183,41 +197,41 @@ fn evaluate(slots: &[Slot], failure: Option<Fail>) -> TryResult {
 }
 
 /// Both queries over one connected UDP socket, then answers until both
-/// slots leave `Pending` or `try_end` comes. A failure ends the phase at
-/// once. A datagram longer than 512 bytes is read as truncated (the
-/// kernel cut it), so its type is asked again over TCP.
+/// slots leave `Pending` or `try_end` comes. `Ok` carries the failure of a
+/// query, if one failed: the phase waits on for the other (ADR-022, D5).
+/// `Err` is a socket error, which ends the phase at once. A datagram
+/// longer than 512 bytes is read as truncated (the kernel cut it), so its
+/// type is asked again over TCP.
 fn udp_phase(
     server: SocketAddr,
     outstanding: &[Outstanding],
     slots: &mut [Slot],
     try_end: Instant,
-) -> Option<Fail> {
+) -> Result<Option<Fail>, Fail> {
     let local = match server {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = match UdpSocket::bind(local).and_then(|s| s.connect(server).map(|()| s)) {
-        Ok(socket) => socket,
-        Err(e) => return Some(io_fail(e)),
-    };
+    let socket = UdpSocket::bind(local)
+        .and_then(|s| s.connect(server).map(|()| s))
+        .map_err(io_fail)?;
     for query in outstanding {
-        if let Err(e) = socket.send(&encode_query(query.id, &query.name, query.qtype)) {
-            return Some(io_fail(e));
-        }
+        socket
+            .send(&encode_query(query.id, &query.name, query.qtype))
+            .map_err(io_fail)?;
     }
+    let mut failed = None;
     let mut buf = [0u8; DNS_UDP_MESSAGE_BYTES + 1];
     while slots.contains(&Slot::Pending) {
         let left = try_end.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return None;
+            break;
         }
-        if let Err(e) = socket.set_read_timeout(Some(left)) {
-            return Some(Fail::Io(e));
-        }
+        socket.set_read_timeout(Some(left)).map_err(Fail::Io)?;
         let len = match socket.recv(&mut buf) {
             Ok(len) => len,
             Err(e) if is_wait_over(&e) || e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Some(io_fail(e)),
+            Err(e) => return Err(io_fail(e)),
         };
         if len > DNS_UDP_MESSAGE_BYTES
             && let Some(flags) = buf.get_mut(2)
@@ -230,26 +244,28 @@ fn udp_phase(
         if let Event::Failed(fail) =
             match_response(parse_response(msg, outstanding), outstanding, slots)
         {
-            return Some(fail);
+            failed = Some(fail);
         }
     }
-    None
+    Ok(failed)
 }
 
 /// Every pending or truncated query over TCP, one connection each, in
 /// slot order, until `window_end`. A query still pending at the end of
-/// the window stays pending: the try timed out.
+/// the window stays pending: the try timed out. A failed query does not
+/// stop the next one (ADR-022, D5); a connection error ends the phase.
 fn tcp_phase(
     server: SocketAddr,
     outstanding: &[Outstanding],
     slots: &mut [Slot],
     window_end: Instant,
 ) -> Option<Fail> {
+    let mut failed = None;
     for index in 0..slots.len() {
         let Some(slot) = slots.get_mut(index) else {
             continue;
         };
-        if matches!(slot, Slot::Settled { .. }) {
+        if !matches!(slot, Slot::Pending | Slot::Truncated) {
             continue;
         }
         *slot = Slot::Pending;
@@ -258,15 +274,25 @@ fn tcp_phase(
         };
         match tcp_query(server, outstanding, slots, query, window_end) {
             Ok(()) => {}
-            Err(TcpEnd::WaitOver) => return None,
+            Err(TcpEnd::WaitOver) => return failed,
+            Err(TcpEnd::Answer(fail)) => {
+                if let Some(slot) = slots.get_mut(index) {
+                    *slot = Slot::Failed;
+                }
+                failed = Some(fail);
+            }
             Err(TcpEnd::Fail(fail)) => return Some(fail),
         }
     }
-    None
+    failed
 }
 
 enum TcpEnd {
+    /// The window ended.
     WaitOver,
+    /// The answer to the query failed it: the next query is still asked.
+    Answer(Fail),
+    /// The connection failed.
     Fail(Fail),
 }
 
@@ -310,8 +336,8 @@ fn tcp_query(
         match match_response(parse_response(&msg, outstanding), outstanding, slots) {
             Event::Ignored => {}
             Event::Settled => return Ok(()),
-            Event::Truncated => return Err(TcpEnd::Fail(Fail::Malformed)),
-            Event::Failed(fail) => return Err(TcpEnd::Fail(fail)),
+            Event::Truncated => return Err(TcpEnd::Answer(Fail::Malformed)),
+            Event::Failed(fail) => return Err(TcpEnd::Answer(fail)),
         }
     }
 }
@@ -432,6 +458,32 @@ mod tests {
             };
             assert_eq!(got, want, "rcode {rcode}");
         }
+        // A failure fails its own slot only; the other still settles, and a
+        // later answer to the failed one is ignored.
+        let mut slots = [Slot::Pending, Slot::Pending];
+        let servfail = Msg::answer(2, "git.example", QType::Aaaa, 2, 0).bytes;
+        let event = match_response(
+            parse_response(&servfail, &outstanding),
+            &outstanding,
+            &mut slots,
+        );
+        assert!(matches!(event, Event::Failed(_)), "{event:?}");
+        assert_eq!(slots, [Slot::Pending, Slot::Failed]);
+        let mut cut = Msg::answer(1, "git.example", QType::A, 0, 1)
+            .record(1, 1, &[192, 0, 2, 1])
+            .bytes;
+        cut.pop();
+        let event = match_response(parse_response(&cut, &outstanding), &outstanding, &mut slots);
+        assert!(matches!(event, Event::Failed(_)), "{event:?}");
+        assert_eq!(slots, [Slot::Failed, Slot::Failed]);
+        let late = Msg::answer(2, "git.example", QType::Aaaa, 0, 0).bytes;
+        let event = match_response(
+            parse_response(&late, &outstanding),
+            &outstanding,
+            &mut slots,
+        );
+        assert!(matches!(event, Event::Ignored), "{event:?}");
+
         let mut slots = [Slot::Pending, Slot::Pending];
         let mut tc = Msg::answer(2, "git.example", QType::Aaaa, 0, 0).bytes;
         tc[2] |= 0x02;

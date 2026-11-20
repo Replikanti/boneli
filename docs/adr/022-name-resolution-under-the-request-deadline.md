@@ -48,7 +48,8 @@ These are the semantics of musl's `getaddrinfo`, which has no NSS:
 Rust's self-contained musl `libc.a` defines `getaddrinfo`,
 `__lookup_name`, `__get_resolv_conf` and `__res_msend` and no
 `getaddrinfo_a` (checked when this was planned). A runner built for musl
-resolves this way today.
+resolves this way today. One exception: musl uses a name server with an
+IPv6 zone (`fe80::1%eth0`), this resolver does not (D3).
 
 Why this mechanism:
 
@@ -103,7 +104,24 @@ hostile input joins an always-review crate.
   default domain glibc derives from the hostname.
 - No `nameserver` line at all means `127.0.0.1:53`, as in libc.
 - A server with a zone (`fe80::1%eth0`) or one that does not parse is
-  skipped and does not count toward the 3.
+  skipped and does not count toward the 3. When `nameserver` lines list
+  servers and every one is skipped, the resolver asks no server: a lookup
+  that needs DNS fails with `Unsupported`, naming the first listed value.
+  It never falls back to `127.0.0.1:53` then, because that asks a server
+  nobody configured: the error would name it (`connection refused`), or
+  whatever listens on loopback port 53 would answer.
+
+  Why not use the zone, as glibc and musl do: a zone is an interface
+  name, and a socket needs its index. `if_nametoindex` is a `libc` call
+  (hand-written FFI in `boneli-sys` and a new `libc` edge, each needing
+  an ADR); `/sys/class/net/<name>/ifindex` builds a path from file text
+  in an always-review crate and is absent where `/sys` is not mounted.
+  Link-local name servers come from IPv6 router advertisements (RDNSS)
+  on IPv6-only links, and NetworkManager writes them into resolv.conf
+  only when systemd-resolved is off; with systemd-resolved, resolv.conf
+  lists the 127.0.0.53 stub. A runner host like that is rare enough that
+  failing with the cause named beats either mechanism; when one shows up,
+  supporting zones is a decision of its own (Known limits).
 - An option value that is not a number keeps the default (glibc reads
   `ndots:x` as 0 through `atoi`; a typo should not turn the search list
   off). A value out of range is clamped (Numbers).
@@ -131,8 +149,12 @@ because a caller's value is a bug, not a file to tolerate.
 - A message is ignored unless QR=1, opcode 0, QDCOUNT 1 and its id and
   question (name case-insensitively, type, class IN) match an
   outstanding query; matching is by (id, type), so an A and an AAAA
-  query with the same id are told apart. A second answer to a settled
-  query is ignored.
+  query with the same id are told apart. A message shorter than the
+  header or whose question does not parse is ignored too, as glibc's
+  `send_dg` drops it (`goto wait`): only a message that matches an
+  outstanding query can fail it, so a sender must know the 16-bit id as
+  well as the port. A second answer to a settled or failed query is
+  ignored.
 - The CNAME chain is followed inside the answer section only, from the
   question name, at most ANCOUNT steps; a name met twice is malformed.
   Only the records of the query's type owned by the chain's last name
@@ -140,13 +162,15 @@ because a caller's value is a bug, not a file to tolerate.
 - Names: labels of at most 63 octets, 255 octets on the wire; the label
   types 0x40 and 0x80 are malformed; a compression pointer must point
   strictly before the labels it ends, and each later pointer before the
-  previous target, so reading always ends.
+  previous target, so reading always ends; more than 127 pointers in one
+  name are malformed, which bounds the work (Numbers).
 - An A record of class IN must have 4 bytes of RDATA and an AAAA record
   16, a CNAME's name must fill its RDATA exactly; records of another
   class or type are skipped. Every index is checked, so no input panics:
-  a message is ignored, an answer, or malformed.
+  a message is ignored, an answer, or a malformed answer to the query it
+  matched.
 - rcode 0 is an answer or NODATA, 3 is NXDOMAIN, and every other rcode
-  (SERVFAIL 2, NOTIMP 4, REFUSED 5 and the rest) fails that server.
+  (SERVFAIL 2, NOTIMP 4, REFUSED 5 and the rest) fails that query.
 
 ### D5. The schedule
 
@@ -157,11 +181,16 @@ because a caller's value is a bug, not a file to tolerate.
 - For each candidate, `for attempt in 0..attempts { for server in
   servers { try } }`. Each try waits at most `min(timeout, left)`;
   `use-vc` sends every query over TCP.
-- A try ends when both types are settled or its wait ends; a failure
-  (an rcode, a malformed answer, ECONNREFUSED) ends it at once, and the
-  next server is asked. Addresses for either type mean Found, even when
-  the other type stays silent or fails (a partial answer). NODATA or
-  NXDOMAIN for both means the candidate has no address.
+- A try ends when both types are answered (settled or failed) or its
+  wait ends. A failed query (an rcode or a malformed answer to it) does
+  not end the try: the other type is still waited for, as glibc's
+  `send_dg` does on SERVFAIL, NOTIMP and REFUSED (`recvresp1`,
+  `recvresp2`), and over TCP the other query is still asked. A socket
+  error (ECONNREFUSED) ends the try at once. Addresses for either type
+  mean Found, whichever arrives first, even when the other type stays
+  silent or fails (a partial answer). Otherwise a failed query fails the
+  server and the next one is asked. NODATA or NXDOMAIN for both means the
+  candidate has no address.
 - A candidate whose tries all time out ends the lookup with `TimedOut`,
   as glibc's `res_search` stops on a timeout. NXDOMAIN, NODATA and
   failures go on to the next candidate.
@@ -225,14 +254,32 @@ in resolv.conf(5).
   EDNS; it holds the measured 262-byte maximum 1.95 times over. A larger
   answer costs one TCP round trip.
 - **65,535 bytes over TCP**: the two-byte length prefix allows no more.
+- **127 compression pointers per name** (`MAX_POINTER_JUMPS`): a name of
+  255 octets has at most 127 labels (each takes at least 2 octets), and a
+  pointer that saves space leads to at least one label, because a pointer
+  to a bare root octet or to another pointer is 2 octets for at most 2.
+  So no space-saving encoding of a legal name needs more jumps; a lower
+  cap could refuse one that shares every suffix. Without a cap a TCP
+  answer of 65,532 bytes whose 4,096 owner names follow one chain of
+  8,169 pointers took about 145 ms to parse (release build, development
+  host), all of it possibly after the deadline; at the cap the heaviest
+  such answer, 5,436 owner names of 127 jumps, takes 3 to 5 ms. A higher
+  cap moves that time up linearly.
 - **The precedence table** (D6): gai.conf(5)'s default.
 - **No cap on search domains**: glibc dropped its cap of 6 in 2.26, and
   the deadline bounds the candidates.
 
 ## Consequences
 
-- With part 2, the lookup counts inside every deadline. With resolv.conf
-  defaults, one dead name server costs 5 s before the second answers:
+- With part 2, the lookup counts inside every deadline. Dead name servers
+  ahead of a live one cost `C x D x T`: `T` the try timeout, `D` the dead
+  servers before the live one, `C` the candidates asked up to the one
+  with the address, because every candidate starts again at the first
+  server (D5, as glibc's `res_search`). A name with at least `ndots` dots
+  is asked as it is first, so `C` is 1; a name with fewer dots goes
+  through the `S` search domains first, so `C` is `S + 1`. With
+  resolv.conf's defaults (`T` 5 s, `ndots` 1) and no search list, one
+  dead server (`D` 1) costs 5 s before the second answers:
   - a CRL fetch over `https`: 5 + 10 connect + 10 handshake + 0.211
     (measured first byte, ADR-017) = 25.2 s, under `CRL_SETUP_TIME` 30 s.
     With two dead servers, 10 + 20.2 = 30.2 s: a fetch is cut off only if
@@ -242,8 +289,24 @@ in resolv.conf(5).
     10 + 10 + 1 = 36 s; none was measured;
   - `boneli-oci`'s `SETUP_TIMEOUT` 30 s and the forge's 30 s: 5 + 10 +
     10 + a round trip, under 30 s.
-  No constant changes. Before, the lookup sat outside these budgets and
-  was unbounded: 10.0 to 28.0 s for glibc in ADR-006.
+
+  The budgets do not hold with a search list and a high `ndots`. A
+  Kubernetes pod's resolv.conf has at least 3 search domains (the
+  cluster's, then the node's) and `ndots:5`, so a
+  CRL host such as `crl3.digicert.com` (2 dots) is asked under the 3
+  domains first: `C` 4, and one dead first server costs 4 x 5 = 20 s.
+  The CRL fetch then needs 20 + 10 + 10 + 0.211 = 40.2 s against 30 s,
+  the OCSP check 20 + 10 + 10 + 1 = 41 s against 31 s, and the oci and
+  forge setups 20 + 10 + 10 s and a round trip against 30 s.
+  glibc spends the same 20 s there (same schedule), so this is not a
+  regression; today those 20 s sit outside every deadline. Part 1 wires
+  nothing and changes no constant. In part 2 the lookup runs under each
+  call's deadline, so on such a host the call ends at its deadline with
+  `TimedOut` instead of running past it, and a revocation check that ends
+  so fails closed (ADR-017, ADR-020); the request fails instead of
+  overrunning. A host that needs these calls to fit lists a live server
+  first or lowers `ndots`. Before, the lookup sat outside these budgets
+  and was unbounded: 10.0 to 28.0 s for glibc in ADR-006.
 - Behavior differs from today's glibc path: NSS sources other than files
   and DNS, the environment variables, gai.conf and the hostname-derived
   search domain are not used, and IPv6 addresses with no route are tried
@@ -270,10 +333,19 @@ in resolv.conf(5).
 - Reading `/etc/resolv.conf` and `/etc/hosts` from a hung network file
   system is not bounded by the deadline. A huge hosts file is: the
   deadline is checked before every line.
-- An on-path attacker can still answer first, as against glibc; a
-  datagram that fails the server (malformed, SERVFAIL) from the server's
-  address moves the try on to the next server. Both cost availability
-  only.
+- An on-path attacker can still answer first, as against glibc. An
+  off-path sender who hits the ephemeral port and the 16-bit id of a
+  query can fail that query (SERVFAIL, a malformed answer), and when the
+  other type yields no address the try moves on to the next server; a
+  datagram that matches no query is ignored, as glibc's `send_dg` does.
+  Both cost availability only.
+- Name servers with an IPv6 zone are not used (D3); when resolv.conf
+  lists only such servers, lookups that need DNS fail with
+  `Unsupported`, where glibc and musl would ask them.
+- Dead name servers ahead of a live one cost `C x D x T` per lookup
+  (Consequences); with a Kubernetes-style search list the CRL, OCSP, oci
+  and forge budgets do not hold, and part 2's deadlines end those calls
+  instead.
 - `boneli-egress` resolves with its own `getaddrinfo` (ADR-006); its known
   limit stays open. This resolver could move into a support crate of its
   own when the egress wants it.

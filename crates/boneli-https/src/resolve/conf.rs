@@ -27,6 +27,10 @@ pub struct ResolverConfig {
     pub(super) attempts: u8,
     pub(super) use_vc: bool,
     pub(super) hosts: Option<String>,
+    /// The first `nameserver` value that was listed but cannot be used,
+    /// kept only when no listed server can: the lookup then fails naming
+    /// it instead of asking `127.0.0.1:53` (ADR-022, D3).
+    pub(super) unusable: Option<String>,
 }
 
 impl ResolverConfig {
@@ -39,7 +43,10 @@ impl ResolverConfig {
     /// `timeout` to 1..=30 seconds, `attempts` to 1..=5; a value that is
     /// not a number keeps the default. Every other line, option and
     /// comment (`#` or `;` at the start of a line) is ignored. With no
-    /// name server at all the resolver asks `127.0.0.1:53`, as libc does.
+    /// `nameserver` line at all the resolver asks `127.0.0.1:53`, as libc
+    /// does; when lines list servers and none of them can be used, it
+    /// asks no server and a lookup that needs DNS fails, naming the first
+    /// (`ErrorKind::Unsupported`).
     pub fn parse(text: &str) -> ResolverConfig {
         let mut config = ResolverConfig {
             servers: Vec::new(),
@@ -49,16 +56,25 @@ impl ResolverConfig {
             attempts: DNS_DEFAULT_ATTEMPTS,
             use_vc: false,
             hosts: None,
+            unusable: None,
         };
+        let mut listed = false;
         for line in text.lines() {
             let mut words = line.split_ascii_whitespace();
             match words.next() {
                 Some("nameserver") => {
-                    let ip = words.next().and_then(|w| w.parse::<IpAddr>().ok());
-                    if let Some(ip) = ip
-                        && config.servers.len() < DNS_MAX_NAME_SERVERS
-                    {
-                        config.servers.push(SocketAddr::new(ip, DNS_PORT));
+                    let Some(word) = words.next() else {
+                        continue;
+                    };
+                    listed = true;
+                    match word.parse::<IpAddr>() {
+                        Ok(ip) if config.servers.len() < DNS_MAX_NAME_SERVERS => {
+                            config.servers.push(SocketAddr::new(ip, DNS_PORT));
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            config.unusable.get_or_insert_with(|| word.to_owned());
+                        }
                     }
                 }
                 Some("search" | "domain") => config.search = search_domains(words),
@@ -70,7 +86,9 @@ impl ResolverConfig {
                 _ => {}
             }
         }
-        if config.servers.is_empty() {
+        if !config.servers.is_empty() {
+            config.unusable = None;
+        } else if !listed {
             config
                 .servers
                 .push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DNS_PORT));
@@ -122,6 +140,7 @@ impl ResolverConfig {
             attempts,
             use_vc: false,
             hosts: None,
+            unusable: None,
         })
     }
 
@@ -245,9 +264,16 @@ mod tests {
             "nameserver fe80::1%eth0\nnameserver x\nnameserver 127.1\nnameserver\nnameserver 192.0.2.7\n",
         );
         assert_eq!(servers(&config), ["192.0.2.7:53"]);
-        // Only skipped lines: the default server.
-        let config = ResolverConfig::parse("nameserver fe80::1%eth0\n");
+        assert_eq!(config.unusable, None);
+        // Only unusable servers listed: no server, not the default one;
+        // the lookup fails naming the first (ADR-022, D3).
+        let config = ResolverConfig::parse("nameserver x\nnameserver fe80::1%eth0\n");
+        assert_eq!(servers(&config), Vec::<String>::new());
+        assert_eq!(config.unusable.as_deref(), Some("x"));
+        // A `nameserver` line without a value lists nothing.
+        let config = ResolverConfig::parse("nameserver\n");
         assert_eq!(servers(&config), ["127.0.0.1:53"]);
+        assert_eq!(config.unusable, None);
     }
 
     #[test]
