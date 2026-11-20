@@ -1035,8 +1035,8 @@
    "state": "implementing",
    "owner": "ae67d3e8",
    "pr": null,
-   "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver",
-   "updated_at": "2026-11-20T22:00:38+00:00",
+   "note": "parked: one large task too many for its holder's profile; opens again when there is a place",
+   "updated_at": "2026-11-20T22:04:26+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1049,9 +1049,9 @@
    "manual": false,
    "user": "ylohnitram",
    "machine": "df82df",
-   "session": true,
+   "session": false,
    "dispatched": true,
-   "parked": null
+   "parked": true
   },
   {
    "issue": 64,
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:06:39+00:00",
-   "issue": 22,
-   "from": "pr-review",
-   "to": "done",
-   "by": "7e33749a",
-   "note": null
-  },
   {
    "at": "2026-11-20T15:06:41+00:00",
    "issue": 54,
@@ -1710,6 +1702,14 @@
    "to": "claimed",
    "by": "62531680",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T22:04:26+00:00",
+   "issue": 55,
+   "from": "implementing",
+   "to": "implementing",
+   "by": "dispatch",
+   "note": "parked: one large task too many for its holder's profile; opens again when there is a place"
   }
  ],
  "open": [
@@ -1745,7 +1745,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:04:16+00:00",
+ "updated_at": "2026-11-20T22:04:26+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
