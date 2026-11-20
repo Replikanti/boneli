@@ -1035,8 +1035,8 @@
    "state": "implementing",
    "owner": "ae67d3e8",
    "pr": null,
-   "note": "",
-   "updated_at": "2026-11-20T22:00:17+00:00",
+   "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver",
+   "updated_at": "2026-11-20T22:00:38+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1261,14 +1261,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:30:10+00:00",
-   "issue": 54,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #78 open"
-  },
   {
    "at": "2026-11-20T13:45:00+00:00",
    "issue": 79,
@@ -1660,6 +1652,14 @@
    "to": "implementing",
    "by": "ae67d3e8",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:00:38+00:00",
+   "issue": 55,
+   "from": "implementing",
+   "to": "implementing",
+   "by": "ae67d3e8",
+   "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver"
   }
  ],
  "open": [
@@ -1693,7 +1693,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:00:17+00:00",
+ "updated_at": "2026-11-20T22:00:38+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
