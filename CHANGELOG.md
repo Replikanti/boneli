@@ -615,3 +615,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limit after its lift: the sandbox's dirty and writeback page cache,
   bounded by `memory.max`, and every direct-I/O write already submitted,
   which `memory.max` does not bound (#52).
+- `destroy_lifts_io_throttle` also waits, up to the same 10 s after the
+  spawn, for a writer that has not entered its 40 MiB write yet (no task
+  in it and `wchar` under 512, nothing of the write returned), so a host
+  under load that starts the probe late no longer fails the test at the
+  first read; a writer that left its write after a partial return still
+  fails at once. The report line names the verdicts the wait read and
+  what ended it (#54).

@@ -669,7 +669,11 @@ fn destroy_lifts_io_throttle() {
     // first count comes when the first bio is dispatched, about 1 s after
     // the writer enters its write, so the check reads again every 100 ms
     // until the device counts or IO_HOLD_DEADLINE_MS (review round 2 of
-    // PR 53: a writer that entered at ~1.2 s read wbytes 0 at 2 s).
+    // PR 53: a writer that entered at ~1.2 s read wbytes 0 at 2 s). It
+    // also reads again while the writer has not entered its write yet
+    // (wchar under IO_ENTRY_WCHAR; #54: under a load average of about 19
+    // the writer was still in futex at 2,014 ms), and fails only when the
+    // writer left the write early or the deadline passes.
     let _alone = support::exclusive();
     let fixture = Fixture::new("io-kill");
     let dev = block_device_of(&fixture.workspace).expect("a block device behind /workspace");
@@ -732,6 +736,7 @@ fn destroy_lifts_io_throttle() {
                 file_dirty: keyed(&memory, "file_dirty"),
                 file_writeback: keyed(&memory, "file_writeback"),
                 reads: 0,
+                waited: Vec::new(),
                 buffer,
             }
         },
@@ -942,6 +947,9 @@ struct IoFacts {
     file_dirty: u64,
     file_writeback: u64,
     reads: u32,
+    /// The verdicts of the reads before this one, which did not end the
+    /// wait, each with its count, in the order they first came.
+    waited: Vec<(IoHold, u32)>,
     buffer: String,
 }
 
@@ -954,30 +962,51 @@ struct IoFacts {
 /// round 2 of PR 53). At 10 s at most 10 MiB plus one 100 ms slice has
 /// drained, so at least 29.9 MiB are still queued, more than `KILL_BOUND`
 /// (10 s) drains at 1 MiB/s, and the test still proves the lift (ADR-007,
-/// "The timing tests").
+/// "The timing tests"). The same deadline bounds the wait for a late
+/// entry into the write (#54): it covers an entry up to 8,900 ms after
+/// the spawn, one 1 MiB bio at the rate and one slice before it.
 const IO_HOLD_DEADLINE_MS: u64 = 10_000;
 /// The pause between two reads while the poll waits: one 100 ms throttle
 /// slice, the step in which blk-throttle dispatches.
 const IO_HOLD_POLL: Duration = Duration::from_millis(100);
+/// `wchar` under this means nothing of the 40 MiB write has returned: an
+/// `O_DIRECT` write returns only multiples of the logical block size, at
+/// least 512 bytes on every Linux block device, and the probe writes 38
+/// bytes before its write (measured on every CI class and the dev host).
+const IO_ENTRY_WCHAR: u64 = 512;
 
-/// Reads the facts until a read is anything but `NotOnDevice`, or until a
-/// read taken at or past [`IO_HOLD_DEADLINE_MS`] after the spawn; returns
-/// the last verdict and its facts, `reads` set. Only the device's count
-/// is waited for: a read that finds the writer out of its write ends the
-/// poll with that verdict, so `Held` always means the writer was inside
-/// its write when the count was seen.
+/// Reads the facts until a read is anything but `NotOnDevice` or
+/// `NotEntered`, or until a read taken at or past [`IO_HOLD_DEADLINE_MS`]
+/// after the spawn; returns the last verdict and its facts, `reads` and
+/// `waited` set. Only the device's count and the writer's entry into its
+/// write are waited for (#54: under load the writer entered after the
+/// first read at 2 s): a read that finds the writer gone, its write
+/// returned or left early ends the poll with that verdict, so `Held`
+/// always means the writer was inside its write when the count was seen.
 fn poll_io_hold(mut read: impl FnMut() -> IoFacts, mut pause: impl FnMut()) -> (IoHold, IoFacts) {
     let mut reads = 0;
+    let mut waited: Vec<(IoHold, u32)> = Vec::new();
     loop {
         let mut f = read();
         reads += 1;
         f.reads = reads;
         let v = io_hold_verdict(&f);
-        if v != IoHold::NotOnDevice || f.elapsed_ms >= IO_HOLD_DEADLINE_MS {
+        if !io_hold_waits(v) || f.elapsed_ms >= IO_HOLD_DEADLINE_MS {
+            f.waited = waited;
             return (v, f);
+        }
+        match waited.iter_mut().find(|(w, _)| *w == v) {
+            Some((_, n)) => *n += 1,
+            None => waited.push((v, 1)),
         }
         pause();
     }
+}
+
+/// Whether a read with this verdict before the deadline makes the poll
+/// read again.
+fn io_hold_waits(v: IoHold) -> bool {
+    matches!(v, IoHold::NotOnDevice | IoHold::NotEntered)
 }
 
 /// The mapping that holds `addr` in a `/proc/<pid>/smaps` text, for the
@@ -1052,7 +1081,14 @@ enum IoHold {
     Finished,
     /// Alive, but `wchar` counts the whole write: it returned.
     Returned,
-    /// Alive, but no task was inside the 40 MiB write.
+    /// Alive, no task inside the 40 MiB write, and `wchar` under
+    /// [`IO_ENTRY_WCHAR`]: nothing of the write has returned, so the writer
+    /// has not entered it yet (#54: futex at 2,014 ms under load). Final
+    /// only at [`IO_HOLD_DEADLINE_MS`]; before it the poll reads again.
+    NotEntered,
+    /// Alive, no task inside the 40 MiB write, and `wchar` from
+    /// [`IO_ENTRY_WCHAR`] up to the write's size: the writer was inside
+    /// and left early (a partial return).
     NotInWrite,
     /// Fallback only: no task in `D`.
     NotBlocked,
@@ -1080,6 +1116,8 @@ fn io_hold_verdict(f: &IoFacts) -> IoHold {
                     if nr == libc::SYS_write && args[2] == IO_KILL_SIZE)
             }) {
                 IoHold::Held
+            } else if *wchar < IO_ENTRY_WCHAR {
+                IoHold::NotEntered
             } else {
                 IoHold::NotInWrite
             }
@@ -1112,9 +1150,21 @@ fn io_hold_text(v: IoHold, f: &IoFacts) -> String {
         ),
         HoldCheck::DState { refused } => (format!("refused {refused}"), "not read".to_string()),
     };
+    let waited = f
+        .waited
+        .iter()
+        .map(|(w, n)| format!("{w:?} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ended = if io_hold_waits(v) && f.elapsed_ms >= IO_HOLD_DEADLINE_MS {
+        "the deadline".to_string()
+    } else {
+        format!("{v:?}")
+    };
     format!(
-        "at {} ms (read {}) hold-check={} verdict {v:?}, tasks [{tasks}], wchar {wchar}, \
-         states {:?}, device {}:{} wbytes {} file_dirty {} file_writeback {}, buffer {}",
+        "at {} ms (read {}) hold-check={} verdict {v:?}, waited [{waited}], ended by {ended}, \
+         tasks [{tasks}], wchar {wchar}, states {:?}, device {}:{} wbytes {} file_dirty {} \
+         file_writeback {}, buffer {}",
         f.elapsed_ms,
         f.reads,
         hold_check_label(&f.check),
@@ -1133,6 +1183,9 @@ fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
         "the io.max device counted no write within {IO_HOLD_DEADLINE_MS} ms of the spawn: \
          the writer's bios may not pass the limited device"
     );
+    let not_entered = format!(
+        "the writer had not entered its 40 MiB write within {IO_HOLD_DEADLINE_MS} ms of the spawn"
+    );
     let why = match v {
         IoHold::Finished if status == ExitStatus::Exited(0) => {
             "io.max did not hold the writer: it finished its 40 MiB write before the check"
@@ -1141,6 +1194,7 @@ fn io_hold_failure(v: IoHold, status: ExitStatus, f: &IoFacts) -> String {
         IoHold::Returned => {
             "io.max did not hold the writer: its 40 MiB write returned before the check"
         }
+        IoHold::NotEntered => not_entered.as_str(),
         IoHold::NotInWrite => "the writer was not inside its 40 MiB write",
         IoHold::NotBlocked => "the writer was not blocked in its write",
         IoHold::NotOnDevice => off_device.as_str(),
@@ -1242,6 +1296,7 @@ fn io_facts(populated: u64, check: HoldCheck, states: &[char]) -> IoFacts {
         file_dirty: 0,
         file_writeback: 41_418_752,
         reads: 1,
+        waited: Vec::new(),
         buffer: "40960 kB nh AnonHugePages 0 kB".to_string(),
     }
 }
@@ -1249,6 +1304,10 @@ fn io_facts(populated: u64, check: HoldCheck, states: &[char]) -> IoFacts {
 fn syscall_check(tasks: Vec<TaskLine>, wchar: u64) -> HoldCheck {
     HoldCheck::Syscall { tasks, wchar }
 }
+
+/// `wchar` after a partial return: the probe's 38 bytes plus 1 MiB of the
+/// write.
+const PARTIAL_WCHAR: u64 = 38 + 1_048_576;
 
 #[test]
 fn io_hold_verdicts() {
@@ -1296,6 +1355,14 @@ fn io_hold_verdicts() {
     );
     assert_eq!(
         zero(1, syscall_check(vec![futex_task()], 38), &['S', 'D']),
+        IoHold::NotEntered
+    );
+    assert_eq!(
+        zero(
+            1,
+            syscall_check(vec![futex_task()], PARTIAL_WCHAR),
+            &['S', 'D']
+        ),
         IoHold::NotInWrite
     );
     let eperm = || HoldCheck::DState {
@@ -1313,10 +1380,27 @@ fn io_hold_verdicts() {
             IoHold::Held
         );
     }
+    // #54: the futex task alone with the 38 bytes the probe writes before
+    // its write has not entered it yet (the QA failure at 2,014 ms).
     assert_eq!(
         io_hold_verdict(&io_facts(1, syscall_check(vec![futex_task()], 38), &['S'])),
-        IoHold::NotInWrite
+        IoHold::NotEntered
     );
+    // wchar decides between not yet entered and left early, both bounds
+    // inclusive: under IO_ENTRY_WCHAR nothing of the write has returned,
+    // from it up to the write's size a part has; the whole size returned.
+    for (wchar, want) in [
+        (0, IoHold::NotEntered),
+        (IO_ENTRY_WCHAR - 1, IoHold::NotEntered),
+        (IO_ENTRY_WCHAR, IoHold::NotInWrite),
+        (PARTIAL_WCHAR, IoHold::NotInWrite),
+        (IO_KILL_SIZE - 1, IoHold::NotInWrite),
+        (IO_KILL_SIZE, IoHold::Returned),
+    ] {
+        let f = io_facts(1, syscall_check(vec![futex_task()], wchar), &['S', 'R']);
+        assert_eq!(io_hold_verdict(&f), want, "wchar {wchar}");
+    }
+    assert_eq!((IO_ENTRY_WCHAR, PARTIAL_WCHAR), (512, 1_048_614));
     // Not in the write.
     let fdatasync = task(
         "4101",
@@ -1342,9 +1426,20 @@ fn io_hold_verdicts() {
     for tasks in not_in_write {
         let raws: Vec<String> = tasks.iter().map(|t| t.raw.clone()).collect();
         // A task in D outside the write does not count when the syscall
-        // check ran.
+        // check ran. With nothing returned yet (a task in another write
+        // included) the writer has not entered: the poll waits and fails
+        // at the deadline, it never passes; after a partial return it left.
         assert_eq!(
-            io_hold_verdict(&io_facts(1, syscall_check(tasks, 38), &['S', 'D'])),
+            io_hold_verdict(&io_facts(1, syscall_check(tasks.clone(), 38), &['S', 'D'])),
+            IoHold::NotEntered,
+            "{raws:?}"
+        );
+        assert_eq!(
+            io_hold_verdict(&io_facts(
+                1,
+                syscall_check(tasks, PARTIAL_WCHAR),
+                &['S', 'D']
+            )),
             IoHold::NotInWrite,
             "{raws:?}"
         );
@@ -1382,7 +1477,12 @@ fn io_hold_failure_messages() {
     );
     let finished = io_facts(0, syscall_check(vec![w.clone()], 41_943_130), &[]);
     let returned = io_facts(1, syscall_check(vec![w.clone()], 41_943_130), &['S']);
-    let not_in = io_facts(1, syscall_check(vec![futex_task()], 38), &['S']);
+    let not_in = io_facts(1, syscall_check(vec![futex_task()], PARTIAL_WCHAR), &['S']);
+    // Both waiting verdicts end a failed run only at the deadline.
+    let mut not_entered = io_facts(1, syscall_check(vec![futex_task()], 38), &['S', 'R']);
+    not_entered.elapsed_ms = IO_HOLD_DEADLINE_MS + 3;
+    not_entered.reads = 81;
+    not_entered.waited = vec![(IoHold::NotEntered, 80)];
     let refused = io_facts(
         1,
         HoldCheck::DState {
@@ -1396,6 +1496,9 @@ fn io_hold_failure_messages() {
         &['S', 'D'],
     );
     off_device.wbytes = 0;
+    off_device.elapsed_ms = IO_HOLD_DEADLINE_MS + 35;
+    off_device.reads = 81;
+    off_device.waited = vec![(IoHold::NotEntered, 3), (IoHold::NotOnDevice, 77)];
     let cases = [
         (
             IoHold::Finished,
@@ -1428,6 +1531,12 @@ fn io_hold_failure_messages() {
             "the writer was not inside its 40 MiB write",
         ),
         (
+            IoHold::NotEntered,
+            ExitStatus::Signaled(9),
+            &not_entered,
+            "the writer had not entered its 40 MiB write within 10000 ms of the spawn",
+        ),
+        (
             IoHold::NotBlocked,
             ExitStatus::Signaled(9),
             &refused,
@@ -1449,7 +1558,7 @@ fn io_hold_failure_messages() {
         for part in [
             hold_check_label(&facts.check).as_str(),
             "259:0",
-            "at 2004 ms (read 1)",
+            &format!("at {} ms (read {})", facts.elapsed_ms, facts.reads),
             &format!("wbytes {}", facts.wbytes),
             "buffer 40960 kB nh AnonHugePages 0 kB",
             "file_dirty 0",
@@ -1474,6 +1583,56 @@ fn io_hold_failure_messages() {
     }
     // The held facts render too (the report line uses the same text).
     assert!(io_hold_failure(IoHold::Held, ExitStatus::Signaled(9), &f).contains("4101"));
+    // The report line names what the wait read and which case ended it:
+    // a waiting verdict at or past the deadline ends it by the deadline.
+    for (v, facts, want) in [
+        (
+            IoHold::NotEntered,
+            &not_entered,
+            "verdict NotEntered, waited [NotEntered x80], ended by the deadline,",
+        ),
+        (
+            IoHold::NotOnDevice,
+            &off_device,
+            "verdict NotOnDevice, waited [NotEntered x3, NotOnDevice x77], \
+             ended by the deadline,",
+        ),
+        (IoHold::Held, &f, "verdict Held, waited [], ended by Held,"),
+    ] {
+        let text = io_hold_text(v, facts);
+        assert!(text.contains(want), "{want:?} missing in {text}");
+    }
+    // Any other read ends it by its own verdict (the QA case of #54 and
+    // the mixed wait, Held at the third read).
+    let mut late = io_facts(
+        1,
+        syscall_check(vec![futex_task(), w.clone()], 38),
+        &['S', 'D'],
+    );
+    late.elapsed_ms = 2216;
+    late.reads = 3;
+    for (waited, want) in [
+        (
+            vec![(IoHold::NotEntered, 2)],
+            "at 2216 ms (read 3) hold-check=syscall verdict Held, \
+             waited [NotEntered x2], ended by Held, tasks [",
+        ),
+        (
+            vec![(IoHold::NotEntered, 1), (IoHold::NotOnDevice, 1)],
+            "verdict Held, waited [NotEntered x1, NotOnDevice x1], ended by Held,",
+        ),
+    ] {
+        late.waited = waited;
+        let text = io_hold_text(IoHold::Held, &late);
+        assert!(text.contains(want), "{want:?} missing in {text}");
+    }
+    let mut left = io_facts(1, syscall_check(vec![futex_task()], PARTIAL_WCHAR), &['S']);
+    left.waited = vec![(IoHold::NotEntered, 4)];
+    let m = io_hold_failure(IoHold::NotInWrite, ExitStatus::Signaled(9), &left);
+    assert!(
+        m.contains("verdict NotInWrite, waited [NotEntered x4], ended by NotInWrite,"),
+        "{m}"
+    );
 }
 
 /// The facts of one poll read: `verdict` picks the shape, `ms` the time
@@ -1486,7 +1645,9 @@ fn poll_read(verdict: IoHold, ms: u64) -> IoFacts {
         }
         IoHold::Finished => io_facts(0, syscall_check(vec![w()], 41_943_130), &['Z']),
         IoHold::Returned => io_facts(1, syscall_check(vec![w()], 41_943_130), &['S']),
-        IoHold::NotInWrite => io_facts(1, syscall_check(vec![futex_task()], 38), &['S']),
+        // The measured QA failure: futex plus running, wchar 38.
+        IoHold::NotEntered => io_facts(1, syscall_check(vec![futex_task()], 38), &['S', 'R']),
+        IoHold::NotInWrite => io_facts(1, syscall_check(vec![futex_task()], PARTIAL_WCHAR), &['S']),
         IoHold::NotBlocked => io_facts(
             1,
             HoldCheck::DState {
@@ -1506,13 +1667,31 @@ fn poll_read(verdict: IoHold, ms: u64) -> IoFacts {
 /// Runs the poll over `reads` and returns its verdict, the time of the
 /// read it ended on, the reads it took and the pauses between them.
 fn run_poll(reads: Vec<IoFacts>) -> (IoHold, u64, u32, usize) {
+    let (v, f, pauses) = poll_facts(reads);
+    (v, f.elapsed_ms, f.reads, pauses)
+}
+
+/// [`run_poll`] with the facts of the last read and the pauses.
+fn poll_facts(reads: Vec<IoFacts>) -> (IoHold, IoFacts, usize) {
     let mut queue = reads.into_iter();
     let mut pauses = 0;
     let (v, f) = poll_io_hold(
         || queue.next().expect("the poll read past the fixture"),
         || pauses += 1,
     );
-    (v, f.elapsed_ms, f.reads, pauses)
+    (v, f, pauses)
+}
+
+/// Reads of `verdict` every 100 ms from 2,004 ms after the spawn up to the
+/// deadline: one at `IO_HOLD_DEADLINE_MS - 1` and the last at the deadline.
+fn reads_to_deadline(verdict: IoHold) -> Vec<IoFacts> {
+    let mut reads: Vec<IoFacts> = (0..80)
+        .map(|i| poll_read(verdict, 2004 + i * 100))
+        .filter(|f| f.elapsed_ms < IO_HOLD_DEADLINE_MS)
+        .collect();
+    reads.push(poll_read(verdict, IO_HOLD_DEADLINE_MS - 1));
+    reads.push(poll_read(verdict, IO_HOLD_DEADLINE_MS));
+    reads
 }
 
 #[test]
@@ -1546,17 +1725,94 @@ fn io_hold_polls() {
     }
     // No count by the deadline: NotOnDevice, and no read after the one at
     // the deadline (inclusive); one millisecond before it still waits.
-    let mut reads: Vec<IoFacts> = (0..80)
-        .map(|i| poll_read(NotOnDevice, 2004 + i * 100))
-        .filter(|f| f.elapsed_ms < IO_HOLD_DEADLINE_MS)
-        .collect();
-    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS - 1));
-    reads.push(poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS));
+    let reads = reads_to_deadline(NotOnDevice);
     let n = reads.len() as u32;
+    let (v, f, pauses) = poll_facts(reads);
     assert_eq!(
-        run_poll(reads),
+        (v, f.elapsed_ms, f.reads, pauses),
         (NotOnDevice, IO_HOLD_DEADLINE_MS, n, n as usize - 1)
     );
+    assert_eq!(f.waited, vec![(NotOnDevice, n - 1)]);
+    // #54, QA of PR 58: under load the writer had not entered its write at
+    // the first read (futex, wchar 38, 2,014 ms). The poll waits for the
+    // entry as it waits for the count.
+    let (v, f, pauses) = poll_facts(vec![
+        poll_read(NotEntered, 2014),
+        poll_read(NotEntered, 2115),
+        poll_read(Held, 2216),
+    ]);
+    assert_eq!((v, f.elapsed_ms, f.reads, pauses), (Held, 2216, 3, 2));
+    assert_eq!(f.waited, vec![(NotEntered, 2)]);
+    // Entered, then waited for the count: both waits in one poll, in the
+    // order they came.
+    let (v, f, pauses) = poll_facts(vec![
+        poll_read(NotEntered, 2014),
+        poll_read(NotOnDevice, 2115),
+        poll_read(Held, 2216),
+    ]);
+    assert_eq!((v, f.elapsed_ms, f.reads, pauses), (Held, 2216, 3, 2));
+    assert_eq!(f.waited, vec![(NotEntered, 1), (NotOnDevice, 1)]);
+    // Counted per verdict, not per run of reads.
+    let (v, f, _) = poll_facts(vec![
+        poll_read(NotOnDevice, 2014),
+        poll_read(NotEntered, 2115),
+        poll_read(NotOnDevice, 2216),
+        poll_read(Held, 2317),
+    ]);
+    assert_eq!((v, f.reads), (Held, 4));
+    assert_eq!(f.waited, vec![(NotOnDevice, 2), (NotEntered, 1)]);
+    // Any final verdict after a wait for the entry ends the poll with it:
+    // a writer that failed before its write is Finished, one that entered
+    // and left is NotInWrite.
+    for late in [Finished, Returned, NotInWrite, NotBlocked] {
+        let (v, f, pauses) = poll_facts(vec![
+            poll_read(NotEntered, 2004),
+            poll_read(NotEntered, 2105),
+            poll_read(late, 2206),
+        ]);
+        assert_eq!((v, f.elapsed_ms, f.reads, pauses), (late, 2206, 3, 2));
+        assert_eq!(f.waited, vec![(NotEntered, 2)], "{late:?}");
+    }
+    // Never entered by the deadline: NotEntered, final at the deadline
+    // (inclusive), still waiting one millisecond before it.
+    let reads = reads_to_deadline(NotEntered);
+    let n = reads.len() as u32;
+    let (v, f, pauses) = poll_facts(reads);
+    assert_eq!(
+        (v, f.elapsed_ms, f.reads, pauses),
+        (NotEntered, IO_HOLD_DEADLINE_MS, n, n as usize - 1)
+    );
+    assert_eq!(f.waited, vec![(NotEntered, n - 1)]);
+    // A task in another write (a 1 MiB count) with nothing returned reads
+    // as not entered: it waits and fails at the deadline, it never passes.
+    let other = |ms| {
+        let mut f = io_facts(
+            1,
+            syscall_check(vec![futex_task(), write_task(1_048_576, 2)], 38),
+            &['S', 'D'],
+        );
+        f.elapsed_ms = ms;
+        f
+    };
+    let (v, f, _) = poll_facts(vec![
+        other(2004),
+        other(IO_HOLD_DEADLINE_MS - 1),
+        other(IO_HOLD_DEADLINE_MS),
+    ]);
+    assert_eq!(
+        (v, f.elapsed_ms, f.reads),
+        (NotEntered, IO_HOLD_DEADLINE_MS, 3)
+    );
+    // A first read past the deadline that has not entered is final too.
+    assert_eq!(
+        run_poll(vec![poll_read(NotEntered, IO_HOLD_DEADLINE_MS + 50)]),
+        (NotEntered, IO_HOLD_DEADLINE_MS + 50, 1, 0)
+    );
+    // The D-state fallback cannot tell not yet from left: NotBlocked at
+    // the first read stays final.
+    let (v, f, pauses) = poll_facts(vec![poll_read(NotBlocked, 2004)]);
+    assert_eq!((v, f.reads, pauses), (NotBlocked, 1, 0));
+    assert!(f.waited.is_empty());
     // A first read already past the deadline still decides by its facts.
     assert_eq!(
         run_poll(vec![poll_read(NotOnDevice, IO_HOLD_DEADLINE_MS + 50)]),
@@ -1584,6 +1840,16 @@ fn io_hold_deadline_keeps_the_lift_proven() {
     let first_count_ms = 872 + 1_048_576 * 1000 / IO_KILL_WBPS;
     assert_eq!(first_count_ms, 1_872);
     assert!(first_count_ms < IO_HOLD_DEADLINE_MS, "{first_count_ms} ms");
+    // #54: the poll also waits for a late entry. The latest entry it
+    // covers leaves one 1 MiB bio at the rate and one slice before the
+    // deadline; the QA failure's writer was still outside at 2,014 ms.
+    // A later entry only leaves more queued at the deadline, so the lift
+    // proof above holds for every entry the wait covers.
+    let latest_entry_ms = IO_HOLD_DEADLINE_MS - 1_048_576 * 1000 / IO_KILL_WBPS - 100;
+    assert_eq!(latest_entry_ms, 8_900);
+    assert!(2_014 < latest_entry_ms, "{latest_entry_ms} ms");
+    assert_eq!(10 * IO_KILL_WBPS, 10_485_760);
+    assert!(queued > 10 * IO_KILL_WBPS, "{queued}");
 }
 
 /// One `/proc/<pid>/smaps` mapping for the pure tests.
