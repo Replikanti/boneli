@@ -1006,11 +1006,11 @@
    "title": "boneli-oci: evict unused layers from the image cache",
    "epic": null,
    "order": 38,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "03af0ec4",
-   "pr": 92,
-   "note": "PR 1 #92 merged (c422aa7); PR 2 eviction + budget in progress",
-   "updated_at": "2026-11-20T22:49:27+00:00",
+   "pr": 99,
+   "note": "PR #99 open",
+   "updated_at": "2026-11-20T23:32:02+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1309,49 +1309,57 @@
     "core"
    ],
    "manual": false
+  },
+  {
+   "issue": 98,
+   "title": "boneli-oci: check whether the image cache locks stay held through a child between fork and exec",
+   "epic": null,
+   "order": 50,
+   "state": "claimed",
+   "owner": "785e81ac",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
+   "parked": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-20T23:32:02+00:00",
+   "priority": "P2",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
+  },
+  {
+   "issue": 97,
+   "title": "boneli-store-fs: the store lock's owner check compares pids across pid namespaces",
+   "epic": null,
+   "order": 51,
+   "state": "claimed",
+   "owner": "36e4fbcc",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
+   "parked": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-20T23:32:02+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T17:25:51+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "98fa59e8",
-   "note": "PR 78 fix round 2 (review run 2: stalled-at-end keeper, cadence pin); upstream kernel report draft after merge (operator yes)"
-  },
-  {
-   "at": "2026-11-20T17:27:18+00:00",
-   "issue": 54,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #78 open"
-  },
-  {
-   "at": "2026-11-20T17:45:30+00:00",
-   "issue": 81,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "f7d29cb8",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T17:52:10+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "done",
-   "by": "98fa59e8",
-   "note": "PR 1 #76 + PR 2 #78 (dccbbdc) merged; upstream memcg report draft for the operator"
-  },
-  {
-   "at": "2026-11-20T17:52:20+00:00",
-   "issue": 57,
-   "from": "ready",
-   "to": "claimed",
-   "by": "b6fae515",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T18:11:55+00:00",
    "issue": 81,
@@ -1711,6 +1719,46 @@
    "to": "implementing",
    "by": "f11746bb",
    "note": null
+  },
+  {
+   "at": "2026-11-20T23:32:02+00:00",
+   "issue": 98,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T23:32:02+00:00",
+   "issue": 97,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T23:32:02+00:00",
+   "issue": 56,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #99 open"
+  },
+  {
+   "at": "2026-11-20T23:32:02+00:00",
+   "issue": 98,
+   "from": "ready",
+   "to": "claimed",
+   "by": "785e81ac",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T23:32:02+00:00",
+   "issue": 97,
+   "from": "ready",
+   "to": "claimed",
+   "by": "36e4fbcc",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1741,10 +1789,12 @@
   69,
   80,
   93,
-  94
+  94,
+  97,
+  98
  ],
  "xopen": [],
- "updated_at": "2026-11-20T23:10:34+00:00",
+ "updated_at": "2026-11-20T23:32:02+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
