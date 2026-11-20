@@ -1238,13 +1238,13 @@
    "title": "boneli-git-cli: check the ancestors of its working root",
    "epic": null,
    "order": 47,
-   "state": "pr-review",
-   "owner": "6860ecc9",
-   "user": "ylohnitram",
-   "machine": "df82df",
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
    "pr": 90,
    "note": "PR #90 open",
-   "updated_at": "2026-11-20T21:01:14+00:00",
+   "updated_at": "2026-11-20T21:45:30+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1255,20 +1255,12 @@
     "core"
    ],
    "manual": false,
-   "session": true,
-   "dispatched": true,
+   "session": null,
+   "dispatched": null,
    "parked": null
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:28:18+00:00",
-   "issue": 22,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "7e33749a",
-   "note": null
-  },
   {
    "at": "2026-11-20T13:29:29+00:00",
    "issue": 54,
@@ -1660,6 +1652,14 @@
    "to": "plan-review",
    "by": "dispatch",
    "note": "parked: one large task too many for its holder's profile; opens again when there is a place"
+  },
+  {
+   "at": "2026-11-20T21:45:30+00:00",
+   "issue": 85,
+   "from": "pr-review",
+   "to": "done",
+   "by": "6860ecc9",
+   "note": null
   }
  ],
  "open": [
@@ -1690,11 +1690,10 @@
   68,
   69,
   80,
-  81,
-  85
+  81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T21:43:54+00:00",
+ "updated_at": "2026-11-20T21:45:33+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
