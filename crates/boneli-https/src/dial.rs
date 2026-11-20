@@ -98,7 +98,7 @@ impl Dial for TlsDial {
 /// [`connect`](crate::connect) checks the server name before it resolves
 /// (ADR-003, item 3); `connect_over` checks it only once TCP is
 /// connected, so the dial checks first (ADR-009, D10).
-fn check_host(host: &str, port: u16) -> io::Result<()> {
+pub(crate) fn check_host(host: &str, port: u16) -> io::Result<()> {
     let authority = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {

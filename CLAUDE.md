@@ -265,7 +265,10 @@ whose leaves name only an OCSP responder (GitHub, GHCR, GitLab) must be
 check SSL.com's revoked test leaves and two delegated responders
 (`pypi.org`, `www.microsoft.com`) through the OCSP path directly. Run
 them by hand before a change under `crates/boneli-https/src/revocation/`
-merges.
+merges. `tests/network.rs` also compares the name resolver of ADR-022
+with the system's on the runner's hosts
+(`own_resolver_agrees_with_the_system`); run it by hand before a change
+under `crates/boneli-https/src/resolve/` merges.
 
 ```sh
 cargo test -p boneli-https --test interop -- --ignored
