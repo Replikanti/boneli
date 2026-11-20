@@ -1023,7 +1023,7 @@
    "manual": false,
    "user": "ylohnitram",
    "machine": "df82df",
-   "session": true,
+   "session": false,
    "dispatched": true,
    "parked": null
   },
@@ -1265,16 +1265,16 @@
    "title": "boneli-store-fs: reopen can fail with InUse while another thread spawns a process",
    "epic": null,
    "order": 48,
-   "state": "pr-review",
-   "owner": "3ebab419",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 96,
    "note": "",
-   "updated_at": "2026-11-20T22:49:52+00:00",
+   "updated_at": "2026-11-20T23:40:42+00:00",
    "priority": "P2",
    "size": "small",
    "deps": [],
@@ -1360,14 +1360,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T18:11:55+00:00",
-   "issue": 81,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "f7d29cb8",
-   "note": null
-  },
   {
    "at": "2026-11-20T18:47:50+00:00",
    "issue": 81,
@@ -1759,6 +1751,14 @@
    "to": "claimed",
    "by": "36e4fbcc",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T23:40:42+00:00",
+   "issue": 94,
+   "from": "pr-review",
+   "to": "done",
+   "by": "3ebab419",
+   "note": null
   }
  ],
  "open": [
@@ -1789,12 +1789,11 @@
   69,
   80,
   93,
-  94,
   97,
   98
  ],
  "xopen": [],
- "updated_at": "2026-11-20T23:32:02+00:00",
+ "updated_at": "2026-11-20T23:40:44+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
