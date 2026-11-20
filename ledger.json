@@ -10,11 +10,11 @@
    "title": "Release workflow and versioning",
    "epic": null,
    "order": 33,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "7e33749a",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-12T07:19:42+00:00",
+   "updated_at": "2026-11-20T13:06:07+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -25,8 +25,8 @@
     "ci"
    ],
    "manual": false,
-   "user": null,
-   "machine": null
+   "user": "ylohnitram",
+   "machine": "df82df"
   },
   {
    "issue": 21,
@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR 2 (#78 draft): tracefs diagnostic round on NVMe copies",
-   "updated_at": "2026-11-20T12:40:17+00:00",
+   "note": "PR #78 open",
+   "updated_at": "2026-11-20T13:06:07+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1008,11 +1008,11 @@
    "title": "Wire the patch policy into the run: Git port diff as Patch, gate between FixWritten and VerifyFix",
    "epic": null,
    "order": 43,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "47331c5b",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-19T00:55:27+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T13:06:07+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1023,8 +1023,8 @@
     "debugger"
    ],
    "manual": false,
-   "user": null,
-   "machine": null
+   "user": "ylohnitram",
+   "machine": "df82df"
   },
   {
    "issue": 81,
@@ -1097,30 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-18T21:07:50+00:00",
-   "issue": 68,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
-  {
-   "at": "2026-11-18T21:07:50+00:00",
-   "issue": 69,
-   "from": "ready",
-   "to": "blocked",
-   "by": "sync",
-   "note": null
-  },
-  {
-   "at": "2026-11-18T21:07:50+00:00",
-   "issue": 68,
-   "from": "ready",
-   "to": "blocked",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-18T21:07:54+00:00",
    "issue": 18,
@@ -1496,6 +1472,30 @@
    "to": "pr-review",
    "by": "abd3f92f",
    "note": null
+  },
+  {
+   "at": "2026-11-20T13:06:07+00:00",
+   "issue": 54,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #78 open"
+  },
+  {
+   "at": "2026-11-20T13:06:07+00:00",
+   "issue": 68,
+   "from": "ready",
+   "to": "claimed",
+   "by": "47331c5b",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T13:06:07+00:00",
+   "issue": 22,
+   "from": "ready",
+   "to": "claimed",
+   "by": "7e33749a",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:02:48+00:00",
+ "updated_at": "2026-11-20T13:06:07+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -1546,5 +1546,6 @@
  "visibility": {
   "at": 1795169975,
   "private": false
- }
+ },
+ "schema": 2
 }
