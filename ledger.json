@@ -1091,7 +1091,7 @@
     "core"
    ],
    "manual": false,
-   "session": false
+   "session": true
   },
   {
    "issue": 80,
@@ -1601,7 +1601,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T17:27:18+00:00",
+ "updated_at": "2026-11-20T17:31:24+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
