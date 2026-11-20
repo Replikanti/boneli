@@ -1008,11 +1008,11 @@
    "title": "Wire the patch policy into the run: Git port diff as Patch, gate between FixWritten and VerifyFix",
    "epic": null,
    "order": 43,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "47331c5b",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T13:06:07+00:00",
+   "updated_at": "2026-11-20T13:27:24+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T00:59:07+00:00",
-   "issue": 19,
-   "from": "ready",
-   "to": "claimed",
-   "by": "cbec3aa3",
-   "note": ""
-  },
   {
    "at": "2026-11-19T01:23:33+00:00",
    "issue": 19,
@@ -1496,6 +1488,14 @@
    "to": "claimed",
    "by": "0d47f612",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T13:27:24+00:00",
+   "issue": 68,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "47331c5b",
+   "note": null
   }
  ],
  "open": [
@@ -1533,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:20:27+00:00",
+ "updated_at": "2026-11-20T13:27:24+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
