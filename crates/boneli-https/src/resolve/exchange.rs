@@ -212,8 +212,8 @@ fn udp_phase(
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = UdpSocket::bind(local)
-        .and_then(|s| s.connect(server).map(|()| s))
+    let socket = UdpSocket::bind::<::std::net::SocketAddr>(local)
+        .and_then(|s| s.connect::<::std::net::SocketAddr>(server).map(|()| s))
         .map_err(io_fail)?;
     for query in outstanding {
         socket

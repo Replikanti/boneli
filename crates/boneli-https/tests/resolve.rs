@@ -1075,20 +1075,17 @@ fn resolver_module_spawns_nothing_and_uses_no_std_lookup() {
 /// `&SocketAddr` and is another identifier.
 const STD_LOOKUP_NAMES: [&str; 3] = ["connect", "send_to", "bind"];
 
-/// Call sites of the std lookups whose argument is a `SocketAddr`
-/// variable: the file under `src/` and the argument. The resolver's UDP
-/// socket binds the unspecified address of the server's family and
-/// connects to the server.
-const SOCKET_ADDR_ARGS: [(&str, &str); 2] = [
-    ("resolve/exchange.rs", "local"),
-    ("resolve/exchange.rs", "server"),
-];
+/// The turbofish that lets the compiler check a std lookup's argument:
+/// `bind::<::std::net::SocketAddr>(local)` does not compile with a
+/// string. The leading `::` matters: a file-local `type SocketAddr =
+/// String` or `use ... as SocketAddr` cannot stand in for the type.
+const SOCKET_ADDR_TURBOFISH: [&str; 9] =
+    ["::", "<", "::", "std", "::", "net", "::", "SocketAddr", ">"];
 
 /// The number of socket-address calls in each file under `src/` that has
-/// any, exactly as the tree holds them: the resolver's bind and connect,
-/// and the test servers' binds to `127.0.0.1:0`. `SOCKET_ADDR_ARGS`
-/// checks a name, not a type, so a new call whose argument has an
-/// allowed name but holds a host name changes the count and fails.
+/// any, exactly as the tree holds them: the resolver's bind and connect
+/// (`SOCKET_ADDR_TURBOFISH`), and the test servers' binds to
+/// `127.0.0.1:0`. A new call changes the count and fails.
 const SOCKET_ADDR_CALLS: [(&str, usize); 2] =
     [("resolve/exchange.rs", 2), ("revocation/http.rs", 6)];
 
@@ -1346,11 +1343,12 @@ fn tokens_text(toks: &[Token]) -> String {
 ///   anywhere);
 /// - a name of `STD_LOOKUP_NAMES`, unless it is defined there (`fn`
 ///   before it) or is the crate's own `connect` (`crate::` before it;
-///   `crate` cannot be shadowed), or it is called (`(` right after it)
-///   with one argument token that is a string literal parsing as a
-///   socket address (std parses it before it would look anything up) or
-///   a `SocketAddr` variable of `SOCKET_ADDR_ARGS`. A UFCS call holds
-///   the socket in its argument too and never passes; a turbofish or the
+///   `crate` cannot be shadowed), or it is called with one argument
+///   token: right after the name, either `(` and a string literal
+///   parsing as a socket address (std parses it before it would look
+///   anything up), or `SOCKET_ADDR_TURBOFISH`, `(` and an identifier,
+///   whose type the compiler then checks. A UFCS call holds the socket
+///   in its argument too and never passes; any other turbofish or the
 ///   function as a value has no `(` after the name.
 ///
 /// Source the lexer refuses (see `lex`) is one hit.
@@ -1390,6 +1388,16 @@ fn std_lookup_hits(file: &str, text: &str) -> (Vec<String>, usize) {
                 if definition || crate_own {
                     continue;
                 }
+                let n = SOCKET_ADDR_TURBOFISH.len();
+                let typed = SOCKET_ADDR_TURBOFISH.iter().enumerate().all(|(k, text)| {
+                    punct(i + 1 + k, text) || ident(i + 1 + k) == Some((*text, false))
+                }) && punct(i + 1 + n, "(")
+                    && ident(i + 2 + n).is_some()
+                    && punct(i + 3 + n, ")");
+                if typed {
+                    allowed += 1;
+                    continue;
+                }
                 if !punct(i + 1, "(") {
                     hits.push(format!("{at}: {name} {}", after()));
                     continue;
@@ -1415,12 +1423,6 @@ fn std_lookup_hits(file: &str, text: &str) -> (Vec<String>, usize) {
                             ..
                         },
                     ] => text.parse::<SocketAddr>().is_ok(),
-                    [
-                        Token {
-                            tok: Tok::Ident { name, .. },
-                            ..
-                        },
-                    ] => SOCKET_ADDR_ARGS.contains(&(file, name.as_str())),
                     _ => false,
                 };
                 if socket_addr {
@@ -1532,6 +1534,27 @@ fn std_lookup_scan_rule() {
         ("dial.rs", "TcpListener::bind(\"localhost:0\")"),
         ("dial.rs", "TcpListener::bind(\"127.0.0.1:0\".to_string())"),
         ("dial.rs", "UdpSocket::bind(local)"),
+        // Only the absolute `SocketAddr` turbofish lets an identifier
+        // through: the compiler checks its type.
+        ("resolve/exchange.rs", "UdpSocket::bind(local)"),
+        ("resolve/exchange.rs", "s.connect(server)"),
+        ("resolve/exchange.rs", "s.connect::<SocketAddr>(server)"),
+        (
+            "resolve/exchange.rs",
+            "s.connect::<std::net::SocketAddr>(server)",
+        ),
+        (
+            "resolve/exchange.rs",
+            "s.connect::<::std::net::SocketAddrV4>(server)",
+        ),
+        (
+            "resolve/exchange.rs",
+            "s.connect::<::std::net::SocketAddr>(server.0)",
+        ),
+        (
+            "resolve/exchange.rs",
+            "s.connect::<::std::net::SocketAddr>(\"localhost:53\")",
+        ),
         // Only the crate path is the crate's own `connect`.
         ("dial.rs", "use crate::connect; connect(host)"),
         // The trait, by any mention.
@@ -1552,10 +1575,15 @@ fn std_lookup_scan_rule() {
     let through = [
         (
             "resolve/exchange.rs",
-            "let socket = UdpSocket::bind(local)",
+            "let socket = UdpSocket::bind::<::std::net::SocketAddr>(local)",
             1,
         ),
-        ("resolve/exchange.rs", ".and_then(|s| s.connect(server))", 1),
+        (
+            "resolve/exchange.rs",
+            ".and_then(|s| s.connect::<::std::net::SocketAddr>(server))",
+            1,
+        ),
+        ("dial.rs", "s.send_to::<::std::net::SocketAddr>(addr)", 1),
         (
             "revocation/http.rs",
             "TcpListener::bind(\"127.0.0.1:0\")",
@@ -1685,11 +1713,30 @@ fn std_lookup_scan_catches_each_form_in_real_sources() {
         // and a left-to-right mark it reads as whitespace.
         "use std::net::TcpStream as X\u{301}crate;\nfn mutant(host: &str) -> io::Result<X\u{301}crate> {\n    X\u{301}crate::connect(host)\n}",
         "#[rustfmt::skip]\n#[path\u{200E}= \"../../mutant.rs\"]\nmod mutant;",
-        // An allowed argument name that holds a host name.
+        // A call with an identifier and no turbofish.
         "fn mutant(server: &str) -> io::Result<std::net::TcpStream> {\n    std::net::TcpStream::connect(server)\n}",
+        // A typed call more than the count.
+        "fn mutant(s: &UdpSocket, a: SocketAddr) -> io::Result<()> {\n    s.connect::<::std::net::SocketAddr>(a)\n}",
     ];
     for mutant in mutants {
         let hits = crate_file_hits(file, &format!("{text}\n{mutant}\n"));
         assert_eq!(hits.len(), 1, "{mutant}: {hits:#?}");
+    }
+    // The counted calls edited in place. Without its turbofish a call is
+    // a hit. With it, rebinding `server` to a `String` in front of the
+    // call does not compile (E0308), so a rebinding mutant that compiles
+    // drops the turbofish too.
+    let connect = "s.connect::<::std::net::SocketAddr>(server)";
+    let bind = "let socket = UdpSocket::bind::<::std::net::SocketAddr>(local)";
+    let rebind =
+        "let server = std::env::var(\"BONELI_DNS_RELAY\").unwrap_or_else(|_| server.to_string());";
+    for (from, to) in [
+        (connect, "s.connect(server)".to_string()),
+        (bind, "let socket = UdpSocket::bind(local)".to_string()),
+        (connect, format!("{{ {rebind} s.connect(server) }}")),
+    ] {
+        assert!(text.contains(from), "{from}");
+        let hits = crate_file_hits(file, &text.replacen(from, &to, 1));
+        assert_eq!(hits.len(), 1, "{to}: {hits:#?}");
     }
 }
