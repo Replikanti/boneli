@@ -373,9 +373,11 @@ cached. The probe's one 40 MiB write from a 4096-aligned buffer is
 accepted on the same device and held by `io.max` (D8, "The timing tests");
 that `dd`'s buffer missed the device's 512-byte DMA alignment is inferred
 from the EINVAL and the queue limit, not checked. Whether `io.max`
-throttles the writeback of such page-cache data on AWS is open: over 3 s
-the 40 MiB stayed under writeback with `wbytes` 0 on both device lines
-(#54). The CI step "Host features" prints these facts on every run.
+throttles the writeback of such page-cache data on AWS was open here
+(over 3 s the 40 MiB stayed under writeback with `wbytes` 0 on both
+device lines); #54 measured that it does, on the device line
+`block_device_of` picks (D8, "Buffered writes and the statistics
+keeper", AWS). The CI step "Host features" prints these facts on every run.
 
 ### D6. Lints of the unsafe crate
 
@@ -626,7 +628,9 @@ in its own `Delegate=yes` service (#8). The harness calls it only with
 reorganized; a later test binary of the same run starts in `leaf/` and
 opens its parent instead. A `systemd-run --user --scope -p Delegate=yes`
 scope has all four controllers on the dev host (without `Delegate=yes`
-there is no io, measured at planning) and on both CI legs (D5).
+there is no io, measured at planning) and on both CI legs (D5). A
+`Parent` runs no thread; every sandbox cgroup runs its own statistics
+keeper ("Buffered writes and the statistics keeper", below).
 
 **One descriptor per directory, no path used twice.** The parent is
 opened once (`openat2` with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`,
@@ -705,17 +709,19 @@ of D7):
   302–312 ms at 1 GiB with 1,280 MiB written, both under 32 MiB/s. Without
   `io.max` some sizes were killed too (256 MiB on Azure arm64, 1 GiB on
   AWS) and none at 2 GiB; with the host reading `memory.stat` every 50 ms
-  nothing was killed on the Azure legs (cause not verified). Small cgroups
+  nothing was killed on the Azure legs (the cause is stale memcg
+statistics, "Buffered writes and the statistics keeper" below). Small cgroups
   on the dev host behave the same: `memory.max` 32 and 64 MiB under `wbps`
   4 MiB/s and a 64 MiB write were killed after 325 and 644 ms with
   `file_writeback` at about `memory.max`, and 32 MiB without `io.max` was
   not (measured in transient units at planning). So a sandbox with
   `io.max` that writes through the page cache faster than its device
   drains can be OOM-killed with nothing wrong in its workload, and #8
-  sizes `memory.max` and `wbps` together. The cause, whether AWS throttles
-  that writeback and on which device line it counts, the sandbox's
-  handling and a test that pins buffered writes on CI are #54; until then
-  no test pins them.
+  sizes `memory.max` and `wbps` together. The runtime's answer is each
+  sandbox's statistics keeper, which holds such a writer at `memory.max`
+  64 MiB and above on every CI class, with and without `io.max`; the
+  cause, AWS, the floor and the tests that pin it are in "Buffered
+  writes and the statistics keeper" below (#54).
 - `memory.oom.group` is always 1: a partial OOM kill leaves a half-dead
   pod (PostgreSQL gone, the application alive) whose test results
   mislead. `memory_limit_kills_whole_group`: with `memory.max` 32 MiB and
@@ -879,8 +885,14 @@ direct part can reach about 2 GiB per task inside such a call, times the
 tasks `pids.max` allows, plus asynchronous I/O (`io_submit`, which the D2
 policy does not deny; it denies `io_uring`). The release follows from the
 order in `kill_and_remove` (`write_kill`, then `lift_throttles`, then
-`wait_unpopulated`); the page-cache writeback after the lift is not
-measured (#54). #8 cannot bound the release with `memory.max` alone.
+`wait_unpopulated`). The page-cache part after the lift was measured in
+#54 (W2: `memory.max` 1 GiB, `wbps` 8 MiB/s, 512 MiB, `destroy` as soon
+as the write loop ended, a backlog of 182-512 MiB): `destroy` returned
+after 0.8-2.3 s on AWS, 1.6 s on Azure arm64, 1.0-5.5 s on Azure x86_64
+and 0.10-0.19 s on the dev host. The slowest, 512 MiB in 5.5 s, is
+about 93 MiB/s, so `KILL_BOUND` (10 s) covers about 930 MiB of backlog
+at that rate (derived, not measured). #8 cannot bound the release with
+`memory.max` alone.
 Deleting or truncating the sandbox's files before the kill is an option
 for the page-cache part; whether it shortens queued direct I/O is not
 checked.
@@ -1127,6 +1139,286 @@ tmpfs, on fixture text.
   that the timing tests take exclusively, so they do not compete with the
   other host tests for the CPU and the disk.
 
+**Buffered writes and the statistics keeper (#54).** Added by #54's
+second PR; the measurements are in its pull request (#78), from
+temporary diagnostic CI jobs on 16 x86_64 and 2-4 arm64 copies per round
+and dev-host runs in a delegated scope. CI classes: AWS x86_64
+`7.0.0-1016-aws` (workspace on the dm snapshot 252:0), Azure arm64
+`7.0.0-1017-azure` (8:0), Azure x86_64 `7.0.0-1019-azure` and
+`7.0.0-1020-azure` (workspace on `/dev/sda1`, 8:0, or on an NVMe device,
+259:0); every class 4 vCPU and about 16 GB. Dev host: Linux 7.2.10.
+"Source" below means upstream tags v7.0 / v7.2 (mm/memcontrol.c unless
+named), read at planning; the CI kernels are Ubuntu builds of 7.0, so
+every behavior claim comes from runs, and the line numbers locate the
+code.
+
+- **The problem.** A writer that writes through the page cache faster
+  than the device drains it (`Limits` above) fills `memory.max` with
+  dirty pages, which reclaim cannot free, and the cgroup is OOM-killed
+  instead of slowed by dirty throttling (`balance_dirty_pages`,
+  mm/page-writeback.c). With `memory.max` 256 MiB, `wbps` 32 MiB/s and
+  512 MiB written, a host that only waits saw the writer killed in 53 of
+  54 CI runs (M1, A0), and without `io.max` in 47 of 54 (N0).
+- **H-S, stale memcg statistics.** The throttle stays out of the way
+  while the memcg domain is under its freerun ceiling, (thresh +
+  bg_thresh) ÷ 2 (page-writeback.c 813 in both; the check 1845 / 1847),
+  and it takes the memcg's dirty count from `mem_cgroup_wb_stats`
+  (3414-3437 / 3762-3785, called at page-writeback.c 860), which flushes
+  the statistics only when the last flush is over 4 s old (3421 / 3769;
+  635-639 / 740-744); the periodic flush runs every 2 s (`FLUSH_TIME`,
+  559 / 664; 642-650 / 747-755). The headroom comes from the live page
+  counter (3432 / 3780), the dirty count from the last flush. A writer
+  at the measured 3.1-6.3 GiB/s fills 256 MiB in 40-64 ms. Evidence
+  (M1): reads every 50 ms of files that flush nothing (`memory.current`,
+  `memory.events`, `io.stat`) left 54 of 54 runs killed (A1), reads of
+  `memory.stat` of the sandbox (A2) or of its parent (A3) every 50 ms 0
+  of 54 each. A `memory.stat` read flushes: `memory_stat_show` (4527 /
+  4905) → `memcg_stat_format` (1481 / 1693) → `mem_cgroup_flush_stats`
+  (1495 / 1707), unratelimited, when more than 64 × online CPUs updates
+  are pending (`MEMCG_CHARGE_BATCH`, include/linux/memcontrol.h 332 /
+  331; 561-565 and 606 / 666-670 and 711): 256 on the runners, 768 on a
+  12-thread host. A read at offset 0 of a held descriptor runs the show
+  again (fs/seq_file.c 189 in both), so one descriptor serves every read.
+  Tracefs on A0 showed the sandbox's first `balance_dirty_pages` after
+  `oom:mark_victim` in every killed run. That a read flushes is kernel
+  behavior, not documented API.
+- **H4, a flushable sandbox stops the parent's read.** A keeper that read
+  the parent every 10 ms (one read flushes the whole subtree through
+  `css_rstat_flush`, 612 / 717, kernel/cgroup/rstat.c 388-431 / 397-440)
+  still lost: 7 of 162 CI runs killed in M2a, and in the traced round
+  (run 44740298530, 16 x86_64 copies) 67 of 1,920 K10 runs, while the
+  control without reads (K0) was killed in 92 of 96 and N10 (no `io.max`)
+  in 3 of 160. In all 67 killed runs the read at the write's start
+  flushed and every later read of the parent was skipped
+  (`memcg_flush_stats` `needs_flush=0`), the parent's `file_dirty` stayed
+  at 0.1-0.3 MiB while the sandbox's `memory.current` reached
+  `memory.max`, and the writer entered `balance_dirty_pages` 63-250
+  times before the kill without being throttled. Cause, from the source:
+  `memcg_rstat_updated` (567-597 / 672-702) walks from the writer's
+  memcg (578 / 683) towards the root and stops at the first level that
+  is already flushable (586-587 / 691-692), on the stated assumption that
+  the ancestors are then flushable too (581-585 / 686-690); updates reach
+  a level's counter only in per-CPU batches of 64. `__mem_cgroup_flush_stats`
+  (599-613 / 704-718) skips a target at or below the threshold (606-607 /
+  711-712). Once the sandbox's counter is over 256 while the parent's is
+  not, the sandbox's updates never count towards the parent again, and
+  every read of the parent is a no-op until something flushes the
+  sandbox itself. How the state starts is inferred, not traced: a flush
+  resets each memcg's counter in its per-CPU callback (4162-4165 /
+  4540-4543), one CPU after the other with the lock dropped between
+  CPUs (rstat.c 413-430 / 422-439), while the writer keeps updating; a
+  parent reset after the sandbox's last one leaves the sandbox ahead.
+  The same code is in v7.2. Reading the sandbox's own `memory.stat`
+  (KS10) was killed in 0 of 960 traced runs; AWS's one copy had 0 of 120
+  K10 runs killed, too few to tell whether its class differs.
+- **Why the sandbox's own read is robust** (source): the throttle uses the
+  dirty count of the writer's memcg (`wb->memcg_css`) and live page
+  counters, no parent statistic (`mem_cgroup_wb_stats`); the update walk
+  starts at the writer's memcg, whose counter gets every update unless it
+  is already flushable, and then its own read flushes (606-612 /
+  711-717). H4 needs a flushable level below the cgroup that is read, and
+  a sandbox has none: `cgroup.max.descendants` and `cgroup.max.depth` are
+  0 ("No sub-cgroups" above, `sandbox_cannot_create_sub_cgroups`).
+  Residual, inferred: a flush racing an update can leave one flush window
+  uncounted, and the next 64 × CPUs + 1 updates (257 on the runners,
+  about 1 MiB of 4 KiB pages) make the sandbox flushable again, so it
+  does not persist.
+- **The decision: one keeper per sandbox** (`src/keeper.rs`). The last
+  step of `Cgroup::create` opens the cgroup's own `memory.stat` relative
+  to its directory descriptor (`O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, no
+  path), reads it once and starts the thread `memcg-keeper`, which reads
+  it every `STATS_KEEPER_PERIOD` on deadlines (`pread` from offset 0 into
+  a 4 KiB stack buffer until 0, content discarded, nothing allocated per
+  tick). A missed period is counted as late and the schedule re-anchors
+  without a burst. A file that cannot be opened or read fails `create`
+  with `Error::CgroupFile`, one that reads as empty with
+  `Error::StatsKeeper { errno: EIO }`, and a failed spawn with
+  `Error::Sys`; each drops the cgroup, so no sandbox runs without its
+  keeper. `kill_and_remove` stops and joins it right after a successful
+  `cgroup.kill`, before the lift, the wait and `unlinkat`; after a failed
+  kill it runs until the drop. A later read error is sticky in
+  `KeeperReport::failed` and ends the thread; the sandbox is not killed
+  for it, because that would turn a possible OOM kill into a certain one,
+  and #8 checks the report with each run's outcome (an OOM kill after a
+  keeper failure is unverified). `Cgroup::stats_keeper()` reports the
+  reads, late reads, the largest gap, the longest read, the thread's
+  whole CPU time (wake-ups included) and the failure. A `Parent` runs no
+  thread. The thread lives in `boneli-sys`, the only crate with `unsafe`
+  (`pread`, `clock_gettime`); no port sees it.
+- **The period, P\* = 5 ms, by rule R-S1** (fixed in #54's plan before the
+  data). M3 (run 44746104468 on d999fa9, 16 x86_64 and 4 arm64 copies,
+  3 of the x86_64 copies on AWS; dev host once) read the sandbox's own
+  `memory.stat` at the write's start and then every T (KS_T) at three
+  sizes with the same loop bound, (M, `wbps` = M ÷ 8 s, 2M written):
+  (64 MiB, 8 MiB/s, 128 MiB), (128, 16, 256), (256, 32, 512), 20 runs
+  per size and T per copy, a held run cut 1.5 s after the write's start.
+  A size holds at T when KS_T had no OOM kill there in any CI or
+  dev-host run, and P holds a size when it holds at T = 2P. Killed runs
+  of the 400 CI runs per cell (the dev host 0 of 20 unless noted; K0: 40
+  CI runs, 2 per copy):
+
+  | size | KS10 | KS20 | KS50 | KS100 | K0 (no reads, CI) |
+  |---|---|---|---|---|---|
+  | 64 MiB | 0 | 200 | 398 (dev 0) | 389 (dev 1) | 40 of 40 |
+  | 128 MiB | 0 | 2 (arm64) | 267 | 392 | 39 of 40 |
+  | 256 MiB | 0 | 0 | 0 | 388 | 40 of 40 |
+
+  So 5 ms (T = 10) holds all three sizes, 10 ms (T = 20) loses 64 MiB on
+  four of six CI classes and 128 MiB on arm64, 25 ms holds only 256 MiB
+  and 50 ms none: P\* = 5 ms, the floor F = 64 MiB (R-S1; R-S2's fallback
+  to 128 MiB was not needed). R-S3 (5 ms must hold 256 MiB) and R-S4 (no
+  kill without `io.max` at T = 2P\*: NS10, 256 MiB, 512 MiB, uncut, 0 of
+  210 runs) pass. **The factor 2** covers a host whose buffered writes
+  are up to twice as fast as the fastest CI class, or a keeper woken a
+  whole period late (inferred, not measured on such a host). **The
+  margin per size**, the largest T held divided by P\*: 64 MiB 10 ÷ 5 = 2,
+  128 MiB 10 ÷ 5 = 2, 256 MiB 50 ÷ 5 = 10. The kill times of the lost
+  cells (20-62 ms after the write's start at 64 MiB, 35-83 ms at
+  128 MiB, 69-172 ms at 256 MiB) bound what a period can miss: at
+  64 MiB a 20 ms gap already reaches the kill on the fastest classes.
+- **The floor, 64 MiB, documented, not enforced.** It depends on the
+  host's buffered write rate, which `boneli-sys` cannot know, so a
+  constant in `Limits::validate` would be wrong on other hosts, and the
+  operator rejected a sizing rule. Below 64 MiB nothing was measured, and
+  #8 sizes each sandbox at F or more, with headroom for faster hosts.
+- **R-S5, the read's duration.** The p99 wall time of one read with 32
+  sandboxes, each with its own reader at 5 ms (CS32), was 17-77 µs on
+  CI, against the bound P\* ÷ 10 = 500 µs (a tenth of the one period of
+  margin the factor 2 buys). The dev host, in a CPU-capped slice whose
+  quota stalls threads (one read took 75 ms), measured 154-208 µs and is
+  reported only. **CPU**, each keeper thread's whole CPU time over its
+  life at 5 ms (debug build, the test binaries' profile): per sandbox
+  per second 2.5-10.6 ms at N = 1, 2.7-8.5 ms at N = 8 and 2.3-8.3 ms at
+  N = 32 on CI, 73.5-265 ms per second for all 32 together (7-27 % of
+  one CPU); dev host 14.8-16.8, 11.0-11.4 and 8.0-8.7 ms per sandbox,
+  257-279 ms in total at N = 32. CPU per sandbox per second = CPU per
+  read ÷ P\*: 11-53 µs per read on CI is 2.3-10.6 ms per second. It is
+  reported, not bounded; the flush walks every possible CPU and its
+  threshold scales with online CPUs, so the cost on hosts with more CPUs
+  is derived, not measured. `keeper_cost_report` asserts CPU per read
+  ≤ P\* ÷ 10 at N = 1 and 8.
+- **What could still defeat it.** (1) A writer in a sub-cgroup: excluded
+  today (`cgroup.max.descendants`/`depth` 0, `nsdelegate` refuses to
+  raise them, pinned by `sandbox_cannot_create_sub_cgroups`); per-container
+  sub-cgroups (#8) would need a keeper per leaf. (2) A foreign inode,
+  written back under another cgroup: the throttle then uses that
+  cgroup's count; the traces saw no foreign dirtying and one inode wb
+  switch in 67 runs; not covered. (3) A kernel whose `memory.stat` read
+  stops flushing: the permanent tests fail with `OomKilled`, which they
+  give only when the keeper's report taken after the writer's end shows
+  at least one read per 10 periods of the run and no gap over 10
+  periods, and the keeper reads again within 1 s after that report;
+  detection covers only the kernels CI runs, and a runner
+  kernel change shows in "Host features". Then the keeper needs another
+  flushing read or a flush-independent mechanism. (4) A starved keeper:
+  `late` and `max_gap` show it; an OOM kill with fewer reads or a longer
+  gap is `KeeperStalled`, not `OomKilled`, and so is any run after which
+  the keeper does not read again within 1 s (`max_gap` grows only when
+  the next read lands, so a keeper that stopped and stays stopped shows
+  only there). #8 must not CPU-limit the runner's cgroup so hard that
+  the keeper falls behind.
+- **Alternatives weighed.** The parent read (H4: 67 traced kills at
+  10 ms). The parent read plus a fallback that reads the sandboxes when
+  `memory.current` grows while `file_dirty` stands still: it reacts a
+  period late on a heuristic, and the sandbox read needs neither. One
+  thread per parent walking the sandboxes: staleness grows with N and
+  the slowest read (the dev host's parent reads already had a p99 of
+  506-3,325 µs at N = 32). A `memory.high` band (M1: 2 % at 64 MiB was
+  killed in 52 of 54 CI runs, 5 % crawled 45 s at 2 GiB on the dev
+  host); a band with a floor; a sizing rule; `vm.dirty_*` sysctls;
+  tmpfs-only workspaces (#8); accepting the kill; a read triggered by
+  `memory.events`, which fires at `memory.max`, when 21-30 ms are left
+  on the fastest classes.
+- **AWS (W1).** Buffered writeback under `io.max` is throttled on AWS:
+  `memory.max` 1 GiB, `wbps` 8 MiB/s, 64 MiB and `fdatasync` took
+  8,003-8,004 ms (bound 7,500), with `wbytes` 67,108,864 on the line
+  252:0 that `block_device_of` picks; the COW device 259:1 counts the
+  same bytes. Bio size at dispatch 4,096 bytes on AWS, 2,097,152 on Azure.
+- **The tests.** `io_limit_holds_buffered_writes` (256 MiB, 32 MiB/s,
+  512 MiB), `io_limit_holds_buffered_writes_at_floor` (F, F ÷ 8 s, 2F)
+  and `buffered_writes_without_io_max_are_not_killed` (256 MiB, no
+  `io.max`, 512 MiB) run the probe's `never` writer (1 MiB writes of
+  incompressible data, no sync in the loop, then `fdatasync`) and must be
+  Held: no OOM kill and exit 0, dirty or writeback data at the loop's
+  end, the loop at least (S − M) ÷ `wbps` − 500 ms = 7,500 ms and the
+  whole write at least S ÷ `wbps` − 500 ms = 15,500 ms (one 100 ms
+  throttle slice and 400 ms of timer slack), every byte on the `io.max`
+  device, and at least max(1, ⌊loop ms ÷ (10 × P\*)⌋) keeper reads during
+  the loop (150 for a 7,500 ms loop). The keeper's report is taken before
+  the spawn, when the loop's end is printed and after the writer ended,
+  so a writer killed in its loop, which prints no loop end, still shows
+  what the keeper did; after the writer's end the test also waits up to
+  1 s (200 periods, against the 56 ms the largest gap a loaded dev host
+  showed) for the keeper's next read. Verdicts in precedence:
+  `KeeperFailed` (a failure in any of the reports), `KeeperStalled` (no
+  read within that 1 s, in any run, or an OOM kill with fewer than
+  max(1, ⌊run ms ÷ (10 × P\*)⌋) reads from the spawn to the writer's end
+  or a gap over 10 × P\*), `OomKilled`, `WriterFailed`,
+  `NotBuffered`, `Escaped`, `OffDevice`, `KeeperIdle`, `Held`.
+  `keeper_reads_its_own_sandbox` (each keeper holds exactly its own
+  sandbox's `memory.stat`, none the parent's, none left after `destroy`
+  or a drop, and, watched through inotify `IN_ACCESS`, each sandbox's
+  file is read in at least 15 of 20 slots of 10 × P\* and the parent's
+  in at most 5; each keeper's report grows by at least 3/4 of the
+  window ÷ P\*, which rejects any period over 4/3 × P\*, with no gap
+  over 20 ms, the shortest read interval that lost a size in M3 (KS20
+  at 64 MiB); a window that misses the cadence is tried again with fresh
+  keepers, up to 3 windows, because a host that starves the thread for
+  a moment fails one window while a keeper that reads too seldom fails
+  all),
+  `keeper_runs_while_cgroup_lives` and `keeper_cost_report` pin the
+  lifecycle and the cost; the unit tests pin the schedule, the report,
+  a refused start and a sticky failure. Mutation runs are listed in the
+  PR: MK1 (no keeper thread) and MK-P (the keeper reads the parent) on
+  CI; MK-P's behavioral run takes n = ⌈ln 0.01 ÷ ln(1 − p)⌉ = 50 runs of
+  the floor test on Azure x86_64, with p = 23/260, the kill rate of
+  parent reads every 5 ms at 64 MiB there (M3, KP5), so it misses a
+  kill with probability 1 % or less (R-S6).
+- **MK-P's result and the decision on it.** MK1 failed all three
+  buffered tests with `OomKilled` on both CI legs (run 44756507651). MK-P
+  (run 44756978618) failed `keeper_reads_its_own_sandbox` and
+  `keeper_runs_while_cgroup_lives` on both legs (jobs 136359165476 and
+  136359165516), but its behavioral run killed **0 of 70** floor runs on
+  Azure x86_64 (5 per copy on 14 copies; the 2 AWS runs were Held too).
+  At KP5's rate, 0 of 70 has probability (1 − 23/260)^70 ≈ 0.15 %
+  (derived), so R-S6 did not hold. The reason is **inferred from the code,
+  not measured**: KP5's first read was pinned to the write's start, the
+  flush the trace round found as the trigger in all 67 killed K10 runs,
+  while a real keeper starts in `create`, before the spawn, and reads on
+  its own 5 ms rhythm, so its reads have no fixed phase to the write and
+  the parent was flushed every 5 ms before the writer began. KP5 also
+  read the sandbox's `memory.current` after each read and ran in turn
+  with other arms in one process; MK-P ran the floor test alone in a
+  fresh scope. So a kill rate measured with a read pinned at the write's
+  start does not carry over to a free-running keeper. **Operator decision
+  (2026-11-20):** 0 of 70 is accepted, and the deterministic pin
+  `keeper_reads_its_own_sandbox` is the proof for the parent-read mutant;
+  MK1 is the behavioral proof that the tests see a missing keeper.
+  **The pin, strengthened after review (#78):** as decided it checked
+  only which descriptors a keeper holds, so a keeper that held its own
+  file but opened, read and closed the parent's every period passed it
+  (and `keeper_runs_while_cgroup_lives`) on the dev host. It now also
+  watches the files through inotify `IN_ACCESS`, which every successful
+  read raises whoever reads, and needs each sandbox's file read in 15 of
+  20 slots of 10 periods and the parent's in at most 5. Measured on the
+  dev host: the keeper 20 of 20 and the parent 0; that mutant 0 and 20,
+  failed; a keeper holding the parent's file failed the descriptor
+  checks; a thread that reads nothing but reports reads 0 of 20, failed.
+  Review run 2 found that a slot of 10 periods is filled by a keeper
+  that reads once per 10 periods, so the pin also checks the cadence
+  from the keeper's report (above): a keeper at 10 × P\* read 21 times
+  per 1 s window against the 150 needed and failed all 3 windows; the
+  keeper itself read 201 in a 1 s window. The same round found that a
+  keeper that stopped for good after 300 reads was still called
+  `OomKilled` and could pass as `Held`, hence the 1 s wait for its next
+  read: that mutant is now `KeeperStalled` on the floor test (and on
+  the 256 MiB test with `io.max`), and the same hang after 100 reads is
+  `KeeperStalled` on the test without `io.max`.
+- **For #8.** One keeper thread per sandbox, from `create` to the kill,
+  at the CPU above. A Landlock ruleset applied to the runner must allow
+  reading `memory.stat` below the parent at every `create`, or `create`
+  fails closed. Below 64 MiB nothing is promised.
+
 **The harness** gives every host test that does not set its own limits a
 cgroup with `memory.max` 256 MiB without swap, `pids.max` 64 and
 `cpu.max` `100000 100000` (one CPU), no IO limit: enough for the probe
@@ -1163,6 +1455,10 @@ mountinfo as bytes.
   and IO limits that are in place before it starts and that it cannot
   change from inside; the runner needs a delegated cgroup with the four
   controllers (D8).
+- The runner process runs one `memcg-keeper` thread per live sandbox,
+  reading that sandbox's `memory.stat` every 5 ms, and a buffered writer
+  is held, not OOM-killed, only at `memory.max` 64 MiB and above (D8,
+  "Buffered writes and the statistics keeper").
 - One id inside: images that switch users fail, and the runner must be a
   dedicated user without privileged supplementary groups.
 - The host-setup block runs with root, on CI and on user hosts. It is

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use boneli_sys::{
-    Cgroup, CpuMax, Error, ExitStatus, IoLimits, IoMax, Limits, Mount, Parent, Root, Spec, Stdio,
-    Step, block_device_of, spawn,
+    Cgroup, CpuMax, Error, ExitStatus, IoLimits, IoMax, KeeperReport, Limits, Mount, Parent, Root,
+    STATS_KEEPER_PERIOD, Spec, Stdio, Step, block_device_of, spawn,
 };
 
 use crate::support::cgroup::{self, keyed, read};
@@ -363,6 +363,1072 @@ fn io_limit_throttles_writes() {
 }
 
 #[test]
+#[ignore = "host: cgroup v2 delegation (io, memory), a block device behind the target dir; timing"]
+fn io_limit_holds_buffered_writes() {
+    // A buffered write is limited at its writeback, not in write(2)
+    // (#52). The probe writes S = 512 MiB without O_DIRECT and without a
+    // sync in its loop into a cgroup with memory.max M = 256 MiB and wbps
+    // W = 32 MiB/s. Without the sandbox's statistics keeper the 7.0
+    // kernels of CI OOM-killed it in 53 of 54 runs, because dirty
+    // throttling judged it by stale memcg statistics (#54, ADR-007 D8).
+    // With it the writer is slowed: at the loop's end at most M of the
+    // file waits in the page cache, so at least S - M passed the throttle
+    // (loop >= 8,000 - 500 ms), and the whole S passed it by the end of
+    // the final fdatasync (elapsed >= 16,000 - 500 ms); buffered_bounds.
+    let _alone = support::exclusive();
+    let f = buffered_case(
+        "io_limit_holds_buffered_writes",
+        IO_BUF_MEMORY_MAX,
+        Some(IO_BUF_WBPS),
+        IO_BUF_SIZE,
+    );
+    buffered_assert("io_limit_holds_buffered_writes", &f);
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (io, memory), a block device behind the target dir; timing"]
+fn io_limit_holds_buffered_writes_at_floor() {
+    // The same at the keeper's floor F = 64 MiB, the smallest memory.max
+    // its period protects (ADR-007 D8): wbps F / 8 s = 8 MiB/s, 2F
+    // written, so the bounds are the same 7,500 and 15,500 ms. Without
+    // the keeper this size was OOM-killed in every CI run and on the dev
+    // host (#54, K0 in M2a, the trace round and M3).
+    let _alone = support::exclusive();
+    let f = buffered_case(
+        "io_limit_holds_buffered_writes_at_floor",
+        KEEPER_FLOOR,
+        Some(KEEPER_FLOOR / 8),
+        2 * KEEPER_FLOOR,
+    );
+    buffered_assert("io_limit_holds_buffered_writes_at_floor", &f);
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation (memory), a block device behind the target dir"]
+fn buffered_writes_without_io_max_are_not_killed() {
+    // 256 MiB, no io.max, 512 MiB buffered: the keeper protects every
+    // sandbox, not only those with a write limit (#54, STOP 1 decision 2).
+    // Without reads the 7.0 kernels of CI killed it in 47 of 54 runs (M1,
+    // N0). No time bound: nothing limits the rate.
+    let _alone = support::exclusive();
+    let f = buffered_case(
+        "buffered_writes_without_io_max_are_not_killed",
+        IO_BUF_MEMORY_MAX,
+        None,
+        IO_BUF_SIZE,
+    );
+    buffered_assert("buffered_writes_without_io_max_are_not_killed", &f);
+}
+
+/// What `io_limit_holds_buffered_writes` writes: 512 MiB.
+const IO_BUF_SIZE: u64 = 512 << 20;
+/// Its `memory.max`: 256 MiB, the harness's `MEMORY_MAX`.
+const IO_BUF_MEMORY_MAX: u64 = 256 << 20;
+/// Its `wbps`: 32 MiB/s, so the run takes about 16 s.
+const IO_BUF_WBPS: u64 = 32 << 20;
+/// The smallest `memory.max` the statistics keeper protects (ADR-007 D8,
+/// #54 M3, rule R-S1).
+const KEEPER_FLOOR: u64 = 64 << 20;
+/// One 100 ms throttle slice plus 400 ms of timer and scheduling slack.
+const IO_BUF_SLACK_MS: u64 = 500;
+/// Hang bound of the buffered writer: about 7 times its 17 s run.
+const IO_BUF_HANG: Duration = Duration::from_secs(120);
+
+/// Runs the buffered writer in a cgroup with `memory_max` and, if set,
+/// `wbps` on the workspace's device, and gathers the facts.
+fn buffered_case(name: &str, memory_max: u64, wbps: Option<u64>, size: u64) -> BufferedFacts {
+    let fixture = Fixture::new("io-buffered");
+    let dev = block_device_of(&fixture.workspace).unwrap_or_else(|e| {
+        panic!(
+            "{name} needs a block device behind {}: {e}",
+            fixture.workspace.display()
+        )
+    });
+    let io = match wbps {
+        Some(w) => IoLimits::new(vec![IoMax {
+            dev,
+            rbps: None,
+            wbps: Some(w),
+            riops: None,
+            wiops: None,
+        }])
+        .expect("one device"),
+        None => IoLimits::none(),
+    };
+    let cg = cgroup::create(
+        "io-buffered",
+        &limits(memory_max, 16, (100_000, 100_000), io),
+    );
+    let run = buffered_writer_run(&fixture, &cg, size);
+    let events = read(&cg, "memory.events");
+    let stat = read(&cg, "io.stat");
+    let f = buffered_facts(
+        &run,
+        BufferedSetup {
+            dev: (dev.major, dev.minor),
+            size,
+            memory_max,
+            wbps: wbps.unwrap_or(0),
+        },
+        keyed(&events, "oom_kill"),
+        keyed(&events, "max"),
+        &stat,
+    );
+    let _ = cg.destroy();
+    f
+}
+
+/// Reports the facts and fails the test unless they are [`BufferedHold::Held`].
+fn buffered_assert(name: &str, f: &BufferedFacts) {
+    let v = buffered_verdict(f);
+    report(&format!("{name}: {v:?}: {}", buffered_text(f)));
+    assert!(v == BufferedHold::Held, "{}", buffered_failure(v, f));
+}
+
+/// One run of the buffered writer: its output, the keeper's report before
+/// the spawn, when the loop ended and once the writer ended, and the run's
+/// wall time from the spawn to the writer's end.
+struct BufferedRun {
+    probe: support::Probe,
+    keeper_before: KeeperReport,
+    keeper_at_loop_end: Option<KeeperReport>,
+    keeper_after: KeeperReport,
+    run_ms: u64,
+    /// The report once the keeper read again after `keeper_after`, or
+    /// failed, or [`KEEPER_RESUME`] passed without either.
+    keeper_settled: KeeperReport,
+    /// When the keeper's next read after `keeper_after` was seen, if it
+    /// came within [`KEEPER_RESUME`].
+    keeper_resumed_ms: Option<u64>,
+}
+
+/// How long a buffered case waits after the writer's end for the keeper's
+/// next read: 200 periods of 5 ms. A keeper that reads at all reads again
+/// within one or a few periods (the largest gap a loaded dev host showed
+/// was about 56 ms); one that stopped never does. A stop shows nowhere
+/// else: `max_gap` grows only when the next read lands, and the read
+/// counts run from before the spawn (#78 review, run 2).
+const KEEPER_RESUME: Duration = Duration::from_secs(1);
+
+/// Waits up to [`KEEPER_RESUME`] for a read after `after` or a failure,
+/// and returns the last report and when a read was seen.
+fn keeper_resume(cg: &Cgroup, after: KeeperReport) -> (KeeperReport, Option<u64>) {
+    let start = Instant::now();
+    loop {
+        let r = cg.stats_keeper();
+        let waited = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if r.reads > after.reads {
+            return (r, Some(waited));
+        }
+        if r.failed.is_some() || start.elapsed() >= KEEPER_RESUME {
+            return (r, None);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Runs the buffered writer in `cg` on `fixture` and waits for it within
+/// [`IO_BUF_HANG`]. Its output goes through pipes read on threads, so the
+/// hang bound starts at once: `run_in` reads the pipes to EOF before its
+/// hang bound starts, so a stuck writer would hold the job until its
+/// timeout. Not files: the probe's output written to a file is a dirty
+/// page charged to the sandbox, which hid a loop that synced every write
+/// from the not-buffered guard (mutant MD, measured: 4,096 bytes). The
+/// stdout reader takes the keeper's report as the `loop_ms` line arrives;
+/// a writer killed in its loop prints none, so the report after the
+/// writer's end is what shows whether the keeper read during such a run
+/// (#54 review).
+fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup, size: u64) -> BufferedRun {
+    let _runs = support::shared();
+    let (out_r, out_w) = support::pipe();
+    let (err_r, err_w) = support::pipe();
+    let mut s = spec(
+        root_with_cgroup(fixture),
+        cg,
+        crate::support::rootfs::PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+    );
+    s.stdio.stdout = out_w;
+    s.stdio.stderr = err_w;
+    let size = size.to_string();
+    s.env = [
+        (support::probe::ACTION_VAR, "io-write"),
+        ("BONELI_PROBE_FILE", "/workspace/buffered"),
+        ("BONELI_PROBE_SIZE", size.as_str()),
+        ("BONELI_PROBE_DIRECT", "never"),
+    ]
+    .iter()
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+    .collect();
+    let keeper_before = cg.stats_keeper();
+    let started = Instant::now();
+    let mut child = spawn(&s).expect("spawn the buffered writer");
+    // The write ends live in the spec; dropping it leaves the child as the
+    // only writer, so the reads end when it exits.
+    drop(s);
+    std::thread::scope(|scope| {
+        let out = scope.spawn(move || {
+            use std::io::BufRead;
+            let mut r = std::io::BufReader::new(std::fs::File::from(out_r));
+            let mut text = String::new();
+            let mut at_loop_end = None;
+            loop {
+                let n = r
+                    .read_line(&mut text)
+                    .expect("read the buffered writer's stdout");
+                if n == 0 {
+                    break;
+                }
+                if at_loop_end.is_none() && text.contains("BONELI_PROBE loop_ms=") {
+                    at_loop_end = Some(cg.stats_keeper());
+                }
+            }
+            (text, at_loop_end)
+        });
+        let err = scope.spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::fs::File::from(err_r), &mut buf)
+                .expect("read the buffered writer's stderr");
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let status = wait_bounded(&mut child, IO_BUF_HANG);
+        // The keeper runs until the cgroup is destroyed, so this report
+        // covers the whole run, a killed one too.
+        let keeper_after = cg.stats_keeper();
+        let run_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (keeper_settled, keeper_resumed_ms) = keeper_resume(cg, keeper_after);
+        let (stdout, keeper_at_loop_end) = out.join().expect("the stdout reader");
+        let stderr = err.join().expect("the stderr reader");
+        BufferedRun {
+            probe: support::parse_probe(support::Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            keeper_before,
+            keeper_at_loop_end,
+            keeper_after,
+            run_ms,
+            keeper_settled,
+            keeper_resumed_ms,
+        }
+    })
+}
+
+/// A buffered case's sizes.
+#[derive(Debug, Clone, Copy)]
+struct BufferedSetup {
+    dev: (u32, u32),
+    size: u64,
+    memory_max: u64,
+    /// 0: no `io.max` line.
+    wbps: u64,
+}
+
+/// What a buffered case measured.
+#[derive(Debug, Clone)]
+struct BufferedFacts {
+    setup: BufferedSetup,
+    kernel: String,
+    status: ExitStatus,
+    oom_kill: u64,
+    max_events: u64,
+    loop_start: bool,
+    loop_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    last_progress: Option<String>,
+    loop_wbytes: u64,
+    loop_file_dirty: u64,
+    loop_file_writeback: u64,
+    /// The cgroup's `io.stat` after the run, every line.
+    io_stat: String,
+    wbytes: u64,
+    keeper_before: KeeperReport,
+    keeper_at_loop_end: Option<KeeperReport>,
+    /// The keeper's report once the writer ended.
+    keeper_after: KeeperReport,
+    /// From the spawn to the writer's end.
+    run_ms: u64,
+    /// The keeper's report once it read again after the run, failed, or
+    /// [`KEEPER_RESUME`] passed.
+    keeper_settled: KeeperReport,
+    /// When that next read was seen; `None`: not within [`KEEPER_RESUME`].
+    keeper_resumed_ms: Option<u64>,
+}
+
+/// The facts from the probe's keys (a missing number reads 0, a missing
+/// time `None`), the keeper's reports and the cgroup's files.
+fn buffered_facts(
+    run: &BufferedRun,
+    setup: BufferedSetup,
+    oom_kill: u64,
+    max_events: u64,
+    io_stat: &str,
+) -> BufferedFacts {
+    let p = &run.probe;
+    let time = |k: &str| p.values.get(k).and_then(|v| v.parse().ok());
+    let number = |k: &str| time(k).unwrap_or(0);
+    let loop_stat = p
+        .values
+        .get("loop_io_stat")
+        .map(|s| s.replace(';', "\n"))
+        .unwrap_or_default();
+    BufferedFacts {
+        setup,
+        kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map_or_else(|e| format!("unreadable ({e})"), |k| k.trim().to_string()),
+        status: p.status,
+        oom_kill,
+        max_events,
+        loop_start: p.values.get("loop_start").is_some_and(|v| v == "1"),
+        loop_ms: time("loop_ms"),
+        elapsed_ms: time("elapsed_ms"),
+        last_progress: p.values.get("progress").cloned(),
+        loop_wbytes: io_stat_wbytes(&loop_stat, setup.dev.0, setup.dev.1),
+        loop_file_dirty: number("loop_file_dirty"),
+        loop_file_writeback: number("loop_file_writeback"),
+        io_stat: io_stat.to_string(),
+        wbytes: io_stat_wbytes(io_stat, setup.dev.0, setup.dev.1),
+        keeper_before: run.keeper_before,
+        keeper_at_loop_end: run.keeper_at_loop_end,
+        keeper_after: run.keeper_after,
+        run_ms: run.run_ms,
+        keeper_settled: run.keeper_settled,
+        keeper_resumed_ms: run.keeper_resumed_ms,
+    }
+}
+
+/// What one buffered run shows, in the order of precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedHold {
+    /// The sandbox's statistics keeper failed, before, during or after the
+    /// run: nothing protected the writer, so nothing else is said.
+    KeeperFailed,
+    /// The keeper stopped: no read within [`KEEPER_RESUME`] after the
+    /// writer's end, in any run. Or an OOM kill while the keeper stalled:
+    /// it read less than once per 10 periods of the run, or paused longer
+    /// than 10 periods. The keeper, not the kernel, is the first suspect
+    /// (ADR-007 D8, "What could still defeat it" (4)).
+    KeeperStalled,
+    /// An OOM kill although the keeper kept reading: dirty throttling did
+    /// not slow the writer in time, so a read of `memory.stat` may no
+    /// longer flush (ADR-007 D8, "What could still defeat it" (3)).
+    OomKilled,
+    /// The writer did not exit 0 or printed no `loop_start`, `loop_ms` or
+    /// `elapsed_ms`.
+    WriterFailed,
+    /// No dirty data at the loop's end, or the device had counted every
+    /// byte by then: not a buffered write. A buffered loop leaves at least
+    /// its last write in the page cache when it ends; a loop that synced
+    /// every write showed `file_writeback` 1 MiB in statistics read right
+    /// after it (mutant MD, dev host), so dirty data alone does not tell.
+    NotBuffered,
+    /// The loop or the whole write finished under its bound: io.max did
+    /// not hold.
+    Escaped,
+    /// The limited device did not see every byte.
+    OffDevice,
+    /// The keeper did not read at least once per 10 periods of the loop.
+    KeeperIdle,
+    /// Slowed, not killed, every bound met.
+    Held,
+}
+
+/// The least loop time and the least whole-write time in ms that `wbps`
+/// allows: (S - M) and S over the rate, each minus [`IO_BUF_SLACK_MS`];
+/// (0, 0) without a rate. Floors, so it errs low.
+fn buffered_bounds_ms(size: u64, memory_max: u64, wbps: u64) -> (u64, u64) {
+    let over = |bytes: u64| {
+        bytes
+            .saturating_mul(1000)
+            .checked_div(wbps)
+            .unwrap_or(0)
+            .saturating_sub(IO_BUF_SLACK_MS)
+    };
+    (over(size.saturating_sub(memory_max)), over(size))
+}
+
+/// The keeper's reads from before the spawn to the loop's end, and the
+/// least it must have done: one per 10 keeper periods of the loop, at
+/// least one. A tenth of what it should read: a keeper that reads at all
+/// reads far more, one that stopped or stalls for good reads less.
+fn keeper_reads(f: &BufferedFacts) -> (u64, u64) {
+    let done = f
+        .keeper_at_loop_end
+        .map_or(0, |r| r.reads.saturating_sub(f.keeper_before.reads));
+    let ten_periods = 10 * STATS_KEEPER_PERIOD.as_millis() as u64;
+    let need = (f.loop_ms.unwrap_or(0) / ten_periods).max(1);
+    (done, need)
+}
+
+/// The keeper's reads from before the spawn to the writer's end, and the
+/// least it must have done: one per 10 keeper periods of the run, at least
+/// one (the measure of [`keeper_reads`], over the whole run).
+fn keeper_run_reads(f: &BufferedFacts) -> (u64, u64) {
+    let done = f.keeper_after.reads.saturating_sub(f.keeper_before.reads);
+    let ten_periods = 10 * STATS_KEEPER_PERIOD.as_millis() as u64;
+    (done, (f.run_ms / ten_periods).max(1))
+}
+
+/// The keeper read less than [`keeper_run_reads`] asks, or its largest gap
+/// between two reads, over its whole life, is over 10 periods, or it
+/// stopped ([`keeper_stopped`]).
+fn keeper_stalled(f: &BufferedFacts) -> bool {
+    let (done, need) = keeper_run_reads(f);
+    done < need || f.keeper_after.max_gap > 10 * STATS_KEEPER_PERIOD || keeper_stopped(f)
+}
+
+/// No read within [`KEEPER_RESUME`] after the writer's end: the gap still
+/// open when the run was judged.
+fn keeper_stopped(f: &BufferedFacts) -> bool {
+    f.keeper_settled.reads <= f.keeper_after.reads
+}
+
+/// The first `errno` a keeper report shows, before, at the loop's end or
+/// after the run.
+fn keeper_failure(f: &BufferedFacts) -> Option<i32> {
+    [
+        Some(f.keeper_before),
+        f.keeper_at_loop_end,
+        Some(f.keeper_after),
+        Some(f.keeper_settled),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|r| r.failed)
+}
+
+fn buffered_verdict(f: &BufferedFacts) -> BufferedHold {
+    if keeper_failure(f).is_some() {
+        return BufferedHold::KeeperFailed;
+    }
+    if keeper_stopped(f) {
+        return BufferedHold::KeeperStalled;
+    }
+    if f.oom_kill >= 1 {
+        return if keeper_stalled(f) {
+            BufferedHold::KeeperStalled
+        } else {
+            BufferedHold::OomKilled
+        };
+    }
+    let (Some(loop_ms), Some(elapsed_ms), true, ExitStatus::Exited(0)) =
+        (f.loop_ms, f.elapsed_ms, f.loop_start, f.status)
+    else {
+        return BufferedHold::WriterFailed;
+    };
+    let (loop_bound, elapsed_bound) =
+        buffered_bounds_ms(f.setup.size, f.setup.memory_max, f.setup.wbps);
+    let (done, need) = keeper_reads(f);
+    if f.loop_file_dirty.saturating_add(f.loop_file_writeback) == 0 || f.loop_wbytes >= f.setup.size
+    {
+        BufferedHold::NotBuffered
+    } else if loop_ms < loop_bound || elapsed_ms < elapsed_bound {
+        BufferedHold::Escaped
+    } else if f.wbytes < f.setup.size {
+        BufferedHold::OffDevice
+    } else if done < need {
+        BufferedHold::KeeperIdle
+    } else {
+        BufferedHold::Held
+    }
+}
+
+fn opt_ms(v: Option<u64>) -> String {
+    v.map_or("none".to_string(), |v| v.to_string())
+}
+
+fn keeper_text(r: Option<KeeperReport>) -> String {
+    r.map_or("none".to_string(), |r| {
+        format!(
+            "reads {} late {} max_gap {:?} max_read {:?} cpu {:?} failed {:?}",
+            r.reads, r.late, r.max_gap, r.max_read, r.cpu, r.failed
+        )
+    })
+}
+
+/// The facts of a buffered case, for its report line and every message.
+fn buffered_text(f: &BufferedFacts) -> String {
+    let (loop_bound, elapsed_bound) =
+        buffered_bounds_ms(f.setup.size, f.setup.memory_max, f.setup.wbps);
+    let (done, need) = keeper_reads(f);
+    let (run_done, run_need) = keeper_run_reads(f);
+    format!(
+        "kernel {}, device {}:{}, status {:?}, oom_kill {}, memory.events max {}, \
+         loop_start {}, loop_ms {} (bound {loop_bound}), elapsed_ms {} (bound {elapsed_bound}), \
+         last progress {}, loop wbytes {}, loop file_dirty {}, loop file_writeback {}, \
+         wbytes {} after fdatasync, io.stat [{}], size {}, memory.max {}, wbps {}, \
+         keeper reads in the loop {done} (need {need}), in the run {run_done} (need {run_need}) \
+         over run_ms {}, keeper before [{}], at the loop's end [{}], after the run [{}], \
+         next read after the run {}, settled [{}], period {:?}",
+        f.kernel,
+        f.setup.dev.0,
+        f.setup.dev.1,
+        f.status,
+        f.oom_kill,
+        f.max_events,
+        f.loop_start,
+        opt_ms(f.loop_ms),
+        opt_ms(f.elapsed_ms),
+        f.last_progress.as_deref().unwrap_or("none"),
+        f.loop_wbytes,
+        f.loop_file_dirty,
+        f.loop_file_writeback,
+        f.wbytes,
+        f.io_stat.lines().collect::<Vec<_>>().join("; "),
+        f.setup.size,
+        f.setup.memory_max,
+        f.setup.wbps,
+        f.run_ms,
+        keeper_text(Some(f.keeper_before)),
+        keeper_text(f.keeper_at_loop_end),
+        keeper_text(Some(f.keeper_after)),
+        resumed_text(f.keeper_resumed_ms),
+        keeper_text(Some(f.keeper_settled)),
+        boneli_sys::STATS_KEEPER_PERIOD,
+    )
+}
+
+/// When the keeper's next read after the run came.
+fn resumed_text(ms: Option<u64>) -> String {
+    ms.map_or_else(
+        || format!("none within {KEEPER_RESUME:?}"),
+        |ms| format!("{ms} ms"),
+    )
+}
+
+fn buffered_failure(v: BufferedHold, f: &BufferedFacts) -> String {
+    let (loop_bound, elapsed_bound) =
+        buffered_bounds_ms(f.setup.size, f.setup.memory_max, f.setup.wbps);
+    let why = match v {
+        BufferedHold::KeeperFailed => format!(
+            "the sandbox's memory statistics keeper failed (errno {}), so nothing kept the \
+             statistics fresh (ADR-007 D8)",
+            keeper_failure(f).unwrap_or(0)
+        ),
+        BufferedHold::KeeperStalled => {
+            let (done, need) = keeper_run_reads(f);
+            let killed = if f.oom_kill >= 1 {
+                format!(
+                    "the buffered writer was OOM-killed (memory.events oom_kill {}) while the \
+                     statistics keeper stalled",
+                    f.oom_kill
+                )
+            } else {
+                "the statistics keeper stopped".to_string()
+            };
+            format!(
+                "{killed}: {done} reads in the run's {} ms (need {need}, one per 10 keeper \
+                 periods), largest gap {:?} (bound {:?}), next read after the run {}; suspect \
+                 the keeper first (ADR-007 D8)",
+                f.run_ms,
+                f.keeper_after.max_gap,
+                10 * STATS_KEEPER_PERIOD,
+                resumed_text(f.keeper_resumed_ms)
+            )
+        }
+        BufferedHold::OomKilled => {
+            let (done, need) = keeper_run_reads(f);
+            format!(
+                "the buffered writer was OOM-killed (memory.events oom_kill {}) although the \
+                 statistics keeper read {done} times in the run's {} ms (need {need}), largest \
+                 gap {:?}: dirty throttling did not slow it in time, so a read of memory.stat \
+                 may no longer flush the statistics (ADR-007 D8)",
+                f.oom_kill, f.run_ms, f.keeper_after.max_gap
+            )
+        }
+        BufferedHold::WriterFailed => "the buffered writer failed".to_string(),
+        BufferedHold::NotBuffered => format!(
+            "the write loop left no dirty data, or the workspace's device had counted all {} bytes \
+             ({} by the loop's end), so it was not a buffered write and the test did not \
+             cover the kernel's writeback",
+            f.setup.size, f.loop_wbytes
+        ),
+        BufferedHold::Escaped => format!(
+            "io.max did not hold the buffered write: the loop took {} ms (bound {loop_bound}) \
+             and the whole write {} ms (bound {elapsed_bound}) at wbps {} with memory.max {}",
+            opt_ms(f.loop_ms),
+            opt_ms(f.elapsed_ms),
+            f.setup.wbps,
+            f.setup.memory_max
+        ),
+        BufferedHold::OffDevice => format!(
+            "the buffered bytes did not reach the limited device: wbytes {} on {}:{} after \
+             fdatasync, under the {} bytes written",
+            f.wbytes, f.setup.dev.0, f.setup.dev.1, f.setup.size
+        ),
+        BufferedHold::KeeperIdle => {
+            let (done, need) = keeper_reads(f);
+            format!(
+                "the statistics keeper read {done} times during the loop, under the {need} \
+                 (one per 10 keeper periods): it ran but did not read"
+            )
+        }
+        BufferedHold::Held => "the buffered write was held".to_string(),
+    };
+    format!("{why}: {}", buffered_text(f))
+}
+
+/// A held run at 512 MiB, 256 MiB, 32 MiB/s with `loop_ms` (measured
+/// shape: M1's A3 runs); the run takes 200 ms more than the whole write,
+/// or 470 ms without a loop time.
+fn buffered_facts_for(loop_ms: Option<u64>) -> BufferedFacts {
+    let run_ms = loop_ms.map_or(470, |l| l + 1_700);
+    let keeper = |reads: u64| KeeperReport {
+        reads,
+        late: 0,
+        max_gap: Duration::from_millis(11),
+        max_read: Duration::from_micros(90),
+        cpu: Duration::from_micros(70 * reads),
+        failed: None,
+    };
+    BufferedFacts {
+        setup: BufferedSetup {
+            dev: (259, 0),
+            size: IO_BUF_SIZE,
+            memory_max: IO_BUF_MEMORY_MAX,
+            wbps: IO_BUF_WBPS,
+        },
+        kernel: "7.0.0-1019-azure".to_string(),
+        status: ExitStatus::Exited(0),
+        oom_kill: 0,
+        max_events: 1044,
+        loop_start: true,
+        loop_ms,
+        elapsed_ms: loop_ms.map(|l| l + 1_500),
+        last_progress: Some("512:14600:230000".to_string()),
+        loop_wbytes: 480_000_000,
+        loop_file_dirty: 30_000_000,
+        loop_file_writeback: 3_000_000,
+        io_stat: "259:0 rbytes=0 wbytes=536870912 rios=0 wios=4096 dbytes=0 dios=0\n8:0 rbytes=4096 wbytes=0 rios=1 wios=0 dbytes=0 dios=0".to_string(),
+        wbytes: IO_BUF_SIZE,
+        keeper_before: keeper(100),
+        keeper_at_loop_end: Some(keeper(100 + loop_ms.unwrap_or(0) / 10)),
+        // A keeper that read every period of the run.
+        keeper_after: keeper(100 + run_ms / STATS_KEEPER_PERIOD.as_millis() as u64),
+        run_ms,
+        // It read again one period after the run.
+        keeper_settled: keeper(101 + run_ms / STATS_KEEPER_PERIOD.as_millis() as u64),
+        keeper_resumed_ms: Some(STATS_KEEPER_PERIOD.as_millis() as u64),
+    }
+}
+
+#[test]
+fn buffered_bounds() {
+    // The three sizes of the keeper's measurement: M / 8 s, 2M written.
+    for m in [64u64 << 20, 128 << 20, 256 << 20] {
+        assert_eq!(buffered_bounds_ms(2 * m, m, m / 8), (7500, 15_500), "{m}");
+    }
+    // At F = 64 MiB, written out.
+    assert_eq!((134_217_728u64 - 67_108_864) * 1000 / 8_388_608 - 500, 7500);
+    assert_eq!(134_217_728u64 * 1000 / 8_388_608 - 500, 15_500);
+    assert_eq!(
+        buffered_bounds_ms(536_870_912, 268_435_456, 33_554_433),
+        (7499, 15_499)
+    );
+    // S <= M: no loop bound, saturating.
+    assert_eq!(
+        buffered_bounds_ms(268_435_456, 268_435_456, 33_554_432).0,
+        0
+    );
+    assert_eq!(buffered_bounds_ms(1, 268_435_456, 33_554_432), (0, 0));
+    // No rate: no bounds and no division by zero.
+    assert_eq!(buffered_bounds_ms(536_870_912, 268_435_456, 0), (0, 0));
+    assert_eq!(
+        buffered_bounds_ms(u64::MAX, 0, 1),
+        (18_446_744_073_709_551_115, 18_446_744_073_709_551_115)
+    );
+}
+
+#[test]
+fn buffered_verdicts() {
+    let f = buffered_facts_for;
+    assert_eq!(buffered_verdict(&f(Some(14_600))), BufferedHold::Held);
+    // The loop bound is inclusive.
+    let mut g = f(Some(7500));
+    g.elapsed_ms = Some(16_000);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    g.loop_ms = Some(7499);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Escaped);
+    // The elapsed bound is inclusive.
+    let mut g = f(Some(14_000));
+    g.elapsed_ms = Some(15_500);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    g.elapsed_ms = Some(15_499);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Escaped);
+    // wbytes, inclusive.
+    let mut g = f(Some(14_600));
+    g.wbytes = 536_870_911;
+    assert_eq!(buffered_verdict(&g), BufferedHold::OffDevice);
+    g.wbytes = 536_870_912;
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // The keeper's reads during the loop: one per 10 periods, at least
+    // one. A 7,500 ms loop needs 150 at 5 ms and 75 at 10 ms.
+    let need = match STATS_KEEPER_PERIOD.as_millis() {
+        5 => 150,
+        10 => 75,
+        25 => 30,
+        50 => 15,
+        p => panic!("no case for a period of {p} ms"),
+    };
+    let mut g = f(Some(7500));
+    g.elapsed_ms = Some(16_000);
+    let mut at_end = g.keeper_before;
+    at_end.reads += need;
+    g.keeper_at_loop_end = Some(at_end);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    at_end.reads -= 1;
+    g.keeper_at_loop_end = Some(at_end);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperIdle);
+    // A 40 ms loop needs 1.
+    let mut g = f(Some(40));
+    g.setup.wbps = 0;
+    let mut at_end = g.keeper_before;
+    g.keeper_at_loop_end = Some(at_end);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperIdle);
+    at_end.reads += 1;
+    g.keeper_at_loop_end = Some(at_end);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // No report at the loop's end: no reads counted.
+    g.keeper_at_loop_end = None;
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperIdle);
+
+    // Precedence: KeeperFailed > KeeperStalled > OomKilled > WriterFailed >
+    // NotBuffered > Escaped > OffDevice > KeeperIdle > Held, each over
+    // everything after.
+    let mut all = f(None);
+    all.status = ExitStatus::Signaled(9);
+    all.oom_kill = 1;
+    all.loop_start = false;
+    all.loop_file_dirty = 0;
+    all.loop_file_writeback = 0;
+    all.wbytes = 0;
+    all.keeper_at_loop_end = None;
+    all.keeper_before.failed = Some(libc::ENODEV);
+    assert_eq!(buffered_verdict(&all), BufferedHold::KeeperFailed);
+    // A failure at the loop's end counts too.
+    let mut g = f(Some(14_600));
+    let mut at_end = g.keeper_at_loop_end.expect("a report");
+    at_end.failed = Some(libc::ENODEV);
+    g.keeper_at_loop_end = Some(at_end);
+    g.oom_kill = 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperFailed);
+    // A failure only in the report after the run counts too: a writer
+    // killed in its loop prints no loop_ms, so there is no loop-end report
+    // (#54 review, finding 1).
+    let mut g = f(None);
+    g.oom_kill = 1;
+    g.keeper_at_loop_end = None;
+    g.keeper_after.failed = Some(libc::EIO);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperFailed);
+    all.keeper_before.failed = None;
+    all.keeper_after.reads = all.keeper_before.reads;
+    assert_eq!(buffered_verdict(&all), BufferedHold::KeeperStalled);
+    all.keeper_after = f(None).keeper_after;
+    assert_eq!(buffered_verdict(&all), BufferedHold::OomKilled);
+    let mut g = f(Some(14_600));
+    g.oom_kill = 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::OomKilled);
+    all.oom_kill = 0;
+    assert_eq!(buffered_verdict(&all), BufferedHold::WriterFailed);
+    for (status, loop_ms, elapsed, start) in [
+        (ExitStatus::Exited(101), Some(14_600), Some(16_100), true),
+        (ExitStatus::Signaled(9), Some(14_600), Some(16_100), true),
+        (ExitStatus::Exited(0), None, Some(16_100), true),
+        (ExitStatus::Exited(0), Some(14_600), None, true),
+        (ExitStatus::Exited(0), Some(14_600), Some(16_100), false),
+    ] {
+        let mut g = f(loop_ms);
+        g.status = status;
+        g.elapsed_ms = elapsed;
+        g.loop_start = start;
+        assert_eq!(
+            buffered_verdict(&g),
+            BufferedHold::WriterFailed,
+            "{status:?} {loop_ms:?} {elapsed:?} {start}"
+        );
+    }
+    let mut g = f(Some(10));
+    g.elapsed_ms = Some(20);
+    g.loop_file_dirty = 0;
+    g.loop_file_writeback = 0;
+    g.wbytes = 0;
+    g.keeper_at_loop_end = None;
+    assert_eq!(buffered_verdict(&g), BufferedHold::NotBuffered);
+    g.loop_file_writeback = 4096;
+    assert_eq!(buffered_verdict(&g), BufferedHold::Escaped);
+    g.loop_ms = Some(7500);
+    g.elapsed_ms = Some(15_500);
+    assert_eq!(buffered_verdict(&g), BufferedHold::OffDevice);
+    g.wbytes = IO_BUF_SIZE;
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperIdle);
+    // The device counted every byte by the loop's end: the loop synced
+    // (mutant MD), whatever the statistics still show. One byte short is
+    // still buffered.
+    let mut g = f(Some(14_600));
+    g.loop_wbytes = IO_BUF_SIZE - 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    g.loop_wbytes = IO_BUF_SIZE;
+    assert_eq!(buffered_verdict(&g), BufferedHold::NotBuffered);
+    g.oom_kill = 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::OomKilled);
+    // Dirty plus writeback saturates.
+    let mut g = f(Some(14_600));
+    g.loop_file_dirty = u64::MAX;
+    g.loop_file_writeback = 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+}
+
+#[test]
+fn buffered_keeper_stalled() {
+    // An OOM kill is the keeper's (KeeperStalled) when it read less than
+    // once per 10 periods of the run or paused longer than 10 periods,
+    // and the kernel's (OomKilled) otherwise (#54 review, finding 1).
+    let ten = 10 * STATS_KEEPER_PERIOD;
+    let ten_ms = ten.as_millis() as u64;
+    let killed = |run_ms: u64, reads: u64, max_gap: Duration| {
+        let mut g = buffered_facts_for(None);
+        g.oom_kill = 1;
+        g.keeper_at_loop_end = None;
+        g.run_ms = run_ms;
+        g.keeper_after = g.keeper_before;
+        g.keeper_after.reads += reads;
+        g.keeper_after.max_gap = max_gap;
+        // It read again after the run.
+        g.keeper_settled = g.keeper_after;
+        g.keeper_settled.reads += 1;
+        buffered_verdict(&g)
+    };
+    let gap = Duration::from_millis(6);
+    // Reads: one per 10 periods of the run, inclusive.
+    assert_eq!(killed(470, 470 / ten_ms, gap), BufferedHold::OomKilled);
+    assert_eq!(
+        killed(470, 470 / ten_ms - 1, gap),
+        BufferedHold::KeeperStalled
+    );
+    // At least one, also for a run shorter than 10 periods.
+    assert_eq!(killed(ten_ms - 1, 1, gap), BufferedHold::OomKilled);
+    assert_eq!(killed(0, 0, gap), BufferedHold::KeeperStalled);
+    // The keeper that stopped reading at the spawn.
+    assert_eq!(killed(470, 0, gap), BufferedHold::KeeperStalled);
+    // The largest gap, inclusive at 10 periods.
+    assert_eq!(killed(470, 94, ten), BufferedHold::OomKilled);
+    assert_eq!(
+        killed(470, 94, ten + Duration::from_nanos(1)),
+        BufferedHold::KeeperStalled
+    );
+    // No OOM kill: a stalled keeper is not a verdict of its own there
+    // (KeeperIdle judges the loop's reads).
+    let mut g = buffered_facts_for(Some(14_600));
+    g.keeper_after = g.keeper_before;
+    g.keeper_after.max_gap = Duration::from_secs(1);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // A keeper that stopped, whatever it read before: no read within
+    // KEEPER_RESUME after the writer's end (#78 review, run 2: a keeper
+    // hung after 300 reads read 299 in a 2,814 ms run, largest gap 6 ms).
+    let stopped = |mut g: BufferedFacts| {
+        g.keeper_settled = g.keeper_after;
+        g.keeper_resumed_ms = None;
+        g
+    };
+    let mut g = buffered_facts_for(None);
+    g.oom_kill = 1;
+    g.keeper_at_loop_end = None;
+    g.run_ms = 2814;
+    g.keeper_after = g.keeper_before;
+    g.keeper_after.reads += 299;
+    g.keeper_after.max_gap = Duration::from_micros(6256);
+    g.keeper_settled = g.keeper_after;
+    g.keeper_settled.reads += 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::OomKilled);
+    let g = stopped(g);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperStalled);
+    let m = buffered_failure(BufferedHold::KeeperStalled, &g);
+    assert!(
+        m.starts_with(
+            "the buffered writer was OOM-killed (memory.events oom_kill 1) while the statistics \
+             keeper stalled: 299 reads"
+        ),
+        "{m}"
+    );
+    assert!(m.contains("next read after the run none within 1s"), "{m}");
+    // Also without an OOM kill: a held run with a stopped keeper is not Held.
+    let g = stopped(buffered_facts_for(Some(14_600)));
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperStalled);
+    let m = buffered_failure(BufferedHold::KeeperStalled, &g);
+    assert!(m.starts_with("the statistics keeper stopped: "), "{m}");
+    // One more read is enough, however late within the bound.
+    let mut g = stopped(buffered_facts_for(Some(14_600)));
+    g.keeper_settled.reads += 1;
+    g.keeper_resumed_ms = Some(KEEPER_RESUME.as_millis() as u64);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // A failure seen while waiting for that read is a failure.
+    let mut g = stopped(buffered_facts_for(Some(14_600)));
+    g.keeper_settled.failed = Some(libc::EIO);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperFailed);
+
+    // A failure wins over a stall.
+    let mut g = buffered_facts_for(None);
+    g.oom_kill = 1;
+    g.keeper_after = g.keeper_before;
+    g.keeper_after.failed = Some(libc::ENODEV);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperFailed);
+    assert!(
+        buffered_failure(BufferedHold::KeeperFailed, &g).contains("failed (errno 19)"),
+        "{}",
+        buffered_failure(BufferedHold::KeeperFailed, &g)
+    );
+}
+
+#[test]
+fn buffered_failure_messages() {
+    let f = buffered_facts_for;
+    let mut failed_keeper = f(Some(14_600));
+    failed_keeper.keeper_before.failed = Some(libc::ENODEV);
+    // A writer OOM-killed mid-loop: loop_start and its last progress key
+    // stay, from a partial output parsed like a real one.
+    let partial = support::parse_probe(support::Output {
+        status: ExitStatus::Signaled(9),
+        stdout: "BONELI_PROBE loop_start=1\nBONELI_PROBE progress=16:3:389\n\
+                 BONELI_PROBE progress=48:12:470\n"
+            .to_string(),
+        stderr: String::new(),
+    });
+    let before = f(None).keeper_before;
+    let mut oom = buffered_facts(
+        &BufferedRun {
+            probe: partial,
+            keeper_before: before,
+            keeper_at_loop_end: None,
+            keeper_after: f(None).keeper_after,
+            run_ms: 470,
+            keeper_settled: f(None).keeper_settled,
+            keeper_resumed_ms: f(None).keeper_resumed_ms,
+        },
+        f(None).setup,
+        1,
+        80,
+        "259:0 rbytes=0 wbytes=1572864 rios=0 wios=12 dbytes=0 dios=0",
+    );
+    oom.kernel = "7.0.0-1019-azure".to_string();
+    assert!(oom.loop_start);
+    assert_eq!(oom.last_progress.as_deref(), Some("48:12:470"));
+    assert_eq!((oom.loop_ms, oom.wbytes), (None, 1_572_864));
+    let mut writer = f(Some(14_600));
+    writer.status = ExitStatus::Exited(101);
+    let mut not_buffered = f(Some(14_600));
+    not_buffered.loop_file_dirty = 0;
+    not_buffered.loop_file_writeback = 0;
+    let mut off = f(Some(14_600));
+    off.wbytes = 4096;
+    let mut stalled = oom.clone();
+    stalled.keeper_after = stalled.keeper_before;
+    let mut idle = f(Some(14_600));
+    idle.keeper_at_loop_end = Some(idle.keeper_before);
+    let idle_prefix = format!(
+        "the statistics keeper read 0 times during the loop, under the {} \
+         (one per 10 keeper periods)",
+        14_600 / (10 * STATS_KEEPER_PERIOD.as_millis())
+    );
+    let cases = [
+        (
+            BufferedHold::KeeperFailed,
+            &failed_keeper,
+            "the sandbox's memory statistics keeper failed",
+        ),
+        (
+            BufferedHold::KeeperStalled,
+            &stalled,
+            "the buffered writer was OOM-killed (memory.events oom_kill 1) while the statistics keeper stalled: 0 reads in the run's 470 ms",
+        ),
+        (
+            BufferedHold::OomKilled,
+            &oom,
+            "the buffered writer was OOM-killed (memory.events oom_kill 1) although the statistics keeper read",
+        ),
+        (
+            BufferedHold::WriterFailed,
+            &writer,
+            "the buffered writer failed",
+        ),
+        (
+            BufferedHold::NotBuffered,
+            &not_buffered,
+            "the write loop left no dirty data",
+        ),
+        (
+            BufferedHold::Escaped,
+            &f(Some(3004)),
+            "io.max did not hold the buffered write: the loop took 3004 ms (bound 7500) and the whole write 4504 ms (bound 15500) at wbps 33554432 with memory.max 268435456",
+        ),
+        (
+            BufferedHold::OffDevice,
+            &off,
+            "the buffered bytes did not reach the limited device: wbytes 4096 on 259:0 after fdatasync, under the 536870912 bytes written",
+        ),
+        (BufferedHold::KeeperIdle, &idle, idle_prefix.as_str()),
+    ];
+    for (v, facts, prefix) in cases {
+        let m = buffered_failure(v, facts);
+        assert!(m.starts_with(prefix), "{v:?}: {m}");
+        for part in [
+            "kernel 7.0.0-1019-azure".to_string(),
+            "device 259:0".to_string(),
+            format!("status {:?}", facts.status),
+            format!("oom_kill {}", facts.oom_kill),
+            format!("loop_start {}", facts.loop_start),
+            format!("loop_ms {}", opt_ms(facts.loop_ms)),
+            format!("elapsed_ms {}", opt_ms(facts.elapsed_ms)),
+            format!(
+                "last progress {}",
+                facts.last_progress.as_deref().unwrap_or("none")
+            ),
+            format!("loop file_dirty {}", facts.loop_file_dirty),
+            format!("loop file_writeback {}", facts.loop_file_writeback),
+            format!("wbytes {} after fdatasync", facts.wbytes),
+            "size 536870912".to_string(),
+            "memory.max 268435456".to_string(),
+            "wbps 33554432".to_string(),
+            format!("keeper before [{}]", keeper_text(Some(facts.keeper_before))),
+            format!(
+                "at the loop's end [{}]",
+                keeper_text(facts.keeper_at_loop_end)
+            ),
+            format!("after the run [{}]", keeper_text(Some(facts.keeper_after))),
+            format!("over run_ms {}", facts.run_ms),
+            format!(
+                "next read after the run {}",
+                resumed_text(facts.keeper_resumed_ms)
+            ),
+            format!("settled [{}]", keeper_text(Some(facts.keeper_settled))),
+        ] {
+            assert!(m.contains(&part), "{v:?}: {part:?} missing in {m}");
+        }
+        // Every io.stat line.
+        for line in facts.io_stat.lines() {
+            assert!(m.contains(line), "{v:?}: {line:?} missing in {m}");
+        }
+    }
+    let m = buffered_failure(BufferedHold::OomKilled, &oom);
+    assert!(m.contains("loop_ms none"), "{m}");
+    assert!(m.contains("last progress 48:12:470"), "{m}");
+    assert!(m.contains("at the loop's end [none]"), "{m}");
+    assert!(m.contains("reads 100 late 0"), "{m}");
+    // A killed run still shows what the keeper did during it.
+    let reads = 470 / STATS_KEEPER_PERIOD.as_millis();
+    assert_eq!(buffered_verdict(&oom), BufferedHold::OomKilled);
+    assert!(
+        m.contains(&format!("read {reads} times in the run's 470 ms")),
+        "{m}"
+    );
+    assert!(
+        m.contains(&format!("after the run [reads {}", 100 + reads)),
+        "{m}"
+    );
+    assert_eq!(buffered_verdict(&stalled), BufferedHold::KeeperStalled);
+}
+
+#[test]
 fn io_write_plan_forms() {
     use crate::support::probe::{IoDirect, io_write_plan};
     let plan = |size: &str, chunk: Option<&str>, direct: Option<&str>| {
@@ -373,6 +1439,10 @@ fn io_write_plan_forms() {
         Ok((8_388_608, 1 << 20, IoDirect::Auto))
     );
     assert_eq!(8_388_608 / (1 << 20), 8);
+    assert_eq!(
+        plan("536870912", None, Some("never")),
+        Ok((536_870_912, 1 << 20, IoDirect::Never))
+    );
     assert_eq!(
         plan("41943040", Some("41943040"), Some("require")),
         Ok((41_943_040, 41_943_040, IoDirect::Require))
@@ -390,7 +1460,7 @@ fn io_write_plan_forms() {
     );
     assert!(plan("abc", None, None).is_err(), "size");
     for direct in [
-        "never", "Require", "require ", "Never", "NEVER", " never", "never ", "auto", "1", "",
+        "Require", "require ", "Never", "NEVER", " never", "never ", "auto", "1", "",
     ] {
         assert!(
             plan("8388608", None, Some(direct)).is_err(),
@@ -2196,6 +3266,16 @@ fn io_stat_wbytes_parses() {
     // The key ends in a space, so 8:1 never reads the 8:16 line.
     assert_eq!(io_stat_wbytes(stat, 8, 1), 4096);
     assert_eq!(io_stat_wbytes(stat, 8, 16), 999);
+    // The probe's loop_io_stat round trip.
+    let joined = crate::support::probe::joined_lines(stat);
+    assert_eq!(joined.matches(';').count(), 1, "{joined}");
+    let back = joined.replace(';', "\n");
+    for (major, minor) in [(8, 1), (8, 16), (259, 0)] {
+        assert_eq!(
+            io_stat_wbytes(&back, major, minor),
+            io_stat_wbytes(stat, major, minor)
+        );
+    }
     // A line without counters (all zero, measured on CI) reads 0, also
     // with another policy's keys on it.
     assert_eq!(io_stat_wbytes("259:0 \n", 259, 0), 0);

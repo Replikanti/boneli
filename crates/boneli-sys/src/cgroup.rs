@@ -7,6 +7,12 @@
 //! opened once, and every file is reached relative to those descriptors
 //! (`openat`, `mkdirat`, `unlinkat`), so no path is checked and then used
 //! by name (ADR-007, D8).
+//!
+//! Every sandbox cgroup runs a statistics keeper (`crate::keeper`) from the
+//! end of [`Cgroup::create`] until it is killed: a thread that reads the
+//! sandbox's own `memory.stat` every [`crate::STATS_KEEPER_PERIOD`], which
+//! keeps its memory statistics fresh enough for dirty throttling to slow a
+//! buffered writer before `memory.max` OOM-kills it (ADR-007, D8, #54).
 
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -16,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result, errno};
+use crate::keeper::{KeeperReport, StatsKeeper};
 
 /// The controllers every sandbox cgroup is limited by, in the order a
 /// missing one is reported.
@@ -273,7 +280,7 @@ fn check_cgroup2(dir: &OwnedFd, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_file(dir: &OwnedFd, file: &'static str, flags: c_int) -> Result<OwnedFd> {
+pub(crate) fn open_file(dir: &OwnedFd, file: &'static str, flags: c_int) -> Result<OwnedFd> {
     let name = c_name(file);
     // SAFETY: name is NUL-terminated; dir is an open directory.
     let fd = unsafe {
@@ -486,6 +493,10 @@ pub struct Cgroup {
     kill: Option<OwnedFd>,
     events: Option<OwnedFd>,
     live: bool,
+    /// The sandbox's statistics keeper, started as the last step of
+    /// `create` and stopped once the sandbox is killed (ADR-007, D8).
+    /// `None` only in `unplaced()` and while `create` runs.
+    keeper: Option<StatsKeeper>,
 }
 
 /// The cgroups a [`Cgroup`] drop could not remove, for the runner (#8) to
@@ -509,6 +520,14 @@ impl Cgroup {
     /// half-dead pod whose test results mislead; the sandbox may create no
     /// cgroup below its own, because one would keep `destroy` from removing
     /// it (ADR-007, D8). On any error the directory is removed again.
+    ///
+    /// Its last step starts the sandbox's statistics keeper, the thread
+    /// `memcg-keeper`, which reads the cgroup's own `memory.stat` once
+    /// before `create` returns and then every [`crate::STATS_KEEPER_PERIOD`]
+    /// (ADR-007, D8): a file that cannot be read fails with
+    /// [`Error::CgroupFile`], one that reads as empty with
+    /// [`Error::StatsKeeper`], and then the directory is removed as on any
+    /// other error. No sandbox runs without it.
     pub fn create(parent: &Parent, name: &str, limits: &Limits) -> Result<Cgroup> {
         limits.validate()?;
         check_name(name)?;
@@ -553,6 +572,7 @@ impl Cgroup {
             kill: None,
             events: None,
             live: true,
+            keeper: None,
         };
         let mut cg = cg;
         check_cgroup2(&cg.dir, &cg.path)?;
@@ -560,6 +580,8 @@ impl Cgroup {
         cg.check_limits(limits)?;
         cg.kill = Some(open_file(&cg.dir, "cgroup.kill", libc::O_WRONLY)?);
         cg.events = Some(open_file(&cg.dir, "cgroup.events", libc::O_RDONLY)?);
+        // Last, so that a failure drops `cg` and removes the directory.
+        cg.keeper = Some(StatsKeeper::start(&cg.dir)?);
         Ok(cg)
     }
 
@@ -639,6 +661,16 @@ impl Cgroup {
         &self.path
     }
 
+    /// What the sandbox's statistics keeper did so far: its reads, late
+    /// ticks, largest gap, longest read, the thread's CPU time and, once a
+    /// read failed, that read's `errno` (ADR-007, D8). All zero for a value
+    /// without a keeper.
+    pub fn stats_keeper(&self) -> KeeperReport {
+        self.keeper
+            .as_ref()
+            .map_or_else(KeeperReport::default, StatsKeeper::report)
+    }
+
     /// Kills every process in the cgroup (`cgroup.kill`), lifts the IO and
     /// CPU limits so that killed tasks are not held back while they exit
     /// (a task waiting for throttled IO cannot die before its queued bios
@@ -649,6 +681,8 @@ impl Cgroup {
     ///
     /// The kill goes through the `cgroup.kill` descriptor `create` held
     /// open, so the workload cannot block it by changing the file's mode.
+    /// The statistics keeper is stopped and joined right after a
+    /// successful kill (ADR-007, D8), and on a drop otherwise.
     /// The limits are lifted only after the kill succeeded; if it failed,
     /// they stay, there is no wait (nothing would empty the cgroup), and
     /// the removal is still tried. A failed lift never skips the wait or
@@ -673,7 +707,13 @@ impl Cgroup {
             Ok(()) => {
                 // Killed: no task returns to user space, so none can start
                 // new IO or use the CPU it gets now; what is left is in the
-                // kernel. Only now are the limits lifted.
+                // kernel. Only now are the limits lifted. Nothing in the
+                // cgroup dirties pages any more either, so its keeper stops
+                // first, before the lift, the wait and the removal; after a
+                // failed kill it runs on until the drop (ADR-007, D8).
+                if let Some(k) = &self.keeper {
+                    k.stop();
+                }
                 self.lift_throttles(&mut errors);
                 if let Err(e) = self.wait_unpopulated() {
                     errors.push(e);
@@ -811,6 +851,7 @@ impl Cgroup {
             kill: None,
             events: None,
             live: false,
+            keeper: None,
         }
     }
 }
