@@ -467,8 +467,10 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
     no check (D2): Replikanti/boneli#79, filed at #38 STOP 2.
   - Intermediates are not checked (D3):
     Replikanti/boneli#80, filed at #38 STOP 2.
-  - No CRL fetch through a proxy: the `CrlSource` seam, when a customer
-    needs it.
+  - No CRL fetch through a proxy. `boneli-https` has no proxy support
+    for its own connections either, so a host that needs a proxy cannot
+    use the client at all today; this ADR adds no new case. When proxy
+    support lands, the `CrlSource` seam takes a proxy source.
   - Staleness: at most about 48 h after the CA records a revocation while
     refreshes get through, plus 1 h per failed refresh in a row, and up to
     the cached list's `nextUpdate` (238 h measured, 240 h by the BR) while
@@ -482,7 +484,8 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
     `TlsDial`'s request deadline: std's resolver takes no timeout, so a
     resolver whose answers are dropped holds the check for its own
     timeout per URL. It is the same gap `TlsDial` has for its own target,
-    and everything after the lookup is bounded.
+    and everything after the lookup is bounded. Both close in
+    Replikanti/boneli#81.
   - A cold cache adds one fetch per URL per process; a slow fetch could
     outlast a server's idle timeout on the open TLS connection
     (assumption, not measured: servers wait well over the measured 0.59
