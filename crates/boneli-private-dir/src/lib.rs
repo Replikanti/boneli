@@ -125,6 +125,19 @@ fn ancestor_problem(facts: AncestorFacts, uid: u32) -> Option<&'static str> {
     None
 }
 
+/// Why a root owned by `owner` with `mode` is refused for the caller
+/// `uid`, if it is: someone else owns it, or its group or others hold a
+/// permission bit.
+fn root_problem(owner: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    if owner != uid {
+        return Some("must be owned by the caller");
+    }
+    if mode & 0o077 != 0 {
+        return Some("must have no group or other permission bits");
+    }
+    None
+}
+
 /// Checks `dir` and each of its ancestors by [`ancestor_problem`], from
 /// `dir` up, so the deepest offender is reported. `dir` must be resolved,
 /// so the walk sees no symlink.
@@ -219,14 +232,8 @@ pub fn prepare_root(
     if !meta.is_dir() {
         return Err(rule(&resolved, "must be a directory"));
     }
-    if meta.uid() != uid {
-        return Err(rule(&resolved, "must be owned by the caller"));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(rule(
-            &resolved,
-            "must have no group or other permission bits",
-        ));
+    if let Some(reason) = root_problem(meta.uid(), meta.mode(), uid) {
+        return Err(rule(&resolved, reason));
     }
     if let Some(parent) = resolved.parent() {
         check_ancestors(parent, uid)?;
@@ -284,6 +291,15 @@ pub fn create_new_root(
     // mode, not the mode under some umask.
     fs::set_permissions(&prospective, fs::Permissions::from_mode(0o700))
         .map_err(|e| io_err(&prospective, e))?;
+    // A filesystem that ignores `chmod` (vfat with `quiet`, CIFS without
+    // unix extensions) reports success and keeps the mode it made, so the
+    // result is checked as `prepare_root` checks a root (ADR-024, D2).
+    let meta = fs::symlink_metadata(&prospective).map_err(|e| io_err(&prospective, e))?;
+    if let Some(reason) = root_problem(meta.uid(), meta.mode(), uid) {
+        // Made by this call and still empty.
+        let _ = fs::remove_dir(&prospective);
+        return Err(rule(&prospective, reason));
+    }
     Ok(prospective)
 }
 
@@ -309,6 +325,33 @@ mod tests {
             owner,
             mode,
             is_fs_root,
+        }
+    }
+
+    /// The root rule, which `create_new_root` applies to the root it made
+    /// because a filesystem may ignore `chmod` (ADR-024, D2).
+    #[test]
+    fn root_problem_table() {
+        let owner = Some("must be owned by the caller");
+        let bits = Some("must have no group or other permission bits");
+        let rows: &[(u32, u32, Option<&str>)] = &[
+            (ME, DIR | 0o700, None),
+            (ME, DIR | 0o1700, None),
+            (ME, DIR | 0o755, bits),
+            (ME, DIR | 0o740, bits),
+            (ME, DIR | 0o701, bits),
+            (ME, DIR | 0o710, bits),
+            (ME, DIR | 0o704, bits),
+            (OTHER, DIR | 0o700, owner),
+            (0, DIR | 0o700, owner),
+            (OVERFLOW, DIR | 0o755, owner),
+        ];
+        for &(owner_uid, mode, want) in rows {
+            assert_eq!(
+                root_problem(owner_uid, mode, ME),
+                want,
+                "owner {owner_uid} mode {mode:o}"
+            );
         }
     }
 

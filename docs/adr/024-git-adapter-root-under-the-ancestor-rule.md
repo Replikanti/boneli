@@ -70,9 +70,15 @@ It runs, in this order, with the reason texts of `prepare_root`:
 9. one non-recursive `mkdir` with mode `0o700` there; `EEXIST` is `Io`
    of kind `AlreadyExists` at the prospective root;
 10. an explicit `chmod 0o700`;
-11. the prospective root is returned.
+11. the new root is read back without following a link and must pass the
+    root rule of `prepare_root` (owned by the caller, no group or other
+    permission bits); otherwise it is removed and the call is a `Rule`
+    error. A filesystem that ignores `chmod` (vfat mounted with `quiet`,
+    CIFS without unix extensions) reports success and keeps a mode such
+    as `0o755`, which would let every local user read the stores;
+12. the prospective root is returned.
 
-There is no re-check after `mkdir`: in a parent that passed the rule,
+Nothing is re-checked beyond step 11: in a parent that passed the rule,
 only root or the caller can rename the new entry. `prepare_root` and
 `create` are unchanged, so `boneli-oci` and `boneli-store-fs` see no
 change.

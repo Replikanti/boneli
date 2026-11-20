@@ -609,7 +609,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ADR-021 for a root that must not exist yet. The parent is resolved and
   checked with every ancestor, and the root is made by one non-recursive
   `mkdir` at the resolved parent, mode `0o700` whatever the umask; a root
-  that exists in any form is `Io` with kind `AlreadyExists`.
+  that exists in any form is `Io` with kind `AlreadyExists`. The new root
+  is read back and removed with a `Rule` error when it is not the
+  caller's or keeps group or other bits, as on a filesystem that ignores
+  `chmod`.
 - `boneli_git_cli::OpenError::Root` (#85, ADR-024): a root, or one of its
   ancestors, that breaks a root rule.
 
