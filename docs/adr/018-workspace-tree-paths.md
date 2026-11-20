@@ -125,9 +125,15 @@ that holds all three classes.
   is not UTF-8 is read twice: once with every maximal run of invalid bytes
   removed, and once with each such run replaced by `.`. Either reading
   that is `.git` refuses. Removal covers a file system that drops what it
-  cannot decode (`.g<0xFF>it`); `.` covers one that decodes overlong
-  sequences, where the overlong `.` is `<0xC0 0xAE>`, two invalid bytes,
+  cannot decode (`.g<0xFF>it`); `.` covers an invalid run that stands
+  for the dot, such as the overlong `.` `<0xC0 0xAE>`, two invalid bytes,
   so removal alone would read `<0xC0 0xAE>git` as `git` and miss it.
+  Neither reading decodes overlong sequences in general: an overlong
+  letter (`.<0xC1 0xA7>it`, or `.git` overlong throughout) passes, as it
+  passes git's own byte check. A full decoder is not added because the
+  runner writes to Linux file systems, which store such names as bytes
+  and do not decode them to `.git` (an assumption, not a measurement; a
+  host that breaks it needs a decoder here first).
 - **Over-refusal** costs nothing observed: in this repository's tree at
   `14e3869` the only name either widening reads differently is
   `a\b.txt`, whose parts `a` and `b.txt` are content. This is ADR-010

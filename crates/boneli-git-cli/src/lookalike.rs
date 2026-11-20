@@ -28,8 +28,11 @@
 //!   every maximal run of bytes that are not UTF-8 removed and once with
 //!   each such run replaced by `.`, and either reading that is `.git`
 //!   refuses. Removal covers a file system that drops the bytes it cannot
-//!   decode (`.g<0xFF>it`); `.` covers one that decodes an overlong
-//!   sequence, where `<0xC0 0xAE>` is `.` and `<0xC0 0xAE>git` is `.git`.
+//!   decode (`.g<0xFF>it`); `.` covers an invalid run that stands for
+//!   the dot, such as the overlong `.` in `<0xC0 0xAE>git`. This is not
+//!   an overlong decoder: an overlong letter (`.<0xC1 0xA7>it`) folds to
+//!   neither reading and passes, as it passes git's byte check. ADR-018
+//!   D3 records why that is accepted.
 
 /// Unicode `Default_Ignorable_Code_Point`, as inclusive ranges, merged
 /// from DerivedCoreProperties.txt of Unicode 18.0.0.
