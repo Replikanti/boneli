@@ -29,7 +29,9 @@ allow = [
 # The TLS stack of boneli-https (ADR-005). Exceptions are by crate name, not
 # version: a license that changes in an update still fails unless it is
 # listed here. ISC, BSD-3-Clause and CDLA-Permissive-2.0 are permissive and
-# compatible with Apache-2.0; binary releases ship their notices (#22).
+# compatible with Apache-2.0; binary releases ship their notices: every
+# license, copying and notice file of every bundled crate, verbatim, from
+# tools/third-party-notices.sh (ADR-019, D4).
 exceptions = [
     # boneli-https -> rustls -> ring: Apache-2.0 AND ISC (BoringSSL code).
     { crate = "ring", allow = ["ISC"] },

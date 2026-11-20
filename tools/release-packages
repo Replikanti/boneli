@@ -1,0 +1,4 @@
+# Packages a release ships, one per line: each must be a workspace member
+# with a binary target, and never a test or tool root (tools/release-check.sh,
+# docs/release.md). The runner (#33) and the CLI (#32) join when they exist.
+boneli-egress
