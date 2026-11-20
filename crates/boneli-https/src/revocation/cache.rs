@@ -96,6 +96,48 @@ impl Entry {
     }
 }
 
+/// Where a cached answer stands at `now` (ADR-017, item 8; ADR-019):
+/// the one rule both caches use. All times are Unix seconds and every sum
+/// saturates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Window {
+    /// At or past `nextUpdate`: never used again.
+    Expired,
+    /// `confirmed_at <= now < confirmed_at + max_age`: used without a
+    /// fetch.
+    Fresh,
+    /// Past its maximum age, and a refresh was claimed less than `retry`
+    /// ago (`claimed_at <= now`): used without a fetch.
+    Waiting,
+    /// Past its maximum age with no claim waiting: the caller claims the
+    /// refresh and fetches. A clock moved back before `confirmed_at` or
+    /// `claimed_at` lands here too, never in a longer `Fresh`.
+    Claim,
+}
+
+/// The window of an answer confirmed at `confirmed_at`, valid until
+/// `next_update` (exclusive), whose last refresh was claimed at
+/// `claimed_at`.
+pub(crate) fn window(
+    now: u64,
+    confirmed_at: u64,
+    claimed_at: Option<u64>,
+    next_update: u64,
+    max_age: u64,
+    retry: u64,
+) -> Window {
+    if next_update <= now {
+        return Window::Expired;
+    }
+    if confirmed_at <= now && now < confirmed_at.saturating_add(max_age) {
+        return Window::Fresh;
+    }
+    if claimed_at.is_some_and(|at| at <= now && now < at.saturating_add(retry)) {
+        return Window::Waiting;
+    }
+    Window::Claim
+}
+
 /// What the cache says about a URL at a time. The verifiers are all lists
 /// the entry holds; a leaf is checked against each.
 #[derive(Clone, Debug)]
@@ -179,19 +221,24 @@ impl CrlCache {
             return Lookup::Missing;
         }
         entry.last_used = tick;
-        let fresh =
-            entry.confirmed_at <= now && now < entry.confirmed_at.saturating_add(CRL_MAX_AGE_SECS);
-        if fresh {
-            return Lookup::Fresh(entry.verifiers());
+        // Every list left is before its `nextUpdate`, so the window is
+        // never `Expired` here.
+        let next_update = entry.lists.iter().map(|l| l.next_update).max().unwrap_or(0);
+        match window(
+            now,
+            entry.confirmed_at,
+            entry.claimed_at,
+            next_update,
+            CRL_MAX_AGE_SECS,
+            CRL_REFRESH_RETRY_SECS,
+        ) {
+            Window::Fresh => Lookup::Fresh(entry.verifiers()),
+            Window::Waiting => Lookup::Stale(entry.verifiers()),
+            Window::Claim | Window::Expired => {
+                entry.claimed_at = Some(now);
+                Lookup::Refresh(entry.verifiers(), entry.this_update)
+            }
         }
-        let waiting = entry
-            .claimed_at
-            .is_some_and(|at| at <= now && now < at.saturating_add(CRL_REFRESH_RETRY_SECS));
-        if waiting {
-            return Lookup::Stale(entry.verifiers());
-        }
-        entry.claimed_at = Some(now);
-        Lookup::Refresh(entry.verifiers(), entry.this_update)
     }
 
     /// Stores the list of `entry`, which settled a leaf, by the insert

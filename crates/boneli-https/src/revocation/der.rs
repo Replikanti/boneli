@@ -1,11 +1,17 @@
-//! A DER reader for the two things webpki parses but keeps to itself
-//! (ADR-017, item 9): the CRL distribution points of a certificate and the
-//! `thisUpdate` and `nextUpdate` of a CRL.
+//! A DER reader for the things webpki parses but keeps to itself (ADR-017,
+//! item 9): the CRL distribution points of a certificate and the
+//! `thisUpdate` and `nextUpdate` of a CRL; and, for OCSP (ADR-019), the
+//! responder URLs of a certificate, the parts of a public key, and the
+//! reader and encoder `ocsp` builds its request and parses its response
+//! with.
 //!
-//! Both functions read only bytes webpki has accepted already: the leaf
-//! after the handshake verified it, the CRL after `build()` parsed it. A
-//! misparse here can therefore refuse a valid certificate or miss a point,
-//! but never accept a certificate a CRL lists: webpki decides that.
+//! The certificate and CRL functions read only bytes webpki has accepted
+//! already: the leaf after the handshake verified it, the CRL after
+//! `build()` parsed it. A misparse there can therefore refuse a valid
+//! certificate or miss a point, but never accept a certificate a CRL
+//! lists: webpki decides that. The OCSP response is different: its parse
+//! decides (ADR-019), so `ocsp::response` reads it with this reader
+//! strictly and checks its signature over the raw bytes.
 //!
 //! Definite lengths only, in their minimal encoding, at most four length
 //! bytes; low tag numbers only. No index can panic: every slice comes from
@@ -23,52 +29,61 @@ impl fmt::Display for DerError {
     }
 }
 
-const SEQUENCE: u8 = 0x30;
-const INTEGER: u8 = 0x02;
-const BOOLEAN: u8 = 0x01;
-const BIT_STRING: u8 = 0x03;
-const OCTET_STRING: u8 = 0x04;
-const OID: u8 = 0x06;
+pub(crate) const SEQUENCE: u8 = 0x30;
+pub(crate) const INTEGER: u8 = 0x02;
+pub(crate) const BOOLEAN: u8 = 0x01;
+pub(crate) const BIT_STRING: u8 = 0x03;
+pub(crate) const OCTET_STRING: u8 = 0x04;
+pub(crate) const NULL: u8 = 0x05;
+pub(crate) const OID: u8 = 0x06;
+pub(crate) const ENUMERATED: u8 = 0x0A;
 const UTC_TIME: u8 = 0x17;
-const GENERALIZED_TIME: u8 = 0x18;
+pub(crate) const GENERALIZED_TIME: u8 = 0x18;
 /// `[0]` constructed: the certificate version, a distribution point's
-/// name, and `fullName` inside it.
-const CONTEXT_0: u8 = 0xA0;
-/// `[1]` constructed: `nameRelativeToCRLIssuer`.
-const CONTEXT_1: u8 = 0xA1;
+/// name, `fullName` inside it; in OCSP, `responseBytes`, a version, the
+/// certificates of a response and `nextUpdate`.
+pub(crate) const CONTEXT_0: u8 = 0xA0;
+/// `[1]` constructed: `nameRelativeToCRLIssuer`; in OCSP, a responder ID
+/// by name, a revoked status and extensions.
+pub(crate) const CONTEXT_1: u8 = 0xA1;
 /// `[1]` and `[2]` primitive: the unique IDs of a certificate, and
 /// `reasons` of a distribution point (`[1]`, a BIT STRING).
 const CONTEXT_1_PRIMITIVE: u8 = 0x81;
 const CONTEXT_2_PRIMITIVE: u8 = 0x82;
-/// `[2]` constructed: a distribution point's `cRLIssuer`.
-const CONTEXT_2: u8 = 0xA2;
+/// `[2]` constructed: a distribution point's `cRLIssuer`; in OCSP, a
+/// responder ID by key hash.
+pub(crate) const CONTEXT_2: u8 = 0xA2;
 /// `[3]` constructed: the extensions of a certificate.
 const CONTEXT_3: u8 = 0xA3;
 /// `uniformResourceIdentifier [6] IA5String`, implicitly tagged.
 const URI: u8 = 0x86;
 /// id-ce-cRLDistributionPoints, 2.5.29.31.
 const CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1D, 0x1F];
+/// id-pe-authorityInfoAccess, 1.3.6.1.5.5.7.1.1.
+const AUTHORITY_INFO_ACCESS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
+/// id-ad-ocsp, 1.3.6.1.5.5.7.48.1.
+const AD_OCSP: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
 
 /// A cursor over DER bytes.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     data: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Reader<'a> {
         Reader { data }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    fn peek(&self) -> Option<u8> {
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.data.first().copied()
     }
 
     /// The next tag and value.
-    fn read(&mut self) -> Result<(u8, &'a [u8]), DerError> {
+    pub(crate) fn read(&mut self) -> Result<(u8, &'a [u8]), DerError> {
         let (&tag, rest) = self.data.split_first().ok_or(DerError("truncated"))?;
         if tag & 0x1F == 0x1F {
             return Err(DerError("high tag number"));
@@ -102,7 +117,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The value of the next element, which must have `tag`.
-    fn expect(&mut self, tag: u8) -> Result<&'a [u8], DerError> {
+    pub(crate) fn expect(&mut self, tag: u8) -> Result<&'a [u8], DerError> {
         match self.read()? {
             (t, value) if t == tag => Ok(value),
             _ => Err(DerError("unexpected tag")),
@@ -110,7 +125,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The value of the next element if it has `tag`.
-    fn optional(&mut self, tag: u8) -> Result<Option<&'a [u8]>, DerError> {
+    pub(crate) fn optional(&mut self, tag: u8) -> Result<Option<&'a [u8]>, DerError> {
         if self.peek() == Some(tag) {
             return self.expect(tag).map(Some);
         }
@@ -118,23 +133,34 @@ impl<'a> Reader<'a> {
     }
 
     /// Nothing may follow.
-    fn finish(&self) -> Result<(), DerError> {
+    pub(crate) fn finish(&self) -> Result<(), DerError> {
         if self.is_empty() {
             Ok(())
         } else {
             Err(DerError("trailing bytes"))
         }
     }
+
+    /// The next element with `tag`, whole: tag, length and value. For
+    /// bytes a signature covers exactly as they arrived.
+    pub(crate) fn expect_tlv(&mut self, tag: u8) -> Result<&'a [u8], DerError> {
+        let before = self.data;
+        self.expect(tag)?;
+        let used = before.len() - self.data.len();
+        before
+            .split_at_checked(used)
+            .map(|(whole, _)| whole)
+            .ok_or(DerError("truncated"))
+    }
 }
 
-/// The `uniformResourceIdentifier` names of the certificate's CRL
-/// distribution points, in certificate order, from every point whose
-/// `distributionPoint` is a `fullName` and that has neither `reasons` nor
-/// `cRLIssuer` (ADR-017, item 3). Other name types and
-/// `nameRelativeToCRLIssuer` are skipped, as webpki's `authoritative_for`
-/// skips them. No extension gives an empty list; a second
-/// cRLDistributionPoints extension is an error.
-pub(crate) fn distribution_point_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerError> {
+/// The value of the certificate's extension `id`; `None` when it has
+/// none. A second extension with that id is the error `duplicate`.
+fn extension<'a>(
+    cert: &'a [u8],
+    id: &[u8],
+    duplicate: &'static str,
+) -> Result<Option<&'a [u8]>, DerError> {
     let mut outer = Reader::new(cert);
     let certificate = outer.expect(SEQUENCE)?;
     outer.finish()?;
@@ -155,7 +181,7 @@ pub(crate) fn distribution_point_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerErro
     tbs.optional(CONTEXT_2_PRIMITIVE)?; // subjectUniqueID
     let Some(extensions) = tbs.optional(CONTEXT_3)? else {
         tbs.finish()?;
-        return Ok(Vec::new());
+        return Ok(None);
     };
     tbs.finish()?;
 
@@ -166,21 +192,110 @@ pub(crate) fn distribution_point_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerErro
     let mut found: Option<&[u8]> = None;
     while !extensions.is_empty() {
         let mut extension = Reader::new(extensions.expect(SEQUENCE)?);
-        let id = extension.expect(OID)?;
+        let oid = extension.expect(OID)?;
         extension.optional(BOOLEAN)?; // critical
         let value = extension.expect(OCTET_STRING)?;
         extension.finish()?;
-        if id == CRL_DISTRIBUTION_POINTS {
+        if oid == id {
             if found.is_some() {
-                return Err(DerError("two cRLDistributionPoints extensions"));
+                return Err(DerError(duplicate));
             }
             found = Some(value);
         }
     }
-    match found {
+    Ok(found)
+}
+
+/// The `uniformResourceIdentifier` names of the certificate's CRL
+/// distribution points, in certificate order, from every point whose
+/// `distributionPoint` is a `fullName` and that has neither `reasons` nor
+/// `cRLIssuer` (ADR-017, item 3). Other name types and
+/// `nameRelativeToCRLIssuer` are skipped, as webpki's `authoritative_for`
+/// skips them. No extension gives an empty list; a second
+/// cRLDistributionPoints extension is an error.
+pub(crate) fn distribution_point_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerError> {
+    match extension(
+        cert,
+        CRL_DISTRIBUTION_POINTS,
+        "two cRLDistributionPoints extensions",
+    )? {
         Some(value) => points(value),
         None => Ok(Vec::new()),
     }
+}
+
+/// The `uniformResourceIdentifier` locations of the certificate's
+/// `id-ad-ocsp` access descriptions, in certificate order (ADR-019, item
+/// 1). Other access methods (`caIssuers`) and other location types
+/// (`directoryName`) are skipped, but read, so that a malformed one is an
+/// error wherever it sits. No extension gives an empty list; a second
+/// authorityInfoAccess extension is an error.
+pub(crate) fn ocsp_responder_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerError> {
+    let Some(value) = extension(
+        cert,
+        AUTHORITY_INFO_ACCESS,
+        "two authorityInfoAccess extensions",
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    // AuthorityInfoAccessSyntax ::= SEQUENCE SIZE (1..MAX) OF
+    // AccessDescription; AccessDescription ::= SEQUENCE { accessMethod
+    // OBJECT IDENTIFIER, accessLocation GeneralName }.
+    let mut wrapper = Reader::new(value);
+    let descriptions = wrapper.expect(SEQUENCE)?;
+    wrapper.finish()?;
+    let mut descriptions = Reader::new(descriptions);
+    let mut uris = Vec::new();
+    while !descriptions.is_empty() {
+        let mut description = Reader::new(descriptions.expect(SEQUENCE)?);
+        let method = description.expect(OID)?;
+        let (tag, location) = description.read()?;
+        description.finish()?;
+        if method == AD_OCSP && tag == URI {
+            uris.push(location);
+        }
+    }
+    Ok(uris)
+}
+
+/// The algorithm (the content of its AlgorithmIdentifier) and the key bits
+/// (the BIT STRING without its unused-bits byte, which must be 0) of a
+/// whole `SubjectPublicKeyInfo`: what webpki compares and verifies with.
+pub(crate) fn spki_parts(spki: &[u8]) -> Result<(&[u8], &[u8]), DerError> {
+    let mut outer = Reader::new(spki);
+    let mut inner = Reader::new(outer.expect(SEQUENCE)?);
+    outer.finish()?;
+    let algorithm = inner.expect(SEQUENCE)?;
+    let bits = inner.expect(BIT_STRING)?;
+    inner.finish()?;
+    match bits.split_first() {
+        Some((0, key)) => Ok((algorithm, key)),
+        _ => Err(DerError("a key with unused bits")),
+    }
+}
+
+/// A GeneralizedTime value as Unix seconds, by the rules of `time`.
+pub(crate) fn generalized_time(value: &[u8]) -> Result<u64, DerError> {
+    time(GENERALIZED_TIME, value)
+}
+
+/// One element in DER: `tag`, the minimal length, `value`.
+pub(crate) fn encode(tag: u8, value: &[u8]) -> Vec<u8> {
+    let len = value.len();
+    let mut out = Vec::with_capacity(value.len() + 6);
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|b| **b == 0).count();
+        let significant = &bytes[skip..];
+        out.push(0x80 | significant.len() as u8);
+        out.extend_from_slice(significant);
+    }
+    out.extend_from_slice(value);
+    out
 }
 
 /// `CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint`.
@@ -407,6 +522,15 @@ mod tests {
         assert!(next < this);
     }
 
+    /// Leaves with an authorityInfoAccess extension (ADR-019).
+    const AIA_CERTS: [&[u8]; 5] = [
+        include_bytes!("../../tests/data/ocsp-good.pem"),
+        include_bytes!("../../tests/data/ocsp-three-urls.pem"),
+        include_bytes!("../../tests/data/ocsp-ldap-only.pem"),
+        include_bytes!("../../tests/data/ocsp-and-crl.pem"),
+        include_bytes!("../../tests/data/capture-e36-chain.pem"),
+    ];
+
     #[test]
     fn every_truncation_is_an_error() {
         for pem in CERTS {
@@ -415,6 +539,16 @@ mod tests {
             for len in 0..cert.len() {
                 assert!(
                     distribution_point_uris(&cert[..len]).is_err(),
+                    "prefix of {len} bytes"
+                );
+            }
+        }
+        for pem in AIA_CERTS {
+            let cert = der(pem);
+            assert!(!ocsp_responder_uris(&cert).expect("whole").is_empty());
+            for len in 0..cert.len() {
+                assert!(
+                    ocsp_responder_uris(&cert[..len]).is_err(),
                     "prefix of {len} bytes"
                 );
             }
@@ -435,6 +569,14 @@ mod tests {
                 let mut flipped = cert.clone();
                 flipped[i] ^= 1 << bit;
                 let _ = distribution_point_uris(&flipped);
+            }
+        }
+        let cert = der(include_bytes!("../../tests/data/ocsp-good.pem"));
+        for i in 0..cert.len() {
+            for bit in 0..8 {
+                let mut flipped = cert.clone();
+                flipped[i] ^= 1 << bit;
+                let _ = ocsp_responder_uris(&flipped);
             }
         }
         let crl = CRLS[0];
@@ -557,6 +699,144 @@ mod tests {
         let mut trailing = one.clone();
         trailing.push(0);
         assert!(distribution_point_uris(&trailing).is_err());
+    }
+
+    /// An authorityInfoAccess extension with these access descriptions,
+    /// each a method OID and a whole GeneralName.
+    fn aia_extension(descriptions: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+        let body: Vec<u8> = descriptions
+            .iter()
+            .flat_map(|(method, location)| {
+                let mut d = tlv(OID, method);
+                d.extend_from_slice(location);
+                tlv(SEQUENCE, &d)
+            })
+            .collect();
+        let mut ext = tlv(OID, AUTHORITY_INFO_ACCESS);
+        ext.extend(tlv(OCTET_STRING, &tlv(SEQUENCE, &body)));
+        tlv(SEQUENCE, &ext)
+    }
+
+    const AD_CA_ISSUERS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+
+    #[test]
+    fn ocsp_uris_of_fixtures() {
+        let uris = |pem: &[u8]| -> Vec<String> {
+            ocsp_responder_uris(&der(pem))
+                .expect("AIA")
+                .into_iter()
+                .map(|u| String::from_utf8(u.to_vec()).expect("ASCII"))
+                .collect()
+        };
+        // caIssuers comes first in this leaf and is skipped.
+        assert_eq!(
+            uris(include_bytes!("../../tests/data/ocsp-good.pem")),
+            ["http://ocsp.boneli.test"]
+        );
+        assert_eq!(
+            uris(include_bytes!("../../tests/data/ocsp-three-urls.pem")),
+            [
+                "http://ocsp1.boneli.test",
+                "http://ocsp2.boneli.test/",
+                "http://ocsp3.boneli.test"
+            ]
+        );
+        assert_eq!(
+            uris(include_bytes!("../../tests/data/capture-e36-chain.pem")),
+            ["http://ocsp.sectigo.com"]
+        );
+        assert!(uris(include_bytes!("../../tests/data/crl-good.pem")).is_empty());
+    }
+
+    #[test]
+    fn duplicate_aia_extension_is_error() {
+        let ocsp = |uri: &[u8]| aia_extension(&[(AD_OCSP, tlv(URI, uri))]);
+        let one = cert_with(&[ocsp(b"http://a/")]);
+        assert_eq!(ocsp_responder_uris(&one), Ok(vec![b"http://a/".as_slice()]));
+        let two = cert_with(&[ocsp(b"http://a/"), ocsp(b"http://b/")]);
+        assert_eq!(
+            ocsp_responder_uris(&two),
+            Err(DerError("two authorityInfoAccess extensions"))
+        );
+    }
+
+    #[test]
+    fn aia_non_uri_location_skipped() {
+        // directoryName [4] holding a Name, then a URI.
+        let name = tlv(0xA4, &tlv(SEQUENCE, &[]));
+        let cert = cert_with(&[aia_extension(&[
+            (AD_OCSP, name),
+            (AD_OCSP, tlv(URI, b"http://b/")),
+        ])]);
+        assert_eq!(
+            ocsp_responder_uris(&cert),
+            Ok(vec![b"http://b/".as_slice()])
+        );
+        // A malformed location is an error even where it would be skipped.
+        let broken = cert_with(&[aia_extension(&[(AD_OCSP, vec![0xA4, 0x05, 0x30])])]);
+        assert!(ocsp_responder_uris(&broken).is_err());
+    }
+
+    #[test]
+    fn aia_ca_issuers_only_has_no_ocsp() {
+        let cert = cert_with(&[aia_extension(&[(
+            AD_CA_ISSUERS,
+            tlv(URI, b"http://ca.example/ca.der"),
+        )])]);
+        assert_eq!(ocsp_responder_uris(&cert), Ok(Vec::new()));
+        // No extension at all.
+        assert_eq!(ocsp_responder_uris(&cert_with(&[])), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn spki_parts_of_fixture() {
+        let ca = der(include_bytes!("../../tests/data/ocsp-ca.pem"));
+        let cert = rustls::pki_types::CertificateDer::from(ca);
+        let ee = webpki::EndEntityCert::try_from(&cert).expect("cert");
+        let spki = ee.subject_public_key_info();
+        let (alg, key) = spki_parts(spki.as_ref()).expect("SPKI");
+        // id-ecPublicKey with prime256v1; an uncompressed point.
+        assert_eq!(
+            alg,
+            [
+                0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A, 0x86, 0x48,
+                0xCE, 0x3D, 0x03, 0x01, 0x07
+            ]
+        );
+        assert_eq!((key.len(), key[0]), (65, 0x04));
+        let mut unused = spki.as_ref().to_vec();
+        let at = unused.len() - 66;
+        unused[at] = 1;
+        assert!(spki_parts(&unused).is_err());
+    }
+
+    #[test]
+    fn encode_uses_minimal_lengths() {
+        assert_eq!(encode(OCTET_STRING, &[]), [0x04, 0x00]);
+        assert_eq!(encode(OCTET_STRING, &[0; 0x7F])[..2], [0x04, 0x7F]);
+        assert_eq!(encode(OCTET_STRING, &[0; 0x80])[..3], [0x04, 0x81, 0x80]);
+        assert_eq!(
+            encode(OCTET_STRING, &[0; 0x100])[..4],
+            [0x04, 0x82, 0x01, 0x00]
+        );
+        for len in [0, 1, 0x7F, 0x80, 0xFF, 0x100, 0x1_0000] {
+            let value = vec![7u8; len];
+            let encoded = encode(OCTET_STRING, &value);
+            let mut reader = Reader::new(&encoded);
+            assert_eq!(reader.read(), Ok((OCTET_STRING, value.as_slice())), "{len}");
+            assert!(reader.is_empty());
+        }
+    }
+
+    #[test]
+    fn expect_tlv_returns_the_whole_element() {
+        let mut bytes = encode(SEQUENCE, &encode(INTEGER, &[5]));
+        bytes.extend(encode(NULL, &[]));
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.expect_tlv(SEQUENCE), Ok(&bytes[..5]));
+        assert_eq!(reader.expect_tlv(NULL), Ok(&bytes[5..]));
+        assert!(reader.is_empty());
+        assert!(Reader::new(&bytes).expect_tlv(NULL).is_err());
     }
 
     fn utc(text: &str) -> Result<u64, DerError> {
