@@ -111,7 +111,10 @@ namespaces; and `open` can remove every temporary file without judging
 whether its owner is alive, the part of `boneli-oci` that took three
 review rounds on #60. Weak spot: `flock` is advisory and may be emulated
 or missing on network filesystems, which are not supported (D7); two
-runners need two roots.
+runners need two roots. Released by the close alone, the lock outlived a
+dropped store while a child spawned by another thread held a copy of its
+description between fork and exec; ADR-026 releases it by an explicit
+unlock.
 
 ### D2. Names
 

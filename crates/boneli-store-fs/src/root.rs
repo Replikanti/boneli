@@ -79,9 +79,44 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
     }
 }
 
+/// The store's exclusive lock on `<root>/lock` (ADR-012, D1), released by an
+/// explicit unlock when it drops, not by the close alone (ADR-026). `flock`
+/// belongs to the open file description, and a child process spawned by any
+/// thread holds a copy of that description from fork until exec (the file
+/// is `O_CLOEXEC`, so exec closes it). A close while such a copy lives
+/// leaves the lock held, and a reopen gets `InUse`; an unlock acts on the
+/// description, so it releases the lock whatever copies exist (#94).
+#[derive(Debug)]
+pub(crate) struct StoreLock(File);
+
+impl StoreLock {
+    /// Takes the lock on `file` at `path` without waiting: `InUse` while
+    /// another store, in this process or another, holds it.
+    fn acquire(file: File, path: &Path) -> Result<StoreLock, OpenError> {
+        match file.try_lock() {
+            Ok(()) => Ok(StoreLock(file)),
+            Err(TryLockError::WouldBlock) => Err(OpenError::InUse {
+                path: path.to_path_buf(),
+            }),
+            Err(TryLockError::Error(e)) => Err(io_err(path, e)),
+        }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // An error is ignored: the close that follows still releases the
+        // lock when no child holds a copy, and a drop has no caller to
+        // report to.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Checks the root, takes the lock, prepares the directories and sweeps
-/// them; returns the resolved root and the locked file.
-pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
+/// them; returns the resolved root and the lock. The lock is a
+/// [`StoreLock`] from the moment it is taken, so every error after that
+/// unlocks it too.
+pub(crate) fn open(root: &Path) -> Result<(PathBuf, StoreLock), OpenError> {
     // No rule of its own on the root's text: no mount option is built
     // from it.
     let resolved = boneli_private_dir::prepare_root(root, &|_| Ok(())).map_err(root_err)?;
@@ -102,11 +137,7 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
             reason: "the lock must be a regular file",
         });
     }
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err(OpenError::InUse { path: lock_path }),
-        Err(TryLockError::Error(e)) => return Err(io_err(&lock_path, e)),
-    }
+    let lock = StoreLock::acquire(lock, &lock_path)?;
 
     let runs = resolved.join(RUNS);
     let evidence = resolved.join(EVIDENCE);
@@ -122,4 +153,140 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
         sync_dir(dir).map_err(|e| io_err(dir, e))?;
     }
     Ok((resolved, lock))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::process::{Child, Command, Stdio};
+
+    /// Test-only access to the locked file: a copy of its description for
+    /// a child to hold, and its descriptor for `/proc/self/fdinfo`.
+    impl StoreLock {
+        fn try_clone(&self) -> io::Result<File> {
+            self.0.try_clone()
+        }
+    }
+
+    impl AsRawFd for StoreLock {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+
+    /// A fresh directory under the system temporary directory, removed on
+    /// drop; the store root is `store` in it.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir()
+                .join(format!("boneli-store-fs-root-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch dir");
+            // Resolved, because `open` refuses a root with dot components
+            // (ADR-012 D1) and `TMPDIR` may hold some.
+            Scratch(dir.canonicalize().expect("resolve the scratch dir"))
+        }
+
+        fn root(&self) -> PathBuf {
+            self.0.join("store")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A child process that holds a copy of the lock's open file
+    /// description as its stdin, as every child does between fork and
+    /// exec; killed and reaped on drop, also when the test panics.
+    struct Holder(Child);
+
+    impl Holder {
+        fn spawn(copy: File) -> Holder {
+            let child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::from(copy))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn sleep");
+            Holder(child)
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A store dropped while a child holds a copy of its lock description
+    /// leaves the root openable: the drop releases the lock itself, not
+    /// only its own descriptor (#94).
+    #[test]
+    fn unlock_on_drop_releases_while_a_child_holds_a_copy() {
+        let scratch = Scratch::new("unlock-on-drop");
+        let (_, lock) = open(&scratch.root()).expect("open");
+        let _holder = Holder::spawn(lock.try_clone().expect("dup the lock"));
+        drop(lock);
+        let reopened = open(&scratch.root());
+        assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
+
+    /// While the store lives, a child's copy changes nothing: a second
+    /// `open` is `InUse`.
+    #[test]
+    fn live_store_stays_locked_with_a_child_copy() {
+        let scratch = Scratch::new("live-locked");
+        let (resolved, lock) = open(&scratch.root()).expect("open");
+        let _holder = Holder::spawn(lock.try_clone().expect("dup the lock"));
+        match open(&scratch.root()) {
+            Err(OpenError::InUse { path }) => assert_eq!(path, resolved.join(LOCK)),
+            other => panic!("a second open gave {other:?}"),
+        }
+        drop(lock);
+    }
+
+    /// The lock descriptor is `O_CLOEXEC` (octal 02000000 in the `flags:`
+    /// line of `/proc/self/fdinfo`), so a child's copy lives only from
+    /// fork to exec, also after a crash of the store's process (ADR-026).
+    #[test]
+    fn lock_file_is_close_on_exec() {
+        let scratch = Scratch::new("cloexec");
+        let (_, lock) = open(&scratch.root()).expect("open");
+        let info =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", lock.as_raw_fd())).expect("fdinfo");
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .expect("a flags line");
+        let flags = u32::from_str_radix(flags.trim(), 8).expect("octal flags");
+        assert_ne!(flags & 0o2000000, 0, "flags {flags:o}");
+    }
+
+    /// An `open` that fails after it took the lock (here `runs` is a
+    /// symlink) releases it: the root opens once the symlink is gone.
+    #[test]
+    fn failed_open_leaves_the_root_openable() {
+        let scratch = Scratch::new("failed-open");
+        let root = scratch.root();
+        drop(open(&root).expect("open"));
+        let elsewhere = scratch.0.join("elsewhere");
+        fs::create_dir(&elsewhere).expect("dir");
+        fs::remove_dir(root.join(RUNS)).expect("remove runs");
+        std::os::unix::fs::symlink(&elsewhere, root.join(RUNS)).expect("symlink");
+        match open(&root) {
+            Err(OpenError::Root { .. }) => {}
+            other => panic!("a symlinked runs gave {other:?}"),
+        }
+        fs::remove_file(root.join(RUNS)).expect("remove the symlink");
+        let reopened = open(&root);
+        assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
 }

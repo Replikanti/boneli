@@ -91,8 +91,9 @@ impl std::error::Error for OpenError {
 #[derive(Debug)]
 pub struct FsStore {
     root: PathBuf,
-    /// The exclusive lock on `<root>/lock`, released when the store drops.
-    _lock: File,
+    /// The exclusive lock on `<root>/lock`, released when the store drops,
+    /// by an explicit unlock (ADR-026).
+    _lock: root::StoreLock,
     log_lock: Mutex<()>,
     next_temp: AtomicU64,
 }

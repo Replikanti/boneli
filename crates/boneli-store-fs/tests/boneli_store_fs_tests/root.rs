@@ -6,6 +6,7 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+use boneli_app::Evidence;
 use boneli_store_fs::{FsStore, OpenError};
 
 use crate::support::{TempDir, names_in};
@@ -274,4 +275,52 @@ fn temp_leftovers_swept_on_open() {
         );
     }
     drop(store);
+}
+
+/// A reopen does not fail while another thread of the process spawns
+/// processes: a child holds a copy of every descriptor from fork to exec,
+/// the lock's included, and the drop must release the lock anyway (#94,
+/// ADR-026). Probabilistic before the fix; the deterministic pin is the
+/// unit test `unlock_on_drop_releases_while_a_child_holds_a_copy`.
+#[test]
+fn reopen_survives_concurrent_spawns() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const CYCLES: usize = 300;
+    let tmp = TempDir::new("reopen-spawns");
+    let root = tmp.path().join("store");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut spawned = 0u64;
+            loop {
+                std::process::Command::new("true")
+                    .status()
+                    .expect("spawn true");
+                spawned += 1;
+                if stop.load(Ordering::Relaxed) {
+                    return spawned;
+                }
+            }
+        }
+    });
+    let mut failure = None;
+    for cycle in 0..CYCLES {
+        match FsStore::open(&root) {
+            Ok(store) => {
+                store.put(format!("cycle {cycle}").as_bytes()).expect("put");
+            }
+            Err(e) => {
+                failure = Some((cycle, e));
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let spawned = spawner.join().expect("spawner");
+    if let Some((cycle, e)) = failure {
+        panic!("open failed at cycle {cycle} of {CYCLES}, {spawned} spawns: {e}");
+    }
 }
