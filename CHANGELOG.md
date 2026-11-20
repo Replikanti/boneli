@@ -488,9 +488,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tools/check-architecture.sh` runs every cargo call from `/`, so no
   cargo config or toolchain file in the checkout applies; it refuses to
   build when the checker's build closure holds any crate but its three,
-  when one of them is not a workspace member or its directory is reached
-  through a symlink, or when a workspace member has a build script or is a
-  proc macro, and it builds
+  when one of them is not a workspace member as cargo resolves it or its
+  directory is reached through a symlink, or when a workspace member has a
+  build script or is a proc macro, reading only cargo output the checkout
+  cannot fill with text or tests that added text can only make stricter,
+  and it builds
   for the host triple with the committed lockfile into `target/arch-check`
   after deleting the old binary, then runs it. The rules, their ids, the
   output format, the flags and the fixture format are unchanged; it reads

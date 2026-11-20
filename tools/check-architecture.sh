@@ -7,13 +7,15 @@
 #
 # Every cargo call here runs from `/` with an explicit manifest path, so that
 # no cargo config or toolchain file in the checkout applies (the check
-# reports such files). Before anything is compiled, two reads that run no
-# code from the checkout make sure the build of the checker runs none either
-# (ADR-015, D2):
+# reports such files). Before anything is compiled, reads that run no code
+# from the checkout make sure the build of the checker runs none either
+# (ADR-015, D2). Each decision reads only output that the checkout cannot
+# fill with free text, matched whole, or tests for something cargo prints
+# that added text cannot take away:
 #   - its build closure is exactly boneli-arch-check, boneli-json and
-#     boneli-toml, each a directory of this checkout without symlinks and a
-#     workspace member: no other crate, so no external build script and no
-#     proc macro;
+#     boneli-toml, each a directory of this checkout without symlinks and,
+#     by cargo's own workspace resolution, a member of this workspace: no
+#     other crate, so no external build script and no proc macro;
 #   - no workspace member has a build script or is a proc macro
 #     (roles.build-script is empty), so neither do those three.
 # The checker is then built from the committed lockfile for the host triple,
@@ -29,41 +31,68 @@ root=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd -P) || exit 2
 manifest=$root/Cargo.toml
 crates=$root/crates
 checker_crates="boneli-arch-check boneli-json boneli-toml"
-host=$(cd / && rustc -vV | sed -n 's/^host: //p') && [ -n "$host" ] ||
+# rustc's own output; the triple is used in paths, so only its characters.
+host=$(cd / && rustc -vV | sed -n 's/^host: //p') ||
   fail tool-error "cannot read the host triple from rustc -vV" 2
+case $host in
+  '' | *[!A-Za-z0-9_.-]*) fail tool-error "rustc -vV printed no usable host triple" 2 ;;
+esac
 # Each of the three is a real directory of this checkout: no symlink in its
 # path, so the sources the closure names are the ones under crates/.
 for name in $checker_crates; do
   [ "$(CDPATH='' cd -P -- "$crates/$name" 2>/dev/null && pwd -P)" = "$crates/$name" ] ||
     fail tool-error "crates/$name is not a directory of this checkout without symlinks" 2
 done
-closure=$(cd / && cargo tree --locked --manifest-path "$manifest" -p boneli-arch-check \
-    -e normal,build --target "$host" --prefix none --format '{p}') ||
+# Each of the three is a member of this workspace, as cargo resolves it:
+# the workspace root cargo finds for its manifest is this one, the whole
+# output (one path cargo computes) compared exactly. An excluded crate
+# gives its own manifest or an error, never this root.
+for name in $checker_crates; do
+  ws=$(cd / && cargo locate-project --workspace --message-format plain \
+      --manifest-path "$crates/$name/Cargo.toml") && [ "$ws" = "$manifest" ] ||
+    fail tool-error "$name, which the architecture checker's build compiles, is not a member of this workspace" 2
+done
+# The build closure: one line per package in both forms, so that a path
+# with a line break cannot add a line to one form only, and each line
+# exactly `<name> v<version> (<checkout>/crates/<name>)` with a version of
+# semver characters, so a path cannot carry a second package name either.
+tree() {
+  cd / && cargo tree --locked --manifest-path "$manifest" -p boneli-arch-check \
+    -e normal,build --target "$host" --prefix none --format "$1"
+}
+dots=$(tree .) && closure=$(tree '{p}') ||
   fail tool-error "cannot list the build closure of the architecture checker (cargo output on stderr)" 2
-[ -n "$closure" ] || fail tool-error "the build closure of the architecture checker is empty" 2
-printf '%s\n' "$closure" | while IFS= read -r line; do
-  case $line in
-    "boneli-arch-check v"*" ($crates/boneli-arch-check)"* | \
-    "boneli-json v"*" ($crates/boneli-json)"* | \
-    "boneli-toml v"*" ($crates/boneli-toml)"*) ;;
-    *) exit 1 ;;
-  esac
-done || fail tool-error "the architecture checker's build would compile a crate other than boneli-arch-check, boneli-json and boneli-toml of this checkout, which could run code before the check" 2
+foreign="the architecture checker's build would compile a crate other than boneli-arch-check, boneli-json and boneli-toml of this checkout, which could run code before the check"
+[ "$dots" = "$(printf '.\n.\n.')" ] || fail tool-error "$foreign" 2
+seen=
+while IFS= read -r line; do
+  matched=
+  for name in $checker_crates; do
+    rest=${line#"$name v"}
+    [ "$rest" != "$line" ] || continue
+    version=${rest%" ($crates/$name)"}
+    [ "$version" != "$rest" ] || continue
+    case $version in
+      '' | *[!0-9A-Za-z.+-]*) continue ;;
+    esac
+    case " $seen " in
+      *" $name "*) ;;
+      *) seen="$seen $name" matched=1 ;;
+    esac
+  done
+  [ -n "$matched" ] || fail tool-error "$foreign" 2
+done <<EOF_CLOSURE
+$closure
+EOF_CLOSURE
+[ "$(printf '%s\n' "$closure" | wc -l)" -eq 3 ] || fail tool-error "$foreign" 2
+# Build scripts and proc macros of the members: `cargo metadata --no-deps`
+# also echoes [workspace.metadata] and [package.metadata] verbatim, but a
+# target cargo reports as `custom-build` or `proc-macro` always prints its
+# kind array, and text the checkout adds can only add matches, never
+# remove one (a false positive fails closed). Attack 1 of the CI
+# regression step proves on every run that this cargo prints the kind.
 members=$(cd / && cargo metadata --no-deps --offline --format-version 1 --manifest-path "$manifest") ||
   fail tool-error "cargo metadata --no-deps failed (cargo output on stderr)" 2
-case $members in
-  *'"targets":'*) ;;
-  *) fail tool-error "cargo metadata --no-deps printed no targets" 2 ;;
-esac
-# Each of the three is a workspace member, so the two checks below cover
-# it: a crate excluded from the workspace, or the root of a workspace of
-# its own, would build with its build script unseen.
-for name in $checker_crates; do
-  case $members in
-    *"\"manifest_path\":\"$crates/$name/Cargo.toml\""*) ;;
-    *) fail tool-error "$name, which the architecture checker's build compiles, is not a member of this workspace" 2 ;;
-  esac
-done
 case $members in
   *'"kind":['*'"custom-build"'*) fail build-script "a workspace member has a build script, which would run before the check could report it (roles.build-script is empty)" 1 ;;
 esac

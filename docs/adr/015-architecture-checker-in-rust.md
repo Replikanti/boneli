@@ -67,32 +67,64 @@ under dash and bash). It takes the repository root from `$0` with
 `pwd -P`, runs every cargo call from `/` with
 `--manifest-path "$root/Cargo.toml"`, and in this order:
 
-1. **The host triple** from `rustc -vV`.
+Every decision before the build reads cargo or rustc output, and three
+review rounds found a bypass in how a shell reads it (round 3: a substring
+search over `cargo metadata`, which echoes `[workspace.metadata]` and
+`[package.metadata]` verbatim). The rule since round 3: a decision reads
+only output the checkout cannot fill with free text, compared whole, or
+it tests for something cargo prints that added text cannot remove.
+
+1. **The host triple** from `rustc -vV`: rustc's own output, with the
+   toolchain chosen from `/`; it must consist of `[A-Za-z0-9_.-]`, since
+   it becomes part of a path.
 2. **The three checker crates are real directories**:
    `crates/boneli-arch-check`, `crates/boneli-json` and `crates/boneli-toml`
    must each resolve (`pwd -P`) to themselves, so no symlink anywhere on
-   the path points the build at other sources.
-3. **The build closure** (`cargo tree --locked -p boneli-arch-check -e
-   normal,build --target <host> --prefix none --format '{p}'`) must be
-   exactly those three crates, each at its path under this checkout's
-   `crates/`. Anything else, a crates.io crate, a git crate, another
-   member, a path crate elsewhere or a `[patch]` replacement (both change
-   the printed path), is a tool error (exit 2) before anything is
-   compiled: building it could run its build script or proc macro.
-4. **Each of the three is a workspace member**: its `manifest_path`
-   appears in `cargo metadata --no-deps --offline` (which runs no code),
-   else a tool error (exit 2). Found in round 2 of the review: with
+   the path points the build at other sources. No cargo output involved.
+3. **Each of the three is a workspace member, as cargo resolves it**:
+   `cargo locate-project --workspace --message-format plain` on its
+   manifest prints the one path of the workspace root cargo finds for it,
+   which must equal this root's `Cargo.toml` exactly. A crate in
+   `exclude` gives its own manifest, one with `package.workspace` pointing
+   at a root that excludes it gives an error, and a crate with its own
+   `[workspace]` gives its own manifest; none matches. The output is a
+   path cargo computes, not repository text. Found in round 2: with
    `exclude = ["crates/boneli-toml"]` and a standalone manifest, the
-   closure still listed `crates/boneli-toml` by path, the member checks
-   below no longer saw it, and its build script ran before the checker
-   was compiled; it swapped the checker's `main.rs` for one that printed
-   OK and restored the original, and the gate step stayed green. The
-   same holds for a crate that is the root of a workspace of its own.
-5. **No workspace member has a build script or is a proc macro** (the
-   same output): a
+   closure still listed `crates/boneli-toml`, the member checks no longer
+   saw it, and its build script ran before the checker was compiled (it
+   swapped the checker's `main.rs` for one that printed OK and restored
+   the original). The round-2 fix looked for the crate's `manifest_path`
+   anywhere in `cargo metadata --no-deps`; round 3 planted that string in
+   `[workspace.metadata]` and the bypass came back. Rejected:
+   `cargo tree --workspace --depth 0 --format '{p}'`, which also works,
+   but prints paths of every member, which the checkout names; the root
+   path of `locate-project` is the smaller surface.
+4. **The build closure** (`cargo tree --locked -p boneli-arch-check -e
+   normal,build --target <host> --prefix none`) is read twice, with
+   `--format .` and with `--format '{p}'`. The first must be exactly three
+   lines of `.`: one per package, with nothing from the checkout in it.
+   The second must also be three lines, each exactly
+   `<name> v<version> (<checkout>/crates/<name>)` for a different one of
+   the three names, with a version of `[0-9A-Za-z.+-]` only. In `{p}` the
+   checkout controls only the path: a path with a line break adds a line
+   to that form only, and a path that ends in ` (<checkout>/crates/<name>`
+   leaves a space and a parenthesis in what would be the version. A
+   crates.io crate, a git crate, another member or a path crate elsewhere
+   is therefore a tool error (exit 2) before anything is compiled:
+   building it could run its build script or proc macro.
+5. **No workspace member has a build script or is a proc macro**
+   (`cargo metadata --no-deps --offline`, which runs no code): a
    `custom-build` target is `FAIL [build-script] Cargo.toml: ...`, a
    `proc-macro` target `FAIL [proc-macro] Cargo.toml: ...`, exit 1, the
-   rules the checker would report. Found in round 1 of the review: a
+   rules the checker would report. This is the one substring test left,
+   and on purpose: the output does carry repository text (metadata
+   tables, descriptions), but cargo prints the kind array of every target
+   it found, and text the checkout adds can only add a match, a false
+   positive that fails closed, never remove cargo's. Steps 3 and 4 put
+   all three crates of the closure among those members. Whether this
+   cargo still prints the kind that way is proven on every CI run by
+   attack 1 of the regression step. Rejected: `cargo tree -e build`,
+   which lists build-dependencies, not build scripts. Found in round 1: a
    `build.rs` added to `boneli-toml` ran during the checker's build,
    deleted itself, and the check then printed OK. `roles.build-script` is
    empty, so a member with a build script is a violation anyway; a PR that
@@ -169,14 +201,18 @@ directories, after the gate has judged the real tree.
   built), stale binaries at the host path and at the old `debug/` path
   with `CARGO_BUILD_TARGET` set (the real checker runs), `boneli-toml`
   excluded from the workspace with a build script that leaves a marker
-  (exit 2, no marker, nothing built) and `crates/boneli-json` as a
-  symlink (exit 2, nothing built). It also requires that no step before
-  the gate in the `check` job uses cargo or rust-cache. Each part fails
-  on the code before its fix, run by hand: on 6abcd3a, OK and exit 0
-  after the build script deleted itself, exit 1 from the old checker
-  after compiling the extra crate, the stale `OK`, and rust-cache and
-  `cargo fmt` before the gate; on 126cfb5, the excluded crate's build
-  script ran (the marker exists) and the symlinked crate gave OK.
+  (exit 2, no marker, nothing built), `crates/boneli-json` as a symlink
+  (exit 2, nothing built), and the excluded crate again with its
+  `manifest_path` written into `[workspace.metadata]` and then into a
+  member's `[package.metadata]` (exit 2, no marker, nothing built). It
+  also requires that no step before the gate in the `check` job uses
+  cargo or rust-cache. Each part fails on the code before its fix, run by
+  hand: on 6abcd3a, OK and exit 0 after the build script deleted itself,
+  exit 1 from the old checker after compiling the extra crate, the stale
+  `OK`, and rust-cache and `cargo fmt` before the gate; on 126cfb5, the
+  excluded crate's build script ran (the marker exists) and the symlinked
+  crate gave OK; on 707e358, the excluded crate's build script ran with
+  either metadata table.
 - "No build output in the checkout" fails if anything under `target/` is
   tracked.
 
