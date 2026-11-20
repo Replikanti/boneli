@@ -179,18 +179,32 @@ impl OcspCache {
             return entry;
         }
         while self.entries.len() >= OCSP_CACHE_MAX_ENTRIES {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
+            // Eviction keeps revocations final: the least recently used good
+            // answer goes first. With no good answer left, a good answer is
+            // not stored (it still decides this check), and a revocation
+            // displaces the least recently used one, the only case in which
+            // a revocation leaves before its `nextUpdate` (ADR-019, item 6).
+            let victim = match self.oldest(Some(Status::Good)) {
+                Some(k) => k,
+                None if entry.status == Status::Good => return entry,
+                None => match self.oldest(None) {
+                    Some(k) => k,
+                    None => break,
+                },
             };
-            self.entries.remove(&oldest);
+            self.entries.remove(&victim);
         }
         self.entries.insert(key.to_vec(), entry.clone());
         entry
+    }
+
+    /// The least recently used key, among entries of `status` if given.
+    fn oldest(&self, status: Option<Status>) -> Option<Vec<u8>> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| status.is_none_or(|s| e.status == s))
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(k, _)| k.clone())
     }
 }
 
@@ -317,6 +331,41 @@ mod tests {
         assert!(cache.get(&0u32.to_be_bytes()).is_some());
         assert!(cache.get(&1u32.to_be_bytes()).is_none());
         assert!(cache.get(&5_000u32.to_be_bytes()).is_some());
+    }
+
+    #[test]
+    fn ocsp_eviction_keeps_a_cached_revocation() {
+        // The review's sequence: a revoked leaf, then 1,024 other leaves,
+        // then a replayed good answer signed before the revocation.
+        let mut cache = OcspCache::new();
+        cache.insert(b"k", revoked(T0 + 3_600), T0 + 3_600);
+        for i in 0..OCSP_CACHE_MAX_ENTRIES as u32 {
+            cache.insert(&i.to_be_bytes(), good(T0), T0 + 3_600);
+        }
+        assert_eq!(cache.len(), 1_024);
+        assert_eq!(cache.get(b"k").expect("kept").status, Status::Revoked);
+        let decided = cache.insert(b"k", good(T0), T0 + 7_200);
+        assert_eq!(decided.status, Status::Revoked);
+        assert_eq!(at(&mut cache, T0 + 7_200), "fresh");
+    }
+
+    #[test]
+    fn ocsp_full_of_revocations_stores_no_good_answer() {
+        let mut cache = OcspCache::new();
+        for i in 0..OCSP_CACHE_MAX_ENTRIES as u32 {
+            cache.insert(&i.to_be_bytes(), revoked(T0), T0);
+        }
+        let decided = cache.insert(b"k", good(T0), T0);
+        assert_eq!(decided.status, Status::Good, "it still decides this check");
+        assert!(cache.get(b"k").is_none());
+        assert_eq!(cache.len(), 1_024);
+        // A new revocation displaces the least recently used one.
+        assert_eq!(kind(&cache.lookup(&0u32.to_be_bytes(), T0)), "fresh");
+        cache.insert(b"r", revoked(T0), T0);
+        assert_eq!(cache.len(), 1_024);
+        assert!(cache.get(&0u32.to_be_bytes()).is_some());
+        assert!(cache.get(&1u32.to_be_bytes()).is_none());
+        assert!(cache.get(b"r").is_some());
     }
 
     #[test]

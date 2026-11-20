@@ -194,8 +194,12 @@ Decided at #79 STOP 1 (2026-11-20), all three as the plan recommended:
    older one changes nothing; a revoked answer replaces any good one, and
    no good answer replaces a revocation before its `nextUpdate` (so a
    cached revocation is not refreshed at all). Answers that settle
-   nothing are not cached. At most `OCSP_CACHE_MAX_ENTRIES`, least
-   recently used out first; a poisoned mutex clears the cache.
+   nothing are not cached. At most `OCSP_CACHE_MAX_ENTRIES`; eviction
+   keeps revocations final: the least recently used good answer goes
+   first, a good answer is not stored when only revocations are left
+   (it still decides its check), and a revocation leaves before its
+   `nextUpdate` only when the cache holds 1,024 of them and a newer one
+   displaces the least recently used. A poisoned mutex clears the cache.
    - Why 24 h and 1 h: one staleness policy for both mechanisms. The
      measured answers were 35.78 to 82.23 h old at fetch with 85.76 to
      132.21 h left, so caching until `nextUpdate` alone would trail the
