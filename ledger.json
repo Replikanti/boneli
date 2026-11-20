@@ -1288,16 +1288,16 @@
    "title": "boneli-https: std lookup scan misses turbofish, qualified-path and alias forms",
    "epic": null,
    "order": 49,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "17f7a4ac",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T22:10:46+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T22:10:54+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:55:17+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "98fa59e8",
-   "note": "PR 78 fix round 1: review findings (keeper report on OomKilled, pin counts own reads) + AWS landing job"
-  },
   {
    "at": "2026-11-20T16:00:41+00:00",
    "issue": 66,
@@ -1710,6 +1702,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:10:54+00:00",
+   "issue": 93,
+   "from": "ready",
+   "to": "claimed",
+   "by": "17f7a4ac",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1743,7 +1743,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:10:46+00:00",
+ "updated_at": "2026-11-20T22:10:54+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
