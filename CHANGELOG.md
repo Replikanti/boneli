@@ -487,8 +487,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   root in `roles.roots` that is held to every rule it enforces (ADR-015).
   `tools/check-architecture.sh` runs every cargo call from `/`, so no
   cargo config or toolchain file in the checkout applies; it refuses to
-  build when the checker's build closure holds any crate but its three, or
-  a workspace member has a build script or is a proc macro, and it builds
+  build when the checker's build closure holds any crate but its three,
+  when one of them is not a workspace member or its directory is reached
+  through a symlink, or when a workspace member has a build script or is a
+  proc macro, and it builds
   for the host triple with the committed lockfile into `target/arch-check`
   after deleting the old binary, then runs it. The rules, their ids, the
   output format, the flags and the fixture format are unchanged; it reads
@@ -503,8 +505,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Nothing in the repository runs Python: `tools/check_architecture.py` is
   removed, CI's `check` and `sandbox` jobs shadow every Python executable
   on PATH with a stub that logs the call and exits 127 and fail if any step
-  called one, and `check` fails if a tracked file names the interpreter
-  (ADR-015 D10). Two fixtures pin TOML the checker refuses
+  called one, and `check` fails if a tracked file, read as text whatever
+  its attributes, names the interpreter (ADR-015 D10). Two fixtures pin TOML the checker refuses
   where the former checker read it: a float in `[package.metadata]` and a
   date in the policy (ADR-015 D6).
 - The `boneli-oci` test that ran a Python helper to observe a process

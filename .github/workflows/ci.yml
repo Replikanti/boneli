@@ -48,10 +48,12 @@ jobs:
       # Nothing in the repository runs Python (ADR-015, D10): no tracked
       # file names the interpreter, which catches shebangs and absolute
       # paths that the PATH stubs below cannot see. ADR history and the
-      # vendored toml-test corpus are the allowed hits. Git only.
+      # vendored toml-test corpus are the allowed hits. Git only; `-a`
+      # reads every file as text, so no `.gitattributes` line of the PR can
+      # hide one as binary.
       - name: No Python in tracked files
         run: |
-          if git grep -n -I -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'; then
+          if git grep -n -a -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'; then
             echo "a tracked file names the interpreter (ADR-015, D10)"
             exit 1
           fi
@@ -149,9 +151,12 @@ jobs:
       # Regression attacks on the entry point (ADR-015, D2), each on a
       # fresh export of HEAD: a build script that deletes itself and a
       # foreign crate in the checker's build closure stop the check before
-      # anything is built, and a stale binary never runs, also with
-      # CARGO_BUILD_TARGET set. Last, the gate must be the first step of
-      # this job that runs cargo or rust-cache.
+      # anything is built, a stale binary never runs, also with
+      # CARGO_BUILD_TARGET set, and a checker crate taken out of the
+      # workspace or reached through a symlink is refused before its build
+      # script can run. Last, the
+      # gate must be the first step of this job that runs cargo or
+      # rust-cache.
       - name: Architecture check refuses code that runs before it
         run: |
           a="$RUNNER_TEMP/attack"
@@ -207,7 +212,29 @@ jobs:
             echo "a stale checker binary ran"
             exit 1
           fi
-          # 4. Nothing before the gate runs cargo or rust-cache.
+          # 4. A checker crate excluded from the workspace, with a build
+          # script that would leave a marker.
+          fresh
+          sed -i 's|^members = \["crates/\*"\]$|&\nexclude = ["crates/boneli-toml"]|' "$a/Cargo.toml"
+          grep -q '^exclude = \["crates/boneli-toml"\]$' "$a/Cargo.toml"
+          printf '[package]\nname = "boneli-toml"\nversion = "0.0.0"\nedition = "2024"\n' > "$a/crates/boneli-toml/Cargo.toml"
+          printf 'fn main() {\n    let _ = std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../BUILD_SCRIPT_RAN"), "");\n}\n' \
+            > "$a/crates/boneli-toml/build.rs"
+          (cd "$a" && cargo metadata --offline --format-version 1 > /dev/null)
+          gate
+          test "$code" = 2
+          grep -q '^FAIL \[tool-error\] Cargo.toml: boneli-toml, which the architecture checker.s build compiles, is not a member of this workspace$' "$out"
+          test ! -e "$a/BUILD_SCRIPT_RAN"
+          test ! -e "$a/target/arch-check"
+          # 5. A checker crate whose directory is a symlink.
+          fresh
+          mv "$a/crates/boneli-json" "$a/elsewhere-json"
+          ln -s ../elsewhere-json "$a/crates/boneli-json"
+          gate
+          test "$code" = 2
+          grep -q '^FAIL \[tool-error\] Cargo.toml: crates/boneli-json is not a directory of this checkout without symlinks$' "$out"
+          test ! -e "$a/target/arch-check"
+          # 6. Nothing before the gate runs cargo or rust-cache.
           before=$(awk '/^  check:$/ { j = 1; next } j && /^  [^ ]/ { exit } j && /- name: Architecture rules$/ { exit } j' .github/workflows/ci.yml | grep -v '^ *#' || true)
           if printf '%s\n' "$before" | grep -n -E 'cargo|rust-cache'; then
             echo "a step before the gate runs cargo or rust-cache"

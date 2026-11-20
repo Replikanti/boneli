@@ -67,14 +67,29 @@ under dash and bash). It takes the repository root from `$0` with
 `pwd -P`, runs every cargo call from `/` with
 `--manifest-path "$root/Cargo.toml"`, and in this order:
 
-1. **The build closure** (`cargo tree --locked -p boneli-arch-check -e
-   normal,build --prefix none --format '{p}'`) must be exactly
-   `boneli-arch-check`, `boneli-json` and `boneli-toml`, each at its path
-   under this checkout's `crates/`. Anything else, a crates.io crate, a
-   git crate or another member, is a tool error (exit 2) before anything
-   is compiled: building it could run its build script or proc macro.
-2. **No workspace member has a build script or is a proc macro**
-   (`cargo metadata --no-deps --offline`, which runs no code): a
+1. **The host triple** from `rustc -vV`.
+2. **The three checker crates are real directories**:
+   `crates/boneli-arch-check`, `crates/boneli-json` and `crates/boneli-toml`
+   must each resolve (`pwd -P`) to themselves, so no symlink anywhere on
+   the path points the build at other sources.
+3. **The build closure** (`cargo tree --locked -p boneli-arch-check -e
+   normal,build --target <host> --prefix none --format '{p}'`) must be
+   exactly those three crates, each at its path under this checkout's
+   `crates/`. Anything else, a crates.io crate, a git crate, another
+   member, a path crate elsewhere or a `[patch]` replacement (both change
+   the printed path), is a tool error (exit 2) before anything is
+   compiled: building it could run its build script or proc macro.
+4. **Each of the three is a workspace member**: its `manifest_path`
+   appears in `cargo metadata --no-deps --offline` (which runs no code),
+   else a tool error (exit 2). Found in round 2 of the review: with
+   `exclude = ["crates/boneli-toml"]` and a standalone manifest, the
+   closure still listed `crates/boneli-toml` by path, the member checks
+   below no longer saw it, and its build script ran before the checker
+   was compiled; it swapped the checker's `main.rs` for one that printed
+   OK and restored the original, and the gate step stayed green. The
+   same holds for a crate that is the root of a workspace of its own.
+5. **No workspace member has a build script or is a proc macro** (the
+   same output): a
    `custom-build` target is `FAIL [build-script] Cargo.toml: ...`, a
    `proc-macro` target `FAIL [proc-macro] Cargo.toml: ...`, exit 1, the
    rules the checker would report. Found in round 1 of the review: a
@@ -83,7 +98,7 @@ under dash and bash). It takes the repository root from `$0` with
    empty, so a member with a build script is a violation anyway; a PR that
    lists one there has to scope this step to the three crates of the
    closure.
-3. **The host triple** from `rustc -vV`, and the build for it:
+6. **The build** for the host triple:
    `rm -f "$root/target/arch-check/<host>/debug/boneli-arch-check"`, then
    `cargo build --quiet --locked -p boneli-arch-check --target <host> --target-dir "$root/target/arch-check"`,
    and a missing binary afterwards is a tool error. With the target
@@ -96,7 +111,7 @@ under dash and bash). It takes the repository root from `$0` with
    after it. Found in round 1: with `build.target` set, the
    fresh build went to `<triple>/debug/` while an older binary at the
    fixed `debug/` path ran, with the older rules.
-4. **`exec`** of that binary from the caller's working directory, with the
+7. **`exec`** of that binary from the caller's working directory, with the
    caller's arguments.
 
 Why each part:
@@ -147,17 +162,21 @@ directories, after the gate has judged the real tree.
   wrapper did run, for the checker's own cargo calls) and no
   `--crate-name boneli_arch_check` in it. A mutant of the entry point that
   builds from the repository fails it (checked by hand).
-- "Architecture check refuses code that runs before it" runs the three
-  round-1 attacks on fresh exports of HEAD: a self-deleting `build.rs` in
+- "Architecture check refuses code that runs before it" runs the review's
+  attacks on fresh exports of HEAD: a self-deleting `build.rs` in
   `boneli-toml` (exit 1, the `build-script` line, the file still there and
   nothing built), a new member in the checker's closure (exit 2, nothing
-  built), and stale binaries at the host path and at the old `debug/`
-  path with `CARGO_BUILD_TARGET` set (the real checker runs). It also
-  requires that no step before the gate in the `check` job uses cargo or
-  rust-cache. Each part fails on the code before round 1 (run by hand on
-  6abcd3a: OK and exit 0 after the build script deleted itself; exit 1
-  from the old checker after compiling the extra crate; the stale `OK`;
-  rust-cache and `cargo fmt` before the gate).
+  built), stale binaries at the host path and at the old `debug/` path
+  with `CARGO_BUILD_TARGET` set (the real checker runs), `boneli-toml`
+  excluded from the workspace with a build script that leaves a marker
+  (exit 2, no marker, nothing built) and `crates/boneli-json` as a
+  symlink (exit 2, nothing built). It also requires that no step before
+  the gate in the `check` job uses cargo or rust-cache. Each part fails
+  on the code before its fix, run by hand: on 6abcd3a, OK and exit 0
+  after the build script deleted itself, exit 1 from the old checker
+  after compiling the extra crate, the stale `OK`, and rust-cache and
+  `cargo fmt` before the gate; on 126cfb5, the excluded crate's build
+  script ran (the marker exists) and the symlinked crate gave OK.
 - "No build output in the checkout" fails if anything under `target/` is
   tracked.
 
@@ -453,9 +472,11 @@ only calls through PATH; a `#!/usr/bin/python3` shebang or a call by
 absolute path gets past it (round 1 of the review ran both). The step
 "No Python in tracked files", git only and before the toolchain, catches
 those in what the repository holds: it fails unless
-`git grep -n -I -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'`
+`git grep -n -a -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'`
 prints nothing (checked by hand: a tracked `#!/usr/bin/python3` script
-fails it). Making the runner's interpreters non-executable was rejected:
+fails it). `-a` reads every file as text: with `-I`, found in round 2,
+a `.gitattributes` line `tools/gen -diff` in the PR marked such a script
+binary and the grep skipped it. Making the runner's interpreters non-executable was rejected:
 the runner's own system tools may need them, and a name built at run time
 from pieces would still pass both; D10 is a policy, and review owns what
 a grep cannot see. Without the exclusions it finds only the vendored
@@ -472,7 +493,8 @@ ADR-007 (proposed, owned by #6) is not edited.
 - The gate's trusted base now includes `boneli-json`, `boneli-toml`, the
   checker crate and their compilation, instead of a Python interpreter.
   The entry point refuses to build them when the build could run code
-  (a build script, a proc macro, another crate in the closure; D2), so
+  (a build script, a proc macro, another crate in the closure, a checker
+  crate outside the workspace or behind a symlink; D2), so
   what runs before the check is rustc compiling those three crates. In
   CI the gate is the first step of `check` that runs cargo (D2), and all
   three crates are reviewed on every change (the always-review list).
