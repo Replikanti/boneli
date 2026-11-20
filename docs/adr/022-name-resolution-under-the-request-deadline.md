@@ -373,10 +373,12 @@ in resolv.conf(5).
   no source file of the crate outside comments names `to_socket_addrs`
   or `ToSocketAddrs`, or names a std function that takes them
   (`TcpStream::connect`, `TcpListener::bind`, `UdpSocket::bind`,
-  `UdpSocket::connect`, `UdpSocket::send_to`, in any form: a call, UFCS
+  `UdpSocket::connect`, `UdpSocket::send_to`, as a call, a UFCS call
   or the function as a value; and the methods `connect` and `send_to`)
   except in a call whose argument is a socket address
-  (`crate_has_no_std_lookup`).
+  (`crate_has_no_std_lookup`). The scan is a text match: it does not see
+  a method turbofish (`socket.connect::<&str>(host)`), a qualified path
+  (`<TcpStream>::connect(host)`), an alias or a macro.
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte
   flip of a valid answer.
