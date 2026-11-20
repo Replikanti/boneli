@@ -968,7 +968,7 @@
    "note": "",
    "updated_at": "2026-11-20T15:27:28+00:00",
    "priority": "P3",
-   "size": "small",
+   "size": "medium",
    "deps": [
     4
    ],
@@ -1531,7 +1531,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:27:28+00:00",
+ "updated_at": "2026-11-20T15:33:18+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
