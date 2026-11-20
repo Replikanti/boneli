@@ -962,11 +962,11 @@
    "title": "Extract the store-root rules of ADR-009 D8 into a shared support crate",
    "epic": null,
    "order": 41,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "373fe023",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T15:27:28+00:00",
+   "updated_at": "2026-11-20T16:00:41+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T03:36:09+00:00",
-   "issue": 35,
-   "from": "pr-review",
-   "to": "done",
-   "by": "9db267e1",
-   "note": null
-  },
   {
    "at": "2026-11-20T03:41:08+00:00",
    "issue": 54,
@@ -1496,6 +1488,14 @@
    "to": "implementing",
    "by": "98fa59e8",
    "note": "PR 78 fix round 1: review findings (keeper report on OomKilled, pin counts own reads) + AWS landing job"
+  },
+  {
+   "at": "2026-11-20T16:00:41+00:00",
+   "issue": 66,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "373fe023",
+   "note": null
   }
  ],
  "open": [
@@ -1531,7 +1531,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:55:17+00:00",
+ "updated_at": "2026-11-20T16:00:41+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
