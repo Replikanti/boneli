@@ -1074,13 +1074,13 @@
    "title": "boneli-https: bound name resolution by the request deadline",
    "epic": null,
    "order": 44,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
+   "state": "claimed",
+   "owner": "f7d29cb8",
+   "user": "ylohnitram",
+   "machine": "df82df",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T11:44:34+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T16:36:22+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1091,7 +1091,7 @@
     "core"
    ],
    "manual": false,
-   "session": null
+   "session": true
   },
   {
    "issue": 80,
@@ -1167,14 +1167,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T09:58:45+00:00",
-   "issue": 38,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "14f36a32",
-   "note": null
-  },
   {
    "at": "2026-11-20T10:12:34+00:00",
    "issue": 54,
@@ -1566,6 +1558,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-20T16:36:22+00:00",
+   "issue": 81,
+   "from": "ready",
+   "to": "claimed",
+   "by": "f7d29cb8",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1601,7 +1601,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T16:36:16+00:00",
+ "updated_at": "2026-11-20T16:36:22+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
