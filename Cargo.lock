@@ -87,7 +87,9 @@ version = "0.0.0"
 dependencies = [
  "boneli-http",
  "ml-kem",
+ "ring",
  "rustls",
+ "rustls-webpki",
  "webpki-roots",
  "zeroize",
 ]

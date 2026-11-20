@@ -1,12 +1,14 @@
 # Test certificates and keys
 
-Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs` and
-`tests/revocation.rs` and the unit tests of `src/revocation/`, read with
-`include_bytes!`. The keys protect nothing: they exist only so that a local
-test server can complete a TLS handshake and so that `RsaSha256Key` can be
-checked against OpenSSL. No system trusts these CAs, and no GitHub App or
-other account has any of these keys. The signing keys say so in their
-names (`test-only-`).
+Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`,
+`tests/revocation.rs`, `tests/ocsp.rs` and the unit tests of
+`src/revocation/`, read with `include_bytes!`. The keys protect nothing:
+they exist only so that a local test server can complete a TLS
+handshake, so that `RsaSha256Key` can be checked against OpenSSL, and so
+that tests can sign OCSP answers. No system trusts these CAs (the real
+captures at the end are public certificates of real hosts), and no
+GitHub App or other account has any of these keys. The signing keys say
+so in their names (`test-only-`).
 
 | File | What |
 | --- | --- |
@@ -280,4 +282,187 @@ gencrl crl-ca-reversed.crl crl-ca 21250601000000Z 21250101000000Z
 gencrl crl-ca-forged.crl crl-forged-ca 20260101000000Z 21260101000000Z
 rm -f index.txt index.txt.* crlnumber crlnumber.* ./*.crl.pem leaf.cnf ca.cnf \
   crl-ca.key crl-forged-ca.key crl-forged-ca.pem
+```
+
+## Revocation by OCSP (`tests/ocsp.rs`, `src/revocation/ocsp/`, ADR-020)
+
+A third test CA with leaves that name OCSP responders (authorityInfoAccess)
+and no CRL point, delegated responder certificates, and answers of
+OpenSSL's own responder. Every leaf has SAN `DNS:localhost,
+IP:127.0.0.1`, EKU serverAuth, validity 2026-01-01 to 2126-01-01, and the
+key `crl-leaf.key`; `ocsp.boneli.test` and its siblings never resolve.
+Unlike the other CAs, the OCSP CA's key and the responder's key are kept
+(`test-only-`), so the unit tests can build and sign answers at test
+time; they protect nothing.
+
+| File | What |
+| --- | --- |
+| `ocsp-ca.pem` | "Boneli OCSP test CA", 2026-01-01 to 2126-01-01, `keyCertSign, cRLSign` |
+| `test-only-ocsp-ca.key` | its key, P-256, PKCS#8 |
+| `ocsp-decoy-ca.pem` | a CA named "Boneli OCSP test CA" under `test-only-p256.key`: the decoy and the forger |
+| `ocsp-good.pem` | serial 0x10; AIA `caIssuers` first, then OCSP `http://ocsp.boneli.test` |
+| `ocsp-revoked.pem` | serial 0x80 (DER `02 02 00 80`), the same AIA |
+| `ocsp-three-urls.pem` | serial 0x12, OCSP `http://ocsp1.boneli.test`, `http://ocsp2.boneli.test/`, `http://ocsp3.boneli.test` |
+| `ocsp-ldap-only.pem` | serial 0x13, an `ldap` OCSP URI only |
+| `ocsp-query.pem` | serial 0x14, OCSP `http://ocsp.boneli.test/?a=b` |
+| `ocsp-and-crl.pem` | serial 0x15, OCSP and the CRL point `http://crl.boneli.test/ocsp-ca.crl` |
+| `ocsp-ldap-crl.pem` | serial 0x16, OCSP and an `ldap`-only CRL point |
+| `ocsp-responder.pem` | "Boneli OCSP test responder": EKU OCSPSigning, `ocsp-nocheck`, issued by the CA |
+| `test-only-ocsp-responder.key` | the key of every `ocsp-responder*.pem`, P-256, PKCS#8 |
+| `ocsp-responder-no-eku.pem` | the same without an EKU |
+| `ocsp-responder-other-ca.pem` | the same, issued by the decoy |
+| `ocsp-responder-expired.pem` | the same, valid 2026-01-01 to 2026-01-02 only |
+| `ocsp-responder-ca.pem` | the same with `CA:TRUE` |
+| `ocsp-good.req` | `openssl ocsp -no_nonce -reqout` for `ocsp-good.pem`, 68 B |
+| `ocsp-good.resp` | good for 0x10, by name, signed by the CA, no certificates, 100 years |
+| `ocsp-good-bykey.resp` | the same with the responder ID by key hash |
+| `ocsp-revoked.resp` | revoked for 0x80 |
+| `ocsp-unknown.resp` | unknown for 0x10 (an empty index) |
+| `ocsp-delegated.resp` | good for 0x10, signed by `ocsp-responder.pem`, which it carries |
+| `ocsp-expired.resp` | good for 0x10, `nextUpdate` one minute after it was made |
+
+Generated once with OpenSSL 3.5 from a directory holding copies of
+`crl-leaf.key` and `test-only-p256.key`, then copied here; the answers
+carry the time of the run as `thisUpdate`, so every file changes together
+when it runs again.
+
+```sh
+set -eu
+key() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1"; }
+key test-only-ocsp-ca.key; key test-only-ocsp-responder.key
+openssl req -x509 -new -key test-only-ocsp-ca.key -subj "/CN=Boneli OCSP test CA" \
+  -not_before 20260101000000Z -not_after 21260101000000Z \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -out ocsp-ca.pem
+# The decoy: the CA's name under another key, test-only-p256.key.
+openssl req -x509 -new -key test-only-p256.key -subj "/CN=Boneli OCSP test CA" \
+  -not_before 20260101000000Z -not_after 21260101000000Z \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -out ocsp-decoy-ca.pem
+cat > ocsp.cnf <<'CNF'
+[leaf]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = caIssuers;URI:http://ca.boneli.test/ca.der, OCSP;URI:http://ocsp.boneli.test
+[three]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:http://ocsp1.boneli.test, OCSP;URI:http://ocsp2.boneli.test/, OCSP;URI:http://ocsp3.boneli.test
+[ldap]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:ldap://ldap.boneli.test/cn=Boneli%20OCSP%20test%20CA
+[query]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:http://ocsp.boneli.test/?a=b
+[both]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:http://ocsp.boneli.test
+crlDistributionPoints = URI:http://crl.boneli.test/ocsp-ca.crl
+[ldap_crl]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:http://ocsp.boneli.test
+crlDistributionPoints = URI:ldap://ldap.boneli.test/cn=Boneli%20OCSP%20test%20CA?certificateRevocationList
+[responder]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = OCSPSigning
+noCheck = ignored
+[no_eku]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+noCheck = ignored
+[responder_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,digitalSignature,keyCertSign
+extendedKeyUsage = OCSPSigning
+noCheck = ignored
+CNF
+cert() { # serial section out key issuer issuer-key [from to]
+  openssl req -new -key "$4" -subj "/CN=${CN:-localhost}" |
+    openssl x509 -req -CA "$5" -CAkey "$6" -set_serial "$1" \
+      -not_before "${7:-20260101000000Z}" -not_after "${8:-21260101000000Z}" \
+      -extfile ocsp.cnf -extensions "$2" -out "$3"
+}
+leaf() { cert "$1" "$2" "$3" crl-leaf.key ocsp-ca.pem test-only-ocsp-ca.key; }
+leaf 0x10 leaf ocsp-good.pem
+leaf 0x80 leaf ocsp-revoked.pem
+leaf 0x12 three ocsp-three-urls.pem
+leaf 0x13 ldap ocsp-ldap-only.pem
+leaf 0x14 query ocsp-query.pem
+leaf 0x15 both ocsp-and-crl.pem
+leaf 0x16 ldap_crl ocsp-ldap-crl.pem
+CN="Boneli OCSP test responder"
+r() { cert "$1" "$2" "$3" test-only-ocsp-responder.key "$4" "$5" ${6:+"$6"} ${7:+"$7"}; }
+r 0x20 responder ocsp-responder.pem ocsp-ca.pem test-only-ocsp-ca.key
+r 0x21 no_eku ocsp-responder-no-eku.pem ocsp-ca.pem test-only-ocsp-ca.key
+r 0x22 responder ocsp-responder-other-ca.pem ocsp-decoy-ca.pem test-only-p256.key
+r 0x23 responder ocsp-responder-expired.pem ocsp-ca.pem test-only-ocsp-ca.key \
+  20260101000000Z 20260102000000Z
+r 0x24 responder_ca ocsp-responder-ca.pem ocsp-ca.pem test-only-ocsp-ca.key
+CN=
+# Responses from openssl's own responder: 0x10 good, 0x80 revoked, a
+# serial missing from the index unknown.
+printf 'V\t21260101000000Z\t\t10\tunknown\t/CN=localhost\n' > index.txt
+printf 'R\t21260101000000Z\t260101000000Z\t80\tunknown\t/CN=localhost\n' >> index.txt
+: > empty.txt
+openssl ocsp -issuer ocsp-ca.pem -cert ocsp-good.pem -no_nonce -reqout ocsp-good.req
+openssl ocsp -issuer ocsp-ca.pem -cert ocsp-revoked.pem -no_nonce -reqout ocsp-revoked.req
+resp() { # request out index signer key [options]
+  in=$1 out=$2 idx=$3 signer=$4 rkey=$5; shift 5
+  openssl ocsp -index "$idx" -CA ocsp-ca.pem -rsigner "$signer" -rkey "$rkey" \
+    -reqin "$in" -respout "$out" "$@"
+}
+ca() { resp "$1" "$2" "$3" ocsp-ca.pem test-only-ocsp-ca.key -resp_no_certs "$4" "$5" ${6:+"$6"}; }
+ca ocsp-good.req ocsp-good.resp index.txt -ndays 36500
+ca ocsp-good.req ocsp-good-bykey.resp index.txt -ndays 36500 -resp_key_id
+ca ocsp-revoked.req ocsp-revoked.resp index.txt -ndays 36500
+ca ocsp-good.req ocsp-unknown.resp empty.txt -ndays 36500
+ca ocsp-good.req ocsp-expired.resp index.txt -nmin 1
+resp ocsp-good.req ocsp-delegated.resp index.txt ocsp-responder.pem \
+  test-only-ocsp-responder.key -ndays 36500
+rm -f index.txt index.txt.* empty.txt empty.txt.* ocsp.cnf ocsp-revoked.req
+```
+
+### Real captures
+
+Public certificates and signed public OCSP answers, captured on
+2026-11-20 between 13:24 and 13:29 UTC while planning #79; the unit tests
+check each at its capture time and at its `nextUpdate`. Each chain is
+what the server sent, leaf first.
+
+| File | What |
+| --- | --- |
+| `capture-e36-chain.pem` | `github.com`, issued by Sectigo DV E36 (ECDSA) |
+| `capture-e36.req`, `capture-e36.resp` | openssl's request (83 B) and Sectigo's answer, good, 279 B, fetched at 1,795,181,189 |
+| `capture-r36-chain.pem` | `gitlab.com`, issued by Sectigo DV R36 (RSA), a 17-byte serial |
+| `capture-r36.req`, `capture-r36.resp` | openssl's request (84 B) and Sectigo's answer, good, 599 B, fetched at 1,795,181,189 |
+| `capture-globalsign-chain.pem`, `capture-globalsign.resp` | `www.globalsign.com` and GlobalSign's answer from a delegated responder, which it carries, good, fetched at 1,795,181,238 |
+| `capture-sslcom-revoked-chain.pem`, `capture-sslcom-revoked.resp` | `revoked-rsa-dv.ssl.com` and SSL.com's answer, revoked, responder by name, fetched at 1,795,181,340 |
+
+```sh
+host=github.com   # gitlab.com, www.globalsign.com, revoked-rsa-dv.ssl.com
+openssl s_client -connect "$host:443" -servername "$host" -showcerts </dev/null |
+  awk '/BEGIN CERT/,/END CERT/' > chain.pem
+csplit -s -z -f cert- chain.pem '/BEGIN CERT/' '{*}'
+url=$(openssl x509 -in cert-00 -noout -ocsp_uri)
+openssl ocsp -issuer cert-01 -cert cert-00 -no_nonce -reqout capture.req
+curl -s "$url/$(base64 -w0 capture.req | sed 's/+/%2B/g; s#/#%2F#g; s/=/%3D/g')" \
+  -o capture.resp
+openssl ocsp -respin capture.resp -resp_text -noverify
 ```

@@ -27,7 +27,13 @@
 //! [`Error::Revoked`]; a leaf that names a point no list settles fails it
 //! with [`Error::RevocationUnknown`]: an attacker on the path can drop a
 //! plain-HTTP fetch, so the check fails closed and has no switch to turn
-//! it off. A leaf that names no point passes unchecked, which
+//! it off. A leaf that names no point but an OCSP responder is checked by
+//! OCSP instead (ADR-020): one GET per responder over plain HTTP, the
+//! answer verified against the leaf's issuer on the verified path (or a
+//! responder that issuer authorized), cached by the same rules; a revoked
+//! answer is [`Error::Revoked`], and every answer that does not settle the
+//! leaf, an unreachable responder included, is
+//! [`Error::RevocationUnknown`]. A leaf with neither passes unchecked, which
 //! [`TlsStream::revocation`] reports. Resumed sessions are checked again.
 //!
 //! The handshake has a total deadline, `ConnectOptions::handshake_timeout`,
@@ -64,8 +70,11 @@ pub use random::{RandomFailed, fill_random};
 pub use revocation::{
     CRL_CACHE_MAX_BYTES, CRL_CHECK_DEADLINE, CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT,
     CRL_IO_TIMEOUT, CRL_MAX_AGE_SECS, CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, CRL_MIN_RATE,
-    CRL_REFRESH_RETRY_SECS, CRL_SETUP_TIME, CrlFailure, CrlFailureKind, CrlFetchError, CrlScheme,
-    CrlSource, CrlUrl, MAX_CRL_BYTES, MAX_CRL_URL_BYTES, MAX_CRL_URLS, RevocationStatus,
+    CRL_REFRESH_RETRY_SECS, CRL_SETUP_TIME, CrlFetchError, CrlScheme, CrlSource, CrlUrl,
+    MAX_CRL_BYTES, MAX_CRL_URL_BYTES, MAX_CRL_URLS, MAX_OCSP_RESPONSE_BYTES,
+    MAX_OCSP_RESPONSE_CERTS, MAX_OCSP_URLS, OCSP_CACHE_MAX_ENTRIES, OCSP_CHECK_DEADLINE,
+    OCSP_MAX_AGE_SECS, OCSP_REFRESH_RETRY_SECS, OcspSource, RevocationFailure,
+    RevocationFailureKind, RevocationStatus,
 };
 pub use rsa::{KeyError, RsaSha256Key};
 pub use sha256::Sha256;
@@ -84,7 +93,7 @@ use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-use revocation::{HttpCrlSource, Revocation};
+use revocation::{HttpSource, Revocation};
 
 /// Everything that can go wrong while configuring or opening a TLS
 /// connection.
@@ -107,15 +116,18 @@ pub enum Error {
     Pem(pem::Error),
     /// A zero timeout or port.
     InvalidInput(&'static str),
-    /// The server's certificate is listed in the CRL at `url` (ADR-017).
+    /// The server's certificate is revoked: listed in the CRL at `url`
+    /// (ADR-017), or reported revoked by the OCSP responder at `url`
+    /// (ADR-020).
     Revoked {
-        /// The canonical URL of the list.
+        /// The canonical URL of the list or the responder.
         url: String,
     },
-    /// The server's certificate names CRL distribution points and none of
-    /// them settled whether it is revoked: each failure with its URL and
-    /// cause (ADR-017, item 4). The check fails closed.
-    RevocationUnknown(Vec<CrlFailure>),
+    /// The server's certificate names CRL distribution points or OCSP
+    /// responders and none of them settled whether it is revoked: each
+    /// failure with its URL and cause (ADR-017, item 4; ADR-020). The
+    /// check fails closed.
+    RevocationUnknown(Vec<RevocationFailure>),
 }
 
 impl fmt::Display for Error {
@@ -127,7 +139,7 @@ impl fmt::Display for Error {
             Error::NoCertificates => f.write_str("no certificates"),
             Error::Pem(e) => write!(f, "corrupt PEM: {e}"),
             Error::InvalidInput(what) => write!(f, "invalid input: {what}"),
-            Error::Revoked { url } => write!(f, "the certificate is revoked (CRL {url})"),
+            Error::Revoked { url } => write!(f, "the certificate is revoked ({url})"),
             Error::RevocationUnknown(failures) => {
                 f.write_str("the certificate's revocation status is unknown")?;
                 for (i, failure) in failures.iter().enumerate() {
@@ -236,9 +248,9 @@ impl Roots {
 /// the given roots (ADR-005). The key exchange groups are, in this order,
 /// X25519MLKEM768 (TLS 1.3 only), X25519, P-256 and P-384 (ADR-016), or
 /// the last three for [`TlsConfig::classical`]. Server certificates are
-/// checked for revocation by CRL (ADR-017), with no switch to turn it
-/// off. Cheap to clone; clones share the session store and the CRL cache,
-/// so share one per set of roots.
+/// checked for revocation by CRL (ADR-017) or OCSP (ADR-020), with no
+/// switch to turn it off. Cheap to clone; clones share the session store
+/// and the CRL and OCSP caches, so share one per set of roots.
 #[derive(Clone, Debug)]
 pub struct TlsConfig {
     client: Arc<ClientConfig>,
@@ -304,19 +316,20 @@ impl TlsConfig {
         client.enable_early_data = false;
         // `key_log` stays rustls' `NoKeyLog`.
         let client = Arc::new(client);
-        // `https` distribution points are fetched over the same client
-        // without a revocation check, which keeps the fetch from
-        // recursing (ADR-017, item 6).
+        // `https` distribution points and OCSP responders are fetched over
+        // the same client without a revocation check, which keeps the
+        // fetch from recursing (ADR-017, item 6; ADR-020, item 8).
         let fetch = TlsConfig {
             client: Arc::clone(&client),
             roots: Arc::clone(&roots),
             revocation: Arc::new(Revocation::off()),
         };
-        let source: Arc<dyn CrlSource> = Arc::new(HttpCrlSource::new(fetch));
+        let source = Arc::new(HttpSource::new(fetch));
         Ok(TlsConfig {
             revocation: Arc::new(Revocation::on(
                 Arc::clone(&roots),
                 Arc::clone(client.crypto_provider()),
+                Arc::clone(&source) as Arc<dyn CrlSource>,
                 source,
             )),
             client,
@@ -324,26 +337,37 @@ impl TlsConfig {
         })
     }
 
-    /// The same configuration with CRLs from `source` and an empty cache
-    /// of its own (ADR-017, item 10): for tests, and for a source that
-    /// reaches CRLs another way. Whatever the source returns is verified
-    /// against this configuration's roots and the system clock; a source
-    /// can make connections fail, never pass a certificate a valid list
-    /// revokes.
+    /// The same configuration with CRLs from `source`, the OCSP source of
+    /// this one, and both caches empty (ADR-017, item 10): for tests, and
+    /// for a source that reaches CRLs another way. Whatever the source
+    /// returns is verified against this configuration's roots and the
+    /// system clock; a source can make connections fail, never pass a
+    /// certificate a valid list revokes.
     pub fn with_crl_source(&self, source: Arc<dyn CrlSource>) -> TlsConfig {
         TlsConfig {
             client: Arc::clone(&self.client),
             roots: Arc::clone(&self.roots),
-            revocation: Arc::new(Revocation::on(
-                Arc::clone(&self.roots),
-                Arc::clone(self.client.crypto_provider()),
-                source,
-            )),
+            revocation: Arc::new(self.revocation.with_sources(Some(source), None)),
+        }
+    }
+
+    /// The same configuration with OCSP responses from `source`, the CRL
+    /// source of this one, and both caches empty (ADR-020, item 11): for
+    /// tests, and for a source that reaches responders another way.
+    /// Whatever the source returns is verified against the leaf's issuer
+    /// on the path these roots verify, the leaf's CertID and the system
+    /// clock; a source can make connections fail, never pass a certificate
+    /// the issuer reports revoked in an answer still valid.
+    pub fn with_ocsp_source(&self, source: Arc<dyn OcspSource>) -> TlsConfig {
+        TlsConfig {
+            client: Arc::clone(&self.client),
+            roots: Arc::clone(&self.roots),
+            revocation: Arc::new(self.revocation.with_sources(None, Some(source))),
         }
     }
 
     /// The same configuration without a revocation check: what an `https`
-    /// CRL fetch connects with.
+    /// CRL or OCSP fetch connects with.
     #[cfg(test)]
     pub(crate) fn without_revocation(&self) -> TlsConfig {
         TlsConfig {
@@ -359,9 +383,11 @@ impl TlsConfig {
 /// 7).
 ///
 /// The revocation check after the handshake has its own deadline,
-/// [`CRL_CHECK_DEADLINE`], shared by all the leaf's CRL URLs: on a cold
-/// cache, or once a list is due again, it adds at most that to `connect`
-/// and `connect_over` (ADR-017, item 7). A warm cache adds no I/O.
+/// [`CRL_CHECK_DEADLINE`], shared by all the leaf's CRL URLs, or
+/// [`OCSP_CHECK_DEADLINE`] for a leaf checked by OCSP: on a cold cache, or
+/// once a list or answer is due again, it adds at most that to `connect`
+/// and `connect_over` (ADR-017, item 7; ADR-020, item 7). A warm cache
+/// adds no I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
     connect_timeout: Duration,
@@ -502,9 +528,9 @@ fn handshake<S: Transport>(
     let revocation = match conn.peer_certificates() {
         Some(chain) => config.revocation.check(chain, &name, outer)?,
         None => {
-            return Err(Error::RevocationUnknown(vec![CrlFailure {
+            return Err(Error::RevocationUnknown(vec![RevocationFailure {
                 url: None,
-                kind: CrlFailureKind::NotSettled,
+                kind: RevocationFailureKind::NotSettled,
                 detail: "the server sent no certificate".into(),
             }]));
         }
@@ -706,9 +732,10 @@ impl<S: Read + Write> TlsStream<S> {
             .map(|group| group.name())
     }
 
-    /// What the revocation check found (ADR-017): checked against which
-    /// list, decided by a stale cached list, or a certificate without a
-    /// distribution point that passed unchecked. For tests and logs.
+    /// What the revocation check found (ADR-017, ADR-020): checked against
+    /// which list or responder, decided by a stale cached list or answer,
+    /// or a certificate without either source that passed unchecked. For
+    /// tests and logs.
     pub fn revocation(&self) -> &RevocationStatus {
         &self.revocation
     }

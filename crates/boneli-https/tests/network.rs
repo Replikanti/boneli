@@ -9,8 +9,10 @@
 //!
 //! Revocation by CRL (ADR-017, item 12): Let's Encrypt's test sites serve
 //! a revoked and a valid leaf whose CRLs come from a real CA over the
-//! real network path, which no loopback test reaches. Run them by hand
-//! before a change under `src/revocation/` merges:
+//! real network path, which no loopback test reaches. Revocation by OCSP
+//! (ADR-020, item 12): the six forge hosts whose leaves name only an OCSP
+//! responder must be checked by Sectigo's. Run them by hand before a
+//! change under `src/revocation/` merges:
 //!
 //! ```sh
 //! cargo test -p boneli-https --test network -- --ignored --nocapture
@@ -109,4 +111,37 @@ fn runner_hosts_revocation_status() {
         let tls = connect(host, 443, &config, &live_options()).expect(host);
         println!("{host}: {:?}", tls.revocation());
     }
+}
+
+/// The forge hosts whose leaves name no CRL point and one OCSP responder,
+/// Sectigo's (ADR-020, Context).
+const OCSP_HOSTS: [&str; 6] = [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "ghcr.io",
+    "gitlab.com",
+    "registry.gitlab.com",
+];
+
+#[test]
+#[ignore = "network: reaches GitHub, GHCR, GitLab and ocsp.sectigo.com"]
+fn forge_hosts_checked_by_ocsp() {
+    let config = TlsConfig::new(Roots::mozilla()).expect("config");
+    let mut wrong = Vec::new();
+    for host in OCSP_HOSTS {
+        let status =
+            connect(host, 443, &config, &live_options()).map(|tls| tls.revocation().clone());
+        println!("{host}: {status:?}");
+        let expected = RevocationStatus::OcspChecked {
+            url: "http://ocsp.sectigo.com/".into(),
+        };
+        if !matches!(&status, Ok(s) if *s == expected) {
+            wrong.push(host);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "not checked by Sectigo's responder: {wrong:?}"
+    );
 }

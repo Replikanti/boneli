@@ -548,9 +548,39 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Pull requests that touch the release files and dispatches build without
   publishing; a dispatch on `main` rehearses the publish path with a draft
   release that it deletes.
+- `boneli-https` (#79, ADR-020): certificate revocation by OCSP for
+  leaves that name an OCSP responder and no fetchable CRL point, the
+  leaves of GitHub, GHCR and GitLab among them. The check re-verifies the
+  chain with webpki for the leaf's issuer, sends one GET per responder
+  (RFC 6960, A.1; one SHA-1 CertID, no nonce) over plain HTTP, and
+  accepts an answer only when the issuer or a responder certificate it
+  issued for `id-kp-OCSPSigning` signed it, it names exactly the leaf's
+  CertID and it is before its `nextUpdate`. A revoked answer fails with
+  `Error::Revoked`; unknown, responder errors, unreachable, malformed,
+  expired and badly signed answers fail with `Error::RevocationUnknown`
+  (fail closed, no opt-out). Answers are cached per CertID by ADR-017's
+  staleness rules (24 h maximum age, soft refresh, 1 h retry), and a
+  revocation is never undone before its `nextUpdate`. New public items:
+  `OcspSource`, `TlsConfig::with_ocsp_source`,
+  `RevocationStatus::OcspChecked` and `OcspCheckedStale`, the failure
+  kinds `ResponderError`, `UnknownCertificate` and `BadSignature`, and the
+  limits `MAX_OCSP_URLS` (2), `MAX_OCSP_RESPONSE_BYTES` (64 KiB),
+  `MAX_OCSP_RESPONSE_CERTS` (4), `OCSP_CHECK_DEADLINE` (31 s),
+  `OCSP_CACHE_MAX_ENTRIES` (1,024), `OCSP_MAX_AGE_SECS` and
+  `OCSP_REFRESH_RETRY_SECS`. Two direct edges to crates already in the
+  graph, `rustls-webpki` and `ring`; no new crate. ADR-017's first known
+  limit points to ADR-020.
 
 ### Changed
 
+- `boneli-https` (#79): the revocation names that were CRL-only now cover
+  OCSP too. `CrlFailure` is `RevocationFailure`, `CrlFailureKind` is
+  `RevocationFailureKind`, its `BadDistributionPoint` is `BadUrl`, and
+  `RevocationStatus::NoDistributionPoint` is `NoRevocationSource`.
+  `Error::Revoked` reads `the certificate is revoked (<url>)`, without
+  "CRL". The transport types (`CrlSource`, `CrlUrl`, `CrlScheme`,
+  `CrlFetchError`) and the `CRL_*` fetch limits keep their names and are
+  shared by both mechanisms.
 - The architecture check is the Rust crate `boneli-arch-check`, a tool
   root in `roles.roots` that is held to every rule it enforces (ADR-015).
   `tools/check-architecture.sh` runs every cargo call from `/`, so no

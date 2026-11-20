@@ -1,4 +1,4 @@
-//! Certificate revocation by CRL (ADR-017).
+//! Certificate revocation by CRL (ADR-017) and OCSP (ADR-020).
 //!
 //! After rustls has verified the chain in the handshake, the check reads
 //! the CRL distribution points of the verified leaf, fetches each CRL
@@ -7,8 +7,10 @@
 //! only, unknown status is an error, an expired list is an error. A leaf
 //! listed in a list fails the connection with `Error::Revoked`; a leaf that
 //! names a point no list settles fails it with `Error::RevocationUnknown`
-//! (D1: fail closed, no opt-out); a leaf that names no fetchable point
-//! passes unchecked (D2).
+//! (D1: fail closed, no opt-out). A leaf that names no fetchable point
+//! but an OCSP responder is checked by OCSP instead (`ocsp`, ADR-020),
+//! with the same outcomes; a leaf with neither passes unchecked (ADR-017,
+//! D2).
 //!
 //! The check runs on `peer_certificates()` after the handshake, not in a
 //! verifier inside it, because rustls skips the verifier on resumed
@@ -17,11 +19,16 @@
 mod cache;
 mod der;
 mod http;
+mod ocsp;
 mod url;
 
+pub use ocsp::{
+    MAX_OCSP_RESPONSE_BYTES, MAX_OCSP_RESPONSE_CERTS, MAX_OCSP_URLS, OCSP_CACHE_MAX_ENTRIES,
+    OCSP_CHECK_DEADLINE, OCSP_MAX_AGE_SECS, OCSP_REFRESH_RETRY_SECS, OcspSource,
+};
 pub use url::{CrlScheme, CrlUrl};
 
-pub(crate) use http::HttpCrlSource;
+pub(crate) use http::HttpSource;
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -35,6 +42,7 @@ use rustls::{CertificateError, RootCertStore};
 
 use crate::Error;
 use cache::{CrlCache, Entry, Lookup};
+use ocsp::OcspCache;
 use url::Candidate;
 
 /// The largest CRL accepted, in bytes (32 MiB; D4): 3.05 times the largest
@@ -86,7 +94,8 @@ pub const CRL_MIN_RATE: u64 = 1_048_576;
 pub const CRL_CHECK_DEADLINE: Duration =
     Duration::from_secs(CRL_SETUP_TIME.as_secs() + MAX_CRL_BYTES as u64 / CRL_MIN_RATE);
 
-/// The largest response head of a fetch, in bytes.
+/// The largest response head of a fetch, in bytes. Shared by CRL and
+/// OCSP fetches, as are the timeouts above (ADR-020, item 7).
 pub const CRL_MAX_HEAD_BYTES: usize = 16_384;
 
 /// The most header fields in the response head of a fetch.
@@ -103,7 +112,8 @@ pub trait CrlSource: Send + Sync {
     fn fetch(&self, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError>;
 }
 
-/// Why a source returned no list.
+/// Why a source returned no list or response; shared by `CrlSource` and
+/// `OcspSource`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CrlFetchError {
     /// No connection, or the connection failed.
@@ -112,7 +122,7 @@ pub enum CrlFetchError {
     TimedOut,
     /// A status other than 200; redirects are not followed.
     Status(u16),
-    /// More than `MAX_CRL_BYTES`.
+    /// More than `MAX_CRL_BYTES`, or `MAX_OCSP_RESPONSE_BYTES` for OCSP.
     TooLarge,
     /// A response this client does not accept, such as a content coding
     /// or a head over its limits.
@@ -125,7 +135,7 @@ impl fmt::Display for CrlFetchError {
             CrlFetchError::Unreachable(why) => write!(f, "unreachable: {why}"),
             CrlFetchError::TimedOut => f.write_str("timed out"),
             CrlFetchError::Status(status) => write!(f, "status {status}"),
-            CrlFetchError::TooLarge => f.write_str("larger than the CRL size cap"),
+            CrlFetchError::TooLarge => f.write_str("larger than the size cap"),
             CrlFetchError::Malformed(why) => write!(f, "malformed response: {why}"),
         }
     }
@@ -148,81 +158,112 @@ pub enum RevocationStatus {
         /// The canonical URL of the list.
         url: String,
     },
-    /// The leaf names no `http` or `https` CRL distribution point, so it
-    /// passes unchecked (ADR-017, D2).
-    NoDistributionPoint,
+    /// The OCSP responder at `url` settled the leaf as not revoked
+    /// (ADR-020).
+    OcspChecked {
+        /// The canonical URL of the responder.
+        url: String,
+    },
+    /// A cached OCSP answer past its maximum age settled the leaf, because
+    /// its refresh is failing or another connection is running it. The
+    /// answer is still before its `nextUpdate`; from then on the check
+    /// fails closed.
+    OcspCheckedStale {
+        /// The canonical URL of the responder.
+        url: String,
+    },
+    /// The leaf names neither an `http` or `https` CRL distribution point
+    /// nor such an OCSP responder, so it passes unchecked (ADR-017, D2).
+    NoRevocationSource,
 }
 
-/// Why one distribution point did not settle the leaf.
+/// Why one distribution point or OCSP responder did not settle the leaf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CrlFailureKind {
+pub enum RevocationFailureKind {
     /// Not a URL this client fetches, or the extension cannot be read.
-    BadDistributionPoint,
+    BadUrl,
     /// No connection, or it failed.
     Unreachable,
     /// The fetch ran out of time.
     TimedOut,
     /// A status other than 200.
     Status,
-    /// More than `MAX_CRL_BYTES`.
+    /// More than `MAX_CRL_BYTES` or `MAX_OCSP_RESPONSE_BYTES`.
     TooLarge,
-    /// Not a CRL webpki accepts, or its dates are reversed.
+    /// Not a CRL webpki accepts or an OCSP response this client parses, or
+    /// its dates are reversed or missing.
     Malformed,
     /// At or past its `nextUpdate`.
     Expired,
-    /// A valid list that does not cover the leaf: another issuer, another
-    /// shard, a bad signature.
+    /// A valid list that does not cover the leaf (another issuer, another
+    /// shard, a bad signature), or an OCSP response that names another
+    /// certificate.
     NotSettled,
+    /// An OCSP responder answered with an error status: `malformedRequest`,
+    /// `internalError`, `tryLater`, `sigRequired` or `unauthorized`.
+    ResponderError,
+    /// An OCSP responder does not know the certificate (`unknown`).
+    UnknownCertificate,
+    /// An OCSP response not signed by the leaf's issuer or a responder
+    /// it authorized.
+    BadSignature,
 }
 
-impl fmt::Display for CrlFailureKind {
+impl fmt::Display for RevocationFailureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            CrlFailureKind::BadDistributionPoint => "bad distribution point",
-            CrlFailureKind::Unreachable => "unreachable",
-            CrlFailureKind::TimedOut => "timed out",
-            CrlFailureKind::Status => "unexpected status",
-            CrlFailureKind::TooLarge => "too large",
-            CrlFailureKind::Malformed => "malformed",
-            CrlFailureKind::Expired => "expired",
-            CrlFailureKind::NotSettled => "does not settle the certificate",
+            RevocationFailureKind::BadUrl => "bad URL",
+            RevocationFailureKind::Unreachable => "unreachable",
+            RevocationFailureKind::TimedOut => "timed out",
+            RevocationFailureKind::Status => "unexpected status",
+            RevocationFailureKind::TooLarge => "too large",
+            RevocationFailureKind::Malformed => "malformed",
+            RevocationFailureKind::Expired => "expired",
+            RevocationFailureKind::NotSettled => "does not settle the certificate",
+            RevocationFailureKind::ResponderError => "responder error",
+            RevocationFailureKind::UnknownCertificate => "unknown certificate",
+            RevocationFailureKind::BadSignature => "bad signature",
         })
     }
 }
 
-/// One distribution point that did not settle the leaf.
+/// One distribution point or OCSP responder that did not settle the leaf.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrlFailure {
-    /// The canonical URL, when the point was one.
+pub struct RevocationFailure {
+    /// The canonical URL, when the point or responder was one.
     pub url: Option<String>,
     /// What went wrong.
-    pub kind: CrlFailureKind,
+    pub kind: RevocationFailureKind,
     /// The details, for logs.
     pub detail: String,
 }
 
-impl CrlFailure {
-    fn new(url: Option<&CrlUrl>, kind: CrlFailureKind, detail: impl Into<String>) -> CrlFailure {
-        CrlFailure {
+impl RevocationFailure {
+    fn new(
+        url: Option<&CrlUrl>,
+        kind: RevocationFailureKind,
+        detail: impl Into<String>,
+    ) -> RevocationFailure {
+        RevocationFailure {
             url: url.map(|u| u.as_str().to_owned()),
             kind,
             detail: detail.into(),
         }
     }
 
-    fn from_fetch(url: &CrlUrl, e: CrlFetchError) -> CrlFailure {
+    fn from_fetch(url: &CrlUrl, e: CrlFetchError) -> RevocationFailure {
         let kind = match e {
-            CrlFetchError::Unreachable(_) => CrlFailureKind::Unreachable,
-            CrlFetchError::TimedOut => CrlFailureKind::TimedOut,
-            CrlFetchError::Status(_) => CrlFailureKind::Status,
-            CrlFetchError::TooLarge => CrlFailureKind::TooLarge,
-            CrlFetchError::Malformed(_) => CrlFailureKind::Malformed,
+            CrlFetchError::Unreachable(_) => RevocationFailureKind::Unreachable,
+            CrlFetchError::TimedOut => RevocationFailureKind::TimedOut,
+            CrlFetchError::Status(_) => RevocationFailureKind::Status,
+            CrlFetchError::TooLarge => RevocationFailureKind::TooLarge,
+            CrlFetchError::Malformed(_) => RevocationFailureKind::Malformed,
         };
-        CrlFailure::new(Some(url), kind, e.to_string())
+        RevocationFailure::new(Some(url), kind, e.to_string())
     }
 }
 
-impl fmt::Display for CrlFailure {
+impl fmt::Display for RevocationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.url {
             Some(url) => write!(f, "{url}: {} ({})", self.kind, self.detail),
@@ -237,14 +278,16 @@ pub(crate) struct Revocation {
 }
 
 enum Mode {
-    /// Only the crate-private configuration of an `https` CRL fetch
-    /// (ADR-017, item 6); no public constructor builds it.
+    /// Only the crate-private configuration of an `https` CRL or OCSP
+    /// fetch (ADR-017, item 6); no public constructor builds it.
     Off,
     On {
         roots: Arc<RootCertStore>,
         provider: Arc<CryptoProvider>,
         source: Arc<dyn CrlSource>,
         cache: Mutex<CrlCache>,
+        ocsp_source: Arc<dyn OcspSource>,
+        ocsp_cache: Mutex<OcspCache>,
     },
 }
 
@@ -278,7 +321,7 @@ enum Verdict {
 enum Outcome {
     /// Not revoked, by these lists.
     Settled(RevocationStatus, Vec<Arc<WebPkiServerVerifier>>),
-    Failed(CrlFailure),
+    Failed(RevocationFailure),
 }
 
 /// The leaf and the time of one check.
@@ -291,13 +334,25 @@ struct Leaf<'a> {
     deadline: Instant,
 }
 
+/// `started + limit`, never past `outer`.
+fn deadline(limit: Duration, outer: Option<Instant>) -> Instant {
+    let started = Instant::now();
+    let deadline = started.checked_add(limit).unwrap_or(started);
+    match outer {
+        Some(outer) => deadline.min(outer),
+        None => deadline,
+    }
+}
+
 impl Revocation {
-    /// Checks revocation with lists from `source`, verified against
-    /// `roots` with `provider`'s algorithms: those of the handshake.
+    /// Checks revocation with lists from `source` and OCSP responses from
+    /// `ocsp_source`, verified against `roots` with `provider`'s
+    /// algorithms: those of the handshake. Both caches start empty.
     pub(crate) fn on(
         roots: Arc<RootCertStore>,
         provider: Arc<CryptoProvider>,
         source: Arc<dyn CrlSource>,
+        ocsp_source: Arc<dyn OcspSource>,
     ) -> Revocation {
         Revocation {
             mode: Mode::On {
@@ -305,13 +360,39 @@ impl Revocation {
                 provider,
                 source,
                 cache: Mutex::new(CrlCache::new()),
+                ocsp_source,
+                ocsp_cache: Mutex::new(OcspCache::new()),
             },
         }
     }
 
-    /// No check, for the connection of an `https` CRL fetch only.
+    /// No check, for the connection of an `https` CRL or OCSP fetch only.
     pub(crate) fn off() -> Revocation {
         Revocation { mode: Mode::Off }
+    }
+
+    /// The same check with `crl` or `ocsp` in place of its sources, where
+    /// given, and both caches empty. A check that is off stays off.
+    pub(crate) fn with_sources(
+        &self,
+        crl: Option<Arc<dyn CrlSource>>,
+        ocsp: Option<Arc<dyn OcspSource>>,
+    ) -> Revocation {
+        match &self.mode {
+            Mode::Off => Revocation::off(),
+            Mode::On {
+                roots,
+                provider,
+                source,
+                ocsp_source,
+                ..
+            } => Revocation::on(
+                Arc::clone(roots),
+                Arc::clone(provider),
+                crl.unwrap_or_else(|| Arc::clone(source)),
+                ocsp.unwrap_or_else(|| Arc::clone(ocsp_source)),
+            ),
+        }
     }
 
     /// The check at the system clock's time.
@@ -325,8 +406,11 @@ impl Revocation {
     }
 
     /// The check of a verified `chain` (leaf first) for `name` at `now`,
-    /// which is used throughout: the cache, the validity of each list and
-    /// webpki's verification. `outer` cuts the check's deadline shorter.
+    /// which is used throughout: the cache, the validity of each list or
+    /// answer and webpki's verification. `outer` cuts the check's deadline
+    /// shorter. A leaf with an `http` or `https` CRL point takes the CRL
+    /// path only; a leaf without one and with such an OCSP responder takes
+    /// the OCSP path (ADR-020, item 1).
     pub(crate) fn check_at(
         &self,
         chain: &[CertificateDer<'_>],
@@ -334,24 +418,31 @@ impl Revocation {
         outer: Option<Instant>,
         now: UnixTime,
     ) -> crate::Result<RevocationStatus> {
-        let Mode::On { .. } = self.mode else {
+        let Mode::On {
+            roots,
+            provider,
+            ocsp_source,
+            ocsp_cache,
+            ..
+        } = &self.mode
+        else {
             // Never reaches a caller: only the connection of an `https`
-            // CRL fetch runs without a check.
-            return Ok(RevocationStatus::NoDistributionPoint);
+            // CRL or OCSP fetch runs without a check.
+            return Ok(RevocationStatus::NoRevocationSource);
         };
         let Some((cert, intermediates)) = chain.split_first() else {
-            return Err(Error::RevocationUnknown(vec![CrlFailure::new(
+            return Err(Error::RevocationUnknown(vec![RevocationFailure::new(
                 None,
-                CrlFailureKind::NotSettled,
+                RevocationFailureKind::NotSettled,
                 "the server sent no certificate",
             )]));
         };
         // rustls verified this leaf in the handshake: the reader reads
         // only bytes webpki has accepted (ADR-017, item 9).
         let uris = der::distribution_point_uris(cert.as_ref()).map_err(|e| {
-            Error::RevocationUnknown(vec![CrlFailure::new(
+            Error::RevocationUnknown(vec![RevocationFailure::new(
                 None,
-                CrlFailureKind::BadDistributionPoint,
+                RevocationFailureKind::BadUrl,
                 format!("the certificate's CRL distribution points cannot be read: {e}"),
             )])
         })?;
@@ -362,12 +453,32 @@ impl Revocation {
             .take(MAX_CRL_URLS)
             .collect();
         if candidates.is_empty() {
-            return Ok(RevocationStatus::NoDistributionPoint);
-        }
-        let started = Instant::now();
-        let mut deadline = started.checked_add(CRL_CHECK_DEADLINE).unwrap_or(started);
-        if let Some(outer) = outer {
-            deadline = deadline.min(outer);
+            let responders = der::ocsp_responder_uris(cert.as_ref()).map_err(|e| {
+                Error::RevocationUnknown(vec![RevocationFailure::new(
+                    None,
+                    RevocationFailureKind::BadUrl,
+                    format!("the certificate's OCSP responders cannot be read: {e}"),
+                )])
+            })?;
+            let candidates = ocsp::candidates(&responders);
+            if candidates.is_empty() {
+                return Ok(RevocationStatus::NoRevocationSource);
+            }
+            let leaf = Leaf {
+                cert,
+                intermediates,
+                name,
+                now,
+                secs: now.as_secs(),
+                deadline: deadline(OCSP_CHECK_DEADLINE, outer),
+            };
+            let ctx = ocsp::Context {
+                roots,
+                algorithms: provider.signature_verification_algorithms.all,
+                source: ocsp_source.as_ref(),
+                cache: ocsp_cache,
+            };
+            return ocsp::check(&ctx, &leaf, &candidates);
         }
         let leaf = Leaf {
             cert,
@@ -375,7 +486,7 @@ impl Revocation {
             name,
             now,
             secs: now.as_secs(),
-            deadline,
+            deadline: deadline(CRL_CHECK_DEADLINE, outer),
         };
         let urls: Vec<&CrlUrl> = candidates
             .iter()
@@ -389,9 +500,9 @@ impl Revocation {
             let url = match candidate {
                 Candidate::Fetch(url) => url,
                 Candidate::Bad(why) => {
-                    failures.push(CrlFailure::new(
+                    failures.push(RevocationFailure::new(
                         None,
-                        CrlFailureKind::BadDistributionPoint,
+                        RevocationFailureKind::BadUrl,
                         *why,
                     ));
                     continue;
@@ -450,9 +561,9 @@ impl Revocation {
     /// (ADR-017, items 4 and 8). `Revoked` is an error at once.
     fn check_url(&self, url: &CrlUrl, leaf: &Leaf<'_>) -> crate::Result<Outcome> {
         let Mode::On { cache, .. } = &self.mode else {
-            return Ok(Outcome::Failed(CrlFailure::new(
+            return Ok(Outcome::Failed(RevocationFailure::new(
                 Some(url),
-                CrlFailureKind::NotSettled,
+                RevocationFailureKind::NotSettled,
                 "no revocation check",
             )));
         };
@@ -507,14 +618,14 @@ impl Revocation {
                         self.store(url, fetched, leaf.secs);
                         Err(revoked(url))
                     }
-                    Verdict::Expired(detail) => Ok(Outcome::Failed(CrlFailure::new(
+                    Verdict::Expired(detail) => Ok(Outcome::Failed(RevocationFailure::new(
                         Some(url),
-                        CrlFailureKind::Expired,
+                        RevocationFailureKind::Expired,
                         detail,
                     ))),
-                    Verdict::NotSettled(detail) => Ok(Outcome::Failed(CrlFailure::new(
+                    Verdict::NotSettled(detail) => Ok(Outcome::Failed(RevocationFailure::new(
                         Some(url),
-                        CrlFailureKind::NotSettled,
+                        RevocationFailureKind::NotSettled,
                         detail,
                     ))),
                 }
@@ -523,7 +634,7 @@ impl Revocation {
     }
 
     /// Fetches, size-checks, parses and date-checks the list at `url`.
-    fn fetch(&self, url: &CrlUrl, leaf: &Leaf<'_>) -> Result<Fetched, CrlFailure> {
+    fn fetch(&self, url: &CrlUrl, leaf: &Leaf<'_>) -> Result<Fetched, RevocationFailure> {
         let Mode::On {
             roots,
             provider,
@@ -531,20 +642,20 @@ impl Revocation {
             ..
         } = &self.mode
         else {
-            return Err(CrlFailure::new(
+            return Err(RevocationFailure::new(
                 Some(url),
-                CrlFailureKind::NotSettled,
+                RevocationFailureKind::NotSettled,
                 "off",
             ));
         };
         let bytes = source
             .fetch(url, leaf.deadline)
-            .map_err(|e| CrlFailure::from_fetch(url, e))?;
+            .map_err(|e| RevocationFailure::from_fetch(url, e))?;
         // Any source, not only the HTTP one, is held to the cap.
         if bytes.len() > MAX_CRL_BYTES {
-            return Err(CrlFailure::new(
+            return Err(RevocationFailure::new(
                 Some(url),
-                CrlFailureKind::TooLarge,
+                RevocationFailureKind::TooLarge,
                 format!("{} bytes", bytes.len()),
             ));
         }
@@ -561,12 +672,17 @@ impl Revocation {
                 .enforce_revocation_expiration()
                 .build()
                 .map_err(|e| {
-                    CrlFailure::new(Some(url), CrlFailureKind::Malformed, e.to_string())
+                    RevocationFailure::new(
+                        Some(url),
+                        RevocationFailureKind::Malformed,
+                        e.to_string(),
+                    )
                 })?;
-        let (this_update, next_update) = validity
-            .map_err(|e| CrlFailure::new(Some(url), CrlFailureKind::Malformed, e.to_string()))?;
+        let (this_update, next_update) = validity.map_err(|e| {
+            RevocationFailure::new(Some(url), RevocationFailureKind::Malformed, e.to_string())
+        })?;
         if let Some((kind, detail)) = validity_failure(this_update, next_update, leaf.secs) {
-            return Err(CrlFailure::new(Some(url), kind, detail));
+            return Err(RevocationFailure::new(Some(url), kind, detail));
         }
         Ok(Fetched {
             verifier,
@@ -599,13 +715,16 @@ fn validity_failure(
     this_update: u64,
     next_update: u64,
     now: u64,
-) -> Option<(CrlFailureKind, &'static str)> {
+) -> Option<(RevocationFailureKind, &'static str)> {
     if next_update < this_update {
-        return Some((CrlFailureKind::Malformed, "nextUpdate is before thisUpdate"));
+        return Some((
+            RevocationFailureKind::Malformed,
+            "nextUpdate is before thisUpdate",
+        ));
     }
     if next_update <= now {
         return Some((
-            CrlFailureKind::Expired,
+            RevocationFailureKind::Expired,
             "the list is at or past its nextUpdate",
         ));
     }
@@ -628,17 +747,23 @@ fn decide(
             Verdict::Revoked => return Err(revoked(url)),
             Verdict::Good => good.push(verifier),
             Verdict::Expired(detail) => {
-                failure.get_or_insert((CrlFailureKind::Expired, detail));
+                failure.get_or_insert((RevocationFailureKind::Expired, detail));
             }
             Verdict::NotSettled(detail) => {
-                failure.get_or_insert((CrlFailureKind::NotSettled, detail));
+                failure.get_or_insert((RevocationFailureKind::NotSettled, detail));
             }
         }
     }
     if good.is_empty() {
-        let (kind, detail) =
-            failure.unwrap_or((CrlFailureKind::NotSettled, "no cached list".to_owned()));
-        return Ok(Outcome::Failed(CrlFailure::new(Some(url), kind, detail)));
+        let (kind, detail) = failure.unwrap_or((
+            RevocationFailureKind::NotSettled,
+            "no cached list".to_owned(),
+        ));
+        return Ok(Outcome::Failed(RevocationFailure::new(
+            Some(url),
+            kind,
+            detail,
+        )));
     }
     let url = url.as_str().to_owned();
     let status = if stale {
@@ -671,9 +796,26 @@ fn revoked(url: &CrlUrl) -> Error {
     }
 }
 
-/// The cache's lock. A poisoned one is recovered and the cache cleared:
+/// A cache that a poisoned lock clears.
+trait Clear {
+    fn clear(&mut self);
+}
+
+impl Clear for CrlCache {
+    fn clear(&mut self) {
+        CrlCache::clear(self);
+    }
+}
+
+impl Clear for OcspCache {
+    fn clear(&mut self) {
+        OcspCache::clear(self);
+    }
+}
+
+/// A cache's lock. A poisoned one is recovered and the cache cleared:
 /// the cache only saves fetches.
-fn lock(cache: &Mutex<CrlCache>) -> MutexGuard<'_, CrlCache> {
+fn lock<T: Clear>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
     match cache.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -814,8 +956,18 @@ pub(crate) mod tests {
         Err(CrlFetchError::Unreachable("refused".into()))
     }
 
+    /// An OCSP source that must never be asked: no CRL fixture names a
+    /// responder.
+    struct NoOcsp;
+
+    impl OcspSource for NoOcsp {
+        fn fetch(&self, url: &CrlUrl, _request: &[u8], _deadline: Instant) -> Reply {
+            panic!("OCSP fetch of {url}")
+        }
+    }
+
     fn revocation(source: Arc<dyn CrlSource>) -> Revocation {
-        Revocation::on(roots(), provider(), source)
+        Revocation::on(roots(), provider(), source, Arc::new(NoOcsp))
     }
 
     fn check(r: &Revocation, leaf: &[u8], secs: u64) -> crate::Result<RevocationStatus> {
@@ -830,7 +982,7 @@ pub(crate) mod tests {
         RevocationStatus::CheckedStale { url: URL.into() }
     }
 
-    fn kinds(result: crate::Result<RevocationStatus>) -> Vec<CrlFailureKind> {
+    fn kinds(result: crate::Result<RevocationStatus>) -> Vec<RevocationFailureKind> {
         match result {
             Err(Error::RevocationUnknown(failures)) => failures.iter().map(|f| f.kind).collect(),
             other => panic!("expected RevocationUnknown, got {other:?}"),
@@ -882,10 +1034,16 @@ pub(crate) mod tests {
         check(&r, GOOD, WEEK1_END).expect("day2");
         assert_eq!(script.calls(), 2);
         // Day2's `nextUpdate`, and exactly its maximum age.
-        assert_eq!(kinds(check(&r, GOOD, DAY2_END)), [CrlFailureKind::Expired]);
+        assert_eq!(
+            kinds(check(&r, GOOD, DAY2_END)),
+            [RevocationFailureKind::Expired]
+        );
         assert_eq!(script.calls(), 3);
         assert!(entry(&r).is_none(), "not cached");
-        assert_eq!(kinds(check(&r, GOOD, DAY2_END)), [CrlFailureKind::Expired]);
+        assert_eq!(
+            kinds(check(&r, GOOD, DAY2_END)),
+            [RevocationFailureKind::Expired]
+        );
         assert_eq!(script.calls(), 4);
     }
 
@@ -994,12 +1152,12 @@ pub(crate) mod tests {
         // Inside the retry wait, but the list has expired: fetched anyway.
         assert_eq!(
             kinds(check(&r, GOOD, WEEK1_END)),
-            [CrlFailureKind::Unreachable]
+            [RevocationFailureKind::Unreachable]
         );
         assert_eq!(script.calls(), 3);
         assert_eq!(
             kinds(check(&r, GOOD, WEEK1_END)),
-            [CrlFailureKind::Unreachable]
+            [RevocationFailureKind::Unreachable]
         );
         assert_eq!(script.calls(), 4);
     }
@@ -1011,7 +1169,7 @@ pub(crate) mod tests {
         check(&r, GOOD, WEEK1_END).expect("check");
         assert_eq!(
             kinds(check(&r, GOOD, DAY2_END)),
-            [CrlFailureKind::Unreachable]
+            [RevocationFailureKind::Unreachable]
         );
     }
 
@@ -1081,9 +1239,15 @@ pub(crate) mod tests {
     fn unsettling_list_is_not_cached() {
         let script = Script::new(vec![ok(OTHER_SHARD), ok(OTHER_SHARD)]);
         let r = revocation(script.clone());
-        assert_eq!(kinds(check(&r, GOOD, T0)), [CrlFailureKind::NotSettled]);
+        assert_eq!(
+            kinds(check(&r, GOOD, T0)),
+            [RevocationFailureKind::NotSettled]
+        );
         assert!(entry(&r).is_none());
-        assert_eq!(kinds(check(&r, GOOD, T0)), [CrlFailureKind::NotSettled]);
+        assert_eq!(
+            kinds(check(&r, GOOD, T0)),
+            [RevocationFailureKind::NotSettled]
+        );
         assert_eq!(script.calls(), 2);
     }
 
@@ -1142,7 +1306,7 @@ pub(crate) mod tests {
     fn zero_length_validity_is_expired() {
         assert_eq!(
             validity_failure(T0, T0, T0).map(|(kind, _)| kind),
-            Some(CrlFailureKind::Expired)
+            Some(RevocationFailureKind::Expired)
         );
         assert_eq!(validity_failure(T0, T0 + 1, T0), None);
     }
@@ -1151,11 +1315,14 @@ pub(crate) mod tests {
     fn reversed_validity_is_malformed() {
         assert_eq!(
             validity_failure(T0 + 1, T0, T0 - 5).map(|(kind, _)| kind),
-            Some(CrlFailureKind::Malformed)
+            Some(RevocationFailureKind::Malformed)
         );
         let script = Script::new(vec![ok(REVERSED)]);
         let r = revocation(script);
-        assert_eq!(kinds(check(&r, GOOD, T0)), [CrlFailureKind::Malformed]);
+        assert_eq!(
+            kinds(check(&r, GOOD, T0)),
+            [RevocationFailureKind::Malformed]
+        );
     }
 
     #[test]
@@ -1165,9 +1332,15 @@ pub(crate) mod tests {
             Ok(vec![0; MAX_CRL_BYTES]),
         ]);
         let r = revocation(script);
-        assert_eq!(kinds(check(&r, GOOD, T0)), [CrlFailureKind::TooLarge]);
+        assert_eq!(
+            kinds(check(&r, GOOD, T0)),
+            [RevocationFailureKind::TooLarge]
+        );
         // At the cap the size check passes and webpki refuses the bytes.
-        assert_eq!(kinds(check(&r, GOOD, T0)), [CrlFailureKind::Malformed]);
+        assert_eq!(
+            kinds(check(&r, GOOD, T0)),
+            [RevocationFailureKind::Malformed]
+        );
     }
 
     #[test]
@@ -1175,7 +1348,7 @@ pub(crate) mod tests {
         let script = Script::new(vec![]);
         let r = revocation(script.clone());
         let result = r.check_at(&[], &name(), None, time(T0));
-        assert_eq!(kinds(result), [CrlFailureKind::NotSettled]);
+        assert_eq!(kinds(result), [RevocationFailureKind::NotSettled]);
         assert_eq!(script.calls(), 0);
     }
 
@@ -1240,7 +1413,7 @@ pub(crate) mod tests {
         let r = Revocation::off();
         assert_eq!(
             check(&r, GOOD, T0).expect("off"),
-            RevocationStatus::NoDistributionPoint
+            RevocationStatus::NoRevocationSource
         );
     }
 
@@ -1252,7 +1425,10 @@ pub(crate) mod tests {
         let dps = include_bytes!("../../tests/data/crl-dps.pem");
         assert_eq!(
             kinds(check(&r, dps, T0)),
-            [CrlFailureKind::Unreachable, CrlFailureKind::Unreachable]
+            [
+                RevocationFailureKind::Unreachable,
+                RevocationFailureKind::Unreachable
+            ]
         );
         assert_eq!(
             script.asked(),

@@ -22,7 +22,7 @@ use boneli_http::{
     Transport, connect_tunnel,
 };
 use boneli_https::{
-    ConnectOptions, CrlFailureKind, CrlFetchError, CrlSource, CrlUrl, Dial, Error,
+    ConnectOptions, CrlFetchError, CrlSource, CrlUrl, Dial, Error, RevocationFailureKind,
     RevocationStatus, Roots, TlsConfig, TlsDial, TlsStream, connect, connect_over,
 };
 use rustls::pki_types::pem::PemObject;
@@ -283,7 +283,7 @@ fn assert_revoked<T: std::fmt::Debug>(result: boneli_https::Result<T>) {
 /// The failure kinds of a `RevocationUnknown`, each with its URL.
 fn failures<T: std::fmt::Debug>(
     result: boneli_https::Result<T>,
-) -> Vec<(Option<String>, CrlFailureKind)> {
+) -> Vec<(Option<String>, RevocationFailureKind)> {
     match result {
         Err(Error::RevocationUnknown(failures)) => {
             failures.into_iter().map(|f| (f.url, f.kind)).collect()
@@ -292,7 +292,7 @@ fn failures<T: std::fmt::Debug>(
     }
 }
 
-fn one(kind: CrlFailureKind) -> Vec<(Option<String>, CrlFailureKind)> {
+fn one(kind: RevocationFailureKind) -> Vec<(Option<String>, RevocationFailureKind)> {
     vec![(Some(URL.to_owned()), kind)]
 }
 
@@ -334,7 +334,7 @@ fn unreachable_crl_fails_closed() {
     let source = Fake::new(&[(URL, unreachable())]);
     assert_eq!(
         failures(connect_to(serve(GOOD), &config(source))),
-        one(CrlFailureKind::Unreachable)
+        one(RevocationFailureKind::Unreachable)
     );
     let error = connect_to(serve(GOOD), &config(Fake::new(&[]))).expect_err("unknown");
     let text = error.to_string();
@@ -356,7 +356,7 @@ fn malformed_crl_fails_closed() {
         let source = Fake::new(&[(URL, Ok(bytes))]);
         assert_eq!(
             failures(connect_to(serve(GOOD), &config(source))),
-            one(CrlFailureKind::Malformed),
+            one(RevocationFailureKind::Malformed),
             "{what}"
         );
     }
@@ -370,7 +370,7 @@ fn expired_crl_fails_closed_and_is_not_cached() {
     for _ in 0..2 {
         assert_eq!(
             failures(connect_to(serve(GOOD), &config)),
-            one(CrlFailureKind::Expired)
+            one(RevocationFailureKind::Expired)
         );
     }
     assert_eq!(source.asked(), [URL, URL], "asked again: not cached");
@@ -385,7 +385,7 @@ fn other_shard_fails_closed() {
             serve(REVOKED),
             &config(Fake::serving(OTHER_SHARD))
         )),
-        one(CrlFailureKind::NotSettled)
+        one(RevocationFailureKind::NotSettled)
     );
 }
 
@@ -402,7 +402,7 @@ fn matching_idp_is_used() {
 fn forged_issuer_fails_closed() {
     assert_eq!(
         failures(connect_to(serve(GOOD), &config(Fake::serving(FORGED)))),
-        one(CrlFailureKind::NotSettled)
+        one(RevocationFailureKind::NotSettled)
     );
 }
 
@@ -451,7 +451,11 @@ fn fifth_url_is_never_tried() {
     let source = Fake::new(&[(CRL5, ok(EMPTY))]);
     let found = failures(connect_to(serve(FIVE_URLS), &config(source.clone())));
     assert_eq!(found.len(), 4);
-    assert!(found.iter().all(|(_, k)| *k == CrlFailureKind::Unreachable));
+    assert!(
+        found
+            .iter()
+            .all(|(_, k)| *k == RevocationFailureKind::Unreachable)
+    );
     assert_eq!(source.asked(), [CRL1, CRL2, CRL3, CRL4]);
 }
 
@@ -470,7 +474,7 @@ fn ldap_only_passes_unchecked() {
     let source = Fake::new(&[]);
     assert_eq!(
         status_of(LDAP_ONLY, source.clone()).expect("connect"),
-        RevocationStatus::NoDistributionPoint
+        RevocationStatus::NoRevocationSource
     );
     assert!(source.asked().is_empty());
 }
@@ -480,17 +484,17 @@ fn reasons_only_passes_unchecked() {
     let source = Fake::new(&[]);
     assert_eq!(
         status_of(REASONS_ONLY, source.clone()).expect("connect"),
-        RevocationStatus::NoDistributionPoint
+        RevocationStatus::NoRevocationSource
     );
     assert!(source.asked().is_empty());
 }
 
 #[test]
-fn no_distribution_point_passes_unchecked() {
+fn no_source_passes_unchecked() {
     let source = Fake::new(&[]);
     let (addr, _server) = server(server_config(&[LEAF], LEAF_KEY, &both()), 1);
     let tls = connect_to(addr, &config(source.clone())).expect("connect");
-    assert_eq!(tls.revocation(), &RevocationStatus::NoDistributionPoint);
+    assert_eq!(tls.revocation(), &RevocationStatus::NoRevocationSource);
     assert!(source.asked().is_empty());
 }
 

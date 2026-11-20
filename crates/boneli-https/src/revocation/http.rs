@@ -1,12 +1,14 @@
-//! The real `CrlSource` (ADR-017, items 6 and 7): one HTTP/1.1 `GET` per
-//! fetch through `boneli-http`, directly from this process, under the
-//! check's deadline. `Host` is the only field sent: no `User-Agent`,
-//! credentials or cookies. 200 only, no redirect followed, no
-//! `Content-Encoding`, the body read to its end under `MAX_CRL_BYTES`.
-//! An `https` point is fetched over this crate's TLS client with the same
-//! roots and without a revocation check of its own, which keeps the fetch
-//! from recursing: the list's integrity comes from its signature, not
-//! from the transport.
+//! The real `CrlSource` and `OcspSource` (ADR-017, items 6 and 7; ADR-020,
+//! item 8): one HTTP/1.1 `GET` per fetch through `boneli-http`, directly
+//! from this process, under the check's deadline. `Host` is the only field
+//! sent: no `User-Agent`, credentials or cookies. 200 only, no redirect
+//! followed, no `Content-Encoding`, the body read to its end under
+//! `MAX_CRL_BYTES` for a list and `MAX_OCSP_RESPONSE_BYTES` for an OCSP
+//! response, whose request travels in the path (RFC 6960, A.1). An
+//! `https` point or responder is fetched over this crate's TLS client with
+//! the same roots and without a revocation check of its own, which keeps
+//! the fetch from recursing: the list's or response's integrity comes from
+//! its signature, not from the transport.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -16,6 +18,7 @@ use boneli_http::{
     Connection, IdleCheck, Limits, Method, RequestBody, RequestHead, Target, Transport,
 };
 
+use super::ocsp::{MAX_OCSP_RESPONSE_BYTES, OcspSource};
 use super::url::{CrlScheme, CrlUrl};
 use super::{
     CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT, CRL_IO_TIMEOUT, CRL_MAX_HEAD_BYTES,
@@ -24,23 +27,23 @@ use super::{
 use crate::dial::{DeadlineSocket, time_left};
 use crate::{ConnectOptions, TlsConfig};
 
-/// Fetches CRLs over HTTP and HTTPS.
-pub(crate) struct HttpCrlSource {
+/// Fetches CRLs and OCSP responses over HTTP and HTTPS.
+pub(crate) struct HttpSource {
     /// The handshake's roots and groups, without a revocation check.
     tls: TlsConfig,
     /// Each TCP connection attempt.
     pub(crate) connect_timeout: Duration,
-    /// The TLS handshake of an `https` point.
+    /// The TLS handshake of an `https` point or responder.
     pub(crate) handshake_timeout: Duration,
     /// Each read and write.
     pub(crate) io_timeout: Duration,
 }
 
-impl HttpCrlSource {
+impl HttpSource {
     /// A source whose `https` fetches use `tls`, which must not check
     /// revocation itself.
-    pub(crate) fn new(tls: TlsConfig) -> HttpCrlSource {
-        HttpCrlSource {
+    pub(crate) fn new(tls: TlsConfig) -> HttpSource {
+        HttpSource {
             tls,
             connect_timeout: CRL_CONNECT_TIMEOUT,
             handshake_timeout: CRL_HANDSHAKE_TIMEOUT,
@@ -48,10 +51,41 @@ impl HttpCrlSource {
         }
     }
 
+    /// `GET path` at `url`'s host, the body at most `cap` bytes.
+    fn fetch_path(
+        &self,
+        url: &CrlUrl,
+        path: &str,
+        cap: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        time_left(deadline).map_err(io_error)?;
+        // std's resolver takes no timeout, so the lookup itself is not
+        // bounded by the deadline, as for `TlsDial`'s own host (ADR-017,
+        // known limits); everything after it is.
+        let addrs = (url.host(), url.port())
+            .to_socket_addrs()
+            .map_err(|e| CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")))?;
+        let mut last = None;
+        for addr in addrs {
+            let left = time_left(deadline).map_err(io_error)?;
+            match TcpStream::connect_timeout(&addr, left.min(self.connect_timeout)) {
+                Ok(tcp) => return self.get(tcp, url, path, cap, deadline),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.map_or_else(
+            || CrlFetchError::Unreachable("the host has no address".into()),
+            io_error,
+        ))
+    }
+
     fn get(
         &self,
         tcp: TcpStream,
         url: &CrlUrl,
+        path: &str,
+        cap: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, CrlFetchError> {
         let socket = DeadlineSocket::new(tcp, deadline);
@@ -60,7 +94,7 @@ impl HttpCrlSource {
             .and_then(|()| socket.set_write_timeout(Some(self.io_timeout)))
             .map_err(io_error)?;
         match url.scheme() {
-            CrlScheme::Http => request(socket, url),
+            CrlScheme::Http => request(socket, url, path, cap),
             CrlScheme::Https => {
                 let options = ConnectOptions::new(
                     self.connect_timeout,
@@ -79,52 +113,53 @@ impl HttpCrlSource {
                     crate::Error::Io(e) => io_error(e),
                     other => CrlFetchError::Unreachable(format!("TLS: {other}")),
                 })?;
-                request(tls, url)
+                request(tls, url, path, cap)
             }
         }
     }
 }
 
-impl CrlSource for HttpCrlSource {
+impl CrlSource for HttpSource {
     fn fetch(&self, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError> {
-        time_left(deadline).map_err(io_error)?;
-        // std's resolver takes no timeout, so the lookup itself is not
-        // bounded by the deadline, as for `TlsDial`'s own host (ADR-017,
-        // known limits); everything after it is.
-        let addrs = (url.host(), url.port())
-            .to_socket_addrs()
-            .map_err(|e| CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")))?;
-        let mut last = None;
-        for addr in addrs {
-            let left = time_left(deadline).map_err(io_error)?;
-            match TcpStream::connect_timeout(&addr, left.min(self.connect_timeout)) {
-                Ok(tcp) => return self.get(tcp, url, deadline),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.map_or_else(
-            || CrlFetchError::Unreachable("the host has no address".into()),
-            io_error,
-        ))
+        self.fetch_path(url, url.path(), MAX_CRL_BYTES, deadline)
     }
 }
 
-/// `GET <path>` with `Host` only; 200, no content coding, the whole body.
-fn request<S: Read + Write + IdleCheck>(stream: S, url: &CrlUrl) -> Result<Vec<u8>, CrlFetchError> {
-    let limits = Limits::new(CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, MAX_CRL_BYTES as u64)
-        .map_err(http_error)?;
+impl OcspSource for HttpSource {
+    fn fetch(
+        &self,
+        responder: &CrlUrl,
+        request: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        let path = super::ocsp::get_path(responder, request);
+        self.fetch_path(responder, &path, MAX_OCSP_RESPONSE_BYTES, deadline)
+    }
+}
+
+/// `GET <path>` with `Host` only; 200, no content coding, the whole body
+/// of at most `cap` bytes.
+fn request<S: Read + Write + IdleCheck>(
+    stream: S,
+    url: &CrlUrl,
+    path: &str,
+    cap: usize,
+) -> Result<Vec<u8>, CrlFetchError> {
+    let limits =
+        Limits::new(CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, cap as u64).map_err(http_error)?;
     let mut conn = Connection::new(stream, &url.authority(), limits).map_err(http_error)?;
     let head = RequestHead::new(
         Method::new("GET").map_err(http_error)?,
-        Target::Origin(url.path().to_owned()),
+        Target::Origin(path.to_owned()),
     );
     let mut response = conn.request(&head, RequestBody::None).map_err(http_error)?;
     let status = response.head.status;
     if status != 200 {
         return Err(CrlFetchError::Status(status));
     }
-    // RFC 5280, 4.2.1.13: the point serves DER. A coding would need a
-    // decoder and is never needed (none measured, ADR-017 item 6).
+    // RFC 5280, 4.2.1.13 and RFC 6960, A.1: the server sends DER. A coding
+    // would need a decoder and is never needed (none measured, ADR-017
+    // item 6, ADR-020 item 8).
     let coded = response
         .head
         .headers
@@ -185,9 +220,22 @@ mod tests {
         roots
     }
 
-    fn source() -> HttpCrlSource {
+    fn source() -> HttpSource {
         let tls = TlsConfig::new(crl_roots()).expect("config");
-        HttpCrlSource::new(tls.without_revocation())
+        HttpSource::new(tls.without_revocation())
+    }
+
+    fn crl(source: &HttpSource, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError> {
+        CrlSource::fetch(source, url, deadline)
+    }
+
+    fn ocsp(
+        source: &HttpSource,
+        url: &CrlUrl,
+        request: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        OcspSource::fetch(source, url, request, deadline)
     }
 
     fn url(addr: SocketAddr, path: &str) -> CrlUrl {
@@ -245,9 +293,7 @@ mod tests {
     #[test]
     fn request_carries_host_only() {
         let (addr, server) = answer(ok_with(b"list"));
-        let body = source()
-            .fetch(&url(addr, "/ca.crl"), deadline())
-            .expect("fetch");
+        let body = crl(&source(), &url(addr, "/ca.crl"), deadline()).expect("fetch");
         assert_eq!(body, b"list");
         let head = String::from_utf8(server.join().expect("server")).expect("ASCII");
         let mut lines = head.split("\r\n");
@@ -269,7 +315,7 @@ mod tests {
             format!("HTTP/1.1 301 Moved\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
                 .into_bytes(),
         );
-        let err = source().fetch(&url(addr, "/ca.crl"), deadline());
+        let err = crl(&source(), &url(addr, "/ca.crl"), deadline());
         assert_eq!(err, Err(CrlFetchError::Status(301)));
         let accepted = target.accept().map(|_| ());
         assert_eq!(
@@ -285,7 +331,7 @@ mod tests {
             let (addr, _server) =
                 answer(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").into_bytes());
             assert_eq!(
-                source().fetch(&url(addr, "/ca.crl"), deadline()),
+                crl(&source(), &url(addr, "/ca.crl"), deadline()),
                 Err(CrlFetchError::Status(status))
             );
         }
@@ -297,7 +343,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\nlist".to_vec(),
         );
         assert!(matches!(
-            source().fetch(&url(addr, "/ca.crl"), deadline()),
+            crl(&source(), &url(addr, "/ca.crl"), deadline()),
             Err(CrlFetchError::Malformed(_))
         ));
         let (addr, _server) = answer(
@@ -305,7 +351,7 @@ mod tests {
                 .to_vec(),
         );
         assert_eq!(
-            source().fetch(&url(addr, "/ca.crl"), deadline()),
+            crl(&source(), &url(addr, "/ca.crl"), deadline()),
             Ok(b"list".to_vec())
         );
     }
@@ -332,7 +378,7 @@ mod tests {
     fn oversized_head_is_refused() {
         let fetch = |head: Vec<u8>| {
             let (addr, _server) = answer(head);
-            source().fetch(&url(addr, "/ca.crl"), deadline())
+            crl(&source(), &url(addr, "/ca.crl"), deadline())
         };
         assert_eq!(
             fetch(head_with(1, Some(CRL_MAX_HEAD_BYTES))),
@@ -352,9 +398,7 @@ mod tests {
     #[test]
     fn body_at_cap_passes_size_check() {
         let (addr, _server) = answer(ok_with(&vec![0u8; MAX_CRL_BYTES]));
-        let body = source()
-            .fetch(&url(addr, "/ca.crl"), deadline())
-            .expect("fetch");
+        let body = crl(&source(), &url(addr, "/ca.crl"), deadline()).expect("fetch");
         assert_eq!(body.len(), MAX_CRL_BYTES);
     }
 
@@ -371,7 +415,7 @@ mod tests {
             let _ = tcp.write_all(b"1\r\n\0\r\n0\r\n\r\n");
         });
         assert_eq!(
-            source().fetch(&url(addr, "/ca.crl"), deadline()),
+            crl(&source(), &url(addr, "/ca.crl"), deadline()),
             Err(CrlFetchError::TooLarge)
         );
     }
@@ -391,7 +435,7 @@ mod tests {
         });
         let start = Instant::now();
         assert_eq!(
-            source().fetch(&url(addr, "/ca.crl"), deadline()),
+            crl(&source(), &url(addr, "/ca.crl"), deadline()),
             Err(CrlFetchError::TooLarge)
         );
         assert!(start.elapsed() < Duration::from_secs(5));
@@ -408,7 +452,7 @@ mod tests {
         source.io_timeout = Duration::from_millis(200);
         let start = Instant::now();
         assert_eq!(
-            source.fetch(&url(addr, "/ca.crl"), deadline()),
+            crl(&source, &url(addr, "/ca.crl"), deadline()),
             Err(CrlFetchError::TimedOut)
         );
         assert!(
@@ -431,7 +475,11 @@ mod tests {
         });
         let start = Instant::now();
         assert_eq!(
-            source().fetch(&url(addr, "/ca.crl"), start + Duration::from_millis(300)),
+            crl(
+                &source(),
+                &url(addr, "/ca.crl"),
+                start + Duration::from_millis(300)
+            ),
             Err(CrlFetchError::TimedOut)
         );
         assert!(
@@ -447,7 +495,7 @@ mod tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr");
         assert_eq!(
-            source().fetch(&url(addr, "/ca.crl"), Instant::now()),
+            crl(&source(), &url(addr, "/ca.crl"), Instant::now()),
             Err(CrlFetchError::TimedOut)
         );
         assert_eq!(
@@ -488,8 +536,153 @@ mod tests {
             head
         });
         let url = CrlUrl::parse(&format!("https://127.0.0.1:{}/ca.crl", addr.port())).expect("URL");
-        assert_eq!(source().fetch(&url, deadline()), Ok(b"over tls".to_vec()));
+        assert_eq!(crl(&source(), &url, deadline()), Ok(b"over tls".to_vec()));
         let head = server.join().expect("server");
         assert!(head.starts_with(b"GET /ca.crl HTTP/1.1\r\n"));
+    }
+
+    // ------------------------------------------------------------- OCSP
+
+    /// openssl's request for `ocsp-good.pem`.
+    const REQUEST: &[u8] = include_bytes!("../../tests/data/ocsp-good.req");
+
+    fn responder(addr: SocketAddr) -> CrlUrl {
+        url(addr, "/")
+    }
+
+    #[test]
+    fn ocsp_request_carries_host_only() {
+        let (addr, server) = answer(ok_with(b"answer"));
+        let body = ocsp(&source(), &responder(addr), REQUEST, deadline()).expect("fetch");
+        assert_eq!(body, b"answer");
+        let head = String::from_utf8(server.join().expect("server")).expect("ASCII");
+        let mut lines = head.split("\r\n");
+        let path = super::super::ocsp::get_path(&responder(addr), REQUEST);
+        assert_eq!(lines.next(), Some(format!("GET {path} HTTP/1.1").as_str()));
+        let fields: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+        assert_eq!(fields, [format!("Host: 127.0.0.1:{}", addr.port())]);
+        let lower = head.to_ascii_lowercase();
+        for name in ["user-agent", "accept", "cookie", "authorization"] {
+            assert!(!lower.contains(name), "{name} in {head:?}");
+        }
+    }
+
+    #[test]
+    fn ocsp_non_200_and_redirect_fail() {
+        for status in [301, 404, 500] {
+            let (addr, _server) = answer(
+                format!("HTTP/1.1 {status} X\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n")
+                    .into_bytes(),
+            );
+            assert_eq!(
+                ocsp(&source(), &responder(addr), REQUEST, deadline()),
+                Err(CrlFetchError::Status(status))
+            );
+        }
+    }
+
+    #[test]
+    fn ocsp_content_encoding_is_refused() {
+        let (addr, _server) = answer(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\nresp".to_vec(),
+        );
+        assert!(matches!(
+            ocsp(&source(), &responder(addr), REQUEST, deadline()),
+            Err(CrlFetchError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn ocsp_body_at_cap_passes_size_check() {
+        let (addr, _server) = answer(ok_with(&vec![0u8; MAX_OCSP_RESPONSE_BYTES]));
+        let body = ocsp(&source(), &responder(addr), REQUEST, deadline()).expect("fetch");
+        assert_eq!(body.len(), MAX_OCSP_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn ocsp_body_one_over_cap_is_too_large() {
+        let (addr, _server) = server(|tcp| {
+            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let _ = tcp.write_all(b"10000\r\n");
+            let _ = tcp.write_all(&vec![0u8; MAX_OCSP_RESPONSE_BYTES]);
+            let _ = tcp.write_all(b"\r\n1\r\n\0\r\n0\r\n\r\n");
+        });
+        assert_eq!(
+            ocsp(&source(), &responder(addr), REQUEST, deadline()),
+            Err(CrlFetchError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn ocsp_content_length_over_cap_fails_before_body() {
+        let (addr, server) = server(|tcp| {
+            let _ = tcp.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_OCSP_RESPONSE_BYTES + 1
+                )
+                .as_bytes(),
+            );
+            // No body byte: the client must not wait for one.
+            let _ = read_head(tcp);
+        });
+        let start = Instant::now();
+        assert_eq!(
+            ocsp(&source(), &responder(addr), REQUEST, deadline()),
+            Err(CrlFetchError::TooLarge)
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn https_responder_fetches_without_recursion() {
+        // The server's leaf names `http://ocsp.boneli.test`, which does not
+        // resolve: with a revocation check on this connection the fetch
+        // would fail there.
+        let chain =
+            CertificateDer::pem_slice_iter(include_bytes!("../../tests/data/ocsp-good.pem"))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("cert");
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/data/crl-leaf.key"))
+            .expect("key");
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .expect("server cert"),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            tcp.set_read_timeout(Some(GUARD)).expect("timeout");
+            let conn = ServerConnection::new(config).expect("server");
+            let mut tls = StreamOwned::new(conn, tcp);
+            let head = read_head(&mut tls);
+            let _ = tls.write_all(&ok_with(b"over tls"));
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            head
+        });
+        let mut roots = Roots::empty();
+        roots
+            .add_pem(include_bytes!("../../tests/data/ocsp-ca.pem"))
+            .expect("OCSP test CA");
+        let tls = TlsConfig::new(roots).expect("config");
+        let source = HttpSource::new(tls.without_revocation());
+        let url = CrlUrl::parse(&format!("https://127.0.0.1:{}/ocsp", addr.port())).expect("URL");
+        assert_eq!(
+            ocsp(&source, &url, REQUEST, deadline()),
+            Ok(b"over tls".to_vec())
+        );
+        let head = server.join().expect("server");
+        assert!(
+            head.starts_with(b"GET /ocsp/MEIwQDA%2BMDwwOjAJBgUrDgMCGgUA"),
+            "{:?}",
+            String::from_utf8_lossy(&head)
+        );
     }
 }
