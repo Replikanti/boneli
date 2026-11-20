@@ -40,3 +40,4 @@ boneli-store-fs = { path = "crates/boneli-store-fs" }
 boneli-sys = { path = "crates/boneli-sys" }
 boneli-git-cli = { path = "crates/boneli-git-cli" }
 boneli-forge-github = { path = "crates/boneli-forge-github" }
+boneli-private-dir = { path = "crates/boneli-private-dir" }

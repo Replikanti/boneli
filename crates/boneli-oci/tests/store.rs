@@ -255,6 +255,68 @@ fn root_owned_by_another_user_refused() {
     assert_eq!(names_in(usr), before, "open wrote into /usr");
 }
 
+/// The root rules live in `boneli-private-dir` (ADR-021), and its errors
+/// map back to this crate's: a rule to `Error::Root` with the same text, a
+/// filesystem failure (here a NUL byte in the root) to `Error::Cache`.
+#[test]
+fn root_errors_keep_their_variants_and_text() {
+    let fake = hub_fake(Hub::default());
+    match OciImageStore::open(Path::new("store"), config(&fake)) {
+        Err(e @ Error::Root { .. }) => {
+            assert_eq!(e.to_string(), "store root store: must be an absolute path")
+        }
+        other => panic!("a relative root gave {other:?}"),
+    }
+    let tmp = TempDir::new("root-errors");
+    let nul = {
+        use std::os::unix::ffi::OsStrExt;
+        tmp.path().join(std::ffi::OsStr::from_bytes(b"a\0b"))
+    };
+    match OciImageStore::open(&nul, config(&fake)) {
+        Err(Error::Cache { source, .. }) => {
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput, "{source}")
+        }
+        other => panic!("a NUL byte gave {other:?}"),
+    }
+    assert!(names_in(tmp.path()).is_empty(), "created something");
+}
+
+/// Fullwidth `：`, `，` and `＼` are not the bytes overlay splits on: every
+/// byte of a multibyte UTF-8 sequence is at least 0x80, so none is 0x2C,
+/// 0x3A or 0x5C, and such a root opens.
+#[test]
+fn root_overlay_lookalikes_accepted() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("root-lookalikes");
+    for name in ["a\u{FF1A}b", "a\u{FF0C}b", "a\u{FF3C}b"] {
+        let root = tmp.path().join(name);
+        let store = OciImageStore::open(&root, config(&fake)).expect(name);
+        assert_eq!(store.root(), root);
+    }
+}
+
+/// A root whose ancestor link points to a name the overlay rule refuses
+/// (`<d>/link -> <d>/real:dir`) is refused at the path it would be created
+/// at, before it is created: `real:dir` stays empty (ADR-021, D3).
+#[test]
+fn root_refused_after_resolution_creates_nothing() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("root-after-resolution");
+    let colon = tmp.path().join("real:dir");
+    std::fs::create_dir(&colon).expect("dir");
+    std::fs::set_permissions(&colon, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&colon, &link).expect("symlink");
+    match OciImageStore::open(&link.join("store"), config(&fake)) {
+        Err(Error::Root { path, reason }) => {
+            assert_eq!(path, colon.join("store"));
+            assert_eq!(reason, "must not contain ',', ':' or '\\'");
+        }
+        other => panic!("a link to real:dir gave {other:?}"),
+    }
+    assert!(names_in(&colon).is_empty(), "created under real:dir");
+}
+
 /// A leftover of a dead owner that cannot be removed does not make the
 /// store unopenable: here a staging tree deeper than `PATH_MAX`, as a root
 /// reached through a shorter path (a bind mount) can leave, whose

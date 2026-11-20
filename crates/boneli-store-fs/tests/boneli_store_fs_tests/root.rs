@@ -1,7 +1,7 @@
 //! The store root and the lock (ADR-012, D1). The root matrix is the one
 //! `boneli-oci` pins for the same rules (`crates/boneli-oci/tests/store.rs`,
 //! ADR-009 D8), minus the overlay separators, which this store does not
-//! hand to a mount; extracting the rules is #66.
+//! hand to a mount; the rules live in `boneli-private-dir` (ADR-021).
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -195,6 +195,32 @@ fn root_owned_by_another_user_refused() {
         other => panic!("/usr gave {other:?}"),
     }
     assert_eq!(names_in(usr), before, "open wrote into /usr");
+}
+
+/// The root rules live in `boneli-private-dir` (ADR-021), and its errors
+/// map back to this crate's: a rule to `OpenError::Root` with the same
+/// text, a filesystem failure (here a NUL byte in the root) to
+/// `OpenError::Io`.
+#[test]
+fn root_errors_keep_their_variants_and_text() {
+    match FsStore::open(Path::new("store")) {
+        Err(e @ OpenError::Root { .. }) => {
+            assert_eq!(e.to_string(), "store root store: must be an absolute path")
+        }
+        other => panic!("a relative root gave {other:?}"),
+    }
+    let tmp = TempDir::new("root-errors");
+    let nul = {
+        use std::os::unix::ffi::OsStrExt;
+        tmp.path().join(std::ffi::OsStr::from_bytes(b"a\0b"))
+    };
+    match FsStore::open(&nul) {
+        Err(OpenError::Io { source, .. }) => {
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput, "{source}")
+        }
+        other => panic!("a NUL byte gave {other:?}"),
+    }
+    assert!(names_in(tmp.path()).is_empty(), "created something");
 }
 
 /// One store per root: a second `open` while the first store lives is

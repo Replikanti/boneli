@@ -178,53 +178,29 @@ impl std::fmt::Debug for OciImageStore {
     }
 }
 
-// `own_uid`, `private_dir` and `check_ancestors` are copied into
-// `boneli-store-fs` (`src/root.rs`, ADR-012 D1); a fix to one copy goes
-// into the other until #66 extracts them.
-
-/// The owner of the root and of this process: the uid of `/proc/self`,
-/// which is this process's effective uid.
-fn own_uid(at: &Path) -> Result<u32, Error> {
-    let me = Path::new("/proc/self");
-    fs::metadata(me).map(|m| m.uid()).map_err(|e| Error::Cache {
-        path: at.to_path_buf(),
-        source: e,
-    })
-}
-
-/// The text rules of a root, before and after it is resolved: absolute,
-/// no `.` or `..` component, UTF-8, and none of `,`, `:` and `\`, which
-/// overlay mount options use as separators and escapes (ADR-007, D7).
-/// `open` checks the existing ancestors of a missing root on its text
-/// before it creates it, and `..` would make that text name an ancestor
-/// other than the one creation resolves to (ADR-012, D1). The components
-/// are split on the bytes: `Path::components` drops every `.` but a
-/// leading one.
-fn check_root_text(path: &Path) -> Result<(), Error> {
-    let refuse = |reason| {
-        Err(Error::Root {
-            path: path.to_path_buf(),
-            reason,
-        })
-    };
-    if !path.is_absolute() {
-        return refuse("must be an absolute path");
-    }
-    if path
-        .as_os_str()
-        .as_encoded_bytes()
-        .split(|&b| b == b'/')
-        .any(|c| c == b"." || c == b"..")
-    {
-        return refuse("must not have a `.` or `..` component");
-    }
+/// This store's rule on the text of its root, as given, as it would be
+/// created and as resolved; `boneli-private-dir` applies the shared rules
+/// around it (ADR-021). UTF-8, and none of `,`, `:` and `\`, which overlay
+/// mount options use as separators and escapes (ADR-007, D7).
+fn overlay_text_rule(path: &Path) -> Result<(), &'static str> {
     let Some(text) = path.to_str() else {
-        return refuse("must be UTF-8");
+        return Err("must be UTF-8");
     };
     if text.contains([',', ':', '\\']) {
-        return refuse("must not contain ',', ':' or '\\'");
+        return Err("must not contain ',', ':' or '\\'");
     }
     Ok(())
+}
+
+/// The shared root rules' errors as this crate's: a broken rule is
+/// `Root`, a filesystem failure `Cache`. A private mapping, so
+/// `boneli-private-dir` stays out of this adapter's public API (ADR-021,
+/// D5).
+fn root_err(e: boneli_private_dir::Error) -> Error {
+    match e {
+        boneli_private_dir::Error::Rule { path, reason } => Error::Root { path, reason },
+        boneli_private_dir::Error::Io { path, source } => Error::Cache { path, source },
+    }
 }
 
 fn cache_err(path: &Path, source: io::Error) -> Error {
@@ -232,48 +208,6 @@ fn cache_err(path: &Path, source: io::Error) -> Error {
         path: path.to_path_buf(),
         source,
     }
-}
-
-/// Creates `dir` with mode `0o700` where it is missing.
-fn private_dir(dir: &Path) -> Result<(), Error> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| cache_err(dir, e))
-}
-
-/// Checks `dir` and each of its ancestors the way sshd's `StrictModes`
-/// checks a path: a directory, owned by root or by `uid`, and not writable
-/// by its group or by others unless it is sticky. Anyone who can rename an
-/// entry of an ancestor can swap the root after `open` and plant layers
-/// that the store then hands out; in a sticky directory only an entry's
-/// owner can rename it, and the next entry down is root's or the caller's.
-/// The filesystem root is checked for its mode only: whoever owns it owns
-/// every path on the host, and in a user namespace it shows the overflow
-/// uid. `dir` must be resolved, so the walk sees no symlink.
-fn check_ancestors(dir: &Path, uid: u32) -> Result<(), Error> {
-    for at in dir.ancestors() {
-        let refuse = |reason| {
-            Err(Error::Root {
-                path: at.to_path_buf(),
-                reason,
-            })
-        };
-        let meta = fs::symlink_metadata(at).map_err(|e| cache_err(at, e))?;
-        if !meta.is_dir() {
-            return refuse("an ancestor of the root must be a directory");
-        }
-        if at.parent().is_some() && meta.uid() != 0 && meta.uid() != uid {
-            return refuse("an ancestor of the root must be owned by root or the caller");
-        }
-        if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-            return refuse(
-                "an ancestor of the root must not be writable by its group or others unless it is sticky",
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Removes every name in `dir` that carries an owner (D8) whose owner is
@@ -353,7 +287,8 @@ impl OciImageStore {
     /// - `root` must be absolute, without a `.` or `..` component, UTF-8
     ///   and free of `,`, `:` and `\`; it is created with mode `0o700`
     ///   where it is missing, once its existing ancestors pass the check
-    ///   below, resolved, and checked again;
+    ///   below, at the path that check saw, which must pass these text
+    ///   rules too; then it is resolved and checked again (ADR-021);
     /// - it must be a directory owned by the caller with no group or other
     ///   permission bits;
     /// - each of its ancestors must be owned by root or the caller and not
@@ -364,46 +299,13 @@ impl OciImageStore {
     ///   format (0:0 whiteouts, `user.*` xattrs, D1), or `open` fails
     ///   here rather than in a pull.
     pub fn open(root: &Path, config: StoreConfig) -> Result<OciImageStore, Error> {
-        check_root_text(root)?;
-        let uid = own_uid(root)?;
-        if fs::symlink_metadata(root).is_err() {
-            // Nothing is created under an ancestor that fails the check.
-            if let Some(existing) = root
-                .ancestors()
-                .skip(1)
-                .find(|a| fs::symlink_metadata(a).is_ok())
-            {
-                let existing = existing
-                    .canonicalize()
-                    .map_err(|e| cache_err(existing, e))?;
-                check_ancestors(&existing, uid)?;
-            }
-            private_dir(root)?;
-        }
-        let resolved = root.canonicalize().map_err(|e| cache_err(root, e))?;
-        check_root_text(&resolved)?;
-        let refuse = |reason| Error::Root {
-            path: resolved.clone(),
-            reason,
-        };
-        let meta = fs::metadata(&resolved).map_err(|e| cache_err(&resolved, e))?;
-        if !meta.is_dir() {
-            return Err(refuse("must be a directory"));
-        }
-        if meta.uid() != uid {
-            return Err(refuse("must be owned by the caller"));
-        }
-        if meta.mode() & 0o077 != 0 {
-            return Err(refuse("must have no group or other permission bits"));
-        }
-        if let Some(parent) = resolved.parent() {
-            check_ancestors(parent, uid)?;
-        }
+        let resolved =
+            boneli_private_dir::prepare_root(root, &overlay_text_rule).map_err(root_err)?;
 
         let blobs = resolved.join("blobs").join("sha256");
         let layer_dir = resolved.join("layers").join("sha256");
-        private_dir(&blobs)?;
-        private_dir(&layer_dir)?;
+        boneli_private_dir::create(&blobs).map_err(root_err)?;
+        boneli_private_dir::create(&layer_dir).map_err(root_err)?;
         let judge = Judge::current()?;
         sweep(&blobs, &judge)?;
         sweep(&layer_dir, &judge)?;

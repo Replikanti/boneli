@@ -1,15 +1,10 @@
-//! The store root (ADR-012, D1): the root rules, the lock, the sweep of
-//! temporary files and directory syncs.
-//!
-//! `own_uid`, `private_dir` and `check_ancestors` are copies of the
-//! functions of the same names in `boneli-oci`'s `store.rs` (ADR-009, D8),
-//! and the tests copy its root matrix. An adapter cannot depend on another
-//! adapter, so the rules live in both crates until #66 extracts them; a
-//! fix to one copy goes into the other.
+//! The store root (ADR-012, D1): the lock, the sweep of temporary files and
+//! directory syncs. The root rules, shared with `boneli-oci`, live in
+//! `boneli-private-dir` (ADR-021).
 
-use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::OpenError;
@@ -37,54 +32,15 @@ fn io_err(path: &Path, source: io::Error) -> OpenError {
     }
 }
 
-/// The owner of the root and of this process: the uid of `/proc/self`,
-/// which is this process's effective uid.
-fn own_uid(at: &Path) -> Result<u32, OpenError> {
-    let me = Path::new("/proc/self");
-    fs::metadata(me).map(|m| m.uid()).map_err(|e| io_err(at, e))
-}
-
-/// Creates `dir` with mode `0o700` where it is missing.
-fn private_dir(dir: &Path) -> Result<(), OpenError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| io_err(dir, e))
-}
-
-/// Checks `dir` and each of its ancestors the way sshd's `StrictModes`
-/// checks a path: a directory, owned by root or by `uid`, and not writable
-/// by its group or by others unless it is sticky. Anyone who can rename an
-/// entry of an ancestor can swap the root after `open` and rewrite the run
-/// logs, which have no integrity check of their own (ADR-012, D7); in a
-/// sticky directory only an entry's owner can rename it, and the next
-/// entry down is root's or the caller's. The filesystem root is checked
-/// for its mode only: whoever owns it owns every path on the host, and in
-/// a user namespace it shows the overflow uid. `dir` must be resolved, so
-/// the walk sees no symlink.
-fn check_ancestors(dir: &Path, uid: u32) -> Result<(), OpenError> {
-    for at in dir.ancestors() {
-        let refuse = |reason| {
-            Err(OpenError::Root {
-                path: at.to_path_buf(),
-                reason,
-            })
-        };
-        let meta = fs::symlink_metadata(at).map_err(|e| io_err(at, e))?;
-        if !meta.is_dir() {
-            return refuse("an ancestor of the root must be a directory");
-        }
-        if at.parent().is_some() && meta.uid() != 0 && meta.uid() != uid {
-            return refuse("an ancestor of the root must be owned by root or the caller");
-        }
-        if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-            return refuse(
-                "an ancestor of the root must not be writable by its group or others unless it is sticky",
-            );
-        }
+/// The shared root rules' errors as this crate's: a broken rule is
+/// `Root`, a filesystem failure `Io`. A private mapping, so
+/// `boneli-private-dir` stays out of this adapter's public API (ADR-021,
+/// D5).
+fn root_err(e: boneli_private_dir::Error) -> OpenError {
+    match e {
+        boneli_private_dir::Error::Rule { path, reason } => OpenError::Root { path, reason },
+        boneli_private_dir::Error::Io { path, source } => OpenError::Io { path, source },
     }
-    Ok(())
 }
 
 /// `fsync` of a directory, so the entries created or renamed in it are
@@ -123,63 +79,12 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
     }
 }
 
-/// Whether `path` has a `.` or `..` component. Decided on the bytes:
-/// `Path::components` drops every `.` but a leading one.
-fn has_dot_component(path: &Path) -> bool {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .split(|&b| b == b'/')
-        .any(|c| c == b"." || c == b"..")
-}
-
 /// Checks the root, takes the lock, prepares the directories and sweeps
 /// them; returns the resolved root and the locked file.
 pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
-    if !root.is_absolute() {
-        return Err(OpenError::Root {
-            path: root.to_path_buf(),
-            reason: "must be an absolute path",
-        });
-    }
-    // The check before creation walks the root's text, which `..` makes
-    // name an ancestor other than the one creation resolves to (D1).
-    if has_dot_component(root) {
-        return Err(OpenError::Root {
-            path: root.to_path_buf(),
-            reason: "must not have a `.` or `..` component",
-        });
-    }
-    let uid = own_uid(root)?;
-    if fs::symlink_metadata(root).is_err() {
-        // Nothing is created under an ancestor that fails the check.
-        if let Some(existing) = root
-            .ancestors()
-            .skip(1)
-            .find(|a| fs::symlink_metadata(a).is_ok())
-        {
-            let existing = existing.canonicalize().map_err(|e| io_err(existing, e))?;
-            check_ancestors(&existing, uid)?;
-        }
-        private_dir(root)?;
-    }
-    let resolved = root.canonicalize().map_err(|e| io_err(root, e))?;
-    let refuse = |reason| OpenError::Root {
-        path: resolved.clone(),
-        reason,
-    };
-    let meta = fs::metadata(&resolved).map_err(|e| io_err(&resolved, e))?;
-    if !meta.is_dir() {
-        return Err(refuse("must be a directory"));
-    }
-    if meta.uid() != uid {
-        return Err(refuse("must be owned by the caller"));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(refuse("must have no group or other permission bits"));
-    }
-    if let Some(parent) = resolved.parent() {
-        check_ancestors(parent, uid)?;
-    }
+    // No rule of its own on the root's text: no mount option is built
+    // from it.
+    let resolved = boneli_private_dir::prepare_root(root, &|_| Ok(())).map_err(root_err)?;
 
     let lock_path = resolved.join(LOCK);
     let lock = OpenOptions::new()
@@ -206,8 +111,8 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, File), OpenError> {
     let runs = resolved.join(RUNS);
     let evidence = resolved.join(EVIDENCE);
     let blobs = evidence.join(SHA256);
-    private_dir(&runs)?;
-    private_dir(&blobs)?;
+    boneli_private_dir::create(&runs).map_err(root_err)?;
+    boneli_private_dir::create(&blobs).map_err(root_err)?;
     for dir in [&runs, &evidence, &blobs] {
         check_store_dir(dir)?;
     }

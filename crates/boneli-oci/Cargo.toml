@@ -41,6 +41,9 @@ miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-a
 # rust-version 1.87, which the workspace MSRV covers (1.87 since ADR-009,
 # 1.89 since ADR-012).
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+# The store-root rules of ADR-009 D8, shared with boneli-store-fs
+# (ADR-021). A support crate, no external edge.
+boneli-private-dir.workspace = true
 
 
 # Its own `main`: the process whose main thread has exited comes from
