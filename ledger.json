@@ -26,7 +26,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 21,
@@ -49,7 +50,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 20,
@@ -74,7 +76,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 19,
@@ -100,7 +103,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 18,
@@ -123,7 +127,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 17,
@@ -150,7 +155,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 16,
@@ -175,7 +181,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 15,
@@ -198,7 +205,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 14,
@@ -222,7 +230,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 13,
@@ -250,7 +259,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 12,
@@ -279,7 +289,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 11,
@@ -304,7 +315,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 10,
@@ -328,7 +340,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 9,
@@ -352,7 +365,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 8,
@@ -377,7 +391,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 7,
@@ -402,7 +417,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 6,
@@ -425,7 +441,8 @@
    ],
    "manual": false,
    "user": "ylohnitram",
-   "machine": "df82df"
+   "machine": "df82df",
+   "session": null
   },
   {
    "issue": 5,
@@ -448,7 +465,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 4,
@@ -471,7 +489,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 3,
@@ -494,7 +513,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 2,
@@ -517,7 +537,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 1,
@@ -538,7 +559,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 28,
@@ -561,7 +583,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 33,
@@ -586,7 +609,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 32,
@@ -611,7 +635,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 31,
@@ -636,7 +661,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 30,
@@ -659,7 +685,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 29,
@@ -682,7 +709,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 35,
@@ -707,7 +735,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 34,
@@ -730,7 +759,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 38,
@@ -753,7 +783,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 37,
@@ -776,7 +807,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 45,
@@ -799,7 +831,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 49,
@@ -823,7 +856,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 52,
@@ -844,7 +878,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 54,
@@ -865,7 +900,8 @@
    ],
    "manual": false,
    "user": "ylohnitram",
-   "machine": "df82df"
+   "machine": "df82df",
+   "session": true
   },
   {
    "issue": 57,
@@ -888,7 +924,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 56,
@@ -911,7 +948,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 55,
@@ -934,7 +972,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 64,
@@ -955,7 +994,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 66,
@@ -978,7 +1018,8 @@
    ],
    "manual": false,
    "user": "ylohnitram",
-   "machine": "df82df"
+   "machine": "df82df",
+   "session": true
   },
   {
    "issue": 69,
@@ -1001,7 +1042,8 @@
    ],
    "manual": false,
    "user": null,
-   "machine": null
+   "machine": null,
+   "session": null
   },
   {
    "issue": 68,
@@ -1024,7 +1066,8 @@
    ],
    "manual": false,
    "user": "ylohnitram",
-   "machine": "df82df"
+   "machine": "df82df",
+   "session": false
   },
   {
    "issue": 81,
@@ -1047,7 +1090,8 @@
    "areas": [
     "core"
    ],
-   "manual": false
+   "manual": false,
+   "session": null
   },
   {
    "issue": 80,
@@ -1070,7 +1114,8 @@
    "areas": [
     "core"
    ],
-   "manual": false
+   "manual": false,
+   "session": null
   },
   {
    "issue": 79,
@@ -1093,7 +1138,8 @@
    "areas": [
     "core"
    ],
-   "manual": false
+   "manual": false,
+   "session": null
   },
   {
    "issue": 85,
@@ -1116,7 +1162,8 @@
    "areas": [
     "core"
    ],
-   "manual": false
+   "manual": false,
+   "session": null
   }
  ],
  "log": [
@@ -1555,7 +1602,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T16:04:03+00:00",
+ "updated_at": "2026-11-20T16:11:31+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
