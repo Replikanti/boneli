@@ -618,7 +618,9 @@ numbers (`2.100.0` is newer than `2.39.1`; `2.43.0.windows.1` reads as
   the run, before a sandbox starts rather than at every `diff` after it. This repository is one: at the commit the network
   test fetches, an architecture-checker fixture has a backslash in its
   name, and the test pins that the snapshot names it. Widening the path
-  rule is a change to D1 and D2, not made here.
+  rule is a change to D1 and D2, not made here. ADR-018 closes this limit
+  for backslash, blank and non-UTF-8 paths; a component that is `.git`
+  on another file system stays refused.
 - A failed fetch of a commit the remote does not advertise as a tip
   costs one more fetch, the probe (D6). The residual: a remote that
   answers `ls-remote` and then fails both fetches still reports

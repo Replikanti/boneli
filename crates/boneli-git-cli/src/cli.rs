@@ -20,7 +20,8 @@
 //! - `snapshot` is the tree's files plus a generated one-commit `.git`
 //!   with no remote, hook or credential; a tree that holds a path the
 //!   workspace cannot carry or a name `diff` refuses, gitlinks included,
-//!   is refused.
+//!   is refused. Paths are [`TreePath`]s, so a backslash, a blank name and
+//!   a name that is not UTF-8 are carried (ADR-018, D4).
 //! - `push` (ADR-014, D1 and D2) is `commit-tree` of the checkout's tree
 //!   with the base as the only parent, then `ls-remote` of the branch,
 //!   where an existing branch is `BranchExists` and nothing is pushed,
@@ -41,7 +42,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
+use boneli_app::{
+    BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl, TreePath,
+};
 use boneli_domain::CommitSha;
 
 use crate::credentials::{Credentials, refused};
@@ -242,17 +245,22 @@ fn ls_tree(bytes: &[u8]) -> Result<Vec<TreeEntry>, GitError> {
     Ok(out)
 }
 
-/// A path git listed, as a `RelativePath`, or `Failed` naming it.
-fn tree_path(raw: &[u8]) -> Result<RelativePath, GitError> {
-    let text = std::str::from_utf8(raw).map_err(|_| {
+/// A path for a `Failed` detail, lossless: a UTF-8 path as its `Debug`
+/// string, as before ADR-018, any other in quotes with its bytes escaped
+/// to ASCII (`"x\xff"`), so a detail never carries an invalid byte.
+fn shown(path: &[u8]) -> String {
+    match std::str::from_utf8(path) {
+        Ok(text) => format!("{text:?}"),
+        Err(_) => format!("\"{}\"", path.escape_ascii()),
+    }
+}
+
+/// A path git listed, as a `TreePath`, or `Failed` naming it.
+fn tree_path(raw: &[u8]) -> Result<TreePath, GitError> {
+    TreePath::parse(raw).map_err(|problem| {
         failed(format!(
-            "the tree has a path that is not UTF-8: {:?}",
-            String::from_utf8_lossy(raw)
-        ))
-    })?;
-    RelativePath::parse(text).map_err(|problem| {
-        failed(format!(
-            "the tree has a path a workspace cannot carry: {text:?} ({problem:?})"
+            "the tree has a path a workspace cannot carry: {} ({problem:?})",
+            shown(raw)
         ))
     })
 }
@@ -262,19 +270,19 @@ fn scoped<'a>(url: &'a str, value: Option<&'a str>) -> Option<Authorization<'a>>
     value.map(|value| Authorization { url, value })
 }
 
-/// Whether some component of `path` is `.git` on another file system
-/// (`src/lookalike.rs`).
-fn lookalike(path: &str) -> bool {
-    path.split('/').any(names_git_elsewhere)
+/// Whether some component of `path`, split at `/` and `\`, is `.git` on
+/// another file system (`src/lookalike.rs`).
+fn lookalike(path: &TreePath) -> bool {
+    names_git_elsewhere(path.as_bytes())
 }
 
 /// `Failed` for a tree path with a component that is `.git` on another
 /// file system.
-fn refuse_lookalike(path: &RelativePath) -> Result<(), GitError> {
-    if lookalike(path.as_str()) {
+fn refuse_lookalike(path: &TreePath) -> Result<(), GitError> {
+    if lookalike(path) {
         return Err(failed(format!(
-            "the tree has a path that is .git on another file system: {:?}",
-            path.as_str()
+            "the tree has a path that is .git on another file system: {}",
+            shown(path.as_bytes())
         )));
     }
     Ok(())
@@ -610,7 +618,7 @@ impl GitCli {
     }
 
     /// The gitlinks of a tree.
-    fn gitlinks(&self, store: &Path, tree: &str) -> Result<Vec<RelativePath>, GitError> {
+    fn gitlinks(&self, store: &Path, tree: &str) -> Result<Vec<TreePath>, GitError> {
         let out = self.git(
             Call::on(store),
             &[
@@ -676,7 +684,7 @@ impl GitCli {
     }
 
     /// The generated `.git` of a store's base commit, in path order.
-    fn generated_git(&self, store: &Store) -> Result<Vec<(RelativePath, Kind, Vec<u8>)>, GitError> {
+    fn generated_git(&self, store: &Store) -> Result<Vec<(TreePath, Kind, Vec<u8>)>, GitError> {
         let tmp = self.fresh("tmp")?;
         let index = tmp.path.join("index");
         self.git(
@@ -726,7 +734,7 @@ impl GitCli {
         entries
             .into_iter()
             .map(|(p, data)| {
-                RelativePath::parse(&p)
+                TreePath::parse(p.as_bytes())
                     .map(|p| (p, Kind::File, data))
                     .map_err(|_| failed("a generated .git path is refused"))
             })
@@ -819,8 +827,8 @@ impl Git for GitCli {
             let path = tree_path(&entry.path)?;
             if path.is_repository_metadata() {
                 return Err(failed(format!(
-                    "the tree holds repository metadata at {:?}",
-                    path.as_str()
+                    "the tree holds repository metadata at {}",
+                    shown(path.as_bytes())
                 )));
             }
             // `diff` refuses these names, so a checkout that holds one
@@ -843,7 +851,7 @@ impl Git for GitCli {
         let mut merged = Vec::new();
         loop {
             let take_tree = match (tree.peek(), git.peek()) {
-                (Some(t), Some(g)) => t.0.as_str().as_bytes() < g.0.as_str().as_bytes(),
+                (Some(t), Some(g)) => t.0.as_bytes() < g.0.as_bytes(),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
@@ -865,10 +873,10 @@ impl Git for GitCli {
         // Before anything is written: on a case-insensitive scratch
         // directory git would read `sub/.GIT` as `sub/.git` while it walks
         // the tree, before its own path checks see the name.
-        if let Some((path, _, _)) = workspace.iter().find(|(p, _, _)| lookalike(p.as_str())) {
+        if let Some((path, _, _)) = workspace.iter().find(|(p, _, _)| lookalike(p)) {
             return Err(failed(format!(
-                "the workspace has a path that is .git on another file system: {:?}",
-                path.as_str()
+                "the workspace has a path that is .git on another file system: {}",
+                shown(path.as_bytes())
             )));
         }
         let gitlinks = self.gitlinks(store, &c.tree)?;
@@ -945,9 +953,10 @@ impl Git for GitCli {
         )?;
         let tree = self.line(indexed(), &[os("write-tree")])?;
         // git refuses its own look-alikes only, and accepts paths a
-        // workspace cannot carry. Every path of the applied tree, gitlinks
-        // included, gets the checks `snapshot` makes, so no checkout holds
-        // a path that `snapshot` or `diff` would refuse.
+        // workspace cannot carry (a NUL-free tree path always parses, so
+        // that check is defense in depth). Every path of the applied tree,
+        // gitlinks included, gets the checks `snapshot` makes, so no
+        // checkout holds a path that `snapshot` or `diff` would refuse.
         let out = self.git(
             Call::on(store),
             &[
@@ -959,16 +968,16 @@ impl Git for GitCli {
             ],
         )?;
         for (n, entry) in ls_tree(&out)?.into_iter().enumerate() {
-            let shown = String::from_utf8_lossy(&entry.path);
+            let shown = shown(&entry.path);
             let path = tree_path(&entry.path).map_err(|_| {
                 failed(format!(
-                    "the diff leaves a path a workspace cannot carry: entry {n}, {shown:?}"
+                    "the diff leaves a path a workspace cannot carry: entry {n}, {shown}"
                 ))
             })?;
-            if lookalike(path.as_str()) {
+            if lookalike(&path) {
                 return Err(failed(format!(
                     "the diff leaves a path that is .git on another file system: entry {n}, \
-                     {shown:?}"
+                     {shown}"
                 )));
             }
         }
@@ -1083,6 +1092,27 @@ mod tests {
         ] {
             assert!(ls_tree(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A detail names a UTF-8 path as before and any other with its bytes
+    /// escaped, so it is lossless and ASCII-safe (ADR-018, D4).
+    #[test]
+    fn details_render_paths_losslessly() {
+        assert_eq!(shown(b"a\\b"), "\"a\\\\b\"");
+        assert_eq!(shown(" ".as_bytes()), "\" \"");
+        assert_eq!(shown("\u{17E}".as_bytes()), "\"\u{17E}\"");
+        assert_eq!(shown(b".g\xffit"), "\".g\\xffit\"");
+        assert_eq!(shown(b"x\xff\"\\"), "\"x\\xff\\\"\\\\\"");
+        let detail = match tree_path(b"a//b") {
+            Err(GitError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        assert!(detail.contains("\"a//b\" (EmptyComponent)"), "{detail}");
+        let detail = match refuse_lookalike(&TreePath::parse(b".g\xffit").expect("a tree path")) {
+            Err(GitError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        assert!(detail.contains("\\xff"), "{detail}");
     }
 
     #[test]

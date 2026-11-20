@@ -20,7 +20,7 @@ use boneli_app::{
     Agent, Clock, DataError, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore,
     Evidence, EvidenceError, FixRequest, Forge, ForgeRef, GitError, Ids, ImageError, JobFailure,
     PreviousRunError, PullRequest, ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog,
-    RunStart, SandboxError, StoreError, TriageReport, TriageRequest, Verifier, Written,
+    RunStart, SandboxError, StoreError, TreePath, TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, CheckStatus, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef,
@@ -580,7 +580,8 @@ pub fn render_app(scenarios: &[AppScenario]) -> String {
 }
 
 /// The `Display` and `Debug` of every variant of every `boneli-app` type
-/// with a hand-written `Display`, so the replay compares them too.
+/// with a hand-written `Display`, and the hand-written `Debug` of
+/// `TreePath`, so the replay compares them too.
 pub fn render_app_errors() -> String {
     let unavailable = || String::from(FAULT);
     let store = [
@@ -659,6 +660,12 @@ pub fn render_app_errors() -> String {
     }
     for error in data {
         let _ = writeln!(out, "display app: {error}\n{error:?}");
+    }
+    // `TreePath`'s `Debug` (ADR-018): a UTF-8 path and one that is not.
+    for bytes in [&b"src/a\\b.rs"[..], b"x\xff\"\\"] {
+        if let Ok(path) = TreePath::parse(bytes) {
+            let _ = writeln!(out, "debug app: {path:?}");
+        }
     }
     out
 }

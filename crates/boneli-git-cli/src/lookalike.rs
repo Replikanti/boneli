@@ -16,6 +16,23 @@
 //!   git accepts, would be `.git`.
 //!
 //! Exactly `.git` is in both forms; `without_metadata` drops it first.
+//!
+//! Paths are bytes (ADR-018, D3):
+//!
+//! - components are split at `/` and at `\`, because git's own NTFS check
+//!   treats `\` as a separator on every host: git 2.56.0 refuses
+//!   `x\.git`, `.git\config` and `x\git~1` in `add` and `apply`, and
+//!   accepts `x\.g<U+200B>it`, which this check refuses too;
+//! - the NTFS form reads bytes, as git's does;
+//! - the folded form reads a component that is not UTF-8 twice, once with
+//!   every maximal run of bytes that are not UTF-8 removed and once with
+//!   each such run replaced by `.`, and either reading that is `.git`
+//!   refuses. Removal covers a file system that drops the bytes it cannot
+//!   decode (`.g<0xFF>it`); `.` covers an invalid run that stands for
+//!   the dot, such as the overlong `.` in `<0xC0 0xAE>git`. This is not
+//!   an overlong decoder: an overlong letter (`.<0xC1 0xA7>it`) folds to
+//!   neither reading and passes, as it passes git's byte check. ADR-018
+//!   D3 records why that is accepted.
 
 /// Unicode `Default_Ignorable_Code_Point`, as inclusive ranges, merged
 /// from DerivedCoreProperties.txt of Unicode 18.0.0.
@@ -47,7 +64,7 @@ fn ignorable(c: char) -> bool {
 }
 
 /// `.git` in any ASCII case once the ignorable code points are gone.
-fn folds_to_git(component: &str) -> bool {
+fn str_folds_to_git(component: &str) -> bool {
     let mut rest = component.chars().filter(|c| !ignorable(*c));
     ".git"
         .chars()
@@ -55,9 +72,33 @@ fn folds_to_git(component: &str) -> bool {
         && rest.next().is_none()
 }
 
+/// The folded form over bytes: as UTF-8 when the component is, otherwise
+/// both readings of its invalid runs (removed, and each replaced by `.`).
+fn folds_to_git(component: &[u8]) -> bool {
+    if let Ok(text) = std::str::from_utf8(component) {
+        return str_folds_to_git(text);
+    }
+    let mut removed = String::new();
+    let mut replaced = String::new();
+    // `utf8_chunks` ends a chunk at each invalid sequence, so a run of
+    // invalid bytes spans chunks whose valid part between them is empty.
+    let mut in_run = false;
+    for chunk in component.utf8_chunks() {
+        if !chunk.valid().is_empty() {
+            in_run = false;
+        }
+        removed.push_str(chunk.valid());
+        replaced.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() && !in_run {
+            replaced.push('.');
+            in_run = true;
+        }
+    }
+    str_folds_to_git(&removed) || str_folds_to_git(&replaced)
+}
+
 /// git's `is_ntfs_dotgit` for one component.
-fn ntfs_git(component: &str) -> bool {
-    let bytes = component.as_bytes();
+fn ntfs_git(bytes: &[u8]) -> bool {
     let rest = if bytes.len() >= 4 && bytes[0] == b'.' && bytes[1..4].eq_ignore_ascii_case(b"git") {
         &bytes[4..]
     } else if bytes.len() >= 5 && bytes[..3].eq_ignore_ascii_case(b"git") && &bytes[3..5] == b"~1" {
@@ -76,9 +117,11 @@ fn ntfs_git(component: &str) -> bool {
     true
 }
 
-/// Whether a path component may name `.git` on some file system.
-pub(crate) fn names_git_elsewhere(component: &str) -> bool {
-    folds_to_git(component) || ntfs_git(component)
+/// Whether some component of a tree path, split at `/` and at `\`, may
+/// name `.git` on some file system.
+pub(crate) fn names_git_elsewhere(path: &[u8]) -> bool {
+    path.split(|b| *b == b'/' || *b == b'\\')
+        .any(|component| folds_to_git(component) || ntfs_git(component))
 }
 
 #[cfg(test)]
@@ -106,7 +149,7 @@ mod tests {
             ".git\u{00AD}",
             ".gi\u{E0001}t",
         ] {
-            assert!(names_git_elsewhere(name), "{name:?}");
+            assert!(names_git_elsewhere(name.as_bytes()), "{name:?}");
         }
         for name in [
             "git",
@@ -123,7 +166,40 @@ mod tests {
             ".git\u{0301}",
             "\u{FF0E}git",
         ] {
-            assert!(!names_git_elsewhere(name), "{name:?}");
+            assert!(!names_git_elsewhere(name.as_bytes()), "{name:?}");
+        }
+        // Components split at `\` too, as git's NTFS check splits them: the
+        // first three git refuses itself, the last it accepts (ADR-018, D3).
+        // `.git\x` is one name, not metadata, so it is refused here.
+        // Bytes that are not UTF-8 are read removed and as `.`.
+        let refused: [&[u8]; 11] = [
+            b"x\\.git",
+            b".git\\config",
+            b"x\\GIT~1",
+            "x\\.g\u{200B}it".as_bytes(),
+            b".git\\x",
+            b"a/b\\.GIT/c",
+            b".g\xffit",
+            b"\xc0\xaegit",
+            b".git\xff",
+            b"\xff.git",
+            b"a/.g\xfe\xffit/b",
+        ];
+        for path in refused {
+            assert!(names_git_elsewhere(path), "{path:?}");
+        }
+        let passed: [&[u8]; 8] = [
+            b"a\\b",
+            b"x\xff",
+            b"\xff",
+            b"\xc0\xae\xc0\xae",
+            b"..\\x",
+            b"x.git\\y",
+            b".gi\xff",
+            b"src/lib.rs",
+        ];
+        for path in passed {
+            assert!(!names_git_elsewhere(path), "{path:?}");
         }
     }
 

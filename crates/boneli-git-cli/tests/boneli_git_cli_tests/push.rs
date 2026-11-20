@@ -7,8 +7,8 @@ use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError};
 use boneli_git_cli::GitCli;
 
 use crate::support::{
-    EDITED, LIB, Source, TempDir, branch_at, cli, contract_source, edit, fgit, host_git, open,
-    path, sha, tracing_git, write_executable,
+    EDITED, LIB, Source, TempDir, branch_at, cli, contract_source, edit, fgit, host_git, open, sha,
+    tpath, tracing_git, write_executable,
 };
 
 fn branch(name: &str) -> BranchName {
@@ -29,7 +29,7 @@ fn info() -> CommitInfo {
 fn edited(git: &GitCli, source: &Source, base: &str) -> (CheckoutId, CheckoutId) {
     let c = git.fetch_base(&source.url(), &sha(base)).expect("fetch");
     let snapshot = git.snapshot(&c).expect("snapshot");
-    let workspace = edit(&snapshot, &path("src/lib.rs"), Some(EDITED));
+    let workspace = edit(&snapshot, &tpath("src/lib.rs"), Some(EDITED));
     let diff = git.diff(&c, &workspace).expect("diff");
     let after = git.apply(&c, &diff).expect("apply");
     (c, after)

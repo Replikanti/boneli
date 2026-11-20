@@ -134,10 +134,9 @@ fn nested_metadata_is_dropped() {
         fn diff(&self, c: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
             let mut diff = self.0.diff(c, workspace)?;
             for (p, _, data) in decode(workspace).iter() {
-                if p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
-                    diff.extend_from_slice(
-                        format!("nested {} {}\n", p.as_str(), data.len()).as_bytes(),
-                    );
+                if p.is_repository_metadata() && !p.as_bytes().starts_with(b".git/") {
+                    let shown = String::from_utf8_lossy(p.as_bytes());
+                    diff.extend_from_slice(format!("nested {shown} {}\n", data.len()).as_bytes());
                 }
             }
             Ok(diff)
@@ -181,10 +180,11 @@ fn edit_hook_keeps_kinds() {
     let snapshot = git.snapshot(&c).expect("snapshot");
     let trip = Trip::new(&tmp);
     let (hook, script) = trip.hook();
+    let hook = boneli_app::TreePath::from(hook);
     let w = edit(&snapshot, &hook, Some(&script));
     let w = edit(
         &w,
-        &crate::support::path("run.sh"),
+        &crate::support::tpath("run.sh"),
         Some(b"#!/bin/sh\nexit 0\n"),
     );
     let d = decode(&w);
@@ -193,7 +193,7 @@ fn edit_hook_keeps_kinds() {
         Some(boneli_git_cli::Kind::Executable)
     );
     assert_eq!(
-        d.get(&crate::support::path("run.sh")).map(|(k, _)| k),
+        d.get(&crate::support::tpath("run.sh")).map(|(k, _)| k),
         Some(boneli_git_cli::Kind::Executable)
     );
     // `encode` keeps what it is given.

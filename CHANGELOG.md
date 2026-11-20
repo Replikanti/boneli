@@ -516,6 +516,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Limits are public constants: 32 MiB per list, 64 MiB per cache, 62 s
   per check. No new crate or edge. ADR-005's revocation known limit
   points to ADR-017.
+- Workspaces carry paths the citation rule refuses (#64, ADR-018): the
+  new byte type `boneli_app::TreePath` holds what a tree holds, so a
+  backslash, a blank name and a name that is not UTF-8 pass through the
+  workspace codec, `materialize`, `snapshot`, `diff`, `apply` and
+  `MemoryGit`, and this repository's own tree snapshots. `RelativePath`,
+  the citation precheck (ADR-002 D2), the patch policy (ADR-013) and the
+  `Git` trait are unchanged: such files cannot be cited, read through the
+  port or changed by a fix. `TreePath::citable` is the way back.
+  `boneli-git-cli` splits look-alike components at `\` as well as `/`,
+  as git's NTFS check does, and reads a component that is not UTF-8 with
+  its invalid runs removed and replaced by `.`; failure details escape
+  bytes that are not UTF-8. `patch_between` returns a `PatchInputError`
+  for a changed path or base link that is not UTF-8. The `Git` contract
+  gains its 16th clause, `uncitable-paths-carried` (four sub-checks), and
+  its `edit` hook takes a `&TreePath`; counts are 55 clauses and 70
+  mutant cases, 8 regression mutants and 8 vacuous fixtures. ADR-010's
+  known limit points to ADR-018.
 
 ### Changed
 

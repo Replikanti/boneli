@@ -145,6 +145,7 @@ pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
     "evidence.rs: impl fmt::Display for EvidenceError {",
     "git.rs: impl fmt::Display for GitError {",
     "image.rs: impl fmt::Display for ImageError {",
+    "path.rs: impl fmt::Debug for TreePath {",
     "sandbox.rs: impl fmt::Display for SandboxError {",
     "store.rs: impl fmt::Display for StoreError {",
 ];

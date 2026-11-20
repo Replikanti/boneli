@@ -1280,7 +1280,8 @@ pub mod sandbox {
 pub mod git {
     use super::*;
     use crate::git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
-    use crate::path::RelativePath;
+    use crate::path::{RelativePath, TreePath, Uncitable};
+    use boneli_domain::CitationProblem;
 
     const PORT: &str = "Git";
 
@@ -1301,6 +1302,7 @@ pub mod git {
         "push-parent-is-base",
         "push-never-overwrites",
         "push-unknown-checkout",
+        "uncitable-paths-carried",
     ];
 
     /// The sub-checks of `workspace-metadata-inert`, each with its own
@@ -1312,6 +1314,15 @@ pub mod git {
         "fresh-checkout",
         "same-apply",
         "apply-refuses",
+    ];
+
+    /// The sub-checks of `uncitable-paths-carried`, each with its own
+    /// mutant (ADR-004, D2; ADR-018, D6).
+    pub const UNCITABLE_CHECKS: &[&str] = &[
+        "snapshot-carries",
+        "edit-round-trip",
+        "remove-round-trip",
+        "add-round-trip",
     ];
 
     /// An adapter with a repository whose content at the base commit the
@@ -1339,6 +1350,11 @@ pub mod git {
         /// Repository metadata the suite plants in a workspace, path and
         /// content; every path must be [`RelativePath::is_repository_metadata`].
         pub metadata: Vec<(RelativePath, Vec<u8>)>,
+        /// Files at the base commit whose paths the citation rule refuses
+        /// ([`TreePath::citable`]), with their content at the base: at
+        /// least one path that is not UTF-8, one with a backslash and one
+        /// that is blank, none of them repository metadata (ADR-018, D6).
+        pub uncitable: Vec<(TreePath, Vec<u8>)>,
     }
 
     /// Whether anything the planted metadata asks for ran on the host. Only
@@ -1378,7 +1394,9 @@ pub mod git {
     /// `edit` takes a workspace in the adapter's snapshot format, a path
     /// and content, and returns the workspace with that file set to that
     /// content, or removed for `None`. The snapshot format belongs to the
-    /// adapter (#30), so only its own test knows how. `retarget` takes a
+    /// adapter (#30), so only its own test knows how. Its path is a
+    /// [`TreePath`], because a workspace carries paths an agent cannot cite
+    /// (ADR-018). `retarget` takes a
     /// diff in the adapter's format and two paths and returns the diff with
     /// every change of the first path moved to the second; the suite proves
     /// on a content path that the result applies. `tripwire` reports what
@@ -1386,7 +1404,7 @@ pub mod git {
     /// `remote` what the push clauses left on the remote.
     pub fn run<G: Git>(
         make: impl Fn() -> Repository<G>,
-        edit: impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         retarget: impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         tripwire: &impl Tripwire<G>,
         remote: &impl Remote<G>,
@@ -1405,7 +1423,13 @@ pub mod git {
         push_reads_back(&make(), &edit, remote)?;
         push_parent_is_base(&make(), &edit, remote)?;
         push_never_overwrites(&make(), &edit, remote)?;
-        push_unknown_checkout(&make(), remote)
+        push_unknown_checkout(&make(), remote)?;
+        uncitable_paths_carried(&make(), &edit)
+    }
+
+    /// A content path as the `edit` hook takes it.
+    fn tree(path: &RelativePath) -> TreePath {
+        TreePath::from(path)
     }
 
     fn call<T>(
@@ -1453,7 +1477,7 @@ pub mod git {
     fn applied<G: Git>(
         r: &Repository<G>,
         clause: &'static str,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(CheckoutId, CheckoutId), Violation> {
         if r.edited == r.content {
             return Err(violation(
@@ -1466,7 +1490,7 @@ pub mod git {
             ));
         }
         changed(r, clause, |snapshot| {
-            edit(snapshot, &r.path, Some(&r.edited))
+            edit(snapshot, &tree(&r.path), Some(&r.edited))
         })
     }
 
@@ -1503,7 +1527,7 @@ pub mod git {
 
     fn apply_then_read<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "apply-then-read";
         let (_, after) = applied(r, clause, edit)?;
@@ -1514,7 +1538,7 @@ pub mod git {
     /// (invariant 6), so applying a diff must not change the base.
     fn apply_leaves_base<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "apply-leaves-base";
         let (base, _) = applied(r, clause, edit)?;
@@ -1526,7 +1550,7 @@ pub mod git {
     /// apply write into the cache.
     fn base_refetch_unchanged<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "base-refetch-unchanged";
         applied(r, clause, edit)?;
@@ -1539,11 +1563,11 @@ pub mod git {
     /// them.
     fn added_file<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "added-file";
         let (_, after) = changed(r, clause, |snapshot| {
-            edit(snapshot, &r.missing, Some(&r.edited))
+            edit(snapshot, &tree(&r.missing), Some(&r.edited))
         })?;
         expect_read(r, clause, &after, &r.missing, Some(&r.edited))
     }
@@ -1551,10 +1575,10 @@ pub mod git {
     /// A file removed from the workspace is removed by the diff.
     fn removed_file<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "removed-file";
-        let (_, after) = changed(r, clause, |snapshot| edit(snapshot, &r.path, None))?;
+        let (_, after) = changed(r, clause, |snapshot| edit(snapshot, &tree(&r.path), None))?;
         expect_read(r, clause, &after, &r.path, None)
     }
 
@@ -1566,12 +1590,12 @@ pub mod git {
     /// observed through the port; the error is what the clause pins.
     fn apply_mismatch_fails<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
     ) -> Result<(), Violation> {
         let clause = "apply-mismatch-fails";
         let base = checkout(r, clause)?;
         let snapshot = call(clause, "snapshot", r.adapter.snapshot(&base))?;
-        let workspace = edit(&snapshot, &r.path, None);
+        let workspace = edit(&snapshot, &tree(&r.path), None);
         let diff = call(clause, "diff", r.adapter.diff(&base, &workspace))?;
         let once = call(clause, "apply", r.adapter.apply(&base, &diff))?;
         let before = call(clause, "snapshot", r.adapter.snapshot(&once))?;
@@ -1644,14 +1668,14 @@ pub mod git {
     /// and unchanged, are `d_plain` and empty.
     fn diffs_as_before<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         checkout: &CheckoutId,
         d_plain: &[u8],
         sub: &str,
         which: &str,
     ) -> Result<(), Violation> {
         let snapshot = call(METADATA, "snapshot", r.adapter.snapshot(checkout))?;
-        let edited = edit(&snapshot, &r.path, Some(&r.edited));
+        let edited = edit(&snapshot, &tree(&r.path), Some(&r.edited));
         let d_edited = call(METADATA, "diff", r.adapter.diff(checkout, &edited))?;
         let d_unchanged = call(METADATA, "diff", r.adapter.diff(checkout, &snapshot))?;
         ensure(
@@ -1712,12 +1736,12 @@ pub mod git {
     /// would have to recognize metadata paths and undo its own damage.
     fn metadata_diffs<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         retarget: &impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         base: &CheckoutId,
         snapshot: &[u8],
     ) -> Result<Vec<(RelativePath, Vec<u8>)>, Violation> {
-        let added = edit(snapshot, &r.missing, Some(&r.edited));
+        let added = edit(snapshot, &tree(&r.missing), Some(&r.edited));
         let d_add = call(METADATA, "diff", r.adapter.diff(base, &added))?;
         let twin_name = format!("{}.twin", r.missing.as_str());
         let twin = RelativePath::parse(&twin_name).map_err(|problem| {
@@ -1759,7 +1783,7 @@ pub mod git {
     /// writes no metadata at all. Pure: the adapter sees none of it.
     fn every_entry_reaches_the_workspace(
         r_metadata: &[(RelativePath, Vec<u8>)],
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         plain: &[u8],
         hostile: &[u8],
     ) -> Result<(), Violation> {
@@ -1769,7 +1793,7 @@ pub mod git {
                 .enumerate()
                 .filter(|(j, _)| *j != k)
                 .fold(plain.to_vec(), |workspace, (_, (other, content))| {
-                    edit(&workspace, other, Some(content))
+                    edit(&workspace, &tree(other), Some(content))
                 });
             if without == hostile {
                 return Err(metadata_fixture(format!(
@@ -1808,7 +1832,7 @@ pub mod git {
     /// Details quote lengths, not bytes (ADR-004, D10).
     fn workspace_metadata_inert<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         retarget: &impl Fn(&[u8], &RelativePath, &RelativePath) -> Vec<u8>,
         tripwire: &impl Tripwire<G>,
     ) -> Result<(), Violation> {
@@ -1835,12 +1859,12 @@ pub mod git {
         }
         let base = checkout(r, METADATA)?;
         let snapshot = call(METADATA, "snapshot", r.adapter.snapshot(&base))?;
-        let plain = edit(&snapshot, &r.path, Some(&r.edited));
+        let plain = edit(&snapshot, &tree(&r.path), Some(&r.edited));
         let hostile = r
             .metadata
             .iter()
             .fold(plain.clone(), |workspace, (path, content)| {
-                edit(&workspace, path, Some(content))
+                edit(&workspace, &tree(path), Some(content))
             });
         every_entry_reaches_the_workspace(&r.metadata, edit, &plain, &hostile)?;
         // Taken before any metadata reaches the adapter.
@@ -1974,7 +1998,7 @@ pub mod git {
     fn pushed<G: Git>(
         r: &Repository<G>,
         clause: &'static str,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         remote: &impl Remote<G>,
     ) -> Result<(CheckoutId, CheckoutId, BranchName, CommitSha), Violation> {
         let branch = absent_branch(r, remote, clause)?;
@@ -1989,7 +2013,7 @@ pub mod git {
     /// shows the verified fix.
     fn push_reads_back<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         remote: &impl Remote<G>,
     ) -> Result<(), Violation> {
         let clause = "push-reads-back";
@@ -2014,7 +2038,7 @@ pub mod git {
     /// request shows the fix and nothing else.
     fn push_parent_is_base<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         remote: &impl Remote<G>,
     ) -> Result<(), Violation> {
         let clause = "push-parent-is-base";
@@ -2035,7 +2059,7 @@ pub mod git {
     /// included (ADR-014, D2).
     fn push_never_overwrites<G: Git>(
         r: &Repository<G>,
-        edit: &impl Fn(&[u8], &RelativePath, Option<&[u8]>) -> Vec<u8>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
         remote: &impl Remote<G>,
     ) -> Result<(), Violation> {
         let clause = "push-never-overwrites";
@@ -2099,6 +2123,212 @@ pub mod git {
                 diff.len()
             )
         })
+    }
+    const UNCITABLE: &str = "uncitable-paths-carried";
+
+    /// A fixture that would make `uncitable-paths-carried` vacuous.
+    fn uncitable_fixture(detail: String) -> Violation {
+        violation(PORT, UNCITABLE, format!("fixture: {detail}"))
+    }
+
+    /// Content that differs from `content`: it with `+` appended.
+    fn altered(content: &[u8]) -> Vec<u8> {
+        let mut other = content.to_vec();
+        other.push(b'+');
+        other
+    }
+
+    /// The class of an uncitable path, for the fixture guards; `None` for
+    /// a citable one.
+    fn class(path: &TreePath) -> Option<Uncitable> {
+        path.citable().err()
+    }
+
+    /// The twin of an uncitable path: its last component with U+200B
+    /// appended. That keeps its class (a byte string that is not UTF-8
+    /// stays so, a backslash stays, and U+200B is blank), and it is a
+    /// path the base must not have.
+    fn twin(k: usize, path: &TreePath) -> Result<TreePath, Violation> {
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.extend_from_slice("\u{200B}".as_bytes());
+        TreePath::parse(&bytes).map_err(|problem| {
+            uncitable_fixture(format!(
+                "the twin of path {k} is not a tree path: {problem:?}"
+            ))
+        })
+    }
+
+    /// The list guards, each a `fixture:` violation, checked before the
+    /// adapter is called: the list holds one path of each class and no
+    /// citable or metadata path.
+    fn uncitable_list<G>(r: &Repository<G>) -> Result<(), Violation> {
+        if r.uncitable.is_empty() {
+            return Err(uncitable_fixture(String::from(
+                "no uncitable paths, so the clause cannot tell an adapter that carries them from \
+                 one that drops them",
+            )));
+        }
+        for (k, (path, _)) in r.uncitable.iter().enumerate() {
+            if class(path).is_none() {
+                return Err(uncitable_fixture(format!(
+                    "path {k} is citable, so it proves nothing about the paths an agent cannot cite"
+                )));
+            }
+            if path.is_repository_metadata() {
+                return Err(uncitable_fixture(format!(
+                    "path {k} is repository metadata, which a diff drops"
+                )));
+            }
+        }
+        let wanted = [
+            ("not UTF-8", Uncitable::NotUtf8),
+            (
+                "a backslash",
+                Uncitable::Citation(CitationProblem::Backslash),
+            ),
+            ("blank", Uncitable::Citation(CitationProblem::BlankPath)),
+        ];
+        for (name, want) in wanted {
+            if !r.uncitable.iter().any(|(p, _)| class(p) == Some(want)) {
+                return Err(uncitable_fixture(format!(
+                    "no path is {name}, so that class is not covered"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `edit` guards, each a `fixture:` violation: `edit` really
+    /// writes, removes and adds each path, and the base has no file at a
+    /// twin. `full` is the base snapshot with every listed file written by
+    /// `edit`, so the guards hold for an adapter whose snapshot leaves the
+    /// paths out too, and that adapter is caught by `snapshot-carries`
+    /// instead. Returns the twins.
+    fn uncitable_edits<G>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+        snapshot: &[u8],
+    ) -> Result<Vec<TreePath>, Violation> {
+        let full = r
+            .uncitable
+            .iter()
+            .fold(snapshot.to_vec(), |workspace, (path, content)| {
+                edit(&workspace, path, Some(content))
+            });
+        let mut twins = Vec::new();
+        for (k, (path, content)) in r.uncitable.iter().enumerate() {
+            let other = altered(content);
+            if edit(&full, path, Some(&other)) == full {
+                return Err(uncitable_fixture(format!(
+                    "the edit hook does not write path {k}, so the adapter never sees a change \
+                     there"
+                )));
+            }
+            if edit(&full, path, None) == full {
+                return Err(uncitable_fixture(format!(
+                    "the edit hook does not remove path {k}, so the adapter never sees a removal \
+                     there"
+                )));
+            }
+            let twin = twin(k, path)?;
+            if class(&twin) != class(path) {
+                return Err(uncitable_fixture(format!(
+                    "the twin of path {k} has another class than the path"
+                )));
+            }
+            if edit(snapshot, &twin, None) != snapshot {
+                return Err(uncitable_fixture(format!(
+                    "the base snapshot has a file at the twin of path {k}, so adding it proves \
+                     nothing"
+                )));
+            }
+            if edit(snapshot, &twin, Some(content)) == snapshot {
+                return Err(uncitable_fixture(format!(
+                    "the edit hook does not add the twin of path {k}"
+                )));
+            }
+            twins.push(twin);
+        }
+        Ok(twins)
+    }
+
+    /// `sub`: `workspace`, diffed against the base and applied to it,
+    /// gives a checkout whose snapshot is `workspace`.
+    fn round_trip<G: Git>(
+        r: &Repository<G>,
+        base: &CheckoutId,
+        workspace: &[u8],
+        sub: &str,
+        what: &str,
+    ) -> Result<(), Violation> {
+        let diff = call(UNCITABLE, "diff", r.adapter.diff(base, workspace))?;
+        let after = call(UNCITABLE, "apply", r.adapter.apply(base, &diff))?;
+        let got = call(UNCITABLE, "snapshot", r.adapter.snapshot(&after))?;
+        ensure(got == workspace, PORT, UNCITABLE, || {
+            format!(
+                "{sub}: {what}, diffed ({} bytes) and applied, gives a snapshot of {} bytes \
+                 that differs from the workspace ({} bytes)",
+                diff.len(),
+                got.len(),
+                workspace.len()
+            )
+        })
+    }
+
+    /// A repository may hold files whose paths an agent cannot cite (a
+    /// backslash, a blank name, a name that is not UTF-8), and the replica
+    /// must hold them too (ADR-018, D4 and D6):
+    ///
+    /// - `snapshot-carries`: the base snapshot holds every such file with
+    ///   its base content;
+    /// - `edit-round-trip`: each, changed, diffs and applies to a checkout
+    ///   whose snapshot is the edited workspace;
+    /// - `remove-round-trip`: the same with the file removed;
+    /// - `add-round-trip`: the same with a new file at its twin, a path of
+    ///   the same class the base does not have.
+    ///
+    /// Fixture guards come first (`uncitable_list`, `uncitable_edits`).
+    /// Details quote
+    /// indexes and lengths, never path bytes (ADR-004, D10).
+    fn uncitable_paths_carried<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        uncitable_list(r)?;
+        let base = checkout(r, UNCITABLE)?;
+        let snapshot = call(UNCITABLE, "snapshot", r.adapter.snapshot(&base))?;
+        let twins = uncitable_edits(r, edit, &snapshot)?;
+        for (k, (path, content)) in r.uncitable.iter().enumerate() {
+            ensure(
+                edit(&snapshot, path, Some(content)) == snapshot,
+                PORT,
+                UNCITABLE,
+                || {
+                    format!(
+                        "snapshot-carries: the base snapshot does not hold path {k} with its \
+                         base content ({} bytes)",
+                        content.len()
+                    )
+                },
+            )?;
+        }
+        for (k, (path, content)) in r.uncitable.iter().enumerate() {
+            let other = altered(content);
+            let workspace = edit(&snapshot, path, Some(&other));
+            let what = format!("the base with path {k} changed");
+            round_trip(r, &base, &workspace, "edit-round-trip", &what)?;
+        }
+        for (k, (path, _)) in r.uncitable.iter().enumerate() {
+            let workspace = edit(&snapshot, path, None);
+            let what = format!("the base without path {k}");
+            round_trip(r, &base, &workspace, "remove-round-trip", &what)?;
+        }
+        for (k, ((_, content), twin)) in r.uncitable.iter().zip(&twins).enumerate() {
+            let workspace = edit(&snapshot, twin, Some(content));
+            let what = format!("the base with the twin of path {k} added");
+            round_trip(r, &base, &workspace, "add-round-trip", &what)?;
+        }
+        Ok(())
     }
 }
 

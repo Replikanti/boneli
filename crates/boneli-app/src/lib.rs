@@ -15,7 +15,8 @@
 //! [`Sandbox`], [`Git`], [`ImageStore`] and [`DataSnapshot`], which the
 //! verifier, the environments and the agent's workspace build on. Paths
 //! that ports take are [`RelativePath`]s, the citation path rule of the
-//! domain. [`contract`] holds the suites every adapter of a port must pass;
+//! domain; the paths a tree holds are [`TreePath`]s, which also carry
+//! names an agent cannot cite (ADR-018). [`contract`] holds the suites every adapter of a port must pass;
 //! the in-memory adapters live in the `boneli-memory` crate.
 #![no_std]
 #![doc(test(attr(forbid(unsafe_code))))]
@@ -53,7 +54,7 @@ pub use git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
 pub use ids::Ids;
 pub use image::{ImageError, ImageRef, ImageStore, RootfsRef};
 pub use job::JobFailure;
-pub use path::RelativePath;
+pub use path::{RelativePath, TreePath, TreePathProblem, Uncitable};
 pub use sandbox::{
     Command, ExecResult, ExitStatus, Limits, Phase, Sandbox, SandboxError, SandboxId, SandboxSpec,
 };

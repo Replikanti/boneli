@@ -4,7 +4,7 @@ use boneli_app::{Git, GitError};
 use boneli_git_cli::Kind;
 
 use crate::support::{
-    Source, TempDir, cli, decode, edit, entries, failed, fgit, listing, path, sha,
+    Source, TempDir, bpath, cli, decode, edit, entries, failed, fgit, listing, sha, tpath,
 };
 
 const ALLOWLIST: &[&str] = &[
@@ -55,29 +55,123 @@ fn snapshot_keeps_modes() {
     let git = cli(&tmp);
     let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
     let w = decode(&git.snapshot(&c).expect("snapshot"));
-    assert_eq!(w.get(&path("plain")), Some((Kind::File, &b"p"[..])));
+    assert_eq!(w.get(&tpath("plain")), Some((Kind::File, &b"p"[..])));
     assert_eq!(
-        w.get(&path("run.sh")),
+        w.get(&tpath("run.sh")),
         Some((Kind::Executable, &b"#!/bin/sh\n"[..]))
     );
     assert_eq!(
-        w.get(&path("link")),
+        w.get(&tpath("link")),
         Some((Kind::Symlink, &b"../outside"[..]))
     );
 }
 
+/// A base tree with paths the citation rule refuses snapshots, each with
+/// its kind and content: a backslash, blank names, a name that is not
+/// UTF-8, a backslash directory, an executable and a symlink whose target
+/// is not UTF-8 (ADR-018, D4). This replaces the refusal of ADR-010.
 #[test]
-fn snapshot_refuses_unrepresentable_paths() {
-    for (name, bad) in [("backslash", "a\\b"), ("blank", " ")] {
-        let tmp = TempDir::new("unrepresentable");
+fn snapshot_carries_uncitable_paths() {
+    let tmp = TempDir::new("uncitable");
+    let source = Source::new(&tmp, "src", false);
+    source.write("ok", b"ok", false);
+    let files: [(&[u8], &[u8]); 6] = [
+        (b"a\\b", b"1"),
+        (b" ", b"2"),
+        ("\u{200B}".as_bytes(), b"3"),
+        (b"\t", b"4"),
+        (b"x\xff", b"5"),
+        (b"d\\e/f", b"6"),
+    ];
+    for (p, data) in files {
+        source.write_bytes(p, data, false);
+    }
+    source.write_bytes(b"run\\x.sh", b"#!/bin/sh\n", true);
+    source.link_bytes(b"l\\x", b"x\xff");
+    let base = source.commit("base");
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let snapshot = git.snapshot(&c).expect("snapshot");
+    let w = decode(&snapshot);
+    for (p, data) in files {
+        assert_eq!(w.get(&bpath(p)), Some((Kind::File, data)), "{p:?}");
+    }
+    assert_eq!(
+        w.get(&bpath(b"run\\x.sh")),
+        Some((Kind::Executable, &b"#!/bin/sh\n"[..]))
+    );
+    assert_eq!(w.get(&bpath(b"l\\x")), Some((Kind::Symlink, &b"x\xff"[..])));
+    // The snapshot is the workspace `diff` takes back unchanged.
+    assert_eq!(git.diff(&c, &snapshot), Ok(vec![]));
+}
+
+/// Tree entries that sort before the generated `.git/` block (tab, space,
+/// `-`) and after it (0xFF) merge with it in byte order, so `from_sorted`
+/// sees no `Unsorted`.
+#[test]
+fn snapshot_merges_wide_paths_around_generated_git() {
+    let tmp = TempDir::new("merge-order");
+    let source = Source::new(&tmp, "src", false);
+    for p in [&b"\t"[..], b" ", b"-", b"\xff"] {
+        source.write_bytes(p, p, false);
+    }
+    let base = source.commit("base");
+    let git = cli(&tmp);
+    let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+    let w = decode(&git.snapshot(&c).expect("snapshot"));
+    let order: Vec<Vec<u8>> = w.iter().map(|(p, _, _)| p.as_bytes().to_vec()).collect();
+    let first_git = order
+        .iter()
+        .position(|p| p.starts_with(b".git/"))
+        .expect("the generated .git");
+    assert_eq!(
+        &order[..first_git],
+        [b"\t".to_vec(), b" ".to_vec(), b"-".to_vec()]
+    );
+    assert_eq!(order.last(), Some(&b"\xff".to_vec()));
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted);
+}
+
+/// A base path with a component that is `.git` on another file system
+/// once `\\` splits it, as git's NTFS check splits it, or once bytes that
+/// are not UTF-8 are read, never snapshots (ADR-018, D3). The forms git
+/// refuses itself (`x\\.git`, `.git\\config`, `x\\GIT~1`, `.git\\x/y`)
+/// fail at the fetch, whose fsck reports `hasDotgit`; the forms git
+/// accepts (`x\\.g<U+200B>it`, `.g<0xFF>it`) are fetched, and `snapshot`
+/// refuses them, naming the path.
+#[test]
+fn snapshot_refuses_backslash_lookalikes() {
+    let cases: [(&[u8], Option<&str>); 6] = [
+        (b"x\\.git", None),
+        (b".git\\config", None),
+        (b"x\\GIT~1", None),
+        (b".git\\x/y", None),
+        ("x\\.g\u{200B}it".as_bytes(), Some("\"x\\\\.g\\u{200b}it\"")),
+        (b"a/.g\xffit", Some("\"a/.g\\xffit\"")),
+    ];
+    for (p, shown) in cases {
+        let tmp = TempDir::new("backslash-lookalike");
         let source = Source::new(&tmp, "src", false);
         source.write("ok", b"ok", false);
-        source.write(bad, b"x", false);
+        source.write_bytes(p, b"x", false);
         let base = source.commit("base");
         let git = cli(&tmp);
-        let c = git.fetch_base(&source.url(), &sha(&base)).expect("fetch");
+        let fetched = git.fetch_base(&source.url(), &sha(&base));
+        let Some(shown) = shown else {
+            let detail = failed(fetched);
+            assert!(detail.contains("hasDotgit"), "{p:?}: {detail}");
+            continue;
+        };
+        let c = fetched.expect("git accepts this name");
         let detail = failed(git.snapshot(&c));
-        assert!(detail.contains(&format!("{bad:?}")), "{name}: {detail}");
+        assert!(
+            detail.contains(".git on another file system"),
+            "{p:?}: {detail}"
+        );
+        assert!(detail.contains(shown), "{p:?}: {detail}");
+        assert_eq!(listing(&git.root().join("tmp")), Vec::<String>::new());
     }
 }
 
@@ -272,12 +366,12 @@ fn gitlinks_are_kept_and_closed() {
             .all(|(p, _, _)| p != "mod" && !p.starts_with("mod/"))
     );
     assert_eq!(git.diff(&c, &snapshot), Ok(vec![]));
-    let edited = edit(&snapshot, &path("a"), Some(b"b"));
+    let edited = edit(&snapshot, &tpath("a"), Some(b"b"));
     let diff = git.diff(&c, &edited).expect("diff");
     assert!(!String::from_utf8_lossy(&diff).contains("mod"));
-    let under = edit(&snapshot, &path("mod/x"), Some(b"x"));
+    let under = edit(&snapshot, &tpath("mod/x"), Some(b"x"));
     failed(git.diff(&c, &under));
-    let at = edit(&snapshot, &path("mod"), Some(b"x"));
+    let at = edit(&snapshot, &tpath("mod"), Some(b"x"));
     failed(git.diff(&c, &at));
     assert_eq!(
         crate::support::listing(&git.root().join("scratch")),

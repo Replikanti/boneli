@@ -8,7 +8,7 @@ use boneli_git_cli::{DEFAULT_MAX_NODES, GitCli, GitCliConfig, Transports};
 
 use crate::support::record::Recorder;
 use crate::support::{
-    Source, TempDir, cli, decode, edit, failed, fgit, listing, open, path, sha, unpack_all,
+    Source, TempDir, cli, decode, edit, failed, fgit, listing, open, path, sha, tpath, unpack_all,
 };
 
 /// Every refused URL is refused by the pure check and by `fetch_base`
@@ -218,11 +218,11 @@ fn sha256_repository_round_trip() {
     );
     let snapshot = git.snapshot(&c).expect("snapshot");
     let config = decode(&snapshot)
-        .get(&path(".git/config"))
+        .get(&tpath(".git/config"))
         .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
         .expect("a config");
     assert!(config.contains("objectformat = sha256"), "{config}");
-    let edited = edit(&snapshot, &path("src/lib.rs"), Some(b"fn a() { 1 }\n"));
+    let edited = edit(&snapshot, &tpath("src/lib.rs"), Some(b"fn a() { 1 }\n"));
     let diff = git.diff(&c, &edited).expect("diff");
     assert!(!diff.is_empty());
     let after = git.apply(&c, &diff).expect("apply");

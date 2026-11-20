@@ -6,7 +6,7 @@ use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
     BranchName, Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase,
     RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId, SandboxSpec, SnapshotSource,
-    TriageReport, Written,
+    TreePath, TriageReport, Written,
 };
 use boneli_domain::{CitationStatus, CommitSha, FixChecks, TriageVerdict};
 use boneli_memory::{
@@ -185,6 +185,33 @@ fn path(text: &str) -> RelativePath {
     RelativePath::parse(text).expect("a valid path")
 }
 
+/// A tree path, of any bytes.
+fn tpath(bytes: &[u8]) -> TreePath {
+    TreePath::parse(bytes).expect("a valid tree path")
+}
+
+/// The base's files whose paths the citation rule refuses, one of each
+/// class: a backslash, a blank name, a name that is not UTF-8 (ADR-018).
+pub fn uncitable() -> Vec<(TreePath, Vec<u8>)> {
+    vec![
+        (tpath(b"dir\\file"), b"backslash\n".to_vec()),
+        (tpath(b" "), b"blank\n".to_vec()),
+        (tpath(b"x\xff"), b"not UTF-8\n".to_vec()),
+    ]
+}
+
+/// The base commit's files: two content files and [`uncitable`].
+pub fn base_files() -> Tree {
+    let mut files: Tree = [
+        (tpath(b"src/lib.rs"), b"fn total() {}\n".to_vec()),
+        (tpath(b"README"), b"app".to_vec()),
+    ]
+    .into_iter()
+    .collect();
+    files.extend(uncitable());
+    files
+}
+
 fn command(program: &str) -> Command {
     Command {
         program: String::from(program),
@@ -238,16 +265,12 @@ fn in_memory_sandbox_passes_contract() {
 const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 const OTHER: &str = "89abcdef0123456789abcdef0123456789abcdef";
 
-/// A repository with one commit holding two files.
+/// A repository with one commit holding two files and one uncitable file
+/// of each class.
 pub fn repository() -> contract::git::Repository<MemoryGit> {
     let repo = RepoUrl::new(String::from("https://example.invalid/app.git"));
     let base = CommitSha::parse(BASE).expect("valid SHA");
-    let files: Tree = [
-        (path("src/lib.rs"), b"fn total() {}\n".to_vec()),
-        (path("README"), b"app".to_vec()),
-    ]
-    .into_iter()
-    .collect();
+    let files = base_files();
     contract::git::Repository {
         adapter: MemoryGit::new(vec![GitCommit {
             repo: repo.clone(),
@@ -262,6 +285,7 @@ pub fn repository() -> contract::git::Repository<MemoryGit> {
         unknown: CommitSha::parse(OTHER).expect("valid SHA"),
         edited: b"fn total() { 1 }\n".to_vec(),
         metadata: metadata(),
+        uncitable: uncitable(),
     }
 }
 
@@ -362,7 +386,7 @@ pub fn retarget(diff: &[u8], from: &RelativePath, to: &RelativePath) -> Vec<u8> 
 }
 
 /// Sets or removes a file in a workspace of `MemoryGit`'s snapshot format.
-pub fn edit(workspace: &[u8], file: &RelativePath, content: Option<&[u8]>) -> Vec<u8> {
+pub fn edit(workspace: &[u8], file: &TreePath, content: Option<&[u8]>) -> Vec<u8> {
     let mut tree = unpack_tree(workspace).expect("the adapter's own snapshot");
     match content {
         Some(content) => tree.insert(file.clone(), content.to_vec()),
@@ -411,7 +435,7 @@ fn metadata_fixture_must_be_metadata() {
 /// clause vacuous: the adapter never sees any (review of #61).
 #[test]
 fn metadata_fixture_must_reach_the_workspace() {
-    let skipping = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+    let skipping = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
         if p.is_repository_metadata() {
             w.to_vec()
         } else {
@@ -447,13 +471,8 @@ fn retarget_must_make_a_diff_that_applies() {
     }
     let twin_exists = || {
         let r = repository();
-        let mut files: Tree = [
-            (path("src/lib.rs"), b"fn total() {}\n".to_vec()),
-            (path("src/missing.rs.twin"), b"here".to_vec()),
-        ]
-        .into_iter()
-        .collect();
-        files.insert(path("README"), b"app".to_vec());
+        let mut files = base_files();
+        files.insert(tpath(b"src/missing.rs.twin"), b"here".to_vec());
         contract::git::Repository {
             adapter: MemoryGit::new(vec![GitCommit {
                 repo: r.repo.clone(),
@@ -481,19 +500,19 @@ fn retarget_must_make_a_diff_that_applies() {
 /// top-level `.git` pass (review round 2 of #61).
 #[test]
 fn metadata_fixture_entries_each_reach_the_workspace() {
-    let skip_nested = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
-        if p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+    let skip_nested = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
+        if p.is_repository_metadata() && !p.as_bytes().starts_with(b".git/") {
             w.to_vec()
         } else {
             edit(w, p, c)
         }
     };
-    let drop_nested_later = |w: &[u8], p: &RelativePath, c: Option<&[u8]>| {
+    let drop_nested_later = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
         let top = unpack_tree(w)
             .expect("a workspace")
             .keys()
-            .any(|k| k.as_str().starts_with(".git/"));
-        if top && p.is_repository_metadata() && !p.as_str().starts_with(".git/") {
+            .any(|k| k.as_bytes().starts_with(b".git/"));
+        if top && p.is_repository_metadata() && !p.as_bytes().starts_with(b".git/") {
             w.to_vec()
         } else {
             edit(w, p, c)
@@ -571,6 +590,96 @@ fn metadata_fixture_must_not_be_empty() {
     assert!(detail.starts_with("fixture:"), "{detail}");
 }
 
+/// Fixtures that would make `uncitable-paths-carried` vacuous are
+/// violations, not passes (ADR-018, D6): an empty list, a list without a
+/// class, a citable or metadata path in it, an `edit` that skips
+/// uncitable paths, and a base that has a twin.
+#[test]
+fn uncitable_fixture_guards() {
+    let with = |list: Vec<(TreePath, Vec<u8>)>| {
+        move || contract::git::Repository {
+            uncitable: list.clone(),
+            ..repository()
+        }
+    };
+    let without = |k: usize| {
+        let mut list = uncitable();
+        list.remove(k);
+        list
+    };
+    let plus = |p: &[u8]| {
+        let mut list = uncitable();
+        list.push((tpath(p), b"x".to_vec()));
+        list
+    };
+    let skipping = |w: &[u8], p: &TreePath, c: Option<&[u8]>| {
+        if p.citable().is_err() {
+            w.to_vec()
+        } else {
+            edit(w, p, c)
+        }
+    };
+    let twin_at_base = || {
+        let r = repository();
+        let mut files = base_files();
+        files.insert(tpath(" \u{200B}".as_bytes()), b"twin".to_vec());
+        contract::git::Repository {
+            adapter: MemoryGit::new(vec![GitCommit {
+                repo: r.repo.clone(),
+                sha: r.base.clone(),
+                files,
+            }]),
+            ..r
+        }
+    };
+    let run = |make: &dyn Fn() -> contract::git::Repository<MemoryGit>| {
+        contract::git::run(make, edit, retarget, &NothingRuns, &MemoryRemote)
+    };
+    let cases: Vec<(&str, Result<(), contract::Violation>, &str)> = vec![
+        ("empty", run(&with(vec![])), "no uncitable paths"),
+        ("no backslash", run(&with(without(0))), "a backslash"),
+        ("no blank", run(&with(without(1))), "blank"),
+        ("no non-UTF-8", run(&with(without(2))), "not UTF-8"),
+        (
+            "citable",
+            run(&with(plus(b"src/lib.rs"))),
+            "path 3 is citable",
+        ),
+        (
+            "metadata",
+            run(&with(plus(b".git/x\\y"))),
+            "path 3 is repository metadata",
+        ),
+        (
+            "skipping edit",
+            contract::git::run(repository, skipping, retarget, &NothingRuns, &MemoryRemote),
+            "does not write path 0",
+        ),
+        ("twin at the base", run(&twin_at_base), "twin of path 1"),
+    ];
+    for (name, result, words) in cases {
+        let (clause, detail) = git_clause(result);
+        assert_eq!(clause, "uncitable-paths-carried", "{name}: {detail}");
+        assert!(detail.starts_with("fixture:"), "{name}: {detail}");
+        assert!(detail.contains(words), "{name}: {detail}");
+    }
+}
+
+/// `MemoryGit` carries uncitable paths through its formats: unpacking
+/// takes the tree path rule, so a backslash, a blank name and a name that
+/// is not UTF-8 round-trip, and `..` is still refused.
+#[test]
+fn memory_formats_carry_uncitable_paths() {
+    let tree = base_files();
+    assert_eq!(unpack_tree(&pack_tree(&tree)), Ok(tree));
+    let mut packed = Vec::new();
+    for field in [&b"a/../b"[..], b"x"] {
+        packed.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        packed.extend_from_slice(field);
+    }
+    assert!(unpack_tree(&packed).is_err());
+}
+
 /// A tripwire that is already tripped cannot tell what the clause caused.
 #[test]
 fn tripped_before_the_clause_is_a_violation() {
@@ -615,7 +724,7 @@ fn memory_diff_drops_repository_metadata() {
     let r = repository();
     let base = r.adapter.fetch_base(&r.repo, &r.base).expect("fetched");
     let snapshot = r.adapter.snapshot(&base).expect("snapshot");
-    let plain = edit(&snapshot, &r.path, Some(&r.edited));
+    let plain = edit(&snapshot, &TreePath::from(&r.path), Some(&r.edited));
     let mut hostile = plain.clone();
     for (file, content) in [
         (
@@ -624,13 +733,13 @@ fn memory_diff_drops_repository_metadata() {
         ),
         ("sub/.git/HEAD", b"ref: refs/heads/main\n"),
     ] {
-        hostile = edit(&hostile, &path(file), Some(content));
+        hostile = edit(&hostile, &tpath(file.as_bytes()), Some(content));
     }
     let expected = r.adapter.diff(&base, &plain).expect("diff");
     assert!(!expected.is_empty());
     assert_eq!(r.adapter.diff(&base, &hostile), Ok(expected));
     // Metadata alone is an unchanged workspace.
-    let only = edit(&snapshot, &path(".git/config"), Some(b"[core]\n"));
+    let only = edit(&snapshot, &tpath(b".git/config"), Some(b"[core]\n"));
     assert_eq!(r.adapter.diff(&base, &only), Ok(vec![]));
 }
 
@@ -879,7 +988,7 @@ fn unknown_program_and_hostile_workspace() {
     ));
     // A removed file round-trips through diff and apply.
     let mut tree = unpack_tree(&r.adapter.snapshot(&base).expect("snapshot")).expect("unpacked");
-    tree.remove(&path("README"));
+    tree.remove(&tpath(b"README"));
     let diff = r.adapter.diff(&base, &pack_tree(&tree)).expect("diff");
     let after = r.adapter.apply(&base, &diff).expect("applied");
     assert_eq!(r.adapter.read(&after, &path("README")), Ok(None));

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use boneli_app::{Attached, Forge, Git, PullRequest, RelativePath, RepoUrl};
+use boneli_app::{Attached, Forge, Git, PullRequest, RepoUrl, TreePath};
 use boneli_domain::{
     CheckStatus, Citation, CommitSha, EvidenceRef, FixChecks, RunId, TestStatus, Ticket,
     TicketSource, Usage,
@@ -500,7 +500,7 @@ fn opens_a_pull_request_on_the_test_repository() {
         DEFAULT_MAX_NODES,
     )
     .expect("decode");
-    let readme = RelativePath::parse("README.md").expect("path");
+    let readme = TreePath::parse(b"README.md").expect("path");
     assert!(snapshot.get(&readme).is_some(), "the base has README.md");
     let entries: Vec<_> = snapshot
         .iter()

@@ -35,7 +35,8 @@ fn every_clause_is_killed() {
 
 /// Every clause has a mutant, and a clause with sub-checks has one per
 /// sub-check: `silent-failure-detail` per operation of its port,
-/// `tampered-refused` per pull, `workspace-metadata-inert` per sub-check.
+/// `tampered-refused` per pull, `workspace-metadata-inert` and
+/// `uncitable-paths-carried` per sub-check.
 #[test]
 fn mutant_table_covers_every_clause() {
     type SubChecks = &'static [(&'static str, &'static [&'static str])];
@@ -63,7 +64,10 @@ fn mutant_table_covers_every_clause() {
         (
             "Git",
             contract::git::CLAUSES,
-            &[("workspace-metadata-inert", contract::git::METADATA_CHECKS)],
+            &[
+                ("workspace-metadata-inert", contract::git::METADATA_CHECKS),
+                ("uncitable-paths-carried", contract::git::UNCITABLE_CHECKS),
+            ],
         ),
         (
             "ImageStore",
@@ -141,16 +145,16 @@ fn regression_mutants_name_covered_cases() {
 /// Fixture hooks that review of #61 showed making the clause vacuous (an
 /// `edit` that skips or drops metadata, a `retarget` that breaks diffs
 /// pointed at it) are fixture violations of `workspace-metadata-inert`,
-/// not passes.
+/// not passes; the vacuous fixtures of #64 (an `edit` that skips uncitable
+/// paths, a list without a class, a twin at the base) are fixture
+/// violations of `uncitable-paths-carried`.
 #[test]
 fn vacuous_fixture_hooks_are_violations() {
-    for (bug, result) in vacuous_fixture_violations() {
+    let rows = vacuous_fixture_violations();
+    assert_eq!(rows.len(), 8);
+    for (bug, clause, result) in rows {
         let violation = result.expect_err("a vacuous fixture must not pass");
-        assert_eq!(
-            (violation.port, violation.clause),
-            ("Git", "workspace-metadata-inert"),
-            "{bug}"
-        );
+        assert_eq!((violation.port, violation.clause), ("Git", clause), "{bug}");
         assert!(
             violation.detail.starts_with("fixture:"),
             "{bug}: {violation:?}"
