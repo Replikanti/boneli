@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange and certificate revocation by CRL and OCSP, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

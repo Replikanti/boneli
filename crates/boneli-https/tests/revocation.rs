@@ -2,12 +2,14 @@
 //! local rustls servers on 127.0.0.1, with CRLs from a fake `CrlSource`:
 //! revoked and good leaves, every way a list can fail to settle a leaf,
 //! the order and number of distribution points, leaves without one,
-//! resumed sessions, CONNECT tunnels, `TlsDial`'s deadline and the
-//! default source.
+//! resumed sessions, CONNECT tunnels, `TlsDial`'s deadline, the default
+//! source and its name resolution (ADR-022).
 //!
 //! The fixtures are openssl 3.5 certificates and CRLs of the "Boneli CRL
 //! test CA" (`tests/data/README.md`). These tests do not prove
 //! interoperability with real CAs; `tests/network.rs` does, by hand.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -648,6 +650,71 @@ fn default_config_checks_revocation() {
     let config = TlsConfig::new(roots()).expect("config");
     let error = connect_to(serve(GOOD), &config).expect_err("unknown");
     assert!(matches!(error, Error::RevocationUnknown(_)), "{error:?}");
+}
+
+/// The real source resolves the CRL host through the configuration's
+/// resolver under the request's deadline: against a name server that
+/// never answers, `TlsDial` fails at its 300 ms deadline with a timed-out
+/// fetch, not after the resolver's 3.75 s of tries (#81, first
+/// criterion), and no query is sent once it returned: a lookup left
+/// running would send one at 500 ms (`Stalled::call_site_resolver`).
+/// `localhost` itself needs no query.
+#[test]
+fn crl_lookup_stops_at_the_request_deadline() {
+    let stalled = common::Stalled::start();
+    let config = TlsConfig::new(roots())
+        .expect("config")
+        .with_resolver(stalled.call_site_resolver());
+    let addr = serve(GOOD);
+    let dial = TlsDial::new(config, options());
+    let start = Instant::now();
+    let error = match dial.dial("localhost", addr.port(), start + Duration::from_millis(300)) {
+        Ok(_) => panic!("the dial passed"),
+        Err(e) => e,
+    };
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    let inner = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<Error>())
+        .expect("the TLS client's error");
+    match inner {
+        Error::RevocationUnknown(list) => {
+            let kinds: Vec<_> = list.iter().map(|f| (f.url.clone(), f.kind)).collect();
+            assert_eq!(kinds, one(RevocationFailureKind::TimedOut), "{list:?}");
+        }
+        other => panic!("expected RevocationUnknown, got {other:?}"),
+    }
+    let sent = stalled.take();
+    assert!(
+        sent.is_multiple_of(2) && (2..=6).contains(&sent),
+        "{sent} queries"
+    );
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(stalled.take(), 0, "a query after the dial returned");
+}
+
+/// `with_resolver` replaces a CRL source set before it with the real one
+/// over the new resolver, as its doc says; a source set after it stays.
+#[test]
+fn with_resolver_replaces_custom_sources() {
+    let stalled = common::Stalled::start();
+    let resolver = stalled.resolver(Duration::from_millis(100), 1);
+    let fake = Fake::serving(EMPTY);
+    let before = config(fake.clone()).with_resolver(resolver.clone());
+    let failed = failures(connect_to(serve(GOOD), &before));
+    assert_eq!(failed, one(RevocationFailureKind::TimedOut));
+    assert!(fake.asked().is_empty(), "{:?}", fake.asked());
+    assert_eq!(stalled.take(), 2, "the real source asked for A and AAAA");
+
+    let after = TlsConfig::new(roots())
+        .expect("config")
+        .with_resolver(resolver)
+        .with_crl_source(fake.clone());
+    let status = connect_to(serve(GOOD), &after).expect("checked");
+    assert_eq!(status.revocation(), &checked(URL));
+    assert_eq!(fake.asked(), [URL]);
+    assert_eq!(stalled.take(), 0, "the custom source sends no query");
 }
 
 #[test]

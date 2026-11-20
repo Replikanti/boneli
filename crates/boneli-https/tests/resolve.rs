@@ -637,6 +637,34 @@ fn stalled_server_times_out_at_the_deadline() {
     assert_eq!(fake.count(), 2);
 }
 
+/// Nothing outlives the call (#81, second criterion): with a 200 ms try
+/// timeout, 5 attempts and a 500 ms deadline, tries start at 0, 200 and
+/// 400 ms and the third ends at the deadline, so no fourth starts. Every
+/// query arrived before `lookup` returned, and none comes later.
+#[test]
+fn no_query_after_the_lookup_returns() {
+    let fake = Fake::start(|_, _, _| Reply::Silence);
+    let resolver = Resolver::fixed(config(&[&fake], Duration::from_millis(200), 5));
+    let start = Instant::now();
+    let err = lookup(&resolver, "git.example", Duration::from_millis(500)).expect_err("deadline");
+    let returned = Instant::now();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+    assert!(
+        returned - start < Duration::from_secs(1),
+        "{:?}",
+        returned - start
+    );
+    let arrivals = fake.arrivals();
+    // 3 tries of an A and an AAAA query; fewer when CI is slow.
+    assert!(
+        arrivals.len().is_multiple_of(2) && (2..=6).contains(&arrivals.len()),
+        "{arrivals:?}"
+    );
+    assert!(arrivals.iter().all(|a| a.at < returned), "{arrivals:?}");
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(fake.count(), arrivals.len(), "a query after the return");
+}
+
 #[test]
 fn partial_answer_after_the_try_timeout() {
     let fake = Fake::start(|_, qtype, _| match qtype {
@@ -1035,4 +1063,195 @@ fn resolver_module_spawns_nothing_and_uses_no_std_lookup() {
         }
     }
     assert!(hits.is_empty(), "{hits:#?}");
+}
+
+/// The std functions that take `impl ToSocketAddrs`, by path: given a
+/// name, each runs `getaddrinfo`, without a deadline. Every mention
+/// counts, not only a call: the UFCS form with the socket as the first
+/// argument (`UdpSocket::connect(s, addr)`) and the function passed as a
+/// value (`.map(TcpStream::connect)`) look up too.
+/// `TcpStream::connect_timeout` takes a `&SocketAddr` and is not one of
+/// them.
+const STD_LOOKUP_PATHS: [&str; 5] = [
+    "TcpStream::connect",
+    "TcpListener::bind",
+    "UdpSocket::bind",
+    "UdpSocket::connect",
+    "UdpSocket::send_to",
+];
+
+/// The method forms of the same lookups (`socket.connect(addr)`).
+const STD_LOOKUP_METHODS: [&str; 2] = [".connect(", ".send_to("];
+
+/// Call sites of the std lookups whose argument is a `SocketAddr`
+/// variable: the file under `src/` and the argument. The resolver's UDP
+/// socket binds the unspecified address of the server's family and
+/// connects to the server.
+const SOCKET_ADDR_ARGS: [(&str, &str); 2] = [
+    ("resolve/exchange.rs", "local"),
+    ("resolve/exchange.rs", "server"),
+];
+
+/// The argument text of a call whose `(` ends `rest`'s prefix: up to the
+/// matching `)` on the line, or the rest of the line.
+fn call_argument(rest: &str) -> &str {
+    let mut depth = 0usize;
+    for (at, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => return &rest[..at],
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Whether a std lookup's argument cannot be a name: a string
+/// literal that parses as a socket address (std parses it before it would
+/// look anything up), or a `SocketAddr` variable of `SOCKET_ADDR_ARGS`.
+fn is_socket_addr(file: &str, argument: &str) -> bool {
+    let argument = argument.trim();
+    let literal = argument
+        .strip_prefix('"')
+        .and_then(|a| a.strip_suffix('"'))
+        .is_some_and(|a| a.parse::<SocketAddr>().is_ok());
+    literal || SOCKET_ADDR_ARGS.contains(&(file, argument))
+}
+
+/// The std lookups on one source line of `file`: the ones that may take
+/// a name, and the count of those whose argument is a socket address.
+/// A path followed by `(` is a call, and its argument is checked; for
+/// the UFCS forms the argument holds the socket too and never passes. A
+/// path followed by anything else (a value, a turbofish) is a lookup
+/// whose argument the scan cannot see.
+fn std_lookups(file: &str, line: &str) -> (Vec<String>, usize) {
+    // Calls as (name, the text after their `(`), and the hits that are
+    // no call.
+    let mut calls = Vec::new();
+    let mut hits = Vec::new();
+    for path in STD_LOOKUP_PATHS {
+        for (start, _) in line.match_indices(path) {
+            let rest = &line[start + path.len()..];
+            if path == "TcpStream::connect"
+                && rest
+                    .strip_prefix("_timeout")
+                    .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+            {
+                continue;
+            }
+            match rest.trim_start().strip_prefix('(') {
+                Some(rest) => calls.push((path, rest)),
+                None => hits.push(format!("{path}{rest}")),
+            }
+        }
+    }
+    for method in STD_LOOKUP_METHODS {
+        for (start, _) in line.match_indices(method) {
+            calls.push((&method[..method.len() - 1], &line[start + method.len()..]));
+        }
+    }
+    let mut allowed = 0;
+    for (name, rest) in calls {
+        let argument = call_argument(rest);
+        if is_socket_addr(file, argument) {
+            allowed += 1;
+        } else {
+            hits.push(format!("{name}({argument})"));
+        }
+    }
+    (hits, allowed)
+}
+
+/// No call site of the crate resolves with std any more (ADR-022, D7):
+/// `TlsDial`, `connect` and the CRL and OCSP fetches go through
+/// `Resolver`, so no `getaddrinfo` runs outside a deadline. Neither
+/// `ToSocketAddrs` nor a std function that takes it may appear, in any
+/// form, except in a call whose argument is a socket address. Comment
+/// lines may name them.
+#[test]
+fn crate_has_no_std_lookup() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    assert!(files.len() >= 15, "{files:?}");
+    let mut hits = Vec::new();
+    let mut allowed = 0;
+    for file in &files {
+        let relative = file.strip_prefix(&root).expect("under src");
+        let relative = relative.to_str().expect("UTF-8 path");
+        let text = std::fs::read_to_string(file).expect("source");
+        for (number, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let at = format!("{relative}:{}", number + 1);
+            for token in ["to_socket_addrs", "ToSocketAddrs"] {
+                if line.contains(token) {
+                    hits.push(format!("{at}: {token}"));
+                }
+            }
+            let (found, socket_addrs) = std_lookups(relative, line);
+            hits.extend(found.into_iter().map(|hit| format!("{at}: {hit}")));
+            allowed += socket_addrs;
+        }
+    }
+    assert!(hits.is_empty(), "{hits:#?}");
+    // The scan sees the calls that are there: the resolver's bind and
+    // connect, and the test servers' binds to 127.0.0.1:0.
+    assert!(allowed >= 3, "{allowed} socket-address calls");
+}
+
+/// The scan's rule on the forms it must catch and the ones it must let
+/// through.
+#[test]
+fn std_lookup_scan_rule() {
+    let caught = [
+        (
+            "revocation/http.rs",
+            "TcpStream::connect((url.host(), url.port()))",
+        ),
+        (
+            "revocation/http.rs",
+            "TcpStream::connect(format!(\"{host}:{port}\"))",
+        ),
+        ("dial.rs", "UdpSocket::bind(host)"),
+        ("dial.rs", "socket.send_to(&query, (name, 53))"),
+        ("dial.rs", "socket.connect(server)"),
+        ("resolve/exchange.rs", "UdpSocket::bind(\"localhost:0\")"),
+        // UFCS: the socket is the first argument.
+        (
+            "revocation/http.rs",
+            "std::net::UdpSocket::connect(s, (url.host(), url.port()))",
+        ),
+        ("revocation/http.rs", "UdpSocket::send_to(&s, buf, host)"),
+        ("resolve/exchange.rs", "UdpSocket::connect(&socket, server)"),
+        // The function as a value, and a turbofish.
+        ("revocation/http.rs", ".map(TcpStream::connect)"),
+        ("revocation/http.rs", "addrs.map(UdpSocket::bind)"),
+        ("revocation/http.rs", "TcpStream::connect::<&str>(host)"),
+        ("revocation/http.rs", "TcpStream::connect (host)"),
+    ];
+    for (file, line) in caught {
+        let (hits, allowed) = std_lookups(file, line);
+        assert_eq!((hits.len(), allowed), (1, 0), "{file}: {line}: {hits:?}");
+    }
+    for (file, line) in [
+        ("resolve/exchange.rs", "let socket = UdpSocket::bind(local)"),
+        ("resolve/exchange.rs", ".and_then(|s| s.connect(server))"),
+        ("revocation/http.rs", "TcpListener::bind(\"127.0.0.1:0\")"),
+        ("dial.rs", "TcpStream::connect_timeout(&addr, left)"),
+    ] {
+        let (hits, _) = std_lookups(file, line);
+        assert!(hits.is_empty(), "{file}: {line}: {hits:?}");
+    }
+    for (file, argument) in [
+        ("resolve/exchange.rs", "local"),
+        ("resolve/exchange.rs", " server"),
+        ("revocation/http.rs", "\"127.0.0.1:0\""),
+        ("dial.rs", "\"[::1]:443\""),
+    ] {
+        assert!(is_socket_addr(file, argument), "{file}: {argument}");
+    }
+    assert_eq!(call_argument("(a, b)).expect(\"x\")"), "(a, b)");
 }

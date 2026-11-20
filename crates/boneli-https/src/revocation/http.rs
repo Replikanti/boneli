@@ -1,6 +1,7 @@
 //! The real `CrlSource` and `OcspSource` (ADR-017, items 6 and 7; ADR-020,
 //! item 8): one HTTP/1.1 `GET` per fetch through `boneli-http`, directly
-//! from this process, under the check's deadline. `Host` is the only field
+//! from this process, under the check's deadline, which bounds the host's
+//! name lookup too (ADR-022). `Host` is the only field
 //! sent: no `User-Agent`, credentials or cookies. 200 only, no redirect
 //! followed, no `Content-Encoding`, the body read to its end under
 //! `MAX_CRL_BYTES` for a list and `MAX_OCSP_RESPONSE_BYTES` for an OCSP
@@ -11,7 +12,7 @@
 //! its signature, not from the transport.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use boneli_http::{
@@ -29,7 +30,8 @@ use crate::{ConnectOptions, TlsConfig};
 
 /// Fetches CRLs and OCSP responses over HTTP and HTTPS.
 pub(crate) struct HttpSource {
-    /// The handshake's roots and groups, without a revocation check.
+    /// The handshake's roots and groups, without a revocation check, and
+    /// the resolver of every fetch's host.
     tls: TlsConfig,
     /// Each TCP connection attempt.
     pub(crate) connect_timeout: Duration,
@@ -60,12 +62,16 @@ impl HttpSource {
         deadline: Instant,
     ) -> Result<Vec<u8>, CrlFetchError> {
         time_left(deadline).map_err(io_error)?;
-        // std's resolver takes no timeout, so the lookup itself is not
-        // bounded by the deadline, as for `TlsDial`'s own host (ADR-017,
-        // known limits); everything after it is.
-        let addrs = (url.host(), url.port())
-            .to_socket_addrs()
-            .map_err(|e| CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")))?;
+        // The lookup counts inside the deadline (ADR-022); a lookup that
+        // ran out of it is a timeout, like every later step.
+        let addrs = self
+            .tls
+            .resolver
+            .lookup(url.host(), url.port(), deadline)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::TimedOut => CrlFetchError::TimedOut,
+                _ => CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")),
+            })?;
         let mut last = None;
         for addr in addrs {
             let left = time_left(deadline).map_err(io_error)?;
@@ -502,6 +508,46 @@ mod tests {
             listener.accept().map(|_| ()).map_err(|e| e.kind()),
             Err(io::ErrorKind::WouldBlock)
         );
+    }
+
+    /// The lookup of a point's or responder's host counts inside the
+    /// fetch's deadline (ADR-022): against a name server that never
+    /// answers, both fetches end at the 300 ms deadline with `TimedOut`,
+    /// never `Unreachable`, and not at the resolver's 10 s try timeout.
+    #[test]
+    fn stalled_resolver_times_out_at_the_deadline() {
+        // Bound and never read: every query waits in its queue.
+        let stalled = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let resolver = crate::Resolver::fixed(
+            crate::ResolverConfig::new(
+                vec![stalled.local_addr().expect("addr")],
+                Duration::from_secs(10),
+                2,
+            )
+            .expect("config"),
+        );
+        let tls = TlsConfig::new(crl_roots())
+            .expect("config")
+            .with_resolver(resolver);
+        let source = HttpSource::new(tls.without_revocation());
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        let start = Instant::now();
+        let result = crl(&source, &point, start + Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert_eq!(result, Err(CrlFetchError::TimedOut));
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        let responder = CrlUrl::parse("http://ocsp.boneli.test/").expect("URL");
+        let start = Instant::now();
+        let result = ocsp(
+            &source,
+            &responder,
+            b"request",
+            start + Duration::from_millis(300),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(result, Err(CrlFetchError::TimedOut));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR-022: Name resolution under the request deadline
 
-- Status: proposed
+- Status: accepted (2026-11-20, after the live tests of part 2)
 - Date: 2026-11-20
 
 ## Context
@@ -217,9 +217,34 @@ a host without an IPv6 route; its connect then fails at once with
   `ResolverConfig::new` and its builders (`with_search`, `with_ndots`,
   `with_use_vc`, `with_hosts`), and the `DNS_*` constants.
 - Part 2: `TlsConfig::with_resolver`, and `TlsDial`, `connect` and the
-  CRL and OCSP fetches resolve through the `TlsConfig`'s resolver.
-  `connect`'s lookup is bounded by its `connect_timeout`, and it refuses
-  names outside the ADR-003 grammar before any query.
+  CRL and OCSP fetches resolve through the `TlsConfig`'s resolver
+  (`Resolver::system()` by default). `TlsDial` and the fetches resolve
+  under the request's or the check's deadline; a fetch whose lookup runs
+  out of it fails as `TimedOut`, like every later step, and any other
+  lookup error is `Unreachable`.
+- `with_resolver` installs fetch sources over the new resolver for both
+  CRLs and OCSP, so it replaces a source set earlier by
+  `with_crl_source` or `with_ocsp_source`, and both caches start empty;
+  a caller who wants both sets the source after the resolver. Why not
+  keep a custom source: a source reaches lists its own way, so whether a
+  resolver applies to it is the source's business, and a configuration
+  where the CRL fetches silently kept the old resolver would be worse
+  than one rebuilt in a documented order.
+- `connect`'s lookup is bounded by its `connect_timeout`, the only bound
+  `connect` has before the handshake: it already bounds each TCP attempt,
+  and a caller who set it expects `connect` not to wait longer for an
+  address. A `connect_timeout` too large to add to the clock
+  (`Duration::MAX`, "no bound of mine") saturates, so only the
+  resolver's own tries bound that lookup, as before. `connect` refuses
+  names outside the ADR-003 grammar before any query: after
+  `server_name` (`Error::InvalidServerName`), a name rustls accepts and
+  the grammar does not (an underscore, a trailing dot) is `Error::Io` of
+  kind `InvalidInput`. This narrows a public API; every lookup of the
+  crate then has one grammar and a bound. Upper case still passes,
+  because the resolver lowercases first.
+- This changes `connect` as ADR-005, item 8, describes it: it no longer
+  resolves with std (no NSS sources such as mDNS or `myhostname`), and
+  a trailing-dot name is refused.
 
 ### D8. No thread, no process, no cache
 
@@ -299,8 +324,8 @@ in resolv.conf(5).
   the OCSP check 20 + 10 + 10 + 1 = 41 s against 31 s, and the oci and
   forge setups 20 + 10 + 10 s and a round trip against 30 s.
   glibc spends the same 20 s there (same schedule), so this is not a
-  regression; today those 20 s sit outside every deadline. Part 1 wires
-  nothing and changes no constant. In part 2 the lookup runs under each
+  regression; with `getaddrinfo` those 20 s sat outside every deadline.
+  No constant changes. From part 2 the lookup runs under each
   call's deadline, so on such a host the call ends at its deadline with
   `TimedOut` instead of running past it, and a revocation check that ends
   so fails closed (ADR-017, ADR-020); the request fails instead of
@@ -321,6 +346,39 @@ in resolv.conf(5).
   - first run, the stub's cache cold for the own resolver: own 0.7 to
     57.7 ms (median about 21 ms), system after it 0.6 to 2.0 ms;
   - second run, both warm: own 0.25 to 1.2 ms, system 0.23 to 1.6 ms.
+- Live tests, part 2 (2026-11-20, development host, the same
+  resolv.conf), with `TlsDial`, `connect` and the CRL and OCSP fetches
+  on this resolver: `own_resolver_agrees_with_the_system` again found
+  equal address sets for all 14 hosts (own 0.6 to 40.3 ms, system 0.5 to
+  2.0 ms; the slow own lookups are the ones the stub had not cached for
+  it). Let's Encrypt's revoked test site failed with `Error::Revoked`
+  and its valid one was checked against its CRL; the six forge hosts
+  were `OcspChecked` by Sectigo's responder; the runner hosts' status
+  printed (`Checked` by CRL for Docker Hub and the LLM provider,
+  `OcspChecked` for GitHub); the crate's `ocsp::live` tests (SSL.com's
+  revoked leaves, two delegated responders) and the 32 `openssl
+  s_server` handshakes of `tests/interop.rs` passed.
+- In CI, through the call sites, against a name server that receives
+  every query and never answers (deadline 300 ms; 250 ms tries, 3.75 s
+  of them, so a lookup left running would send its next query at 500
+  ms): `TlsDial`, `connect` (at a 300 ms `connect_timeout`), the CRL
+  and the OCSP fetch end within 1 s with `TimedOut` (the fetches
+  inside a revocation failure), and no query arrives in the 600 ms
+  after they returned (`dial_fails_at_the_deadline_on_a_stalled_resolver`,
+  `connect_lookup_stops_at_the_connect_timeout`,
+  `crl_lookup_stops_at_the_request_deadline`,
+  `ocsp_lookup_stops_at_the_request_deadline`; each fails against a
+  lookup moved to a detached thread, run 2026-11-20), nor after a
+  direct lookup returned (`no_query_after_the_lookup_returns`); and
+  no source file of the crate outside comments names `to_socket_addrs`
+  or `ToSocketAddrs`, or names a std function that takes them
+  (`TcpStream::connect`, `TcpListener::bind`, `UdpSocket::bind`,
+  `UdpSocket::connect`, `UdpSocket::send_to`, as a call, a UFCS call
+  or the function as a value; and the methods `connect` and `send_to`)
+  except in a call whose argument is a socket address
+  (`crate_has_no_std_lookup`). The scan is a text match: it does not see
+  a method turbofish (`socket.connect::<&str>(host)`), a qualified path
+  (`<TcpStream>::connect(host)`), an alias or a macro.
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte
   flip of a valid answer.

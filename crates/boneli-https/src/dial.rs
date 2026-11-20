@@ -12,10 +12,13 @@
 //! below TLS: a TLS read returns only once a whole record has arrived, so
 //! a peer that sends a record one byte at a time, each byte within the
 //! read timeout, would hold a read above TLS open far past the deadline.
+//! The deadline bounds the name lookup too: [`TlsDial`] resolves through
+//! its `TlsConfig`'s [`Resolver`](crate::Resolver), whose every wait ends
+//! by the deadline (ADR-022).
 
 use std::cell::Cell;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use boneli_http::{IdleCheck, Target, Transport};
@@ -37,11 +40,12 @@ pub trait Dial {
 }
 
 /// The real dial: the host checked against the grammar of ADR-003, then
-/// TCP to each address of the host in turn, then a TLS handshake with
+/// resolved by the `TlsConfig`'s resolver (ADR-022), then TCP to each
+/// address of the host in turn, then a TLS handshake with
 /// [`connect_over`](crate::connect_over), certificates always verified
 /// against the caller's `TlsConfig` (ADR-005), and the timeouts of the
-/// caller's `ConnectOptions`. The deadline holds on the socket under TLS
-/// for the handshake and every later read and write.
+/// caller's `ConnectOptions`. The deadline bounds the lookup, and holds on
+/// the socket under TLS for the handshake and every later read and write.
 #[derive(Clone, Debug)]
 pub struct TlsDial {
     config: TlsConfig,
@@ -59,15 +63,15 @@ impl Dial for TlsDial {
     fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>> {
         check_host(host, port)?;
         let mut last = None;
-        for addr in (host, port).to_socket_addrs()? {
+        for addr in self.config.resolver.lookup(host, port, deadline)? {
             let left = time_left(deadline)?;
             match TcpStream::connect_timeout(&addr, left.min(self.options.connect_timeout())) {
                 Ok(tcp) => {
                     let socket = DeadlineSocket::new(tcp, deadline);
                     // The request's deadline bounds the revocation check
-                    // too, so a CRL fetch never outlives the request,
-                    // except its name resolution, which std cannot bound,
-                    // as for the dial's own host (ADR-017, item 7).
+                    // too, so a CRL or OCSP fetch, its name lookup
+                    // included, never outlives the request (ADR-017, item
+                    // 7; ADR-022).
                     return crate::connect_over_until(
                         socket,
                         host,
