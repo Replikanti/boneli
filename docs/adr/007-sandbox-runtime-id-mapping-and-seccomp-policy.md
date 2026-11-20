@@ -1307,12 +1307,16 @@ code.
   stops flushing: the permanent tests fail with `OomKilled`, which they
   give only when the keeper's report taken after the writer's end shows
   at least one read per 10 periods of the run and no gap over 10
-  periods; detection covers only the kernels CI runs, and a runner
+  periods, and the keeper reads again within 1 s after that report;
+  detection covers only the kernels CI runs, and a runner
   kernel change shows in "Host features". Then the keeper needs another
   flushing read or a flush-independent mechanism. (4) A starved keeper:
   `late` and `max_gap` show it; an OOM kill with fewer reads or a longer
-  gap is `KeeperStalled`, not `OomKilled`, and #8 must not CPU-limit the
-  runner's cgroup so hard that the keeper falls behind.
+  gap is `KeeperStalled`, not `OomKilled`, and so is any run after which
+  the keeper does not read again within 1 s (`max_gap` grows only when
+  the next read lands, so a keeper that stopped and stays stopped shows
+  only there). #8 must not CPU-limit the runner's cgroup so hard that
+  the keeper falls behind.
 - **Alternatives weighed.** The parent read (H4: 67 traced kills at
   10 ms). The parent read plus a fallback that reads the sandboxes when
   `memory.current` grows while `file_dirty` stands still: it reacts a
@@ -1343,16 +1347,25 @@ code.
   the loop (150 for a 7,500 ms loop). The keeper's report is taken before
   the spawn, when the loop's end is printed and after the writer ended,
   so a writer killed in its loop, which prints no loop end, still shows
-  what the keeper did. Verdicts in precedence: `KeeperFailed` (a failure
-  in any of the three reports), `KeeperStalled` (an OOM kill with fewer
-  than max(1, ⌊run ms ÷ (10 × P\*)⌋) reads from the spawn to the
-  writer's end, or a gap over 10 × P\*), `OomKilled`, `WriterFailed`,
+  what the keeper did; after the writer's end the test also waits up to
+  1 s (200 periods, against the 56 ms the largest gap a loaded dev host
+  showed) for the keeper's next read. Verdicts in precedence:
+  `KeeperFailed` (a failure in any of the reports), `KeeperStalled` (no
+  read within that 1 s, in any run, or an OOM kill with fewer than
+  max(1, ⌊run ms ÷ (10 × P\*)⌋) reads from the spawn to the writer's end
+  or a gap over 10 × P\*), `OomKilled`, `WriterFailed`,
   `NotBuffered`, `Escaped`, `OffDevice`, `KeeperIdle`, `Held`.
   `keeper_reads_its_own_sandbox` (each keeper holds exactly its own
   sandbox's `memory.stat`, none the parent's, none left after `destroy`
   or a drop, and, watched through inotify `IN_ACCESS`, each sandbox's
   file is read in at least 15 of 20 slots of 10 × P\* and the parent's
-  in at most 5),
+  in at most 5; each keeper's report grows by at least 3/4 of the
+  window ÷ P\*, which rejects any period over 4/3 × P\*, with no gap
+  over 20 ms, the shortest read interval that lost a size in M3 (KS20
+  at 64 MiB); a window that misses the cadence is tried again with fresh
+  keepers, up to 3 windows, because a host that starves the thread for
+  a moment fails one window while a keeper that reads too seldom fails
+  all),
   `keeper_runs_while_cgroup_lives` and `keeper_cost_report` pin the
   lifecycle and the cost; the unit tests pin the schedule, the report,
   a refused start and a sticky failure. Mutation runs are listed in the
@@ -1391,6 +1404,16 @@ code.
   dev host: the keeper 20 of 20 and the parent 0; that mutant 0 and 20,
   failed; a keeper holding the parent's file failed the descriptor
   checks; a thread that reads nothing but reports reads 0 of 20, failed.
+  Review run 2 found that a slot of 10 periods is filled by a keeper
+  that reads once per 10 periods, so the pin also checks the cadence
+  from the keeper's report (above): a keeper at 10 × P\* read 21 times
+  per 1 s window against the 150 needed and failed all 3 windows; the
+  keeper itself read 201 in a 1 s window. The same round found that a
+  keeper that stopped for good after 300 reads was still called
+  `OomKilled` and could pass as `Held`, hence the 1 s wait for its next
+  read: that mutant is now `KeeperStalled` on the floor test (and on
+  the 256 MiB test with `io.max`), and the same hang after 100 reads is
+  `KeeperStalled` on the test without `io.max`.
 - **For #8.** One keeper thread per sandbox, from `create` to the kill,
   at the CPU above. A Landlock ruleset applied to the runner must allow
   reading `memory.stat` below the parent at every `create`, or `create`

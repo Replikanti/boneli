@@ -149,67 +149,130 @@ fn read_slots(files: &[&Path]) -> Vec<usize> {
     slots
 }
 
+/// How many windows `keeper_reads_its_own_sandbox` tries, each with fresh
+/// keepers, before it fails on the cadence: a host that starves the
+/// keeper thread for a moment (the dev host under a parallel build showed
+/// a 56 ms gap) fails one window, a keeper that reads too seldom fails
+/// every one (the precedent is `cpu_limit_throttles`, ADR-007 D8).
+const CADENCE_ATTEMPTS: usize = 3;
+
+/// The largest gap between two reads a window allows: 4 periods, 20 ms,
+/// the shortest read interval that lost a size in #54's M3 (reads every
+/// 20 ms at 64 MiB: 200 of 400 CI runs OOM-killed).
+const CADENCE_MAX_GAP: Duration = Duration::from_millis(20);
+
+/// What one window of `keeper_reads_its_own_sandbox` saw of one keeper.
+fn cadence_failure(
+    name: &str,
+    slots: usize,
+    before: KeeperReport,
+    after: KeeperReport,
+    window: Duration,
+) -> Option<String> {
+    let reads = after.reads.saturating_sub(before.reads);
+    // At least 3/4 of the periods in the window: on time a keeper reads
+    // once per period, a late read re-anchors without catching up, and a
+    // quarter leaves room for that. It rejects any period over 4/3 of
+    // STATS_KEEPER_PERIOD, so a keeper at 2 or 10 periods fails.
+    let need = u64::try_from(window.as_nanos() * 3 / (4 * STATS_KEEPER_PERIOD.as_nanos()))
+        .unwrap_or(u64::MAX);
+    if slots * 4 < READ_SLOTS * 3 {
+        Some(format!(
+            "the keeper of sandbox {name} read its memory.stat in {slots} of {READ_SLOTS} slots \
+             of 10 periods"
+        ))
+    } else if reads < need {
+        Some(format!(
+            "the keeper of sandbox {name} read {reads} times in {window:?}, under the {need} \
+             (3/4 of one per {STATS_KEEPER_PERIOD:?})"
+        ))
+    } else if after.max_gap > CADENCE_MAX_GAP {
+        Some(format!(
+            "the keeper of sandbox {name} paused {:?} between two reads, over {CADENCE_MAX_GAP:?}",
+            after.max_gap
+        ))
+    } else {
+        None
+    }
+}
+
 #[test]
 #[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids)"]
 fn keeper_reads_its_own_sandbox() {
     // H4 (ADR-007 D8): a read of the parent's memory.stat stops flushing
     // once a sandbox below it is flushable, so each keeper must read its
     // own sandbox's file, every period, and never the parent's. The
-    // descriptors show what a keeper holds; the inotify reads show what it
-    // reads: a keeper that holds its own file but opens, reads and closes
-    // the parent's every period passed the descriptor checks alone (#54
-    // review, finding 2).
+    // descriptors show what a keeper holds; the inotify reads show which
+    // file it reads: a keeper that holds its own file but opens, reads and
+    // closes the parent's every period passed the descriptor checks alone
+    // (#78 review, run 1). The keeper's own report shows how often: a slot
+    // is 10 periods long, so a keeper reading every 10 periods filled
+    // every slot (#78 review, run 2).
     let _alone = support::exclusive();
     let parent_stat = cgroup::parent().path().join("memory.stat");
     let parent_before = descriptors_of(&parent_stat);
-    let a = cgroup::sandbox("keeper-own");
-    let b = cgroup::sandbox("keeper-own");
-    let a_stat = a.path().join("memory.stat");
-    let b_stat = b.path().join("memory.stat");
-    assert_eq!(descriptors_of(&a_stat), 1, "{}", a_stat.display());
-    assert_eq!(descriptors_of(&b_stat), 1, "{}", b_stat.display());
-    assert_eq!(
-        descriptors_of(&parent_stat),
-        parent_before,
-        "a keeper holds the parent's memory.stat"
-    );
-    // Each keeper reads its own file in at least 3 of 4 slots of 10
-    // periods (one read in ten is late at worst; a keeper that reads every
-    // period fills every slot), and the parent's file is read in at most
-    // a quarter of them (nothing in this test reads it; a host's monitor
-    // may, about once a second; a keeper that reads it every period fills
-    // every slot).
-    let slots = read_slots(&[&a_stat, &b_stat, &parent_stat]);
-    report(&format!(
-        "keeper_reads_its_own_sandbox: slots of {:?} with a read, of {READ_SLOTS}: \
-         sandbox a {}, sandbox b {}, parent {}; {:?} {:?}",
-        10 * STATS_KEEPER_PERIOD,
-        slots[0],
-        slots[1],
-        slots[2],
-        a.stats_keeper(),
-        b.stats_keeper()
-    ));
-    for (i, name) in ["a", "b"].iter().enumerate() {
+    let mut failures = Vec::new();
+    for attempt in 1..=CADENCE_ATTEMPTS {
+        let a = cgroup::sandbox("keeper-own");
+        let b = cgroup::sandbox("keeper-own");
+        let a_stat = a.path().join("memory.stat");
+        let b_stat = b.path().join("memory.stat");
+        assert_eq!(descriptors_of(&a_stat), 1, "{}", a_stat.display());
+        assert_eq!(descriptors_of(&b_stat), 1, "{}", b_stat.display());
+        assert_eq!(
+            descriptors_of(&parent_stat),
+            parent_before,
+            "a keeper holds the parent's memory.stat"
+        );
+        // Each keeper reads its own file in at least 3 of 4 slots of 10
+        // periods (a keeper that reads every period fills every slot), and
+        // the parent's file is read in at most a quarter of them (nothing
+        // in this test reads it; a host's monitor may, about once a
+        // second; a keeper that reads it every period fills every slot).
+        let (a0, b0) = (a.stats_keeper(), b.stats_keeper());
+        let start = Instant::now();
+        let slots = read_slots(&[&a_stat, &b_stat, &parent_stat]);
+        let window = start.elapsed();
+        let (a1, b1) = (a.stats_keeper(), b.stats_keeper());
+        report(&format!(
+            "keeper_reads_its_own_sandbox: attempt {attempt}, slots of {:?} with a read, of \
+             {READ_SLOTS}: sandbox a {}, sandbox b {}, parent {}; window {window:?}, reads a {} \
+             b {}; {a1:?} {b1:?}",
+            10 * STATS_KEEPER_PERIOD,
+            slots[0],
+            slots[1],
+            slots[2],
+            a1.reads.saturating_sub(a0.reads),
+            b1.reads.saturating_sub(b0.reads),
+        ));
         assert!(
-            slots[i] * 4 >= READ_SLOTS * 3,
-            "the keeper of sandbox {name} read its memory.stat in {} of {READ_SLOTS} slots of \
-             10 periods: {:?}",
-            slots[i],
+            slots[2] * 4 <= READ_SLOTS,
+            "the parent's memory.stat was read in {} of {READ_SLOTS} slots of 10 periods: {:?}",
+            slots[2],
             slots
         );
+        let failed: Vec<String> = [
+            cadence_failure("a", slots[0], a0, a1, window),
+            cadence_failure("b", slots[1], b0, b1, window),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !failed.is_empty() {
+            failures.push(format!("attempt {attempt}: {}", failed.join("; ")));
+            continue;
+        }
+        a.destroy().expect("destroy");
+        assert_eq!(descriptors_of(&a_stat), 0, "left after destroy");
+        assert_eq!(descriptors_of(&b_stat), 1);
+        drop(b);
+        assert_eq!(descriptors_of(&b_stat), 0, "left after a drop");
+        return;
     }
-    assert!(
-        slots[2] * 4 <= READ_SLOTS,
-        "the parent's memory.stat was read in {} of {READ_SLOTS} slots of 10 periods: {:?}",
-        slots[2],
-        slots
+    panic!(
+        "no window of {CADENCE_ATTEMPTS} kept the cadence: {}",
+        failures.join(" | ")
     );
-    a.destroy().expect("destroy");
-    assert_eq!(descriptors_of(&a_stat), 0, "left after destroy");
-    assert_eq!(descriptors_of(&b_stat), 1);
-    drop(b);
-    assert_eq!(descriptors_of(&b_stat), 0, "left after a drop");
 }
 
 #[test]

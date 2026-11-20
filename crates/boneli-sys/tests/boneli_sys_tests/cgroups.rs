@@ -494,6 +494,37 @@ struct BufferedRun {
     keeper_at_loop_end: Option<KeeperReport>,
     keeper_after: KeeperReport,
     run_ms: u64,
+    /// The report once the keeper read again after `keeper_after`, or
+    /// failed, or [`KEEPER_RESUME`] passed without either.
+    keeper_settled: KeeperReport,
+    /// When the keeper's next read after `keeper_after` was seen, if it
+    /// came within [`KEEPER_RESUME`].
+    keeper_resumed_ms: Option<u64>,
+}
+
+/// How long a buffered case waits after the writer's end for the keeper's
+/// next read: 200 periods of 5 ms. A keeper that reads at all reads again
+/// within one or a few periods (the largest gap a loaded dev host showed
+/// was about 56 ms); one that stopped never does. A stop shows nowhere
+/// else: `max_gap` grows only when the next read lands, and the read
+/// counts run from before the spawn (#78 review, run 2).
+const KEEPER_RESUME: Duration = Duration::from_secs(1);
+
+/// Waits up to [`KEEPER_RESUME`] for a read after `after` or a failure,
+/// and returns the last report and when a read was seen.
+fn keeper_resume(cg: &Cgroup, after: KeeperReport) -> (KeeperReport, Option<u64>) {
+    let start = Instant::now();
+    loop {
+        let r = cg.stats_keeper();
+        let waited = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if r.reads > after.reads {
+            return (r, Some(waited));
+        }
+        if r.failed.is_some() || start.elapsed() >= KEEPER_RESUME {
+            return (r, None);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Runs the buffered writer in `cg` on `fixture` and waits for it within
@@ -565,6 +596,7 @@ fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup, size: u64) -> BufferedRun
         // covers the whole run, a killed one too.
         let keeper_after = cg.stats_keeper();
         let run_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (keeper_settled, keeper_resumed_ms) = keeper_resume(cg, keeper_after);
         let (stdout, keeper_at_loop_end) = out.join().expect("the stdout reader");
         let stderr = err.join().expect("the stderr reader");
         BufferedRun {
@@ -577,6 +609,8 @@ fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup, size: u64) -> BufferedRun
             keeper_at_loop_end,
             keeper_after,
             run_ms,
+            keeper_settled,
+            keeper_resumed_ms,
         }
     })
 }
@@ -615,6 +649,11 @@ struct BufferedFacts {
     keeper_after: KeeperReport,
     /// From the spawn to the writer's end.
     run_ms: u64,
+    /// The keeper's report once it read again after the run, failed, or
+    /// [`KEEPER_RESUME`] passed.
+    keeper_settled: KeeperReport,
+    /// When that next read was seen; `None`: not within [`KEEPER_RESUME`].
+    keeper_resumed_ms: Option<u64>,
 }
 
 /// The facts from the probe's keys (a missing number reads 0, a missing
@@ -654,6 +693,8 @@ fn buffered_facts(
         keeper_at_loop_end: run.keeper_at_loop_end,
         keeper_after: run.keeper_after,
         run_ms: run.run_ms,
+        keeper_settled: run.keeper_settled,
+        keeper_resumed_ms: run.keeper_resumed_ms,
     }
 }
 
@@ -663,10 +704,11 @@ enum BufferedHold {
     /// The sandbox's statistics keeper failed, before, during or after the
     /// run: nothing protected the writer, so nothing else is said.
     KeeperFailed,
-    /// An OOM kill while the keeper stalled: it read less than once per 10
-    /// periods of the run, or paused longer than 10 periods. The keeper,
-    /// not the kernel, is the first suspect (ADR-007 D8, "What could still
-    /// defeat it" (4)).
+    /// The keeper stopped: no read within [`KEEPER_RESUME`] after the
+    /// writer's end, in any run. Or an OOM kill while the keeper stalled:
+    /// it read less than once per 10 periods of the run, or paused longer
+    /// than 10 periods. The keeper, not the kernel, is the first suspect
+    /// (ADR-007 D8, "What could still defeat it" (4)).
     KeeperStalled,
     /// An OOM kill although the keeper kept reading: dirty throttling did
     /// not slow the writer in time, so a read of `memory.stat` may no
@@ -729,10 +771,17 @@ fn keeper_run_reads(f: &BufferedFacts) -> (u64, u64) {
 }
 
 /// The keeper read less than [`keeper_run_reads`] asks, or its largest gap
-/// between two reads, over its whole life, is over 10 periods.
+/// between two reads, over its whole life, is over 10 periods, or it
+/// stopped ([`keeper_stopped`]).
 fn keeper_stalled(f: &BufferedFacts) -> bool {
     let (done, need) = keeper_run_reads(f);
-    done < need || f.keeper_after.max_gap > 10 * STATS_KEEPER_PERIOD
+    done < need || f.keeper_after.max_gap > 10 * STATS_KEEPER_PERIOD || keeper_stopped(f)
+}
+
+/// No read within [`KEEPER_RESUME`] after the writer's end: the gap still
+/// open when the run was judged.
+fn keeper_stopped(f: &BufferedFacts) -> bool {
+    f.keeper_settled.reads <= f.keeper_after.reads
 }
 
 /// The first `errno` a keeper report shows, before, at the loop's end or
@@ -742,6 +791,7 @@ fn keeper_failure(f: &BufferedFacts) -> Option<i32> {
         Some(f.keeper_before),
         f.keeper_at_loop_end,
         Some(f.keeper_after),
+        Some(f.keeper_settled),
     ]
     .into_iter()
     .flatten()
@@ -751,6 +801,9 @@ fn keeper_failure(f: &BufferedFacts) -> Option<i32> {
 fn buffered_verdict(f: &BufferedFacts) -> BufferedHold {
     if keeper_failure(f).is_some() {
         return BufferedHold::KeeperFailed;
+    }
+    if keeper_stopped(f) {
+        return BufferedHold::KeeperStalled;
     }
     if f.oom_kill >= 1 {
         return if keeper_stalled(f) {
@@ -807,7 +860,7 @@ fn buffered_text(f: &BufferedFacts) -> String {
          wbytes {} after fdatasync, io.stat [{}], size {}, memory.max {}, wbps {}, \
          keeper reads in the loop {done} (need {need}), in the run {run_done} (need {run_need}) \
          over run_ms {}, keeper before [{}], at the loop's end [{}], after the run [{}], \
-         period {:?}",
+         next read after the run {}, settled [{}], period {:?}",
         f.kernel,
         f.setup.dev.0,
         f.setup.dev.1,
@@ -830,7 +883,17 @@ fn buffered_text(f: &BufferedFacts) -> String {
         keeper_text(Some(f.keeper_before)),
         keeper_text(f.keeper_at_loop_end),
         keeper_text(Some(f.keeper_after)),
+        resumed_text(f.keeper_resumed_ms),
+        keeper_text(Some(f.keeper_settled)),
         boneli_sys::STATS_KEEPER_PERIOD,
+    )
+}
+
+/// When the keeper's next read after the run came.
+fn resumed_text(ms: Option<u64>) -> String {
+    ms.map_or_else(
+        || format!("none within {KEEPER_RESUME:?}"),
+        |ms| format!("{ms} ms"),
     )
 }
 
@@ -845,15 +908,23 @@ fn buffered_failure(v: BufferedHold, f: &BufferedFacts) -> String {
         ),
         BufferedHold::KeeperStalled => {
             let (done, need) = keeper_run_reads(f);
+            let killed = if f.oom_kill >= 1 {
+                format!(
+                    "the buffered writer was OOM-killed (memory.events oom_kill {}) while the \
+                     statistics keeper stalled",
+                    f.oom_kill
+                )
+            } else {
+                "the statistics keeper stopped".to_string()
+            };
             format!(
-                "the buffered writer was OOM-killed (memory.events oom_kill {}) while the \
-                 statistics keeper stalled: {done} reads in the run's {} ms (need {need}, one \
-                 per 10 keeper periods), largest gap {:?} (bound {:?}); suspect the keeper \
-                 first (ADR-007 D8)",
-                f.oom_kill,
+                "{killed}: {done} reads in the run's {} ms (need {need}, one per 10 keeper \
+                 periods), largest gap {:?} (bound {:?}), next read after the run {}; suspect \
+                 the keeper first (ADR-007 D8)",
                 f.run_ms,
                 f.keeper_after.max_gap,
-                10 * STATS_KEEPER_PERIOD
+                10 * STATS_KEEPER_PERIOD,
+                resumed_text(f.keeper_resumed_ms)
             )
         }
         BufferedHold::OomKilled => {
@@ -936,6 +1007,9 @@ fn buffered_facts_for(loop_ms: Option<u64>) -> BufferedFacts {
         // A keeper that read every period of the run.
         keeper_after: keeper(100 + run_ms / STATS_KEEPER_PERIOD.as_millis() as u64),
         run_ms,
+        // It read again one period after the run.
+        keeper_settled: keeper(101 + run_ms / STATS_KEEPER_PERIOD.as_millis() as u64),
+        keeper_resumed_ms: Some(STATS_KEEPER_PERIOD.as_millis() as u64),
     }
 }
 
@@ -1019,8 +1093,9 @@ fn buffered_verdicts() {
     g.keeper_at_loop_end = None;
     assert_eq!(buffered_verdict(&g), BufferedHold::KeeperIdle);
 
-    // Precedence: KeeperFailed > OomKilled > WriterFailed > NotBuffered >
-    // Escaped > OffDevice > KeeperIdle > Held, each over everything after.
+    // Precedence: KeeperFailed > KeeperStalled > OomKilled > WriterFailed >
+    // NotBuffered > Escaped > OffDevice > KeeperIdle > Held, each over
+    // everything after.
     let mut all = f(None);
     all.status = ExitStatus::Signaled(9);
     all.oom_kill = 1;
@@ -1119,6 +1194,9 @@ fn buffered_keeper_stalled() {
         g.keeper_after = g.keeper_before;
         g.keeper_after.reads += reads;
         g.keeper_after.max_gap = max_gap;
+        // It read again after the run.
+        g.keeper_settled = g.keeper_after;
+        g.keeper_settled.reads += 1;
         buffered_verdict(&g)
     };
     let gap = Duration::from_millis(6);
@@ -1145,6 +1223,50 @@ fn buffered_keeper_stalled() {
     g.keeper_after = g.keeper_before;
     g.keeper_after.max_gap = Duration::from_secs(1);
     assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // A keeper that stopped, whatever it read before: no read within
+    // KEEPER_RESUME after the writer's end (#78 review, run 2: a keeper
+    // hung after 300 reads read 299 in a 2,814 ms run, largest gap 6 ms).
+    let stopped = |mut g: BufferedFacts| {
+        g.keeper_settled = g.keeper_after;
+        g.keeper_resumed_ms = None;
+        g
+    };
+    let mut g = buffered_facts_for(None);
+    g.oom_kill = 1;
+    g.keeper_at_loop_end = None;
+    g.run_ms = 2814;
+    g.keeper_after = g.keeper_before;
+    g.keeper_after.reads += 299;
+    g.keeper_after.max_gap = Duration::from_micros(6256);
+    g.keeper_settled = g.keeper_after;
+    g.keeper_settled.reads += 1;
+    assert_eq!(buffered_verdict(&g), BufferedHold::OomKilled);
+    let g = stopped(g);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperStalled);
+    let m = buffered_failure(BufferedHold::KeeperStalled, &g);
+    assert!(
+        m.starts_with(
+            "the buffered writer was OOM-killed (memory.events oom_kill 1) while the statistics \
+             keeper stalled: 299 reads"
+        ),
+        "{m}"
+    );
+    assert!(m.contains("next read after the run none within 1s"), "{m}");
+    // Also without an OOM kill: a held run with a stopped keeper is not Held.
+    let g = stopped(buffered_facts_for(Some(14_600)));
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperStalled);
+    let m = buffered_failure(BufferedHold::KeeperStalled, &g);
+    assert!(m.starts_with("the statistics keeper stopped: "), "{m}");
+    // One more read is enough, however late within the bound.
+    let mut g = stopped(buffered_facts_for(Some(14_600)));
+    g.keeper_settled.reads += 1;
+    g.keeper_resumed_ms = Some(KEEPER_RESUME.as_millis() as u64);
+    assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+    // A failure seen while waiting for that read is a failure.
+    let mut g = stopped(buffered_facts_for(Some(14_600)));
+    g.keeper_settled.failed = Some(libc::EIO);
+    assert_eq!(buffered_verdict(&g), BufferedHold::KeeperFailed);
+
     // A failure wins over a stall.
     let mut g = buffered_facts_for(None);
     g.oom_kill = 1;
@@ -1180,6 +1302,8 @@ fn buffered_failure_messages() {
             keeper_at_loop_end: None,
             keeper_after: f(None).keeper_after,
             run_ms: 470,
+            keeper_settled: f(None).keeper_settled,
+            keeper_resumed_ms: f(None).keeper_resumed_ms,
         },
         f(None).setup,
         1,
@@ -1272,6 +1396,11 @@ fn buffered_failure_messages() {
             ),
             format!("after the run [{}]", keeper_text(Some(facts.keeper_after))),
             format!("over run_ms {}", facts.run_ms),
+            format!(
+                "next read after the run {}",
+                resumed_text(facts.keeper_resumed_ms)
+            ),
+            format!("settled [{}]", keeper_text(Some(facts.keeper_settled))),
         ] {
             assert!(m.contains(&part), "{v:?}: {part:?} missing in {m}");
         }
