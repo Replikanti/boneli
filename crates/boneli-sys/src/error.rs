@@ -155,6 +155,14 @@ pub enum Error {
         /// The number of devices, 0 if it could not be read.
         devices: u64,
     },
+    /// The memory statistics keeper of a sandbox cgroup failed: in
+    /// [`crate::Cgroup::create`], its first read of `memory.stat` read
+    /// nothing, and no sandbox is created without it (ADR-007, D8). A read
+    /// error after the start shows in [`crate::KeeperReport::failed`].
+    StatsKeeper {
+        /// The `errno`; `EIO` for a file that read as empty.
+        errno: i32,
+    },
 }
 
 impl Error {
@@ -293,6 +301,11 @@ impl fmt::Display for Error {
                 "the file system of {} spans {devices} devices; io.max would limit only one",
                 path.display()
             ),
+            Error::StatsKeeper { errno } => write!(
+                f,
+                "the memory statistics keeper of a sandbox cgroup failed (errno {errno}); \
+                 no sandbox is created without it (ADR-007, D8)"
+            ),
         }
     }
 }
@@ -302,6 +315,18 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_keeper_error_text() {
+        assert_eq!(
+            Error::StatsKeeper { errno: libc::EIO }.to_string(),
+            format!(
+                "the memory statistics keeper of a sandbox cgroup failed (errno {}); \
+                 no sandbox is created without it (ADR-007, D8)",
+                libc::EIO
+            )
+        );
+    }
 
     #[test]
     fn setup_error_renders_step_index_and_strerror() {
