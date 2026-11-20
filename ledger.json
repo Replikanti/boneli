@@ -1108,11 +1108,11 @@
    "title": "Patch policy: disabled-test detection for Python and in-source .vue/.svelte tests",
    "epic": null,
    "order": 42,
-   "state": "claimed",
+   "state": "stopped",
    "owner": "62531680",
    "pr": null,
-   "note": "",
-   "updated_at": "2026-11-20T22:04:16+00:00",
+   "note": "scout NO-GO: start gate 'second stack once onboarding on TypeScript works' not met; #14 and #15 open",
+   "updated_at": "2026-11-20T22:05:50+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:11:11+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "98fa59e8",
-   "note": "PR 2 (#78): MK-P decided; ADR note, AWS landing, mark ready"
-  },
   {
    "at": "2026-11-20T15:12:48+00:00",
    "issue": 79,
@@ -1710,6 +1702,14 @@
    "to": "done",
    "by": "47331c5b",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:05:50+00:00",
+   "issue": 69,
+   "from": "claimed",
+   "to": "stopped",
+   "by": "62531680",
+   "note": "scout NO-GO: start gate 'second stack once onboarding on TypeScript works' not met; #14 and #15 open"
   }
  ],
  "open": [
@@ -1744,7 +1744,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:05:45+00:00",
+ "updated_at": "2026-11-20T22:05:50+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
