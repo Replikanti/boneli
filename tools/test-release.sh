@@ -321,7 +321,7 @@ write_meta() {
 }
 notices() {
   # $1: file with `cargo tree` output.
-  run env NOTICES_CRATES="$1" NOTICES_METADATA="$meta" \
+  run env NOTICES_CRATES="$1" NOTICES_METADATA="$meta" NOTICES_SYSROOT="$sysroot" \
     sh "$tools/third-party-notices.sh" x86_64-unknown-linux-gnu boneli-egress
 }
 # Prints the copy of file $3 in the section of crate "$1 $2" of notices $4.
@@ -356,6 +356,16 @@ printf 'Apache text\n\n  indented line, trailing blanks follow\n\n\n' > "$reg/al
 printf 'MIT text without a final newline' > "$reg/alpha-1.0.0/LICENSE-MIT"
 printf 'NOTICE text\n' > "$reg/alpha-1.0.0/NOTICE"
 printf 'not a license\n' > "$reg/alpha-1.0.0/README.md"
+# Nested license files (vendored code), a COPYRIGHT file, and what is
+# never read: build output, git data, a symlink.
+mkdir -p "$reg/alpha-1.0.0/src/vendored/once" "$reg/alpha-1.0.0/third_party/x" \
+  "$reg/alpha-1.0.0/target" "$reg/alpha-1.0.0/.git" "$reg/alpha-1.0.0/sub"
+printf 'vendored MIT\n\n  kept verbatim\n' > "$reg/alpha-1.0.0/src/vendored/once/LICENSE-MIT"
+printf 'third party notice\n' > "$reg/alpha-1.0.0/third_party/x/NOTICE"
+printf 'alpha copyright\n' > "$reg/alpha-1.0.0/COPYRIGHT"
+printf 'build output\n' > "$reg/alpha-1.0.0/target/LICENSE"
+printf 'git data\n' > "$reg/alpha-1.0.0/.git/LICENSE"
+printf 'a source file\n' > "$reg/alpha-1.0.0/src/vendored/once/lib.rs"
 crate alpha 2.0.0 "MIT"
 printf 'alpha two MIT\n' > "$reg/alpha-2.0.0/LICENSE"
 crate a_b 0.1.0 "MIT"
@@ -374,6 +384,9 @@ mkdir -p "$reg/delta-0.4.0/LICENSES"
 printf 'in a directory\n' > "$reg/delta-0.4.0/LICENSES/MIT.txt"
 crate nolicense 1.0.0 "MIT"
 printf 'readme only\n' > "$reg/nolicense-1.0.0/README.md"
+crate nestedonly 1.0.0 "MIT"
+mkdir -p "$reg/nestedonly-1.0.0/vendor"
+printf 'a vendored license only\n' > "$reg/nestedonly-1.0.0/vendor/LICENSE"
 crate emptylicense 1.0.0 "MIT"
 : > "$reg/emptylicense-1.0.0/LICENSE"
 printf ' \n\t\n' > "$reg/emptylicense-1.0.0/LICENSE-MIT"
@@ -382,6 +395,18 @@ printf 'secret\n' > "$tmp/outside-file"
 ln -s "$tmp/outside-file" "$reg/linked-1.0.0/LICENSE"
 mkdir -p "$tmp/ws-member"
 write_meta
+ln -s "$tmp/outside-file" "$reg/alpha-1.0.0/sub/LICENSE"
+
+# A fake toolchain: the standard library's notices name Apache-2.0 and
+# MIT, not GPL-2.0-only.
+sysroot="$tmp/sysroot"
+rustdoc="$sysroot/share/doc/rust"
+mkdir -p "$rustdoc/licenses"
+printf '<html>\n<p>License: Apache-2.0 OR MIT</p>\n<p>gimli: notices</p>\n</html>\n' > "$rustdoc/COPYRIGHT-library.html"
+printf 'Apache text of the toolchain\n' > "$rustdoc/licenses/Apache-2.0.txt"
+printf 'MIT text of the toolchain\n' > "$rustdoc/licenses/MIT.txt"
+printf 'GPL text\n' > "$rustdoc/licenses/GPL-2.0-only.txt"
+rust_version=$(cd "$root" && rustc -V | cut -d' ' -f2)
 
 # The tree as cargo prints it: members with their path, repeats marked
 # (*), a proc macro, a blank line between two roots.
@@ -483,7 +508,7 @@ collating_locale() {
 }
 
 notices_deterministic_order() {
-  run env LC_ALL=C NOTICES_CRATES="$tree_ok" NOTICES_METADATA="$meta" \
+  run env LC_ALL=C NOTICES_CRATES="$tree_ok" NOTICES_METADATA="$meta" NOTICES_SYSROOT="$sysroot" \
     sh "$tools/third-party-notices.sh" x86_64-unknown-linux-gnu boneli-egress || true
   want_rc 0 || return 1
   cp "$out" "$tmp/first"
@@ -495,14 +520,15 @@ notices_deterministic_order() {
   # Reversed, with repeats, under a collating locale.
   awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' "$tree_ok" > "$tmp/tree"
   cat "$tree_ok" >> "$tmp/tree"
-  run env LC_ALL="$loc" LANG="$loc" NOTICES_CRATES="$tmp/tree" NOTICES_METADATA="$meta" \
+  run env LC_ALL="$loc" LANG="$loc" NOTICES_CRATES="$tmp/tree" NOTICES_METADATA="$meta" NOTICES_SYSROOT="$sysroot" \
     sh "$tools/third-party-notices.sh" x86_64-unknown-linux-gnu boneli-egress || true
   want_rc 0 || return 1
   cmp -s "$out" "$tmp/first" || fail_msg "output depends on input order or locale ($loc)" || return 1
-  # Each crate once, in C order of "name version": Zeta first, a-b
-  # before a_b.
+  # The standard library first, then each crate once, in C order of
+  # "name version": Zeta first, a-b before a_b.
   grep -xE '[A-Za-z_-]+ [0-9.]+' "$tmp/first" > "$tmp/headers"
-  printf 'Zeta 1.0.0\na-b 0.1.0\na_b 0.1.0\nalpha 1.0.0\nalpha 2.0.0\ndelta 0.4.0\ngamma 0.3.0\n' > "$tmp/want"
+  printf 'rust-std %s\n' "$rust_version" > "$tmp/want"
+  printf 'Zeta 1.0.0\na-b 0.1.0\na_b 0.1.0\nalpha 1.0.0\nalpha 2.0.0\ndelta 0.4.0\ngamma 0.3.0\n' >> "$tmp/want"
   cmp -s "$tmp/headers" "$tmp/want" || fail_msg "headers: $(tr '\n' ' ' < "$tmp/headers")"
 }
 
@@ -513,7 +539,71 @@ notices_excludes_members_and_dev() {
   has_line "$out" "gamma 0.3.0"
 }
 
+notices_copy_nested_license_files() {
+  notices "$tree_ok" || true
+  want_rc 0 || return 1
+  cp "$out" "$tmp/notices"
+  for f in src/vendored/once/LICENSE-MIT third_party/x/NOTICE COPYRIGHT; do
+    copy_of alpha 1.0.0 "$f" "$tmp/notices" > "$tmp/copy" || fail_msg "no copy of $f" || return 1
+    cmp -s "$tmp/copy" "$reg/alpha-1.0.0/$f" || fail_msg "$f is not verbatim" || return 1
+  done
+  # Build output, git data, a symlink and other files are never read.
+  for s in "build output" "git data" "secret" "a source file"; do
+    hasnt "$tmp/notices" "$s" || return 1
+  done
+  # Crate-relative paths in C order: top level first, then by directory.
+  awk '$0 == "alpha 1.0.0" { on = 1 } on && /^==> / { print } on && $0 == "alpha 2.0.0" { exit }' \
+    "$tmp/notices" > "$tmp/marks"
+  printf '==> COPYRIGHT <==\n==> LICENSE-APACHE <==\n==> LICENSE-MIT <==\n==> NOTICE <==\n==> src/vendored/once/LICENSE-MIT <==\n==> third_party/x/NOTICE <==\n' > "$tmp/want"
+  cmp -s "$tmp/marks" "$tmp/want" || fail_msg "files of alpha: $(tr '\n' ' ' < "$tmp/marks")"
+}
+
+notices_fail_on_nested_only_license() {
+  printf 'nestedonly v1.0.0\n' > "$tmp/tree"
+  notices "$tmp/tree" || true
+  want_rc 1 || return 1
+  has "$err" "nestedonly 1.0.0" || return 1
+  test ! -s "$out" || fail_msg "wrote notices on failure"
+}
+
+notices_rust_toolchain_section() {
+  notices "$tree_ok" || true
+  want_rc 0 || return 1
+  cp "$out" "$tmp/notices"
+  has_line "$tmp/notices" "rust-std $rust_version" || return 1
+  for f in share/doc/rust/COPYRIGHT-library.html share/doc/rust/licenses/Apache-2.0.txt share/doc/rust/licenses/MIT.txt; do
+    copy_of rust-std "$rust_version" "$f" "$tmp/notices" > "$tmp/copy" || fail_msg "no copy of $f" || return 1
+    cmp -s "$tmp/copy" "$sysroot/$f" || fail_msg "$f is not verbatim" || return 1
+  done
+  # A license text the library's notices do not name stays out.
+  hasnt "$tmp/notices" "GPL text"
+}
+
+notices_fail_without_toolchain_notices() {
+  mv "$rustdoc/COPYRIGHT-library.html" "$tmp/library.html"
+  notices "$tree_ok" || true
+  mv "$tmp/library.html" "$rustdoc/COPYRIGHT-library.html"
+  want_rc 1 || return 1
+  has "$err" "rust-std" || return 1
+  test ! -s "$out" || fail_msg "wrote notices without the toolchain's notices" || return 1
+  # An empty document fails too.
+  cp "$rustdoc/COPYRIGHT-library.html" "$tmp/library.html"
+  printf ' \n' > "$rustdoc/COPYRIGHT-library.html"
+  notices "$tree_ok" || true
+  mv "$tmp/library.html" "$rustdoc/COPYRIGHT-library.html"
+  want_rc 1 || return 1
+  # So does a document whose MIT text is missing.
+  mv "$rustdoc/licenses/MIT.txt" "$tmp/MIT.txt"
+  notices "$tree_ok" || true
+  mv "$tmp/MIT.txt" "$rustdoc/licenses/MIT.txt"
+  want_rc 1
+}
+
 check notices_copy_every_license_file
+check notices_copy_nested_license_files
+check notices_fail_on_nested_only_license
+check notices_rust_toolchain_section
+check notices_fail_without_toolchain_notices
 check notices_filename_case
 check notices_fail_on_missing_license
 check notices_fail_on_empty_license
@@ -539,10 +629,23 @@ notices_real_graph_tls() {
     grep -qE "^$c [0-9]" "$tmp/tls" || fail_msg "no header for $c" || return 1
   done
   has_line "$tmp/tls" "# Community Data License Agreement - Permissive - Version 2.0" || return 1
-  for f in LICENSE LICENSE-BoringSSL LICENSE-other-bits; do
-    v=$(grep -E '^ring [0-9]' "$tmp/tls" | cut -d' ' -f2)
+  # ring's three top-level files and the nested ones its LICENSE points
+  # to (vendored once_cell code, fiat-crypto).
+  v=$(grep -E '^ring [0-9]' "$tmp/tls" | cut -d' ' -f2)
+  for f in LICENSE LICENSE-BoringSSL LICENSE-other-bits src/polyfill/once_cell/LICENSE-APACHE \
+           src/polyfill/once_cell/LICENSE-MIT third_party/fiat/LICENSE; do
     copy_of ring "$v" "$f" "$tmp/tls" > /dev/null || fail_msg "ring $f missing" || return 1
   done
+  # The standard library: the active toolchain's own notices, verbatim.
+  sr=$(cd "$root" && rustc --print sysroot)
+  copy_of rust-std "$rust_version" share/doc/rust/COPYRIGHT-library.html "$tmp/tls" > "$tmp/copy" \
+    || fail_msg "no notices of the standard library" || return 1
+  # The notices end every file with a newline; this one ships without.
+  lib="$sr/share/doc/rust/COPYRIGHT-library.html"
+  { cat "$lib"; [ -z "$(tail -c 1 "$lib")" ] || printf '\n'; } > "$tmp/want"
+  cmp -s "$tmp/copy" "$tmp/want" || fail_msg "std notices not verbatim" || return 1
+  copy_of rust-std "$rust_version" share/doc/rust/licenses/MIT.txt "$tmp/tls" > /dev/null \
+    || fail_msg "no MIT text of the toolchain" || return 1
   # Build-only (cc) and dev-only crates, and workspace members, are not
   # linked into the binary.
   for c in cc shlex find-msvc-tools boneli-https boneli-http; do
@@ -686,7 +789,24 @@ release_workflow_no_expression_in_run() {
   expr_in_run "$root/.github/workflows/release.yml"
 }
 
+release_workflow_publish_gate_and_pins() {
+  wf="$root/.github/workflows/release.yml"
+  # Only a tag push publishes; a dispatch on a tag ref does not.
+  awk '/^  publish:$/ { on = 1; next } on && /^  [^ ]/ { exit } on' "$wf" > "$tmp/publish"
+  has_line "$tmp/publish" "    if: github.event_name == 'push' && github.ref_type == 'tag'" || return 1
+  # Publishing checks the tag against the built commit, before and after.
+  # shellcheck disable=SC2016 # a literal line of the workflow
+  n=$(grep -cF 'tagged=$(tag_commit)' "$tmp/publish")
+  [ "$n" = 2 ] || fail_msg "tag_commit checks in publish: $n" || return 1
+  # Every action outside actions/ is pinned to a full commit.
+  if grep -nE '^ *(- )?uses: ' "$wf" | grep -v 'uses: actions/' | grep -vE 'uses: [^@ ]+@[0-9a-f]{40}( |$)'; then
+    fail_msg "a third-party action is not pinned to a commit"
+    return 1
+  fi
+}
+
 check release_workflow_no_expression_in_run
+check release_workflow_publish_gate_and_pins
 
 # -----------------------------------------------------------------------------
 

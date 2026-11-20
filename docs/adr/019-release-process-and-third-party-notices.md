@@ -29,8 +29,12 @@ Measured while planning (2026-11-20): `cargo build --release -p
 boneli-https --target x86_64-unknown-linux-musl` fails in `ring`'s build
 script (`failed to find tool "x86_64-linux-musl-gcc"`). The registry
 source of every crate in ADR-005's table ships at least one `LICENSE*`
-file; `ring` ships three (`LICENSE`, `LICENSE-BoringSSL`,
-`LICENSE-other-bits`). CI's `check` job took 3 min 27 s on `main`.
+file at its top level. `ring` 0.17.14 ships six license files: three at the
+top (`LICENSE`, `LICENSE-BoringSSL`, `LICENSE-other-bits`) and three below
+it, which its `LICENSE` points to (`src/polyfill/once_cell/LICENSE-APACHE`,
+`src/polyfill/once_cell/LICENSE-MIT`, `third_party/fiat/LICENSE`; counted in
+the review of the PR that adds this ADR). `rand_core` ships a `COPYRIGHT`
+file next to its licenses. CI's `check` job took 3 min 27 s on `main`.
 
 ## Decision
 
@@ -55,8 +59,11 @@ an ancestor of `origin/main`, and the changelog section is non-empty. Every
 mode of the script, `--packages` and `--bins` included, first checks the
 package list (D5). Branch protection does not cover tags, so anyone with
 write access can push one; the ancestry and version guards are what a tag
-must pass before anything is built. A tag ruleset for `v*` is a repository
-setting outside this ADR.
+must pass before anything is built. They run from the tagged tree, so they
+cannot stop a tag on a tree whose workflow drops them: that is what a tag
+ruleset for `v*` does (creation, update and deletion restricted). The
+ruleset is a repository setting, made after the PR that adds this ADR
+merges (decision 3 at STOP 1 of #22).
 
 ### D3. Native glibc builds on Ubuntu 22.04
 
@@ -90,13 +97,31 @@ the binaries. Build and dev dependencies are not linked and stay out (no
 `cc`), and so do workspace members, which the repository's own `LICENSE`
 covers. For each crate, sorted by name and version in the C locale: its
 name, version, license expression and repository from `cargo metadata`,
-then every top-level regular file of its published source whose name
-starts with `LICENSE`, `LICENCE`, `COPYING`, `NOTICE` or `UNLICENSE` (any
-case), verbatim under its file name. The script fails closed: a crate
-without such a file with content, a crate that `cargo metadata` does not
-know, or a symlinked license file (it could point anywhere on the build
-host) is named on stderr, the script exits 1 and writes nothing, and the
-workflow packages only on success. Copying every file instead of choosing
+then every regular file of its published source, at any depth except
+`target/` and `.git/`, whose name starts with `LICENSE`, `LICENCE`,
+`COPYING`, `COPYRIGHT`, `NOTICE` or `UNLICENSE` (any case), verbatim under
+its path in the crate. Nested files matter: vendored code keeps its license
+next to it, and `ring`'s top-level `LICENSE` points to three of them
+(Context). Symlinks are never read (they could point anywhere on the build
+host). The script fails closed: a crate without such a file with content at
+its top level, or a crate that `cargo metadata` does not know, is named on
+stderr, the script exits 1 and writes nothing, and the workflow packages
+only on success.
+
+The standard library is linked into every binary too: `std`, `core`,
+`alloc` and the crates they are built from (`addr2line`, `gimli`,
+`hashbrown`, `miniz_oxide`, `rustc-demangle`, `compiler_builtins` and more),
+which `cargo tree` does not show. Their notices come from the toolchain that
+built the archive: `share/doc/rust/COPYRIGHT-library.html` under `rustc
+--print sysroot`, which lists the in-tree licenses and, for each
+out-of-tree crate of the standard library, its license files, goes in
+verbatim as the first section (`rust-std <version>`), followed by every
+license text in `share/doc/rust/licenses/` whose SPDX id it names
+(Apache-2.0 and MIT at least). It comes with the `rustc` component, so the
+minimal profile installs it. A toolchain without the document or without
+those two texts fails the run like a crate without a license. That covers
+the standard library's graph with its maintainers' own record of it; the
+script does not rebuild that record. Copying every file instead of choosing
 the one that matches the license expression keeps the script free of SPDX
 parsing and over-complies where a crate offers a choice.
 
@@ -109,7 +134,7 @@ Rejected:
 
 - **`cargo-about`.** A Rust tool, but it needs an `accepted` license list
   that duplicates `deny.toml`, a clarification entry with file checksums for
-  `ring` (three license files), and a template, and it does not copy Apache
+  `ring` (six license files), and a template, and it does not copy Apache
   `NOTICE` files. It would also be a new third-party binary in the release
   path.
 - **A Rust member crate** that reads `cargo metadata` through
@@ -138,9 +163,20 @@ the download directory.
 The workflow's token is `contents: read`. Only `publish` (tag pushes, after
 both builds) and `rehearsal` (dispatch on `main`) get `contents: write`;
 they run GitHub's own actions (`checkout`, `download-artifact`) and `gh`,
-nothing third-party. `publish` verifies the four expected files and their
-checksums before it creates the release, and uses `--verify-tag`, so `gh`
-never creates a tag. Ref names reach the shell through `env:` only;
+nothing third-party. `publish` runs only for a tag push
+(`github.event_name == 'push'`): a dispatch never publishes, also on a tag
+ref; a failed release run is re-run with `gh run rerun`, which keeps its
+event. It fetches the tag fresh and requires that it still points at the
+commit the run built (`GITHUB_SHA`), verifies the four expected files and
+their checksums, creates the release with `--verify-tag` (so `gh` never
+creates a tag) on that commit, and checks the tag once more afterwards,
+deleting the release if it moved. The `build` job runs one third-party
+action, `dtolnay/rust-toolchain`, which installs the toolchain that builds
+what users run; it is pinned to a full commit of its `stable` branch, so a
+push to that branch cannot change the build, and the pin is bumped by hand.
+`tools/test-release.sh` fails on an action outside `actions/` that is not
+pinned to a commit, and on a `publish` without the tag-push condition or
+the two tag checks. Ref names reach the shell through `env:` only;
 `tools/test-release.sh` fails on any `${{` inside a `run:` value of
 `release.yml`. The build uses no cache: a cache restored into a tag run
 could carry build output from another run, and a release is built from the
@@ -180,7 +216,13 @@ before merge.
 - The notices tool reads license files by name. A crate update that drops
   its license file, or a new crate without one, fails the release and, for
   crates under `boneli-https` or `boneli-egress`, `check` on the PR that
-  brings it.
+  brings it. A file named otherwise (`MIT.txt` in a `LICENSES/` directory)
+  is not found; when that leaves a crate without a top-level match it fails
+  closed, otherwise the file is missing from the notices unnoticed.
+- The standard library's notices are an HTML document in a text file,
+  about 1.5 MB uncompressed; the archive's gzip keeps the cost small. Its
+  content changes with the toolchain, so two releases built with
+  different toolchains differ there.
 - The `ubuntu-22.04` labels will be retired by GitHub. Moving the label is
   a one-line change plus an update of the floor in D3 and in
   `docs/release.md`; every PR that touches the release files runs the dry

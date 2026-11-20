@@ -52,9 +52,14 @@ with a binary target and not one of the test or tool roots
 each architecture, `cargo test --workspace --locked`, a `--locked` release
 build of the listed packages (a drifting `Cargo.lock` fails the release),
 `tools/third-party-notices.sh` and `tools/release-package.sh`. The notices
-step fails when a bundled crate ships no license file; nothing is packaged
-then. `publish` runs only when both architectures built, and it is the one
-job with a write token.
+hold the Rust standard library's notices from the toolchain, then every
+license, copyright, copying and notice file of every bundled crate,
+nested ones included; the step fails when the toolchain lacks its notices
+or a bundled crate ships no license file at its top level, and nothing is
+packaged then. `publish` runs only for a tag push and only when both
+architectures built, and it is the one job with a write token. It requires
+that the tag still points at the commit the run built, before and after
+creating the release.
 
 The archive is reproducible from the same inputs: entries sorted, owner 0,
 every mtime the commit time, gzip without a time stamp. `sh
@@ -74,12 +79,18 @@ A pull request that changes the release files, and
 `Actions > Release > Run workflow` (or `gh workflow run release.yml`), build
 and test exactly like a tag push and upload the archives as the artifacts
 `dist-x86_64` and `dist-aarch64` (named `boneli-dev-<sha>-linux-<arch>`),
-but skip the tag guard and never publish. A dispatch on `main` also
-rehearses the publish path: it creates a draft release with the archives,
-checks its asset list and checksums, and deletes it again, also when a step
-before failed. GitHub creates a draft's tag only on publishing, so no tag
-appears. Use it after changing the workflow or the toolchain, before
-cutting a tag.
+but never publish, also when dispatched on a tag ref (the tag guard runs
+then). A dispatch on `main` also rehearses the publish path: it creates a
+draft release with the archives, checks its asset list and checksums, and
+deletes it again, also when a step before failed. GitHub creates a draft's
+tag only on publishing, so no tag appears. Use it after changing the
+workflow or the toolchain, before cutting a tag.
+
+## A failed release run
+
+When a leg of a tag push run fails for a reason outside the tree (a runner
+or registry hiccup), re-run it with `gh run rerun <run-id> --failed`: the
+re-run keeps the tag push event and publishes. A new dispatch does not.
 
 ## A bad release
 

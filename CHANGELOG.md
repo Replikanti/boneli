@@ -538,8 +538,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (glibc 2.35, built on Ubuntu 22.04) with a SHA-256 sidecar and the
   changelog section as release notes. Each archive holds the binaries of
   `tools/release-packages` (today `boneli-egress`), `LICENSE` and
-  `THIRD-PARTY-NOTICES.txt`, every license, copying and notice file of
-  every bundled crate verbatim; it fails closed on a crate without one.
+  `THIRD-PARTY-NOTICES.txt`: the Rust standard library's notices from
+  the toolchain, then every license, copyright, copying and notice file of
+  every bundled crate, nested ones included, verbatim; it fails closed on
+  a crate without one at its top level. Only a tag push publishes, and
+  only while the tag points at the commit the run built.
   The tag and package guards, notes, notices and archive are POSIX sh
   scripts under `tools/`, tested by `tools/test-release.sh` in `check`.
   Pull requests that touch the release files and dispatches build without

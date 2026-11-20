@@ -65,8 +65,12 @@ jobs:
           # The ancestry guard needs main's history.
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      # The one third-party action in the release path, pinned to a commit
+      # of its `stable` branch (2026-11-15), so a push to that branch cannot
+      # change what this job builds (ADR-019, D6). Bump the pin by hand.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Tools
         run: |
@@ -101,8 +105,8 @@ jobs:
           sed -n '/^Target: /,/^Third-party crates: /p' "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
       - name: Package
         env:
-          # The tag on releases, dev-<sha> on dry runs.
-          NAME: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+          # The tag on releases (tag pushes), dev-<sha> on dry runs.
+          NAME: ${{ github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
         run: |
           bins=$(tools/release-check.sh --bins)
           set --
@@ -121,12 +125,14 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Tags only. The one job with a write token; it runs GitHub's own
-  # actions and gh, nothing third-party (ADR-019, D6). A few API calls and
-  # uploads of a few MiB: 10 minutes is a hang bound, not a measurement.
+  # Tag pushes only: a dispatch never publishes, also on a tag ref (a
+  # failed release run is re-run with `gh run rerun`, docs/release.md).
+  # The one job with a write token; it runs GitHub's own actions and gh,
+  # nothing third-party (ADR-019, D6). A few API calls and uploads of a
+  # few MiB: 10 minutes is a hang bound, not a measurement.
   publish:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -145,6 +151,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
+          # The tag must still point at the commit this run built, fetched
+          # fresh: a tag moved during the build publishes nothing (ADR-019,
+          # D6).
+          tag_commit() {
+            git fetch -q --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+            git rev-parse --verify "refs/tags/$TAG^{commit}"
+          }
+          tagged=$(tag_commit)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "FAIL: tag $TAG points at $tagged, this run built $GITHUB_SHA"
+            exit 1
+          fi
           (cd dist && LC_ALL=C ls) > "$RUNNER_TEMP/have"
           for arch in aarch64 x86_64; do
             printf 'boneli-%s-linux-%s.tar.gz\nboneli-%s-linux-%s.tar.gz.sha256\n' "$TAG" "$arch" "$TAG" "$arch"
@@ -157,8 +175,16 @@ jobs:
             *-*) prerelease=--prerelease ;;
           esac
           # --verify-tag: never let gh create the tag.
-          gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+          gh release create "$TAG" dist/* --verify-tag --target "$GITHUB_SHA" --title "$TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" $prerelease
+          # Moved between the check and the release: take the release down.
+          tagged=$(tag_commit)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            gh release delete "$TAG" --yes
+            echo "FAIL: tag $TAG moved to $tagged while publishing; release deleted"
+            exit 1
+          fi
+          echo "OK: released $TAG at $GITHUB_SHA"
 
   # A dispatch on main exercises the publish path with the real token and
   # the real assets, without a tag: a draft release (GitHub creates a
