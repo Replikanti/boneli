@@ -1077,13 +1077,13 @@
    "title": "boneli-https: OCSP revocation check for leaves without a CRL distribution point",
    "epic": null,
    "order": 46,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
+   "state": "claimed",
+   "owner": "0d47f612",
+   "user": "ylohnitram",
+   "machine": "df82df",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T11:44:34+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T13:20:03+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T00:55:27+00:00",
-   "issue": 68,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-19T00:59:07+00:00",
    "issue": 19,
@@ -1496,6 +1488,14 @@
    "to": "done",
    "by": "abd3f92f",
    "note": null
+  },
+  {
+   "at": "2026-11-20T13:20:03+00:00",
+   "issue": 79,
+   "from": "ready",
+   "to": "claimed",
+   "by": "0d47f612",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1533,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:19:57+00:00",
+ "updated_at": "2026-11-20T13:20:03+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
