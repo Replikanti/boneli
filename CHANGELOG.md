@@ -475,6 +475,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cost nothing and never carry a body, token, JWT or key bytes.
 - `boneli-acceptance`: a test-only composition root for live tests, with
   the gated GitHub test (`docs/forge-github.md`, the operator guide).
+- `boneli_sys::exit_main_thread` (ADR-015 D10): ends the calling thread
+  with `SYS_exit` when it is the main thread, so the process runs on with
+  a zombie leader; on any other thread it returns `Error::NotMainThread`
+  and changes nothing. `tests/exit_main_thread.rs` (`harness = false`)
+  runs it in a real process.
 
 ### Changed
 
@@ -490,6 +495,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that a committed `rustc-wrapper` does not reach the checker's build.
   For the parity stage CI also runs the former Python checker on the
   workspace and on every fixture run.
+- The `boneli-oci` test that ran a Python helper to observe a process
+  whose main thread has exited is replaced by `tests/exited_main_thread.rs`,
+  a `harness = false` test on `boneli_sys::exit_main_thread` that asserts
+  the kernel facts the store's liveness rule reads (ADR-009 D8, ADR-015
+  D10).
 - The `Dial` seam (`Dial`, `Stream`, `TlsDial`, and `Timed`, now public)
   moves from `boneli-oci` to `boneli-https`, unchanged, so the GitHub
   forge shares the deadline-under-TLS socket (ADR-014, D4). `boneli-oci`

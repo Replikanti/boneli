@@ -300,7 +300,79 @@ the Python checker, and 219.5 s in the parity mode, which runs both.
 
 ### D10. No Python in tooling or tests
 
-Added by the next commit of the same pull request.
+**The boneli-oci test.** `exited_main_thread_reads_unreadable` (round 3 of
+the review of #60) checked the store's liveness rule (ADR-009, D8) on a
+process whose main thread has exited while another thread runs: the
+leader's `ns/time` link then fails with `ENOENT`, and the store must
+record `UNREADABLE_TIME_NAMESPACE` for it, never 0. A `python3` helper
+produced that process with `ctypes` and a raw `SYS_exit`. Measured while
+planning, on this toolchain: libtest runs every test on a spawned thread,
+also with `--test-threads=1` (the main thread waits on a channel), so a
+re-executed test binary cannot end its own main thread; a process whose
+main thread has exited needs a binary with its own `main`. On Linux 7.2,
+once the leader has exited while a thread runs, its state is `Z`,
+`/proc/<pid>/ns` is still a directory with a `time` entry whose link
+fails with `ENOENT`, and the running thread's
+`/proc/<pid>/task/<tid>/ns/time` reads the same link as the parent's
+`/proc/thread-self/ns/time`.
+
+**`boneli_sys::exit_main_thread() -> Result<Infallible>`.** It compares
+`SYS_gettid` with the process id. On any other thread it returns
+`Error::NotMainThread` and changes nothing. On the main thread it calls
+`SYS_exit(0)`, not `exit_group`, which ends that thread only; the process
+runs until its last thread ends. If the syscall ever returned, it aborts;
+it never returns `Ok`. Each syscall has its own `unsafe` block with a
+`// SAFETY:` comment (rule `sys-lints`).
+
+Why a safe function is sound: only the main thread can end itself this
+way, and that is checked before any effect. Its stack is the process's
+initial stack, which stays mapped while any thread runs, so a reference
+another thread holds into it stays valid, and no thread can join the main
+thread. Its destructors and thread-local destructors do not run, which is
+a leak, and safe Rust allows leaks (`mem::forget`). A lock it holds stays
+held, which is a deadlock, not undefined behaviour. Output std still
+buffers is lost; the doc comment says to flush first.
+
+Why this is the smallest surface: std ends a thread only when it returns,
+and returning from `main` ends the process, while boneli-oci forbids
+`unsafe`. Rejected: ending the main thread from another thread with a
+signal whose handler calls `SYS_exit` (a process-wide handler installed by
+a safe function, interrupting the main thread wherever it is, possibly
+inside `malloc`); `CommandExt::pre_exec` or a fork-based helper (`unsafe`
+in boneli-oci, or a fork of a multithreaded process); re-executing a
+libtest binary as the helper (every test runs on a spawned thread).
+
+**Two `harness = false` tests**, each the parent and, with a marker
+variable, its own helper: the helper's second thread polls
+`/proc/self/stat` until the leader is `Z` (at most 1,000 polls of 10 ms,
+a hang bound of 10 s, not a target), prints its thread id from
+`/proc/thread-self` and sleeps 60 s, while its main thread calls
+`exit_main_thread`. The parent reads the id, checks the helper, then kills
+and reaps it; a helper that ends early, prints no id or never sees a
+zombie leader fails the test without a hang (a helper with the call
+delayed past the bound failed in 10.9 s, checked by hand). Both tests
+ignore the arguments cargo passes and need no host preparation, so they
+run in `check` and in the `sandbox` job's `boneli-sys` run.
+
+- `crates/boneli-sys/tests/exit_main_thread.rs`: the leader is `Z`, the
+  running thread is neither `Z` nor `X`, and the helper still runs until
+  it is killed. `exit_main_thread_refuses_other_threads` covers the
+  other path.
+- `crates/boneli-oci/tests/exited_main_thread.rs` asserts the kernel facts
+  the liveness rule reads. With time namespaces (the parent's
+  `/proc/thread-self/ns/time` reads): the exited leader's `ns/time` fails
+  with `ENOENT` while `/proc/<pid>/ns` is still a directory with a `time`
+  entry, so `kernel_lacks_time_namespaces` cannot take it for a kernel
+  without time namespaces and `time_namespace_of` gives
+  `UNREADABLE_TIME_NAMESPACE`; the running thread's link reads the
+  parent's namespace. Without time namespaces, neither directory has a
+  `time` entry. How these facts map to the stored value stays pinned by
+  the unit tests of `time_namespace_of` and `kernel_lacks_time_namespaces`
+  on synthetic directories. Decided at STOP 1 of #35: the binary asserts
+  the facts, and boneli-oci's API does not grow a `#[doc(hidden)]` wrapper
+  of `own_time_namespace` for a test.
+
+ADR-007 (proposed, owned by #6) is not edited.
 
 ## Consequences
 

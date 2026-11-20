@@ -329,7 +329,8 @@ const NO_TIME_NAMESPACE: u64 = 0;
 /// (round-3 review of #60). A running thread's own links always read, and
 /// a thread group shares its PID and time namespaces: `setns` into a time
 /// namespace needs a single-threaded caller, and a PID namespace is never
-/// a thread's own.
+/// a thread's own. `tests/exited_main_thread.rs` checks these kernel facts
+/// on a real process whose main thread has exited (#35).
 const OWN_NAMESPACES: &str = "/proc/thread-self/ns";
 
 /// The time namespace an owner records when it cannot read its own. No
@@ -675,7 +676,8 @@ fn time_namespace_of(link: io::Result<PathBuf>, lacks: bool) -> u64 {
 /// kernel without time namespaces: it is a directory and has no `time`
 /// entry. `/proc/<pid>/ns/` lists exactly the namespace types the kernel
 /// was built with, whether or not their links read, so a link that does
-/// not read still has its entry. A missing or unreadable directory is no
+/// not read still has its entry (`tests/exited_main_thread.rs` checks that
+/// on an exited main thread, #35). A missing or unreadable directory is no
 /// proof.
 fn kernel_lacks_time_namespaces(ns: &Path) -> bool {
     fs::symlink_metadata(ns).is_ok_and(|m| m.is_dir())
@@ -760,8 +762,8 @@ mod tests {
     use super::{
         Judge, Liveness, NO_TIME_NAMESPACE, OWN_NAMESPACES, OWNED_PREFIXES, Owner,
         TEMPORARY_NAME_LEN, UNREADABLE_TIME_NAMESPACE, UUID_VERSION, boot_id_or_random,
-        kernel_lacks_time_namespaces, own_boot_id, own_start_time, own_time_namespace,
-        parse_boot_id, parse_sidecar, proc_is_own, random_u128, temporary_name, time_namespace_of,
+        kernel_lacks_time_namespaces, own_boot_id, own_start_time, parse_boot_id, parse_sidecar,
+        proc_is_own, random_u128, temporary_name, time_namespace_of,
     };
 
     /// Every temporary name has one length, longer than a committed
@@ -1036,47 +1038,6 @@ mod tests {
             kernel_lacks_time_namespaces(Path::new(OWN_NAMESPACES)),
             std::fs::symlink_metadata("/proc/thread-self/ns/time").is_err()
         );
-    }
-
-    /// On this kernel, through a process whose main thread has exited
-    /// while another thread runs (a python3 helper; std cannot end the main
-    /// thread alone): the leader's `ns/time` does not read, which must give
-    /// the unreadable marker, never 0, and the running thread's still reads
-    /// the namespace this process is in (round-3 review of #60).
-    #[test]
-    fn exited_main_thread_reads_unreadable() {
-        use std::io::BufRead;
-        const HELPER: &str = "import ctypes, os, threading, time\n\
-            nr = {'x86_64': 60, 'aarch64': 93}[os.uname().machine]\n\
-            def run():\n\
-            \x20   while open('/proc/self/stat').read().rsplit(')', 1)[1].split()[0] != 'Z':\n\
-            \x20       time.sleep(0.01)\n\
-            \x20   print(threading.get_native_id(), flush=True)\n\
-            \x20   time.sleep(60)\n\
-            threading.Thread(target=run).start()\n\
-            ctypes.CDLL(None).syscall(nr, 0)\n";
-        let mut child = std::process::Command::new("python3")
-            .args(["-I", "-c", HELPER])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("python3, which the architecture check needs too");
-        let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("the helper's thread id");
-        let pid = child.id();
-        let tid: u32 = line.trim().parse().expect("thread id");
-        let leader = own_time_namespace(Path::new(&format!("/proc/{pid}/ns")));
-        let thread = own_time_namespace(Path::new(&format!("/proc/{pid}/task/{tid}/ns")));
-        let _ = child.kill();
-        let _ = child.wait();
-        let me = Owner::current().expect("owner");
-        assert_eq!(thread, me.timens);
-        if me.timens == NO_TIME_NAMESPACE {
-            assert_eq!(leader, NO_TIME_NAMESPACE);
-        } else {
-            assert_eq!(leader, UNREADABLE_TIME_NAMESPACE);
-        }
     }
 
     /// The owner reads the namespace links of the calling thread, not of
