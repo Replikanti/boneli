@@ -1,0 +1,1478 @@
+{
+ "repo": "boneli",
+ "gh": "Replikanti/boneli",
+ "wip_limit": 2,
+ "mirror_issue": 26,
+ "created_at": "2026-11-12T07:00:27+00:00",
+ "tasks": [
+  {
+   "issue": 22,
+   "title": "Release workflow and versioning",
+   "epic": null,
+   "order": 33,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:19:42+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [
+    1
+   ],
+   "xdeps": [],
+   "areas": [
+    "ci"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 21,
+   "title": "Customer standards: Standards port, checkable gate and cited review",
+   "epic": null,
+   "order": 32,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    17
+   ],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 20,
+   "title": "boneli-gw: LLM gateway with budget, transcripts and secret redaction",
+   "epic": null,
+   "order": 31,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P3",
+   "size": "large",
+   "deps": [
+    5,
+    12,
+    29
+   ],
+   "xdeps": [],
+   "areas": [
+    "gateway"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 19,
+   "title": "boneli-forge-github: branches and pull requests through a GitHub App",
+   "epic": 25,
+   "order": 26,
+   "state": "done",
+   "owner": null,
+   "pr": 73,
+   "note": "3 PRs merged: #71 cb3d3f0, #72 25b0800, #73 0e29ca7; ADR-014 accepted after live test 2026-11-19; live-test App boneli-forge-test + private repo Replikanti/boneli-forge-test, env in ~/.config/boneli/forge-test.env",
+   "updated_at": "2026-11-19T18:31:00+00:00",
+   "priority": "P2",
+   "size": "large",
+   "deps": [
+    3,
+    5,
+    29,
+    30
+   ],
+   "xdeps": [],
+   "areas": [
+    "forge"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 18,
+   "title": "Patch policy: diff size, forbidden paths, binaries, symlinks, disabled tests",
+   "epic": 25,
+   "order": 25,
+   "state": "done",
+   "owner": null,
+   "pr": 70,
+   "note": "",
+   "updated_at": "2026-11-19T00:55:25+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    2
+   ],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 17,
+   "title": "Gates: reproduction, citation verification and fix verification in a clean sandbox",
+   "epic": 25,
+   "order": 24,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P2",
+   "size": "large",
+   "deps": [
+    2,
+    3,
+    8,
+    13,
+    30
+   ],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 16,
+   "title": "Case format and case builder: rebuild from the base SHA, sanitized issue, hidden oracle",
+   "epic": 25,
+   "order": 23,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P2",
+   "size": "large",
+   "deps": [
+    3,
+    13,
+    30
+   ],
+   "xdeps": [],
+   "areas": [
+    "bench"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 15,
+   "title": "Onboarding benchmark: 20 open-source TypeScript repositories",
+   "epic": 24,
+   "order": 21,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    14
+   ],
+   "xdeps": [],
+   "areas": [
+    "bench"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 14,
+   "title": "Env builder agent: propose the replica configuration and reach a green baseline",
+   "epic": 24,
+   "order": 20,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P2",
+   "size": "large",
+   "deps": [
+    12,
+    13
+   ],
+   "xdeps": [],
+   "areas": [
+    "env-builder"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 13,
+   "title": "Replica configuration and hand-written environments for three TypeScript repositories",
+   "epic": 24,
+   "order": 16,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    7,
+    8,
+    9,
+    10,
+    30,
+    31
+   ],
+   "xdeps": [],
+   "areas": [
+    "env-builder"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 12,
+   "title": "boneli-agent-claude-code: headless Claude Code in the sandbox through the egress proxy",
+   "epic": 23,
+   "order": 13,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    3,
+    7,
+    8,
+    9,
+    10,
+    29,
+    30
+   ],
+   "xdeps": [],
+   "areas": [
+    "agent"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 11,
+   "title": "Playbook format: id, content-hash version, stage, loaded by the CLI from a local directory",
+   "epic": 25,
+   "order": 18,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P1",
+   "size": "small",
+   "deps": [
+    2,
+    32,
+    34
+   ],
+   "xdeps": [],
+   "areas": [
+    "agent"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 10,
+   "title": "boneli-egress: CONNECT proxy with a per-run allowlist and connection log",
+   "epic": 23,
+   "order": 9,
+   "state": "done",
+   "owner": null,
+   "pr": 50,
+   "note": "merged PR #50 (bd6c5c6), part 2 of 2; #10 closed",
+   "updated_at": "2026-11-15T01:23:26+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    3,
+    5
+   ],
+   "xdeps": [],
+   "areas": [
+    "egress"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 9,
+   "title": "boneli-shim: PID 1, reaper, Landlock and Unix socket forwarders",
+   "epic": 23,
+   "order": 8,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    6,
+    8
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 8,
+   "title": "boneli-sandbox-linux: the Sandbox port on our own runtime, pods with a shared network namespace",
+   "epic": 23,
+   "order": 7,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:00:29+00:00",
+   "priority": "P1",
+   "size": "large",
+   "deps": [
+    3,
+    6
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 7,
+   "title": "boneli-oci: pull and unpack OCI images into a layered rootfs",
+   "epic": 23,
+   "order": 11,
+   "state": "done",
+   "owner": null,
+   "pr": 60,
+   "note": "merged #58, #59, #60 (58e8013); post-merge oci-acceptance on main green (run 43990867106)",
+   "updated_at": "2026-11-17T00:52:40+00:00",
+   "priority": "P1",
+   "size": "large",
+   "deps": [
+    3,
+    5,
+    29
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 6,
+   "title": "boneli-sys: namespaces, mounts, pivot_root, cgroups v2, seccomp-bpf and Landlock",
+   "epic": 23,
+   "order": 6,
+   "state": "stopped",
+   "owner": "660caa91",
+   "pr": 48,
+   "note": "stopped by operator 2026-11-14: safety classifier stopped 3 agents on PR 4 (planner, implementer, run A); WIP local commits 394969b + ea7b888 on feat/boneli-sys-part4 (not pushed, worktree boneli-sys-part4): libs, census data, change 11 tests, probe _exit flake fix (root cause: std exit unmaps alt stack under glibc setxid handler); missing: compile, all PR 4 tests, ADR/docs/CI, PR; plan + amendment issuecomment-6882405979",
+   "updated_at": "2026-11-14T22:13:14+00:00",
+   "priority": "P1",
+   "size": "large",
+   "deps": [
+    28
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": "ylohnitram",
+   "machine": "df82df"
+  },
+  {
+   "issue": 5,
+   "title": "boneli-http and boneli-https: HTTP/1.1 over Unix sockets and TLS",
+   "epic": 23,
+   "order": 5,
+   "state": "done",
+   "owner": null,
+   "pr": 42,
+   "note": "PR A #40 merged (b2bdf54); PR B boneli-https next",
+   "updated_at": "2026-11-13T16:22:19+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    28
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 4,
+   "title": "boneli-store-fs: append-only event log and content-addressed evidence store",
+   "epic": 25,
+   "order": 22,
+   "state": "done",
+   "owner": null,
+   "pr": 67,
+   "note": "",
+   "updated_at": "2026-11-18T08:20:45+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    3
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 3,
+   "title": "Ports as synchronous traits in boneli-app, with in-memory adapters and contract tests",
+   "epic": 23,
+   "order": 4,
+   "state": "done",
+   "owner": null,
+   "pr": 43,
+   "note": "Part 2 (Sandbox, Git, ImageStore, DataSnapshot; closes #3) implementing after /clear resume",
+   "updated_at": "2026-11-13T15:19:00+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    2
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 2,
+   "title": "Run state machine, events and commands in boneli-domain",
+   "epic": 23,
+   "order": 3,
+   "state": "done",
+   "owner": null,
+   "pr": 39,
+   "note": "",
+   "updated_at": "2026-11-13T01:25:26+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    28
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 1,
+   "title": "Repository setup: CI, Cargo workspace and architecture rules",
+   "epic": null,
+   "order": 1,
+   "state": "done",
+   "owner": null,
+   "pr": 27,
+   "note": "closed on GitHub",
+   "updated_at": "2026-11-12T07:19:42+00:00",
+   "priority": "P1",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "ci"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 28,
+   "title": "Harden the architecture and dependency checks before the first external crate",
+   "epic": null,
+   "order": 2,
+   "state": "done",
+   "owner": null,
+   "pr": 36,
+   "note": "STOP 2: QA ✅, review round 4 no bypass (pins added), CI green on 8031e8e; waiting for ship approval",
+   "updated_at": "2026-11-12T17:29:12+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    1
+   ],
+   "xdeps": [],
+   "areas": [
+    "ci"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 33,
+   "title": "boneli-runner: long-running runner that takes jobs over an outbound connection",
+   "epic": null,
+   "order": 34,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:37:39+00:00",
+   "priority": "P3",
+   "size": "large",
+   "deps": [
+    4,
+    11,
+    32
+   ],
+   "xdeps": [],
+   "areas": [
+    "runner"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 32,
+   "title": "boneli-cli: composition root for local runs and the M0 demo",
+   "epic": 23,
+   "order": 14,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:37:39+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    7,
+    12,
+    30
+   ],
+   "xdeps": [],
+   "areas": [
+    "runner"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 31,
+   "title": "boneli-data-postgres: the DataSnapshot port for Postgres in the pod",
+   "epic": 24,
+   "order": 15,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-12T07:37:39+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    3,
+    7,
+    8
+   ],
+   "xdeps": [],
+   "areas": [
+    "env-builder"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 30,
+   "title": "boneli-git-cli: the Git port over the git binary",
+   "epic": 23,
+   "order": 12,
+   "state": "done",
+   "owner": null,
+   "pr": 63,
+   "note": "PR 1 (#61) + PR 2 (#62) merged; PR 3 (adapter + git runs, closes #30) next",
+   "updated_at": "2026-11-17T13:53:05+00:00",
+   "priority": "P1",
+   "size": "large",
+   "deps": [
+    3
+   ],
+   "xdeps": [],
+   "areas": [
+    "forge"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 29,
+   "title": "boneli-json: JSON parser and serializer without derive",
+   "epic": 23,
+   "order": 10,
+   "state": "done",
+   "owner": null,
+   "pr": 51,
+   "note": "",
+   "updated_at": "2026-11-15T11:29:41+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    28
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 35,
+   "title": "Port the architecture checker to Rust",
+   "epic": null,
+   "order": 27,
+   "state": "done",
+   "owner": null,
+   "pr": 74,
+   "note": "",
+   "updated_at": "2026-11-20T03:36:09+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    28,
+    29,
+    34
+   ],
+   "xdeps": [],
+   "areas": [
+    "ci"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 34,
+   "title": "boneli-toml: parser for the TOML subset used by configuration",
+   "epic": null,
+   "order": 17,
+   "state": "done",
+   "owner": null,
+   "pr": 65,
+   "note": "",
+   "updated_at": "2026-11-17T17:41:34+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [
+    28
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 38,
+   "title": "boneli-https: certificate revocation via CRLs",
+   "epic": null,
+   "order": 29,
+   "state": "implementing",
+   "owner": "14f36a32",
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-20T09:58:45+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    5
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": "ylohnitram",
+   "machine": "df82df"
+  },
+  {
+   "issue": 37,
+   "title": "boneli-https: hybrid post-quantum key exchange X25519MLKEM768 on the ring provider",
+   "epic": null,
+   "order": 28,
+   "state": "done",
+   "owner": null,
+   "pr": 75,
+   "note": "",
+   "updated_at": "2026-11-20T04:28:06+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    5
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 45,
+   "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
+   "epic": null,
+   "order": 30,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-13T21:57:07+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    6
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 49,
+   "title": "Pluggable Sandbox adapters: runner selection, isolation conformance suite, adapter guide and Kubernetes design note",
+   "epic": null,
+   "order": 35,
+   "state": "blocked",
+   "owner": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-14T12:18:28+00:00",
+   "priority": "P3",
+   "size": "large",
+   "deps": [
+    8,
+    9
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 52,
+   "title": "boneli-sys: io.max write limit did not throttle on an AWS-kernel CI runner",
+   "epic": null,
+   "order": 19,
+   "state": "done",
+   "owner": null,
+   "pr": 53,
+   "note": "merged PR #53 (f29464b); buffered OOM follow-up in #54",
+   "updated_at": "2026-11-16T00:14:59+00:00",
+   "priority": "P1",
+   "size": "medium",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 54,
+   "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
+   "epic": null,
+   "order": 36,
+   "state": "pr-review",
+   "owner": "98fa59e8",
+   "pr": 76,
+   "note": "",
+   "updated_at": "2026-11-20T10:12:34+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": "ylohnitram",
+   "machine": "df82df"
+  },
+  {
+   "issue": 57,
+   "title": "boneli-oci: verify image signatures and provenance",
+   "epic": null,
+   "order": 37,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-17T00:52:42+00:00",
+   "priority": "P3",
+   "size": "large",
+   "deps": [
+    7
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 56,
+   "title": "boneli-oci: evict unused layers from the image cache",
+   "epic": null,
+   "order": 38,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-17T00:52:42+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    7
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 55,
+   "title": "boneli-oci: private-registry credentials and an HTTP proxy for customer networks",
+   "epic": null,
+   "order": 39,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-17T00:52:42+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    7
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 64,
+   "title": "boneli-app: decide how workspaces carry backslash, blank and non-UTF-8 paths",
+   "epic": null,
+   "order": 40,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-17T13:54:30+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 66,
+   "title": "Extract the store-root rules of ADR-009 D8 into a shared support crate",
+   "epic": null,
+   "order": 41,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-18T08:20:49+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [
+    4
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 69,
+   "title": "Patch policy: disabled-test detection for Python and in-source .vue/.svelte tests",
+   "epic": null,
+   "order": 42,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-19T00:55:27+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    18
+   ],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  },
+  {
+   "issue": 68,
+   "title": "Wire the patch policy into the run: Git port diff as Patch, gate between FixWritten and VerifyFix",
+   "epic": null,
+   "order": 43,
+   "state": "ready",
+   "owner": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-19T00:55:27+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    18
+   ],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false,
+   "user": null,
+   "machine": null
+  }
+ ],
+ "log": [
+  {
+   "at": "2026-11-17T14:28:04+00:00",
+   "issue": 34,
+   "from": "ready",
+   "to": "claimed",
+   "by": "996bfe51",
+   "note": ""
+  },
+  {
+   "at": "2026-11-17T14:48:26+00:00",
+   "issue": 34,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "996bfe51",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T16:15:12+00:00",
+   "issue": 34,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "996bfe51",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T17:23:41+00:00",
+   "issue": 34,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "996bfe51",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T17:41:34+00:00",
+   "issue": 34,
+   "from": "pr-review",
+   "to": "done",
+   "by": "996bfe51",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T17:41:36+00:00",
+   "issue": 35,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T19:19:11+00:00",
+   "issue": 4,
+   "from": "ready",
+   "to": "claimed",
+   "by": "867f864c",
+   "note": ""
+  },
+  {
+   "at": "2026-11-17T19:35:57+00:00",
+   "issue": 4,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "867f864c",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T22:22:34+00:00",
+   "issue": 4,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "867f864c",
+   "note": null
+  },
+  {
+   "at": "2026-11-17T23:04:22+00:00",
+   "issue": 4,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "867f864c",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T08:20:45+00:00",
+   "issue": 4,
+   "from": "pr-review",
+   "to": "done",
+   "by": "867f864c",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T08:20:49+00:00",
+   "issue": 66,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-18T19:37:06+00:00",
+   "issue": 18,
+   "from": "ready",
+   "to": "claimed",
+   "by": "774fe1a9",
+   "note": ""
+  },
+  {
+   "at": "2026-11-18T20:08:05+00:00",
+   "issue": 18,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "774fe1a9",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T21:07:50+00:00",
+   "issue": 69,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-18T21:07:50+00:00",
+   "issue": 68,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-18T21:07:50+00:00",
+   "issue": 69,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T21:07:50+00:00",
+   "issue": 68,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T21:07:54+00:00",
+   "issue": 18,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "774fe1a9",
+   "note": null
+  },
+  {
+   "at": "2026-11-18T21:39:48+00:00",
+   "issue": 18,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "774fe1a9",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T00:55:25+00:00",
+   "issue": 18,
+   "from": "pr-review",
+   "to": "done",
+   "by": "774fe1a9",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T00:55:27+00:00",
+   "issue": 69,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T00:55:27+00:00",
+   "issue": 68,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T00:59:07+00:00",
+   "issue": 19,
+   "from": "ready",
+   "to": "claimed",
+   "by": "cbec3aa3",
+   "note": ""
+  },
+  {
+   "at": "2026-11-19T01:23:33+00:00",
+   "issue": 19,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "cbec3aa3",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T08:24:54+00:00",
+   "issue": 19,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "cbec3aa3",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T08:49:22+00:00",
+   "issue": 19,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "cbec3aa3",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T09:11:50+00:00",
+   "issue": 19,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "cbec3aa3",
+   "note": "PR 1 #71 merged cb3d3f0; PR 2 (boneli-https RS256 + fill_random + Dial move) next"
+  },
+  {
+   "at": "2026-11-19T09:29:54+00:00",
+   "issue": 19,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "cbec3aa3",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T09:47:09+00:00",
+   "issue": 19,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "cbec3aa3",
+   "note": "PR 1 #71 cb3d3f0, PR 2 #72 25b0800 merged; PR 3 (boneli-forge-github + live test) next"
+  },
+  {
+   "at": "2026-11-19T16:30:37+00:00",
+   "issue": 19,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "cbec3aa3",
+   "note": null
+  },
+  {
+   "at": "2026-11-19T17:13:36+00:00",
+   "issue": 19,
+   "from": "pr-review",
+   "to": "pr-review",
+   "by": "cbec3aa3",
+   "note": "PR 3 #73 head 12b7200: QA + 3 review rounds closed; waiting on operator GitHub App for the live test (test repo Replikanti/boneli-forge-test ready: issue #1 target, #2 decoy, base 6f200dc)"
+  },
+  {
+   "at": "2026-11-19T18:31:00+00:00",
+   "issue": 19,
+   "from": "pr-review",
+   "to": "done",
+   "by": "cbec3aa3",
+   "note": "3 PRs merged: #71 cb3d3f0, #72 25b0800, #73 0e29ca7; ADR-014 accepted after live test 2026-11-19; live-test App boneli-forge-test + private repo Replikanti/boneli-forge-test, env in ~/.config/boneli/forge-test.env"
+  },
+  {
+   "at": "2026-11-19T18:38:08+00:00",
+   "issue": 35,
+   "from": "ready",
+   "to": "claimed",
+   "by": "9db267e1",
+   "note": ""
+  },
+  {
+   "at": "2026-11-19T19:03:59+00:00",
+   "issue": 35,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "9db267e1",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T01:11:03+00:00",
+   "issue": 35,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "9db267e1",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T01:53:39+00:00",
+   "issue": 37,
+   "from": "ready",
+   "to": "claimed",
+   "by": "482e8c7c",
+   "note": ""
+  },
+  {
+   "at": "2026-11-20T02:23:44+00:00",
+   "issue": 37,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "482e8c7c",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T02:28:23+00:00",
+   "issue": 35,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "9db267e1",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T03:25:02+00:00",
+   "issue": 37,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "482e8c7c",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T03:36:09+00:00",
+   "issue": 35,
+   "from": "pr-review",
+   "to": "done",
+   "by": "9db267e1",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T03:41:08+00:00",
+   "issue": 54,
+   "from": "ready",
+   "to": "claimed",
+   "by": "98fa59e8",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T03:55:31+00:00",
+   "issue": 37,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "482e8c7c",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T04:14:50+00:00",
+   "issue": 54,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "98fa59e8",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T04:28:06+00:00",
+   "issue": 37,
+   "from": "pr-review",
+   "to": "done",
+   "by": "482e8c7c",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T04:28:10+00:00",
+   "issue": 38,
+   "from": "ready",
+   "to": "claimed",
+   "by": "14f36a32",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T05:00:50+00:00",
+   "issue": 38,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "14f36a32",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T09:53:29+00:00",
+   "issue": 54,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "98fa59e8",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T09:58:45+00:00",
+   "issue": 38,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "14f36a32",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T10:12:34+00:00",
+   "issue": 54,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "98fa59e8",
+   "note": null
+  }
+ ],
+ "open": [
+  6,
+  8,
+  9,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  31,
+  32,
+  33,
+  38,
+  45,
+  49,
+  54,
+  55,
+  56,
+  57,
+  64,
+  66,
+  68,
+  69
+ ],
+ "xopen": [],
+ "updated_at": "2026-11-20T10:19:35+00:00",
+ "wip_auto": true,
+ "pushers": {
+  "at": "2026-11-20T10:11:33+00:00",
+  "logins": [
+   "ylohnitram"
+  ]
+ },
+ "shared": true,
+ "visibility": {
+  "at": 1795169975,
+  "private": false
+ }
+}
