@@ -1038,7 +1038,7 @@
    "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver",
    "updated_at": "2026-11-20T22:00:38+00:00",
    "priority": "P3",
-   "size": "medium",
+   "size": "large",
    "deps": [
     7
    ],
@@ -1108,11 +1108,11 @@
    "title": "Patch policy: disabled-test detection for Python and in-source .vue/.svelte tests",
    "epic": null,
    "order": 42,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "62531680",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-19T00:55:27+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T22:04:16+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1123,10 +1123,10 @@
     "debugger"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null
   },
   {
@@ -1258,49 +1258,59 @@
    "session": null,
    "dispatched": null,
    "parked": null
+  },
+  {
+   "issue": 94,
+   "title": "boneli-store-fs: reopen can fail with InUse while another thread spawns a process",
+   "epic": null,
+   "order": 48,
+   "state": "claimed",
+   "owner": "3ebab419",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
+   "parked": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-20T22:04:16+00:00",
+   "priority": "P2",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
+  },
+  {
+   "issue": 93,
+   "title": "boneli-https: std lookup scan misses turbofish, qualified-path and alias forms",
+   "epic": null,
+   "order": 49,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-20T22:04:16+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [
+    81
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:45:00+00:00",
-   "issue": 79,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "0d47f612",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T13:54:16+00:00",
-   "issue": 22,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #83 open"
-  },
-  {
-   "at": "2026-11-20T14:00:56+00:00",
-   "issue": 79,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "0d47f612",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T14:46:03+00:00",
-   "issue": 79,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "0d47f612",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T15:02:35+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "plan-review",
-   "by": "98fa59e8",
-   "note": "PR 2 (#78 draft, bdf3e59): fix in place (per-sandbox keeper 5 ms), stopped on R-S6: parent-read mutant 0/70 kills; operator decides proof"
-  },
   {
    "at": "2026-11-20T15:06:39+00:00",
    "issue": 22,
@@ -1660,6 +1670,46 @@
    "to": "implementing",
    "by": "ae67d3e8",
    "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver"
+  },
+  {
+   "at": "2026-11-20T22:04:16+00:00",
+   "issue": 94,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T22:04:16+00:00",
+   "issue": 93,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T22:04:16+00:00",
+   "issue": 93,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T22:04:16+00:00",
+   "issue": 94,
+   "from": "ready",
+   "to": "claimed",
+   "by": "3ebab419",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T22:04:16+00:00",
+   "issue": 69,
+   "from": "ready",
+   "to": "claimed",
+   "by": "62531680",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1690,10 +1740,12 @@
   68,
   69,
   80,
-  81
+  81,
+  93,
+  94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:00:38+00:00",
+ "updated_at": "2026-11-20T22:04:16+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
