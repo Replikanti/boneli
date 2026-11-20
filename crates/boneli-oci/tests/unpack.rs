@@ -1378,7 +1378,12 @@ fn image_caps_count_cached_layers() {
     let store = TempDir::new("cache");
     let cache = LayerCache::new(store.path()).expect("cache");
     cache
-        .unpack(&a_id, Compression::None, &a[..], &mut budget())
+        .unpack(
+            &cache.pin(&a_id).expect("pin"),
+            Compression::None,
+            &a[..],
+            &mut budget(),
+        )
         .expect("layer a");
 
     // A warm cache reaches the same verdict as a cold one: the cached layer
@@ -1394,7 +1399,12 @@ fn image_caps_count_cached_layers() {
         assert_eq!((cached.bytes, cached.entries), (a_len, 3));
         let warm_result = warm.charge(&cached).and_then(|()| {
             cache
-                .unpack(&b_id, Compression::None, &b[..], &mut warm)
+                .unpack(
+                    &cache.pin(&b_id).expect("pin"),
+                    Compression::None,
+                    &b[..],
+                    &mut warm,
+                )
                 .map(|_| ())
         });
         assert_eq!(
@@ -1439,7 +1449,12 @@ fn layer_commit_writes_sidecar() {
     assert!(cache.cached(&id).expect("read").is_none());
     let gz = tarball::gzip(&plain);
     let stats = cache
-        .unpack(&id, Compression::Gzip, &gz[..], &mut budget())
+        .unpack(
+            &cache.pin(&id).expect("pin"),
+            Compression::Gzip,
+            &gz[..],
+            &mut budget(),
+        )
         .expect("commit");
     let path = cache.layer_path(&id);
     assert_eq!(path, store.path().join("layers/sha256").join(hex(&id)));
@@ -1456,7 +1471,12 @@ fn layer_commit_writes_sidecar() {
     // A second commit of the same layer (another store won the race) keeps
     // the first and discards its own tree.
     let again = cache
-        .unpack(&id, Compression::None, &plain[..], &mut budget())
+        .unpack(
+            &cache.pin(&id).expect("pin"),
+            Compression::None,
+            &plain[..],
+            &mut budget(),
+        )
         .expect("again");
     assert_eq!(again, stats);
     assert!(tmp_entries(store.path()).is_empty());
@@ -1473,7 +1493,12 @@ fn diff_id_mismatch_removes_tree() {
     let store = TempDir::new("mismatch");
     let cache = LayerCache::new(store.path()).expect("cache");
     let e = cache
-        .unpack(&wrong, Compression::None, &plain[..], &mut budget())
+        .unpack(
+            &cache.pin(&wrong).expect("pin"),
+            Compression::None,
+            &plain[..],
+            &mut budget(),
+        )
         .expect_err("mismatch");
     assert!(matches!(e, Error::DiffId { .. }), "{e}");
     assert!(!exists(&cache.layer_path(&wrong)));
@@ -1486,7 +1511,7 @@ fn diff_id_mismatch_removes_tree() {
     let bad = bad.finish();
     let e = cache
         .unpack(
-            &Sha256::digest(&bad),
+            &cache.pin(&Sha256::digest(&bad)).expect("pin"),
             Compression::None,
             &bad[..],
             &mut budget(),
@@ -1503,7 +1528,12 @@ fn corrupt_sidecar_is_an_error() {
     let store = TempDir::new("sidecar");
     let cache = LayerCache::new(store.path()).expect("cache");
     cache
-        .unpack(&id, Compression::None, &plain[..], &mut budget())
+        .unpack(
+            &cache.pin(&id).expect("pin"),
+            Compression::None,
+            &plain[..],
+            &mut budget(),
+        )
         .expect("commit");
     let sidecar: PathBuf = cache.layer_path(&id).with_extension("stats");
     for text in [

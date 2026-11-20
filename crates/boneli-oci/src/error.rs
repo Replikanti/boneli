@@ -66,6 +66,13 @@ pub enum Error {
     },
     /// A layer's sidecar is malformed (ADR-009, D8).
     Sidecar(PathBuf),
+    /// A lock file kept being replaced while it was locked: every one of
+    /// `LOCK_ATTEMPTS` (1,024) attempts locked a file that an exclusive
+    /// holder had unlinked in the meantime (ADR-025, D3).
+    LockChanged(PathBuf),
+    /// An exclusive holder kept a lock file locked past the deadline of a
+    /// shared locker, `LOCK_WAIT` (120 s) for a pin (ADR-025, D3).
+    LockBusy(PathBuf),
     /// The store's layer directory treats names that differ in case or in
     /// Unicode normalization as one (ADR-009, D8).
     CaseInsensitive(PathBuf),
@@ -111,6 +118,16 @@ impl fmt::Display for Error {
                 write!(f, "layer cache file {} failed: {source}", path.display())
             }
             Error::Sidecar(path) => write!(f, "malformed layer sidecar {}", path.display()),
+            Error::LockChanged(path) => write!(
+                f,
+                "lock file {} kept changing while it was locked",
+                path.display()
+            ),
+            Error::LockBusy(path) => write!(
+                f,
+                "lock file {} stayed locked by a removal past the deadline",
+                path.display()
+            ),
             Error::CaseInsensitive(path) => write!(
                 f,
                 "{} is case-insensitive or normalizes names; a layer store needs exact names",
@@ -216,4 +233,14 @@ impl std::error::Error for PullError {}
 /// A `PullError::Failed` with `detail`.
 pub(crate) fn failed(detail: impl Into<String>) -> PullError {
     PullError::Failed(detail.into())
+}
+
+/// The shared root rules' errors as this crate's: a broken rule is `Root`,
+/// a filesystem failure `Cache`. A private mapping, so `boneli-private-dir`
+/// stays out of this adapter's public API (ADR-021, D5).
+pub(crate) fn root_err(e: boneli_private_dir::Error) -> Error {
+    match e {
+        boneli_private_dir::Error::Rule { path, reason } => Error::Root { path, reason },
+        boneli_private_dir::Error::Io { path, source } => Error::Cache { path, source },
+    }
 }

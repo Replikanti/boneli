@@ -653,6 +653,25 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `keeper_reads_its_own_sandbox` checks through inotify that each keeper
   reads its own sandbox's file and not the parent's.
 
+- `boneli-oci`: locks and leases in the image cache, part 1 of #56
+  (ADR-025, proposed). Every store holds a shared lock on its owner lock
+  file `locks/owners/<token>` while it lives, and `open` judges each owner
+  of a temporary name by an exclusive `try_lock` on it: free means gone,
+  in any PID or time namespace and after a reboot, and its names and then
+  its lock file are removed; without a lock file the `/proc` rule of
+  ADR-009 D8 still decides. A pull pins every layer of its image
+  (`locks/sha256/<hex>`, `LayerCache::pin`, `LayerPin`) before it checks
+  the cache or requests a layer blob. `OciImageStore::pull_leased` and
+  `OciImageStore::lease` return a `Lease` (`rootfs`, `layers`, `config`)
+  that keeps the layers pinned until it is dropped; `lease` does not wait
+  for a pull. `Lease::pin_descriptors` gives one more pin per layer as a
+  descriptor of its own, for the Sandbox adapter (#8) to hand to a holder
+  process in the sandbox's cgroup (never to the workload), so a sandbox's
+  layers stay pinned after its runner is killed. Lock files are checked to be regular files
+  and to be the file the path names after locking (`Error::LockChanged`
+  after 1,024 replacements); a pin waits at most 120 s for a removal
+  (`Error::LockBusy`). Nothing is evicted yet.
+
 ### Changed
 
 - `GitCli::open` (#85, ADR-024) creates its root through
@@ -688,6 +707,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hostname-derived search domain are no longer used, and IPv6
   addresses come first even without an IPv6 route (that connect fails
   at once and the next address is tried).
+- `boneli-oci` (#56, ADR-025): `OciImageStore::layers` is removed; use
+  `OciImageStore::lease` or `OciImageStore::pull_leased`, whose `Lease`
+  keeps the layers pinned. `LayerCache::unpack` takes a `LayerPin` instead
+  of a `diff_id`. `OciImageStore::open` takes the owner lock before it
+  sweeps, and `LayerCache::new` creates `locks/owners/` and
+  `locks/sha256/` next to `layers/sha256/`.
 - The root rules of `boneli-oci` and `boneli-store-fs` live in
   `boneli-private-dir` (#66, ADR-021); the error variants and texts of both
   adapters are unchanged. A missing root is created at the path the

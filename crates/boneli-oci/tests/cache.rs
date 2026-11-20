@@ -50,7 +50,12 @@ fn concurrent_caches_keep_their_sidecars() {
             let mut anomalies = Vec::new();
             for _ in 0..400 {
                 let mut budget = Budget::new(limits());
-                match cache.unpack(&id, Compression::None, &bytes[..], &mut budget) {
+                match cache.unpack(
+                    &cache.pin(&id).expect("pin"),
+                    Compression::None,
+                    &bytes[..],
+                    &mut budget,
+                ) {
                     Ok(s) if s.bytes != bytes.len() as u64 => {
                         anomalies.push(format!("stats {s:?}"))
                     }
@@ -83,7 +88,7 @@ fn refused_layer_leaves_budget_unchanged() {
     let mut budget = Budget::new(limits());
     cache
         .unpack(
-            &Sha256::digest(&good),
+            &cache.pin(&Sha256::digest(&good)).expect("pin"),
             Compression::None,
             &good[..],
             &mut budget,
@@ -94,7 +99,12 @@ fn refused_layer_leaves_budget_unchanged() {
 
     let other = layer_of(2);
     let e = cache
-        .unpack(&[0u8; 32], Compression::None, &other[..], &mut budget)
+        .unpack(
+            &cache.pin(&[0u8; 32]).expect("pin"),
+            Compression::None,
+            &other[..],
+            &mut budget,
+        )
         .expect_err("wrong diff_id");
     assert!(matches!(e, Error::DiffId { .. }), "{e}");
     assert_eq!((budget.bytes(), budget.entries()), before);
@@ -104,7 +114,7 @@ fn refused_layer_leaves_budget_unchanged() {
     let bad = bad.finish();
     let e = cache
         .unpack(
-            &Sha256::digest(&bad),
+            &cache.pin(&Sha256::digest(&bad)).expect("pin"),
             Compression::None,
             &bad[..],
             &mut budget,
@@ -116,7 +126,7 @@ fn refused_layer_leaves_budget_unchanged() {
     // The loser of a commit race is charged like the winner.
     let again = cache
         .unpack(
-            &Sha256::digest(&good),
+            &cache.pin(&Sha256::digest(&good)).expect("pin"),
             Compression::None,
             &good[..],
             &mut budget,
@@ -154,7 +164,12 @@ fn failed_deep_layer_removed_under_low_nofile() {
         let bytes = t.finish();
         let mut budget = Budget::new(limits());
         let e = cache
-            .unpack(&[0u8; 32], Compression::None, &bytes[..], &mut budget)
+            .unpack(
+                &cache.pin(&[0u8; 32]).expect("pin"),
+                Compression::None,
+                &bytes[..],
+                &mut budget,
+            )
             .expect_err("wrong diff_id");
         assert!(matches!(e, Error::DiffId { .. }), "{e}");
         assert!(
@@ -190,16 +205,22 @@ fn failed_deep_layer_removed_under_low_nofile() {
 
 /// The temporary tree is staged inside `layers/sha256/` under a dot name,
 /// so the commit is a rename within one directory (no `..` to rewrite, no
-/// `u+w` to lend the root) and nothing else is created at the root.
+/// `u+w` to lend the root) and nothing else is created at the root but the
+/// lock directories (ADR-025).
 #[test]
 fn staging_stays_in_the_layers_directory() {
     let store = TempDir::new("staging");
     let cache = LayerCache::new(store.path()).expect("cache");
-    assert_eq!(names(store.path()), ["layers"]);
+    assert_eq!(names(store.path()), ["layers", "locks"]);
     let ro = Tar::new().dir("./", 0o555).file("f", 0o444, b"x").finish();
     let id = Sha256::digest(&ro);
     cache
-        .unpack(&id, Compression::None, &ro[..], &mut Budget::new(limits()))
+        .unpack(
+            &cache.pin(&id).expect("pin"),
+            Compression::None,
+            &ro[..],
+            &mut Budget::new(limits()),
+        )
         .expect("commit");
     let layers = store.path().join("layers/sha256");
     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
@@ -213,7 +234,7 @@ fn staging_stays_in_the_layers_directory() {
     assert_eq!(mode, 0o555);
     let e = cache
         .unpack(
-            &[0u8; 32],
+            &cache.pin(&[0u8; 32]).expect("pin"),
             Compression::None,
             &ro[..],
             &mut Budget::new(limits()),
@@ -275,7 +296,7 @@ fn committed_layer_paths_fit_path_max() {
     let id = Sha256::digest(&bytes);
     let stats = cache
         .unpack(
-            &id,
+            &cache.pin(&id).expect("pin"),
             Compression::None,
             &bytes[..],
             &mut Budget::new(limits()),
@@ -296,7 +317,7 @@ fn committed_layer_paths_fit_path_max() {
     let (_, longer) = layer(fits + 1);
     let id = Sha256::digest(&longer);
     match cache.unpack(
-        &id,
+        &cache.pin(&id).expect("pin"),
         Compression::None,
         &longer[..],
         &mut Budget::new(limits()),

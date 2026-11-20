@@ -14,23 +14,63 @@
 //! temporary tree. When another store committed the same layer first, its
 //! directory stays and this one is discarded; the same `diff_id` means the
 //! same bytes, so both trees are equal.
+//!
+//! Locks (ADR-025): a cache holds a shared lock on its owner lock file
+//! `<root>/locks/owners/<token>` for as long as it lives, from before it
+//! creates any name, so a judge can tell whether the owner of a name is
+//! alive in every namespace (D1). A layer is unpacked only under a
+//! [`LayerPin`], a shared lock on `<root>/locks/sha256/<hex>` that keeps
+//! the layer from being removed while it is in use (D2).
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
-use crate::error::Error;
+use crate::error::{Error, root_err};
 use crate::limits::Budget;
+use crate::lock::{self, Held};
 use crate::unpack::{Compression, LayerStats, unpack};
 
 /// The layer cache under a store root.
+///
+/// Holds this process's owner lock (ADR-025, D1) while it, or a clone of
+/// it, lives.
 #[derive(Debug, Clone)]
 pub struct LayerCache {
     root: PathBuf,
+    /// The shared lock on `locks/owners/<token>`; clones share it.
+    _owner: Arc<Held>,
+}
+
+/// A shared lock on the lock file of one layer (ADR-025, D2): while it is
+/// held, the layer is not removed. [`LayerCache::unpack`] commits a layer
+/// only under its pin, and a [`crate::Lease`] holds one for each of its
+/// layers. Dropping it releases the lock.
+#[derive(Debug)]
+pub struct LayerPin {
+    diff_id: [u8; 32],
+    held: Held,
+}
+
+impl LayerPin {
+    /// The `diff_id` of the pinned layer.
+    pub fn diff_id(&self) -> &[u8; 32] {
+        &self.diff_id
+    }
+
+    /// A second pin on the same layer as a descriptor of its own: a new
+    /// read-only open file description of the lock file with its own
+    /// shared lock (ADR-025, D2). It pins the layer as long as any process
+    /// holds it, and its release never releases this pin.
+    pub(crate) fn descriptor(&self) -> Result<OwnedFd, Error> {
+        self.held.reopen_shared()
+    }
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -70,9 +110,16 @@ impl LayerCache {
     /// would not fit at the staging name is refused while it is unpacked.
     pub const STAGING_NAME_LEN: usize = TEMPORARY_NAME_LEN;
 
-    /// The cache under `root`, creating `layers/sha256/` with mode `0o700`
-    /// where it is missing. The store ([`crate::OciImageStore`]) checks the
-    /// root itself: absolute, private, owned by the caller.
+    /// The cache under `root`, creating `layers/sha256/`, `locks/owners/`
+    /// and `locks/sha256/` with mode `0o700` where they are missing. The
+    /// store ([`crate::OciImageStore`]) checks the root itself: absolute,
+    /// private, owned by the caller.
+    ///
+    /// Before it creates any name, it takes a shared lock on this
+    /// process's owner lock file `locks/owners/<token>`, held until the
+    /// last clone of the cache is dropped, and makes the file's directory
+    /// entry durable, so a crash's leftovers are judged by the lock after
+    /// a reboot too (ADR-025, D1).
     ///
     /// Refuses a `layers/sha256/` where names alias each other (a
     /// case-insensitive or normalizing directory, D8): there a symlink
@@ -86,12 +133,16 @@ impl LayerCache {
     /// its owner is gone.
     pub fn new(root: &Path) -> Result<LayerCache, Error> {
         let layers = root.join("layers").join("sha256");
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&layers)
-            .map_err(|e| cache_err(&layers, e))?;
+        let owners = owners_dir(root);
+        for dir in [&layers, &owners, &layer_locks_dir(root)] {
+            boneli_private_dir::create(dir).map_err(root_err)?;
+        }
         let owner = Owner::current()?;
+        let owner_lock = Arc::new(lock::lock_shared(
+            &owners.join(owner.token()),
+            Instant::now() + lock::LOCK_WAIT,
+        )?);
+        sync_dir(&owners)?;
         for (stem, alias_stem) in [
             (".probe-case-", ".PROBE-CASE-"),
             (".probe-\u{e9}-", ".probe-e\u{301}-"),
@@ -108,11 +159,40 @@ impl LayerCache {
         }
         Ok(LayerCache {
             root: root.to_path_buf(),
+            _owner: owner_lock,
         })
     }
 
     fn layers_dir(&self) -> PathBuf {
         self.root.join("layers").join("sha256")
+    }
+
+    /// The lock file of the layer `diff_id`, `locks/sha256/<hex>`.
+    fn layer_lock_path(&self, diff_id: &[u8; 32]) -> PathBuf {
+        layer_locks_dir(&self.root).join(hex(diff_id))
+    }
+
+    /// Pins the layer `diff_id`: a shared lock on its lock file, created
+    /// where it is missing (ADR-025, D2). It waits while a removal holds
+    /// the exclusive lock, for at most 120 s (`Error::LockBusy`, D3). The
+    /// layer need not be in the cache: a pull pins every layer of an image
+    /// before it looks.
+    pub fn pin(&self, diff_id: &[u8; 32]) -> Result<LayerPin, Error> {
+        self.pin_until(diff_id, Instant::now() + lock::LOCK_WAIT)
+    }
+
+    /// [`LayerCache::pin`] with the wait bounded by `deadline`, so a pull
+    /// that pins every layer of an image waits 120 s in all, not per
+    /// layer.
+    pub(crate) fn pin_until(
+        &self,
+        diff_id: &[u8; 32],
+        deadline: Instant,
+    ) -> Result<LayerPin, Error> {
+        Ok(LayerPin {
+            diff_id: *diff_id,
+            held: lock::lock_shared(&self.layer_lock_path(diff_id), deadline)?,
+        })
     }
 
     /// Where the layer with `diff_id` lives once committed.
@@ -147,16 +227,30 @@ impl LayerCache {
     }
 
     /// Unpacks the layer `blob`, compressed as `compression`, checks it
-    /// against `diff_id` and commits it durably. `budget` is charged only
-    /// when the layer is committed (or was committed by another store); on
-    /// every error it is left as it was.
+    /// against the `diff_id` that `pin` pins and commits it durably. The
+    /// pin keeps the layer from being removed from before the commit until
+    /// the caller drops it (ADR-025, D2); a pin of another cache's root is
+    /// refused. `budget` is charged only when the layer is committed (or
+    /// was committed by another store); on every error it is left as it
+    /// was.
     pub fn unpack(
         &self,
-        diff_id: &[u8; 32],
+        pin: &LayerPin,
         compression: Compression,
         blob: impl Read,
         budget: &mut Budget,
     ) -> Result<LayerStats, Error> {
+        let diff_id = pin.diff_id();
+        let expected = self.layer_lock_path(diff_id);
+        if pin.held.path() != expected {
+            return Err(cache_err(
+                &expected,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the layer is pinned in another cache",
+                ),
+            ));
+        }
         let staging = self.temporary()?;
         let mut trial = budget.clone();
         let result = self.unpack_into(&staging, diff_id, compression, blob, &mut trial);
@@ -252,6 +346,18 @@ impl LayerCache {
             Err(e) => Err(cache_err(&final_path, e)),
         }
     }
+}
+
+/// `<root>/locks/owners/`, where each owner lock file is named by its
+/// owner's token (ADR-025, D1).
+pub(crate) fn owners_dir(root: &Path) -> PathBuf {
+    root.join("locks").join("owners")
+}
+
+/// `<root>/locks/sha256/`, where each layer's lock file is named by the 64
+/// hex digits of its `diff_id` (ADR-025, D2).
+pub(crate) fn layer_locks_dir(root: &Path) -> PathBuf {
+    root.join("locks").join("sha256")
 }
 
 /// A new temporary name, `.tmp-<owner>.<n>`: a dot name, so lookups by hex
@@ -437,7 +543,19 @@ impl Owner {
         let rest = OWNED_PREFIXES
             .iter()
             .find_map(|prefix| name.strip_prefix(prefix))?;
-        let mut fields = rest.split('.');
+        let owner = Owner::of_token(rest.get(..OWNER_TOKEN_LEN)?)?;
+        let n = rest.get(OWNER_TOKEN_LEN..)?.strip_prefix('.')?;
+        let suffix = n.get(20..)?;
+        let digits = n.get(..20)?;
+        (digits.bytes().all(|b| b.is_ascii_digit()) && matches!(suffix, "" | ".stats"))
+            .then_some(owner)
+    }
+
+    /// The owner a token `<boot>.<pidns>.<timens>.<pid>.<start>` names, as
+    /// [`Owner::token`] writes it and as an owner lock file is named
+    /// (ADR-025, D1); `None` for any other text.
+    pub(crate) fn of_token(token: &str) -> Option<Owner> {
+        let mut fields = token.split('.');
         let boot = fields.next().filter(|f| is_boot_hex(f))?;
         let boot = u128::from_str_radix(boot, 16).ok()?;
         let mut number = |width: usize| -> Option<u64> {
@@ -450,17 +568,13 @@ impl Owner {
         let timens = number(20)?;
         let pid = u32::try_from(number(10)?).ok()?;
         let start = number(20)?;
-        number(20)?;
-        match (fields.next(), fields.next()) {
-            (None, _) | (Some("stats"), None) => Some(Owner {
-                boot,
-                pidns,
-                timens,
-                pid,
-                start,
-            }),
-            _ => None,
-        }
+        fields.next().is_none().then_some(Owner {
+            boot,
+            pidns,
+            timens,
+            pid,
+            start,
+        })
     }
 
     /// Whether this owner is alive, as `judge` sees it. In the judge's
@@ -829,6 +943,94 @@ mod tests {
         ] {
             assert_eq!(Owner::of_name(&bad), None, "{bad}");
         }
+    }
+
+    /// An owner lock file is named by the owner's token, which parses back
+    /// to the owner and is written again unchanged, so a judge finds the
+    /// lock file of every owned name (ADR-025, D1). A layer's lock file is
+    /// named by the 64 lower-case hex digits of its `diff_id`, the name of
+    /// its directory, and they read back as the digest (D2). Owned names,
+    /// tokens with a suffix and malformed fields are no tokens.
+    #[test]
+    fn owner_lock_name_round_trips() {
+        let me = Owner::current().expect("owner");
+        let others = [
+            me,
+            Owner {
+                boot: u128::MAX,
+                pidns: u64::MAX,
+                timens: 0,
+                pid: u32::MAX,
+                start: u64::MAX,
+            },
+            Owner {
+                boot: 0,
+                pidns: 0,
+                timens: UNREADABLE_TIME_NAMESPACE,
+                pid: 0,
+                start: 0,
+            },
+        ];
+        for owner in others {
+            let token = owner.token();
+            assert_eq!(token.len(), super::OWNER_TOKEN_LEN);
+            assert_eq!(Owner::of_token(&token), Some(owner), "{token}");
+            assert_eq!(
+                Owner::of_token(&token).map(|o| o.token()),
+                Some(token.clone())
+            );
+            let name = format!(".tmp-{token}.{:020}", 3);
+            assert_eq!(Owner::of_name(&name), Some(owner));
+            for bad in [
+                name.clone(),
+                format!("{token}.{:020}", 3),
+                format!("{token}.stats"),
+                format!("{token}."),
+                format!("{token}0"),
+                token[1..].to_owned(),
+                token.to_uppercase(),
+                format!("{}\u{ff41}", &token[..token.len() - 1]),
+                String::new(),
+            ] {
+                if bad == token {
+                    continue;
+                }
+                assert_eq!(Owner::of_token(&bad), None, "{bad}");
+            }
+        }
+
+        let scratch = crate::scratch::ScratchDir::new("lock-names");
+        let cache = super::LayerCache::new(scratch.path()).expect("cache");
+        let digest: [u8; 32] = std::array::from_fn(|i| (i * 37 + 5) as u8);
+        let pin = cache.pin(&digest).expect("pin");
+        let name = pin
+            .held
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name")
+            .to_owned();
+        assert_eq!(
+            Some(name.as_str()),
+            cache
+                .layer_path(&digest)
+                .file_name()
+                .and_then(|n| n.to_str())
+        );
+        assert_eq!(name.len(), 64);
+        let back: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&name[2 * i..2 * i + 2], 16).expect("hex"))
+            .collect();
+        assert_eq!(back, digest);
+        assert_eq!(name, name.to_lowercase());
+        assert_eq!(pin.diff_id(), &digest);
+        // The owner lock file of this cache is named by this process's
+        // token.
+        let owners: Vec<String> = std::fs::read_dir(super::owners_dir(scratch.path()))
+            .expect("owners")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(owners, [me.token()]);
     }
 
     /// This process is alive; its pid with another start time is a reused
