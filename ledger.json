@@ -962,11 +962,11 @@
    "title": "Extract the store-root rules of ADR-009 D8 into a shared support crate",
    "epic": null,
    "order": 41,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "373fe023",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T15:12:58+00:00",
+   "updated_at": "2026-11-20T15:27:28+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T02:28:23+00:00",
-   "issue": 35,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "9db267e1",
-   "note": null
-  },
   {
    "at": "2026-11-20T03:25:02+00:00",
    "issue": 37,
@@ -1496,6 +1488,14 @@
    "to": "claimed",
    "by": "373fe023",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T15:27:28+00:00",
+   "issue": 66,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "373fe023",
+   "note": null
   }
  ],
  "open": [
@@ -1531,7 +1531,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:13:30+00:00",
+ "updated_at": "2026-11-20T15:27:28+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
