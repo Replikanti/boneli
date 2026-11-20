@@ -36,15 +36,15 @@ pub(crate) const LOCK_ATTEMPTS: u32 = 1_024;
 
 /// How long a shared locker waits for an exclusive holder before it gives
 /// up with [`Error::LockBusy`] (ADR-025, D3). An exclusive holder holds a
-/// lock while it removes what the lock covers: a dead owner's names, or
-/// (#56 part 2) one layer's tree. The largest tree is one layer at the
-/// image's entry cap, 1,048,576 entries; ADR-009 D8 measured the removal at
-/// 80,000 directories in 2.6 s (about 32.5 µs each, release build, btrfs),
-/// so about 34 s for the cap (extrapolated, not measured). 120 s leaves
-/// 3.5 times that for slower disks and debug builds. Shorter fails a pull
-/// while a legitimate removal still runs; longer lets a stopped holder
-/// stall a pull, and every pull queued behind it on the store's mutex,
-/// for longer.
+/// lock only for O(1) steps: it renames what it removes to an owned name
+/// of its own and removes the tree after it released the lock (the rule
+/// for #56 part 2). The longest of those steps is a directory `fsync`,
+/// which on ext4 can wait for the dirty page cache, at most
+/// `vm.dirty_ratio` (20 %) of memory: about 12.8 GiB on a 64 GiB runner,
+/// about 105 s at gp3's documented 125 MiB/s baseline. 120 s covers that.
+/// Shorter fails a pull while a legitimate `fsync` runs; longer lets a
+/// stopped holder stall a pull, and every pull queued behind it on the
+/// store's mutex, for longer.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// The first pause of a waiting shared locker; it doubles up to

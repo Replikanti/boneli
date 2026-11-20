@@ -419,8 +419,9 @@ fn lease_child(root: &Path) {
     let lease = store.lease(&rootfs).expect("lease");
     let mut holder = None;
     if std::env::var_os(LEASE_HOLDER).is_some() {
-        // The sandbox's stand-in: a process that holds one more pin per
-        // layer, inherited as its stdin, stdout and stderr, and that
+        // The holder process's stand-in (ADR-025 D2: in the sandbox's
+        // cgroup, never the workload): a process that holds one more pin
+        // per layer, inherited as its stdin, stdout and stderr, and that
         // outlives this runner.
         let mut fds = lease.pin_descriptors().expect("descriptors").into_iter();
         let mut next = || Stdio::from(fds.next().expect("one descriptor per layer"));
@@ -542,7 +543,7 @@ fn killed_holder_releases_its_lease() {
 /// The review of #92: a sandbox outlives a runner that is killed, so the
 /// pins of its mounted layers must not die with the runner. The child (the
 /// runner) leases the image and hands `pin_descriptors` to a holder process
-/// (the sandbox's stand-in), then is killed with `SIGKILL`: every layer
+/// (the stand-in for #8's holder), then is killed with `SIGKILL`: every layer
 /// stays pinned while the holder lives, and is free once it is gone.
 #[test]
 fn pin_descriptors_outlive_the_runner() {

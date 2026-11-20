@@ -665,9 +665,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OciImageStore::lease` return a `Lease` (`rootfs`, `layers`, `config`)
   that keeps the layers pinned until it is dropped; `lease` does not wait
   for a pull. `Lease::pin_descriptors` gives one more pin per layer as a
-  descriptor of its own, for the Sandbox adapter (#8) to hand to whatever
-  lives exactly as long as the mounts, so a sandbox's layers stay pinned
-  after its runner is killed. Lock files are checked to be regular files
+  descriptor of its own, for the Sandbox adapter (#8) to hand to a holder
+  process in the sandbox's cgroup (never to the workload), so a sandbox's
+  layers stay pinned after its runner is killed. Lock files are checked to be regular files
   and to be the file the path names after locking (`Error::LockChanged`
   after 1,024 replacements); a pin waits at most 120 s for a removal
   (`Error::LockBusy`). Nothing is evicted yet.
