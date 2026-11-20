@@ -1264,7 +1264,7 @@
    "title": "boneli-store-fs: reopen can fail with InUse while another thread spawns a process",
    "epic": null,
    "order": 48,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "3ebab419",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1273,7 +1273,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T22:04:16+00:00",
+   "updated_at": "2026-11-20T22:08:20+00:00",
    "priority": "P2",
    "size": "small",
    "deps": [],
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:12:50+00:00",
-   "issue": 54,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #78 open"
-  },
   {
    "at": "2026-11-20T15:12:58+00:00",
    "issue": 66,
@@ -1710,6 +1702,14 @@
    "to": "claimed",
    "by": "f11746bb",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T22:08:20+00:00",
+   "issue": 94,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "3ebab419",
+   "note": null
   }
  ],
  "open": [
@@ -1744,7 +1744,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:06:25+00:00",
+ "updated_at": "2026-11-20T22:08:20+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
