@@ -737,11 +737,11 @@
    "title": "boneli-https: certificate revocation via CRLs",
    "epic": null,
    "order": 29,
-   "state": "pr-review",
-   "owner": "14f36a32",
+   "state": "done",
+   "owner": null,
    "pr": 77,
    "note": "",
-   "updated_at": "2026-11-20T10:41:02+00:00",
+   "updated_at": "2026-11-20T11:44:29+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -752,8 +752,8 @@
     "core"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df"
+   "user": null,
+   "machine": null
   },
   {
    "issue": 37,
@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "plan-review",
+   "state": "pr-review",
    "owner": "98fa59e8",
-   "pr": 76,
-   "note": "PR 2 (#78 draft) M1 stopped on rule R2: no memory.high band passes; keeper (memory.stat read every 50 ms) protected 54/54; operator picks direction",
-   "updated_at": "2026-11-20T11:11:18+00:00",
+   "pr": 78,
+   "note": "PR #78 open",
+   "updated_at": "2026-11-20T11:44:34+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1025,49 +1025,78 @@
    "manual": false,
    "user": null,
    "machine": null
+  },
+  {
+   "issue": 81,
+   "title": "boneli-https: bound name resolution by the request deadline",
+   "epic": null,
+   "order": 44,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-20T11:44:34+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    38
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
+  },
+  {
+   "issue": 80,
+   "title": "boneli-https: revocation check for intermediate CAs",
+   "epic": null,
+   "order": 45,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-20T11:44:34+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    38
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
+  },
+  {
+   "issue": 79,
+   "title": "boneli-https: OCSP revocation check for leaves without a CRL distribution point",
+   "epic": null,
+   "order": 46,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-20T11:44:34+00:00",
+   "priority": "P2",
+   "size": "medium",
+   "deps": [
+    38
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-17T17:23:41+00:00",
-   "issue": 34,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "996bfe51",
-   "note": null
-  },
-  {
-   "at": "2026-11-17T17:41:34+00:00",
-   "issue": 34,
-   "from": "pr-review",
-   "to": "done",
-   "by": "996bfe51",
-   "note": null
-  },
-  {
-   "at": "2026-11-17T17:41:36+00:00",
-   "issue": 35,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
-  {
-   "at": "2026-11-17T19:19:11+00:00",
-   "issue": 4,
-   "from": "ready",
-   "to": "claimed",
-   "by": "867f864c",
-   "note": ""
-  },
-  {
-   "at": "2026-11-17T19:35:57+00:00",
-   "issue": 4,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "867f864c",
-   "note": null
-  },
   {
    "at": "2026-11-17T22:22:34+00:00",
    "issue": 4,
@@ -1427,6 +1456,46 @@
    "to": "plan-review",
    "by": "98fa59e8",
    "note": "PR 2 (#78 draft) M1 stopped on rule R2: no memory.high band passes; keeper (memory.stat read every 50 ms) protected 54/54; operator picks direction"
+  },
+  {
+   "at": "2026-11-20T11:44:29+00:00",
+   "issue": 38,
+   "from": "pr-review",
+   "to": "done",
+   "by": "14f36a32",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T11:44:34+00:00",
+   "issue": 81,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T11:44:34+00:00",
+   "issue": 80,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T11:44:34+00:00",
+   "issue": 79,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-20T11:44:34+00:00",
+   "issue": 54,
+   "from": "plan-review",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #78 open"
   }
  ],
  "open": [
@@ -1450,7 +1519,6 @@
   31,
   32,
   33,
-  38,
   45,
   49,
   54,
@@ -1460,10 +1528,13 @@
   64,
   66,
   68,
-  69
+  69,
+  79,
+  80,
+  81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T11:11:18+00:00",
+ "updated_at": "2026-11-20T11:44:34+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T10:11:33+00:00",
