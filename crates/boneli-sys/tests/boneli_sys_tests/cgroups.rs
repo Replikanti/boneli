@@ -374,6 +374,10 @@ fn io_write_plan_forms() {
     );
     assert_eq!(8_388_608 / (1 << 20), 8);
     assert_eq!(
+        plan("536870912", None, Some("never")),
+        Ok((536_870_912, 1 << 20, IoDirect::Never))
+    );
+    assert_eq!(
         plan("41943040", Some("41943040"), Some("require")),
         Ok((41_943_040, 41_943_040, IoDirect::Require))
     );
@@ -390,7 +394,7 @@ fn io_write_plan_forms() {
     );
     assert!(plan("abc", None, None).is_err(), "size");
     for direct in [
-        "never", "Require", "require ", "Never", "NEVER", " never", "never ", "auto", "1", "",
+        "Require", "require ", "Never", "NEVER", " never", "never ", "auto", "1", "",
     ] {
         assert!(
             plan("8388608", None, Some(direct)).is_err(),

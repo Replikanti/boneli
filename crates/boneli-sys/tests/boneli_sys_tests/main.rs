@@ -15,6 +15,7 @@
 //! lines. Without that variable it does nothing.
 
 mod cgroups;
+mod diag_54;
 mod host_setup;
 mod layer;
 mod mounts;
