@@ -1350,6 +1350,26 @@ code.
   the floor test on Azure x86_64, with p = 23/260, the kill rate of
   parent reads every 5 ms at 64 MiB there (M3, KP5), so it misses a
   kill with probability 1 % or less (R-S6).
+- **MK-P's result and the decision on it.** MK1 failed all three
+  buffered tests with `OomKilled` on both CI legs (run 44756507651). MK-P
+  (run 44756978618) failed `keeper_reads_its_own_sandbox` and
+  `keeper_runs_while_cgroup_lives` on both legs (jobs 136359165476 and
+  136359165516), but its behavioral run killed **0 of 70** floor runs on
+  Azure x86_64 (5 per copy on 14 copies; the 2 AWS runs were Held too).
+  At KP5's rate, 0 of 70 has probability (1 − 23/260)^70 ≈ 0.15 %
+  (derived), so R-S6 did not hold. The reason is **inferred from the code,
+  not measured**: KP5's first read was pinned to the write's start, the
+  flush the trace round found as the trigger in all 67 killed K10 runs,
+  while a real keeper starts in `create`, before the spawn, and reads on
+  its own 5 ms rhythm, so its reads have no fixed phase to the write and
+  the parent was flushed every 5 ms before the writer began. KP5 also
+  read the sandbox's `memory.current` after each read and ran in turn
+  with other arms in one process; MK-P ran the floor test alone in a
+  fresh scope. So a kill rate measured with a read pinned at the write's
+  start does not carry over to a free-running keeper. **Operator decision
+  (2026-11-20):** 0 of 70 is accepted, and the deterministic pin
+  `keeper_reads_its_own_sandbox` is the proof for the parent-read mutant;
+  MK1 is the behavioral proof that the tests see a missing keeper.
 - **For #8.** One keeper thread per sandbox, from `create` to the kill,
   at the CPU above. A Landlock ruleset applied to the runner must allow
   reading `memory.stat` below the parent at every `create`, or `create`
