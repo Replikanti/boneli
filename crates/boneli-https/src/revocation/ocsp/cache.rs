@@ -178,6 +178,11 @@ impl OcspCache {
             *existing = entry.clone();
             return entry;
         }
+        if self.entries.len() >= OCSP_CACHE_MAX_ENTRIES {
+            // Answers at their `nextUpdate` decide nothing; they go before
+            // any live entry is evicted.
+            self.entries.retain(|_, e| e.next_update > now);
+        }
         while self.entries.len() >= OCSP_CACHE_MAX_ENTRIES {
             // Eviction keeps revocations final: the least recently used good
             // answer goes first. With no good answer left, a good answer is
@@ -366,6 +371,23 @@ mod tests {
         assert!(cache.get(&0u32.to_be_bytes()).is_some());
         assert!(cache.get(&1u32.to_be_bytes()).is_none());
         assert!(cache.get(b"r").is_some());
+    }
+
+    #[test]
+    fn ocsp_expired_revocations_go_before_a_live_one() {
+        // 1,023 revocations past their `nextUpdate` and one live one: a
+        // full cache drops the expired ones, not the live revocation.
+        let mut cache = OcspCache::new();
+        for i in 0..(OCSP_CACHE_MAX_ENTRIES - 1) as u32 {
+            cache.insert(&i.to_be_bytes(), revoked(T0), T0);
+        }
+        cache.insert(b"k", revoked(T0 + WEEK), T0 + WEEK);
+        assert_eq!(cache.len(), 1_024);
+        let decided = cache.insert(b"n", good(T0 + WEEK), T0 + WEEK + 1);
+        assert_eq!(decided.status, Status::Good);
+        assert_eq!(cache.len(), 2, "expired revocations are dropped");
+        assert_eq!(cache.get(b"k").expect("kept").status, Status::Revoked);
+        assert!(cache.get(b"n").is_some(), "the good answer is stored");
     }
 
     #[test]
