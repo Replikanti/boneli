@@ -144,6 +144,98 @@ mod host {
         assert_eq!(ino("/private/a"), ino("/private/b"), "{seen:?}");
     }
 
+    /// The acceptance of #56: a layer mounted by a running sandbox is never
+    /// removed. The probe runs on a leased image and waits on its stdin;
+    /// meanwhile a second store on the root with a budget of 1 opens (and
+    /// trims) and trims again: every layer stays, and the probe then reads
+    /// a file of the lowest layer intact. Once the sandbox has exited and
+    /// the lease is dropped, the next trim removes the layers.
+    #[test]
+    #[ignore = "host: unprivileged user namespaces, overlayfs, a delegated cgroup"]
+    fn mounted_layers_survive_trim() {
+        let lowest = Tar::new()
+            .dir("data", 0o755)
+            .file("data/lowest", 0o644, b"bottom\n")
+            .finish();
+        let upper = Tar::new().file("data/upper", 0o644, b"top\n").finish();
+        let mut hub = Hub::default();
+        let pushed = push(
+            &mut hub,
+            "library/mounted",
+            &[Layer::gzip(lowest), Layer::tar(upper)],
+            "",
+        );
+        let fake = Fake::new(move |s| hub.handle(s));
+        let tmp = TempDir::new("host-trim");
+        let store_root = tmp.path().join("store");
+        let store = open(&store_root, &fake);
+        let lease = store
+            .pull_leased(&ImageRef {
+                name: "library/mounted".to_owned(),
+                digest: pushed.index.clone(),
+                platform: "linux/amd64".to_owned(),
+            })
+            .expect("pull");
+        let layer_dirs = lease.layers().to_vec();
+        assert_eq!(layer_dirs.len(), 2);
+
+        let base = tmp.path().join("base");
+        let staging = tmp.path().join("staging");
+        let ready = tmp.path().join("ready");
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::create_dir_all(&ready).expect("ready");
+        let mut mounts = base_layer(&base);
+        std::fs::create_dir_all(base.join("ready")).expect("the ready mount point");
+        mounts.push(boneli_sys::Mount::Bind {
+            source: ready.clone(),
+            target: sandbox::inside("/ready"),
+            writable: true,
+        });
+        let mut layers = vec![base];
+        layers.extend_from_slice(lease.layers());
+        let running = sandbox::start_probe(
+            "wait-stat",
+            &[
+                (sandbox::PATHS_VAR, "/data/lowest,/data/upper"),
+                (sandbox::READY_VAR, "/ready/up"),
+            ],
+            ids(0, 0),
+            root(layers, &staging, mounts),
+        );
+        let deadline = std::time::Instant::now() + sandbox::HANG_BOUND;
+        while !ready.join("up").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut config = crate::support::images::config(&fake);
+        config.cache_budget = 1;
+        let other = OciImageStore::open(&store_root, config).expect("a second store");
+        let report = other.trim().expect("trim");
+        let kept: Vec<bool> = layer_dirs.iter().map(|d| d.is_dir()).collect();
+        let seen = sandbox::probe_values(&running.finish());
+        assert_eq!(kept, [true, true], "a mounted layer went: {report:?}");
+        assert_eq!(report.skipped_in_use, 2, "{report:?}");
+        assert!(
+            seen.get("/data/lowest")
+                .is_some_and(|v| v.starts_with("file:bottom\\n ")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.get("/data/upper")
+                .is_some_and(|v| v.starts_with("file:top\\n ")),
+            "{seen:?}"
+        );
+
+        drop(lease);
+        let report = other.trim().expect("trim");
+        assert_eq!(report.removed_layers, 2, "{report:?}");
+        assert!(layer_dirs.iter().all(|d| !d.exists()));
+    }
+
     fn budget() -> Budget {
         Budget::new(Limits::new(1 << 32, 1 << 34, 1 << 20, 1 << 20, 128).expect("limits"))
     }

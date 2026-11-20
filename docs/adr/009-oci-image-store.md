@@ -1047,7 +1047,9 @@ Hub, 2026-11-16):
   an owner in another PID or time namespace stay until a process of that
   namespace opens the store, and those of another boot id, an earlier
   boot's crash leftovers and the leftovers of a process that could not
-  read its boot id included, until #56 (D8).
+  read its boot id included, until #56 (D8). ADR-025 closes both: owner
+  locks judge leftovers in every namespace and after a reboot, and a trim
+  evicts unused layers and documents under a byte budget.
 - A store root must sit under directories that only root or the caller
   can write (sticky ones aside); a group-writable parent is refused (D8).
 - The `ImageStore` contract has a clause that every future adapter must

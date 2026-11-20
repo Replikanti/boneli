@@ -38,10 +38,18 @@
 //! layer holds a [`LayerPin`] on it: a pull pins all layers of its image
 //! before it fetches one, and a [`Lease`] keeps them pinned while a
 //! sandbox uses them.
+//!
+//! Eviction (ADR-025, D4 to D8): a trim at `open`, at the end of every
+//! pull and in [`OciImageStore::trim`] evicts the least recently used
+//! layers, documents and kept layer blobs that nobody pins, until the
+//! store's accounted bytes are at or under [`StoreConfig::cache_budget`]
+//! ([`CACHE_BUDGET_BYTES`] by default), and reports it as a
+//! [`TrimReport`].
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
 mod error;
+mod evict;
 mod gzip;
 mod layers;
 mod lease;
@@ -62,6 +70,7 @@ mod zstd;
 // the registry client's callers keep their paths.
 pub use boneli_https::{Dial, Stream, TlsDial};
 pub use error::{Error, PullError};
+pub use evict::TrimReport;
 pub use layers::{LayerCache, LayerPin};
 pub use lease::Lease;
 pub use limits::{Budget, Limits};
@@ -71,9 +80,10 @@ pub use registry::{
     Client, FetchLimits, Fetched, MAX_REDIRECTS, Registry, Resolved, Timeouts, select,
 };
 pub use store::{
-    CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT, MAX_BLOB_BYTES, MAX_DEPTH, MAX_DOCUMENT_BYTES,
-    MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_VALUES, MAX_HEAD_BYTES, MAX_HEADERS, MAX_IMAGE_BYTES,
-    MAX_IMAGE_ENTRIES, MAX_LAYER_BYTES, MAX_LAYERS, MAX_PULL_BYTES, MAX_SPECIAL_BYTES,
-    MAX_TOKEN_BYTES, MIN_RATE, OciImageStore, SETUP_TIMEOUT, StoreConfig,
+    BLOCK_ALLOWANCE, CACHE_BUDGET_BYTES, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT,
+    MAX_BLOB_BYTES, MAX_DEPTH, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_VALUES,
+    MAX_HEAD_BYTES, MAX_HEADERS, MAX_IMAGE_BYTES, MAX_IMAGE_ENTRIES, MAX_LAYER_BYTES, MAX_LAYERS,
+    MAX_PULL_BYTES, MAX_SPECIAL_BYTES, MAX_TOKEN_BYTES, MIN_RATE, OciImageStore, SETUP_TIMEOUT,
+    StoreConfig,
 };
 pub use unpack::{Compression, LayerStats, unpack};
