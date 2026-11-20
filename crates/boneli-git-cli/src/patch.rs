@@ -4,54 +4,23 @@
 //! workspace a fix produced as a `boneli_domain::Patch`, without loss: every
 //! changed path with both full sides, and every symlink of the base. The
 //! domain then computes sizes, classes and link walks itself. Nothing calls
-//! it yet; wiring the policy into the run is #68.
+//! it in the run: `GitCli::patch_between` builds the policy's input from
+//! two checkouts' trees (ADR-023, D4), and this function stays as the
+//! differential oracle of its tests.
 //!
 //! The policy's paths are text and follow the citation rule (ADR-013,
 //! ADR-018 D5). A changed path or a base link with a backslash or a blank
 //! name reaches the policy as written, and the policy refuses the fix
 //! (`Malformed`, `BaseLinkMalformed`). One that is not UTF-8 has no text
-//! form, so it is a [`PatchInputError`] here, which #68 turns into a
-//! refused fix.
+//! form, so it is an [`UnreadablePath`] here (ADR-023, D6).
 
 use std::cmp::Ordering;
-use std::fmt;
 use std::iter::Peekable;
 
 use boneli_app::TreePath;
-use boneli_domain::{BaseLink, Change, Entry, EntryKind, Patch};
+use boneli_domain::{BaseLink, Change, Entry, EntryKind, Patch, UnreadablePath};
 
 use crate::workspace::{Kind, Workspace};
-
-/// Why two workspaces have no patch the policy can read: a path the patch
-/// would carry is not UTF-8 (ADR-018, D5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PatchInputError {
-    /// A changed path is not UTF-8.
-    ChangePathNotUtf8 {
-        /// The index the change would have in `Patch::changes`.
-        change: usize,
-    },
-    /// The path of a symlink of the base is not UTF-8.
-    BaseLinkPathNotUtf8 {
-        /// The index the link would have in `Patch::base_links`.
-        link: usize,
-    },
-}
-
-impl fmt::Display for PatchInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PatchInputError::ChangePathNotUtf8 { change } => {
-                write!(f, "change {change}: the path is not UTF-8")
-            }
-            PatchInputError::BaseLinkPathNotUtf8 { link } => {
-                write!(f, "base link {link}: the path is not UTF-8")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PatchInputError {}
 
 /// The path as the policy's text, if it is UTF-8.
 fn text(path: &TreePath) -> Option<String> {
@@ -85,9 +54,9 @@ fn content(workspace: &Workspace) -> Peekable<impl Iterator<Item = (&TreePath, K
 /// symlink of `base`, metadata included, so the policy's walks see every
 /// link a checkout of the base can hold. A workspace holds no gitlinks
 /// (ADR-010, D3), so the patch never has one. A changed path or a base
-/// link path that is not UTF-8 is a [`PatchInputError`]; an unchanged
+/// link path that is not UTF-8 is an [`UnreadablePath`]; an unchanged
 /// file at such a path is no part of the patch.
-pub fn patch_between(base: &Workspace, after: &Workspace) -> Result<Patch, PatchInputError> {
+pub fn patch_between(base: &Workspace, after: &Workspace) -> Result<Patch, UnreadablePath> {
     let mut left = content(base);
     let mut right = content(after);
     let mut changes = Vec::new();
@@ -125,7 +94,7 @@ pub fn patch_between(base: &Workspace, after: &Workspace) -> Result<Patch, Patch
         };
         let change = changes.len();
         changes.push(Change {
-            path: text(path).ok_or(PatchInputError::ChangePathNotUtf8 { change })?,
+            path: text(path).ok_or(UnreadablePath::Change { index: change })?,
             before,
             after: now,
         });
@@ -136,7 +105,7 @@ pub fn patch_between(base: &Workspace, after: &Workspace) -> Result<Patch, Patch
         .enumerate()
         .map(|(link, (path, _, target))| {
             Ok(BaseLink {
-                path: text(path).ok_or(PatchInputError::BaseLinkPathNotUtf8 { link })?,
+                path: text(path).ok_or(UnreadablePath::BaseLink { index: link })?,
                 target: target.to_vec(),
             })
         })
@@ -366,13 +335,13 @@ mod tests {
         after = with(&after, b"x\xff", File, b"changed\n");
         assert_eq!(
             patch_between(&base, &after),
-            Err(PatchInputError::ChangePathNotUtf8 { change: 1 })
+            Err(UnreadablePath::Change { index: 1 })
         );
         let mut removed = base.clone();
         removed.remove(&bpath(b"x\xff"));
         assert_eq!(
             patch_between(&base, &removed),
-            Err(PatchInputError::ChangePathNotUtf8 { change: 0 })
+            Err(UnreadablePath::Change { index: 0 })
         );
         // A base symlink at a backslash path makes every fix malformed; at
         // a non-UTF-8 path it is an input error.
@@ -393,7 +362,7 @@ mod tests {
         let fix = with(&linked, b"a.ts", File, b"b\n");
         assert_eq!(
             patch_between(&linked, &fix),
-            Err(PatchInputError::BaseLinkPathNotUtf8 { link: 0 })
+            Err(UnreadablePath::BaseLink { index: 0 })
         );
         // Unchanged uncitable files and an edit elsewhere: this
         // repository's case, an ordinary fix.
@@ -401,10 +370,6 @@ mod tests {
         assert_eq!(
             patch_policy(&patch(&base, &fix), &PatchLimits::DEFAULT),
             PatchVerdict::Pass { files: 1, lines: 2 }
-        );
-        assert_eq!(
-            PatchInputError::ChangePathNotUtf8 { change: 3 }.to_string(),
-            "change 3: the path is not UTF-8"
         );
     }
 }

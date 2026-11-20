@@ -23,8 +23,10 @@
 //!   environment steers it; [`Transports`] limits the URLs `fetch_base`
 //!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
 //! - [`patch_between`] describes the change between two workspaces as the
-//!   patch policy's input (ADR-013, D1), or a [`PatchInputError`] when a
-//!   path it would carry is not UTF-8 (ADR-018, D5).
+//!   patch policy's input (ADR-013, D1), or a
+//!   `boneli_domain::UnreadablePath` when a path it would carry is not
+//!   UTF-8 (ADR-018, D5); `GitCli::patch_between` builds the same input
+//!   from two checkouts' trees, gitlinks included (ADR-023, D4).
 //! - `push` (ADR-014, D1 and D2) commits a checkout's tree on its base and
 //!   creates a branch with it, never moving one that exists; with
 //!   [`Credentials`] every network call gets an `Authorization` header
@@ -45,7 +47,7 @@ mod workspace;
 pub use cli::{GitCli, GitCliConfig, OpenError};
 pub use credentials::{Credentials, MAX_AUTHORIZATION};
 pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
-pub use patch::{PatchInputError, patch_between};
+pub use patch::patch_between;
 pub use run::MIN_GIT_VERSION;
 pub use url::{Transports, UrlProblem};
 pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};

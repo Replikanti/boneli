@@ -458,6 +458,17 @@ impl Git for FakeGit {
         Ok(CheckoutId::new("applied".to_owned()))
     }
 
+    /// Never called: the forge pushes, it does not judge patches.
+    fn patch_between(
+        &self,
+        _: &CheckoutId,
+        _: &CheckoutId,
+    ) -> Result<Result<boneli_domain::Patch, boneli_domain::UnreadablePath>, GitError> {
+        Err(GitError::Failed {
+            detail: "the fake git judges no patches".to_owned(),
+        })
+    }
+
     fn push(
         &self,
         checkout: &CheckoutId,

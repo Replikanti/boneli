@@ -40,7 +40,7 @@ pub use clock::{SequentialIds, StepClock};
 pub use data::MemoryDataSnapshot;
 pub use evidence::MemoryEvidence;
 pub use forge::{ForgeRequest, ForgeScript, MemoryForge};
-pub use git::{GitCommit, MemoryGit, Tree, pack_tree, unpack_tree};
+pub use git::{GitCommit, MemoryGit, Tree, pack_diff, pack_tree, tree_patch, unpack_tree};
 pub use image::MemoryImageStore;
 pub use sandbox::{MemorySandbox, Program};
 pub use store::MemoryEventStore;

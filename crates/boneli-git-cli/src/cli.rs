@@ -31,6 +31,10 @@
 //! - With [`Credentials`], every network call (`fetch`, `ls-remote`,
 //!   `push`) gets a fresh `Authorization` value, checked before the
 //!   process starts (ADR-014, D3).
+//! - `patch_between` (ADR-023, D4) merge-joins the `ls-tree -r` listings
+//!   of both trees by raw path bytes, so gitlinks are seen, and reads only
+//!   the changed blobs and the base's link targets, each side from its
+//!   own store.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -45,7 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use boneli_app::{
     BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl, TreePath,
 };
-use boneli_domain::CommitSha;
+use boneli_domain::{BaseLink, Change, CommitSha, Entry, EntryKind, Patch, UnreadablePath};
 
 use crate::credentials::{Credentials, refused};
 use crate::lookalike::names_git_elsewhere;
@@ -263,6 +267,165 @@ fn tree_path(raw: &[u8]) -> Result<TreePath, GitError> {
             shown(raw)
         ))
     })
+}
+
+/// The kinds of tree entry a patch carries: git's modes 100644, 100755,
+/// 120000 and 160000 (ADR-013, D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    File,
+    Executable,
+    Symlink,
+    Gitlink,
+}
+
+impl Mode {
+    fn kind(self) -> EntryKind {
+        match self {
+            Mode::File => EntryKind::File,
+            Mode::Executable => EntryKind::Executable,
+            Mode::Symlink => EntryKind::Symlink,
+            Mode::Gitlink => EntryKind::Gitlink,
+        }
+    }
+}
+
+/// One entry of a checked `ls-tree -r` listing.
+#[derive(Debug)]
+struct Listed {
+    mode: Mode,
+    oid: String,
+    path: Vec<u8>,
+}
+
+/// A listing checked for the merge join of `patch_between` (ADR-023, D4):
+/// at most `max` entries, each of a mode a patch carries and at a path a
+/// tree can hold, in strictly ascending byte order of the full paths, the
+/// order `ls-tree -r` prints. Anything else is `Failed`: a tree that
+/// breaks it is not one git wrote, and a join over it could pair the wrong
+/// entries. `which` names the side in the detail.
+fn listed(entries: Vec<TreeEntry>, max: usize, which: &str) -> Result<Vec<Listed>, GitError> {
+    if entries.len() > max {
+        return Err(failed(format!(
+            "the {which} tree lists {} entries, more than the cap of {max}",
+            entries.len()
+        )));
+    }
+    let mut out: Vec<Listed> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mode = match entry.mode.as_str() {
+            "100644" => Mode::File,
+            "100755" => Mode::Executable,
+            "120000" => Mode::Symlink,
+            "160000" => Mode::Gitlink,
+            other => {
+                return Err(failed(format!(
+                    "the {which} tree has an entry of mode {other:?}, which a patch cannot carry"
+                )));
+            }
+        };
+        tree_path(&entry.path)?;
+        if out.last().is_some_and(|last| last.path >= entry.path) {
+            return Err(failed(format!(
+                "the {which} tree's listing is not in ascending path order at {}",
+                shown(&entry.path)
+            )));
+        }
+        out.push(Listed {
+            mode,
+            oid: entry.oid,
+            path: entry.path,
+        });
+    }
+    Ok(out)
+}
+
+/// One side of a joined path: its mode and object id, `None` where the
+/// path is absent.
+type Side = Option<(Mode, String)>;
+
+/// One path whose entry differs between two listings: its mode and object
+/// id on each side, `None` where it is absent.
+#[derive(Debug)]
+struct Joined {
+    path: Vec<u8>,
+    before: Side,
+    after: Side,
+}
+
+/// The merge join of two checked listings by raw path bytes: every path
+/// whose `(mode, oid)` differs, in path order.
+fn join(base: &[Listed], after: &[Listed]) -> Vec<Joined> {
+    let side = |l: &Listed| Some((l.mode, l.oid.clone()));
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    loop {
+        let joined = match (base.get(i), after.get(j)) {
+            (None, None) => break,
+            (Some(b), a) if a.is_none_or(|a| b.path < a.path) => {
+                i += 1;
+                Joined {
+                    path: b.path.clone(),
+                    before: side(b),
+                    after: None,
+                }
+            }
+            (b, Some(a)) if b.is_none_or(|b| a.path < b.path) => {
+                j += 1;
+                Joined {
+                    path: a.path.clone(),
+                    before: None,
+                    after: side(a),
+                }
+            }
+            (Some(b), Some(a)) => {
+                i += 1;
+                j += 1;
+                if (b.mode, &b.oid) == (a.mode, &a.oid) {
+                    continue;
+                }
+                Joined {
+                    path: b.path.clone(),
+                    before: side(b),
+                    after: side(a),
+                }
+            }
+            // Unreachable: a missing side is taken by an arm above.
+            (None, Some(_)) | (Some(_), None) => break,
+        };
+        out.push(joined);
+    }
+    out
+}
+
+/// One side of a change: a gitlink's data is its commit id in hex, any
+/// other entry's is the next blob of its store's batch.
+fn side_entry(
+    side: &Side,
+    blobs: &mut impl Iterator<Item = Vec<u8>>,
+) -> Result<Option<Entry>, GitError> {
+    let Some((mode, oid)) = side else {
+        return Ok(None);
+    };
+    let data = match mode {
+        Mode::Gitlink => oid.clone().into_bytes(),
+        _ => blobs
+            .next()
+            .ok_or_else(|| failed("git cat-file --batch returned fewer blobs than asked for"))?,
+    };
+    Ok(Some(Entry {
+        kind: mode.kind(),
+        data,
+    }))
+}
+
+/// The object ids of the blob sides of `sides`, in order.
+fn blob_ids<'a>(sides: impl Iterator<Item = &'a Side>) -> Vec<String> {
+    sides
+        .flatten()
+        .filter(|(mode, _)| *mode != Mode::Gitlink)
+        .map(|(_, oid)| oid.clone())
+        .collect()
 }
 
 /// The `Authorization` of a call to `url`, when there is a value.
@@ -636,6 +799,22 @@ impl GitCli {
             .collect()
     }
 
+    /// The checkout's whole tree as `ls-tree -r` lists it, checked by
+    /// [`listed`]; `which` names the side in a detail.
+    fn listing(&self, c: &Checkout, which: &str) -> Result<Vec<Listed>, GitError> {
+        let out = self.git(
+            Call::on(&c.store.dir),
+            &[
+                os("ls-tree"),
+                os("-r"),
+                os("-z"),
+                os("--full-tree"),
+                os(&c.tree),
+            ],
+        )?;
+        listed(ls_tree(&out)?, self.max_nodes, which)
+    }
+
     /// The blobs `oids` name, in order, through `cat-file --batch` (raw, no
     /// filters).
     fn blobs(&self, store: &Path, oids: &[String]) -> Result<Vec<Vec<u8>>, GitError> {
@@ -987,6 +1166,62 @@ impl Git for GitCli {
         })
     }
 
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError> {
+        // Both handles before any process starts.
+        let from = self.checkout(base)?;
+        let to = self.checkout(after)?;
+        let before = self.listing(&from, "base")?;
+        let now = self.listing(&to, "after")?;
+        let joined = join(&before, &now);
+        let links: Vec<&Listed> = before.iter().filter(|l| l.mode == Mode::Symlink).collect();
+        // The paths as text first: an unreadable one is the answer, and no
+        // blob needs reading for it (ADR-018, D5).
+        let mut paths = Vec::with_capacity(joined.len());
+        for (index, j) in joined.iter().enumerate() {
+            match String::from_utf8(j.path.clone()) {
+                Ok(text) => paths.push(text),
+                Err(_) => return Ok(Err(UnreadablePath::Change { index })),
+            }
+        }
+        let mut link_paths = Vec::with_capacity(links.len());
+        for (index, l) in links.iter().enumerate() {
+            match String::from_utf8(l.path.clone()) {
+                Ok(text) => link_paths.push(text),
+                Err(_) => return Ok(Err(UnreadablePath::BaseLink { index })),
+            }
+        }
+        // Each side from its own store: two fetches make two stores. The
+        // base's batch holds the before sides, then the link targets.
+        let mut base_ids = blob_ids(joined.iter().map(|j| &j.before));
+        base_ids.extend(links.iter().map(|l| l.oid.clone()));
+        let after_ids = blob_ids(joined.iter().map(|j| &j.after));
+        let mut base_blobs = self.blobs(&from.store.dir, &base_ids)?.into_iter();
+        let mut after_blobs = self.blobs(&to.store.dir, &after_ids)?.into_iter();
+        let mut changes = Vec::with_capacity(joined.len());
+        for (j, path) in joined.iter().zip(paths) {
+            changes.push(Change {
+                path,
+                before: side_entry(&j.before, &mut base_blobs)?,
+                after: side_entry(&j.after, &mut after_blobs)?,
+            });
+        }
+        let mut base_links = Vec::with_capacity(links.len());
+        for path in link_paths {
+            let target = base_blobs.next().ok_or_else(|| {
+                failed("git cat-file --batch returned fewer blobs than asked for")
+            })?;
+            base_links.push(BaseLink { path, target });
+        }
+        Ok(Ok(Patch {
+            changes,
+            base_links,
+        }))
+    }
+
     fn push(
         &self,
         id: &CheckoutId,
@@ -1113,6 +1348,106 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(detail.contains("\\xff"), "{detail}");
+    }
+
+    fn listing(out: &[u8], max: usize) -> Result<Vec<Listed>, GitError> {
+        listed(ls_tree(out).expect("parses"), max, "base")
+    }
+
+    /// A mode outside the four a patch can carry is `Failed`, wherever it
+    /// sits in the listing; the four map to their kinds (ADR-023, D4).
+    #[test]
+    fn merge_join_refuses_unknown_mode() {
+        for mode in ["040000", "100664", "120755", "000000", "644", "x"] {
+            let out = format!("100644 blob a1\ta\x00{mode} blob b1\tb\x00");
+            let detail = match listing(out.as_bytes(), 10) {
+                Err(GitError::Failed { detail }) => detail,
+                other => panic!("{mode}: {:?}", other.map(|l| l.len())),
+            };
+            assert!(detail.contains(&format!("{mode:?}")), "{detail}");
+        }
+        let out =
+            b"100644 blob a\ta\x00100755 blob b\tb\x00120000 blob c\tc\x00160000 commit d\td\x00";
+        let modes: Vec<Mode> = listing(out, 10)
+            .expect("the four modes")
+            .into_iter()
+            .map(|l| l.mode)
+            .collect();
+        assert_eq!(
+            modes,
+            [Mode::File, Mode::Executable, Mode::Symlink, Mode::Gitlink]
+        );
+    }
+
+    /// A listing that is not strictly ascending in the byte order of the
+    /// full paths (a duplicate included) is `Failed`, so the merge join
+    /// never pairs the wrong entries.
+    #[test]
+    fn merge_join_refuses_unsorted_listing() {
+        for out in [
+            &b"100644 blob a\tb\x00100644 blob a\ta\x00"[..],
+            b"100644 blob a\ta\x00100644 blob b\ta\x00",
+            b"100644 blob a\ta/b\x00100644 blob a\ta.c\x00",
+        ] {
+            let detail = match listing(out, 10) {
+                Err(GitError::Failed { detail }) => detail,
+                other => panic!("{out:?}: {:?}", other.map(|l| l.len())),
+            };
+            assert!(detail.contains("ascending"), "{detail}");
+        }
+        // git's own order: `a.c` sorts before the directory `a`.
+        assert!(listing(b"100644 blob a\ta.c\x00100644 blob a\ta/b\x00", 10).is_ok());
+        // A path a tree cannot hold is refused too.
+        assert!(listing(b"100644 blob a\ta//b\x00", 10).is_err());
+    }
+
+    /// The node cap bounds the entries of one listing.
+    #[test]
+    fn merge_join_entry_cap() {
+        let out = b"100644 blob a\ta\x00100644 blob b\tb\x00";
+        assert!(listing(out, 2).is_ok());
+        let detail = match listing(out, 1) {
+            Err(GitError::Failed { detail }) => detail,
+            other => panic!("{:?}", other.map(|l| l.len())),
+        };
+        assert!(
+            detail.contains("2 entries, more than the cap of 1"),
+            "{detail}"
+        );
+    }
+
+    /// The join pairs equal paths, keeps only differing ones and takes the
+    /// head and the tail of either side.
+    #[test]
+    fn merge_join_pairs_paths() {
+        let base = listing(
+            b"100644 blob 1\tb\x00100644 blob 2\tc\x00100755 blob 3\td\x00100644 blob 4\ty\x00",
+            10,
+        )
+        .expect("base");
+        let after = listing(
+            b"100644 blob 0\ta\x00100644 blob 1\tb\x00100644 blob 9\tc\x00100644 blob 3\td\x00",
+            10,
+        )
+        .expect("after");
+        let got: Vec<(Vec<u8>, Side, Side)> = join(&base, &after)
+            .into_iter()
+            .map(|j| (j.path, j.before, j.after))
+            .collect();
+        let side = |mode, oid: &str| Some((mode, oid.to_owned()));
+        assert_eq!(
+            got,
+            [
+                (b"a".to_vec(), None, side(Mode::File, "0")),
+                (b"c".to_vec(), side(Mode::File, "2"), side(Mode::File, "9")),
+                (
+                    b"d".to_vec(),
+                    side(Mode::Executable, "3"),
+                    side(Mode::File, "3")
+                ),
+                (b"y".to_vec(), side(Mode::File, "4"), None),
+            ]
+        );
     }
 
     #[test]

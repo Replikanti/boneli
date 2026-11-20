@@ -20,6 +20,9 @@
 //! `0...0<n>` in hex from a counter, as long as the base's id, so a run
 //! replays to the same ids. A branch that exists is `BranchExists`, and a
 //! pushed commit can be fetched like a fixed one.
+//!
+//! `patch_between` (ADR-023, D4) is [`tree_patch`] of the two checkouts'
+//! trees: every side a `File`, no base links.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -27,7 +30,7 @@ use std::sync::Mutex;
 use boneli_app::{
     BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl, TreePath,
 };
-use boneli_domain::CommitSha;
+use boneli_domain::{Change, CommitSha, Entry, EntryKind, Patch, UnreadablePath};
 
 use crate::lock;
 
@@ -128,7 +131,9 @@ fn changes(from: &Tree, to: &Tree) -> Vec<(TreePath, Option<Vec<u8>>)> {
     out
 }
 
-fn pack_diff(changes: &[(TreePath, Option<Vec<u8>>)]) -> Vec<u8> {
+/// Packs changes into this adapter's diff format: for each, in the order
+/// given, the path, then `1` and the new content, or `0` for a removal.
+pub fn pack_diff(changes: &[(TreePath, Option<Vec<u8>>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (path, content) in changes {
         put_field(&mut out, path.as_bytes());
@@ -164,6 +169,59 @@ fn apply_diff(tree: &Tree, diff: &[u8]) -> Result<Tree, String> {
         }
     }
     Ok(tree)
+}
+
+/// The patch policy's input from `base` to `after` (ADR-023, D4): a merge
+/// join of the two trees in path order. Every side is a `File`, because
+/// this adapter has no modes, symlinks or gitlinks, so `base_links` is
+/// empty. The first changed path that is not UTF-8 is an
+/// [`UnreadablePath`].
+pub fn tree_patch(base: &Tree, after: &Tree) -> Result<Patch, UnreadablePath> {
+    let file = |data: &Vec<u8>| Entry {
+        kind: EntryKind::File,
+        data: data.clone(),
+    };
+    let mut left = base.iter().peekable();
+    let mut right = after.iter().peekable();
+    let mut changes = Vec::new();
+    loop {
+        let (path, before, now) = match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some((b, _)), a) if a.is_none_or(|(a, _)| b < a) => {
+                let Some((path, data)) = left.next() else {
+                    break;
+                };
+                (path, Some(file(data)), None)
+            }
+            (b, Some((a, _))) if b.is_none_or(|(b, _)| a < b) => {
+                let Some((path, data)) = right.next() else {
+                    break;
+                };
+                (path, None, Some(file(data)))
+            }
+            _ => {
+                let (Some((path, was)), Some((_, data))) = (left.next(), right.next()) else {
+                    break;
+                };
+                if was == data {
+                    continue;
+                }
+                (path, Some(file(was)), Some(file(data)))
+            }
+        };
+        let index = changes.len();
+        let path =
+            std::str::from_utf8(path.as_bytes()).map_err(|_| UnreadablePath::Change { index })?;
+        changes.push(Change {
+            path: path.to_owned(),
+            before,
+            after: now,
+        });
+    }
+    Ok(Patch {
+        changes,
+        base_links: Vec::new(),
+    })
 }
 
 /// A checkout: the repository and base commit it came from, and its tree.
@@ -309,6 +367,16 @@ impl Git for MemoryGit {
         let from = self.get(checkout)?;
         let tree = apply_diff(&from.tree, diff).map_err(|e| failed(format!("the diff: {e}")))?;
         Ok(self.checkout(Checkout { tree, ..from }))
+    }
+
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError> {
+        let base = self.tree(base)?;
+        let after = self.tree(after)?;
+        Ok(tree_patch(&base, &after))
     }
 
     fn push(

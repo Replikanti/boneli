@@ -591,6 +591,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DNS_UDP_MESSAGE_BYTES` (512). No call site uses it yet: `TlsDial`,
   `connect` and the CRL and OCSP fetches still resolve with
   `getaddrinfo` until part 2. No new crate.
+- `Git::patch_between(base, after)` (part 1 of #68, ADR-023 proposed):
+  the patch policy's input from two checkouts, every changed path with
+  both full sides in byte order and every symlink of the base, or a
+  `boneli_domain::UnreadablePath` naming the first path that is not
+  UTF-8. `GitCli` merge-joins the `ls-tree -r` listings of both trees, so
+  a gitlink added, removed or retargeted is a `Gitlink` change; a mode
+  outside the four a patch carries, a listing out of order or one over
+  the node cap is `Failed`. `MemoryGit` gets it as `tree_patch`, and
+  `pack_diff` is public. `UnreadablePath` replaces `boneli-git-cli`'s
+  `PatchInputError`. The `Git` contract gains five clauses
+  (`patch-unchanged-empty`, `patch-full-sides`, `patch-added-removed`,
+  `patch-unknown-checkout`, `patch-uncitable-paths` with two sub-checks);
+  counts are 60 clauses and 76 mutant cases. Nothing in the run calls it
+  yet.
 
 - `boneli-sys`: a statistics keeper per sandbox cgroup (ADR-007 D8,
   #54). The last step of `Cgroup::create` starts the thread

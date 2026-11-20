@@ -6,13 +6,16 @@ use std::process::Command;
 
 use boneli_app::contract::{self, git::run};
 use boneli_app::{BranchName, CheckoutId, CommitInfo, Git, GitError, RelativePath, RepoUrl};
-use boneli_domain::CommitSha;
+use boneli_domain::{CommitSha, Patch, UnreadablePath};
 use boneli_git_cli::GitCli;
 
 use crate::support::{
     HostRemote, Source, TempDir, Trip, cli, contract_source, decode, edit, encode, host_git,
     repository, retarget, unpack_all,
 };
+
+/// What `patch_between` returns.
+type PatchResult = Result<Result<Patch, UnreadablePath>, GitError>;
 
 #[test]
 fn git_cli_passes_contract() {
@@ -67,6 +70,9 @@ impl Git for Discovering {
     }
     fn apply(&self, c: &CheckoutId, d: &[u8]) -> Result<CheckoutId, GitError> {
         self.inner.apply(c, d)
+    }
+    fn patch_between(&self, b: &CheckoutId, a: &CheckoutId) -> PatchResult {
+        self.inner.patch_between(b, a)
     }
     fn push(&self, c: &CheckoutId, b: &BranchName, i: &CommitInfo) -> Result<CommitSha, GitError> {
         self.inner.push(c, b, i)
@@ -143,6 +149,9 @@ fn nested_metadata_is_dropped() {
         }
         fn apply(&self, c: &CheckoutId, d: &[u8]) -> Result<CheckoutId, GitError> {
             self.0.apply(c, d)
+        }
+        fn patch_between(&self, b: &CheckoutId, a: &CheckoutId) -> PatchResult {
+            self.0.patch_between(b, a)
         }
         fn push(
             &self,

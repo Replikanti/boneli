@@ -1281,7 +1281,7 @@ pub mod git {
     use super::*;
     use crate::git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
     use crate::path::{RelativePath, TreePath, Uncitable};
-    use boneli_domain::CitationProblem;
+    use boneli_domain::{Change, CitationProblem, Entry, EntryKind, Patch, UnreadablePath};
 
     const PORT: &str = "Git";
 
@@ -1303,6 +1303,11 @@ pub mod git {
         "push-never-overwrites",
         "push-unknown-checkout",
         "uncitable-paths-carried",
+        "patch-unchanged-empty",
+        "patch-full-sides",
+        "patch-added-removed",
+        "patch-unknown-checkout",
+        "patch-uncitable-paths",
     ];
 
     /// The sub-checks of `workspace-metadata-inert`, each with its own
@@ -1324,6 +1329,10 @@ pub mod git {
         "remove-round-trip",
         "add-round-trip",
     ];
+
+    /// The sub-checks of `patch-uncitable-paths`, each with its own mutant
+    /// (ADR-004, D2; ADR-023, D6).
+    pub const PATCH_UNCITABLE_CHECKS: &[&str] = &["uncitable-carried", "unreadable-refused"];
 
     /// An adapter with a repository whose content at the base commit the
     /// adapter's own test knows.
@@ -1424,7 +1433,12 @@ pub mod git {
         push_parent_is_base(&make(), &edit, remote)?;
         push_never_overwrites(&make(), &edit, remote)?;
         push_unknown_checkout(&make(), remote)?;
-        uncitable_paths_carried(&make(), &edit)
+        uncitable_paths_carried(&make(), &edit)?;
+        patch_unchanged_empty(&make())?;
+        patch_full_sides(&make(), &edit)?;
+        patch_added_removed(&make(), &edit)?;
+        patch_unknown_checkout(&make())?;
+        patch_uncitable_paths(&make(), &edit)
     }
 
     /// A content path as the `edit` hook takes it.
@@ -2327,6 +2341,279 @@ pub mod git {
             let workspace = edit(&snapshot, twin, Some(content));
             let what = format!("the base with the twin of path {k} added");
             round_trip(r, &base, &workspace, "add-round-trip", &what)?;
+        }
+        Ok(())
+    }
+
+    /// What `patch_between` gave, for a detail: the number of changes and
+    /// their sides as kind and length, never paths or bytes (ADR-004, D10).
+    fn shape(got: &Result<Result<Patch, UnreadablePath>, GitError>) -> String {
+        let side = |e: &Option<Entry>| e.as_ref().map(|e| (e.kind, e.data.len()));
+        match got {
+            Ok(Ok(patch)) => {
+                let sides: Vec<_> = patch
+                    .changes
+                    .iter()
+                    .map(|c| (side(&c.before), side(&c.after)))
+                    .collect();
+                format!(
+                    "a patch of {} changes with sides {sides:?} and {} base links",
+                    patch.changes.len(),
+                    patch.base_links.len()
+                )
+            }
+            Ok(Err(unreadable)) => format!("{unreadable:?}"),
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    /// Whether `entry` is a regular file, executable or not, with `data`.
+    fn regular(entry: &Entry, data: &[u8]) -> bool {
+        matches!(entry.kind, EntryKind::File | EntryKind::Executable) && entry.data == data
+    }
+
+    /// Equal trees have no changes: a checkout against itself, and the
+    /// base against a second fetch of it, which a real adapter may hold in
+    /// another store (ADR-023, D4). A change with equal sides would be
+    /// refused by the policy as malformed, so an adapter that reports one
+    /// fails every fix.
+    fn patch_unchanged_empty<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "patch-unchanged-empty";
+        let base = checkout(r, clause)?;
+        let again = checkout(r, clause)?;
+        for (which, after) in [("itself", &base), ("a second fetch of the base", &again)] {
+            let got = r.adapter.patch_between(&base, after);
+            ensure(
+                matches!(&got, Ok(Ok(patch)) if patch.changes.is_empty()),
+                PORT,
+                clause,
+                || {
+                    format!(
+                        "the patch from the base to {which} is {}, expected no changes",
+                        shape(&got)
+                    )
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// An edit is one change with both full sides: the base content
+    /// before, the edited content after, the same regular kind. The policy
+    /// counts the base's test declarations from the before side (ADR-013,
+    /// D7), so an adapter that reports every edit as an add hides a removed
+    /// test. The base links do not depend on the after tree.
+    fn patch_full_sides<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "patch-full-sides";
+        let (base, after) = applied(r, clause, edit)?;
+        let got = r.adapter.patch_between(&base, &after);
+        let ok = match &got {
+            Ok(Ok(patch)) => match patch.changes.as_slice() {
+                [
+                    Change {
+                        path,
+                        before: Some(before),
+                        after: Some(now),
+                    },
+                ] => {
+                    path == r.path.as_str()
+                        && regular(before, &r.content)
+                        && now.kind == before.kind
+                        && now.data == r.edited
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        ensure(ok, PORT, clause, || {
+            format!(
+                "after an edit of the fixture's file the patch is {}, expected one change at \
+                 that path from the base content ({} bytes) to the edited content ({} bytes), \
+                 of the same regular kind",
+                shape(&got),
+                r.content.len(),
+                r.edited.len()
+            )
+        })?;
+        let links = |got: &Result<Result<Patch, UnreadablePath>, GitError>| match got {
+            Ok(Ok(patch)) => Some(patch.base_links.clone()),
+            _ => None,
+        };
+        let unchanged = r.adapter.patch_between(&base, &base);
+        ensure(links(&got) == links(&unchanged), PORT, clause, || {
+            format!(
+                "the patch of the edit is {} and the unchanged patch is {}, expected the same \
+                 base links",
+                shape(&got),
+                shape(&unchanged)
+            )
+        })
+    }
+
+    /// One workspace adds [`Repository::missing`] and removes
+    /// [`Repository::path`]: exactly those two changes, in byte order, with
+    /// `None` on the absent sides. The policy refuses a deleted test file
+    /// (ADR-013, D7), so a removal must not be left out.
+    fn patch_added_removed<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let clause = "patch-added-removed";
+        let (base, after) = changed(r, clause, |snapshot| {
+            let added = edit(snapshot, &tree(&r.missing), Some(&r.edited));
+            edit(&added, &tree(&r.path), None)
+        })?;
+        let got = r.adapter.patch_between(&base, &after);
+        let mut want = [(r.path.as_str(), false), (r.missing.as_str(), true)];
+        want.sort();
+        let ok = match &got {
+            Ok(Ok(patch)) => {
+                patch.changes.len() == want.len()
+                    && patch.changes.iter().zip(want).all(|(c, (path, added))| {
+                        let (absent, present, data) = if added {
+                            (&c.before, &c.after, &r.edited)
+                        } else {
+                            (&c.after, &c.before, &r.content)
+                        };
+                        c.path == path
+                            && absent.is_none()
+                            && present.as_ref().is_some_and(|e| regular(e, data))
+                    })
+            }
+            _ => false,
+        };
+        ensure(ok, PORT, clause, || {
+            format!(
+                "after adding a file and removing another the patch is {}, expected two \
+                 changes in byte order: the added file ({} bytes) with no before side and the \
+                 removed one ({} bytes) with no after side",
+                shape(&got),
+                r.edited.len(),
+                r.content.len()
+            )
+        })
+    }
+
+    /// A handle the adapter never issued, on either side, is
+    /// `UnknownCheckout`: an empty patch would read as an empty fix, and a
+    /// patch of the other tree alone as a fix of everything.
+    fn patch_unknown_checkout<G: Git>(r: &Repository<G>) -> Result<(), Violation> {
+        let clause = "patch-unknown-checkout";
+        let issued = checkout(r, clause)?;
+        let unknown = CheckoutId::new(format!("{}-unknown", issued.as_str()));
+        for (which, base, after) in [("base", &unknown, &issued), ("after", &issued, &unknown)] {
+            let got = r.adapter.patch_between(base, after);
+            ensure(
+                matches!(got, Err(GitError::UnknownCheckout)),
+                PORT,
+                clause,
+                || {
+                    format!(
+                        "patch_between with a {which} handle that was never issued gave {}, \
+                         expected UnknownCheckout",
+                        shape(&got)
+                    )
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    const PATCH_UNCITABLE: &str = "patch-uncitable-paths";
+
+    /// The patch of an edit of uncitable path `k`.
+    fn uncitable_patch<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+        base: &CheckoutId,
+        snapshot: &[u8],
+        k: usize,
+    ) -> Result<Result<Result<Patch, UnreadablePath>, GitError>, Violation> {
+        let (path, content) = &r.uncitable[k];
+        let workspace = edit(snapshot, path, Some(&altered(content)));
+        let diff = call(PATCH_UNCITABLE, "diff", r.adapter.diff(base, &workspace))?;
+        let after = call(PATCH_UNCITABLE, "apply", r.adapter.apply(base, &diff))?;
+        Ok(r.adapter.patch_between(base, &after))
+    }
+
+    /// Paths an agent cannot cite reach the policy as they are (ADR-018,
+    /// D5; ADR-023, D6):
+    ///
+    /// - `uncitable-carried`: an edit of each UTF-8 one (a backslash, a
+    ///   blank name) is one change whose path is that text as written, so
+    ///   the policy refuses it as malformed;
+    /// - `unreadable-refused`: an edit of each one that is not UTF-8 is
+    ///   `UnreadablePath::Change { index: 0 }`, never a path rendered
+    ///   through U+FFFD that the policy would accept.
+    ///
+    /// The fixture must hold a backslash path and one that is not UTF-8.
+    /// Details quote indexes and lengths, never path bytes (ADR-004, D10).
+    fn patch_uncitable_paths<G: Git>(
+        r: &Repository<G>,
+        edit: &impl Fn(&[u8], &TreePath, Option<&[u8]>) -> Vec<u8>,
+    ) -> Result<(), Violation> {
+        let wanted = [
+            (
+                "a backslash",
+                Uncitable::Citation(CitationProblem::Backslash),
+            ),
+            ("not UTF-8", Uncitable::NotUtf8),
+        ];
+        for (name, want) in wanted {
+            if !r.uncitable.iter().any(|(p, _)| class(p) == Some(want)) {
+                return Err(violation(
+                    PORT,
+                    PATCH_UNCITABLE,
+                    format!("fixture: no uncitable path is {name}, so that case is not covered"),
+                ));
+            }
+        }
+        let base = checkout(r, PATCH_UNCITABLE)?;
+        let snapshot = call(PATCH_UNCITABLE, "snapshot", r.adapter.snapshot(&base))?;
+        let text = |k: usize| core::str::from_utf8(r.uncitable[k].0.as_bytes()).ok();
+        for k in (0..r.uncitable.len()).filter(|k| text(*k).is_some()) {
+            let got = uncitable_patch(r, edit, &base, &snapshot, k)?;
+            let (_, content) = &r.uncitable[k];
+            let ok = match (&got, text(k)) {
+                (Ok(Ok(patch)), Some(want)) => match patch.changes.as_slice() {
+                    [
+                        Change {
+                            path,
+                            before: Some(before),
+                            after: Some(now),
+                        },
+                    ] => {
+                        path == want && regular(before, content) && regular(now, &altered(content))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            ensure(ok, PORT, PATCH_UNCITABLE, || {
+                format!(
+                    "uncitable-carried: an edit of path {k} gives {}, expected one change at that \
+                     path as written",
+                    shape(&got)
+                )
+            })?;
+        }
+        for k in (0..r.uncitable.len()).filter(|k| text(*k).is_none()) {
+            let got = uncitable_patch(r, edit, &base, &snapshot, k)?;
+            ensure(
+                matches!(got, Ok(Err(UnreadablePath::Change { index: 0 }))),
+                PORT,
+                PATCH_UNCITABLE,
+                || {
+                    format!(
+                        "unreadable-refused: an edit of path {k}, which is not UTF-8, gives {}, \
+                         expected Change {{ index: 0 }}",
+                        shape(&got)
+                    )
+                },
+            )?;
         }
         Ok(())
     }
