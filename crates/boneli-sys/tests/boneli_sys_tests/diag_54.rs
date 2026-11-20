@@ -3,8 +3,10 @@
 //! `memory.stat` may come and still keep a buffered writer from being
 //! OOM-killed, at 64, 128 and 256 MiB, and what one read costs (M2a);
 //! and why reads every 10 ms still lose sometimes (the trace round,
-//! `BONELI_SYS_DIAG_54_ROUND=trace`). No assertions: every run prints one
-//! report line, and the PR records the results.
+//! `BONELI_SYS_DIAG_54_ROUND=trace`); and how late a read of the
+//! sandbox's own `memory.stat` may come, and what one reader per sandbox
+//! costs (M3, `BONELI_SYS_DIAG_54_ROUND=sandbox`). No assertions: every
+//! run prints one report line, and the PR records the results.
 //!
 //! Runs only with `BONELI_SYS_DIAG_54=1`. The trace round reads kernel
 //! trace events through `sudo` when `BONELI_SYS_DIAG_54_TRACE=1` (the
@@ -173,6 +175,10 @@ struct Reads {
     first_after: Option<Duration>,
     /// What every read returned.
     samples: Vec<Sample>,
+    /// The thread's whole CPU time (`CLOCK_THREAD_CPUTIME_ID` at its
+    /// end, so wake-ups count) and its life from the start instant.
+    life_cpu: Duration,
+    life: Duration,
 }
 
 impl Reads {
@@ -228,6 +234,7 @@ fn reader(
         let Ok(t0) = start.recv() else {
             return r;
         };
+        let born = Instant::now();
         let mut buf = [0u8; 4096];
         let mut cur = [0u8; 64];
         let mut deadline = Instant::now();
@@ -244,21 +251,24 @@ fn reader(
             r.bytes = read_stat(&file, &mut buf);
             r.wall.push(w0.elapsed());
             r.cpu.push(thread_cpu().saturating_sub(c0));
-            let current = current.as_ref().map_or(0, |f| {
+            // Without `current` (the cost arms) the content is discarded,
+            // as the keeper does, so the thread CPU is the read's and the
+            // wake-up's only.
+            if let Some(f) = current.as_ref() {
                 let n = read_stat(f, &mut cur);
-                String::from_utf8_lossy(&cur[..n])
+                let current = String::from_utf8_lossy(&cur[..n])
                     .trim()
                     .parse()
-                    .unwrap_or(0)
-            });
-            let text = String::from_utf8_lossy(&buf[..r.bytes]);
-            r.samples.push(Sample {
-                at_ns,
-                file: stat_value(&text, "file"),
-                dirty: stat_value(&text, "file_dirty"),
-                writeback: stat_value(&text, "file_writeback"),
-                current,
-            });
+                    .unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..r.bytes]);
+                r.samples.push(Sample {
+                    at_ns,
+                    file: stat_value(&text, "file"),
+                    dirty: stat_value(&text, "file_dirty"),
+                    writeback: stat_value(&text, "file_writeback"),
+                    current,
+                });
+            }
             deadline += period;
             let now = Instant::now();
             if now >= deadline + period {
@@ -266,6 +276,8 @@ fn reader(
                 deadline = now + period;
             }
         }
+        r.life_cpu = thread_cpu();
+        r.life = born.elapsed();
         r
     })
 }
@@ -1192,6 +1204,196 @@ fn trace_round() {
     ));
 }
 
+/// M3's read intervals of the sandbox's own `memory.stat` in ms.
+const KS_PERIODS: [u64; 4] = [10, 20, 50, 100];
+
+/// M3's runs per KS and KP5 arm (`BONELI_SYS_DIAG_54_RUNS` sets it; the
+/// NS arms run half as often, K0 twice).
+const SANDBOX_RUNS: u32 = 20;
+
+/// The p-th quantile (nearest rank on the sorted values) in us.
+fn quantile_us(v: &[Duration], q: f64) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s: Vec<u64> = v.iter().map(|d| d.as_micros() as u64).collect();
+    s.sort_unstable();
+    s[((s.len() as f64 - 1.0) * q).round() as usize]
+}
+
+/// The C-S cost arm: `n` sandboxes (256 MiB, no `io.max`) each write
+/// 16 MiB buffered and `fdatasync`, all spawned together; each sandbox has
+/// its own reader of its own `memory.stat` at 5 ms, from before the first
+/// spawn until 2 s after the last exit. CPU is each reader thread's whole
+/// `CLOCK_THREAD_CPUTIME_ID`, so wake-ups count.
+fn run_cost_sandbox(n: usize, run: u32) -> (u64, f64) {
+    let tag = format!("CS{n} run {run}");
+    let fixtures: Vec<Fixture> = (0..n).map(|_| Fixture::new("diag54c")).collect();
+    let cgs: Vec<Cgroup> = (0..n)
+        .map(|_| cgroup::create("diag54c", &limits(256 * MIB, IoLimits::none())))
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut starts = Vec::new();
+    let mut readers = Vec::new();
+    for c in &cgs {
+        let (tx, rx) = mpsc::channel::<Instant>();
+        starts.push(tx);
+        readers.push(reader(
+            C_PERIOD,
+            rx,
+            stop.clone(),
+            c.path().join("memory.stat"),
+            None,
+        ));
+    }
+    let size_text = (16 * MIB).to_string();
+    let env = [
+        (support::probe::ACTION_VAR, "io-write"),
+        ("BONELI_PROBE_FILE", "/workspace/buffered"),
+        ("BONELI_PROBE_SIZE", size_text.as_str()),
+        ("BONELI_PROBE_DIRECT", "never"),
+    ];
+    let t0 = Instant::now();
+    for tx in &starts {
+        tx.send(t0).expect("start a reader");
+    }
+    let mut children = Vec::new();
+    for (f, c) in fixtures.iter().zip(&cgs) {
+        let s = spec(f, c, &env, dev_null(), dev_null());
+        children.push(spawn(&s).expect("spawn the probe"));
+    }
+    let mut ok = 0;
+    for c in &mut children {
+        if support::wait_bounded(c, CAP) == ExitStatus::Exited(0) {
+            ok += 1;
+        }
+    }
+    let busy = t0.elapsed();
+    std::thread::sleep(C_IDLE);
+    stop.store(true, Ordering::Relaxed);
+    let all: Vec<Reads> = readers
+        .into_iter()
+        .map(|h| h.join().expect("reader"))
+        .collect();
+    let walls: Vec<Duration> = all.iter().flat_map(|r| r.wall.iter().copied()).collect();
+    let cpus: Vec<Duration> = all.iter().flat_map(|r| r.cpu.iter().copied()).collect();
+    let reads: u64 = all.iter().map(|r| r.wall.len() as u64).sum();
+    let late: u64 = all.iter().map(|r| r.late).sum();
+    let life_cpu: Duration = all.iter().map(|r| r.life_cpu).sum();
+    let life: Duration = all.iter().map(|r| r.life).max().unwrap_or_default();
+    // Per sandbox: its thread's whole CPU over its life, in us per second.
+    let per_sb: Vec<f64> = all
+        .iter()
+        .map(|r| r.life_cpu.as_secs_f64() * 1e6 / r.life.as_secs_f64().max(1e-9))
+        .collect();
+    let mean_sb = per_sb.iter().sum::<f64>() / per_sb.len().max(1) as f64;
+    let max_sb = per_sb.iter().copied().fold(0.0f64, f64::max);
+    let total = life_cpu.as_secs_f64() * 1e6 / life.as_secs_f64().max(1e-9);
+    let per_read_life = life_cpu.as_nanos().checked_div(reads as u128).unwrap_or(0);
+    let p99 = quantile_us(&walls, 0.99);
+    report(&format!(
+        "diag_54 {tag}: {n} sandboxes, {ok} exited 0, busy {} ms, life {} ms; reads {reads} late {late}; \
+         wall us p50 {} p99 {p99} max {}; cpu us per read (around the read) p50 {} p99 {} max {}; \
+         whole-thread cpu ns per read {per_read_life}; cpu us per second per sandbox mean {mean_sb:.1} max {max_sb:.1}; \
+         total cpu us per second {total:.1}",
+        busy.as_millis(),
+        life.as_millis(),
+        quantile_us(&walls, 0.5),
+        quantile_us(&walls, 1.0),
+        quantile_us(&cpus, 0.5),
+        quantile_us(&cpus, 0.99),
+        quantile_us(&cpus, 1.0),
+    ));
+    for c in cgs {
+        let _ = c.destroy();
+    }
+    drop(fixtures);
+    (p99, mean_sb)
+}
+
+/// M3: the sandbox's own `memory.stat` read at `loop_start` and then
+/// every T (KS_T) at 64, 128 and 256 MiB, cut 1.5 s after `loop_start`;
+/// NS_T (256 MiB, no `io.max`, uncut); K0 as the control; KP5 (the
+/// parent every 5 ms at 64 and 128 MiB, for R-S6's kill rate); then the
+/// C-S cost arm. The write arms run in turn, as in the trace round. No
+/// trace events.
+fn sandbox_round() {
+    let k = std::env::var("BONELI_SYS_DIAG_54_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SANDBOX_RUNS);
+    let cut = |mut arm: Arm, target: Target| -> Arm {
+        arm.target = target;
+        arm.cut = Some(TRACE_CUT);
+        arm
+    };
+    let mut arms: Vec<(Arm, u32)> = Vec::new();
+    for (m, w, s) in SIZES {
+        let at = m / MIB;
+        for t in KS_PERIODS {
+            arms.push((
+                cut(
+                    Arm::write(format!("KS{t}@{at}MiB"), m, Some(w), s, Some(t)),
+                    Target::Sandbox,
+                ),
+                k,
+            ));
+        }
+        arms.push((
+            cut(
+                Arm::write(format!("K0@{at}MiB"), m, Some(w), s, None),
+                Target::Sandbox,
+            ),
+            2.min(k),
+        ));
+        if at <= 128 {
+            arms.push((
+                cut(
+                    Arm::write(format!("KP5@{at}MiB"), m, Some(w), s, Some(5)),
+                    Target::Parent,
+                ),
+                k,
+            ));
+        }
+    }
+    for t in KS_PERIODS {
+        let mut arm = Arm::write(format!("NS{t}"), 256 * MIB, None, 512 * MIB, Some(t));
+        arm.target = Target::Sandbox;
+        arms.push((arm, k.div_ceil(2)));
+    }
+    arms.retain(|(a, _)| wanted(&a.name));
+    let mut killed = vec![0u32; arms.len()];
+    let most = arms.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    for r in 1..=most {
+        for (i, (arm, n)) in arms.iter().enumerate() {
+            if r <= *n && run_write(arm, r).killed {
+                killed[i] += 1;
+            }
+        }
+    }
+    let mut cost = Vec::new();
+    for n in C_COUNTS {
+        if !wanted(&format!("CS{n}")) {
+            continue;
+        }
+        for r in 1..=3 {
+            let (p99, per_sb) = run_cost_sandbox(n, r);
+            cost.push(format!(
+                "CS{n} run {r} p99 {p99} us, {per_sb:.1} us/s per sandbox"
+            ));
+        }
+    }
+    report(&format!(
+        "diag_54 summary: {}",
+        arms.iter()
+            .zip(&killed)
+            .map(|((a, n), k)| format!("{} killed {k}/{n}", a.name))
+            .chain(cost)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+}
+
 #[test]
 #[ignore = "host: diagnostic for #54"]
 fn buffered_sweep() {
@@ -1202,6 +1404,11 @@ fn buffered_sweep() {
     host_facts();
     if std::env::var("BONELI_SYS_DIAG_54_ROUND").as_deref() == Ok("trace") {
         trace_round();
+        report("diag_54 done");
+        return;
+    }
+    if std::env::var("BONELI_SYS_DIAG_54_ROUND").as_deref() == Ok("sandbox") {
+        sandbox_round();
         report("diag_54 done");
         return;
     }

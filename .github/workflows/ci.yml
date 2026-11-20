@@ -454,10 +454,10 @@ jobs:
           fi
           echo "OK: no step called Python"
 
-  # Temporary (#54, trace round; removed before the PR leaves draft): the
-  # trace round of diag_54 on 16 x86_64 copies (about half land on an NVMe
-  # workspace, the rest are the control), with kernel trace events through
-  # sudo; the raw traces of killed runs go up as an artifact per copy.
+  # Temporary (#54, M3; removed before the PR leaves draft): the sandbox
+  # round of diag_54 (the sandbox's own memory.stat at 10-100 ms and the
+  # per-sandbox read cost) on 16 x86_64 copies (about 1 in 8 lands on AWS)
+  # and 4 arm64 copies. No trace events, no sudo beyond host setup.
   diag-54:
     name: diag-54 (${{ matrix.arch }} ${{ matrix.copy }})
     runs-on: ${{ matrix.runner }}
@@ -482,6 +482,10 @@ jobs:
           - { arch: x86_64, runner: ubuntu-latest, copy: 14 }
           - { arch: x86_64, runner: ubuntu-latest, copy: 15 }
           - { arch: x86_64, runner: ubuntu-latest, copy: 16 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 1 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 2 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 3 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 4 }
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -495,7 +499,6 @@ jobs:
           echo "lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo absent)"
           echo "workspace fs: $(findmnt -no MAJ:MIN,SOURCE,FSTYPE,OPTIONS -T "$GITHUB_WORKSPACE" 2>/dev/null || echo absent)"
           lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
-          echo "tracefs: $(sudo -n sh -c 'ls -d /sys/kernel/tracing/events/memcg/memcg_flush_stats /sys/kernel/tracing/events/writeback/global_dirty_state 2>&1 | tr "\n" " "')"
       - name: Build
         run: cargo test -p boneli-sys --no-run
       - name: Prepare the runner host
@@ -509,17 +512,8 @@ jobs:
       - name: diag_54
         run: |
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
-            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_DIAG_54=1 BONELI_SYS_DIAG_54_ROUND=trace \
-              BONELI_SYS_DIAG_54_TRACE=1 BONELI_SYS_DIAG_54_TRACE_DIR="$RUNNER_TEMP/diag54-traces" \
+            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_DIAG_54=1 BONELI_SYS_DIAG_54_ROUND=sandbox \
             cargo test -p boneli-sys --test boneli_sys_tests -- --ignored --exact diag_54::buffered_sweep --nocapture
-      - name: Upload the traces
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag54-traces-${{ matrix.arch }}-${{ matrix.copy }}
-          path: ${{ runner.temp }}/diag54-traces
-          if-no-files-found: warn
-          retention-days: 14
 
   audit:
     runs-on: ubuntu-latest
