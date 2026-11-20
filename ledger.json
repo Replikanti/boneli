@@ -10,11 +10,11 @@
    "title": "Release workflow and versioning",
    "epic": null,
    "order": 33,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "7e33749a",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T13:06:07+00:00",
+   "updated_at": "2026-11-20T13:12:13+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1098,14 +1098,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-18T21:39:48+00:00",
-   "issue": 18,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "774fe1a9",
-   "note": null
-  },
-  {
    "at": "2026-11-19T00:55:25+00:00",
    "issue": 18,
    "from": "pr-review",
@@ -1496,6 +1488,14 @@
    "to": "plan-review",
    "by": "98fa59e8",
    "note": "Trace round: cause found (memcg_rstat_updated stops at the sandbox, parent reads stop flushing); re-plan keeper on per-sandbox reads"
+  },
+  {
+   "at": "2026-11-20T13:12:13+00:00",
+   "issue": 22,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "7e33749a",
+   "note": null
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:10:55+00:00",
+ "updated_at": "2026-11-20T13:12:13+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
