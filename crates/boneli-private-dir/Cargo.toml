@@ -1,6 +1,6 @@
 [package]
 name = "boneli-private-dir"
-description = "Boneli support crate: the store-root rules that file-backed adapters share, a private root under ancestors no one else can rename (ADR-021)."
+description = "Boneli support crate: the store-root rules that file-backed adapters share, a private root under ancestors no one else can rename (ADR-021), and the new root of the git adapter (ADR-024)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

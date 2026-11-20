@@ -1,6 +1,7 @@
 //! The store-root rules (ADR-021): the root matrix both consumers pinned
-//! before the rules moved here (ADR-009 D8, ADR-012 D1), and one test per
-//! edge case of the #66 plan.
+//! before the rules moved here (ADR-009 D8, ADR-012 D1), one test per
+//! edge case of the #66 plan, and the new root of the git adapter
+//! (`create_new_root`, ADR-024).
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -11,7 +12,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier};
 
-use boneli_private_dir::{Error, prepare_root};
+use boneli_private_dir::{Error, create_new_root, prepare_root};
 
 /// A directory under `CARGO_TARGET_TMPDIR`, unique per process and call,
 /// removed on drop even when a test left directories without `u+w`.
@@ -690,4 +691,485 @@ fn acl_write_grant_refused() {
     let (path, reason) = rule(&root, prepare_root(&root, &any));
     assert_eq!((path.as_path(), reason), (parent.as_path(), ANCESTOR_MODE));
     assert!(!root.exists(), "the root was created");
+}
+
+// ---- create_new_root (ADR-024): the git adapter's root, which must not
+// exist and is made by one non-recursive `mkdir`. ----
+
+/// Expects `Io` with kind `AlreadyExists` at `at`.
+fn exists_at(root: &Path, at: &Path, result: Result<PathBuf, Error>) {
+    let (path, e) = io(root, result);
+    assert_eq!(path, at, "{root:?}");
+    assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{root:?}: {e}");
+}
+
+/// A parent writable by its group or by others and not sticky is refused
+/// at that parent, whether the root exists or not, and nothing is created
+/// or written; with two offenders the deeper one is reported, with only
+/// the grandparent offending it is reported. Sticky `1777`, `1775` and
+/// `1757` parents and `0o755`, `0o711` and `0o700` ones are accepted, and
+/// the root gets mode `0o700` exactly.
+#[test]
+fn create_new_root_ancestor_rules() {
+    let tmp = TempDir::new("new-ancestors");
+    for (i, mode) in [0o777, 0o775, 0o757, 0o770, 0o707].into_iter().enumerate() {
+        let shared = tmp.path().join(format!("shared{i}"));
+        std::fs::create_dir(&shared).expect("dir");
+        chmod(&shared, mode);
+        let root = shared.join("root");
+        let (path, reason) = rule(&root, create_new_root(&root, &any));
+        assert_eq!((path.as_path(), reason), (shared.as_path(), ANCESTOR_MODE));
+        assert!(!root.exists(), "{mode:o}: the root was created");
+        // An existing root: the rule, not `AlreadyExists`, because the
+        // check comes before `mkdir`.
+        std::fs::create_dir(&root).expect("dir");
+        chmod(&root, 0o700);
+        let (path, reason) = rule(&root, create_new_root(&root, &any));
+        assert_eq!((path.as_path(), reason), (shared.as_path(), ANCESTOR_MODE));
+        assert!(names_in(&root).is_empty(), "{mode:o}: wrote into the root");
+        // Only the grandparent offends.
+        let mid = shared.join("mid");
+        std::fs::create_dir(&mid).expect("dir");
+        chmod(&mid, 0o755);
+        let deep = mid.join("root");
+        let (path, reason) = rule(&deep, create_new_root(&deep, &any));
+        assert_eq!((path.as_path(), reason), (shared.as_path(), ANCESTOR_MODE));
+        assert!(!deep.exists(), "{mode:o}: the deep root was created");
+        // Both offend: the parent is reported.
+        chmod(&mid, mode);
+        let (path, _) = rule(&deep, create_new_root(&deep, &any));
+        assert_eq!(path, mid, "{mode:o}: not the deepest offender");
+        assert!(!deep.exists(), "{mode:o}: the deep root was created");
+    }
+    for (i, mode) in [0o1777, 0o1775, 0o1757, 0o755, 0o711, 0o700]
+        .into_iter()
+        .enumerate()
+    {
+        let parent = tmp.path().join(format!("ok{i}"));
+        std::fs::create_dir(&parent).expect("dir");
+        chmod(&parent, mode);
+        let root = parent.join("root");
+        assert_eq!(create_new_root(&root, &any).expect("accepted"), root);
+        assert_eq!(mode_of(&root), 0o700, "{mode:o}");
+    }
+}
+
+/// A root that exists in any form is `AlreadyExists` at that path, and a
+/// link's target is left alone: a directory, a symlink to a directory, a
+/// dangling symlink, a regular file. `/` and `//` are `AlreadyExists` at
+/// `/`. Creating the returned root again is `AlreadyExists` too.
+#[test]
+fn create_new_root_refuses_an_existing_root() {
+    let tmp = TempDir::new("new-exists");
+    let ok = tmp.private("ok");
+    let dir = ok.join("dir");
+    std::fs::create_dir(&dir).expect("dir");
+    exists_at(&dir, &dir, create_new_root(&dir, &any));
+    assert!(names_in(&dir).is_empty(), "wrote into the directory");
+
+    let target = tmp.private("target");
+    let to_dir = ok.join("to-dir");
+    std::os::unix::fs::symlink(&target, &to_dir).expect("symlink");
+    exists_at(&to_dir, &to_dir, create_new_root(&to_dir, &any));
+    assert!(names_in(&target).is_empty(), "wrote into the link's target");
+
+    let nowhere = ok.join("nowhere");
+    let dangling = ok.join("dangling");
+    std::os::unix::fs::symlink(&nowhere, &dangling).expect("symlink");
+    exists_at(&dangling, &dangling, create_new_root(&dangling, &any));
+    assert!(!nowhere.exists(), "created the dangling link's target");
+
+    let file = ok.join("file");
+    std::fs::write(&file, b"kept").expect("file");
+    exists_at(&file, &file, create_new_root(&file, &any));
+    assert_eq!(std::fs::read(&file).expect("read"), b"kept");
+
+    for given in ["/", "//"] {
+        let root = Path::new(given);
+        exists_at(root, Path::new("/"), create_new_root(root, &any));
+    }
+
+    let made = create_new_root(&ok.join("root"), &any).expect("new");
+    exists_at(&made, &made, create_new_root(&made, &any));
+    assert_eq!(
+        names_in(&ok),
+        vec!["dangling", "dir", "file", "root", "to-dir"]
+    );
+}
+
+/// Eight threads creating one missing root: exactly one succeeds, the
+/// others get `AlreadyExists`. This holds for any interleaving; eight
+/// only make overlapping `mkdir`s likely.
+#[test]
+fn create_new_root_is_exclusive() {
+    let tmp = TempDir::new("new-exclusive");
+    let ok = tmp.private("ok");
+    let root = Arc::new(ok.join("root"));
+    let start = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let root = Arc::clone(&root);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                create_new_root(&root, &any)
+            })
+        })
+        .collect();
+    let (mut created, mut exists) = (0, 0);
+    for t in threads {
+        match t.join().expect("thread") {
+            Ok(path) => {
+                assert_eq!(path, *root);
+                created += 1;
+            }
+            Err(Error::Io { path, source })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                assert_eq!(path, *root);
+                exists += 1;
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    assert_eq!((created, exists), (1, 7));
+}
+
+/// The root is created at the path the check passed, not through the
+/// given path again: a text rule that re-points `<d>/link` from `a` to `b`
+/// when it sees the prospective root finds `a/root` created and returned,
+/// and `b` empty (ADR-021, D3; ADR-024, D2).
+#[test]
+fn create_new_root_creates_at_the_checked_path() {
+    let tmp = TempDir::new("new-repoint");
+    let a = tmp.private("a");
+    let b = tmp.private("b");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&a, &link).expect("symlink");
+    let repointed = RefCell::new(false);
+    let repoint = |p: &Path| {
+        if p.starts_with(&a) && !*repointed.borrow() {
+            std::fs::remove_file(&link).expect("unlink");
+            std::os::unix::fs::symlink(&b, &link).expect("re-point");
+            *repointed.borrow_mut() = true;
+        }
+        Ok(())
+    };
+    let root = link.join("root");
+    let made = create_new_root(&root, &repoint).expect("created");
+    assert!(
+        *repointed.borrow(),
+        "the rule never saw the prospective root"
+    );
+    assert_eq!(made, a.join("root"));
+    assert!(made.is_dir(), "the checked root was not created");
+    assert!(
+        names_in(&b).is_empty(),
+        "created through the re-pointed link"
+    );
+}
+
+/// The text rule sees the given root, then the prospective one, in that
+/// order. A rule that refuses the given root creates nothing; one that
+/// refuses only under a link's target reports the root there and leaves
+/// the target empty.
+#[test]
+fn create_new_root_text_rule_sees_given_then_prospective() {
+    let tmp = TempDir::new("new-rule-order");
+    let real = tmp.private("real");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let seen = RefCell::new(Vec::new());
+    let recording = |p: &Path| {
+        seen.borrow_mut().push(p.to_path_buf());
+        Ok(())
+    };
+    let root = link.join("root");
+    let made = create_new_root(&root, &recording).expect("created");
+    assert_eq!(made, real.join("root"));
+    assert_eq!(*seen.borrow(), vec![root, made]);
+
+    let ok = tmp.private("ok");
+    let root = ok.join("root");
+    let refuse_given = |p: &Path| {
+        if p == root {
+            Err("refused as given")
+        } else {
+            Ok(())
+        }
+    };
+    let (path, reason) = rule(&root, create_new_root(&root, &refuse_given));
+    assert_eq!(
+        (path.as_path(), reason),
+        (root.as_path(), "refused as given")
+    );
+    assert!(names_in(&ok).is_empty(), "created under ok");
+
+    let target = tmp.private("target");
+    let to_target = ok.join("to-target");
+    std::os::unix::fs::symlink(&target, &to_target).expect("symlink");
+    let root = to_target.join("root");
+    let refuse_target = |p: &Path| {
+        if p.starts_with(&target) {
+            Err("refused under the target")
+        } else {
+            Ok(())
+        }
+    };
+    let (path, reason) = rule(&root, create_new_root(&root, &refuse_target));
+    assert_eq!(path, target.join("root"));
+    assert_eq!(reason, "refused under the target");
+    assert!(names_in(&target).is_empty(), "created under the target");
+}
+
+/// A root with a `.` or `..` component is refused on its text before
+/// anything is checked or created. Without the rule `ok/../ok/root`,
+/// `ok/./root` and `./ok/root` would create a root.
+#[test]
+fn create_new_root_dot_components_refused() {
+    let tmp = TempDir::new("new-dots");
+    let ok = tmp.private("ok");
+    for dotted in [
+        "ok/../ok/root",
+        "ok/./root",
+        "ok/root/.",
+        "ok/root/..",
+        "./ok/root",
+    ] {
+        let root = tmp.path().join(dotted);
+        let (path, reason) = rule(&root, create_new_root(&root, &any));
+        assert_eq!(path, root, "{dotted}");
+        assert_eq!(reason, "must not have a `.` or `..` component", "{dotted}");
+        assert_eq!(names_in(tmp.path()), vec!["ok"], "{dotted}");
+        assert!(names_in(&ok).is_empty(), "{dotted}: created under ok");
+    }
+    create_new_root(&ok.join("root"), &any).expect("the plain root");
+}
+
+/// Relative and empty roots are refused as given, before the text rule
+/// runs; doubled and trailing slashes name the plain root; dot look-alikes,
+/// blank and non-UTF-8 names are plain names kept byte for byte; a NUL byte
+/// is `InvalidInput`; a 256-byte name is `ENAMETOOLONG` and creates
+/// nothing, a 255-byte one opens.
+#[test]
+fn create_new_root_path_forms() {
+    let calls = RefCell::new(0);
+    let counting = |_: &Path| {
+        *calls.borrow_mut() += 1;
+        Ok(())
+    };
+    for relative in ["", "root", "~/root", "file:///root"] {
+        let root = Path::new(relative);
+        let (path, reason) = rule(root, create_new_root(root, &counting));
+        assert_eq!(path, root, "{relative:?}");
+        assert_eq!(reason, "must be an absolute path", "{relative:?}");
+    }
+    assert_eq!(*calls.borrow(), 0, "the text rule ran on a relative root");
+
+    let tmp = TempDir::new("new-forms");
+    let ok = tmp.private("ok");
+    let given = PathBuf::from(format!("{}//root/", ok.display()));
+    assert_eq!(
+        create_new_root(&given, &any).expect("slashes"),
+        ok.join("root")
+    );
+
+    let names: [&[u8]; 8] = [
+        "\u{2024}".as_bytes(),
+        "\u{FF0E}\u{FF0E}".as_bytes(),
+        ".\u{200B}".as_bytes(),
+        b" ..",
+        b"%2e%2e",
+        b" ",
+        b"\t",
+        b"caf\xe9",
+    ];
+    for name in names {
+        let root = ok.join(OsStr::from_bytes(name));
+        let made = create_new_root(&root, &any).expect("a plain name");
+        assert_eq!(made, root, "{name:?}");
+        assert_eq!(
+            made.file_name().map(OsStr::as_bytes),
+            Some(name),
+            "{name:?}"
+        );
+        assert_eq!(mode_of(&made), 0o700, "{name:?}");
+    }
+
+    let plain = tmp.private("plain");
+    let nul = plain.join(OsStr::from_bytes(b"a\0b"));
+    let (_, e) = io(&nul, create_new_root(&nul, &any));
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+    let long = plain.join("x".repeat(256));
+    let (path, e) = io(&long, create_new_root(&long, &any));
+    assert_eq!(path, long);
+    assert_eq!(e.raw_os_error(), Some(36), "ENAMETOOLONG: {e}");
+    assert!(
+        names_in(&plain).is_empty(),
+        "created {:?}",
+        names_in(&plain)
+    );
+    let longest = plain.join("x".repeat(255));
+    assert_eq!(create_new_root(&longest, &any).expect("255 bytes"), longest);
+}
+
+/// The parent is never created: a missing one is `NotFound` at the
+/// parent, a dangling link `NotFound` at the link, a link loop `ELOOP`; a
+/// regular file is refused by the ancestor rule; a parent the caller cannot
+/// write (`0o600`) is `PermissionDenied`, not a panic.
+#[test]
+fn create_new_root_parent_errors() {
+    let tmp = TempDir::new("new-parents");
+    let ok = tmp.private("ok");
+    let missing = ok.join("missing");
+    let root = missing.join("root");
+    let (path, e) = io(&root, create_new_root(&root, &any));
+    assert_eq!(path, missing);
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    assert!(names_in(&ok).is_empty(), "created the parent");
+
+    let nowhere = ok.join("nowhere");
+    let dangling = ok.join("dangling");
+    std::os::unix::fs::symlink(&nowhere, &dangling).expect("symlink");
+    let root = dangling.join("root");
+    let (path, e) = io(&root, create_new_root(&root, &any));
+    assert_eq!(path, dangling);
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    assert!(!nowhere.exists(), "created the link's target");
+
+    let l1 = ok.join("l1");
+    let l2 = ok.join("l2");
+    std::os::unix::fs::symlink(&l2, &l1).expect("symlink");
+    std::os::unix::fs::symlink(&l1, &l2).expect("symlink");
+    let root = l1.join("root");
+    let (path, e) = io(&root, create_new_root(&root, &any));
+    assert_eq!(path, l1);
+    assert_eq!(e.raw_os_error(), Some(40), "ELOOP: {e}");
+
+    let file = ok.join("file");
+    std::fs::write(&file, b"").expect("file");
+    let root = file.join("root");
+    let (path, reason) = rule(&root, create_new_root(&root, &any));
+    assert_eq!(path, file);
+    assert_eq!(reason, "an ancestor of the root must be a directory");
+
+    if my_uid() == 0 {
+        println!("skipped: root writes every directory");
+        return;
+    }
+    let closed = tmp.private("closed");
+    chmod(&closed, 0o600);
+    let root = closed.join("root");
+    let (_, e) = io(&root, create_new_root(&root, &any));
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+    chmod(&closed, 0o700);
+    assert!(names_in(&closed).is_empty(), "created under it");
+}
+
+/// A symlinked parent is checked and used where it points: to a private
+/// directory the root is created under the target and the returned path is
+/// resolved; to a `0o777` directory it is refused at the target and nothing
+/// is created there; a link that sits in a `0o777` directory but points to
+/// a private one is fine, because the root is made under the target.
+#[test]
+fn create_new_root_symlinked_ancestors() {
+    let tmp = TempDir::new("new-links");
+    let ok = tmp.private("ok");
+    let private = tmp.private("private");
+    let to_private = ok.join("to-private");
+    std::os::unix::fs::symlink(&private, &to_private).expect("symlink");
+    let made = create_new_root(&to_private.join("root"), &any).expect("private target");
+    assert_eq!(made, private.join("root"));
+    assert_eq!(made.canonicalize().expect("resolve"), made);
+
+    let gw = tmp.path().join("gw");
+    std::fs::create_dir(&gw).expect("dir");
+    chmod(&gw, 0o777);
+    let to_gw = ok.join("to-gw");
+    std::os::unix::fs::symlink(&gw, &to_gw).expect("symlink");
+    let root = to_gw.join("root");
+    let (path, reason) = rule(&root, create_new_root(&root, &any));
+    assert_eq!((path.as_path(), reason), (gw.as_path(), ANCESTOR_MODE));
+    assert!(names_in(&gw).is_empty(), "created under gw");
+
+    let other = tmp.private("other");
+    let in_gw = gw.join("to-other");
+    std::os::unix::fs::symlink(&other, &in_gw).expect("symlink");
+    let made = create_new_root(&in_gw.join("root"), &any).expect("a link in gw");
+    assert_eq!(made, other.join("root"));
+}
+
+/// An ancestor owned by another user, neither root nor the caller, is
+/// refused for its owner: `/proc/<pid>` of a visible process of another
+/// user, mode `0o555`, so only the owner rule can refuse it. Skipped when
+/// no such process is visible.
+#[test]
+fn create_new_root_owner_rule() {
+    let me = my_uid();
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let name = entry.file_name();
+        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if meta.uid() == 0 || meta.uid() == me || meta.mode() & 0o022 != 0 {
+            continue;
+        }
+        let root = dir.join("root");
+        match create_new_root(&root, &any) {
+            Err(Error::Rule { path, reason }) => {
+                assert_eq!(path, dir);
+                assert_eq!(reason, ANCESTOR_OWNER);
+                return;
+            }
+            // The process exited between the listing and the check.
+            Err(Error::Io { .. }) if !dir.exists() => continue,
+            other => panic!("{root:?} gave {other:?}"),
+        }
+    }
+    println!("skipped: no process of another user is visible");
+}
+
+const UMASK_CHILD: &str = "BONELI_PRIVATE_DIR_UMASK_CHILD";
+
+/// The root is `0o700` whatever the umask: a child under `umask 277`,
+/// which clears the only bits `0o700` asks for, first sees a plain
+/// `create_dir` give `0o500`, then gets `0o700` from `create_new_root`.
+#[test]
+fn create_new_root_mode_ignores_umask() {
+    if std::env::var_os(UMASK_CHILD).is_some() {
+        let tmp = TempDir::new("new-umask");
+        // The temp dir itself was made under the umask: `0o500`.
+        chmod(tmp.path(), 0o700);
+        let probe = tmp.path().join("probe");
+        std::fs::create_dir(&probe).expect("probe");
+        assert_eq!(mode_of(&probe), 0o500, "umask 277");
+        let made = create_new_root(&tmp.path().join("root"), &any).expect("created");
+        assert_eq!(mode_of(&made), 0o700);
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("umask 277 && exec \"$0\" \"$@\"")
+        .arg(exe)
+        .args([
+            "--exact",
+            "create_new_root_mode_ignores_umask",
+            "--test-threads",
+            "1",
+        ])
+        .env(UMASK_CHILD, "1")
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran no test: {stdout}"
+    );
 }

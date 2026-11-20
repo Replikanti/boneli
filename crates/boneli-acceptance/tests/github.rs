@@ -467,6 +467,9 @@ fn opens_a_pull_request_on_the_test_repository() {
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("live-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).expect("tmp");
+    // Resolved: a relative `CARGO_TARGET_DIR` puts `..` into the path,
+    // and the adapter refuses a root with dot components (ADR-024).
+    let tmp = tmp.canonicalize().expect("resolve tmp");
     let trace = tmp.join("trace2.json");
     let wrapper = tmp.join("tracing-git");
     fs::write(

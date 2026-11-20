@@ -1,5 +1,5 @@
 //! Boneli support crate: the store-root rules that file-backed adapters
-//! share (ADR-021).
+//! share (ADR-021), and the root of the git adapter (ADR-024).
 //!
 //! A store root is a private directory under ancestors that no one else can
 //! rename: [`prepare_root`] checks a root, creates it `0o700` where it is
@@ -8,12 +8,17 @@
 //! ADR-012 D1 (`boneli-store-fs`), which held one copy each until #66. A
 //! consumer adds its own rules on the root's text through the `text_rule`
 //! argument; the overlay separators of `boneli-oci` stay there.
+//!
+//! [`create_new_root`] applies the same rules to a root that must not
+//! exist yet, the git adapter's (ADR-024): it is made by one non-recursive
+//! `mkdir` under its resolved, checked parent, and one that exists is an
+//! error.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Why a root was refused.
@@ -120,6 +125,19 @@ fn ancestor_problem(facts: AncestorFacts, uid: u32) -> Option<&'static str> {
     None
 }
 
+/// Why a root owned by `owner` with `mode` is refused for the caller
+/// `uid`, if it is: someone else owns it, or its group or others hold a
+/// permission bit.
+fn root_problem(owner: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    if owner != uid {
+        return Some("must be owned by the caller");
+    }
+    if mode & 0o077 != 0 {
+        return Some("must have no group or other permission bits");
+    }
+    None
+}
+
 /// Checks `dir` and each of its ancestors by [`ancestor_problem`], from
 /// `dir` up, so the deepest offender is reported. `dir` must be resolved,
 /// so the walk sees no symlink.
@@ -214,19 +232,75 @@ pub fn prepare_root(
     if !meta.is_dir() {
         return Err(rule(&resolved, "must be a directory"));
     }
-    if meta.uid() != uid {
-        return Err(rule(&resolved, "must be owned by the caller"));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(rule(
-            &resolved,
-            "must have no group or other permission bits",
-        ));
+    if let Some(reason) = root_problem(meta.uid(), meta.mode(), uid) {
+        return Err(rule(&resolved, reason));
     }
     if let Some(parent) = resolved.parent() {
         check_ancestors(parent, uid)?;
     }
     Ok(resolved)
+}
+
+/// Checks `root` and creates it, `0o700` whatever the umask, where it must
+/// not exist yet; returns it as created (ADR-024, D2):
+///
+/// - `root` must be absolute, without a `.` or `..` component, and pass
+///   `text_rule`;
+/// - its parent must exist; it is resolved, and it and each of its
+///   ancestors must pass the ancestor check of [`prepare_root`];
+/// - the root is the resolved parent joined with the root's name, which
+///   must pass `text_rule` too, and is made there by one non-recursive
+///   `mkdir`, so a root that exists in any form (a directory, a file, a
+///   symlink, a dangling one) is an [`Error::Io`] of kind
+///   [`io::ErrorKind::AlreadyExists`], and of two callers racing on one
+///   root exactly one succeeds. `/` has no parent and is that error too.
+///
+/// `text_rule` returns the reason it refuses a path; it sees the root as
+/// given, then as it will be created.
+pub fn create_new_root(
+    root: &Path,
+    text_rule: &dyn Fn(&Path) -> Result<(), &'static str>,
+) -> Result<PathBuf, Error> {
+    if !root.is_absolute() {
+        return Err(rule(root, "must be an absolute path"));
+    }
+    // The parent is resolved, and `..` would make the root's name refer to
+    // a directory other than the one checked.
+    if has_dot_component(root) {
+        return Err(rule(root, "must not have a `.` or `..` component"));
+    }
+    text_rule(root).map_err(|reason| rule(root, reason))?;
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        // Only `/` (and `//`) is left without either: it exists.
+        let fs_root = Path::new("/");
+        return Err(io_err(fs_root, io::ErrorKind::AlreadyExists.into()));
+    };
+    let uid = own_uid(root)?;
+    // Not created: the parent is the operator's configuration (ADR-024, D2).
+    let parent = parent.canonicalize().map_err(|e| io_err(parent, e))?;
+    check_ancestors(&parent, uid)?;
+    // Created where the check looked, not through `root` again: an
+    // ancestor link re-pointed since cannot redirect it (ADR-021, D3).
+    let prospective = parent.join(name);
+    text_rule(&prospective).map_err(|reason| rule(&prospective, reason))?;
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&prospective)
+        .map_err(|e| io_err(&prospective, e))?;
+    // The umask may have cleared bits of `0o700`; ADR-010 D7 states the
+    // mode, not the mode under some umask.
+    fs::set_permissions(&prospective, fs::Permissions::from_mode(0o700))
+        .map_err(|e| io_err(&prospective, e))?;
+    // A filesystem that ignores `chmod` (vfat with `quiet`, CIFS without
+    // unix extensions) reports success and keeps the mode it made, so the
+    // result is checked as `prepare_root` checks a root (ADR-024, D2).
+    let meta = fs::symlink_metadata(&prospective).map_err(|e| io_err(&prospective, e))?;
+    if let Some(reason) = root_problem(meta.uid(), meta.mode(), uid) {
+        // Made by this call and still empty.
+        let _ = fs::remove_dir(&prospective);
+        return Err(rule(&prospective, reason));
+    }
+    Ok(prospective)
 }
 
 #[cfg(test)]
@@ -251,6 +325,33 @@ mod tests {
             owner,
             mode,
             is_fs_root,
+        }
+    }
+
+    /// The root rule, which `create_new_root` applies to the root it made
+    /// because a filesystem may ignore `chmod` (ADR-024, D2).
+    #[test]
+    fn root_problem_table() {
+        let owner = Some("must be owned by the caller");
+        let bits = Some("must have no group or other permission bits");
+        let rows: &[(u32, u32, Option<&str>)] = &[
+            (ME, DIR | 0o700, None),
+            (ME, DIR | 0o1700, None),
+            (ME, DIR | 0o755, bits),
+            (ME, DIR | 0o740, bits),
+            (ME, DIR | 0o701, bits),
+            (ME, DIR | 0o710, bits),
+            (ME, DIR | 0o704, bits),
+            (OTHER, DIR | 0o700, owner),
+            (0, DIR | 0o700, owner),
+            (OVERFLOW, DIR | 0o755, owner),
+        ];
+        for &(owner_uid, mode, want) in rows {
+            assert_eq!(
+                root_problem(owner_uid, mode, ME),
+                want,
+                "owner {owner_uid} mode {mode:o}"
+            );
         }
     }
 

@@ -605,6 +605,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `patch-unknown-checkout`, `patch-uncitable-paths` with two sub-checks);
   counts are 60 clauses and 76 mutant cases. Nothing in the run calls it
   yet.
+- `boneli_private_dir::create_new_root` (#85, ADR-024): the root rules of
+  ADR-021 for a root that must not exist yet. The parent is resolved and
+  checked with every ancestor, and the root is made by one non-recursive
+  `mkdir` at the resolved parent, mode `0o700` whatever the umask; a root
+  that exists in any form is `Io` with kind `AlreadyExists`. The new root
+  is read back and removed with a `Rule` error when it is not the
+  caller's or keeps group or other bits, as on a filesystem that ignores
+  `chmod`.
+- `boneli_git_cli::OpenError::Root` (#85, ADR-024): a root, or one of its
+  ancestors, that breaks a root rule.
 
 - `boneli-sys`: a statistics keeper per sandbox cgroup (ADR-007 D8,
   #54). The last step of `Cgroup::create` starts the thread
@@ -625,6 +635,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `GitCli::open` (#85, ADR-024) creates its root through
+  `boneli_private_dir::create_new_root`, before git runs: a root with a
+  `.` or `..` component, or under an ancestor that is not a directory, is
+  owned by someone other than root or the runner, or is writable by its
+  group or others without the sticky bit (also when the group is the
+  runner's own), is `OpenError::Root`. A file as the parent is now
+  `Root`, not an `ENOTDIR` `Io`. The root is created under the resolved
+  parent, and `GitCli::root()` returns that path. An `Io` error names the
+  path and keeps its kind.
 - The root rules of `boneli-oci` and `boneli-store-fs` live in
   `boneli-private-dir` (#66, ADR-021); the error variants and texts of both
   adapters are unchanged. A missing root is created at the path the

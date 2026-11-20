@@ -197,7 +197,8 @@ unchanged.
 - `boneli-git-cli` keeps its own `private_dir`: its `open` creates a new
   directory non-recursively and refuses one that exists (ADR-010), and
   its root has no ancestor check. Whether it should adopt these rules is
-  #85. `boneli-forge-github` keeps its three-line `own_uid` as part of
+  #85. ADR-024 adopts them for the root through `create_new_root`; its
+  subdirectories keep `private_dir`. `boneli-forge-github` keeps its three-line `own_uid` as part of
   the key-file rule of ADR-014, which checks no ancestor by decision.
 - The skip-prone tests (another user's process, ACLs, `/usr` as root)
   print `skipped` where the host cannot run them; the pure ancestor table
