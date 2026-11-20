@@ -1134,11 +1134,11 @@
    "title": "Wire the patch policy into the run: Git port diff as Patch, gate between FixWritten and VerifyFix",
    "epic": null,
    "order": 43,
-   "state": "pr-review",
-   "owner": "47331c5b",
+   "state": "done",
+   "owner": null,
    "pr": 91,
    "note": "PR 1 #89 merged (26a8050); PR 2 wiring next",
-   "updated_at": "2026-11-20T21:03:00+00:00",
+   "updated_at": "2026-11-20T22:05:43+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1149,10 +1149,10 @@
     "debugger"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:06:41+00:00",
-   "issue": 54,
-   "from": "plan-review",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #78 open"
-  },
   {
    "at": "2026-11-20T15:11:11+00:00",
    "issue": 54,
@@ -1710,6 +1702,14 @@
    "to": "implementing",
    "by": "dispatch",
    "note": "parked: one large task too many for its holder's profile; opens again when there is a place"
+  },
+  {
+   "at": "2026-11-20T22:05:43+00:00",
+   "issue": 68,
+   "from": "pr-review",
+   "to": "done",
+   "by": "47331c5b",
+   "note": null
   }
  ],
  "open": [
@@ -1737,7 +1737,6 @@
   55,
   56,
   57,
-  68,
   69,
   80,
   81,
@@ -1745,7 +1744,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:04:48+00:00",
+ "updated_at": "2026-11-20T22:05:45+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
