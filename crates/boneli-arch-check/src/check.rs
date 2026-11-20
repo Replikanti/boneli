@@ -1037,7 +1037,6 @@ pub(crate) fn check(root: &Path) -> Result<Report, ToolError> {
 mod tests {
     use super::{inherits_workspace_lints, load_toml, skipped_dirs, sys_lints};
     use crate::tmp::TempDir;
-    use boneli_toml::Value;
     use std::path::Path;
 
     fn toml(text: &str) -> boneli_toml::Table {
@@ -1147,7 +1146,6 @@ mod tests {
             missing[0],
             "clippy.odd is missing (needs forbid or stricter)"
         );
-        let _ = Value::Boolean(true);
     }
 
     /// The root's `target` and `$CARGO_TARGET_DIR` are skipped; a relative

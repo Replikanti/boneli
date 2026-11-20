@@ -28,9 +28,6 @@ use crate::tmp::TempDir;
 /// so the runner needs no hashing.
 pub(crate) const CHECKSUM: &str = "{\"files\":{},\"package\":null}";
 
-/// The variable that names the reference checker for a parity run.
-const PARITY_ENV: &str = "BONELI_ARCH_PARITY";
-
 /// A failure of the runner itself, which exits 2.
 #[derive(Debug)]
 pub(crate) struct RunnerError(String);
@@ -236,18 +233,6 @@ struct Ctx {
     fixtures: PathBuf,
     target_dir: PathBuf,
     checker: PathBuf,
-    /// The reference checker of a parity run.
-    reference: Option<PathBuf>,
-    parity: Parity,
-}
-
-/// What a parity run found across all runs.
-#[derive(Default)]
-struct Parity {
-    runs: usize,
-    identical: usize,
-    lines: usize,
-    differing: Vec<String>,
 }
 
 /// Builds one fixture workspace under `tmp`; returns its root.
@@ -373,7 +358,6 @@ fn parse_fail(line: &str) -> Option<(String, String, Option<usize>)> {
 /// count of the summary line, and what is malformed.
 struct Parsed {
     fails: Vec<(String, String, Option<usize>)>,
-    lines: Vec<String>,
     summary: Option<usize>,
     problems: Vec<String>,
 }
@@ -382,7 +366,6 @@ fn parse_output(stdout: &str) -> Parsed {
     let lines = splitlines(stdout);
     let mut parsed = Parsed {
         fails: Vec::new(),
-        lines: Vec::new(),
         summary: None,
         problems: Vec::new(),
     };
@@ -401,7 +384,6 @@ fn parse_output(stdout: &str) -> Parsed {
         let last = i + 1 == lines.len();
         if let Some(fail) = parse_fail(line) {
             parsed.fails.push(fail);
-            parsed.lines.push((*line).to_owned());
         } else if let (Some(summary), true) = (summary_of(line), last) {
             let fails = parsed.fails.len();
             match summary {
@@ -433,10 +415,9 @@ fn exit_code(out: &Output) -> i32 {
 }
 
 /// The checker's command for a fixture workspace.
-fn checker_command(ctx: &Ctx, program: &Path, pre: &[&OsStr], ws: &Path) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.args(pre)
-        .arg("--root")
+fn checker_command(ctx: &Ctx, ws: &Path) -> Command {
+    let mut cmd = Command::new(&ctx.checker);
+    cmd.arg("--root")
         .arg(ws)
         .current_dir(ws)
         .env("CARGO_TARGET_DIR", &ctx.target_dir)
@@ -445,7 +426,7 @@ fn checker_command(ctx: &Ctx, program: &Path, pre: &[&OsStr], ws: &Path) -> Comm
 }
 
 /// Runs one case; `None` when it matches its expect file, else a report.
-fn run_case(ctx: &mut Ctx, case: Option<&Path>, snippet: Option<&str>) -> Result<Option<String>> {
+fn run_case(ctx: &Ctx, case: Option<&Path>, snippet: Option<&str>) -> Result<Option<String>> {
     let mut expect = BTreeSet::new();
     if let Some(case) = case {
         for line in splitlines(&read_text(&case.join("expect"))?) {
@@ -472,19 +453,9 @@ fn run_case(ctx: &mut Ctx, case: Option<&Path>, snippet: Option<&str>) -> Result
         .env("CARGO_TARGET_DIR", &ctx.target_dir)
         .env_remove("RUSTFLAGS")
         .output();
-    let res = checker_command(ctx, &ctx.checker, &[], &ws)
+    let res = checker_command(ctx, &ws)
         .output()
         .map_err(|e| RunnerError::io(ctx.checker.display(), &e))?;
-    let reference = match &ctx.reference {
-        Some(script) => {
-            let pre = [OsStr::new("-I"), script.as_os_str()];
-            let out = checker_command(ctx, Path::new("python3"), &pre, &ws)
-                .output()
-                .map_err(|e| RunnerError::io("the reference checker", &e))?;
-            Some(out)
-        }
-        None => None,
-    };
     drop(tmp);
 
     let stdout = String::from_utf8_lossy(&res.stdout).into_owned();
@@ -508,71 +479,11 @@ fn run_case(ctx: &mut Ctx, case: Option<&Path>, snippet: Option<&str>) -> Result
             got.iter().collect::<Vec<_>>()
         ));
     }
-    let mut extra = String::new();
-    if let Some(reference) = reference {
-        let ref_stdout = String::from_utf8_lossy(&reference.stdout).into_owned();
-        let theirs = parse_output(&ref_stdout);
-        for p in &theirs.problems {
-            problems.push(format!("reference: {p}"));
-        }
-        if exit_code(&reference) != exit_code(&res) {
-            problems.push(format!(
-                "parity: exit {} != reference exit {}",
-                exit_code(&res),
-                exit_code(&reference)
-            ));
-        }
-        if theirs.summary != parsed.summary {
-            problems.push(format!(
-                "parity: summary {:?} != reference summary {:?}",
-                parsed.summary, theirs.summary
-            ));
-        }
-        let mut ours_key = parsed.fails.clone();
-        let mut theirs_key = theirs.fails.clone();
-        ours_key.sort();
-        theirs_key.sort();
-        if ours_key != theirs_key {
-            problems.push(format!(
-                "parity: (rule, path, line) differ: {ours_key:?} != reference {theirs_key:?}"
-            ));
-        }
-        ctx.parity.runs += 1;
-        ctx.parity.lines += parsed.lines.len();
-        let mut rest: Vec<String> = theirs.lines.clone();
-        let mut only_ours = Vec::new();
-        for line in &parsed.lines {
-            match rest.iter().position(|l| l == line) {
-                Some(i) => {
-                    rest.remove(i);
-                    ctx.parity.identical += 1;
-                }
-                None => only_ours.push(line.clone()),
-            }
-        }
-        if !only_ours.is_empty() || !rest.is_empty() {
-            let label = case
-                .and_then(Path::file_name)
-                .map_or_else(|| "base".to_owned(), |n| n.to_string_lossy().into_owned());
-            let mut entry = format!("{} {}", label, snippet.map_or(String::new(), show));
-            for l in &only_ours {
-                entry.push_str(&format!("\n  rust:      {l}"));
-            }
-            for l in &rest {
-                entry.push_str(&format!("\n  reference: {}", show(l)));
-            }
-            ctx.parity.differing.push(entry);
-        }
-        extra = format!(
-            "--- reference stdout\n{ref_stdout}--- reference stderr\n{}",
-            tail(&String::from_utf8_lossy(&reference.stderr))
-        );
-    }
     if problems.is_empty() {
         return Ok(None);
     }
     Ok(Some(format!(
-        "{}\n--- stdout\n{stdout}--- stderr\n{}{extra}",
+        "{}\n--- stdout\n{stdout}--- stderr\n{}",
         problems.join("; "),
         tail(&String::from_utf8_lossy(&res.stderr))
     )))
@@ -589,16 +500,11 @@ fn tail(s: &str) -> &str {
 
 fn runner(repo: &Path) -> Result<Ctx> {
     let checker = std::env::current_exe().map_err(|e| RunnerError::io("current_exe", &e))?;
-    let reference = std::env::var_os(PARITY_ENV)
-        .filter(|v| !v.is_empty())
-        .map(|v| crate::fs::resolve(Path::new(&v)));
     Ok(Ctx {
         repo: repo.to_path_buf(),
         fixtures: repo.join("tools/fixtures/arch"),
         target_dir: repo.join("target/arch-fixtures"),
         checker,
-        reference,
-        parity: Parity::default(),
     })
 }
 
@@ -623,7 +529,7 @@ fn say(out: &mut dyn Write, text: &str) -> Result<()> {
 }
 
 fn run_all(repo: &Path, out: &mut dyn Write) -> Result<u8> {
-    let mut ctx = runner(repo)?;
+    let ctx = runner(repo)?;
     let cases_dir = ctx.fixtures.join("cases");
     let mut cases: Vec<PathBuf> = Vec::new();
     for entry in
@@ -642,7 +548,7 @@ fn run_all(repo: &Path, out: &mut dyn Write) -> Result<u8> {
     let mut covered: BTreeSet<String> = BTreeSet::new();
 
     // base: an empty case, which must give no FAIL line.
-    let report = run_case(&mut ctx, None, None)?;
+    let report = run_case(&ctx, None, None)?;
     runs += 1;
     say(
         out,
@@ -681,7 +587,7 @@ fn run_all(repo: &Path, out: &mut dyn Write) -> Result<u8> {
                 None => name.clone(),
                 Some(_) => format!("{name} #{}", n + 1),
             };
-            let report = run_case(&mut ctx, Some(case), snippet.as_deref())?;
+            let report = run_case(&ctx, Some(case), snippet.as_deref())?;
             runs += 1;
             say(
                 out,
@@ -707,33 +613,12 @@ fn run_all(repo: &Path, out: &mut dyn Write) -> Result<u8> {
     for f in &failures {
         say(out, &format!("\n{f}"))?;
     }
-    if ctx.reference.is_some() {
-        let p = &ctx.parity;
-        say(
-            out,
-            &format!(
-                "\nparity: {} of {} FAIL lines byte-identical; {} run(s) with differing lines (report-only):",
-                p.identical,
-                p.lines,
-                p.differing.len()
-            ),
-        )?;
-        for d in &p.differing {
-            say(out, d)?;
-        }
-    }
     if !failures.is_empty() {
         say(
             out,
             &format!("\nfixtures: {runs} run(s), {} problem(s)", failures.len()),
         )?;
         return Ok(1);
-    }
-    if ctx.reference.is_some() {
-        say(
-            out,
-            &format!("\nparity: {} run(s), both checkers agree", ctx.parity.runs),
-        )?;
     }
     say(
         out,
@@ -750,7 +635,6 @@ mod tests {
     use super::{cargo_config, file_uri, git_commit, parse_fail, parse_output};
     use crate::py_vectors;
     use crate::tmp::TempDir;
-    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
@@ -825,7 +709,6 @@ mod tests {
         ];
         git_commit(repo.path(), &envs).expect("commit despite the signing config");
         assert!(repo.path().join(".git").is_dir());
-        let _ = OsStr::new("");
     }
 
     #[test]

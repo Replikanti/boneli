@@ -1,9 +1,9 @@
 #!/bin/sh
 # Architecture and dependency rules of the workspace. The checker, its rules
-# and the fixture runner are the crate crates/boneli-arch-check; why each
-# rule exists is recorded in docs/adr/001-core-purity-and-dependency-allowlist.md,
-# and why the checker is built this way in
-# docs/adr/015-architecture-checker-in-rust.md.
+# and the fixture runner are the Rust crate crates/boneli-arch-check, which
+# replaced the earlier script checker (ADR-015); why each rule exists is
+# recorded in docs/adr/001-core-purity-and-dependency-allowlist.md, and why
+# the checker is built this way in docs/adr/015-architecture-checker-in-rust.md.
 #
 # The checker is built from `/` with an explicit manifest path, so that no
 # cargo config or toolchain file in the checkout applies to its build (the

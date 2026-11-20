@@ -1,4 +1,5 @@
-# Architecture and dependency policy, read by tools/check_architecture.py.
+# Architecture and dependency policy, read by the architecture checker
+# (crates/boneli-arch-check, run by tools/check-architecture.sh).
 # Why each part exists: docs/adr/001-core-purity-and-dependency-allowlist.md.
 #
 # Format: only [table] headers, bare keys, basic strings and arrays of

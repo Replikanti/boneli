@@ -493,8 +493,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through `boneli-json`, under limits. CI runs the architecture steps
   before clippy and the tests, rejects committed build output and proves
   that a committed `rustc-wrapper` does not reach the checker's build.
-  For the parity stage CI also runs the former Python checker on the
-  workspace and on every fixture run.
+  During the parity stage CI ran the former Python checker on the
+  workspace and on every fixture run, and both agreed on all 202 runs.
+- Nothing in the repository runs Python: `tools/check_architecture.py` is
+  removed, and CI's `check` and `sandbox` jobs shadow every Python
+  executable on PATH with a stub that logs the call and exits 127, and
+  fail if any step called one (ADR-015 D10). Two fixtures pin TOML the checker refuses
+  where the former checker read it: a float in `[package.metadata]` and a
+  date in the policy (ADR-015 D6).
 - The `boneli-oci` test that ran a Python helper to observe a process
   whose main thread has exited is replaced by `tests/exited_main_thread.rs`,
   a `harness = false` test on `boneli_sys::exit_main_thread` that asserts

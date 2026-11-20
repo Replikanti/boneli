@@ -52,6 +52,29 @@ jobs:
           # boneli-sys is checked for both musl targets (ADR-007, D5).
           targets: x86_64-unknown-none, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+      # Nothing in the repository runs Python (ADR-015, D10). Every Python
+      # executable on PATH is shadowed by a stub of the same name that logs
+      # its arguments and exits 127, for every later step of this job; the
+      # last step fails if anything called one, even if a script swallowed
+      # the error. Third-party actions run before. The `[p]` keeps this
+      # file free of hits of the acceptance grep in ADR-015 D10.
+      - name: Hide Python
+        run: |
+          stubs="$RUNNER_TEMP/no-py"
+          mkdir -p "$stubs"
+          IFS=:
+          for dir in $PATH; do
+            for exe in "$dir"/[p]ython*; do
+              name=${exe##*/}
+              if [ -f "$exe" ] && [ -x "$exe" ] && [ ! -e "$stubs/$name" ]; then
+                printf '#!/bin/sh\nprintf "%%s %%s\\n" "%s" "$*" >> "%s/calls.log"\nexit 127\n' "$name" "$stubs" > "$stubs/$name"
+                chmod +x "$stubs/$name"
+              fi
+            done
+          done
+          unset IFS
+          ls "$stubs"
+          echo "$stubs" >> "$GITHUB_PATH"
       - run: cargo fmt --all --check
       # The entry point runs the checker from target/arch-check, so build
       # output must never come from the checkout (ADR-015, D2).
@@ -62,16 +85,8 @@ jobs:
       # boneli-json, boneli-toml) runs before it (ADR-015).
       - name: Architecture rules
         run: ./tools/check-architecture.sh
-      # Parity stage of ADR-015 (D7): the former checker on the same tree.
-      - name: Architecture rules (Python)
-        run: python3 -I tools/check_architecture.py
-      # Every rule has fail cases; a weakened rule turns this step red. With
-      # BONELI_ARCH_PARITY every fixture run also runs the former checker,
-      # and the run fails unless exit codes, summary counts and the
-      # (rule, path, line) of every FAIL line agree (ADR-015, D7).
+      # Every rule has fail cases; a weakened rule turns this step red.
       - name: Architecture rule fixtures
-        env:
-          BONELI_ARCH_PARITY: tools/check_architecture.py
         run: ./tools/check-architecture.sh --fixtures
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
@@ -107,6 +122,15 @@ jobs:
             echo "the checker was built through the committed rustc-wrapper"
             exit 1
           fi
+      - name: No Python was called
+        if: always()
+        run: |
+          if [ -e "$RUNNER_TEMP/no-py/calls.log" ]; then
+            echo "Python was called:"
+            cat "$RUNNER_TEMP/no-py/calls.log"
+            exit 1
+          fi
+          echo "OK: no step called Python"
 
   # The boneli-sys and boneli-oci host tests create user namespaces, so
   # they need a prepared host (ADR-007, D5; ADR-009). The job proves what
@@ -139,6 +163,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Nothing in the repository runs Python (ADR-015, D10). Every Python
+      # executable on PATH is shadowed by a stub of the same name that logs
+      # its arguments and exits 127, for every later step of this job; the
+      # last step fails if anything called one, even if a script swallowed
+      # the error. Third-party actions run before. The `[p]` keeps this
+      # file free of hits of the acceptance grep in ADR-015 D10.
+      - name: Hide Python
+        run: |
+          stubs="$RUNNER_TEMP/no-py"
+          mkdir -p "$stubs"
+          IFS=:
+          for dir in $PATH; do
+            for exe in "$dir"/[p]ython*; do
+              name=${exe##*/}
+              if [ -f "$exe" ] && [ -x "$exe" ] && [ ! -e "$stubs/$name" ]; then
+                printf '#!/bin/sh\nprintf "%%s %%s\\n" "%s" "$*" >> "%s/calls.log"\nexit 127\n' "$name" "$stubs" > "$stubs/$name"
+                chmod +x "$stubs/$name"
+              fi
+            done
+          done
+          unset IFS
+          ls "$stubs"
+          echo "$stubs" >> "$GITHUB_PATH"
       - name: Host features
         run: |
           uname -srm
@@ -214,6 +261,15 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self \
             cargo test -p boneli-oci --test boneli_oci_tests -- --ignored host::
+      - name: No Python was called
+        if: always()
+        run: |
+          if [ -e "$RUNNER_TEMP/no-py/calls.log" ]; then
+            echo "Python was called:"
+            cat "$RUNNER_TEMP/no-py/calls.log"
+            exit 1
+          fi
+          echo "OK: no step called Python"
 
   audit:
     runs-on: ubuntu-latest

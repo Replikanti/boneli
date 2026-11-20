@@ -448,6 +448,8 @@ mod tests {
             std::fs::create_dir_all(root.join(d)).expect("dir");
         }
         symlink("missing", root.join(".cargo/config.toml")).expect("dangling");
+        std::fs::write(root.join("dir/real.toml"), "").expect("file");
+        symlink("../../dir/real.toml", root.join("a/.cargo/config.toml")).expect("link");
         std::fs::write(root.join("a/.cargo/config"), "").expect("file");
         std::fs::write(root.join("nested/.git"), "gitdir: x").expect("nested checkout");
         std::fs::write(root.join("nested/.cargo/config.toml"), "").expect("file");
@@ -465,6 +467,7 @@ mod tests {
             cargo: vec![
                 root.join(".cargo/config.toml"),
                 root.join("a/.cargo/config"),
+                root.join("a/.cargo/config.toml"),
             ],
             clippy: vec![root.join("a/.clippy.toml")],
             toolchain: vec![root.join("a/rust-toolchain")],

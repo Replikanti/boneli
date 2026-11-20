@@ -1,0 +1,8 @@
+[external.leftpad]
+reason = "padding"
+decision = "ARCHITECTURE"
+added = 2026-11-19
+
+[external.leftpad.pulled-by.boneli-http]
+reason = "pads"
+decision = "ARCHITECTURE"

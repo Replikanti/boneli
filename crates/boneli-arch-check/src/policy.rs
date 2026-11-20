@@ -617,7 +617,8 @@ impl Checker<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Policy, adr_accepted, check_policy, names_build_script, strip_html_comments, toml_text,
+        Policy, adr_accepted, adr_files, check_policy, names_build_script, strip_html_comments,
+        toml_text,
     };
     use crate::py_vectors;
     use crate::rules::Report;
@@ -635,6 +636,30 @@ mod tests {
         for &(text, krate, want) in py_vectors::NAMES_BUILD_SCRIPT {
             assert_eq!(names_build_script(text, krate), want, "{text:?} {krate:?}");
         }
+    }
+
+    /// A symlink to an ADR file counts as the file; two files with the
+    /// same number resolve to neither; a directory does not count.
+    #[test]
+    fn policy_adr_files_follow_symlinks() {
+        let tmp = TempDir::new("adr-files");
+        let dir = tmp.path().join("docs/adr");
+        std::fs::create_dir_all(dir.join("003-dir.md")).expect("dirs");
+        std::fs::write(tmp.path().join("real.md"), "- Status: accepted\n").expect("adr");
+        std::os::unix::fs::symlink("../../real.md", dir.join("001-link.md")).expect("link");
+        std::fs::write(dir.join("002-a.md"), "").expect("adr");
+        std::fs::write(dir.join("002-b.md"), "").expect("adr");
+        std::fs::write(dir.join("001.md"), "").expect("no dash");
+        let names = |n: &str| -> Vec<String> {
+            adr_files(tmp.path(), n)
+                .expect("lists")
+                .iter()
+                .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names("001"), ["001-link.md"]);
+        assert_eq!(names("002"), ["002-a.md", "002-b.md"]);
+        assert!(names("003").is_empty());
     }
 
     #[test]

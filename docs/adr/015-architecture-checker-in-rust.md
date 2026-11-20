@@ -1,6 +1,6 @@
 # ADR-015: The architecture checker in Rust
 
-- Status: proposed
+- Status: accepted (2026-11-20, after the parity run in CI)
 - Date: 2026-11-20
 
 ## Context
@@ -225,9 +225,10 @@ functions and are committed as literals (`src/py_vectors.rs`, 14 tables).
   policy, its 8 overlay copies, the policy with each of the 29
   `policy-append` files) uses one, and all 170 give the same result under
   `tomllib` and `boneli-toml` (167 equal values, 3 errors in both). The
-  fixtures `tool-manifest-float` and `tool-policy-date`, which Python
-  would pass, come with the removal commit. Widening goes through ADR-011
-  D1.
+  fixtures `tool-manifest-float` (a float in `[package.metadata]`, which
+  Python read and ignored) and `tool-policy-date` (a date in a policy
+  record, which Python read and reported only as an unknown key) pin it.
+  Widening goes through ADR-011 D1.
 - **Integers outside `i64`** are a tool error; cargo rejects them too.
 - **The limits of D4**, where Python had none.
 - **A directory that cannot be read**, in a member or anywhere in the
@@ -257,7 +258,10 @@ Result (1 base run, 141 single-run cases and 60 `core-token` snippets:
 were byte-identical; the 3 that differ are the TOML parse errors of
 `policy-duplicate-edge`, `policy-duplicate-table` and
 `tool-invalid-manifest`, where the two parsers word the error differently.
-The CI run of the parity commit is linked here when this ADR is accepted.
+In CI, on the parity commit 17626fe of the pull request that adds this ADR
+(https://github.com/Replikanti/boneli/actions/runs/44659024845, job
+`check`), every one of the 202 runs agreed, with the same 244 of 247
+byte-identical lines, and both checkers printed OK on the workspace.
 
 ### D8. Self-scan
 
@@ -297,6 +301,8 @@ binary.
 Times on one machine (12 cores, Linux 7.2, the entry point's build
 warm): the 202 fixture runs take 99.3 s with the Rust checker, 152.4 s with
 the Python checker, and 219.5 s in the parity mode, which runs both.
+With the two fixtures of D6 the suite is 204 runs in 144 cases, and every
+one of the 32 rules stays pinned by some `expect`.
 
 ### D10. No Python in tooling or tests
 
@@ -372,6 +378,25 @@ run in `check` and in the `sandbox` job's `boneli-sys` run.
   the facts, and boneli-oci's API does not grow a `#[doc(hidden)]` wrapper
   of `own_time_namespace` for a test.
 
+**CI without Python.** Both jobs that build code, `check` and `sandbox`,
+run a step "Hide Python" right after the toolchain and cache actions: for
+every directory on PATH, each `python*` executable gets a stub of the same
+name in `$RUNNER_TEMP/no-py`, which appends its arguments to `calls.log`
+there and exits 127; the directory is prepended through `$GITHUB_PATH`.
+The step globs `[p]ython*`, so the workflow itself has no hit of the
+grep below. The last step of
+each job, "No Python was called", fails if `calls.log` exists, so a call
+whose error some script swallows still turns the job red. The stub sees
+only calls through PATH; a hard-coded `/usr/bin/python3` gets past it, and
+the acceptance grep catches that instead:
+`git grep -n -I -E '\bpython3?\b' -- ':!docs/adr' ':!crates/boneli-toml/tests/toml-test'`
+prints nothing. Without the exclusions it finds only the vendored
+toml-test pair `valid/inline-table/end-in-bool` (a `python` key) and ADR
+history. Mentions of the language that stay, none an invocation, are
+the stacks Boneli debugs in `docs/ARCHITECTURE.md`, the Python test
+markers of #69 in `boneli-domain`, the changelog and the ADRs. The weekly
+`oci-acceptance` workflow never ran Python and gets no stub.
+
 ADR-007 (proposed, owned by #6) is not edited.
 
 ## Consequences
@@ -388,14 +413,18 @@ ADR-007 (proposed, owned by #6) is not edited.
   `[package.metadata]` blocks the check (D6), where cargo would accept it.
   The message names the file and the feature.
 - Cold build of the checker by the entry point: 4.97 s on the machine of
-  D9; the check of the workspace then takes 1.78 s, where the Python
-  checker took 6.47 s. The CI numbers are added when the parity run is
-  in.
+  D9, where the check of the workspace then takes 1.78 s and the Python
+  checker took 6.47 s. In CI (the parity run above, `ubuntu-latest`, no
+  cached `target/arch-check`), the "Architecture rules" step, cold build
+  included, took 12 s and the Python checker's step 3 s; the parity
+  fixture step, both checkers on 202 runs, took 83 s, and the job as a
+  whole 3 min 40 s. Without the parity mode the fixture step runs one
+  checker per run instead of two.
 
 ## Accept when
 
 CI runs both checkers on every fixture run and they agree, on the parity
-commit of the pull request that adds this ADR.
+commit of the pull request that adds this ADR. Met on 2026-11-20 (D7).
 
 ## Alternatives considered
 

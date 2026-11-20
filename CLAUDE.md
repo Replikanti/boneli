@@ -87,10 +87,9 @@ harness. Rust workspace, hexagonal architecture. Public repository
 
 ## Validation (CI equivalent — run before every commit)
 
-Once per machine: `rustup target add x86_64-unknown-none`. The architecture
-check needs Python 3.11 or newer. `tools/check-architecture.sh` builds the
-checker (`boneli-arch-check`) into `target/arch-check` on first use and
-then runs it (ADR-015).
+Once per machine: `rustup target add x86_64-unknown-none`.
+`tools/check-architecture.sh` builds the checker (`boneli-arch-check`) into
+`target/arch-check` on first use and then runs it (ADR-015).
 
 ```sh
 cargo fmt --all --check

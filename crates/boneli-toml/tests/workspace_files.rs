@@ -1,16 +1,19 @@
 //! Every TOML file of the workspace parses: the Cargo manifests, the
 //! architecture policy, `deny.toml` and the architecture checker's fixture
-//! manifests, which the Rust checker of #35 will read through this crate
-//! (ADR-011, D1). One fixture is deliberately invalid.
+//! manifests, which the Rust checker of #35 reads through this crate
+//! (ADR-011, D1). One fixture is deliberately invalid, and one uses a
+//! float, which the subset refuses (ADR-015, D6).
 
 mod common;
 
 use std::path::{Path, PathBuf};
 
-use boneli_toml::{ErrorKind, Table, Value, parse};
+use boneli_toml::{ErrorKind, Feature, Table, Value, parse};
 use common::{harness_limits, lookup};
 
 const INVALID: &str = "tools/fixtures/arch/cases/tool-invalid-manifest/overlay/Cargo.toml";
+const FLOAT: &str =
+    "tools/fixtures/arch/cases/tool-manifest-float/overlay/crates/boneli-app/Cargo.toml";
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -59,17 +62,24 @@ fn every_workspace_toml_parses() {
     for rel in &files {
         let bytes = std::fs::read(root().join(rel)).expect("file");
         match parse(&bytes, &harness_limits()) {
-            Ok(_) => assert_ne!(rel, INVALID, "the invalid fixture parsed"),
+            Ok(_) => assert!(rel != INVALID && rel != FLOAT, "{rel} parsed"),
             Err(e) if rel == INVALID => {
                 assert_eq!(
                     (e.kind(), e.offset(), e.line(), e.column()),
                     (ErrorKind::UnexpectedByte, 10, 1, 11)
                 );
             }
+            Err(e) if rel == FLOAT => {
+                assert_eq!(
+                    (e.kind(), e.line(), e.column()),
+                    (ErrorKind::Unsupported(Feature::Float), 8, 9)
+                );
+            }
             Err(e) => panic!("{rel}: {e}"),
         }
     }
     assert!(files.iter().any(|f| f == INVALID));
+    assert!(files.iter().any(|f| f == FLOAT));
     eprintln!("{} workspace TOML files", files.len());
 }
 
