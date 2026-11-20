@@ -969,11 +969,11 @@
    "title": "boneli-oci: evict unused layers from the image cache",
    "epic": null,
    "order": 38,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "03af0ec4",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-17T00:52:42+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T18:55:20+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -984,10 +984,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true
   },
   {
    "issue": 55,
@@ -1192,13 +1192,13 @@
    "title": "boneli-git-cli: check the ancestors of its working root",
    "epic": null,
    "order": 47,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
+   "state": "claimed",
+   "owner": "6860ecc9",
+   "user": "ylohnitram",
+   "machine": "df82df",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T16:36:16+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T18:55:20+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1209,27 +1209,11 @@
     "core"
    ],
    "manual": false,
-   "session": null,
-   "dispatched": null
+   "session": true,
+   "dispatched": true
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T11:44:39+00:00",
-   "issue": 64,
-   "from": "ready",
-   "to": "claimed",
-   "by": "abd3f92f",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-20T12:00:53+00:00",
-   "issue": 64,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "abd3f92f",
-   "note": null
-  },
   {
    "at": "2026-11-20T12:16:31+00:00",
    "issue": 54,
@@ -1613,6 +1597,22 @@
    "to": "implementing",
    "by": "47331c5b",
    "note": null
+  },
+  {
+   "at": "2026-11-20T18:55:20+00:00",
+   "issue": 56,
+   "from": "ready",
+   "to": "claimed",
+   "by": "03af0ec4",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T18:55:20+00:00",
+   "issue": 85,
+   "from": "ready",
+   "to": "claimed",
+   "by": "6860ecc9",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T18:48:27+00:00",
+ "updated_at": "2026-11-20T18:55:20+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
