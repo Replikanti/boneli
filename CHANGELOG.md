@@ -574,6 +574,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   store-root rules that `boneli-oci` and `boneli-store-fs` share,
   `prepare_root` (with a text rule of the caller's), `create` and `Error`.
 
+- `boneli-sys`: a statistics keeper per sandbox cgroup (ADR-007 D8,
+  #54). The last step of `Cgroup::create` starts the thread
+  `memcg-keeper`, which reads the cgroup's own `memory.stat` every
+  `STATS_KEEPER_PERIOD` (5 ms), so that dirty throttling sees fresh
+  statistics and slows a buffered writer instead of letting
+  `memory.max` OOM-kill it; `KeeperReport` and `Cgroup::stats_keeper`
+  report its reads, lateness, CPU time and failure, and
+  `Error::StatsKeeper` refuses a cgroup whose `memory.stat` reads as
+  empty. Host tests `io_limit_holds_buffered_writes`,
+  `io_limit_holds_buffered_writes_at_floor`,
+  `buffered_writes_without_io_max_are_not_killed`,
+  `keeper_reads_its_own_sandbox`, `keeper_runs_while_cgroup_lives` and
+  `keeper_cost_report`.
+
 ### Changed
 
 - The root rules of `boneli-oci` and `boneli-store-fs` live in
@@ -716,3 +730,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ended it, and a writer first seen in its write too late for a count by
   the deadline fails with that cause instead of a device the bios may
   not pass (#54).
+- `Cgroup::create` fails when the new cgroup's `memory.stat` cannot be
+  read, and starts one thread per cgroup; `Cgroup::destroy` and a drop
+  stop and join it right after a successful kill (#54). ADR-007 D8
+  records the cause of the OOM kills of buffered writers on the 7.0 CI
+  kernels, that AWS throttles buffered writeback under `io.max`, and how
+  long a destroy takes to release the page cache.
