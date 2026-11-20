@@ -155,7 +155,9 @@ jobs:
           # fresh: a tag moved during the build publishes nothing (ADR-019,
           # D6).
           tag_commit() {
-            git fetch -q --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+            # errexit does not reach into $(...): a failed fetch must fail
+            # here, or rev-parse reads the tag checkout already set.
+            git fetch -q --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG" || return 1
             git rev-parse --verify "refs/tags/$TAG^{commit}"
           }
           tagged=$(tag_commit)
@@ -177,8 +179,9 @@ jobs:
           # --verify-tag: never let gh create the tag.
           gh release create "$TAG" dist/* --verify-tag --target "$GITHUB_SHA" --title "$TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" $prerelease
-          # Moved between the check and the release: take the release down.
-          tagged=$(tag_commit)
+          # Moved between the check and the release, or no longer readable:
+          # take the release down.
+          tagged=$(tag_commit) || tagged=unreadable
           if [ "$tagged" != "$GITHUB_SHA" ]; then
             gh release delete "$TAG" --yes
             echo "FAIL: tag $TAG moved to $tagged while publishing; release deleted"

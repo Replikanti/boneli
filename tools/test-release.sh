@@ -798,6 +798,13 @@ release_workflow_publish_gate_and_pins() {
   # shellcheck disable=SC2016 # a literal line of the workflow
   n=$(grep -cF 'tagged=$(tag_commit)' "$tmp/publish")
   [ "$n" = 2 ] || fail_msg "tag_commit checks in publish: $n" || return 1
+  # errexit does not reach into $(...): a failed fetch must fail the
+  # function, and an unreadable tag after publishing takes the release down.
+  # shellcheck disable=SC2016 # a literal regex over the workflow
+  grep -qE 'git fetch .*refs/tags/\$TAG.* \|\| return 1$' "$tmp/publish" ||
+    fail_msg "tag_commit does not fail on a failed fetch" || return 1
+  # shellcheck disable=SC2016 # a literal line of the workflow
+  has_line "$tmp/publish" '          tagged=$(tag_commit) || tagged=unreadable' || return 1
   # Every action outside actions/ is pinned to a full commit.
   if grep -nE '^ *(- )?uses: ' "$wf" | grep -v 'uses: actions/' | grep -vE 'uses: [^@ ]+@[0-9a-f]{40}( |$)'; then
     fail_msg "a third-party action is not pinned to a commit"
