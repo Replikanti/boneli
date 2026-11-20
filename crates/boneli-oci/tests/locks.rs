@@ -408,6 +408,7 @@ fn two_stores_one_process_exclude() {
 
 const LEASE_CHILD: &str = "BONELI_OCI_LEASE_CHILD";
 const LEASE_ROOTFS: &str = "BONELI_OCI_LEASE_ROOTFS";
+const LEASE_HOLDER: &str = "BONELI_OCI_LEASE_HOLDER";
 
 /// The child of the two lease tests: opens the store, leases the rootfs,
 /// says so on stdout and holds the lease until stdin closes.
@@ -416,15 +417,48 @@ fn lease_child(root: &Path) {
     let store = open(root, &fake);
     let rootfs = RootfsRef::new(std::env::var(LEASE_ROOTFS).expect("rootfs"));
     let lease = store.lease(&rootfs).expect("lease");
+    let mut holder = None;
+    if std::env::var_os(LEASE_HOLDER).is_some() {
+        // The sandbox's stand-in: a process that holds one more pin per
+        // layer, inherited as its stdin, stdout and stderr, and that
+        // outlives this runner.
+        let mut fds = lease.pin_descriptors().expect("descriptors").into_iter();
+        let mut next = || Stdio::from(fds.next().expect("one descriptor per layer"));
+        let child = Command::new("sleep")
+            .arg("120")
+            .stdin(next())
+            .stdout(next())
+            .stderr(next())
+            .spawn()
+            .expect("spawn the holder");
+        println!("holder {}", child.id());
+        holder = Some(child);
+    }
     println!("leased {}", lease.layers().len());
     let mut rest = String::new();
     let _ = std::io::stdin().read_line(&mut rest);
     drop(lease);
+    // Reached only when the runner is not killed: the holder goes too.
+    if let Some(mut holder) = holder {
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
 }
 
 /// Pulls `library/app` into a new store and starts `test`'s child holding
 /// a lease on it; returns the child once it says it holds the lease.
 fn leasing_child(test: &str, tmp: &TempDir) -> (std::process::Child, PathBuf, Vec<PathBuf>) {
+    let (child, root, locks, _) = leasing_child_with(test, tmp, false);
+    (child, root, locks)
+}
+
+/// [`leasing_child`], whose child also starts a holder process with
+/// `pin_descriptors` when `holder` is set; returns the holder's pid too.
+fn leasing_child_with(
+    test: &str,
+    tmp: &TempDir,
+    holder: bool,
+) -> (std::process::Child, PathBuf, Vec<PathBuf>, Option<u32>) {
     let (hub, pushed, layers) = app_hub();
     let fake = Fake::new(move |s| hub.handle(s));
     let root = tmp.path().join("store");
@@ -435,11 +469,13 @@ fn leasing_child(test: &str, tmp: &TempDir) -> (std::process::Child, PathBuf, Ve
         .args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env(LEASE_CHILD, &root)
         .env(LEASE_ROOTFS, rootfs.as_str())
+        .envs(holder.then_some((LEASE_HOLDER, "1")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the child");
     let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    let mut holder_pid = None;
     loop {
         let line = lines
             .next()
@@ -447,6 +483,9 @@ fn leasing_child(test: &str, tmp: &TempDir) -> (std::process::Child, PathBuf, Ve
             .expect("line");
         // libtest prints `test <name> ... ` on the same line under
         // `--nocapture`.
+        if let Some((_, pid)) = line.rsplit_once("holder ") {
+            holder_pid = Some(pid.parse().expect("holder pid"));
+        }
         if line.ends_with("leased 3") {
             break;
         }
@@ -458,7 +497,7 @@ fn leasing_child(test: &str, tmp: &TempDir) -> (std::process::Child, PathBuf, Ve
         .iter()
         .map(|l| layer_lock(&root, &l.diff_id))
         .collect();
-    (child, root, locks)
+    (child, root, locks, holder_pid)
 }
 
 /// A lease held in another process pins every layer: an exclusive
@@ -498,6 +537,86 @@ fn killed_holder_releases_its_lease() {
     let store = open(&root, &fake);
     assert_eq!(names_in(&root.join("locks/owners")).len(), 1);
     drop(store);
+}
+
+/// The review of #92: a sandbox outlives a runner that is killed, so the
+/// pins of its mounted layers must not die with the runner. The child (the
+/// runner) leases the image and hands `pin_descriptors` to a holder process
+/// (the sandbox's stand-in), then is killed with `SIGKILL`: every layer
+/// stays pinned while the holder lives, and is free once it is gone.
+#[test]
+fn pin_descriptors_outlive_the_runner() {
+    if let Some(root) = std::env::var_os(LEASE_CHILD) {
+        lease_child(Path::new(&root));
+        return;
+    }
+    let tmp = TempDir::new("lease-holder");
+    let (mut runner, _root, locks, holder) =
+        leasing_child_with("pin_descriptors_outlive_the_runner", &tmp, true);
+    let holder = holder.expect("the child started a holder");
+    let kill_holder = || {
+        let _ = Command::new("kill")
+            .args(["-KILL", &holder.to_string()])
+            .status();
+    };
+    runner.kill().expect("SIGKILL the runner");
+    let _ = runner.wait();
+    let held: Vec<bool> = locks.iter().map(|p| is_held(p)).collect();
+    kill_holder();
+    assert_eq!(held, [true, true, true], "pins died with the runner");
+    // The holder was reparented away from this process; its descriptors
+    // close when it exits.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while locks.iter().any(|p| is_held(p)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pins outlived the holder"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `pin_descriptors` are pins of their own: they keep every layer pinned
+/// after the lease is dropped, and a holder's release (`LOCK_UN`) drops
+/// only its own pin, never the lease's.
+#[test]
+fn pin_descriptors_hold_their_own_pins() {
+    let (hub, pushed, layers) = app_hub();
+    let fake = Fake::new(move |s| hub.handle(s));
+    let tmp = TempDir::new("pin-descriptors");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let lease = store
+        .pull_leased(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let locks: Vec<PathBuf> = layers
+        .iter()
+        .map(|l| layer_lock(&root, &l.diff_id))
+        .collect();
+    let copies: Vec<File> = lease
+        .pin_descriptors()
+        .expect("descriptors")
+        .into_iter()
+        .map(File::from)
+        .collect();
+    assert_eq!(copies.len(), 3);
+    for copy in &copies {
+        copy.unlock().expect("a holder's LOCK_UN");
+    }
+    assert!(
+        locks.iter().all(|p| is_held(p)),
+        "the lease's pins went too"
+    );
+    for copy in &copies {
+        copy.lock_shared().expect("lock again");
+    }
+    drop(lease);
+    assert!(
+        locks.iter().all(|p| is_held(p)),
+        "the copies pin on their own"
+    );
+    drop(copies);
+    assert!(locks.iter().all(|p| !is_held(p)));
 }
 
 /// A lease of a rootfs one of whose layers is not in the store is

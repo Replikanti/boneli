@@ -25,10 +25,12 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::error::{Error, root_err};
 use crate::limits::Budget;
@@ -60,6 +62,14 @@ impl LayerPin {
     /// The `diff_id` of the pinned layer.
     pub fn diff_id(&self) -> &[u8; 32] {
         &self.diff_id
+    }
+
+    /// A second pin on the same layer as a descriptor of its own: a new
+    /// read-only open file description of the lock file with its own
+    /// shared lock (ADR-025, D2). It pins the layer as long as any process
+    /// holds it, and its release never releases this pin.
+    pub(crate) fn descriptor(&self) -> Result<OwnedFd, Error> {
+        self.held.reopen_shared()
     }
 }
 
@@ -128,7 +138,10 @@ impl LayerCache {
             boneli_private_dir::create(dir).map_err(root_err)?;
         }
         let owner = Owner::current()?;
-        let owner_lock = Arc::new(lock::lock_shared(&owners.join(owner.token()))?);
+        let owner_lock = Arc::new(lock::lock_shared(
+            &owners.join(owner.token()),
+            Instant::now() + lock::LOCK_WAIT,
+        )?);
         sync_dir(&owners)?;
         for (stem, alias_stem) in [
             (".probe-case-", ".PROBE-CASE-"),
@@ -161,12 +174,24 @@ impl LayerCache {
 
     /// Pins the layer `diff_id`: a shared lock on its lock file, created
     /// where it is missing (ADR-025, D2). It waits while a removal holds
-    /// the exclusive lock. The layer need not be in the cache: a pull pins
-    /// every layer of an image before it looks.
+    /// the exclusive lock, for at most 120 s (`Error::LockBusy`, D3). The
+    /// layer need not be in the cache: a pull pins every layer of an image
+    /// before it looks.
     pub fn pin(&self, diff_id: &[u8; 32]) -> Result<LayerPin, Error> {
+        self.pin_until(diff_id, Instant::now() + lock::LOCK_WAIT)
+    }
+
+    /// [`LayerCache::pin`] with the wait bounded by `deadline`, so a pull
+    /// that pins every layer of an image waits 120 s in all, not per
+    /// layer.
+    pub(crate) fn pin_until(
+        &self,
+        diff_id: &[u8; 32],
+        deadline: Instant,
+    ) -> Result<LayerPin, Error> {
         Ok(LayerPin {
             diff_id: *diff_id,
-            held: lock::lock_shared(&self.layer_lock_path(diff_id))?,
+            held: lock::lock_shared(&self.layer_lock_path(diff_id), deadline)?,
         })
     }
 

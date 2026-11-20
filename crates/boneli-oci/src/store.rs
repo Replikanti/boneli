@@ -26,7 +26,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
 use boneli_https::{ConnectOptions, Dial, Roots, Sha256, TlsConfig, TlsDial};
@@ -429,12 +429,16 @@ impl OciImageStore {
         self.pull_locked(image).map_err(to_image)
     }
 
-    /// One pin for each distinct layer of `diff_ids`.
+    /// One pin for each distinct layer of `diff_ids`, all taken within one
+    /// `LOCK_WAIT` (ADR-025, D3): a removal that holds a layer longer fails
+    /// the pull or lease with `LockBusy` instead of stalling it, and every
+    /// pull queued behind it on the store's mutex, without end.
     fn pin_all(&self, diff_ids: &[Digest]) -> Result<BTreeMap<Digest, LayerPin>, Error> {
+        let deadline = Instant::now() + lock::LOCK_WAIT;
         let mut pins = BTreeMap::new();
         for diff_id in diff_ids {
             if !pins.contains_key(diff_id) {
-                pins.insert(*diff_id, self.cache.pin(diff_id.bytes())?);
+                pins.insert(*diff_id, self.cache.pin_until(diff_id.bytes(), deadline)?);
             }
         }
         Ok(pins)

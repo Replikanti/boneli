@@ -70,6 +70,9 @@ pub enum Error {
     /// `LOCK_ATTEMPTS` (1,024) attempts locked a file that an exclusive
     /// holder had unlinked in the meantime (ADR-025, D3).
     LockChanged(PathBuf),
+    /// An exclusive holder kept a lock file locked past the deadline of a
+    /// shared locker, `LOCK_WAIT` (120 s) for a pin (ADR-025, D3).
+    LockBusy(PathBuf),
     /// The store's layer directory treats names that differ in case or in
     /// Unicode normalization as one (ADR-009, D8).
     CaseInsensitive(PathBuf),
@@ -118,6 +121,11 @@ impl fmt::Display for Error {
             Error::LockChanged(path) => write!(
                 f,
                 "lock file {} kept changing while it was locked",
+                path.display()
+            ),
+            Error::LockBusy(path) => write!(
+                f,
+                "lock file {} stayed locked by a removal past the deadline",
                 path.display()
             ),
             Error::CaseInsensitive(path) => write!(

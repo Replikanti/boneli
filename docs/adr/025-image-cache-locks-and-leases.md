@@ -116,10 +116,40 @@ follow in PR 2 and are added here as D4 to D8 before the ADR is accepted.
   list of paths is exactly the hazard the lease closes, and its only
   intended caller, the Sandbox adapter (#8), has not started. `config`
   stays.
-- **Rule for #8:** the Sandbox adapter holds a `Lease` from before the
-  mount until `destroy` has returned.
+- **Contract on the Sandbox port (#8): a pin dies with the sandbox, not
+  with the runner** (review of #92). A lease lives in the runner, and a
+  sandbox outlives a runner that is killed: ADR-007 gives it no
+  `PR_SET_PDEATHSIG`, and orphan cleanup is #33. Were the lease the only
+  pin, a killed runner would release the layers of a sandbox that still
+  runs, and the next trim (at `open`, at the end of any pull, in any store
+  on the root) would remove lower layers of a live overlay mount. So:
+  - The Sandbox adapter holds a `Lease` from before the mount until
+    `destroy` has returned, **and** puts one more pin per layer into
+    something that lives exactly as long as the mounts: the sandbox's init,
+    which inherits the descriptors without `O_CLOEXEC`, or a holder
+    process in the sandbox's cgroup, which `cgroup.kill` ends with it.
+  - `Lease::pin_descriptors()` gives those pins: per distinct layer a new
+    read-only open file description of its lock file with its own shared
+    lock. A pin lives while any process holds its descriptor, so the
+    lease's drop and the runner's death do not release it. Because it is
+    a description of its own, whoever holds it can release only its own
+    pin (`close`, `LOCK_UN`, which code in the sandbox can call), never the
+    lease's: a sandbox can expose only its own mounts. Each descriptor
+    carries `O_CLOEXEC` until the adapter hands it on; `boneli-sys`'s
+    `spawn` has no way yet to pass extra descriptors, which #8 adds.
+  - A trim does not depend on #33's orphan sweep: an orphaned sandbox keeps
+    its pins until it is gone, whoever opens the root.
+  - Until #8 lands, nothing mounts layers outside a test, so nothing can
+    outlive the runner with a layer mounted; the host tests hold their
+    lease for the whole sandbox run.
+  - Pinned by `pin_descriptors_outlive_the_runner` (a runner child hands
+    the descriptors to a holder process and is killed with `SIGKILL`: the
+    layers stay pinned until the holder exits) and
+    `pin_descriptors_hold_their_own_pins` (a holder's `LOCK_UN` and the
+    lease's drop each leave the other's pins in place).
 - Lock files are opened by std, so they carry `O_CLOEXEC`, and no sandbox
-  inherits a lock through an exec.
+  inherits a lock through an exec by accident; `pin_descriptors` is the
+  one way a pin is handed on.
 - **Descriptors.** A lease holds one descriptor per distinct layer:
   node:22 8, postgres:17 14, at most `MAX_LAYERS` = 128. Under systemd's
   default soft `RLIMIT_NOFILE` of 1,024 that is about 46 concurrent
@@ -154,15 +184,53 @@ follow in PR 2 and are added here as D4 to D8 before the ADR is accepted.
   is the bound `create_probe` already uses for a name it cannot get
   (`PROBE_ATTEMPTS`); any bound above a handful works, and one that never
   ends would turn a bug into a hang.
-- Shared lockers block (`lock_shared`). Exclusive lockers only ever use
-  `try_lock` and never wait while they hold a layer lock, so no lock cycle
-  can form.
+- Shared lockers wait, but not without end (review of #92): they poll
+  `try_lock_shared` until a deadline and then fail with
+  `Error::LockBusy(path)`, which a pull or lease reports as `Failed`.
+  Unbounded, a stopped exclusive holder (a CLI trim suspended with Ctrl-Z,
+  a frozen cgroup, a debugger) would stall the pull that waits for it and,
+  since a pull pins inside the store's pull mutex, every later pull of
+  that store, images without that layer included. A lease takes no mutex,
+  so only leases of that layer wait.
+  - `LOCK_WAIT` = 120 s, one deadline for all pins of a pull or lease, not
+    one per layer. An exclusive holder holds a lock only while it removes
+    what the lock covers: a dead owner's names or, in PR 2, one layer's
+    tree. The largest tree is one layer at the image's entry cap of
+    1,048,576 entries (`MAX_IMAGE_ENTRIES`, ADR-009 D7). ADR-009 D8
+    measured the bounded removal at 80,000 directories in 2.6 s on the dev
+    host (release build, btrfs), about 32.5 µs each, so about 34 s for the
+    cap (extrapolated, not measured). 120 s leaves 3.5 times that for
+    slower disks and debug builds. Shorter fails a pull while a legitimate
+    removal still runs (the caller pulls again); longer lets a stopped
+    holder stall a pull, and the pulls queued behind it, for longer.
+  - The poll pauses start at 1 ms and double up to 100 ms: a waiter gets
+    the lock at most 100 ms after the holder releases it, against a pull
+    that takes seconds, at about 1,200 wake-ups over a whole wait.
+  - Rejected: pinning outside the pull mutex. It frees the other pulls,
+    but the pull that waits still waits without end; the deadline bounds
+    both, and the pins stay inside the mutex, where the pull already
+    holds its config.
+  - Exclusive lockers only ever use `try_lock` and never wait while they
+    hold a layer lock, so no lock cycle can form.
+  - Pinned by `shared_wait_is_bounded` (an exclusive holder that never
+    lets go: `LockBusy` at the deadline) and
+    `shared_wait_ends_when_the_holder_unlinks` (a waiter gets the new file
+    once the holder unlinks and releases).
 - `flock` locks belong to the open file description, so two stores in one
   process exclude each other the same way two processes do.
-- Weak spot: NFS and CIFS emulate `flock` with POSIX byte-range locks,
-  which belong to the process and do not behave this way across hosts. A
-  root shared across hosts, or kept on a network filesystem, is
-  unsupported, the stance ADR-012 takes for `boneli-store-fs`.
+- Unsupported roots, where locks taken by two users of the root do not
+  see each other:
+  - NFS and CIFS emulate `flock` with POSIX byte-range locks, which belong
+    to the process and do not behave this way across hosts. A root shared
+    across hosts, or kept on a network filesystem, is unsupported, the
+    stance ADR-012 takes for `boneli-store-fs`.
+  - A root reached both through an overlayfs merged directory and through
+    that overlay's upperdir (review of #92, reproduced on Linux 7.2: an
+    exclusive `flock` through the upperdir path is acquired while a shared
+    one is held through the merged view, whose files have another device).
+    A root is used through one filesystem view only. A runtime check
+    costs more than it protects: it would have to find every other path
+    to the same files.
 
 ## Consequences
 
@@ -176,11 +244,15 @@ follow in PR 2 and are added here as D4 to D8 before the ADR is accepted.
   another PID namespace, time namespace and boot, and under a foreign
   `/proc` (`host::foreign_proc_judges_no_owner`).
 - Every store holds one more descriptor (its owner lock), every pull one
-  per distinct layer of its image, every lease one per distinct layer.
+  per distinct layer of its image, every lease one per distinct layer, and
+  every sandbox (#8) one more per distinct layer for `pin_descriptors`.
+- A pull or lease fails with `LockBusy` when a removal holds a layer for
+  more than 120 s (D3).
 - `locks/` is a new directory under the root; `open` creates it `0o700`.
 - Breaking for callers of `boneli-oci` (pre-1.0): `OciImageStore::layers`
   is gone (use `lease` or `pull_leased`), `LayerCache::unpack` takes a
-  `LayerPin`, and `Error` has a new variant `LockChanged`.
+  `LayerPin`, and `Error` has the new variants `LockChanged` and
+  `LockBusy`.
 - Writing temporary names into a store's directories outside a store (for
   example `Client::get_blob` aimed at `blobs/sha256/` by hand) is
   unsupported: such names have no owner lock behind them, and the
