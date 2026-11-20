@@ -941,11 +941,11 @@
    "title": "boneli-app: decide how workspaces carry backslash, blank and non-UTF-8 paths",
    "epic": null,
    "order": 40,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "abd3f92f",
-   "pr": null,
+   "pr": 82,
    "note": "",
-   "updated_at": "2026-11-20T12:25:08+00:00",
+   "updated_at": "2026-11-20T13:02:48+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-18T21:07:50+00:00",
-   "issue": 69,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-18T21:07:50+00:00",
    "issue": 68,
@@ -1496,6 +1488,14 @@
    "to": "implementing",
    "by": "98fa59e8",
    "note": "PR 2 (#78 draft): tracefs diagnostic round on NVMe copies"
+  },
+  {
+   "at": "2026-11-20T13:02:48+00:00",
+   "issue": 64,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "abd3f92f",
+   "note": null
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T12:40:17+00:00",
+ "updated_at": "2026-11-20T13:02:48+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
