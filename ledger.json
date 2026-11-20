@@ -941,11 +941,11 @@
    "title": "boneli-app: decide how workspaces carry backslash, blank and non-UTF-8 paths",
    "epic": null,
    "order": 40,
-   "state": "pr-review",
-   "owner": "abd3f92f",
+   "state": "done",
+   "owner": null,
    "pr": 82,
    "note": "",
-   "updated_at": "2026-11-20T13:02:48+00:00",
+   "updated_at": "2026-11-20T13:19:55+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -954,8 +954,8 @@
     "core"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df"
+   "user": null,
+   "machine": null
   },
   {
    "issue": 66,
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T00:55:27+00:00",
-   "issue": 69,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-19T00:55:27+00:00",
    "issue": 68,
@@ -1496,6 +1488,14 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #78 open"
+  },
+  {
+   "at": "2026-11-20T13:19:55+00:00",
+   "issue": 64,
+   "from": "pr-review",
+   "to": "done",
+   "by": "abd3f92f",
+   "note": null
   }
  ],
  "open": [
@@ -1525,7 +1525,6 @@
   55,
   56,
   57,
-  64,
   66,
   68,
   69,
@@ -1534,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:16:13+00:00",
+ "updated_at": "2026-11-20T13:19:57+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
