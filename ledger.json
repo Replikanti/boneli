@@ -1192,13 +1192,13 @@
    "title": "boneli-git-cli: check the ancestors of its working root",
    "epic": null,
    "order": 47,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "6860ecc9",
    "user": "ylohnitram",
    "machine": "df82df",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T19:06:03+00:00",
+   "updated_at": "2026-11-20T19:53:18+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:06:07+00:00",
-   "issue": 68,
-   "from": "ready",
-   "to": "claimed",
-   "by": "47331c5b",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T13:06:07+00:00",
    "issue": 22,
@@ -1613,6 +1605,14 @@
    "to": "implementing",
    "by": "47331c5b",
    "note": "PR 1 #89 merged (26a8050); PR 2 wiring next"
+  },
+  {
+   "at": "2026-11-20T19:53:18+00:00",
+   "issue": 85,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "6860ecc9",
+   "note": null
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T19:41:26+00:00",
+ "updated_at": "2026-11-20T19:53:18+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
