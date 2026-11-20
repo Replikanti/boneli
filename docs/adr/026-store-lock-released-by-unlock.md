@@ -67,7 +67,11 @@ a store would unlock the parent's live store, and a second `open` would
 succeed and sweep its temporary files. With the check such a child only
 closes its own copy, as before this ADR. `getpid` is a system call in
 glibc and musl (glibc dropped its pid cache in 2.25), so the child sees
-its own id.
+its own id. A pid is only unique within its pid namespace: the sandbox
+child runs in a new one as pid 1, so when the runner is itself pid 1 of
+its namespace the ids match and the check does not tell them apart. That
+needs a child that unwinds as well and is not a documented deployment;
+the guard on the namespace identity is #97.
 
 ### D2. After a crash the lock lasts at most until a child's exec
 
