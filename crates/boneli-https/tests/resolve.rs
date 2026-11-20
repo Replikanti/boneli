@@ -1065,23 +1065,15 @@ fn resolver_module_spawns_nothing_and_uses_no_std_lookup() {
     assert!(hits.is_empty(), "{hits:#?}");
 }
 
-/// The std functions that take `impl ToSocketAddrs`, by path: given a
-/// name, each runs `getaddrinfo`, without a deadline. Every mention
-/// counts, not only a call: the UFCS form with the socket as the first
-/// argument (`UdpSocket::connect(s, addr)`) and the function passed as a
-/// value (`.map(TcpStream::connect)`) look up too.
-/// `TcpStream::connect_timeout` takes a `&SocketAddr` and is not one of
-/// them.
-const STD_LOOKUP_PATHS: [&str; 5] = [
-    "TcpStream::connect",
-    "TcpListener::bind",
-    "UdpSocket::bind",
-    "UdpSocket::connect",
-    "UdpSocket::send_to",
-];
-
-/// The method forms of the same lookups (`socket.connect(addr)`).
-const STD_LOOKUP_METHODS: [&str; 2] = [".connect(", ".send_to("];
+/// The names of the std functions that take `impl ToSocketAddrs`:
+/// `TcpStream::connect`, `TcpListener::bind`, `UdpSocket::bind`,
+/// `UdpSocket::connect` and `UdpSocket::send_to`. Given a name, each runs
+/// `getaddrinfo`, without a deadline. The scan keys on the name, not on
+/// the path in front of it: a method call, a turbofish, a qualified path
+/// (`<TcpStream>::connect`) and an alias (`use ... as T`, `type T = ...`)
+/// all end in the same identifier. `connect_timeout` takes a
+/// `&SocketAddr` and is another identifier.
+const STD_LOOKUP_NAMES: [&str; 3] = ["connect", "send_to", "bind"];
 
 /// Call sites of the std lookups whose argument is a `SocketAddr`
 /// variable: the file under `src/` and the argument. The resolver's UDP
@@ -1092,72 +1084,333 @@ const SOCKET_ADDR_ARGS: [(&str, &str); 2] = [
     ("resolve/exchange.rs", "server"),
 ];
 
-/// The argument text of a call whose `(` ends `rest`'s prefix: up to the
-/// matching `)` on the line, or the rest of the line.
-fn call_argument(rest: &str) -> &str {
-    let mut depth = 0usize;
-    for (at, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth == 0 => return &rest[..at],
-            ')' => depth -= 1,
-            _ => {}
-        }
-    }
-    rest
+/// One token of a Rust source file. Comments are dropped and each
+/// literal is one token, so a name or a `)` inside them is not seen.
+#[derive(Debug)]
+enum Tok {
+    /// An identifier or a keyword; `raw` for `r#name`.
+    Ident { name: String, raw: bool },
+    /// A string literal, `"..."` or `r#"..."#`: its text between the
+    /// quotes as written, escapes not decoded.
+    Str(String),
+    /// Any other literal (number, character, byte, byte or C string) or a
+    /// lifetime.
+    Lit,
+    /// `::`, or any other punctuation character.
+    Punct(String),
 }
 
-/// Whether a std lookup's argument cannot be a name: a string
-/// literal that parses as a socket address (std parses it before it would
-/// look anything up), or a `SocketAddr` variable of `SOCKET_ADDR_ARGS`.
-fn is_socket_addr(file: &str, argument: &str) -> bool {
-    let argument = argument.trim();
-    let literal = argument
-        .strip_prefix('"')
-        .and_then(|a| a.strip_suffix('"'))
-        .is_some_and(|a| a.parse::<SocketAddr>().is_ok());
-    literal || SOCKET_ADDR_ARGS.contains(&(file, argument))
+#[derive(Debug)]
+struct Token {
+    tok: Tok,
+    /// The line of the token's first character, from 1.
+    line: usize,
 }
 
-/// The std lookups on one source line of `file`: the ones that may take
-/// a name, and the count of those whose argument is a socket address.
-/// A path followed by `(` is a call, and its argument is checked; for
-/// the UFCS forms the argument holds the socket too and never passes. A
-/// path followed by anything else (a value, a turbofish) is a lookup
-/// whose argument the scan cannot see.
-fn std_lookups(file: &str, line: &str) -> (Vec<String>, usize) {
-    // Calls as (name, the text after their `(`), and the hits that are
-    // no call.
-    let mut calls = Vec::new();
-    let mut hits = Vec::new();
-    for path in STD_LOOKUP_PATHS {
-        for (start, _) in line.match_indices(path) {
-            let rest = &line[start + path.len()..];
-            if path == "TcpStream::connect"
-                && rest
-                    .strip_prefix("_timeout")
-                    .is_some_and(|r| !r.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
-            {
-                continue;
-            }
-            match rest.trim_start().strip_prefix('(') {
-                Some(rest) => calls.push((path, rest)),
-                None => hits.push(format!("{path}{rest}")),
+fn is_ident_start(c: char) -> bool {
+    c == '_' || c.is_alphabetic()
+}
+
+fn is_ident_continue(c: char) -> bool {
+    c == '_' || c.is_alphanumeric()
+}
+
+/// The lexer's position in a source file.
+struct Lexer {
+    chars: Vec<char>,
+    at: usize,
+    line: usize,
+}
+
+impl Lexer {
+    fn peek(&self, ahead: usize) -> Option<char> {
+        self.chars.get(self.at + ahead).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek(0)?;
+        self.at += 1;
+        if c == '\n' {
+            self.line += 1;
+        }
+        Some(c)
+    }
+
+    fn word(&mut self) -> String {
+        let mut word = String::new();
+        while let Some(c) = self.peek(0).filter(|&c| is_ident_continue(c)) {
+            word.push(c);
+            self.at += 1;
+        }
+        word
+    }
+
+    /// The rest of a string literal with escapes, after its `"`.
+    fn quoted(&mut self, start: usize) -> Result<String, String> {
+        let mut text = String::new();
+        loop {
+            match self.bump() {
+                Some('"') => return Ok(text),
+                Some('\\') => {
+                    text.push('\\');
+                    text.extend(self.bump());
+                }
+                Some(c) => text.push(c),
+                None => return Err(format!("{start}: unterminated string literal")),
             }
         }
     }
-    for method in STD_LOOKUP_METHODS {
-        for (start, _) in line.match_indices(method) {
-            calls.push((&method[..method.len() - 1], &line[start + method.len()..]));
+
+    /// The rest of a raw string literal with `hashes` `#`, after its `"`.
+    fn raw_quoted(&mut self, hashes: usize, start: usize) -> Result<String, String> {
+        let mut text = String::new();
+        loop {
+            match self.bump() {
+                Some('"') if (0..hashes).all(|k| self.peek(k) == Some('#')) => {
+                    self.at += hashes;
+                    return Ok(text);
+                }
+                Some(c) => text.push(c),
+                None => return Err(format!("{start}: unterminated raw string literal")),
+            }
         }
     }
-    let mut allowed = 0;
-    for (name, rest) in calls {
-        let argument = call_argument(rest);
-        if is_socket_addr(file, argument) {
-            allowed += 1;
+
+    /// The rest of a character literal, after its `'`.
+    fn char_literal(&mut self, start: usize) -> Result<(), String> {
+        if self.bump() == Some('\\') {
+            self.bump();
+        }
+        loop {
+            match self.bump() {
+                Some('\'') => return Ok(()),
+                Some('\n') | None => {
+                    return Err(format!("{start}: unterminated character literal"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// The tokens of a Rust source file. An unterminated literal or block
+/// comment is an error, so the scan fails closed instead of skipping
+/// the rest of the file.
+fn lex(text: &str) -> Result<Vec<Token>, String> {
+    let mut lx = Lexer {
+        chars: text.chars().collect(),
+        at: 0,
+        line: 1,
+    };
+    let mut out = Vec::new();
+    while let Some(c) = lx.peek(0) {
+        let line = lx.line;
+        let tok = if c.is_whitespace() {
+            lx.bump();
+            continue;
+        } else if c == '/' && lx.peek(1) == Some('/') {
+            while lx.peek(0).is_some_and(|c| c != '\n') {
+                lx.bump();
+            }
+            continue;
+        } else if c == '/' && lx.peek(1) == Some('*') {
+            lx.at += 2;
+            let mut depth = 1;
+            while depth > 0 {
+                match (lx.peek(0), lx.peek(1)) {
+                    (Some('/'), Some('*')) => {
+                        lx.at += 2;
+                        depth += 1;
+                    }
+                    (Some('*'), Some('/')) => {
+                        lx.at += 2;
+                        depth -= 1;
+                    }
+                    (Some(_), _) => {
+                        lx.bump();
+                    }
+                    (None, _) => return Err(format!("{line}: unterminated block comment")),
+                }
+            }
+            continue;
+        } else if c == '"' {
+            lx.bump();
+            Tok::Str(lx.quoted(line)?)
+        } else if c == '\'' {
+            if lx.peek(1) == Some('\\') || lx.peek(1).is_some() && lx.peek(2) == Some('\'') {
+                lx.bump();
+                lx.char_literal(line)?;
+            } else if lx.peek(1).is_some_and(is_ident_start) {
+                lx.bump();
+                lx.word();
+            } else {
+                return Err(format!("{line}: unterminated character literal"));
+            }
+            Tok::Lit
+        } else if c.is_ascii_digit() {
+            lx.word();
+            while lx.peek(0) == Some('.') && lx.peek(1).is_some_and(|c| c.is_ascii_digit()) {
+                lx.at += 1;
+                lx.word();
+            }
+            Tok::Lit
+        } else if is_ident_start(c) {
+            let word = lx.word();
+            let hashes = (0..).take_while(|&k| lx.peek(k) == Some('#')).count();
+            if matches!(word.as_str(), "b" | "c") && lx.peek(0) == Some('"') {
+                lx.bump();
+                lx.quoted(line)?;
+                Tok::Lit
+            } else if word == "b" && lx.peek(0) == Some('\'') {
+                lx.bump();
+                lx.char_literal(line)?;
+                Tok::Lit
+            } else if matches!(word.as_str(), "r" | "br" | "cr") && lx.peek(hashes) == Some('"') {
+                lx.at += hashes + 1;
+                let text = lx.raw_quoted(hashes, line)?;
+                if word == "r" {
+                    Tok::Str(text)
+                } else {
+                    Tok::Lit
+                }
+            } else if word == "r" && hashes == 1 && lx.peek(1).is_some_and(is_ident_start) {
+                lx.at += 1;
+                Tok::Ident {
+                    name: lx.word(),
+                    raw: true,
+                }
+            } else {
+                Tok::Ident {
+                    name: word,
+                    raw: false,
+                }
+            }
+        } else if c == ':' && lx.peek(1) == Some(':') {
+            lx.at += 2;
+            Tok::Punct("::".to_string())
         } else {
-            hits.push(format!("{name}({argument})"));
+            lx.bump();
+            Tok::Punct(c.to_string())
+        };
+        out.push(Token { tok, line });
+    }
+    Ok(out)
+}
+
+/// Tokens as text for a hit message, at most 12 of them.
+fn tokens_text(toks: &[Token]) -> String {
+    let mut parts: Vec<String> = toks
+        .iter()
+        .take(12)
+        .map(|t| match &t.tok {
+            Tok::Ident { name, raw: true } => format!("r#{name}"),
+            Tok::Ident { name, raw: false } => name.clone(),
+            Tok::Str(text) => format!("{text:?}"),
+            Tok::Lit => "<literal>".to_string(),
+            Tok::Punct(p) => p.clone(),
+        })
+        .collect();
+    if toks.len() > 12 {
+        parts.push("...".to_string());
+    }
+    parts.join(" ")
+}
+
+/// The std lookups in the source `text` of `file` (relative to `src/`):
+/// the ones that may take a name, as `file:line: what`, and the count of
+/// calls whose argument is a socket address. A hit is:
+///
+/// - `to_socket_addrs` or `ToSocketAddrs`, by any mention;
+/// - code the scan cannot read: `macro_rules` (a macro body can build a
+///   call from its arguments), `include` (another file, also through an
+///   alias of the macro) and a `path = ...` attribute (a module file
+///   anywhere);
+/// - a name of `STD_LOOKUP_NAMES`, unless it is defined there (`fn`
+///   before it) or is the crate's own `connect` (`crate::` before it;
+///   `crate` cannot be shadowed), or it is called (`(` right after it)
+///   with one argument token that is a string literal parsing as a
+///   socket address (std parses it before it would look anything up) or
+///   a `SocketAddr` variable of `SOCKET_ADDR_ARGS`. A UFCS call holds
+///   the socket in its argument too and never passes; a turbofish or the
+///   function as a value has no `(` after the name.
+///
+/// Source the lexer cannot end is one hit.
+fn std_lookup_hits(file: &str, text: &str) -> (Vec<String>, usize) {
+    let toks = match lex(text) {
+        Ok(toks) => toks,
+        Err(err) => return (vec![format!("{file}:{err}")], 0),
+    };
+    let ident = |at: usize| match toks.get(at).map(|t| &t.tok) {
+        Some(Tok::Ident { name, raw }) => Some((name.as_str(), *raw)),
+        _ => None,
+    };
+    let punct =
+        |at: usize, p: &str| matches!(toks.get(at).map(|t| &t.tok), Some(Tok::Punct(q)) if q == p);
+    let mut hits = Vec::new();
+    let mut allowed = 0;
+    for (i, token) in toks.iter().enumerate() {
+        let Tok::Ident { name, .. } = &token.tok else {
+            continue;
+        };
+        let at = format!("{file}:{}", token.line);
+        let after = || tokens_text(&toks[i + 1..]);
+        match name.as_str() {
+            "to_socket_addrs" | "ToSocketAddrs" => hits.push(format!("{at}: {name}")),
+            "macro_rules" | "include" => hits.push(format!("{at}: {name} {}", after())),
+            "path"
+                if punct(i + 1, "=")
+                    && i.checked_sub(1)
+                        .is_some_and(|b| punct(b, "[") || punct(b, ",") || punct(b, "(")) =>
+            {
+                hits.push(format!("{at}: {name} {}", after()));
+            }
+            name if STD_LOOKUP_NAMES.contains(&name) => {
+                let definition = i.checked_sub(1).and_then(ident) == Some(("fn", false));
+                let crate_own =
+                    i >= 2 && punct(i - 1, "::") && ident(i - 2) == Some(("crate", false));
+                if definition || crate_own {
+                    continue;
+                }
+                if !punct(i + 1, "(") {
+                    hits.push(format!("{at}: {name} {}", after()));
+                    continue;
+                }
+                let mut depth = 0usize;
+                let close = (i + 1..toks.len()).find(|&j| {
+                    if punct(j, "(") {
+                        depth += 1;
+                    } else if punct(j, ")") {
+                        depth -= 1;
+                    }
+                    depth == 0
+                });
+                let Some(close) = close else {
+                    hits.push(format!("{at}: {name} {}", after()));
+                    continue;
+                };
+                let argument = &toks[i + 2..close];
+                let socket_addr = match argument {
+                    [
+                        Token {
+                            tok: Tok::Str(text),
+                            ..
+                        },
+                    ] => text.parse::<SocketAddr>().is_ok(),
+                    [
+                        Token {
+                            tok: Tok::Ident { name, .. },
+                            ..
+                        },
+                    ] => SOCKET_ADDR_ARGS.contains(&(file, name.as_str())),
+                    _ => false,
+                };
+                if socket_addr {
+                    allowed += 1;
+                } else {
+                    hits.push(format!("{at}: {name}({})", tokens_text(argument)));
+                }
+            }
+            _ => {}
         }
     }
     (hits, allowed)
@@ -1167,8 +1420,9 @@ fn std_lookups(file: &str, line: &str) -> (Vec<String>, usize) {
 /// `TlsDial`, `connect` and the CRL and OCSP fetches go through
 /// `Resolver`, so no `getaddrinfo` runs outside a deadline. Neither
 /// `ToSocketAddrs` nor a std function that takes it may appear, in any
-/// form, except in a call whose argument is a socket address. Comment
-/// lines may name them.
+/// form, except in a call whose argument is a socket address
+/// (`std_lookup_hits`). The scan reads tokens, so comments and string
+/// literals may name them.
 #[test]
 fn crate_has_no_std_lookup() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1181,20 +1435,9 @@ fn crate_has_no_std_lookup() {
         let relative = file.strip_prefix(&root).expect("under src");
         let relative = relative.to_str().expect("UTF-8 path");
         let text = std::fs::read_to_string(file).expect("source");
-        for (number, line) in text.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            let at = format!("{relative}:{}", number + 1);
-            for token in ["to_socket_addrs", "ToSocketAddrs"] {
-                if line.contains(token) {
-                    hits.push(format!("{at}: {token}"));
-                }
-            }
-            let (found, socket_addrs) = std_lookups(relative, line);
-            hits.extend(found.into_iter().map(|hit| format!("{at}: {hit}")));
-            allowed += socket_addrs;
-        }
+        let (found, socket_addrs) = std_lookup_hits(relative, &text);
+        hits.extend(found);
+        allowed += socket_addrs;
     }
     assert!(hits.is_empty(), "{hits:#?}");
     // The scan sees the calls that are there: the resolver's bind and
@@ -1203,7 +1446,7 @@ fn crate_has_no_std_lookup() {
 }
 
 /// The scan's rule on the forms it must catch and the ones it must let
-/// through.
+/// through. Each caught text is one hit and no allowed call.
 #[test]
 fn std_lookup_scan_rule() {
     let caught = [
@@ -1226,32 +1469,175 @@ fn std_lookup_scan_rule() {
         ),
         ("revocation/http.rs", "UdpSocket::send_to(&s, buf, host)"),
         ("resolve/exchange.rs", "UdpSocket::connect(&socket, server)"),
-        // The function as a value, and a turbofish.
+        ("dial.rs", "UdpSocket::connect(&s, server)"),
+        // The function as a value.
         ("revocation/http.rs", ".map(TcpStream::connect)"),
         ("revocation/http.rs", "addrs.map(UdpSocket::bind)"),
+        ("dial.rs", "let f = T::connect;"),
+        // Turbofish, on the path and on the method, also spaced.
         ("revocation/http.rs", "TcpStream::connect::<&str>(host)"),
+        ("dial.rs", "socket.connect::<&str>(host)"),
+        ("dial.rs", "socket.send_to::<&str>(buf, host)"),
+        ("dial.rs", "socket.connect :: < &str > (host)"),
         ("revocation/http.rs", "TcpStream::connect (host)"),
+        // Qualified paths.
+        ("dial.rs", "<TcpStream>::connect(host)"),
+        ("dial.rs", "<std::net::TcpStream>::connect(host)"),
+        // Aliases: the `use` and the `type` lines are clean, the call
+        // is the hit.
+        ("dial.rs", "use std::net::TcpStream as T; T::connect(host)"),
+        ("dial.rs", "type T = TcpStream; T::connect(host)"),
+        // Split over lines.
+        ("dial.rs", "TcpStream\n::connect\n(host)"),
+        ("dial.rs", "socket\n.connect(\nhost)"),
+        // A raw identifier is the same name.
+        ("dial.rs", "r#connect(host)"),
+        // Arguments that are not one socket-address token.
+        ("dial.rs", "TcpListener::bind(\"localhost:0\")"),
+        ("dial.rs", "TcpListener::bind(\"127.0.0.1:0\".to_string())"),
+        ("dial.rs", "UdpSocket::bind(local)"),
+        // Only the crate path is the crate's own `connect`.
+        ("dial.rs", "use crate::connect; connect(host)"),
+        // The trait, by any mention.
+        ("dial.rs", "use std::net::ToSocketAddrs;"),
+        ("dial.rs", "let a = (host, 443).to_socket_addrs();"),
+        // Code the scan cannot read: a macro body, an included file, a
+        // module file named by `#[path]`.
+        ("dial.rs", "macro_rules! m { () => {}; }"),
+        ("dial.rs", "include!(\"x.rs\");"),
+        ("dial.rs", "use std::include as inc; inc!(\"x.rs\");"),
+        ("dial.rs", "#[path = \"../x.rs\"] mod x;"),
+        ("dial.rs", "#[cfg_attr(unix, path = \"../x.rs\")] mod x;"),
     ];
-    for (file, line) in caught {
-        let (hits, allowed) = std_lookups(file, line);
-        assert_eq!((hits.len(), allowed), (1, 0), "{file}: {line}: {hits:?}");
+    for (file, text) in caught {
+        let (hits, allowed) = std_lookup_hits(file, text);
+        assert_eq!((hits.len(), allowed), (1, 0), "{file}: {text}: {hits:?}");
     }
-    for (file, line) in [
-        ("resolve/exchange.rs", "let socket = UdpSocket::bind(local)"),
-        ("resolve/exchange.rs", ".and_then(|s| s.connect(server))"),
-        ("revocation/http.rs", "TcpListener::bind(\"127.0.0.1:0\")"),
-        ("dial.rs", "TcpStream::connect_timeout(&addr, left)"),
+    let through = [
+        (
+            "resolve/exchange.rs",
+            "let socket = UdpSocket::bind(local)",
+            1,
+        ),
+        ("resolve/exchange.rs", ".and_then(|s| s.connect(server))", 1),
+        (
+            "revocation/http.rs",
+            "TcpListener::bind(\"127.0.0.1:0\")",
+            1,
+        ),
+        ("dial.rs", "UdpSocket::bind(\"[::1]:443\")", 1),
+        ("dial.rs", "TcpListener::bind(r#\"127.0.0.1:0\"#)", 1),
+        ("dial.rs", "TcpStream::connect_timeout(&addr, left)", 0),
+        ("lib.rs", "pub fn connect(host: &str) {}", 0),
+        (
+            "revocation/ocsp/live.rs",
+            "crate::connect(host, 443, &plain, &options())",
+            0,
+        ),
+        ("dial.rs", "reconnect(host); bind_all(host)", 0),
+        ("dial.rs", "let path = \"../x.rs\";", 0),
+        // Not std's method: a look-alike with a Cyrillic letter.
+        ("dial.rs", "conn\u{435}ct(host)", 0),
+    ];
+    for (file, text, calls) in through {
+        let (hits, allowed) = std_lookup_hits(file, text);
+        assert!(hits.is_empty(), "{file}: {text}: {hits:?}");
+        assert_eq!(allowed, calls, "{file}: {text}");
+    }
+}
+
+/// The lexer drops comments and keeps each literal one token, so names
+/// inside them are no hits and a `)` inside them ends no argument.
+#[test]
+fn lex_ignores_comments_and_literals() {
+    let idents = |text: &str| -> Vec<String> {
+        lex(text)
+            .expect("lex")
+            .into_iter()
+            .filter_map(|t| match t.tok {
+                Tok::Ident { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(idents("// connect(host)\nlet a = 1;"), ["let", "a"]);
+    assert_eq!(idents("/* a /* connect */ bind */ x"), ["x"]);
+    assert_eq!(idents("/// send_to(host)\n//! bind\nx"), ["x"]);
+    assert_eq!(idents("\"lookup file bind\" x"), ["x"]);
+    assert_eq!(idents("\"a \\\" connect(\" x"), ["x"]);
+    assert_eq!(idents("r#\"a ) \" connect\"# x"), ["x"]);
+    assert_eq!(idents("r\"connect\" x"), ["x"]);
+    assert_eq!(idents("b\"bind\" b'x' c\"connect\" br#\"bind\"# x"), ["x"]);
+    assert_eq!(idents("'a' '\\'' '\\u{29}' ')' x"), ["x"]);
+    assert_eq!(idents("1.0e5 0x1F_u8 t.0.1 x"), ["t", "x"]);
+    assert_eq!(idents("fn f<'a>(x: &'a str) {}"), ["fn", "f", "x", "str"]);
+    assert_eq!(idents("'outer: loop {}"), ["loop"]);
+    assert_eq!(idents("r#connect r#fn"), ["connect", "fn"]);
+    let toks = lex("r#fn fn").expect("lex");
+    assert!(matches!(&toks[0].tok, Tok::Ident { raw: true, .. }));
+    assert!(matches!(&toks[1].tok, Tok::Ident { raw: false, .. }));
+    assert_eq!(lex("a\n/* b\n */\nc").expect("lex")[1].line, 4);
+    // A `)` in a literal or a lifetime in an argument does not move the
+    // argument's end: the bind after the call is still seen.
+    for text in [
+        "s.connect(f(')')); TcpListener::bind(\"127.0.0.1:0\")",
+        "s.connect(\")\"); TcpListener::bind(\"127.0.0.1:0\")",
+        "s.connect(g::<'a>(x)); TcpListener::bind(\"127.0.0.1:0\")",
+        "s.connect(r#\")\"#); TcpListener::bind(\"127.0.0.1:0\")",
     ] {
-        let (hits, _) = std_lookups(file, line);
-        assert!(hits.is_empty(), "{file}: {line}: {hits:?}");
+        let (hits, allowed) = std_lookup_hits("dial.rs", text);
+        assert_eq!((hits.len(), allowed), (1, 1), "{text}: {hits:?}");
     }
-    for (file, argument) in [
-        ("resolve/exchange.rs", "local"),
-        ("resolve/exchange.rs", " server"),
-        ("revocation/http.rs", "\"127.0.0.1:0\""),
-        ("dial.rs", "\"[::1]:443\""),
+}
+
+/// Input the lexer cannot end is an error, and the scan counts it as a
+/// hit: nothing after it is read, so nothing after it may pass.
+#[test]
+fn lex_fails_closed_on_unterminated_input() {
+    for text in [
+        "\"abc",
+        "\"abc\\\"",
+        "/* x",
+        "/* /* x */",
+        "r#\"abc\"",
+        "r#\"abc",
+        "b\"abc",
+        "'\\n",
+        "'",
     ] {
-        assert!(is_socket_addr(file, argument), "{file}: {argument}");
+        assert!(lex(text).is_err(), "{text:?}");
+        let (hits, allowed) = std_lookup_hits("dial.rs", text);
+        assert_eq!((hits.len(), allowed), (1, 0), "{text:?}: {hits:?}");
     }
-    assert_eq!(call_argument("(a, b)).expect(\"x\")"), "(a, b)");
+}
+
+/// A mutant per form in a real source file: the resolver's exchange,
+/// with one function or item appended, fails the scan with exactly one
+/// more hit. The file as it is passes, with its two socket-address calls.
+#[test]
+fn std_lookup_scan_catches_each_form_in_real_sources() {
+    let file = "resolve/exchange.rs";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
+    let text = std::fs::read_to_string(path).expect("source");
+    let (hits, allowed) = std_lookup_hits(file, &text);
+    assert!(hits.is_empty(), "{hits:#?}");
+    assert!(allowed >= 2, "{allowed} socket-address calls");
+    let mutants = [
+        // Method turbofish.
+        "fn mutant(s: &UdpSocket, host: &str) -> io::Result<()> {\n    s.connect::<&str>(host)\n}",
+        "fn mutant(s: &UdpSocket, host: &str) -> io::Result<usize> {\n    s.send_to::<&str>(&[], host)\n}",
+        // Qualified path.
+        "fn mutant(host: &str) -> io::Result<std::net::TcpStream> {\n    <std::net::TcpStream>::connect(host)\n}",
+        // Aliases.
+        "use std::net::TcpStream as T;\nfn mutant(host: &str) -> io::Result<T> {\n    T::connect(host)\n}",
+        "type T = std::net::TcpStream;\nfn mutant(host: &str) -> io::Result<T> {\n    T::connect(host)\n}",
+        // Macros.
+        "macro_rules! dial {\n    ($($t:tt)*) => { $($t)* };\n}",
+        "include!(\"../../mutant.rs\");",
+        "#[path = \"../../mutant.rs\"]\nmod mutant;",
+    ];
+    for mutant in mutants {
+        let (hits, _) = std_lookup_hits(file, &format!("{text}\n{mutant}\n"));
+        assert_eq!(hits.len(), 1, "{mutant}: {hits:#?}");
+    }
 }
