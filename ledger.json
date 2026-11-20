@@ -944,11 +944,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "b6fae515",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-17T00:52:42+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T17:52:20+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -959,10 +959,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true
   },
   {
    "issue": 56,
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T11:44:34+00:00",
-   "issue": 81,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-20T11:44:34+00:00",
    "issue": 80,
@@ -1613,6 +1605,14 @@
    "to": "done",
    "by": "98fa59e8",
    "note": "PR 1 #76 + PR 2 #78 (dccbbdc) merged; upstream memcg report draft for the operator"
+  },
+  {
+   "at": "2026-11-20T17:52:20+00:00",
+   "issue": 57,
+   "from": "ready",
+   "to": "claimed",
+   "by": "b6fae515",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T17:52:12+00:00",
+ "updated_at": "2026-11-20T17:52:20+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
