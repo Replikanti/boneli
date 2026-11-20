@@ -962,11 +962,11 @@
    "title": "Extract the store-root rules of ADR-009 D8 into a shared support crate",
    "epic": null,
    "order": 41,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "373fe023",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-18T08:20:49+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T15:12:58+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -977,8 +977,8 @@
     "core"
    ],
    "manual": false,
-   "user": null,
-   "machine": null
+   "user": "ylohnitram",
+   "machine": "df82df"
   },
   {
    "issue": 69,
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T02:23:44+00:00",
-   "issue": 37,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "482e8c7c",
-   "note": null
-  },
   {
    "at": "2026-11-20T02:28:23+00:00",
    "issue": 35,
@@ -1496,6 +1488,14 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #78 open"
+  },
+  {
+   "at": "2026-11-20T15:12:58+00:00",
+   "issue": 66,
+   "from": "ready",
+   "to": "claimed",
+   "by": "373fe023",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1531,7 +1531,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:12:50+00:00",
+ "updated_at": "2026-11-20T15:12:58+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
