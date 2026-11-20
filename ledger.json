@@ -1533,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T14:05:32+00:00",
+ "updated_at": "2026-11-20T14:06:24+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -1546,5 +1546,13 @@
   "at": 1795169975,
   "private": false
  },
- "schema": 2
+ "schema": 2,
+ "profiles": {
+  "ylohnitram": {
+   "profile": "hard",
+   "large": 1,
+   "medium": 3,
+   "small": 6
+  }
+ }
 }
