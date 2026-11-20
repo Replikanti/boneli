@@ -388,7 +388,8 @@ bytes rename equal files onto one name.
 - One process per root (D1). Two runners need two roots, and a second
   `open` fails with `InUse` instead of waiting.
 - The workspace MSRV is 1.89 (D1).
-- The root rules exist twice until #66 (D1).
+- The root rules exist twice until #66 (D1). ADR-021 closes it: the
+  rules live once, in the support crate `boneli-private-dir`.
 - A ticket whose encoded event exceeds 8 MiB fails its run at the first
   append (D3); an intake for larger tickets must truncate them.
 - `append` re-reads the whole log: a few KiB on today's state machine

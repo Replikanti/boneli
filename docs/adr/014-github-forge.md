@@ -827,7 +827,8 @@ gets the same ten lines.
 - Reporter and agent text on GitHub shows `＃`, `＠`, `github․com` and
   `GH‑N` where the original had `#`, `@`, `github.com` and `GH-N` (D8).
 - `own_uid` is now in three crates (`boneli-oci`, `boneli-store-fs`, this
-  one); #66's extraction should take this copy too.
+  one); #66's extraction should take this copy too. ADR-021 extracts
+  the other two and keeps this one as part of the key-file rule.
 
 ## Alternatives considered
 

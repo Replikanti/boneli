@@ -1,0 +1,16 @@
+[package]
+name = "boneli-private-dir"
+description = "Boneli support crate: the store-root rules that file-backed adapters share, a private root under ancestors no one else can rename (ADR-021)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: the rules need only std (`std::fs` and the Unix
+# `MetadataExt`/`DirBuilderExt` extensions), and a support crate that every
+# file-backed adapter links stays without edges of its own (ADR-021, D1).

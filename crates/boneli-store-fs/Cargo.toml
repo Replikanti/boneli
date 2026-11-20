@@ -25,3 +25,6 @@ boneli-json.workspace = true
 # for evidence references and run log names (ADR-012 D2). A support crate,
 # no new external edge.
 boneli-https.workspace = true
+# The store-root rules of ADR-009 D8 and ADR-012 D1, shared with
+# boneli-oci (ADR-021). A support crate, no external edge.
+boneli-private-dir.workspace = true

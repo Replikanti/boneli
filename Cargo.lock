@@ -114,10 +114,15 @@ dependencies = [
  "boneli-http",
  "boneli-https",
  "boneli-json",
+ "boneli-private-dir",
  "boneli-sys",
  "miniz_oxide",
  "ruzstd",
 ]
+
+[[package]]
+name = "boneli-private-dir"
+version = "0.0.0"
 
 [[package]]
 name = "boneli-replay-check"
@@ -137,6 +142,7 @@ dependencies = [
  "boneli-domain",
  "boneli-https",
  "boneli-json",
+ "boneli-private-dir",
 ]
 
 [[package]]

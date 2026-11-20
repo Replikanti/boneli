@@ -570,9 +570,19 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OCSP_REFRESH_RETRY_SECS`. Two direct edges to crates already in the
   graph, `rustls-webpki` and `ring`; no new crate. ADR-017's first known
   limit points to ADR-020.
+- `boneli-private-dir` (#66, ADR-021): a std-only support crate with the
+  store-root rules that `boneli-oci` and `boneli-store-fs` share,
+  `prepare_root` (with a text rule of the caller's), `create` and `Error`.
 
 ### Changed
 
+- The root rules of `boneli-oci` and `boneli-store-fs` live in
+  `boneli-private-dir` (#66, ADR-021); the error variants and texts of both
+  adapters are unchanged. A missing root is created at the path the
+  ancestor check saw, once that path passes the text rule, not through
+  the given path again (ADR-021, D3): a root whose ancestor link points to
+  a name `boneli-oci` refuses leaves no directory behind, and a link
+  re-pointed after the check cannot redirect creation.
 - `boneli-https` (#79): the revocation names that were CRL-only now cover
   OCSP too. `CrlFailure` is `RevocationFailure`, `CrlFailureKind` is
   `RevocationFailureKind`, its `BadDistributionPoint` is `BadUrl`, and

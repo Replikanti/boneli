@@ -15,9 +15,8 @@
 //! - `lock`: held exclusively for the store's lifetime, so one process owns
 //!   the root (ADR-012, D1).
 //!
-//! The root rules are those of `boneli-oci` (ADR-009, D8), copied rather
-//! than shared, because an adapter cannot depend on another adapter;
-//! extracting them is #66.
+//! The root rules are those of `boneli-oci` (ADR-009, D8), shared through
+//! the support crate `boneli-private-dir` (ADR-021).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod codec;
