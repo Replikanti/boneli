@@ -2,6 +2,16 @@
 //! provider, TLS 1.3 and 1.2, Mozilla's roots from `webpki-roots` plus
 //! roots the caller supplies (ADR-005).
 //!
+//! The key exchange offers the hybrid post-quantum group X25519MLKEM768
+//! first (RFC 10024; ADR-016): ML-KEM-768 from the pure-Rust `ml-kem`
+//! crate next to ring's X25519, so a recorded session stays as hard to
+//! decrypt as X25519 alone even if ML-KEM falls, and as hard as ML-KEM
+//! once X25519 falls to a quantum computer. X25519, P-256 and P-384 follow;
+//! the ClientHello carries the hybrid and the X25519 key share, so a
+//! server without the hybrid picks X25519 with no extra round trip.
+//! [`TlsConfig::classical`] leaves the hybrid out, for a host whose
+//! network path drops the larger ClientHello.
+//!
 //! It fails closed. Certificates are always verified and the API has no
 //! switch and no hook to change that. `connect` and `connect_over` finish
 //! the handshake before they return, so a certificate error surfaces there
@@ -32,6 +42,7 @@
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod dial;
+mod pq;
 mod random;
 mod rsa;
 mod sha256;
@@ -49,6 +60,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boneli_http::{IdleCheck, Transport, Tunnel};
+use rustls::crypto::SupportedKxGroup;
+use rustls::crypto::ring::kx_group;
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -182,21 +195,59 @@ impl Roots {
 
 /// A client configuration: the ring provider, TLS 1.3 and 1.2, ALPN
 /// `http/1.1`, SNI on, no early data, no key log, and verification against
-/// the given roots (ADR-005). Cheap to clone; share one per set of roots,
-/// so that sessions can resume.
+/// the given roots (ADR-005). The key exchange groups are, in this order,
+/// X25519MLKEM768 (TLS 1.3 only), X25519, P-256 and P-384 (ADR-016), or
+/// the last three for [`TlsConfig::classical`]. Cheap to clone; share one
+/// per set of roots, so that sessions can resume.
 #[derive(Clone, Debug)]
 pub struct TlsConfig {
     client: Arc<ClientConfig>,
 }
 
 impl TlsConfig {
-    /// A configuration that trusts `roots`. Empty roots are an error: they
-    /// would refuse every server.
+    /// A configuration that trusts `roots` and offers the hybrid
+    /// post-quantum key exchange X25519MLKEM768 first (ADR-016). Empty
+    /// roots are an error: they would refuse every server.
     pub fn new(roots: Roots) -> Result<TlsConfig> {
+        // Explicit, so that a rustls update that changes ring's default
+        // groups cannot change what the runner offers.
+        TlsConfig::with_groups(
+            roots,
+            vec![
+                pq::X25519MLKEM768,
+                kx_group::X25519,
+                kx_group::SECP256R1,
+                kx_group::SECP384R1,
+            ],
+        )
+    }
+
+    /// The same configuration without the hybrid post-quantum group: it
+    /// offers X25519, P-256 and P-384 and sends one X25519 key share
+    /// (ADR-016, item 8). For one case only: a host behind a middlebox that
+    /// drops a ClientHello spanning two TCP segments, which the hybrid's
+    /// 1216-byte key share makes it. Certificates are verified exactly as
+    /// with [`TlsConfig::new`]; what is given up, for that host only, is
+    /// the protection of recorded traffic against a future quantum
+    /// computer. Never a fallback after a failed handshake: retrying
+    /// without the hybrid would hand an active attacker a downgrade.
+    pub fn classical(roots: Roots) -> Result<TlsConfig> {
+        TlsConfig::with_groups(
+            roots,
+            vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1],
+        )
+    }
+
+    /// The one builder of both constructors, so that they differ in the
+    /// key exchange groups and nothing else.
+    fn with_groups(roots: Roots, groups: Vec<&'static dyn SupportedKxGroup>) -> Result<TlsConfig> {
         if roots.is_empty() {
             return Err(Error::NoCertificates);
         }
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::CryptoProvider {
+            kx_groups: groups,
+            ..rustls::crypto::ring::default_provider()
+        });
         let mut client = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(Error::Tls)?
@@ -520,6 +571,15 @@ impl<S: Read + Write> TlsStream<S> {
         self.stream.conn.protocol_version()
     }
 
+    /// The key exchange group of the handshake, such as
+    /// `NamedGroup::X25519MLKEM768` (ADR-016), for tests and logs.
+    pub fn key_exchange_group(&self) -> Option<rustls::NamedGroup> {
+        self.stream
+            .conn
+            .negotiated_key_exchange_group()
+            .map(|group| group.name())
+    }
+
     /// The protocol the server chose by ALPN, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.stream.conn.alpn_protocol()
@@ -627,13 +687,55 @@ impl<S: Read + Write + Nonblocking> IdleCheck for TlsStream<S> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn config_fails_closed() {
-        let config = TlsConfig::new(Roots::mozilla()).expect("config");
+    use rustls::NamedGroup;
+
+    fn groups(config: &TlsConfig) -> Vec<NamedGroup> {
+        let provider = config.client.crypto_provider();
+        provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect()
+    }
+
+    fn assert_fails_closed(config: &TlsConfig) {
         let client = &config.client;
         assert!(!client.enable_early_data, "no 0-RTT");
         assert!(client.enable_sni);
         assert_eq!(client.alpn_protocols, vec![b"http/1.1".to_vec()]);
         assert!(!client.key_log.will_log("CLIENT_RANDOM"), "no key log");
+    }
+
+    #[test]
+    fn config_offers_hybrid_first() {
+        let config = TlsConfig::new(Roots::mozilla()).expect("config");
+        assert_fails_closed(&config);
+        assert_eq!(
+            groups(&config),
+            [
+                NamedGroup::X25519MLKEM768,
+                NamedGroup::X25519,
+                NamedGroup::secp256r1,
+                NamedGroup::secp384r1,
+            ]
+        );
+    }
+
+    #[test]
+    fn classical_config_has_no_hybrid() {
+        let config = TlsConfig::classical(Roots::mozilla()).expect("config");
+        assert_fails_closed(&config);
+        assert_eq!(
+            groups(&config),
+            [
+                NamedGroup::X25519,
+                NamedGroup::secp256r1,
+                NamedGroup::secp384r1,
+            ]
+        );
+        assert!(matches!(
+            TlsConfig::classical(Roots::empty()),
+            Err(Error::NoCertificates)
+        ));
     }
 }

@@ -480,6 +480,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a zombie leader; on any other thread it returns `Error::NotMainThread`
   and changes nothing. `tests/exit_main_thread.rs` (`harness = false`)
   runs it in a real process.
+- `boneli-https` (#37, ADR-016): the hybrid post-quantum key exchange
+  X25519MLKEM768 of RFC 10024, ML-KEM-768 from the pure-Rust `ml-kem`
+  0.3.4 next to ring's X25519, client only and TLS 1.3 only.
+  `TlsConfig::new` offers X25519MLKEM768, X25519, P-256 and P-384 in that
+  order, with a hybrid and an X25519 key share, so a server without the
+  hybrid picks X25519 without a retry; `TlsConfig::classical` offers the
+  last three only, for a host whose network path drops the larger
+  ClientHello. `TlsStream::key_exchange_group` reports the group.
+  Known-answer tests from Wycheproof and RFC 7748, local handshakes
+  including hostile servers, and an OpenSSL interop test that CI runs on
+  every PR (`tests/interop.rs`); a live test against
+  pq.cloudflareresearch.com runs by hand. 17 new crates and 32 edges in
+  `tools/architecture.toml`, one of them `cpufeatures -> libc` on
+  aarch64, and the `num-traits` build script are approved by ADR-016.
+  ADR-005's post-quantum known limit points to ADR-016, which
+  `docs/adr/README.md` now allows.
 
 ### Changed
 

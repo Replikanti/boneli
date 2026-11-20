@@ -116,6 +116,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      # X25519MLKEM768 against an independent implementation (ADR-016,
+      # item 10): the only test that checks the reading of RFC 10024. It
+      # fails, never skips, without OpenSSL 3.5 or the group; the grep
+      # makes sure the 32-handshake test ran and passed, so a renamed or
+      # filtered-out test cannot turn the step green.
+      - name: boneli-https interop with OpenSSL (ADR-016)
+        run: |
+          openssl version
+          out="$RUNNER_TEMP/interop.out"
+          code=0
+          cargo test -p boneli-https --test interop -- --ignored > "$out" 2>&1 || code=$?
+          cat "$out"
+          test "$code" = 0
+          grep -q '^test openssl_hybrid_only_server_32_handshakes \.\.\. ok$' "$out"
+          grep -q '^test openssl_x25519_only_server_falls_back \.\.\. ok$' "$out"
       # The shim (#9) ships as a static musl binary, and libc's constants
       # differ per target; aarch64 is otherwise only compiled on the arm
       # leg of `sandbox` (ADR-007, D5).
@@ -363,6 +378,23 @@ jobs:
             echo "queue $f: $( [ -n "$q" ] && cat "$q/$f" 2>/dev/null || echo absent)"
           done
           lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
+      # The X25519MLKEM768 known-answer tests on aarch64 (ADR-016, item
+      # 10): keccak picks a backend with the SHA3 instructions at run time
+      # there, and no other job runs boneli-https code on arm64. The grep
+      # makes sure the layout tests ran and passed.
+      - name: boneli-https KAT on arm64
+        if: matrix.arch == 'arm64'
+        run: |
+          grep -m1 -ow sha3 /proc/cpuinfo || echo "no sha3 extension: keccak's soft backend"
+          out="$RUNNER_TEMP/kat.out"
+          code=0
+          cargo test -p boneli-https --lib pq:: > "$out" 2>&1 || code=$?
+          cat "$out"
+          test "$code" = 0
+          for t in kat_client_share_is_ek_then_x25519 kat_secret_is_mlkem_then_x25519 \
+                   kat_with_ring_x25519_halves_in_place implicit_rejection_is_not_an_error; do
+            grep -q "^test pq::tests::$t \.\.\. ok$" "$out"
+          done
       # Both crates' test binaries in one build, before the host is
       # prepared: the AppArmor profile names their paths (ADR-009).
       - name: Build

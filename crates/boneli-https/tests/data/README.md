@@ -81,3 +81,24 @@ regenerating the 2048-bit key changes it, so the two 2048-bit files and
 the signature change together; the other keys stand alone. `openssl pkey -in test-only-rsa-2048-pkcs8.key -pubout | openssl
 dgst -sha256 -verify /dev/stdin -signature rs256-test-only.sig
 rs256-message.txt` checks it independently of Boneli.
+
+## Hybrid key exchange values (`x25519mlkem768-kat.txt`, ADR-016)
+
+The known-answer values of the X25519MLKEM768 unit tests in `src/pq.rs`,
+which read the file with `include_str!`. RFC 10024 has no test vectors,
+so each half comes from its own independent source, and the file records
+both in its comments:
+
+- **ML-KEM-768:** Wycheproof `testvectors_v1/mlkem_768_test.json` at
+  commit `3fa63dd0344abb611f1fb1d77e119938603ea230` of
+  `github.com/C2SP/wycheproof`, copied byte for byte: tcId 2 (group
+  "FIPS 203", "official round 3 seeds 0", valid) and tcId 194 (group
+  "mlkem-implicit-rejection", flag `MalleableCiphertext`, valid), each with
+  `seed`, `ek`, `c` and `K`.
+- **X25519:** RFC 7748, section 6.1: Alice's public key, Bob's public key
+  and their shared secret.
+
+The tests build the expected client share (`ek`, then Alice's key) and
+the expected secret (`K`, then the X25519 secret) from these values, so
+they pin the layout against literal bytes; whether that layout is RFC
+10024's is checked by the OpenSSL interop test (`tests/interop.rs`).

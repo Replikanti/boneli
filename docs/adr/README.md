@@ -12,9 +12,10 @@ Decisions made since get one file each here:
   ones), `Alternatives considered`. A proposed ADR adds `Accept when`: the
   event or measurement that settles it.
 - **Lifecycle**: a proposed ADR may be edited freely. An accepted ADR changes
-  only its status line; changing the decision means a new ADR that
-  supersedes it. A decision that changes the baseline design updates
-  `ARCHITECTURE.md` in the same PR and names the ADR there.
+  only its status line; the one other change allowed is a sentence added to
+  a known limit that points to the ADR closing it. Changing the decision
+  means a new ADR that supersedes it. A decision that changes the baseline
+  design updates `ARCHITECTURE.md` in the same PR and names the ADR there.
 - **When**: a PR that makes a design decision adds or flips an ADR, and issues
   labelled `needs-adr` name the ADR they will produce.
 - **Public repository**: ADRs here cover the runner and the code in this
