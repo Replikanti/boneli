@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR #78 open",
-   "updated_at": "2026-11-20T15:06:41+00:00",
+   "note": "PR 2 (#78): MK-P decided; ADR note, AWS landing, mark ready",
+   "updated_at": "2026-11-20T15:11:11+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-19T19:03:59+00:00",
-   "issue": 35,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "9db267e1",
-   "note": null
-  },
   {
    "at": "2026-11-20T01:11:03+00:00",
    "issue": 35,
@@ -1496,6 +1488,14 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #78 open"
+  },
+  {
+   "at": "2026-11-20T15:11:11+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "98fa59e8",
+   "note": "PR 2 (#78): MK-P decided; ADR note, AWS landing, mark ready"
   }
  ],
  "open": [
@@ -1532,7 +1532,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:06:41+00:00",
+ "updated_at": "2026-11-20T15:11:11+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
