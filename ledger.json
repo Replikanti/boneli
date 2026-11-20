@@ -941,11 +941,11 @@
    "title": "boneli-app: decide how workspaces carry backslash, blank and non-UTF-8 paths",
    "epic": null,
    "order": 40,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "abd3f92f",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T11:44:39+00:00",
+   "updated_at": "2026-11-20T12:00:53+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-17T23:04:22+00:00",
-   "issue": 4,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "867f864c",
-   "note": null
-  },
   {
    "at": "2026-11-18T08:20:45+00:00",
    "issue": 4,
@@ -1496,6 +1488,14 @@
    "to": "claimed",
    "by": "abd3f92f",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T12:00:53+00:00",
+   "issue": 64,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "abd3f92f",
+   "note": null
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T11:45:05+00:00",
+ "updated_at": "2026-11-20T12:00:53+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T10:11:33+00:00",
