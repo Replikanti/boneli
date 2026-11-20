@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider and hybrid post-quantum key exchange, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange and certificate revocation by CRL, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,8 @@ boneli-http.workspace = true
 # `rustls::crypto::hash` (`Sha256`, ADR-009), and RS256 signatures and
 # random bytes through the provider's `key_provider` and `secure_random`
 # (`RsaSha256Key`, `fill_random`, ADR-014); none of them needs a feature.
+# Nor does revocation by CRL (ADR-017): `WebPkiServerVerifier` with CRLs
+# is part of the `ring` and `std` features above.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Mozilla's root certificates, compiled in, so trust does not depend on the
 # host's CA bundle (ADR-005).
