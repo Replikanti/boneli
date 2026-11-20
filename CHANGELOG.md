@@ -573,6 +573,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-private-dir` (#66, ADR-021): a std-only support crate with the
   store-root rules that `boneli-oci` and `boneli-store-fs` share,
   `prepare_root` (with a text rule of the caller's), `create` and `Error`.
+- `boneli-https` (#81 part 1, ADR-022 proposed): a stub resolver whose
+  every wait ends by the caller's deadline, on the caller's thread, with
+  no thread or process that outlives the call. It reads `/etc/hosts`,
+  then asks the name servers of `/etc/resolv.conf` for A and AAAA over
+  UDP, TCP when an answer is truncated (musl's semantics: no NSS). Hosts
+  outside the ADR-003 grammar are refused before any query; addresses
+  come back once each in the order of RFC 3484's default precedence
+  table. New public items: `Resolver` (`system`, `fixed`, `lookup`),
+  `ResolverConfig` (`parse`, `new`, `with_search`, `with_ndots`,
+  `with_use_vc`, `with_hosts`) and the constants `DNS_PORT`,
+  `DNS_MAX_NAME_SERVERS` (3), `DNS_DEFAULT_NDOTS` (1), `DNS_MAX_NDOTS`
+  (15), `DNS_DEFAULT_TRY_TIMEOUT` (5 s), `DNS_MAX_TRY_TIMEOUT` (30 s),
+  `DNS_DEFAULT_ATTEMPTS` (2), `DNS_MAX_ATTEMPTS` (5) and
+  `DNS_UDP_MESSAGE_BYTES` (512). No call site uses it yet: `TlsDial`,
+  `connect` and the CRL and OCSP fetches still resolve with
+  `getaddrinfo` until part 2. No new crate.
 
 ### Changed
 

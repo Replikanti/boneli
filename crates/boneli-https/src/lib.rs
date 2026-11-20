@@ -61,12 +61,18 @@
 mod dial;
 mod pq;
 mod random;
+mod resolve;
 mod revocation;
 mod rsa;
 mod sha256;
 
 pub use dial::{Dial, Stream, Timed, TlsDial};
 pub use random::{RandomFailed, fill_random};
+pub use resolve::{
+    DNS_DEFAULT_ATTEMPTS, DNS_DEFAULT_NDOTS, DNS_DEFAULT_TRY_TIMEOUT, DNS_MAX_ATTEMPTS,
+    DNS_MAX_NAME_SERVERS, DNS_MAX_NDOTS, DNS_MAX_TRY_TIMEOUT, DNS_PORT, DNS_UDP_MESSAGE_BYTES,
+    Resolver, ResolverConfig,
+};
 pub use revocation::{
     CRL_CACHE_MAX_BYTES, CRL_CHECK_DEADLINE, CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT,
     CRL_IO_TIMEOUT, CRL_MAX_AGE_SECS, CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, CRL_MIN_RATE,

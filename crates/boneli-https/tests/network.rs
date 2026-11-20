@@ -11,8 +11,10 @@
 //! a revoked and a valid leaf whose CRLs come from a real CA over the
 //! real network path, which no loopback test reaches. Revocation by OCSP
 //! (ADR-020, item 12): the six forge hosts whose leaves name only an OCSP
-//! responder must be checked by Sectigo's. Run them by hand before a
-//! change under `src/revocation/` merges:
+//! responder must be checked by Sectigo's. Name resolution (ADR-022): the
+//! own resolver must agree with the system's on the runner's hosts. Run
+//! them by hand before a change under `src/revocation/` or `src/resolve/`
+//! merges:
 //!
 //! ```sh
 //! cargo test -p boneli-https --test network -- --ignored --nocapture
@@ -143,5 +145,72 @@ fn forge_hosts_checked_by_ocsp() {
     assert!(
         wrong.is_empty(),
         "not checked by Sectigo's responder: {wrong:?}"
+    );
+}
+
+/// The hosts the runner reaches today, measured when ADR-022 was planned:
+/// forges, registries, the model API, and the CRL and OCSP hosts their
+/// leaves name.
+const RESOLVER_HOSTS: [&str; 14] = [
+    "api.anthropic.com",
+    "api.github.com",
+    "codeload.github.com",
+    "ghcr.io",
+    "github.com",
+    "gitlab.com",
+    "registry-1.docker.io",
+    "registry.gitlab.com",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "pkg-containers.githubusercontent.com",
+    "ocsp.sectigo.com",
+    "x1.c.lencr.org",
+    "crl3.digicert.com",
+];
+
+/// ADR-022: the own resolver (resolv.conf and hosts only) finds an
+/// address of each host that the system's `getaddrinfo` (all of NSS) also
+/// finds. Run it by hand before a change under `src/resolve/` merges;
+/// the times it prints are the lookup times ADR-022 records.
+#[test]
+#[ignore = "network: resolves the runner's hosts through the host's name servers"]
+fn own_resolver_agrees_with_the_system() {
+    use std::collections::BTreeSet;
+    use std::net::ToSocketAddrs;
+    use std::time::Instant;
+
+    let resolver = boneli_https::Resolver::system();
+    let mut wrong = Vec::new();
+    for host in RESOLVER_HOSTS {
+        let start = Instant::now();
+        let own = resolver.lookup(host, 443, start + Duration::from_secs(10));
+        let own_time = start.elapsed();
+        let start = Instant::now();
+        let system: BTreeSet<_> = (host, 443)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let system_time = start.elapsed();
+        let own: BTreeSet<_> = match own {
+            Ok(list) => list.into_iter().collect(),
+            Err(e) => {
+                println!("{host}: own resolver failed: {e}");
+                wrong.push(host);
+                continue;
+            }
+        };
+        println!(
+            "{host}: own {} addresses in {own_time:.1?}, system {} in {system_time:.1?}, {} shared",
+            own.len(),
+            system.len(),
+            own.intersection(&system).count()
+        );
+        if own.is_empty() || own.is_disjoint(&system) {
+            wrong.push(host);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the own resolver disagrees with the system on {wrong:?}"
     );
 }
