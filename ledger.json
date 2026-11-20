@@ -1092,11 +1092,11 @@
    "title": "Wire the patch policy into the run: Git port diff as Patch, gate between FixWritten and VerifyFix",
    "epic": null,
    "order": 43,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "47331c5b",
-   "pr": null,
+   "pr": 89,
    "note": "",
-   "updated_at": "2026-11-20T18:48:27+00:00",
+   "updated_at": "2026-11-20T19:13:48+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T12:40:17+00:00",
-   "issue": 54,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "98fa59e8",
-   "note": "PR 2 (#78 draft): tracefs diagnostic round on NVMe copies"
-  },
   {
    "at": "2026-11-20T13:02:48+00:00",
    "issue": 64,
@@ -1613,6 +1605,14 @@
    "to": "pr-review",
    "by": "f7d29cb8",
    "note": null
+  },
+  {
+   "at": "2026-11-20T19:13:48+00:00",
+   "issue": 68,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "47331c5b",
+   "note": null
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T19:12:09+00:00",
+ "updated_at": "2026-11-20T19:13:48+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
