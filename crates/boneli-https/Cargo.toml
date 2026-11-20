@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
+description = "Boneli support crate: a TLS client on rustls with the ring provider and hybrid post-quantum key exchange, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -31,3 +31,17 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # Mozilla's root certificates, compiled in, so trust does not depend on the
 # host's CA bundle (ADR-005).
 webpki-roots = "1.0.12"
+# ML-KEM-768 (FIPS 203), the post-quantum half of the hybrid key exchange
+# X25519MLKEM768 (RFC 10024, ADR-016); the X25519 half is ring's, through
+# rustls. Pure Rust; ADR-016 records its audit status and its 17 crates.
+# - `zeroize`: wipes the decapsulation key on drop; it adds no crate.
+# - No `alloc`: it would list five unused PKCS#8 crates in the metadata
+#   the architecture check reads.
+# - No `getrandom`: it would pull a second getrandom with its own libc
+#   edge; the seed comes from `fill_random`, ring's source.
+# At least 0.3.4, the release with the hardened reduction and the
+# `ctutils` and `cmov` versions past their advisories (ADR-016, item 3).
+ml-kem = { version = "0.3.4", default-features = false, features = ["zeroize"] }
+# Wipes the key generation seed and the ML-KEM shared secret (ADR-016).
+# Already in the graph through rustls; a direct edge, no new crate.
+zeroize = { version = "1.9.1", default-features = false }

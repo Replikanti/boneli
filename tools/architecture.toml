@@ -268,3 +268,208 @@ decision = "ADR-005"
 [external.rustls-pki-types.pulled-by.webpki-roots]
 reason = "the roots are pki-types trust anchors"
 decision = "ADR-005"
+
+# ---- Post-quantum key exchange of boneli-https (ADR-016) -------------------
+# ml-kem without default features, with `zeroize`, as resolved for #37:
+# ML-KEM-768 for the hybrid X25519MLKEM768 (RFC 10024). The crates and the
+# edges between them; ADR-016 lists every crate with its version, license,
+# MSRV and role, and names the one edge into libc literally. cfg-if, libc
+# and zeroize are ADR-005 crates; only their new edges are recorded here.
+
+[external.ml-kem]
+reason = "ML-KEM-768 (FIPS 203), the post-quantum half of the TLS key exchange"
+decision = "ADR-016"
+
+[external.module-lattice]
+reason = "polynomial ring and NTT arithmetic for ml-kem"
+decision = "ADR-016"
+
+[external.hybrid-array]
+reason = "fixed-size arrays with type-level lengths, the key and ciphertext types of ml-kem"
+decision = "ADR-016"
+
+[external.typenum]
+reason = "type-level numbers for hybrid-array's lengths"
+decision = "ADR-016"
+
+[external.ctutils]
+reason = "constant-time selection and comparison in ml-kem's decapsulation"
+decision = "ADR-016"
+
+[external.cmov]
+reason = "constant-time conditional moves under ctutils"
+decision = "ADR-016"
+
+[external.kem]
+reason = "the KEM traits ml-kem implements"
+decision = "ADR-016"
+
+[external.crypto-common]
+reason = "traits shared by kem and digest"
+decision = "ADR-016"
+
+[external.rand_core]
+reason = "RNG traits in ml-kem's API; boneli-https passes a seed and no RNG"
+decision = "ADR-016"
+
+[external.sha3]
+reason = "SHA3-256 and SHA3-512, the H and G functions of ML-KEM"
+decision = "ADR-016"
+
+[external.shake]
+reason = "SHAKE128 and SHAKE256, the XOF and PRF functions of ML-KEM"
+decision = "ADR-016"
+
+[external.digest]
+reason = "hash traits for sha3 and shake"
+decision = "ADR-016"
+
+[external.keccak]
+reason = "the Keccak permutation under sha3 and shake"
+decision = "ADR-016"
+
+[external.sponge-cursor]
+reason = "sponge buffering for sha3 and shake"
+decision = "ADR-016"
+
+[external.cpufeatures]
+reason = "detects the aarch64 SHA3 instructions for keccak"
+decision = "ADR-016"
+
+[external.num-traits]
+reason = "numeric traits for module-lattice's arithmetic"
+decision = "ADR-016"
+# Probes `f64::total_cmp` with autocfg and prints one cfg (ADR-016).
+build-script = "ADR-016"
+
+[external.autocfg]
+reason = "rustc feature probe for num-traits' build script (build-dependency only)"
+decision = "ADR-016"
+
+[external.ml-kem.pulled-by.boneli-https]
+reason = "boneli-https builds the hybrid key exchange X25519MLKEM768"
+decision = "ADR-016"
+
+[external.zeroize.pulled-by.boneli-https]
+reason = "boneli-https wipes the ML-KEM seed and shared secret"
+decision = "ADR-016"
+
+[external.hybrid-array.pulled-by.ml-kem]
+reason = "ml-kem's keys, ciphertexts and secrets are fixed-size arrays"
+decision = "ADR-016"
+
+[external.kem.pulled-by.ml-kem]
+reason = "ml-kem implements the KEM traits"
+decision = "ADR-016"
+
+[external.module-lattice.pulled-by.ml-kem]
+reason = "ml-kem computes in the module lattice"
+decision = "ADR-016"
+
+[external.rand_core.pulled-by.ml-kem]
+reason = "ml-kem's key generation API takes RNG traits"
+decision = "ADR-016"
+
+[external.sha3.pulled-by.ml-kem]
+reason = "ml-kem hashes with SHA3-256 and SHA3-512"
+decision = "ADR-016"
+
+[external.shake.pulled-by.ml-kem]
+reason = "ml-kem samples with SHAKE128 and SHAKE256"
+decision = "ADR-016"
+
+[external.zeroize.pulled-by.ml-kem]
+reason = "ml-kem wipes decapsulation keys on drop (feature zeroize)"
+decision = "ADR-016"
+
+[external.ctutils.pulled-by.module-lattice]
+reason = "module-lattice compares and selects in constant time"
+decision = "ADR-016"
+
+[external.hybrid-array.pulled-by.module-lattice]
+reason = "module-lattice's polynomials are fixed-size arrays"
+decision = "ADR-016"
+
+[external.num-traits.pulled-by.module-lattice]
+reason = "module-lattice is generic over integer types"
+decision = "ADR-016"
+
+[external.zeroize.pulled-by.module-lattice]
+reason = "module-lattice wipes secret polynomials (feature zeroize)"
+decision = "ADR-016"
+
+[external.ctutils.pulled-by.hybrid-array]
+reason = "hybrid-array's constant-time comparisons (feature ctutils)"
+decision = "ADR-016"
+
+[external.typenum.pulled-by.hybrid-array]
+reason = "hybrid-array's lengths are type-level numbers"
+decision = "ADR-016"
+
+[external.zeroize.pulled-by.hybrid-array]
+reason = "hybrid-array wipes arrays (feature zeroize)"
+decision = "ADR-016"
+
+[external.cmov.pulled-by.ctutils]
+reason = "ctutils selects with constant-time moves"
+decision = "ADR-016"
+
+[external.crypto-common.pulled-by.kem]
+reason = "kem builds on the shared key traits"
+decision = "ADR-016"
+
+[external.rand_core.pulled-by.kem]
+reason = "kem's encapsulation traits take RNG traits"
+decision = "ADR-016"
+
+[external.hybrid-array.pulled-by.crypto-common]
+reason = "crypto-common's sizes are fixed-size arrays"
+decision = "ADR-016"
+
+[external.rand_core.pulled-by.crypto-common]
+reason = "crypto-common's key generation traits take RNG traits"
+decision = "ADR-016"
+
+[external.crypto-common.pulled-by.digest]
+reason = "digest builds on the shared traits"
+decision = "ADR-016"
+
+[external.digest.pulled-by.sha3]
+reason = "sha3 implements the hash traits"
+decision = "ADR-016"
+
+[external.keccak.pulled-by.sha3]
+reason = "sha3 runs the Keccak permutation"
+decision = "ADR-016"
+
+[external.sponge-cursor.pulled-by.sha3]
+reason = "sha3 buffers its sponge input"
+decision = "ADR-016"
+
+[external.digest.pulled-by.shake]
+reason = "shake implements the XOF traits"
+decision = "ADR-016"
+
+[external.keccak.pulled-by.shake]
+reason = "shake runs the Keccak permutation"
+decision = "ADR-016"
+
+[external.sponge-cursor.pulled-by.shake]
+reason = "shake buffers its sponge input and output"
+decision = "ADR-016"
+
+[external.cfg-if.pulled-by.keccak]
+reason = "keccak picks its backend per architecture"
+decision = "ADR-016"
+
+[external.cpufeatures.pulled-by.keccak]
+reason = "keccak uses the SHA3 instructions when the aarch64 CPU has them"
+decision = "ADR-016"
+
+[external.libc.pulled-by.cpufeatures]
+reason = "cpufeatures reads the CPU features with getauxval on aarch64 Linux (ADR-016 names this edge)"
+decision = "ADR-016"
+
+[external.autocfg.pulled-by.num-traits]
+reason = "num-traits' build script probes rustc with autocfg"
+decision = "ADR-016"

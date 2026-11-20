@@ -254,7 +254,7 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
   #5:
   - No post-quantum hybrid key exchange: the ring provider has none.
     Replikanti/boneli#37 adds X25519MLKEM768 over the pure-Rust `ml-kem`
-    crate.
+    crate. ADR-016 closes this limit with X25519MLKEM768 over `ml-kem`.
   - No certificate revocation checking: rustls checks CRLs only when it is
     given them, and nothing fetches them yet. Replikanti/boneli#38 adds
     fetching and caching of CRLs.

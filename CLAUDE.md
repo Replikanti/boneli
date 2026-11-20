@@ -72,7 +72,8 @@ harness. Rust workspace, hexagonal architecture. Public repository
    `build-script = "ADR-NNN"` on its `[external.<crate>]` record, required
    by the check for every reachable external crate whose cargo metadata
    has a build script (`httparse`: ADR-003; `libc`, `ring`, `rustls`:
-   ADR-005). The approval is per crate, not per version (ADR-005).
+   ADR-005; `num-traits`: ADR-016). The approval is per crate, not per
+   version (ADR-005).
 5. **The sandbox holds no secrets and has no network.** Capabilities reach it
    only through broker sockets. The MVP subscription token is the one
    documented exception.
@@ -241,6 +242,22 @@ credential path merges, and fails, naming the variable, when one of the
 
 ```sh
 cargo test -p boneli-acceptance --test github -- --ignored --nocapture
+```
+
+### Interop and live test (boneli-https)
+
+The hybrid key exchange X25519MLKEM768 (ADR-016) has two ignored tests
+next to the local ones. `tests/interop.rs` runs 32 handshakes against
+`openssl s_server` and needs OpenSSL 3.5 or newer on PATH; it fails, not
+skips, without it or without the group. CI runs it in `check` on every
+PR. `tests/network.rs` checks the group against
+pq.cloudflareresearch.com and runs by hand before a change to
+`crates/boneli-https/src/pq.rs` or to the key exchange group lists of
+`TlsConfig` merges.
+
+```sh
+cargo test -p boneli-https --test interop -- --ignored
+cargo test -p boneli-https --test network -- --ignored --nocapture
 ```
 
 ## Conventions
