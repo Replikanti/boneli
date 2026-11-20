@@ -1170,6 +1170,22 @@ fn connect_lookup_stops_at_the_connect_timeout() {
     );
 }
 
+/// A `connect_timeout` too large to add to the clock (`Duration::MAX`,
+/// "no bound of mine") still resolves and dials, as before ADR-022: the
+/// lookup's deadline saturates instead of failing with `InvalidInput`.
+#[test]
+fn connect_with_a_huge_connect_timeout_still_dials() {
+    let closed = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let options = ConnectOptions::new(Duration::MAX, GUARD, GUARD).expect("options");
+    let err = connect("127.0.0.1", port, &config(test_roots()), &options).expect_err("refused");
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused),
+        "{err:?}"
+    );
+}
+
 /// Names rustls takes as server names but ADR-003's grammar does not (an
 /// underscore, a trailing dot) are refused before any query is sent or
 /// connection made, as `TlsDial` refuses them (ADR-022, D7).

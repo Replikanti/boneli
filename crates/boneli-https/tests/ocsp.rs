@@ -589,13 +589,15 @@ fn default_config_checks_ocsp() {
 /// The real source resolves the responder's host through the
 /// configuration's resolver under the request's deadline: against a name
 /// server that never answers, `TlsDial` fails at its 300 ms deadline with
-/// a timed-out fetch, not at the resolver's 10 s try timeout.
+/// a timed-out fetch, not after the resolver's 3.75 s of tries, and no
+/// query is sent once it returned: a lookup left running would send one
+/// at 500 ms (`Stalled::call_site_resolver`).
 #[test]
 fn ocsp_lookup_stops_at_the_request_deadline() {
     let stalled = common::Stalled::start();
     let config = TlsConfig::new(roots())
         .expect("config")
-        .with_resolver(stalled.resolver(Duration::from_secs(10), 2));
+        .with_resolver(stalled.call_site_resolver());
     let addr = serve(GOOD);
     let dial = TlsDial::new(config, options());
     let start = Instant::now();

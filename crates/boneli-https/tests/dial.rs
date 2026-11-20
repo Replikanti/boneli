@@ -177,12 +177,13 @@ fn invalid_hosts_rejected_before_dialing() {
 
 /// A name server that receives every query and never answers (ADR-006's
 /// measurement): the dial fails with `TimedOut` at the request deadline,
-/// not at the resolver's 10 s try timeout (#81, first criterion), and no
-/// query is sent once it returned (second criterion).
+/// not after the resolver's 3.75 s of tries (#81, first criterion), and no
+/// query is sent once it returned (second criterion): a lookup left
+/// running would send one at 500 ms (`Stalled::call_site_resolver`).
 #[test]
 fn dial_fails_at_the_deadline_on_a_stalled_resolver() {
     let stalled = common::Stalled::start();
-    let dial = dial_with(stalled.resolver(Duration::from_secs(10), 2));
+    let dial = dial_with(stalled.call_site_resolver());
     let start = Instant::now();
     let err = match dial.dial(
         "stalled.boneli.test",

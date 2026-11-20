@@ -517,9 +517,7 @@ pub fn connect(
     if port == 0 {
         return Err(Error::InvalidInput("port is zero"));
     }
-    let lookup_deadline = Instant::now()
-        .checked_add(options.connect_timeout)
-        .ok_or(Error::InvalidInput("the connect timeout is too large"))?;
+    let lookup_deadline = saturating_deadline(Instant::now(), options.connect_timeout);
     let mut last = None;
     for addr in config.resolver.lookup(host, port, lookup_deadline)? {
         match TcpStream::connect_timeout(&addr, options.connect_timeout) {
@@ -530,6 +528,21 @@ pub fn connect(
     Err(Error::Io(last.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "the host has no address")
     })))
+}
+
+/// `now + timeout`, or, when the clock cannot hold that sum (a timeout
+/// such as `Duration::MAX`, "no bound of mine"), the latest instant within
+/// a factor of two of it: the lookup is then bounded by the resolver's own
+/// tries only, as the dial was before ADR-022.
+fn saturating_deadline(now: Instant, timeout: Duration) -> Instant {
+    let mut timeout = timeout;
+    loop {
+        // Halving ends: `now + 0` always fits.
+        if let Some(deadline) = now.checked_add(timeout) {
+            return deadline;
+        }
+        timeout /= 2;
+    }
 }
 
 /// Completes a TLS handshake over `transport`, for example a CONNECT

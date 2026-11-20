@@ -44,6 +44,18 @@ impl Stalled {
         resolver_for(self.addr(), try_timeout, attempts)
     }
 
+    /// A resolver for the call-site tests with a 300 ms deadline: 250 ms
+    /// tries, five rounds over this server listed three times, so 3.75 s
+    /// of tries. A lookup that ignored the deadline would outlive the
+    /// tests' 1 s bound, and one that outlived its call would send its
+    /// next query at 500 ms, inside the 600 ms the tests watch after the
+    /// call returned (the 300 ms deadline cuts the second try).
+    pub fn call_site_resolver(&self) -> Resolver {
+        let config = ResolverConfig::new(vec![self.addr(); 3], Duration::from_millis(250), 5)
+            .expect("config");
+        Resolver::fixed(config)
+    }
+
     /// The queries that arrived since the last call, removed from the
     /// queue. Delivery over loopback is done when `send` returns, so a
     /// query sent before a lookup returned is counted by a call after it.

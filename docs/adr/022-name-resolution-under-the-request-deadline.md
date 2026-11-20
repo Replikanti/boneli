@@ -233,12 +233,18 @@ a host without an IPv6 route; its connect then fails at once with
 - `connect`'s lookup is bounded by its `connect_timeout`, the only bound
   `connect` has before the handshake: it already bounds each TCP attempt,
   and a caller who set it expects `connect` not to wait longer for an
-  address. `connect` refuses names outside the ADR-003 grammar before any
-  query: after `server_name` (`Error::InvalidServerName`), a name rustls
-  accepts and the grammar does not (an underscore, a trailing dot) is
-  `Error::Io` of kind `InvalidInput`. This narrows a public API; every
-  lookup of the crate then has one grammar and a bound. Upper case still
-  passes, because the resolver lowercases first.
+  address. A `connect_timeout` too large to add to the clock
+  (`Duration::MAX`, "no bound of mine") saturates, so only the
+  resolver's own tries bound that lookup, as before. `connect` refuses
+  names outside the ADR-003 grammar before any query: after
+  `server_name` (`Error::InvalidServerName`), a name rustls accepts and
+  the grammar does not (an underscore, a trailing dot) is `Error::Io` of
+  kind `InvalidInput`. This narrows a public API; every lookup of the
+  crate then has one grammar and a bound. Upper case still passes,
+  because the resolver lowercases first.
+- This changes `connect` as ADR-005, item 8, describes it: it no longer
+  resolves with std (no NSS sources such as mDNS or `myhostname`), and
+  a trailing-dot name is refused.
 
 ### D8. No thread, no process, no cache
 
@@ -353,14 +359,21 @@ in resolv.conf(5).
   revoked leaves, two delegated responders) and the 32 `openssl
   s_server` handshakes of `tests/interop.rs` passed.
 - In CI, through the call sites, against a name server that receives
-  every query and never answers (try timeout 10 s, deadline 300 ms):
-  `TlsDial`, the CRL and the OCSP fetch end within 1 s, the fetches with
-  `TimedOut`; `connect` ends at a 300 ms `connect_timeout`; no query
-  arrives once a lookup or a dial returned
-  (`no_query_after_the_lookup_returns`,
-  `dial_fails_at_the_deadline_on_a_stalled_resolver`); and no source
-  file of the crate outside comments names `to_socket_addrs` or
-  `ToSocketAddrs` (`crate_has_no_std_lookup`).
+  every query and never answers (deadline 300 ms; 250 ms tries, 3.75 s
+  of them, so a lookup left running would send its next query at 500
+  ms): `TlsDial`, the CRL and the OCSP fetch end within 1 s, the fetches
+  with `TimedOut`, and no query arrives in the 600 ms after they
+  returned (`dial_fails_at_the_deadline_on_a_stalled_resolver`,
+  `crl_lookup_stops_at_the_request_deadline`,
+  `ocsp_lookup_stops_at_the_request_deadline`; each fails against a
+  lookup moved to a detached thread, run 2026-11-20), nor after a
+  direct lookup returned (`no_query_after_the_lookup_returns`);
+  `connect` ends at a 300 ms `connect_timeout` (try timeout 10 s); and
+  no source file of the crate outside comments names `to_socket_addrs`
+  or `ToSocketAddrs` or calls a std function that takes them
+  (`TcpStream::connect`, `TcpListener::bind`, `UdpSocket::bind`,
+  `connect` and `send_to`) with anything but a socket address
+  (`crate_has_no_std_lookup`).
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte
   flip of a valid answer.
