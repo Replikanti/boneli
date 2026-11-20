@@ -19,6 +19,17 @@
 //! `UnexpectedEof` error, never a clean end of the stream. No 0-RTT data
 //! is sent, and no key log is written (`SSLKEYLOGFILE` is never read).
 //!
+//! Server certificates are checked for revocation by CRL (ADR-017). After
+//! rustls has verified the chain, the CRL distribution points of the leaf
+//! are fetched over plain HTTP (or HTTPS), cached per `TlsConfig` for at
+//! most 24 hours and never past their `nextUpdate`, and the chain is
+//! verified again with the list. A listed leaf fails the connection with
+//! [`Error::Revoked`]; a leaf that names a point no list settles fails it
+//! with [`Error::RevocationUnknown`]: an attacker on the path can drop a
+//! plain-HTTP fetch, so the check fails closed and has no switch to turn
+//! it off. A leaf that names no point passes unchecked, which
+//! [`TlsStream::revocation`] reports. Resumed sessions are checked again.
+//!
 //! The handshake has a total deadline, `ConnectOptions::handshake_timeout`,
 //! on top of the timeout of each read and write, so a peer that sends a
 //! byte now and then cannot hold `connect` open.
@@ -44,11 +55,18 @@
 mod dial;
 mod pq;
 mod random;
+mod revocation;
 mod rsa;
 mod sha256;
 
 pub use dial::{Dial, Stream, Timed, TlsDial};
 pub use random::{RandomFailed, fill_random};
+pub use revocation::{
+    CRL_CACHE_MAX_BYTES, CRL_CHECK_DEADLINE, CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT,
+    CRL_IO_TIMEOUT, CRL_MAX_AGE_SECS, CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, CRL_MIN_RATE,
+    CRL_REFRESH_RETRY_SECS, CRL_SETUP_TIME, CrlFailure, CrlFailureKind, CrlFetchError, CrlScheme,
+    CrlSource, CrlUrl, MAX_CRL_BYTES, MAX_CRL_URL_BYTES, MAX_CRL_URLS, RevocationStatus,
+};
 pub use rsa::{KeyError, RsaSha256Key};
 pub use sha256::Sha256;
 
@@ -65,6 +83,8 @@ use rustls::crypto::ring::kx_group;
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+
+use revocation::{HttpCrlSource, Revocation};
 
 /// Everything that can go wrong while configuring or opening a TLS
 /// connection.
@@ -87,6 +107,15 @@ pub enum Error {
     Pem(pem::Error),
     /// A zero timeout or port.
     InvalidInput(&'static str),
+    /// The server's certificate is listed in the CRL at `url` (ADR-017).
+    Revoked {
+        /// The canonical URL of the list.
+        url: String,
+    },
+    /// The server's certificate names CRL distribution points and none of
+    /// them settled whether it is revoked: each failure with its URL and
+    /// cause (ADR-017, item 4). The check fails closed.
+    RevocationUnknown(Vec<CrlFailure>),
 }
 
 impl fmt::Display for Error {
@@ -98,6 +127,15 @@ impl fmt::Display for Error {
             Error::NoCertificates => f.write_str("no certificates"),
             Error::Pem(e) => write!(f, "corrupt PEM: {e}"),
             Error::InvalidInput(what) => write!(f, "invalid input: {what}"),
+            Error::Revoked { url } => write!(f, "the certificate is revoked (CRL {url})"),
+            Error::RevocationUnknown(failures) => {
+                f.write_str("the certificate's revocation status is unknown")?;
+                for (i, failure) in failures.iter().enumerate() {
+                    f.write_str(if i == 0 { ": " } else { "; " })?;
+                    write!(f, "{failure}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -197,11 +235,15 @@ impl Roots {
 /// `http/1.1`, SNI on, no early data, no key log, and verification against
 /// the given roots (ADR-005). The key exchange groups are, in this order,
 /// X25519MLKEM768 (TLS 1.3 only), X25519, P-256 and P-384 (ADR-016), or
-/// the last three for [`TlsConfig::classical`]. Cheap to clone; share one
-/// per set of roots, so that sessions can resume.
+/// the last three for [`TlsConfig::classical`]. Server certificates are
+/// checked for revocation by CRL (ADR-017), with no switch to turn it
+/// off. Cheap to clone; clones share the session store and the CRL cache,
+/// so share one per set of roots.
 #[derive(Clone, Debug)]
 pub struct TlsConfig {
     client: Arc<ClientConfig>,
+    roots: Arc<RootCertStore>,
+    revocation: Arc<Revocation>,
 }
 
 impl TlsConfig {
@@ -248,25 +290,78 @@ impl TlsConfig {
             kx_groups: groups,
             ..rustls::crypto::ring::default_provider()
         });
+        // One store for the handshake and the revocation check, so a list
+        // is verified against exactly the roots the chain was.
+        let roots = Arc::new(roots.store);
         let mut client = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(Error::Tls)?
-            .with_root_certificates(roots.store)
+            .with_root_certificates(Arc::clone(&roots))
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
         client.enable_sni = true;
         // A replayed request to a paid API would be charged twice.
         client.enable_early_data = false;
         // `key_log` stays rustls' `NoKeyLog`.
+        let client = Arc::new(client);
+        // `https` distribution points are fetched over the same client
+        // without a revocation check, which keeps the fetch from
+        // recursing (ADR-017, item 6).
+        let fetch = TlsConfig {
+            client: Arc::clone(&client),
+            roots: Arc::clone(&roots),
+            revocation: Arc::new(Revocation::off()),
+        };
+        let source: Arc<dyn CrlSource> = Arc::new(HttpCrlSource::new(fetch));
         Ok(TlsConfig {
-            client: Arc::new(client),
+            revocation: Arc::new(Revocation::on(
+                Arc::clone(&roots),
+                Arc::clone(client.crypto_provider()),
+                source,
+            )),
+            client,
+            roots,
         })
+    }
+
+    /// The same configuration with CRLs from `source` and an empty cache
+    /// of its own (ADR-017, item 10): for tests, and for a source that
+    /// reaches CRLs another way. Whatever the source returns is verified
+    /// against this configuration's roots and the system clock; a source
+    /// can make connections fail, never pass a certificate a valid list
+    /// revokes.
+    pub fn with_crl_source(&self, source: Arc<dyn CrlSource>) -> TlsConfig {
+        TlsConfig {
+            client: Arc::clone(&self.client),
+            roots: Arc::clone(&self.roots),
+            revocation: Arc::new(Revocation::on(
+                Arc::clone(&self.roots),
+                Arc::clone(self.client.crypto_provider()),
+                source,
+            )),
+        }
+    }
+
+    /// The same configuration without a revocation check: what an `https`
+    /// CRL fetch connects with.
+    #[cfg(test)]
+    pub(crate) fn without_revocation(&self) -> TlsConfig {
+        TlsConfig {
+            client: Arc::clone(&self.client),
+            roots: Arc::clone(&self.roots),
+            revocation: Arc::new(Revocation::off()),
+        }
     }
 }
 
 /// Timeouts for `connect` and `connect_over`. No defaults: the right
 /// values depend on the peer, as for `boneli_http::Limits` (ADR-003, item
 /// 7).
+///
+/// The revocation check after the handshake has its own deadline,
+/// [`CRL_CHECK_DEADLINE`], shared by all the leaf's CRL URLs: on a cold
+/// cache, or once a list is due again, it adds at most that to `connect`
+/// and `connect_over` (ADR-017, item 7). A warm cache adds no I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
     connect_timeout: Duration,
@@ -339,7 +434,7 @@ pub fn connect(
     let mut last = None;
     for addr in (host, port).to_socket_addrs()? {
         match TcpStream::connect_timeout(&addr, options.connect_timeout) {
-            Ok(tcp) => return handshake(tcp, name, config, options),
+            Ok(tcp) => return handshake(tcp, name, config, options, None),
             Err(e) => last = Some(e),
         }
     }
@@ -358,8 +453,20 @@ pub fn connect_over<S: Transport>(
     config: &TlsConfig,
     options: &ConnectOptions,
 ) -> Result<TlsStream<S>> {
+    connect_over_until(transport, name, config, options, None)
+}
+
+/// `connect_over` whose revocation check ends by `outer` at the latest:
+/// `TlsDial` passes its request's deadline (ADR-017, item 7).
+pub(crate) fn connect_over_until<S: Transport>(
+    transport: S,
+    name: &str,
+    config: &TlsConfig,
+    options: &ConnectOptions,
+    outer: Option<Instant>,
+) -> Result<TlsStream<S>> {
     let name = server_name(name)?;
-    handshake(transport, name, config, options)
+    handshake(transport, name, config, options, outer)
 }
 
 fn handshake<S: Transport>(
@@ -367,8 +474,10 @@ fn handshake<S: Transport>(
     name: ServerName<'static>,
     config: &TlsConfig,
     options: &ConnectOptions,
+    outer: Option<Instant>,
 ) -> Result<TlsStream<S>> {
-    let mut conn = ClientConnection::new(Arc::clone(&config.client), name).map_err(Error::Tls)?;
+    let mut conn =
+        ClientConnection::new(Arc::clone(&config.client), name.clone()).map_err(Error::Tls)?;
     let deadline = Instant::now()
         .checked_add(options.handshake_timeout)
         .ok_or(Error::InvalidInput("the handshake timeout is too large"))?;
@@ -386,10 +495,25 @@ fn handshake<S: Transport>(
             }
         }
     }
+    // rustls has verified the chain; now its revocation (ADR-017, item 1).
+    // Not inside the handshake: rustls skips the verifier when it resumes a
+    // session, but restores the peer's chain from it, so a resumed
+    // connection is checked here again. No application byte has been sent.
+    let revocation = match conn.peer_certificates() {
+        Some(chain) => config.revocation.check(chain, &name, outer)?,
+        None => {
+            return Err(Error::RevocationUnknown(vec![CrlFailure {
+                url: None,
+                kind: CrlFailureKind::NotSettled,
+                detail: "the server sent no certificate".into(),
+            }]));
+        }
+    };
     framed.inner.set_read_timeout(Some(options.io_timeout))?;
     framed.inner.set_write_timeout(Some(options.io_timeout))?;
     Ok(TlsStream {
         stream: StreamOwned::new(conn, framed),
+        revocation,
     })
 }
 
@@ -553,9 +677,11 @@ impl<S: Nonblocking> Nonblocking for Tunnel<S> {
     }
 }
 
-/// A client TLS connection over `S`, after its handshake.
+/// A client TLS connection over `S`, after its handshake and revocation
+/// check.
 pub struct TlsStream<S: Read + Write> {
     stream: StreamOwned<ClientConnection, Framed<S>>,
+    revocation: RevocationStatus,
 }
 
 impl<S: Read + Write> TlsStream<S> {
@@ -578,6 +704,13 @@ impl<S: Read + Write> TlsStream<S> {
             .conn
             .negotiated_key_exchange_group()
             .map(|group| group.name())
+    }
+
+    /// What the revocation check found (ADR-017): checked against which
+    /// list, decided by a stale cached list, or a certificate without a
+    /// distribution point that passed unchecked. For tests and logs.
+    pub fn revocation(&self) -> &RevocationStatus {
+        &self.revocation
     }
 
     /// The protocol the server chose by ALPN, if any.
@@ -628,6 +761,7 @@ impl<S: Read + Write> fmt::Debug for TlsStream<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsStream")
             .field("protocol_version", &self.protocol_version())
+            .field("revocation", &self.revocation)
             .finish_non_exhaustive()
     }
 }

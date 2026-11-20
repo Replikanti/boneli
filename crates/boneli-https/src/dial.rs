@@ -63,18 +63,25 @@ impl Dial for TlsDial {
             let left = time_left(deadline)?;
             match TcpStream::connect_timeout(&addr, left.min(self.options.connect_timeout())) {
                 Ok(tcp) => {
-                    let socket = DeadlineSocket {
-                        tcp,
-                        deadline,
-                        read_cap: Cell::new(None),
-                        write_cap: Cell::new(None),
-                    };
-                    return crate::connect_over(socket, host, &self.config, &self.options)
-                        .map(|tls| Box::new(tls) as Box<dyn Stream>)
-                        .map_err(|e| match e {
-                            crate::Error::Io(e) => e,
-                            other => io::Error::other(other.to_string()),
-                        });
+                    let socket = DeadlineSocket::new(tcp, deadline);
+                    // The request's deadline bounds the revocation check
+                    // too, so a CRL fetch never outlives the request,
+                    // except its name resolution, which std cannot bound,
+                    // as for the dial's own host (ADR-017, item 7).
+                    return crate::connect_over_until(
+                        socket,
+                        host,
+                        &self.config,
+                        &self.options,
+                        Some(deadline),
+                    )
+                    .map(|tls| Box::new(tls) as Box<dyn Stream>)
+                    .map_err(|e| match e {
+                        crate::Error::Io(e) => e,
+                        // The error itself, so a caller can tell a revoked
+                        // certificate (ADR-017) from a network failure.
+                        other => io::Error::other(other),
+                    });
                 }
                 Err(e) => last = Some(e),
             }
@@ -107,7 +114,7 @@ fn check_host(host: &str, port: u16) -> io::Result<()> {
 }
 
 /// What is left until `deadline`, or a `TimedOut` error once it passed.
-fn time_left(deadline: Instant) -> io::Result<Duration> {
+pub(crate) fn time_left(deadline: Instant) -> io::Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(io::Error::new(
@@ -126,12 +133,31 @@ fn next_timeout(deadline: Instant, cap: Option<Duration>) -> io::Result<Duration
 }
 
 /// A TCP socket whose every read and write is bounded by a deadline and by
-/// the timeout TLS sets (`ConnectOptions::io_timeout`).
-struct DeadlineSocket {
+/// the timeout TLS sets (`ConnectOptions::io_timeout`). The CRL fetch of
+/// ADR-017 uses it too, under the check's deadline.
+pub(crate) struct DeadlineSocket {
     tcp: TcpStream,
     deadline: Instant,
     read_cap: Cell<Option<Duration>>,
     write_cap: Cell<Option<Duration>>,
+}
+
+impl DeadlineSocket {
+    /// `tcp` under `deadline`, with no read or write cap yet.
+    pub(crate) fn new(tcp: TcpStream, deadline: Instant) -> DeadlineSocket {
+        DeadlineSocket {
+            tcp,
+            deadline,
+            read_cap: Cell::new(None),
+            write_cap: Cell::new(None),
+        }
+    }
+}
+
+impl IdleCheck for DeadlineSocket {
+    fn is_idle(&mut self) -> io::Result<Option<bool>> {
+        self.tcp.is_idle()
+    }
 }
 
 impl Read for DeadlineSocket {

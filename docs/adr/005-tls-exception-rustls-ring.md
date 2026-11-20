@@ -257,7 +257,9 @@ adding `rustls = "0.23.46"` (`default-features = false`, features `ring`,
     crate. ADR-016 closes this limit with X25519MLKEM768 over `ml-kem`.
   - No certificate revocation checking: rustls checks CRLs only when it is
     given them, and nothing fetches them yet. Replikanti/boneli#38 adds
-    fetching and caching of CRLs.
+    fetching and caching of CRLs. ADR-017 closes this limit for server
+    certificates that name a CRL distribution point; its known limits list
+    what stays open.
 
 ## Alternatives considered
 
