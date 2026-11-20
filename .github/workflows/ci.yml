@@ -461,6 +461,44 @@ jobs:
           fi
           echo "OK: no step called Python"
 
+  # TEMPORARY (#54, review round 1 of #78): the three buffered host tests
+  # on 16 x86_64 copies, so that at least one lands on AWS. Dropped before
+  # the merge.
+  aws-54:
+    name: aws-54 (${{ matrix.copy }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Host features
+        run: |
+          uname -srm
+          nproc
+          echo "workspace fs: $(findmnt -no MAJ:MIN,SOURCE,FSTYPE,OPTIONS -T "$GITHUB_WORKSPACE" 2>/dev/null || echo absent)"
+      - name: Build
+        run: cargo test -p boneli-sys --no-run
+      - name: Prepare the runner host
+        run: |
+          awk '/^<!-- host-setup:begin -->$/ { m = 1; next }
+               /^<!-- host-setup:end -->$/ { m = 0 }
+               m && /^```$/ { c = 0 }
+               m && c { print }
+               m && /^```sh$/ { c = 1 }' CLAUDE.md > "$RUNNER_TEMP/host-setup.sh"
+          TARGET_DIR="$GITHUB_WORKSPACE/target" RUN_USER="$USER" ENABLE_LINGER=1 sh -eu "$RUNNER_TEMP/host-setup.sh"
+      - name: Buffered host tests
+        run: |
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
+            env BONELI_SYS_TEST_CGROUP=self \
+            cargo test -p boneli-sys --test boneli_sys_tests -- --ignored --nocapture --test-threads=1 \
+            cgroups::io_limit_holds_buffered_writes cgroups::buffered_writes_without_io_max_are_not_killed
+
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
