@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR 2 (#78): MK-P decided; ADR note, AWS landing, mark ready",
-   "updated_at": "2026-11-20T15:11:11+00:00",
+   "note": "PR #78 open",
+   "updated_at": "2026-11-20T15:12:50+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1077,13 +1077,13 @@
    "title": "boneli-https: OCSP revocation check for leaves without a CRL distribution point",
    "epic": null,
    "order": 46,
-   "state": "pr-review",
-   "owner": "0d47f612",
-   "user": "ylohnitram",
-   "machine": "df82df",
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
    "pr": 84,
    "note": "",
-   "updated_at": "2026-11-20T14:46:03+00:00",
+   "updated_at": "2026-11-20T15:12:48+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1097,22 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T01:11:03+00:00",
-   "issue": 35,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "9db267e1",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T01:53:39+00:00",
-   "issue": 37,
-   "from": "ready",
-   "to": "claimed",
-   "by": "482e8c7c",
-   "note": ""
-  },
   {
    "at": "2026-11-20T02:23:44+00:00",
    "issue": 37,
@@ -1496,6 +1480,22 @@
    "to": "implementing",
    "by": "98fa59e8",
    "note": "PR 2 (#78): MK-P decided; ADR note, AWS landing, mark ready"
+  },
+  {
+   "at": "2026-11-20T15:12:48+00:00",
+   "issue": 79,
+   "from": "pr-review",
+   "to": "done",
+   "by": "0d47f612",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T15:12:50+00:00",
+   "issue": 54,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #78 open"
   }
  ],
  "open": [
@@ -1527,12 +1527,11 @@
   66,
   68,
   69,
-  79,
   80,
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T15:11:11+00:00",
+ "updated_at": "2026-11-20T15:12:50+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
