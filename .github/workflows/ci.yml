@@ -116,6 +116,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      # The release tooling of release.yml (#22, ADR-019): the tag and
+      # package guards, the release notes, the third-party notices over
+      # fixtures and over the real graph (it reads the registry the tests
+      # above fetched) and the archive. `sh` is dash here. The grep makes
+      # sure the suite ran to its end.
+      - name: Release tooling
+        run: |
+          out="$RUNNER_TEMP/release-tooling.out"
+          sh tools/test-release.sh | tee "$out"
+          grep -q '^OK: test-release: [0-9]* cases passed$' "$out"
       # X25519MLKEM768 against an independent implementation (ADR-016,
       # item 10): the only test that checks the reading of RFC 10024. It
       # fails, never skips, without OpenSSL 3.5 or the group; the grep

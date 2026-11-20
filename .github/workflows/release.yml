@@ -1,0 +1,209 @@
+name: Release
+
+# A pushed `vX.Y.Z` tag tests the workspace, builds the packages listed in
+# tools/release-packages for Linux x86_64 and aarch64 and publishes one
+# archive per architecture (binaries, LICENSE, THIRD-PARTY-NOTICES.txt) with
+# a SHA-256 sidecar as a GitHub Release, the CHANGELOG.md section as its
+# notes (recipe: docs/release.md, decisions: ADR-019). A tag with `-` is a
+# prerelease. `workflow_dispatch` and pull requests are dry runs: they build
+# and upload the archives as artifacts and never publish; a dispatch on
+# `main` also rehearses the publish path with a draft release that it
+# deletes. `pull_request` is limited to the release files: GitHub
+# dispatches `workflow_dispatch` only for workflows already on the default
+# branch, so a PR that edits them runs the build before merge. Not a
+# required check.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/release-*
+      - tools/third-party-notices.sh
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Native builds on both architectures. The glibc floor of a binary is
+  # that of its builder: 2.35 on Ubuntu 22.04, which every host the sandbox
+  # runs on has in practice (ADR-019, D3). Matrix values are literals; ref
+  # names reach the shell through env only, never `${{ }}` in `run:`
+  # (tools/test-release.sh checks this file for it). No build cache: a
+  # release is built from the tagged tree and the registry alone.
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Provisional until the dry run of #22 is measured (ADR-019, D7).
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      # As in ci.yml: the installed toolchain outranks any toolchain file
+      # in the checkout (ADR-001).
+      RUSTUP_TOOLCHAIN: stable
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The ancestry guard needs main's history.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Tools
+        run: |
+          cargo --version
+          jq --version
+          tar --version
+      # Before anything is built: the tag is `v` + the workspace version,
+      # on a commit of main, with a non-empty changelog section, and the
+      # package list holds only shippable binaries.
+      - name: Guard the tag
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: tools/release-check.sh "$TAG" "$GITHUB_SHA"
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build
+        run: |
+          pkgs=$(tools/release-check.sh --packages)
+          set --
+          for p in $pkgs; do
+            set -- "$@" -p "$p"
+          done
+          cargo build --release --locked --target "$TARGET" "$@"
+      # Fails, and nothing is packaged, when a bundled crate ships no
+      # license file (ADR-019, D4).
+      - name: Third-party notices
+        run: |
+          pkgs=$(tools/release-check.sh --packages)
+          # shellcheck disable=SC2086 # package names, checked by release-check
+          tools/third-party-notices.sh "$TARGET" $pkgs > "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
+          sed -n '/^Target: /,/^Third-party crates: /p' "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
+      - name: Package
+        env:
+          # The tag on releases, dev-<sha> on dry runs.
+          NAME: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+        run: |
+          bins=$(tools/release-check.sh --bins)
+          set --
+          for b in $bins; do
+            set -- "$@" "target/$TARGET/release/$b"
+          done
+          for b in "$@"; do
+            echo "$b: highest glibc symbol version $(objdump -T "$b" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)"
+          done
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) tools/release-package.sh \
+            "boneli-$NAME-linux-$ARCH" dist LICENSE "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt" "$@"
+          tar -tvzf dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Tags only. The one job with a write token; it runs GitHub's own
+  # actions and gh, nothing third-party (ADR-019, D6). A few API calls and
+  # uploads of a few MiB: 10 minutes is a hang bound, not a measurement.
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && LC_ALL=C ls) > "$RUNNER_TEMP/have"
+          for arch in aarch64 x86_64; do
+            printf 'boneli-%s-linux-%s.tar.gz\nboneli-%s-linux-%s.tar.gz.sha256\n' "$TAG" "$arch" "$TAG" "$arch"
+          done > "$RUNNER_TEMP/want"
+          diff "$RUNNER_TEMP/want" "$RUNNER_TEMP/have"
+          (cd dist && sha256sum -c ./*.sha256)
+          tools/release-notes.sh "${TAG#v}" > "$RUNNER_TEMP/notes.md"
+          prerelease=
+          case $TAG in
+            *-*) prerelease=--prerelease ;;
+          esac
+          # --verify-tag: never let gh create the tag.
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" $prerelease
+
+  # A dispatch on main exercises the publish path with the real token and
+  # the real assets, without a tag: a draft release (GitHub creates a
+  # draft's tag only when it is published), its asset list and checksums
+  # checked, then deleted, also when a step before failed.
+  rehearsal:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      DRAFT: rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release
+        run: |
+          gh release create "$DRAFT" dist/* --draft --target "$GITHUB_SHA" --title "$DRAFT" \
+            --notes "Rehearsal of the publish path (docs/release.md); deleted by the same run."
+      - name: Check the draft
+        run: |
+          test "$(gh release view "$DRAFT" --json isDraft -q .isDraft)" = true
+          (cd dist && LC_ALL=C ls) > "$RUNNER_TEMP/want"
+          gh release view "$DRAFT" --json assets -q '.assets[].name' | LC_ALL=C sort > "$RUNNER_TEMP/have"
+          diff "$RUNNER_TEMP/want" "$RUNNER_TEMP/have"
+          gh release download "$DRAFT" -D "$RUNNER_TEMP/back"
+          (cd "$RUNNER_TEMP/back" && sha256sum -c ./*.sha256)
+      - name: Delete the draft
+        if: always()
+        run: |
+          if gh release view "$DRAFT" > /dev/null 2>&1; then
+            gh release delete "$DRAFT" --yes
+          fi
+          if gh release view "$DRAFT" > /dev/null 2>&1; then
+            echo "the draft $DRAFT is still there"
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$DRAFT" > /dev/null 2>&1; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$DRAFT"
+            echo "the rehearsal created the tag $DRAFT; deleted"
+            exit 1
+          fi
+          echo "OK: draft $DRAFT deleted, no tag created"

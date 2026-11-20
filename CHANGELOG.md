@@ -533,6 +533,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its `edit` hook takes a `&TreePath`; counts are 55 clauses and 70
   mutant cases, 8 regression mutants and 8 vacuous fixtures. ADR-010's
   known limit points to ADR-018.
+- Release workflow (ADR-019, `docs/release.md`): a `vX.Y.Z` tag on `main`
+  publishes `boneli-vX.Y.Z-linux-<arch>.tar.gz` for x86_64 and aarch64
+  (glibc 2.35, built on Ubuntu 22.04) with a SHA-256 sidecar and the
+  changelog section as release notes. Each archive holds the binaries of
+  `tools/release-packages` (today `boneli-egress`), `LICENSE` and
+  `THIRD-PARTY-NOTICES.txt`, every license, copying and notice file of
+  every bundled crate verbatim; it fails closed on a crate without one.
+  The tag and package guards, notes, notices and archive are POSIX sh
+  scripts under `tools/`, tested by `tools/test-release.sh` in `check`.
+  Pull requests that touch the release files and dispatches build without
+  publishing; a dispatch on `main` rehearses the publish path with a draft
+  release that it deletes.
 
 ### Changed
 

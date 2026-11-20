@@ -14,6 +14,9 @@ harness. Rust workspace, hexagonal architecture. Public repository
   design decision adds or flips an ADR.
 - Work: GitHub issues, labelled `area::*`, `P1`–`P3`, `size::*`, `epic`,
   `needs-adr`. The pinned "Task ledger" issue lists them in processing order.
+- Releases: `docs/release.md` (versioning, the tag recipe, what ships:
+  `tools/release-packages`; ADR-019). `sh tools/test-release.sh` tests the
+  release tooling.
 
 ## Invariants
 
