@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "implementing",
+   "state": "plan-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR 2 (#78 draft): keeper approved, M2a period measurement then M2b",
-   "updated_at": "2026-11-20T12:16:31+00:00",
+   "note": "PR 2 (#78 draft) M2a stopped on R-K3: keeper at 10 ms still lost on Azure NVMe copies (writer 5-6 GiB/s, killed 43-120 ms); cause unidentified; operator picks next step",
+   "updated_at": "2026-11-20T12:37:09+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-18T19:37:06+00:00",
-   "issue": 18,
-   "from": "ready",
-   "to": "claimed",
-   "by": "774fe1a9",
-   "note": ""
-  },
   {
    "at": "2026-11-18T20:08:05+00:00",
    "issue": 18,
@@ -1496,6 +1488,14 @@
    "to": "implementing",
    "by": "abd3f92f",
    "note": null
+  },
+  {
+   "at": "2026-11-20T12:37:09+00:00",
+   "issue": 54,
+   "from": "implementing",
+   "to": "plan-review",
+   "by": "98fa59e8",
+   "note": "PR 2 (#78 draft) M2a stopped on R-K3: keeper at 10 ms still lost on Azure NVMe copies (writer 5-6 GiB/s, killed 43-120 ms); cause unidentified; operator picks next step"
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T12:25:08+00:00",
+ "updated_at": "2026-11-20T12:37:09+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
