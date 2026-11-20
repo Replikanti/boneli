@@ -15,8 +15,10 @@
 //! in the meantime, and the caller tries again, at most [`LOCK_ATTEMPTS`]
 //! times. Only an exclusive holder ever unlinks a lock file. A path that
 //! is not a regular file is an error, never followed. Shared lockers wait
-//! up to a deadline ([`LOCK_WAIT`]); exclusive lockers only ever try, so no
-//! lock cycle can form. Every file is opened by std, with `O_CLOEXEC`, so
+//! up to a deadline ([`LOCK_WAIT`]); exclusive lockers of layer and owner
+//! locks only ever try, and the one exclusive lock that is waited for,
+//! `locks/trim` (ADR-025, D6), is held by a trim that never waits for
+//! another lock, so no lock cycle can form. Every file is opened by std, with `O_CLOEXEC`, so
 //! no sandbox inherits a lock by accident; a lease hands out descriptors
 //! for that on purpose ([`crate::Lease::pin_descriptors`]).
 
@@ -142,20 +144,49 @@ pub(crate) fn try_exclusive_existing(path: &Path) -> Result<Exclusive, Error> {
     acquire(path, Mode::TryExclusive, Create::No, &mut |_, _| {})
 }
 
+/// Tries the exclusive lock on the lock file at `path`, creating the file
+/// where it is missing, without waiting: a layer committed by a build
+/// before ADR-025 has no lock file, and is evicted under one all the same
+/// (ADR-025, D7). Never [`Exclusive::Missing`].
+pub(crate) fn try_exclusive(path: &Path) -> Result<Exclusive, Error> {
+    acquire(path, Mode::TryExclusive, Create::Yes, &mut |_, _| {})
+}
+
+/// Takes the exclusive lock on `path`, creating the file where it is
+/// missing, and waits while anyone else holds a lock on it, until
+/// `deadline` ([`Error::LockBusy`] after it). Only the trim lock
+/// `locks/trim` is taken this way (ADR-025, D6); its holder never waits
+/// for a layer lock, so no lock cycle can form.
+pub(crate) fn lock_exclusive(path: &Path, deadline: Instant) -> Result<Held, Error> {
+    match acquire(path, Mode::Exclusive(deadline), Create::Yes, &mut |_, _| {})? {
+        Exclusive::Held(held) => Ok(held),
+        // As in `lock_shared`: neither answer comes back.
+        Exclusive::Busy | Exclusive::Missing => Err(Error::LockChanged(path.to_path_buf())),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// Wait for the shared lock until the deadline.
     Shared(Instant),
+    /// Wait for the exclusive lock until the deadline.
+    Exclusive(Instant),
     TryExclusive,
 }
 
-/// Waits for the shared lock on `file` until `deadline`, polling
-/// `try_lock_shared` with pauses from [`POLL_MIN`] doubling to
-/// [`POLL_MAX`]. std's `lock_shared` has no timeout.
-fn wait_shared(file: &File, path: &Path, deadline: Instant) -> Result<(), Error> {
+/// Waits for the shared (or, with `exclusive`, the exclusive) lock on
+/// `file` until `deadline`, polling `try_lock_shared` (`try_lock`) with
+/// pauses from [`POLL_MIN`] doubling to [`POLL_MAX`]. std's `lock_shared`
+/// and `lock` have no timeout.
+fn wait_for(file: &File, path: &Path, deadline: Instant, exclusive: bool) -> Result<(), Error> {
     let mut pause = POLL_MIN;
     loop {
-        match file.try_lock_shared() {
+        let tried = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match tried {
             Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(e)) => return Err(lock_err(path, e)),
@@ -260,7 +291,8 @@ fn acquire(
             return Err(not_regular(path));
         }
         match mode {
-            Mode::Shared(deadline) => wait_shared(&file, path, deadline)?,
+            Mode::Shared(deadline) => wait_for(&file, path, deadline, false)?,
+            Mode::Exclusive(deadline) => wait_for(&file, path, deadline, true)?,
             Mode::TryExclusive => match file.try_lock() {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => return Ok(Exclusive::Busy),
@@ -512,5 +544,47 @@ mod tests {
         assert!(is_held(&path), "the copy holds the file on its own");
         drop(other);
         assert!(!is_held(&path));
+    }
+
+    /// The trim lock (ADR-025, D6): `lock_exclusive` creates a missing
+    /// file `0o600`, waits while a shared or exclusive lock is held
+    /// elsewhere, only until its deadline (`LockBusy`), and gets the lock
+    /// once the other holder lets go. `try_exclusive` creates a missing
+    /// file, as an eviction does for a layer committed before ADR-025.
+    #[test]
+    fn exclusive_wait_is_bounded() {
+        let scratch = ScratchDir::new("lock-exclusive");
+        let path = scratch.path().join("trim");
+        let held = super::lock_exclusive(&path, far()).expect("created and locked");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o600
+        );
+        let started = Instant::now();
+        let wait = Duration::from_millis(300);
+        match super::lock_exclusive(&path, started + wait) {
+            Err(Error::LockBusy(p)) => assert_eq!(p, path),
+            other => panic!("waited past an exclusive holder: {other:?}"),
+        }
+        assert!(started.elapsed() >= wait);
+        drop(held);
+        let shared = File::open(&path).expect("open");
+        shared.lock_shared().expect("shared");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(shared);
+        });
+        let held = super::lock_exclusive(&path, far()).expect("locked once free");
+        releaser.join().expect("releaser");
+        assert!(is_held(&path));
+        drop(held);
+
+        let missing = scratch.path().join("layer");
+        let Ok(Exclusive::Held(held)) = super::try_exclusive(&missing) else {
+            panic!("a missing lock file is created and locked");
+        };
+        assert!(is_held(&missing));
+        held.remove().expect("remove");
+        assert!(!missing.exists());
     }
 }

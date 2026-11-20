@@ -75,7 +75,7 @@ impl LayerPin {
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn hex(digest: &[u8; 32]) -> String {
+pub(crate) fn hex(digest: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -200,7 +200,9 @@ impl LayerCache {
         self.layers_dir().join(hex(diff_id))
     }
 
-    fn sidecar_path(&self, diff_id: &[u8; 32]) -> PathBuf {
+    /// The sidecar of the layer `diff_id`, `<hex>.stats`; its mtime is the
+    /// layer's last use (ADR-025, D5).
+    pub(crate) fn sidecar_path(&self, diff_id: &[u8; 32]) -> PathBuf {
         self.layers_dir().join(format!("{}.stats", hex(diff_id)))
     }
 
@@ -642,14 +644,14 @@ pub(crate) fn create_probe(
 }
 
 /// Makes the entries of the directory `dir` durable.
-fn sync_dir(dir: &Path) -> Result<(), Error> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), Error> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| cache_err(dir, e))
 }
 
 /// `bytes N\nentries N\nskipped-devices N\n`, exactly.
-fn parse_sidecar(text: &[u8]) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_sidecar(text: &[u8]) -> Option<(u64, u64, u64)> {
     let text = std::str::from_utf8(text).ok()?;
     let mut lines = text.split_terminator('\n');
     let mut value = |key: &str| -> Option<u64> {
