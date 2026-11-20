@@ -58,6 +58,17 @@ Exclusion does not change: while the store lives the lock is held, and a
 second `open`, from this process or another, is `InUse` with or without a
 child holding a copy.
 
+Only the process that took the lock unlocks it: `acquire` records
+`std::process::id()`, and the drop skips the unlock when the id differs.
+The unlock acts on a description that forked children share, so without
+the check a child forked without exec (the sandbox launch runs on a copy
+of the parent's stack, review of #96) that unwinds through a frame holding
+a store would unlock the parent's live store, and a second `open` would
+succeed and sweep its temporary files. With the check such a child only
+closes its own copy, as before this ADR. `getpid` is a system call in
+glibc and musl (glibc dropped its pid cache in 2.25), so the child sees
+its own id.
+
 ### D2. After a crash the lock lasts at most until a child's exec
 
 When the store's process dies without dropping the store (a crash,
@@ -83,7 +94,19 @@ the timing. The length of the fork-to-exec interval depends on the host
 - `live_store_stays_locked_with_a_child_copy`: a second `open` while the
   store lives is `InUse` with a child copy alive (exclusion, D1).
 - `failed_open_leaves_the_root_openable`: an `open` that fails after the
-  lock is taken leaves the root openable (D1, error paths).
+  lock is taken leaves the root openable while a child holds a copy of
+  the lock (D1, error paths). The copy is handed to the child through a
+  private hook, `open_with`, called right after the lock is taken; `open`
+  passes a no-op. Without the hook no copy can be taken from inside
+  `open`, and the test caught a lock wrapped only on success by chance
+  only (review of #96: green in 10 of 10 runs); with it that regression
+  fails in 6 of 6 runs, parallel and single-threaded.
+- `copy_dropped_in_another_process_keeps_the_lock`: the owner check of D1.
+  Forking in a test needs `unsafe`, which this crate forbids, so the test
+  builds a copy whose owner is not this process, which is how a forked
+  child's copy looks from inside the child, and drops it: the lock stays
+  held. It pins the comparison, not that a child sees its own id (D1).
+  Without the check it fails in 6 of 6 runs.
 - `lock_file_is_close_on_exec`: the guard of D2.
 - `reopen_survives_concurrent_spawns` (integration test) is the smoke
   test: 300 open, put and drop cycles on one root while another thread
@@ -104,7 +127,7 @@ the timing. The length of the fork-to-exec interval depends on the host
 
 - A reopen no longer fails because another thread spawned a process, so
   the runner can spawn git and the sandbox while it reopens a store.
-- One more system call per store drop.
+- Two more system calls per store drop (`getpid`, `flock`).
 - The unit tests need `sleep` on `PATH` and `/proc/self/fdinfo`; the crate
   is Linux-only already (`flock`, `/proc/self` in ADR-012 D1).
 - Unchanged: the lock primitive, the root rules (ADR-021), the run log and

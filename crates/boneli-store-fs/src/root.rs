@@ -86,15 +86,28 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
 /// is `O_CLOEXEC`, so exec closes it). A close while such a copy lives
 /// leaves the lock held, and a reopen gets `InUse`; an unlock acts on the
 /// description, so it releases the lock whatever copies exist (#94).
+///
+/// Only the process that took the lock unlocks it. A process forked
+/// without exec runs on a copy of its parent's memory, so an unwinding
+/// panic there could drop a copy of this value; an unlock from it would
+/// release the parent's live lock, while its close only closes its own
+/// descriptor (ADR-026, D1).
 #[derive(Debug)]
-pub(crate) struct StoreLock(File);
+pub(crate) struct StoreLock {
+    file: File,
+    /// The id of the process that took the lock.
+    owner: u32,
+}
 
 impl StoreLock {
     /// Takes the lock on `file` at `path` without waiting: `InUse` while
     /// another store, in this process or another, holds it.
     fn acquire(file: File, path: &Path) -> Result<StoreLock, OpenError> {
         match file.try_lock() {
-            Ok(()) => Ok(StoreLock(file)),
+            Ok(()) => Ok(StoreLock {
+                file,
+                owner: std::process::id(),
+            }),
             Err(TryLockError::WouldBlock) => Err(OpenError::InUse {
                 path: path.to_path_buf(),
             }),
@@ -105,10 +118,14 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        // A copy dropped in a forked child leaves the parent's lock alone.
+        if std::process::id() != self.owner {
+            return;
+        }
         // An error is ignored: the close that follows still releases the
         // lock when no child holds a copy, and a drop has no caller to
         // report to.
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -117,6 +134,17 @@ impl Drop for StoreLock {
 /// [`StoreLock`] from the moment it is taken, so every error after that
 /// unlocks it too.
 pub(crate) fn open(root: &Path) -> Result<(PathBuf, StoreLock), OpenError> {
+    open_with(root, &mut |_| {})
+}
+
+/// [`open`], with `after_lock` called on the locked file right after the
+/// lock is taken. [`open`] passes a no-op; the tests give a child a copy of
+/// the lock there, so a failing `open` is checked with a copy alive
+/// (ADR-026, D3).
+fn open_with(
+    root: &Path,
+    after_lock: &mut dyn FnMut(&File),
+) -> Result<(PathBuf, StoreLock), OpenError> {
     // No rule of its own on the root's text: no mount option is built
     // from it.
     let resolved = boneli_private_dir::prepare_root(root, &|_| Ok(())).map_err(root_err)?;
@@ -138,6 +166,7 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, StoreLock), OpenError> {
         });
     }
     let lock = StoreLock::acquire(lock, &lock_path)?;
+    after_lock(&lock.file);
 
     let runs = resolved.join(RUNS);
     let evidence = resolved.join(EVIDENCE);
@@ -165,13 +194,13 @@ mod tests {
     /// a child to hold, and its descriptor for `/proc/self/fdinfo`.
     impl StoreLock {
         fn try_clone(&self) -> io::Result<File> {
-            self.0.try_clone()
+            self.file.try_clone()
         }
     }
 
     impl AsRawFd for StoreLock {
         fn as_raw_fd(&self) -> RawFd {
-            self.0.as_raw_fd()
+            self.file.as_raw_fd()
         }
     }
 
@@ -271,7 +300,9 @@ mod tests {
     }
 
     /// An `open` that fails after it took the lock (here `runs` is a
-    /// symlink) releases it: the root opens once the symlink is gone.
+    /// symlink) releases it, also while a child holds a copy of the lock
+    /// taken right after the lock: the root opens once the symlink is
+    /// gone, with the child still alive.
     #[test]
     fn failed_open_leaves_the_root_openable() {
         let scratch = Scratch::new("failed-open");
@@ -281,12 +312,40 @@ mod tests {
         fs::create_dir(&elsewhere).expect("dir");
         fs::remove_dir(root.join(RUNS)).expect("remove runs");
         std::os::unix::fs::symlink(&elsewhere, root.join(RUNS)).expect("symlink");
-        match open(&root) {
+        let mut holder = None;
+        let failed = open_with(&root, &mut |file| {
+            holder = Some(Holder::spawn(file.try_clone().expect("dup the lock")));
+        });
+        match failed {
             Err(OpenError::Root { .. }) => {}
             other => panic!("a symlinked runs gave {other:?}"),
         }
+        assert!(holder.is_some(), "open failed before it took the lock");
         fs::remove_file(root.join(RUNS)).expect("remove the symlink");
         let reopened = open(&root);
+        assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
+
+    /// A copy of the lock dropped in another process, as in a child forked
+    /// without exec that unwinds, does not unlock: its owner is not that
+    /// process. The test cannot fork without `unsafe`, so it builds the
+    /// copy with an owner id that is not this process's, which is what a
+    /// forked child's copy looks like from inside the child.
+    #[test]
+    fn copy_dropped_in_another_process_keeps_the_lock() {
+        let scratch = Scratch::new("foreign-drop");
+        let (resolved, lock) = open(&scratch.root()).expect("open");
+        let foreign = StoreLock {
+            file: lock.try_clone().expect("dup the lock"),
+            owner: lock.owner.wrapping_add(1),
+        };
+        drop(foreign);
+        match open(&scratch.root()) {
+            Err(OpenError::InUse { path }) => assert_eq!(path, resolved.join(LOCK)),
+            other => panic!("an open after a foreign drop gave {other:?}"),
+        }
+        drop(lock);
+        let reopened = open(&scratch.root());
         assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
     }
 }

@@ -865,4 +865,6 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `FsStore` (#94, ADR-026) releases its lock by an explicit unlock when it
   drops, and on every error of `open` after the lock is taken: a reopen
   no longer fails with `InUse` while a process spawned by another thread
-  is between fork and exec and holds a copy of the lock.
+  is between fork and exec and holds a copy of the lock. Only the process
+  that took the lock unlocks it, so a copy dropped in a forked child
+  leaves the parent's lock held.
