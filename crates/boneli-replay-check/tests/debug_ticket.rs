@@ -7,16 +7,17 @@
 use std::collections::BTreeSet;
 
 use boneli_app::{
-    DebugTicketError, EvidenceError, PreviousRunError, PreviousTriage, StoreError, replay,
+    DebugTicketError, EvidenceError, GitError, PreviousRunError, PreviousTriage, StoreError, replay,
 };
 use boneli_domain::{
-    AgentOutputProblem, Budget, BudgetDimension, DomainError, EventKind, FixCheck, GateFailure,
-    Outcome, Overrun, RunId, Stage, TicketField, Usage,
+    AgentOutputProblem, Budget, BudgetDimension, DomainError, EventKind, FixCheck, ForbiddenClass,
+    GateFailure, Marker, Outcome, Overrun, PatchCheck, PatchLimits, PatchVerdict, PatchViolation,
+    RunEvent, RunId, Stage, TestDisabling, TicketField, UnreadablePath, Usage,
 };
 use boneli_memory::{AgentRequest, ForgeRequest, VerifierRequest};
 use boneli_replay_check::app::{
-    AppScenario, CLOCK_START, Call, FAULT, Fault, FaultKind, Played, STEP_MS, play, questions,
-    scenarios, second_questions,
+    AppScenario, CLOCK_START, Call, FAULT, Fault, FaultKind, Played, STEP_MS, fix_diff, play,
+    questions, scenarios, second_questions,
 };
 
 type Want = Result<(Stage, Usage), DebugTicketError>;
@@ -100,9 +101,14 @@ fn expect(
     }
 }
 
-/// The full delivered path: 4 agent jobs of 1 000 µUSD and 7 measured jobs
+/// The full delivered path: 4 agent jobs of 1 000 µUSD and 8 measured jobs
 /// of 1 000 ms.
 const FULL: Usage = Usage {
+    cost_micro_usd: 4_000,
+    duration_ms: 8_000,
+};
+/// Up to and including the patch check: 4 agent jobs and 7 measured jobs.
+const CHECKED: Usage = Usage {
     cost_micro_usd: 4_000,
     duration_ms: 7_000,
 };
@@ -138,7 +144,7 @@ fn hand_written_expectations() -> Vec<Expectation> {
                     overrun: Some(Overrun {
                         dimension: BudgetDimension::Duration,
                         spent: FULL,
-                        budget: budget(1_000_000, 6_999),
+                        budget: budget(1_000_000, 7_999),
                     }),
                 },
                 FULL,
@@ -380,7 +386,87 @@ fn hand_written_expectations() -> Vec<Expectation> {
             )],
             (1, 0, 0),
         ),
+        expect(
+            "patch-forbidden-path",
+            vec![refused(vec![PatchViolation::Forbidden {
+                index: 0,
+                class: ForbiddenClass::Ci,
+            }])],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-disables-test",
+            vec![refused(vec![PatchViolation::DisablesTests {
+                index: 1,
+                reason: TestDisabling::Marker(Marker::Skip),
+            }])],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-over-file-limit",
+            vec![refused(vec![PatchViolation::TooManyFiles {
+                files: 2,
+                limit: 1,
+            }])],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-at-file-limit",
+            vec![done(delivered("pull-1"), FULL)],
+            (4, 3, 1),
+        ),
+        expect(
+            "patch-empty-fix",
+            vec![refused(vec![PatchViolation::Empty])],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-unreadable-path",
+            vec![done(
+                Outcome::GateFailed(GateFailure::PatchUnreadable(UnreadablePath::Change {
+                    index: 1,
+                })),
+                CHECKED,
+            )],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-diff-does-not-apply",
+            vec![done(
+                job_failed(
+                    EventKind::PatchChecked,
+                    "applying the diff failed: git failed: the diff: removes \
+                     TreePath(\"src/missing.rs\"), which does not exist",
+                ),
+                CHECKED,
+            )],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-check-over-duration",
+            vec![done(
+                over(BudgetDimension::Duration, CHECKED, budget(1_000_000, 6_999)),
+                CHECKED,
+            )],
+            (4, 2, 0),
+        ),
+        expect(
+            "patch-refused-over-duration",
+            vec![done(
+                over(BudgetDimension::Duration, CHECKED, budget(1_000_000, 6_999)),
+                CHECKED,
+            )],
+            (4, 2, 0),
+        ),
     ]
+}
+
+/// A run the patch gate stopped after the patch check.
+fn refused(violations: Vec<PatchViolation>) -> Want {
+    done(
+        Outcome::GateFailed(GateFailure::PatchRefused(violations)),
+        CHECKED,
+    )
 }
 
 // --------------------------------------------------------- The fault model
@@ -393,19 +479,30 @@ fn hand_written_expectations() -> Vec<Expectation> {
 struct Job {
     awaiting: EventKind,
     loads: &'static [&'static str],
-    call: Call,
+    /// The agent, verifier or forge call; the patch check makes none.
+    call: Option<Call>,
+    /// The git calls after it, each with the step its failure names.
+    git: &'static [(Call, &'static str)],
     agent: bool,
     stores: Option<&'static str>,
     measured: bool,
 }
 
+/// The git calls of the patch check (ADR-023, D3).
+const CHECK_PATCH: &[(Call, &str)] = &[
+    (Call::FetchBase, "fetching the base"),
+    (Call::Apply, "applying the diff"),
+    (Call::PatchBetween, "describing the patch"),
+];
+
 const TEST: &str = "reproduction test";
 
-const DELIVERED_RUN: [Job; 8] = [
+const DELIVERED_RUN: [Job; 9] = [
     Job {
         awaiting: EventKind::TriageFinished,
         loads: &[],
-        call: Call::Triage,
+        call: Some(Call::Triage),
+        git: &[],
         agent: true,
         stores: None,
         measured: true,
@@ -413,7 +510,8 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::ReproductionWritten,
         loads: &[],
-        call: Call::WriteReproduction,
+        call: Some(Call::WriteReproduction),
+        git: &[],
         agent: true,
         stores: Some(TEST),
         measured: true,
@@ -421,7 +519,8 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::ReproductionChecked,
         loads: &[TEST],
-        call: Call::CheckReproduction,
+        call: Some(Call::CheckReproduction),
+        git: &[],
         agent: false,
         stores: None,
         measured: true,
@@ -429,7 +528,8 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::RootCauseProposed,
         loads: &[TEST],
-        call: Call::AnalyzeRootCause,
+        call: Some(Call::AnalyzeRootCause),
+        git: &[],
         agent: true,
         stores: Some("analysis"),
         measured: true,
@@ -437,7 +537,8 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::CitationsChecked,
         loads: &[],
-        call: Call::VerifyCitations,
+        call: Some(Call::VerifyCitations),
+        git: &[],
         agent: false,
         stores: None,
         measured: true,
@@ -445,15 +546,26 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::FixWritten,
         loads: &[TEST, "analysis"],
-        call: Call::WriteFix,
+        call: Some(Call::WriteFix),
+        git: &[],
         agent: true,
         stores: Some("diff"),
         measured: true,
     },
     Job {
+        awaiting: EventKind::PatchChecked,
+        loads: &["diff"],
+        call: None,
+        git: CHECK_PATCH,
+        agent: false,
+        stores: None,
+        measured: true,
+    },
+    Job {
         awaiting: EventKind::FixVerified,
         loads: &["diff", TEST],
-        call: Call::VerifyFix,
+        call: Some(Call::VerifyFix),
+        git: &[],
         agent: false,
         stores: None,
         measured: true,
@@ -461,7 +573,8 @@ const DELIVERED_RUN: [Job; 8] = [
     Job {
         awaiting: EventKind::PullRequestOpened,
         loads: &["diff", TEST, "analysis"],
-        call: Call::OpenPullRequest,
+        call: Some(Call::OpenPullRequest),
+        git: &[],
         agent: false,
         stores: None,
         measured: false,
@@ -533,9 +646,9 @@ impl Model<'_> {
                     break;
                 }
             }
-            if failed.is_none() {
-                let hit = self.hit(job.call);
-                match job.call {
+            if let (None, Some(call)) = (&failed, job.call) {
+                let hit = self.hit(call);
+                match call {
                     Call::OpenPullRequest => counts.2 += 1,
                     _ if job.agent => counts.0 += 1,
                     _ => counts.1 += 1,
@@ -545,6 +658,14 @@ impl Model<'_> {
                     cost = if job.agent { 700 } else { 0 };
                 } else if job.agent {
                     cost = 1_000;
+                }
+            }
+            for (call, step) in job.git {
+                if failed.is_some() {
+                    break;
+                }
+                if let Some(FaultKind::Git(error)) = self.hit(*call) {
+                    failed = Some(format!("{step} failed: {error}"));
                 }
             }
             if let (None, Some(what)) = (&failed, job.stores)
@@ -669,10 +790,22 @@ fn fault_model_spot_checks() {
             FULL
         )
     );
-    // The 5th load is the diff in VerifyFix (review mutant B), the 7th the
-    // diff for the pull request (review mutant A).
+    // The 5th load is the diff in the patch check, the 6th the diff in
+    // VerifyFix (review mutant B), the 8th the diff for the pull request
+    // (review mutant A).
     assert_eq!(
-        model(&fault(Call::Get, 5, unavailable_evidence)),
+        model(&fault(Call::Get, 5, unavailable_evidence.clone())),
+        (
+            failed(
+                EventKind::PatchChecked,
+                "loading the diff failed: the evidence store is unavailable: the disk is full",
+                CHECKED
+            ),
+            (4, 2, 0)
+        )
+    );
+    assert_eq!(
+        model(&fault(Call::Get, 6, unavailable_evidence)),
         (
             failed(
                 EventKind::FixVerified,
@@ -685,7 +818,7 @@ fn fault_model_spot_checks() {
     assert_eq!(
         model(&fault(
             Call::Get,
-            7,
+            8,
             FaultKind::Evidence(EvidenceError::Corrupted)
         )),
         (
@@ -718,10 +851,43 @@ fn fault_model_spot_checks() {
             (1, 0, 0)
         )
     );
+    // A failed patch_between charges no cost and the check's 1 000 ms:
+    // 4 000 µUSD and 7 000 ms, and the verifier never sees the fix.
+    assert_eq!(
+        model(&fault(
+            Call::PatchBetween,
+            1,
+            FaultKind::Git(GitError::Failed {
+                detail: String::from(FAULT)
+            })
+        )),
+        (
+            failed(
+                EventKind::PatchChecked,
+                "describing the patch failed: git failed: the disk is full",
+                usage(4_000, 7_000)
+            ),
+            (4, 2, 0)
+        )
+    );
+    assert_eq!(
+        model(&fault(
+            Call::FetchBase,
+            1,
+            FaultKind::Git(GitError::UnknownCommit)
+        ))
+        .0,
+        failed(
+            EventKind::PatchChecked,
+            "fetching the base failed: the repository has no such commit",
+            CHECKED
+        )
+    );
+    // The 10th append is the pull request's.
     assert_eq!(
         model(&fault(
             Call::Append,
-            9,
+            10,
             FaultKind::Store(StoreError::InvalidRunId)
         )),
         (
@@ -753,6 +919,8 @@ fn job_event(call: Call) -> Option<EventKind> {
         Call::VerifyFix => Some(EventKind::FixVerified),
         Call::PostQuestions => Some(EventKind::QuestionsPosted),
         Call::OpenPullRequest => Some(EventKind::PullRequestOpened),
+        Call::FetchBase | Call::Apply | Call::PatchBetween => Some(EventKind::PatchChecked),
+        Call::Read | Call::Snapshot | Call::Diff | Call::Push => None,
         Call::Create
         | Call::Append
         | Call::Load
@@ -806,6 +974,9 @@ fn every_fault_fails_closed() {
             }),
             (FaultKind::Evidence(error), _) => job_ended(&|_, detail| {
                 detail.starts_with("loading the ") && detail.ends_with(&format!(" failed: {error}"))
+            }),
+            (FaultKind::Git(error), call) => job_ended(&|awaiting, detail| {
+                Some(awaiting) == job_event(call) && detail.ends_with(&format!(" failed: {error}"))
             }),
             (FaultKind::Store(StoreError::UnknownRun | StoreError::InvalidRunId), Call::Load) => {
                 *result == Err(DebugTicketError::PreviousRun(PreviousRunError::Unknown))
@@ -881,12 +1052,25 @@ fn previous_run_load_failure_fails_closed() {
 }
 
 /// Wherever the forge got a pull request, it carries exactly the diff and
-/// test bytes the verifier checked in that run's `VerifyFix` (ADR-004, D9).
+/// test bytes the verifier checked in that run's `VerifyFix` (ADR-004, D9),
+/// and the patch check applied the same diff bytes (ADR-023, D3): every
+/// verified diff is one the patch check judged first.
 #[test]
 fn forge_gets_the_bytes_the_verifier_checked() {
     let mut opened = 0;
     for scenario in scenarios() {
         let played = play(&scenario);
+        let verified_diffs = played.verifier.iter().filter_map(|request| match request {
+            VerifierRequest::VerifyFix { diff, .. } => Some(diff),
+            _ => None,
+        });
+        for (k, diff) in verified_diffs.enumerate() {
+            assert!(
+                played.applied.len() > k && &played.applied[k] == diff,
+                "{}: verified diff {k} was not the one applied",
+                scenario.name
+            );
+        }
         let checked: Vec<(&Vec<u8>, &Vec<u8>)> = played
             .verifier
             .iter()
@@ -1002,7 +1186,8 @@ fn delivered_end_to_end() {
     assert_eq!(request.run.as_str(), "run-1");
     assert_eq!(request.test.content, b"test");
     assert_eq!(request.analysis.content, b"cause");
-    assert_eq!(request.diff.content, b"diff");
+    assert_eq!(request.diff.content, fix_diff());
+    assert_eq!(played.applied, [fix_diff()]);
     assert_eq!(request.spent, FULL);
     assert_eq!(request.overrun, None);
     // The verifier saw the stored bytes, and the fix with the same test.
@@ -1010,7 +1195,7 @@ fn delivered_end_to_end() {
         played.verifier.last(),
         Some(&VerifierRequest::VerifyFix {
             base: request.base.clone(),
-            diff: b"diff".to_vec(),
+            diff: fix_diff(),
             test: b"test".to_vec(),
         })
     );
@@ -1217,7 +1402,7 @@ fn overrun_reaches_the_forge_unchanged() {
     let overrun = Some(Overrun {
         dimension: BudgetDimension::Duration,
         spent: FULL,
-        budget: budget(1_000_000, 6_999),
+        budget: budget(1_000_000, 7_999),
     });
     assert_eq!(request.overrun, overrun);
     assert_eq!(request.spent, FULL);
@@ -1236,4 +1421,50 @@ fn store_failure_leaves_the_accepted_prefix() {
     );
     let (run, _) = replay(id, log).expect("the prefix replays");
     assert_eq!(run.expects(), Some(EventKind::ReproductionWritten));
+}
+
+/// The patch check's event as the run logged it: the request's limits and
+/// the policy's verdict, also when the budget ended the run on it.
+#[test]
+fn patch_checked_logs_limits_and_verdict() {
+    let checked = |name: &str| -> PatchCheck {
+        let played = played(name);
+        let [(_, log)] = played.logs.as_slice() else {
+            panic!("{name}: one run logged");
+        };
+        let checks: Vec<&PatchCheck> = log
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::PatchChecked { check, .. } => Some(check),
+                _ => None,
+            })
+            .collect();
+        let [check] = checks.as_slice() else {
+            panic!("{name}: one patch check logged");
+        };
+        (*check).clone()
+    };
+    assert_eq!(
+        checked("delivered"),
+        PatchCheck::Judged {
+            limits: PatchLimits::DEFAULT,
+            verdict: PatchVerdict::Pass { files: 1, lines: 2 },
+        }
+    );
+    let PatchCheck::Judged { limits, verdict } = checked("patch-at-file-limit") else {
+        panic!("judged");
+    };
+    assert_eq!(limits.max_changed_files.get(), 2);
+    assert!(matches!(verdict, PatchVerdict::Pass { files: 2, .. }));
+    assert_eq!(
+        checked("patch-refused-over-duration"),
+        PatchCheck::Judged {
+            limits: PatchLimits::DEFAULT,
+            verdict: PatchVerdict::Reject(vec![PatchViolation::Forbidden {
+                index: 0,
+                class: ForbiddenClass::Ci,
+            }]),
+        }
+    );
 }

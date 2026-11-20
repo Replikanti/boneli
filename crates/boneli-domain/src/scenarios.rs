@@ -8,7 +8,8 @@
 //! for byte. That comparison is the gate for address leaks from the domain
 //! (ADR-001, decision D1), so the corpus runs every error path: every
 //! rejected (state, event) pair, every gate failure, every outcome, and an
-//! overrun both set and unset.
+//! overrun both set and unset. The patch check sits between `FixWritten`
+//! and `FixVerified` (ADR-023, D1 and D8).
 
 use alloc::string::String;
 use alloc::vec;
@@ -18,7 +19,9 @@ use crate::budget::{Budget, Usage};
 use crate::command::RunCommand;
 use crate::error::DomainError;
 use crate::event::{EventKind, RunEvent, TriageVerdict};
-use crate::gate::{CheckStatus, CitationStatus, FixChecks, TestStatus};
+use crate::gate::{CheckStatus, CitationStatus, FixChecks, PatchCheck, TestStatus};
+use crate::patch::{PatchLimits, PatchVerdict, PatchViolation, TestDisabling, UnreadablePath};
+use crate::patch_path::ForbiddenClass;
 use crate::run::{Run, Stage};
 use crate::values::{Citation, CommitSha, EvidenceRef, RunId, Ticket, TicketSource};
 
@@ -96,6 +99,16 @@ pub(crate) const JOB: Usage = Usage {
     duration_ms: 100,
 };
 
+/// The patch check of the default path. The application charges it no
+/// cost (ADR-023, D1); the corpus gives it no duration either, so the
+/// totals of the other scenarios stay those of their six agent and
+/// verifier jobs. `patch-check-over-budget` and `patch-refused-over-budget`
+/// charge it.
+pub(crate) const CHECK: Usage = Usage {
+    cost_micro_usd: 0,
+    duration_ms: 0,
+};
+
 pub(crate) const PULL_REQUEST: &str = "pull/101";
 pub(crate) const COMMENT: &str = "issue-comment/55";
 pub(crate) const FAILURE: &str = "sandbox exited with status 137";
@@ -155,6 +168,36 @@ pub(crate) fn passing_checks() -> FixChecks {
         previously_green_tests: CheckStatus::Passed,
         lint: CheckStatus::Passed,
         typecheck: CheckStatus::Passed,
+    }
+}
+
+/// The check of the default path: the default limits and a passing
+/// verdict of one file and two lines.
+pub(crate) fn passed_check() -> PatchCheck {
+    PatchCheck::Judged {
+        limits: PatchLimits::DEFAULT,
+        verdict: PatchVerdict::Pass { files: 1, lines: 2 },
+    }
+}
+
+/// A refused fix: it edits CI configuration and removes a test.
+pub(crate) fn refusal() -> Vec<PatchViolation> {
+    vec![
+        PatchViolation::Forbidden {
+            index: 0,
+            class: ForbiddenClass::Ci,
+        },
+        PatchViolation::DisablesTests {
+            index: 1,
+            reason: TestDisabling::TestsRemoved,
+        },
+    ]
+}
+
+pub(crate) fn refused_check() -> PatchCheck {
+    PatchCheck::Judged {
+        limits: PatchLimits::DEFAULT,
+        verdict: PatchVerdict::Reject(refusal()),
     }
 }
 
@@ -237,6 +280,10 @@ fn fixed(usage: Usage) -> RunEvent {
     }
 }
 
+fn patched(check: PatchCheck, usage: Usage) -> RunEvent {
+    RunEvent::PatchChecked { check, usage }
+}
+
 fn verified(checks: FixChecks, usage: Usage) -> RunEvent {
     RunEvent::FixVerified { checks, usage }
 }
@@ -262,8 +309,8 @@ fn failed_with(detail: &str, usage: Usage) -> RunEvent {
     }
 }
 
-/// The full path to `Delivered`, every job spending `each`; the verify job
-/// spends `verify`.
+/// The full path to `Delivered`, every job spending `each`; the patch check
+/// spends [`CHECK`] and the verify job `verify`.
 fn path(each: Usage, verify: Usage) -> Vec<RunEvent> {
     vec![
         received(),
@@ -276,6 +323,7 @@ fn path(each: Usage, verify: Usage) -> Vec<RunEvent> {
             each,
         ),
         fixed(each),
+        patched(passed_check(), CHECK),
         verified(passing_checks(), verify),
         opened(),
     ]
@@ -304,6 +352,7 @@ fn sample(kind: EventKind) -> RunEvent {
         EventKind::RootCauseProposed => proposed(citations(), JOB),
         EventKind::CitationsChecked => cited(vec![CitationStatus::Verified], JOB),
         EventKind::FixWritten => fixed(JOB),
+        EventKind::PatchChecked => patched(passed_check(), JOB),
         EventKind::FixVerified => verified(passing_checks(), JOB),
         EventKind::PullRequestOpened => opened(),
         EventKind::JobFailed => failed(JOB),
@@ -357,10 +406,11 @@ pub(crate) const SIX_JOBS_EACH: Usage = Usage {
     duration_ms: 1_500,
 };
 
-/// The exception scenarios up to `FixWritten`: 60 000 µUSD and 9 000 ms.
+/// The exception scenarios up to `PatchChecked`: 60 000 µUSD and
+/// 9 000 ms.
 fn exception_head() -> Vec<RunEvent> {
     let mut events = path(SIX_JOBS_EACH, SIX_JOBS_EACH);
-    events.truncate(7);
+    events.truncate(8);
     events
 }
 
@@ -392,7 +442,7 @@ pub fn all() -> Vec<Scenario> {
     };
     let after_triage = || with(head(1), vec![needs(questions(), JOB)]);
     vec![
-        scenario("delivered", head(9)),
+        scenario("delivered", head(10)),
         // Every (state, event) pair the run rejects.
         scenario(
             "reject-in-intake",
@@ -424,12 +474,16 @@ pub fn all() -> Vec<Scenario> {
         ),
         scenario("reject-in-fix", rejections(head(6), Some(K::FixWritten))),
         scenario(
+            "reject-in-patch-check",
+            rejections(head(7), Some(K::PatchChecked)),
+        ),
+        scenario(
             "reject-in-verify",
-            rejections(head(7), Some(K::FixVerified)),
+            rejections(head(8), Some(K::FixVerified)),
         ),
         scenario(
             "reject-in-deliver",
-            rejections(head(8), Some(K::PullRequestOpened)),
+            rejections(head(9), Some(K::PullRequestOpened)),
         ),
         scenario(
             "reject-in-done",
@@ -476,8 +530,8 @@ pub fn all() -> Vec<Scenario> {
             with(head(5), vec![failed(JOB)]),
         ),
         scenario("job-failed-fix", with(head(6), vec![failed(JOB)])),
-        scenario("job-failed-verify", with(head(7), vec![failed(JOB)])),
-        scenario("job-failed-pull-request", with(head(8), vec![failed(JOB)])),
+        scenario("job-failed-verify", with(head(8), vec![failed(JOB)])),
+        scenario("job-failed-pull-request", with(head(9), vec![failed(JOB)])),
         // Intake validation: rejected, then accepted.
         scenario(
             "ticket-blank-title",
@@ -501,7 +555,7 @@ pub fn all() -> Vec<Scenario> {
         ),
         scenario(
             "reference-blank-pull-request",
-            with(head(8), vec![opened_as(""), opened_as(" \t"), opened()]),
+            with(head(9), vec![opened_as(""), opened_as(" \t"), opened()]),
         ),
         scenario(
             "job-failed-blank-detail",
@@ -593,11 +647,40 @@ pub fn all() -> Vec<Scenario> {
                 vec![cited(vec![Verified, Verified, Verified], JOB)],
             ),
         ),
+        // Patch gate (ADR-023, D2).
+        scenario(
+            "patch-refused",
+            with(head(7), vec![patched(refused_check(), JOB)]),
+        ),
+        scenario(
+            "patch-reject-empty-list",
+            with(
+                head(7),
+                vec![patched(
+                    PatchCheck::Judged {
+                        limits: PatchLimits::DEFAULT,
+                        verdict: PatchVerdict::Reject(vec![]),
+                    },
+                    JOB,
+                )],
+            ),
+        ),
+        scenario(
+            "patch-unreadable",
+            with(
+                head(7),
+                vec![patched(
+                    PatchCheck::Unreadable(UnreadablePath::BaseLink { index: 2 }),
+                    JOB,
+                )],
+            ),
+        ),
+        scenario("patch-check-job-failed", with(head(7), vec![failed(JOB)])),
         // Fix gate.
         scenario(
             "fix-reproduction-still-fails",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.reproduction_test = TestStatus::FailedOnAssertion),
                     JOB,
@@ -607,7 +690,7 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-test-changed",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.reproduction_test_unchanged = CheckStatus::Failed),
                     JOB,
@@ -617,7 +700,7 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-regression",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.previously_green_tests = CheckStatus::Failed),
                     JOB,
@@ -627,14 +710,14 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-lint-fails",
             with(
-                head(7),
+                head(8),
                 vec![verified(fix_checks(|c| c.lint = CheckStatus::Failed), JOB)],
             ),
         ),
         scenario(
             "fix-typecheck-fails",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.typecheck = CheckStatus::Failed),
                     JOB,
@@ -644,7 +727,7 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-check-unknown",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.previously_green_tests = CheckStatus::Unknown),
                     JOB,
@@ -654,7 +737,7 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-required-not-configured",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.reproduction_test_unchanged = CheckStatus::NotConfigured),
                     JOB,
@@ -664,7 +747,7 @@ pub fn all() -> Vec<Scenario> {
         scenario(
             "fix-lint-not-configured",
             with(
-                head(7),
+                head(8),
                 vec![verified(
                     fix_checks(|c| c.lint = CheckStatus::NotConfigured),
                     JOB,
@@ -720,6 +803,18 @@ pub fn all() -> Vec<Scenario> {
             "budget-stops-fix-written",
             LATE_BUDGET,
             with(head(6), vec![fixed(usage(5_001, 100))]),
+        ),
+        // A patch check over the budget ends the run whatever its verdict:
+        // only a passing FixVerified carries an overrun (ADR-002, D3).
+        limited(
+            "patch-check-over-budget",
+            LATE_BUDGET,
+            with(head(7), vec![patched(passed_check(), usage(4_001, 100))]),
+        ),
+        limited(
+            "patch-refused-over-budget",
+            LATE_BUDGET,
+            with(head(7), vec![patched(refused_check(), usage(4_001, 100))]),
         ),
         limited(
             "budget-beats-job-failed",
@@ -781,6 +876,7 @@ pub fn all() -> Vec<Scenario> {
                 proposed(citations(), usage(0, 1)),
                 cited(vec![Verified, Verified], usage(0, 1)),
                 fixed(usage(0, 1)),
+                patched(passed_check(), CHECK),
                 verified(passing_checks(), usage(2, 1)),
                 failed(usage(0, 0)),
             ],
@@ -905,6 +1001,13 @@ mod tests {
         }
     }
 
+    fn c_check_patch() -> RunCommand {
+        RunCommand::CheckPatch {
+            base: base(),
+            diff: diff_ref(),
+        }
+    }
+
     fn c_verify_fix() -> RunCommand {
         RunCommand::VerifyFix {
             base: base(),
@@ -936,6 +1039,7 @@ mod tests {
             ok(vec![c_analyze()], Stage::RootCause),
             ok(vec![c_verify_citations()], Stage::RootCause),
             ok(vec![c_write_fix()], Stage::Fix),
+            ok(vec![c_check_patch()], Stage::Fix),
             ok(vec![c_verify_fix()], Stage::Verify),
             ok(
                 vec![c_open(passing_checks(), times(JOB, 7), None)],
@@ -951,7 +1055,7 @@ mod tests {
     }
 
     /// The independent legality rule: the expected kind, plus `JobFailed` in
-    /// the nine waiting states.
+    /// the ten waiting states.
     fn legal(expected: Option<EventKind>, got: EventKind) -> bool {
         match expected {
             None => false,
@@ -1022,13 +1126,13 @@ mod tests {
         );
         let fix_fails = |check| {
             join(
-                head_wants(7),
+                head_wants(8),
                 vec![gate_failed(GateFailure::FixCheckFailed(check))],
             )
         };
         let fix_unsure = |check| {
             join(
-                head_wants(7),
+                head_wants(8),
                 vec![gate_failed(GateFailure::FixCheckInconclusive(check))],
             )
         };
@@ -1058,7 +1162,7 @@ mod tests {
             )
         };
         vec![
-            x("delivered", head_wants(9), j(7)),
+            x("delivered", head_wants(10), j(7)),
             x(
                 "reject-in-intake",
                 rejected_all(Some(K::TicketReceived), Stage::Intake),
@@ -1118,9 +1222,17 @@ mod tests {
                 j(5),
             ),
             x(
-                "reject-in-verify",
+                "reject-in-patch-check",
                 join(
                     head_wants(7),
+                    rejected_all(Some(K::PatchChecked), Stage::Fix),
+                ),
+                j(6),
+            ),
+            x(
+                "reject-in-verify",
+                join(
+                    head_wants(8),
                     rejected_all(Some(K::FixVerified), Stage::Verify),
                 ),
                 j(6),
@@ -1128,7 +1240,7 @@ mod tests {
             x(
                 "reject-in-deliver",
                 join(
-                    head_wants(8),
+                    head_wants(9),
                     rejected_all(Some(K::PullRequestOpened), Stage::Deliver),
                 ),
                 j(7),
@@ -1210,12 +1322,12 @@ mod tests {
             ),
             x(
                 "job-failed-verify",
-                join(head_wants(7), vec![job_failed(K::FixVerified)]),
+                join(head_wants(8), vec![job_failed(K::FixVerified)]),
                 j(7),
             ),
             x(
                 "job-failed-pull-request",
-                join(head_wants(8), vec![job_failed(K::PullRequestOpened)]),
+                join(head_wants(9), vec![job_failed(K::PullRequestOpened)]),
                 j(8),
             ),
             x(
@@ -1264,7 +1376,7 @@ mod tests {
             x(
                 "reference-blank-pull-request",
                 join(
-                    head_wants(8),
+                    head_wants(9),
                     join(
                         vec![
                             refused(
@@ -1276,7 +1388,7 @@ mod tests {
                                 Stage::Deliver,
                             ),
                         ],
-                        head_wants(9).split_off(8),
+                        head_wants(10).split_off(9),
                     ),
                 ),
                 j(7),
@@ -1347,6 +1459,37 @@ mod tests {
             x("root-cause-fewer-results", result_count(1), j(5)),
             x("root-cause-more-results", result_count(3), j(5)),
             x(
+                "patch-refused",
+                join(
+                    head_wants(7),
+                    vec![gate_failed(GateFailure::PatchRefused(refusal()))],
+                ),
+                j(7),
+            ),
+            x(
+                "patch-reject-empty-list",
+                join(
+                    head_wants(7),
+                    vec![gate_failed(GateFailure::PatchRefused(vec![]))],
+                ),
+                j(7),
+            ),
+            x(
+                "patch-unreadable",
+                join(
+                    head_wants(7),
+                    vec![gate_failed(GateFailure::PatchUnreadable(
+                        UnreadablePath::BaseLink { index: 2 },
+                    ))],
+                ),
+                j(7),
+            ),
+            x(
+                "patch-check-job-failed",
+                join(head_wants(7), vec![job_failed(K::PatchChecked)]),
+                j(7),
+            ),
+            x(
                 "fix-reproduction-still-fails",
                 fix_fails(FixCheck::ReproductionTest),
                 j(7),
@@ -1376,7 +1519,7 @@ mod tests {
             x(
                 "fix-lint-not-configured",
                 join(
-                    head_wants(7),
+                    head_wants(8),
                     vec![ok(
                         vec![c_open(
                             fix_checks(|c| c.lint = CheckStatus::NotConfigured),
@@ -1462,6 +1605,30 @@ mod tests {
                 usage(10_001, 600),
             ),
             x(
+                "patch-check-over-budget",
+                join(
+                    head_wants(7),
+                    vec![budget_ends(over(
+                        BudgetDimension::Cost,
+                        usage(10_001, 700),
+                        LATE_BUDGET,
+                    ))],
+                ),
+                usage(10_001, 700),
+            ),
+            x(
+                "patch-refused-over-budget",
+                join(
+                    head_wants(7),
+                    vec![budget_ends(over(
+                        BudgetDimension::Cost,
+                        usage(10_001, 700),
+                        LATE_BUDGET,
+                    ))],
+                ),
+                usage(10_001, 700),
+            ),
+            x(
                 "budget-beats-job-failed",
                 join(
                     head_wants(1),
@@ -1476,7 +1643,7 @@ mod tests {
             x(
                 "budget-over-fix-passes",
                 join(
-                    head_wants(7),
+                    head_wants(8),
                     vec![
                         ok(
                             vec![c_open(passing_checks(), usage(60_000, 10_001), Some(late))],
@@ -1493,7 +1660,7 @@ mod tests {
             x(
                 "budget-fix-at-limit",
                 join(
-                    head_wants(7),
+                    head_wants(8),
                     vec![
                         ok(
                             vec![c_open(passing_checks(), usage(60_000, 10_000), None)],
@@ -1509,13 +1676,13 @@ mod tests {
             ),
             x(
                 "budget-over-fix-fails",
-                join(head_wants(7), vec![budget_ends(late)]),
+                join(head_wants(8), vec![budget_ends(late)]),
                 usage(60_000, 10_001),
             ),
             x(
                 "budget-over-then-forge-fails",
                 join(
-                    head_wants(7),
+                    head_wants(8),
                     vec![
                         ok(
                             vec![c_open(passing_checks(), usage(60_000, 10_001), Some(late))],
@@ -1529,7 +1696,7 @@ mod tests {
             x(
                 "budget-overflow-fix-then-forge-fails",
                 join(
-                    head_wants(7),
+                    head_wants(8),
                     vec![
                         ok(
                             vec![c_open(
@@ -1588,11 +1755,11 @@ mod tests {
     fn expectations_and_scenarios_are_a_bijection() {
         let scenarios: Vec<&str> = all().iter().map(|s| s.name).collect();
         let expected: Vec<&str> = expectations().iter().map(|e| e.name).collect();
-        assert_eq!(scenarios.len(), 63);
+        assert_eq!(scenarios.len(), 70);
         assert_eq!(scenarios.len(), expected.len());
         let a: BTreeSet<&str> = scenarios.into_iter().collect();
         let b: BTreeSet<&str> = expected.into_iter().collect();
-        assert_eq!(a.len(), 63, "scenario names are unique");
+        assert_eq!(a.len(), 70, "scenario names are unique");
         assert_eq!(a, b);
     }
 
@@ -1630,7 +1797,7 @@ mod tests {
 
     #[test]
     fn every_state_event_pair_is_exercised() {
-        // A state is identified by what it expects: Intake, the nine
+        // A state is identified by what it expects: Intake, the ten
         // waiting states (each expects another kind) and Done (None).
         let states: Vec<Option<EventKind>> = core::iter::once(None)
             .chain(
@@ -1640,7 +1807,7 @@ mod tests {
                     .map(Some),
             )
             .collect();
-        assert_eq!(states.len(), 11);
+        assert_eq!(states.len(), 12);
         let mut seen = BTreeSet::new();
         let mut accepted = BTreeSet::new();
         for (_, trace) in traces() {
@@ -1684,9 +1851,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen.len(), 121);
-        assert_eq!(legal_pairs, 19);
-        assert_eq!(accepted.len(), 19);
+        assert_eq!(seen.len(), 144);
+        assert_eq!(legal_pairs, 21);
+        assert_eq!(accepted.len(), 21);
     }
 
     #[test]
@@ -1700,7 +1867,7 @@ mod tests {
             .into_iter()
             .filter(|k| !no_usage.contains(k))
             .collect();
-        assert_eq!(usage_kinds.len(), 8);
+        assert_eq!(usage_kinds.len(), 9);
         let traces = traces();
         for kind in usage_kinds {
             let crossed = traces.iter().any(|(_, t)| {
@@ -1834,6 +2001,13 @@ mod tests {
                 assert!(v.overrun.is_some());
             }
             other => panic!("unexpected record {other:?}"),
+        }
+        // A refused patch keeps the diff, and so does one over the budget.
+        for name in ["patch-refused", "patch-refused-over-budget"] {
+            match final_record(name) {
+                Record::Fixed(f) => assert_eq!(f.diff, diff_ref(), "{name}"),
+                other => panic!("{name}: unexpected record {other:?}"),
+            }
         }
         // A failed root-cause gate keeps the analysis and its citations.
         match final_record("root-cause-mismatch") {

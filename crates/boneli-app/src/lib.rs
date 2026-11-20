@@ -10,10 +10,11 @@
 //! (`docs/adr/004-ports-in-memory-adapters-and-debug-ticket.md`).
 //!
 //! The ports are object-safe traits with `&self` methods, one module each:
-//! [`Agent`], [`Verifier`], [`Forge`], [`EventStore`], [`Evidence`],
-//! [`Clock`] and [`Ids`], which [`DebugTicket`] drives through one run, and
-//! [`Sandbox`], [`Git`], [`ImageStore`] and [`DataSnapshot`], which the
-//! verifier, the environments and the agent's workspace build on. Paths
+//! [`Agent`], [`Verifier`], [`Forge`], [`Git`], [`EventStore`],
+//! [`Evidence`], [`Clock`] and [`Ids`], which [`DebugTicket`] drives
+//! through one run (`Git` for the patch check, ADR-023), and [`Sandbox`],
+//! [`ImageStore`] and [`DataSnapshot`], which the verifier, the
+//! environments and the agent's workspace build on. Paths
 //! that ports take are [`RelativePath`]s, the citation path rule of the
 //! domain; the paths a tree holds are [`TreePath`]s, which also carry
 //! names an agent cannot cite (ADR-018). [`contract`] holds the suites every adapter of a port must pass;
@@ -53,7 +54,7 @@ pub use forge::{Attached, Forge, ForgeRef, PullRequest};
 pub use git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
 pub use ids::Ids;
 pub use image::{ImageError, ImageRef, ImageStore, RootfsRef};
-pub use job::JobFailure;
+pub use job::{JobFailure, MAX_DETAIL_BYTES, cap_detail};
 pub use path::{RelativePath, TreePath, TreePathProblem, Uncitable};
 pub use sandbox::{
     Command, ExecResult, ExitStatus, Limits, Phase, Sandbox, SandboxError, SandboxId, SandboxSpec,

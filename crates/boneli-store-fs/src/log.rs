@@ -17,6 +17,12 @@
 //! fails closed like a file without a complete header or any complete line
 //! that does not decode; nothing then modifies the file. Error details
 //! name the file and the line, never content (ADR-008, D9).
+//!
+//! Versions (ADR-023, D7): `create` writes version 2. A version 1 log is
+//! read by the same decoder as long as it holds no `FixWritten` (and no
+//! `PatchChecked`), which the run table of version 2 would replay
+//! differently ([`codec::admits`]); `append` refuses such an event on it,
+//! so whatever is appended loads.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -28,7 +34,7 @@ use boneli_app::{RunLog, RunStart, StoreError};
 use boneli_domain::{RunEvent, RunId};
 use boneli_https::Sha256;
 
-use crate::codec::{self, MAX_LINE_BYTES};
+use crate::codec::{self, MAX_LINE_BYTES, Version};
 use crate::root::{RUNS, sync_dir};
 use crate::{FsStore, Regular, hex, open_regular};
 
@@ -62,6 +68,8 @@ fn open_log(path: &Path, label: &str, options: &OpenOptions) -> Result<File, Sto
 /// A log as read: what it holds, and where its acknowledged lines end.
 struct Parsed {
     log: RunLog,
+    /// The version from the header.
+    version: Version,
     /// The length of the header and every complete line.
     complete: u64,
     /// The length of the file, the unacknowledged tail included.
@@ -75,7 +83,7 @@ fn read_log(file: &File, label: &str, id: &RunId) -> Result<Parsed, StoreError> 
     let mut complete: u64 = 0;
     let mut tail: u64 = 0;
     let mut number: u64 = 0;
-    let mut start: Option<RunStart> = None;
+    let mut start: Option<(RunStart, Version)> = None;
     let mut events = Vec::new();
     // A line is read up to MAX_LINE_BYTES + 1 bytes: content and `\n` at
     // the limit, or proof that the line or tail is over it.
@@ -106,21 +114,24 @@ fn read_log(file: &File, label: &str, id: &RunId) -> Result<Parsed, StoreError> 
         };
         match start {
             None => {
-                let (owner, logged) = codec::read_header(content).map_err(|m| at(&m))?;
+                let (owner, logged, version) = codec::read_header(content).map_err(|m| at(&m))?;
                 if owner != *id {
                     return Err(at(&"the header names another run"));
                 }
-                start = Some(logged);
+                start = Some((logged, version));
             }
-            Some(_) => events.push(codec::read_event(content).map_err(|m| at(&m))?),
+            Some((_, version)) => {
+                events.push(codec::read_event(content, version).map_err(|m| at(&m))?);
+            }
         }
         complete += len_u64(line.len());
     }
-    let Some(start) = start else {
+    let Some((start, version)) = start else {
         return Err(unavailable(format!("{label}: no complete header line")));
     };
     Ok(Parsed {
         log: RunLog { start, events },
+        version,
         complete,
         len: complete + tail,
     })
@@ -186,6 +197,8 @@ pub(crate) fn append(store: &FsStore, id: &RunId, event: &RunEvent) -> Result<()
     let parsed = read_log(&file, &label, id)?;
     // Encoded and checked before the file is touched, so an event over a
     // limit leaves it byte for byte, tail included.
+    codec::admits(parsed.version, event.kind())
+        .map_err(|m| unavailable(format!("{label}: cannot append: {m}")))?;
     let mut line = codec::event_line(event)
         .map_err(|e| unavailable(format!("{label}: cannot append: {e}")))?;
     line.push(b'\n');

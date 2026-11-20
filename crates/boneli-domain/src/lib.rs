@@ -17,7 +17,9 @@
 //! corpus the unit tests and the two-process replay gate fold.
 //!
 //! [`patch_policy`] judges a fix diff before it is verified: size,
-//! forbidden paths, binaries, symlinks and disabled tests (ADR-013).
+//! forbidden paths, binaries, symlinks and disabled tests (ADR-013). The
+//! run asks for it with `CheckPatch` after `FixWritten` and gates on the
+//! `PatchChecked` result (ADR-023).
 //!
 //! # Doctests in this crate cannot use `unsafe` (ADR-001)
 //!
@@ -54,7 +56,7 @@ pub use error::DomainError;
 pub use event::{EventKind, RunEvent, TriageVerdict};
 pub use gate::{
     CheckStatus, CitationProblem, CitationStatus, FixCheck, FixChecks, GateFailure, GateOutcome,
-    TestStatus,
+    PatchCheck, TestStatus,
 };
 pub use patch::{
     BaseLink, Change, ChangeProblem, Entry, EntryKind, LinkProblem, NotText, Patch, PatchLimits,

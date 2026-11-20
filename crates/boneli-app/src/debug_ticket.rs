@@ -8,8 +8,16 @@
 //! appended to the log only after the run accepted it, so every stored log
 //! replays ([`crate::store::replay`]).
 //!
-//! A failure inside a job (the agent, the verifier, the forge, or loading or
-//! storing evidence) ends the run with a recorded `JobFailed` outcome. A
+//! The patch check between `FixWritten` and `VerifyFix` is a job of the
+//! application, not of an adapter: it fetches the base through `Git`,
+//! applies the stored diff, describes the change with
+//! [`Git::patch_between`] and judges it with the domain's
+//! [`patch_policy`] under the request's limits (ADR-023, D3).
+//!
+//! A failure inside a job (the agent, the verifier, the forge, git, or
+//! loading or storing evidence) ends the run with a recorded `JobFailed`
+//! outcome, its detail capped at [`MAX_DETAIL_BYTES`](crate::MAX_DETAIL_BYTES)
+//! so the event fits a log line (ADR-023, D2). A
 //! failure of the event store itself returns [`DebugTicketError::Store`] at
 //! once, and the log stays the prefix of accepted events.
 
@@ -22,7 +30,8 @@ use core::fmt;
 
 use boneli_domain::{
     Budget, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef, FixChecks,
-    Outcome, Run, RunCommand, RunEvent, RunId, Stage, TestStatus, Ticket, TriageVerdict, Usage,
+    Outcome, PatchCheck, PatchLimits, Run, RunCommand, RunEvent, RunId, Stage, TestStatus, Ticket,
+    TriageVerdict, Usage, patch_policy,
 };
 
 use crate::agent::{
@@ -31,8 +40,9 @@ use crate::agent::{
 use crate::clock::Clock;
 use crate::evidence::Evidence;
 use crate::forge::{Attached, Forge, PullRequest};
+use crate::git::{Git, GitError, RepoUrl};
 use crate::ids::Ids;
-use crate::job::JobFailure;
+use crate::job::{JobFailure, cap_detail};
 use crate::store::{EventStore, RunStart, StoreError, replay};
 use crate::verifier::Verifier;
 
@@ -46,6 +56,8 @@ pub struct DebugTicket<'a> {
     pub verifier: &'a dyn Verifier,
     /// Questions and the pull request.
     pub forge: &'a dyn Forge,
+    /// The base and the diff applied to it, for the patch check.
+    pub git: &'a dyn Git,
     /// The run logs.
     pub events: &'a dyn EventStore,
     /// The test, the analysis and the diff.
@@ -63,8 +75,16 @@ pub struct DebugRequest {
     pub ticket: Ticket,
     /// The commit everything is reproduced and verified against.
     pub base: CommitSha,
+    /// The repository `base` is fetched from for the patch check. The
+    /// forge pushes to the repository it was configured with, so the
+    /// composition root builds both from one value (ADR-023, D3).
+    pub repo: RepoUrl,
     /// The run's limits.
     pub budget: Budget,
+    /// The patch policy's limits, run input like the budget (ADR-023,
+    /// D5). Not logged: the `PatchChecked` event records the limits the
+    /// policy judged against.
+    pub patch_limits: PatchLimits,
     /// The run that asked the questions this request answers, if any
     /// (ADR-004, D6).
     pub previous: Option<RunId>,
@@ -143,6 +163,7 @@ enum Produced {
     RootCause(EvidenceRef, Vec<Citation>),
     Citations(Vec<CitationStatus>),
     Fix(EvidenceRef),
+    Patch(PatchCheck),
     Checks(FixChecks),
 }
 
@@ -159,6 +180,7 @@ impl Produced {
             },
             Produced::Citations(results) => RunEvent::CitationsChecked { results, usage },
             Produced::Fix(diff) => RunEvent::FixWritten { diff, usage },
+            Produced::Patch(check) => RunEvent::PatchChecked { check, usage },
             Produced::Checks(checks) => RunEvent::FixVerified { checks, usage },
         }
     }
@@ -197,10 +219,18 @@ impl Job {
     }
 }
 
-/// A forge failure carries no usage (ADR-002, D3).
+/// The run input that is not the run's own state: what the patch check
+/// needs besides the command.
+struct Input {
+    repo: RepoUrl,
+    patch_limits: PatchLimits,
+}
+
+/// A forge failure carries no usage (ADR-002, D3). Its detail is capped
+/// like every `JobFailed` detail ([`cap_detail`]).
 fn forge_failed(detail: String) -> RunEvent {
     RunEvent::JobFailed {
-        detail,
+        detail: cap_detail(detail),
         usage: Usage::default(),
     }
 }
@@ -217,9 +247,12 @@ impl DebugTicket<'_> {
         let DebugRequest {
             ticket,
             base,
+            repo,
             budget,
+            patch_limits,
             previous,
         } = request;
+        let input = Input { repo, patch_limits };
         let context = match &previous {
             Some(id) => Some(self.previous_triage(id, &ticket)?),
             None => None,
@@ -244,7 +277,7 @@ impl DebugTicket<'_> {
         // the one before it, within a job and across jobs (ADR-004, D5).
         let last = Cell::new(None);
         while let Some(command) = queue.pop_front() {
-            let event = self.execute(&id, command, context.as_ref(), &last);
+            let event = self.execute(&id, command, &input, context.as_ref(), &last);
             let (next, more) = run
                 .handle(event.clone())
                 .map_err(DebugTicketError::Domain)?;
@@ -315,6 +348,7 @@ impl DebugTicket<'_> {
         &self,
         id: &RunId,
         command: RunCommand,
+        input: &Input,
         previous: Option<&PreviousTriage>,
         last: &Cell<Option<u64>>,
     ) -> RunEvent {
@@ -411,6 +445,16 @@ impl DebugTicket<'_> {
                     Err(failure) => Job::agent_failed(failure),
                 }
             }),
+            RunCommand::CheckPatch { base, diff } => self.measured(last, || {
+                let diff = match self.load("diff", &diff) {
+                    Ok(diff) => diff,
+                    Err(detail) => return Job::failed(0, detail),
+                };
+                match self.check_patch(input, &base, &diff) {
+                    Ok(check) => Job::done(0, Produced::Patch(check)),
+                    Err(detail) => Job::failed(0, detail),
+                }
+            }),
             RunCommand::VerifyFix { base, diff, test } => self.measured(last, || {
                 let inputs = self
                     .load("diff", &diff)
@@ -465,6 +509,40 @@ impl DebugTicket<'_> {
         }
     }
 
+    /// The patch check (ADR-023, D3): the base, the diff applied to it by
+    /// the same `Git::apply` the forge pushes from (ADR-014), the change
+    /// between the two, and the policy's verdict under the request's
+    /// limits. A git error names the step; a diff that does not apply is
+    /// one, so it ends the run as a failed job (ADR-023, D2).
+    fn check_patch(
+        &self,
+        input: &Input,
+        base: &CommitSha,
+        diff: &[u8],
+    ) -> Result<PatchCheck, String> {
+        let failed = |step: &str, error: GitError| format!("{step} failed: {error}");
+        let checkout = self
+            .git
+            .fetch_base(&input.repo, base)
+            .map_err(|e| failed("fetching the base", e))?;
+        let applied = self
+            .git
+            .apply(&checkout, diff)
+            .map_err(|e| failed("applying the diff", e))?;
+        let patch = self
+            .git
+            .patch_between(&checkout, &applied)
+            .map_err(|e| failed("describing the patch", e))?;
+        let limits = input.patch_limits;
+        Ok(match patch {
+            Ok(patch) => PatchCheck::Judged {
+                limits,
+                verdict: patch_policy(&patch, &limits),
+            },
+            Err(path) => PatchCheck::Unreadable(path),
+        })
+    }
+
     /// Loads stored evidence for the pull request.
     fn attach(&self, what: &str, reference: EvidenceRef) -> Result<Attached, String> {
         self.load(what, &reference)
@@ -508,7 +586,10 @@ impl DebugTicket<'_> {
         };
         match result {
             Ok(produced) => produced.into_event(usage),
-            Err(detail) => RunEvent::JobFailed { detail, usage },
+            Err(detail) => RunEvent::JobFailed {
+                detail: cap_detail(detail),
+                usage,
+            },
         }
     }
 

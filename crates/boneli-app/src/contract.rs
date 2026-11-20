@@ -180,7 +180,12 @@ fn hostile_names() -> Vec<String> {
 pub mod event_store {
     use super::*;
     use crate::store::{EventStore, RunLog, RunStart, StoreError};
-    use boneli_domain::{RunEvent, TriageVerdict, Usage};
+    use boneli_domain::{
+        ChangeProblem, CitationProblem, ForbiddenClass, LinkProblem, Marker, NotText, PatchCheck,
+        PatchLimits, PatchVerdict, PatchViolation, RunEvent, TestDisabling, TriageVerdict,
+        UnreadablePath, Usage,
+    };
+    use core::num::NonZeroU32;
 
     const PORT: &str = "EventStore";
 
@@ -350,8 +355,48 @@ pub mod event_store {
         "\u{1F600}",
     ];
 
+    /// One violation of every family of the patch policy, each with a
+    /// payload a store must carry: the extremes of every number and a
+    /// nested enum value (ADR-023, D7).
+    fn every_violation() -> Vec<PatchViolation> {
+        vec![
+            PatchViolation::TooManyFiles {
+                files: usize::MAX,
+                limit: u32::MAX,
+            },
+            PatchViolation::Empty,
+            PatchViolation::Malformed {
+                index: 0,
+                problem: ChangeProblem::Path(CitationProblem::ParentComponent),
+            },
+            PatchViolation::BaseLinkMalformed {
+                index: 1,
+                problem: ChangeProblem::BaseLinkMismatch,
+            },
+            PatchViolation::TooManyLines { limit: 1 },
+            PatchViolation::TooManyBytes { limit: 42_000 },
+            PatchViolation::Forbidden {
+                index: 2,
+                class: ForbiddenClass::GitConfig,
+            },
+            PatchViolation::Gitlink { index: 3 },
+            PatchViolation::NotText {
+                index: 4,
+                reason: NotText::BidiControl,
+            },
+            PatchViolation::Link {
+                index: 5,
+                problem: LinkProblem::Encloses(ForbiddenClass::RepositoryMetadata),
+            },
+            PatchViolation::DisablesTests {
+                index: usize::MAX,
+                reason: TestDisabling::Marker(Marker::Fcontext),
+            },
+        ]
+    }
+
     /// One event of every kind, with the texts above, an empty `Vec`, zero
-    /// and `u64::MAX` usage.
+    /// and `u64::MAX` usage, and every shape of a patch check.
     pub(crate) fn every_event(base: &CommitSha) -> Result<Vec<RunEvent>, Violation> {
         let clause = "round-trip";
         let max = Usage {
@@ -424,6 +469,42 @@ pub mod event_store {
             },
             RunEvent::FixWritten {
                 diff: reference(TEXTS[3])?,
+                usage: zero,
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Judged {
+                    limits: PatchLimits {
+                        max_changed_files: NonZeroU32::MIN,
+                        max_changed_lines: NonZeroU32::MAX,
+                        max_changed_bytes: NonZeroU32::MIN.saturating_add(41_999),
+                    },
+                    verdict: PatchVerdict::Reject(every_violation()),
+                },
+                usage: max,
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Judged {
+                    limits: PatchLimits::DEFAULT,
+                    verdict: PatchVerdict::Reject(vec![]),
+                },
+                usage: zero,
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Judged {
+                    limits: PatchLimits::DEFAULT,
+                    verdict: PatchVerdict::Pass {
+                        files: u32::MAX,
+                        lines: 0,
+                    },
+                },
+                usage: zero,
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Unreadable(UnreadablePath::BaseLink { index: usize::MAX }),
+                usage: max,
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Unreadable(UnreadablePath::Change { index: 0 }),
                 usage: zero,
             },
             RunEvent::FixVerified {

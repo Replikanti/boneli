@@ -68,6 +68,15 @@ pub enum RunCommand {
         /// The analysis that passed its gate.
         analysis: EvidenceRef,
     },
+    /// Apply the diff to the base and judge the change with the patch
+    /// policy (ADR-023, D1 and D3); the limits are the run's input, not
+    /// the domain's.
+    CheckPatch {
+        /// The base commit.
+        base: CommitSha,
+        /// The fix.
+        diff: EvidenceRef,
+    },
     /// Check the fix in a clean sandbox from the base commit and the diff
     /// only (invariant 6); the test reference lets the verifier confirm the
     /// test is unchanged.
