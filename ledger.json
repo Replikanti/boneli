@@ -886,11 +886,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR 78 79cec85: QA ship-it after fix round 1; STOP 2: upstream kernel report decision",
-   "updated_at": "2026-11-20T16:24:49+00:00",
+   "note": "PR 78 fix round 2 (review run 2: stalled-at-end keeper, cadence pin); upstream kernel report draft after merge (operator yes)",
+   "updated_at": "2026-11-20T17:25:51+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1091,7 +1091,7 @@
     "core"
    ],
    "manual": false,
-   "session": true
+   "session": false
   },
   {
    "issue": 80,
@@ -1167,14 +1167,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T10:37:27+00:00",
-   "issue": 54,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "98fa59e8",
-   "note": "PR 1 merged (#76, ca44aec); PR 2 (M1a/M1b/M2) next"
-  },
   {
    "at": "2026-11-20T10:41:02+00:00",
    "issue": 38,
@@ -1566,6 +1558,14 @@
    "to": "plan-review",
    "by": "f7d29cb8",
    "note": null
+  },
+  {
+   "at": "2026-11-20T17:25:51+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "98fa59e8",
+   "note": "PR 78 fix round 2 (review run 2: stalled-at-end keeper, cadence pin); upstream kernel report draft after merge (operator yes)"
   }
  ],
  "open": [
@@ -1601,7 +1601,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T16:53:19+00:00",
+ "updated_at": "2026-11-20T17:25:51+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
