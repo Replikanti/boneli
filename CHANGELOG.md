@@ -548,7 +548,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Pull requests that touch the release files and dispatches build without
   publishing; a dispatch on `main` rehearses the publish path with a draft
   release that it deletes.
-- `boneli-https` (#79, ADR-019): certificate revocation by OCSP for
+- `boneli-https` (#79, ADR-020): certificate revocation by OCSP for
   leaves that name an OCSP responder and no fetchable CRL point, the
   leaves of GitHub, GHCR and GitLab among them. The check re-verifies the
   chain with webpki for the leaf's issuer, sends one GET per responder
@@ -569,7 +569,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OCSP_CACHE_MAX_ENTRIES` (1,024), `OCSP_MAX_AGE_SECS` and
   `OCSP_REFRESH_RETRY_SECS`. Two direct edges to crates already in the
   graph, `rustls-webpki` and `ring`; no new crate. ADR-017's first known
-  limit points to ADR-019.
+  limit points to ADR-020.
 
 ### Changed
 

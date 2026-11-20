@@ -10,7 +10,7 @@
 //! Revocation by CRL (ADR-017, item 12): Let's Encrypt's test sites serve
 //! a revoked and a valid leaf whose CRLs come from a real CA over the
 //! real network path, which no loopback test reaches. Revocation by OCSP
-//! (ADR-019, item 12): the six forge hosts whose leaves name only an OCSP
+//! (ADR-020, item 12): the six forge hosts whose leaves name only an OCSP
 //! responder must be checked by Sectigo's. Run them by hand before a
 //! change under `src/revocation/` merges:
 //!
@@ -114,7 +114,7 @@ fn runner_hosts_revocation_status() {
 }
 
 /// The forge hosts whose leaves name no CRL point and one OCSP responder,
-/// Sectigo's (ADR-019, Context).
+/// Sectigo's (ADR-020, Context).
 const OCSP_HOSTS: [&str; 6] = [
     "github.com",
     "api.github.com",

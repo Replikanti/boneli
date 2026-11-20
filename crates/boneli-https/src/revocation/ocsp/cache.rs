@@ -1,4 +1,4 @@
-//! The OCSP cache of one `TlsConfig` (ADR-019, item 6; D2): keyed by the
+//! The OCSP cache of one `TlsConfig` (ADR-020, item 6; D2): keyed by the
 //! SHA-1 CertID, so the responder URLs of one leaf share one entry, in
 //! memory for the life of the process, at most `OCSP_CACHE_MAX_ENTRIES`
 //! entries. The staleness rules are the CRL cache's (`cache::window`): an
@@ -188,7 +188,7 @@ impl OcspCache {
             // answer goes first. With no good answer left, a good answer is
             // not stored (it still decides this check), and a revocation
             // displaces the least recently used one, the only case in which
-            // a revocation leaves before its `nextUpdate` (ADR-019, item 6).
+            // a revocation leaves before its `nextUpdate` (ADR-020, item 6).
             let victim = match self.oldest(Some(Status::Good)) {
                 Some(k) => k,
                 None if entry.status == Status::Good => return entry,

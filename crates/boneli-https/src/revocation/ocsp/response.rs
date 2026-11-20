@@ -1,4 +1,4 @@
-//! The OCSP response (RFC 6960, 4.2; ADR-019, item 4): a strict parser
+//! The OCSP response (RFC 6960, 4.2; ADR-020, item 4): a strict parser
 //! and the verifier whose result decides.
 //!
 //! Unlike the CRL reader (ADR-017, item 9), nothing behind this module

@@ -1,4 +1,4 @@
-//! Certificate revocation by OCSP (ADR-019), for leaves that name an OCSP
+//! Certificate revocation by OCSP (ADR-020), for leaves that name an OCSP
 //! responder and no fetchable CRL distribution point.
 //!
 //! The check re-verifies the chain with webpki for the leaf's issuer on
@@ -38,7 +38,7 @@ use request::CertId;
 use response::{Issuer, Status};
 
 /// The most responder URLs tried for one leaf: twice the measured maximum
-/// of 1 (ADR-019, item 7).
+/// of 1 (ADR-020, item 7).
 pub const MAX_OCSP_URLS: usize = 2;
 
 /// The largest OCSP response accepted, in bytes: 28 times the largest
@@ -77,7 +77,7 @@ pub const OCSP_REFRESH_RETRY_SECS: u64 = 3_600;
 
 /// Where OCSP responses come from. Not a verifier hook: whatever a source
 /// returns is verified against the leaf's issuer on the verified path,
-/// the leaf's CertID and the system clock (ADR-019, item 11). A source can
+/// the leaf's CertID and the system clock (ADR-020, item 11). A source can
 /// make a connection fail, hand over an older answer the issuer signed
 /// that is still before its `nextUpdate` on a cold cache, or keep a cached
 /// good answer in use until its `nextUpdate` by failing every refresh,
@@ -121,7 +121,7 @@ pub(crate) fn candidates(uris: &[&[u8]]) -> Vec<Candidate> {
 }
 
 /// The check of `leaf` against `candidates` (not empty, from
-/// `candidates`), in the order of ADR-017 item 4 (ADR-019, item 5).
+/// `candidates`), in the order of ADR-017 item 4 (ADR-020, item 5).
 pub(crate) fn check(
     ctx: &Context<'_>,
     leaf: &Leaf<'_>,
@@ -235,7 +235,7 @@ fn fetch(
 
 /// The leaf's issuer on the path webpki verifies with the handshake's
 /// roots and algorithms at the check's `now`, and the leaf's CertID under
-/// it (ADR-019, item 2). The issuer is the path's first intermediate, or
+/// it (ADR-020, item 2). The issuer is the path's first intermediate, or
 /// its anchor when a root issued the leaf. webpki picks the same kind of
 /// path rustls did; a different path could only change the issuer's key,
 /// which no answer then matches, so the check fails closed.

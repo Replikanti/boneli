@@ -284,7 +284,7 @@ rm -f index.txt index.txt.* crlnumber crlnumber.* ./*.crl.pem leaf.cnf ca.cnf \
   crl-ca.key crl-forged-ca.key crl-forged-ca.pem
 ```
 
-## Revocation by OCSP (`tests/ocsp.rs`, `src/revocation/ocsp/`, ADR-019)
+## Revocation by OCSP (`tests/ocsp.rs`, `src/revocation/ocsp/`, ADR-020)
 
 A third test CA with leaves that name OCSP responders (authorityInfoAccess)
 and no CRL point, delegated responder certificates, and answers of

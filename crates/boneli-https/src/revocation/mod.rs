@@ -1,4 +1,4 @@
-//! Certificate revocation by CRL (ADR-017) and OCSP (ADR-019).
+//! Certificate revocation by CRL (ADR-017) and OCSP (ADR-020).
 //!
 //! After rustls has verified the chain in the handshake, the check reads
 //! the CRL distribution points of the verified leaf, fetches each CRL
@@ -8,7 +8,7 @@
 //! listed in a list fails the connection with `Error::Revoked`; a leaf that
 //! names a point no list settles fails it with `Error::RevocationUnknown`
 //! (D1: fail closed, no opt-out). A leaf that names no fetchable point
-//! but an OCSP responder is checked by OCSP instead (`ocsp`, ADR-019),
+//! but an OCSP responder is checked by OCSP instead (`ocsp`, ADR-020),
 //! with the same outcomes; a leaf with neither passes unchecked (ADR-017,
 //! D2).
 //!
@@ -95,7 +95,7 @@ pub const CRL_CHECK_DEADLINE: Duration =
     Duration::from_secs(CRL_SETUP_TIME.as_secs() + MAX_CRL_BYTES as u64 / CRL_MIN_RATE);
 
 /// The largest response head of a fetch, in bytes. Shared by CRL and
-/// OCSP fetches, as are the timeouts above (ADR-019, item 7).
+/// OCSP fetches, as are the timeouts above (ADR-020, item 7).
 pub const CRL_MAX_HEAD_BYTES: usize = 16_384;
 
 /// The most header fields in the response head of a fetch.
@@ -159,7 +159,7 @@ pub enum RevocationStatus {
         url: String,
     },
     /// The OCSP responder at `url` settled the leaf as not revoked
-    /// (ADR-019).
+    /// (ADR-020).
     OcspChecked {
         /// The canonical URL of the responder.
         url: String,
@@ -410,7 +410,7 @@ impl Revocation {
     /// answer and webpki's verification. `outer` cuts the check's deadline
     /// shorter. A leaf with an `http` or `https` CRL point takes the CRL
     /// path only; a leaf without one and with such an OCSP responder takes
-    /// the OCSP path (ADR-019, item 1).
+    /// the OCSP path (ADR-020, item 1).
     pub(crate) fn check_at(
         &self,
         chain: &[CertificateDer<'_>],

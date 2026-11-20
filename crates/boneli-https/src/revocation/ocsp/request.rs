@@ -1,4 +1,4 @@
-//! The OCSP request (RFC 6960, 4.1; ADR-019, item 3): one CertID with
+//! The OCSP request (RFC 6960, 4.1; ADR-020, item 3): one CertID with
 //! SHA-1 hashes, no version, no requestor name, no extensions (so no
 //! nonce, which no measured responder echoes), no signature; sent as a GET
 //! with the request in the path (RFC 6960, A.1).
@@ -53,7 +53,7 @@ impl CertId {
     }
 }
 
-/// SHA-1, for CertIDs only: ring's `SHA1_FOR_LEGACY_USE_ONLY` (ADR-019,
+/// SHA-1, for CertIDs only: ring's `SHA1_FOR_LEGACY_USE_ONLY` (ADR-020,
 /// item 10). A CertID names a certificate the chain already verified; it
 /// is not a signature, so SHA-1's collisions buy an attacker nothing here.
 fn sha1(data: &[u8]) -> [u8; 20] {

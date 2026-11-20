@@ -1,4 +1,4 @@
-# ADR-019: Certificate revocation by OCSP
+# ADR-020: Certificate revocation by OCSP
 
 - Status: accepted
 - Date: 2026-11-20

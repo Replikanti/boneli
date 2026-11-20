@@ -259,7 +259,7 @@ pq.cloudflareresearch.com and runs by hand before a change to
 `TlsConfig` merges. It also holds the revocation live tests (ADR-017):
 Let's Encrypt's revoked test site must fail with `Error::Revoked`, its
 valid one must be checked against its CRL, and the revocation status of
-the runner's hosts is printed. For OCSP (ADR-019) the six forge hosts
+the runner's hosts is printed. For OCSP (ADR-020) the six forge hosts
 whose leaves name only an OCSP responder (GitHub, GHCR, GitLab) must be
 `OcspChecked` by Sectigo's responder, and the crate's `ocsp::live` tests
 check SSL.com's revoked test leaves and two delegated responders

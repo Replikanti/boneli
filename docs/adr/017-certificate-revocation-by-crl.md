@@ -465,7 +465,7 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
 - **Known limits**, each with where it closes:
   - Leaves without a point, GitHub's, GHCR's and GitLab's among them, get
     no check (D2): Replikanti/boneli#79, filed at #38 STOP 2. Closed for leaves
-    that name an OCSP responder by ADR-019 (Replikanti/boneli#79); a leaf
+    that name an OCSP responder by ADR-020 (Replikanti/boneli#79); a leaf
     with neither still passes unchecked.
   - Intermediates are not checked (D3):
     Replikanti/boneli#80, filed at #38 STOP 2.

@@ -1,5 +1,5 @@
 //! Live tests of the OCSP check against real responders, ignored by
-//! default because they depend on third parties (ADR-019, item 12). They
+//! default because they depend on third parties (ADR-020, item 12). They
 //! call the check directly, so leaves that also name a CRL point, which
 //! the handshake would check by CRL, go through OCSP here: SSL.com's
 //! revoked test leaves (a revoked answer by name, signed by the CA), and

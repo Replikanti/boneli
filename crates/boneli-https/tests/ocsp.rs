@@ -1,4 +1,4 @@
-//! Certificate revocation by OCSP (ADR-019) in real handshakes against
+//! Certificate revocation by OCSP (ADR-020) in real handshakes against
 //! local rustls servers on 127.0.0.1, with answers from a fake
 //! `OcspSource`: good, revoked and unknown leaves, every way an answer can
 //! fail to settle a leaf, resumed sessions, CONNECT tunnels, `TlsDial`'s

@@ -28,7 +28,7 @@
 //! with [`Error::RevocationUnknown`]: an attacker on the path can drop a
 //! plain-HTTP fetch, so the check fails closed and has no switch to turn
 //! it off. A leaf that names no point but an OCSP responder is checked by
-//! OCSP instead (ADR-019): one GET per responder over plain HTTP, the
+//! OCSP instead (ADR-020): one GET per responder over plain HTTP, the
 //! answer verified against the leaf's issuer on the verified path (or a
 //! responder that issuer authorized), cached by the same rules; a revoked
 //! answer is [`Error::Revoked`], and every answer that does not settle the
@@ -118,14 +118,14 @@ pub enum Error {
     InvalidInput(&'static str),
     /// The server's certificate is revoked: listed in the CRL at `url`
     /// (ADR-017), or reported revoked by the OCSP responder at `url`
-    /// (ADR-019).
+    /// (ADR-020).
     Revoked {
         /// The canonical URL of the list or the responder.
         url: String,
     },
     /// The server's certificate names CRL distribution points or OCSP
     /// responders and none of them settled whether it is revoked: each
-    /// failure with its URL and cause (ADR-017, item 4; ADR-019). The
+    /// failure with its URL and cause (ADR-017, item 4; ADR-020). The
     /// check fails closed.
     RevocationUnknown(Vec<RevocationFailure>),
 }
@@ -248,7 +248,7 @@ impl Roots {
 /// the given roots (ADR-005). The key exchange groups are, in this order,
 /// X25519MLKEM768 (TLS 1.3 only), X25519, P-256 and P-384 (ADR-016), or
 /// the last three for [`TlsConfig::classical`]. Server certificates are
-/// checked for revocation by CRL (ADR-017) or OCSP (ADR-019), with no
+/// checked for revocation by CRL (ADR-017) or OCSP (ADR-020), with no
 /// switch to turn it off. Cheap to clone; clones share the session store
 /// and the CRL and OCSP caches, so share one per set of roots.
 #[derive(Clone, Debug)]
@@ -318,7 +318,7 @@ impl TlsConfig {
         let client = Arc::new(client);
         // `https` distribution points and OCSP responders are fetched over
         // the same client without a revocation check, which keeps the
-        // fetch from recursing (ADR-017, item 6; ADR-019, item 8).
+        // fetch from recursing (ADR-017, item 6; ADR-020, item 8).
         let fetch = TlsConfig {
             client: Arc::clone(&client),
             roots: Arc::clone(&roots),
@@ -352,7 +352,7 @@ impl TlsConfig {
     }
 
     /// The same configuration with OCSP responses from `source`, the CRL
-    /// source of this one, and both caches empty (ADR-019, item 11): for
+    /// source of this one, and both caches empty (ADR-020, item 11): for
     /// tests, and for a source that reaches responders another way.
     /// Whatever the source returns is verified against the leaf's issuer
     /// on the path these roots verify, the leaf's CertID and the system
@@ -386,7 +386,7 @@ impl TlsConfig {
 /// [`CRL_CHECK_DEADLINE`], shared by all the leaf's CRL URLs, or
 /// [`OCSP_CHECK_DEADLINE`] for a leaf checked by OCSP: on a cold cache, or
 /// once a list or answer is due again, it adds at most that to `connect`
-/// and `connect_over` (ADR-017, item 7; ADR-019, item 7). A warm cache
+/// and `connect_over` (ADR-017, item 7; ADR-020, item 7). A warm cache
 /// adds no I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -732,7 +732,7 @@ impl<S: Read + Write> TlsStream<S> {
             .map(|group| group.name())
     }
 
-    /// What the revocation check found (ADR-017, ADR-019): checked against
+    /// What the revocation check found (ADR-017, ADR-020): checked against
     /// which list or responder, decided by a stale cached list or answer,
     /// or a certificate without either source that passed unchecked. For
     /// tests and logs.

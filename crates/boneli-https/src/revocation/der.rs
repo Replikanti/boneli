@@ -1,6 +1,6 @@
 //! A DER reader for the things webpki parses but keeps to itself (ADR-017,
 //! item 9): the CRL distribution points of a certificate and the
-//! `thisUpdate` and `nextUpdate` of a CRL; and, for OCSP (ADR-019), the
+//! `thisUpdate` and `nextUpdate` of a CRL; and, for OCSP (ADR-020), the
 //! responder URLs of a certificate, the parts of a public key, and the
 //! reader and encoder `ocsp` builds its request and parses its response
 //! with.
@@ -10,7 +10,7 @@
 //! `build()` parsed it. A misparse there can therefore refuse a valid
 //! certificate or miss a point, but never accept a certificate a CRL
 //! lists: webpki decides that. The OCSP response is different: its parse
-//! decides (ADR-019), so `ocsp::response` reads it with this reader
+//! decides (ADR-020), so `ocsp::response` reads it with this reader
 //! strictly and checks its signature over the raw bytes.
 //!
 //! Definite lengths only, in their minimal encoding, at most four length
@@ -225,7 +225,7 @@ pub(crate) fn distribution_point_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerErro
 }
 
 /// The `uniformResourceIdentifier` locations of the certificate's
-/// `id-ad-ocsp` access descriptions, in certificate order (ADR-019, item
+/// `id-ad-ocsp` access descriptions, in certificate order (ADR-020, item
 /// 1). Other access methods (`caIssuers`) and other location types
 /// (`directoryName`) are skipped, but read, so that a malformed one is an
 /// error wherever it sits. No extension gives an empty list; a second
@@ -522,7 +522,7 @@ mod tests {
         assert!(next < this);
     }
 
-    /// Leaves with an authorityInfoAccess extension (ADR-019).
+    /// Leaves with an authorityInfoAccess extension (ADR-020).
     const AIA_CERTS: [&[u8]; 5] = [
         include_bytes!("../../tests/data/ocsp-good.pem"),
         include_bytes!("../../tests/data/ocsp-three-urls.pem"),

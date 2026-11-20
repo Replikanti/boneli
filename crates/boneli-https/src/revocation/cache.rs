@@ -96,7 +96,7 @@ impl Entry {
     }
 }
 
-/// Where a cached answer stands at `now` (ADR-017, item 8; ADR-019):
+/// Where a cached answer stands at `now` (ADR-017, item 8; ADR-020):
 /// the one rule both caches use. All times are Unix seconds and every sum
 /// saturates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

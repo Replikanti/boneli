@@ -1,4 +1,4 @@
-//! The real `CrlSource` and `OcspSource` (ADR-017, items 6 and 7; ADR-019,
+//! The real `CrlSource` and `OcspSource` (ADR-017, items 6 and 7; ADR-020,
 //! item 8): one HTTP/1.1 `GET` per fetch through `boneli-http`, directly
 //! from this process, under the check's deadline. `Host` is the only field
 //! sent: no `User-Agent`, credentials or cookies. 200 only, no redirect
@@ -159,7 +159,7 @@ fn request<S: Read + Write + IdleCheck>(
     }
     // RFC 5280, 4.2.1.13 and RFC 6960, A.1: the server sends DER. A coding
     // would need a decoder and is never needed (none measured, ADR-017
-    // item 6, ADR-019 item 8).
+    // item 6, ADR-020 item 8).
     let coded = response
         .head
         .headers
