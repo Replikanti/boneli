@@ -944,11 +944,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "b6fae515",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T17:52:20+00:00",
+   "updated_at": "2026-11-20T19:11:42+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T12:25:08+00:00",
-   "issue": 64,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "abd3f92f",
-   "note": null
-  },
   {
    "at": "2026-11-20T12:37:09+00:00",
    "issue": 54,
@@ -1613,6 +1605,14 @@
    "to": "plan-review",
    "by": "6860ecc9",
    "note": null
+  },
+  {
+   "at": "2026-11-20T19:11:42+00:00",
+   "issue": 57,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "b6fae515",
+   "note": null
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T19:06:03+00:00",
+ "updated_at": "2026-11-20T19:11:42+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
