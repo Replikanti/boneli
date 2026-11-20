@@ -454,67 +454,6 @@ jobs:
           fi
           echo "OK: no step called Python"
 
-  # Temporary (#54, M3; removed before the PR leaves draft): the sandbox
-  # round of diag_54 (the sandbox's own memory.stat at 10-100 ms and the
-  # per-sandbox read cost) on 16 x86_64 copies (about 1 in 8 lands on AWS)
-  # and 4 arm64 copies. No trace events, no sudo beyond host setup.
-  diag-54:
-    name: diag-54 (${{ matrix.arch }} ${{ matrix.copy }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: x86_64, runner: ubuntu-latest, copy: 1 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 2 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 3 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 4 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 5 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 6 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 7 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 8 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 9 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 10 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 11 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 12 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 13 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 14 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 15 }
-          - { arch: x86_64, runner: ubuntu-latest, copy: 16 }
-          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 1 }
-          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 2 }
-          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 3 }
-          - { arch: arm64, runner: ubuntu-24.04-arm, copy: 4 }
-    env:
-      RUSTUP_TOOLCHAIN: stable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Host features
-        run: |
-          uname -srm
-          nproc
-          grep MemTotal /proc/meminfo
-          echo "lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo absent)"
-          echo "workspace fs: $(findmnt -no MAJ:MIN,SOURCE,FSTYPE,OPTIONS -T "$GITHUB_WORKSPACE" 2>/dev/null || echo absent)"
-          lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
-      - name: Build
-        run: cargo test -p boneli-sys --no-run
-      - name: Prepare the runner host
-        run: |
-          awk '/^<!-- host-setup:begin -->$/ { m = 1; next }
-               /^<!-- host-setup:end -->$/ { m = 0 }
-               m && /^```$/ { c = 0 }
-               m && c { print }
-               m && /^```sh$/ { c = 1 }' CLAUDE.md > "$RUNNER_TEMP/host-setup.sh"
-          TARGET_DIR="$GITHUB_WORKSPACE/target" RUN_USER="$USER" ENABLE_LINGER=1 sh -eu "$RUNNER_TEMP/host-setup.sh"
-      - name: diag_54
-        run: |
-          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
-            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_DIAG_54=1 BONELI_SYS_DIAG_54_ROUND=sandbox \
-            cargo test -p boneli-sys --test boneli_sys_tests -- --ignored --exact diag_54::buffered_sweep --nocapture
-
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
