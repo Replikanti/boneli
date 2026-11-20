@@ -10,11 +10,11 @@
    "title": "Release workflow and versioning",
    "epic": null,
    "order": 33,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "7e33749a",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T13:12:13+00:00",
+   "updated_at": "2026-11-20T13:28:18+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1098,14 +1098,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-19T01:23:33+00:00",
-   "issue": 19,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "cbec3aa3",
-   "note": null
-  },
-  {
    "at": "2026-11-19T08:24:54+00:00",
    "issue": 19,
    "from": "plan-review",
@@ -1496,6 +1488,14 @@
    "to": "plan-review",
    "by": "47331c5b",
    "note": null
+  },
+  {
+   "at": "2026-11-20T13:28:18+00:00",
+   "issue": 22,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "7e33749a",
+   "note": null
   }
  ],
  "open": [
@@ -1533,7 +1533,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:27:24+00:00",
+ "updated_at": "2026-11-20T13:28:18+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
