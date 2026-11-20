@@ -29,6 +29,9 @@ pub const ACTION_VAR: &str = "BONELI_OCI_PROBE";
 /// The paths a `stat` probe reports, comma-separated.
 pub const PATHS_VAR: &str = "BONELI_OCI_PROBE_PATHS";
 
+/// The file a `wait-stat` probe creates, inside the sandbox, once it runs.
+pub const READY_VAR: &str = "BONELI_OCI_PROBE_READY";
+
 /// The prefix of a probe's output lines.
 pub const PREFIX: &str = "BONELI_PROBE ";
 
@@ -220,19 +223,24 @@ fn exited(pid: i32) -> bool {
     }
 }
 
-/// Runs `program` (a path inside the sandbox) with `args` and exactly
-/// `env` as `ids` on `root`, in a cgroup of its own that is removed
-/// afterwards, and collects its output. The wait is bounded by
-/// [`HANG_BOUND`]: the child is polled through `/proc` until it exits.
-pub fn run(program: &str, args: &[&str], env: &[(&str, &str)], ids: Ids, root: Root) -> Output {
+/// A program running in a sandbox, started by [`start`].
+pub struct Running {
+    program: String,
+    child: boneli_sys::Child,
+    cgroup: Cgroup,
+    stdin: Option<std::io::PipeWriter>,
+    out: std::thread::JoinHandle<String>,
+    err: std::thread::JoinHandle<String>,
+}
+
+/// Starts `program` (a path inside the sandbox) with `args` and exactly
+/// `env` as `ids` on `root`, in a cgroup of its own, with its stdin a pipe
+/// the caller closes through [`Running::finish`].
+pub fn start(program: &str, args: &[&str], env: &[(&str, &str)], ids: Ids, root: Root) -> Running {
     let cg = cgroup("run");
     let (out_r, out_w) = std::io::pipe().expect("pipe");
     let (err_r, err_w) = std::io::pipe().expect("pipe");
-    let null = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .expect("/dev/null");
+    let (in_r, in_w) = std::io::pipe().expect("pipe");
     let spec = Spec {
         program: PathBuf::from(program),
         args: args.iter().map(OsString::from).collect(),
@@ -241,7 +249,7 @@ pub fn run(program: &str, args: &[&str], env: &[(&str, &str)], ids: Ids, root: R
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect(),
         stdio: Stdio {
-            stdin: OwnedFd::from(null),
+            stdin: OwnedFd::from(in_r),
             stdout: OwnedFd::from(out_w),
             stderr: OwnedFd::from(err_w),
         },
@@ -250,44 +258,60 @@ pub fn run(program: &str, args: &[&str], env: &[(&str, &str)], ids: Ids, root: R
         root,
         cgroup: &cg,
     };
-    let mut child = spawn(&spec).unwrap_or_else(|e| panic!("spawn {program}: {e}"));
-    // The spec holds the write ends; dropping it leaves the child as the
+    let child = spawn(&spec).unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+    // The spec holds the child's ends; dropping it leaves the child as the
     // only writer, so the reads end when it exits.
     drop(spec);
-    let err_reader = std::thread::spawn(move || read_all(OwnedFd::from(err_r)));
-    let out_reader = std::thread::spawn(move || read_all(OwnedFd::from(out_r)));
-    let deadline = Instant::now() + HANG_BOUND;
-    while !exited(child.pid()) {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{program} still running after {HANG_BOUND:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let status = child.wait().expect("wait for the child");
-    let stdout = out_reader.join().expect("stdout reader");
-    let stderr = err_reader.join().expect("stderr reader");
-    cg.destroy().expect("destroy the run's cgroup");
-    Output {
-        status,
-        stdout,
-        stderr,
+    let err = std::thread::spawn(move || read_all(OwnedFd::from(err_r)));
+    let out = std::thread::spawn(move || read_all(OwnedFd::from(out_r)));
+    Running {
+        program: program.to_owned(),
+        child,
+        cgroup: cg,
+        stdin: Some(in_w),
+        out,
+        err,
     }
 }
 
-/// Runs this test binary inside the sandbox as a probe for `action`, with
-/// `env` added, and returns its `BONELI_PROBE key=value` lines.
-pub fn probe(action: &str, env: &[(&str, &str)], ids: Ids, root: Root) -> BTreeMap<String, String> {
-    let mut full = vec![(ACTION_VAR, action)];
-    full.extend_from_slice(env);
-    let out = run(
-        PROBE,
-        &["--exact", "probe", "--nocapture", "--quiet"],
-        &full,
-        ids,
-        root,
-    );
+impl Running {
+    /// Closes the program's stdin, waits for it to exit, bounded by
+    /// [`HANG_BOUND`] (the child is polled through `/proc`), removes its
+    /// cgroup and returns its output.
+    pub fn finish(mut self) -> Output {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + HANG_BOUND;
+        while !exited(self.child.pid()) {
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("{} still running after {HANG_BOUND:?}", self.program);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = self.child.wait().expect("wait for the child");
+        let stdout = self.out.join().expect("stdout reader");
+        let stderr = self.err.join().expect("stderr reader");
+        self.cgroup.destroy().expect("destroy the run's cgroup");
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// Runs `program` (a path inside the sandbox) with `args` and exactly
+/// `env` as `ids` on `root`, in a cgroup of its own that is removed
+/// afterwards, and collects its output; its stdin is closed at once. The
+/// wait is bounded by [`HANG_BOUND`].
+pub fn run(program: &str, args: &[&str], env: &[(&str, &str)], ids: Ids, root: Root) -> Output {
+    start(program, args, env, ids, root).finish()
+}
+
+/// The `BONELI_PROBE key=value` lines of a probe's output, which must have
+/// exited 0.
+pub fn probe_values(out: &Output) -> BTreeMap<String, String> {
     assert_eq!(out.status, ExitStatus::Exited(0), "probe failed: {out:?}");
     let mut values = BTreeMap::new();
     for line in out.stdout.lines() {
@@ -302,12 +326,44 @@ pub fn probe(action: &str, env: &[(&str, &str)], ids: Ids, root: Root) -> BTreeM
     values
 }
 
+/// Starts this test binary inside the sandbox as a probe for `action`,
+/// with `env` added; [`Running::finish`] and [`probe_values`] collect it.
+pub fn start_probe(action: &str, env: &[(&str, &str)], ids: Ids, root: Root) -> Running {
+    let mut full = vec![(ACTION_VAR, action)];
+    full.extend_from_slice(env);
+    start(
+        PROBE,
+        &["--exact", "probe", "--nocapture", "--quiet"],
+        &full,
+        ids,
+        root,
+    )
+}
+
+/// Runs this test binary inside the sandbox as a probe for `action`, with
+/// `env` added, and returns its `BONELI_PROBE key=value` lines.
+pub fn probe(action: &str, env: &[(&str, &str)], ids: Ids, root: Root) -> BTreeMap<String, String> {
+    probe_values(&start_probe(action, env, ids, root).finish())
+}
+
 /// The probe side: for `stat`, one line per path of [`PATHS_VAR`] with
 /// what the path is, its mode, inode, link count and, for a file, its
-/// contents. Paths are never followed.
+/// contents. Paths are never followed. `wait-stat` first creates the file
+/// [`READY_VAR`] names and waits until its stdin is closed.
 pub fn probe_main(action: &str) {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    assert_eq!(action, "stat", "unknown probe action {action}");
+    match action {
+        "stat" => {}
+        "wait-stat" => {
+            let ready = std::env::var(READY_VAR).expect("the ready file");
+            std::fs::write(&ready, b"up\n").expect("write the ready file");
+            let mut rest = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut rest)
+                .expect("wait for stdin to close");
+        }
+        _ => panic!("unknown probe action {action}"),
+    }
     let paths = std::env::var(PATHS_VAR).unwrap_or_default();
     for path in paths.split(',').filter(|p| !p.is_empty()) {
         let line = match std::fs::symlink_metadata(path) {

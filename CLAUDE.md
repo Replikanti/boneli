@@ -146,10 +146,12 @@ systemd-run --user --scope -q -p Delegate=yes \
 variable (ADR-009). `host::` mounts a pulled synthetic image in the
 sandbox, and checks a casefold store root (tmpfs `casefold`, Linux 6.13;
 list `tmpfs-casefold` in `BONELI_OCI_HOST_GAPS` where the kernel lacks it),
-a ramfs root through `unshare -Urm`, and a store opened in a PID
-namespace without its own `/proc` through `unshare -Urpfm`. `network::` pulls `node:22` and
-`postgres:17` from Docker Hub and runs them; CI runs it in the weekly
-`oci-acceptance` workflow, not on every PR.
+a ramfs root through `unshare -Urm`, a store opened in a PID
+namespace without its own `/proc` through `unshare -Urpfm`, and that a
+second store's trim with a budget of 1 keeps the layers of a running
+sandbox (`mounted_layers_survive_trim`, ADR-025). `network::` pulls
+`node:22` and `postgres:17` from Docker Hub and runs them; CI runs it in
+the weekly `oci-acceptance` workflow, not on every PR.
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
