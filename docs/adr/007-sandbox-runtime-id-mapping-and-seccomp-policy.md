@@ -1017,13 +1017,41 @@ tmpfs, on fixture text.
   `wchar` under the count (`/proc/<pid>/io` adds a write only when it
   returns); `wbytes` must be above 0, so a limit on a device the bios do
   not pass cannot read as held behind a slow device (review of PR 53; a
-  lower bound only, see below). Only `wbytes` 0 makes it read again, up
-  to 10 s after the spawn; a read that finds the writer out of its write
-  ends the wait with that verdict, so Held means the writer was inside
-  its write after the device counted (review round 2 of PR 53). Then
-  `destroy` must end the writer by SIGKILL within 5 s. A held write needs
-  at least (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice
-  may pass early).
+  lower bound only, see below). Two cases make it read again, up to 10 s
+  after the spawn: `wbytes` 0, and no task seen inside the write with
+  `wchar` under 512 (#54). 512 because an `O_DIRECT` write returns only
+  multiples of the logical block size, at least 512 bytes on every Linux
+  block device, while the probe writes 38 bytes before its write
+  (measured on every CI class and the dev host), so `wchar` under 512
+  means that nothing of the write has returned yet. That is what the
+  read shows, not that the writer is outside the write: the `syscall`
+  file reads `running` for any runnable task, one inside the write
+  included, and a failed write adds nothing to `wchar`. Waiting is right
+  in each case: the next reads find the writer held, gone or still
+  without a count at the deadline. A read that finds the writer gone,
+  its write returned, or no task inside the write after a part of it
+  returned (`wchar` from 512 up to the count) ends the wait with that
+  verdict, so Held means the writer was inside its write after the
+  device counted (review round 2 of PR 53). The report line lists the
+  reads of the wait in order, as runs of one verdict with their count
+  and the time of their first read, and names what ended the wait: a
+  verdict, or the deadline. The entry wait comes from a failure in the
+  QA of PR 58: with the dev host at a load average of about 19, the
+  first read at 2,014 ms found the main thread in `futex` and the writer
+  task `running`, `wchar` 38 and nothing counted, and the single read
+  failed the test as not in the write; it passed 3/3 alone. The deadline
+  covers an entry up to 10,000 − 1,000 (one 1 MiB bio at 1 MiB/s) − 100
+  (one slice) = 8,900 ms after the spawn; a later entry only leaves more
+  queued at the deadline, so the proof of the lift below is unchanged. A
+  writer seen in its write without a count only from after 8,900 ms
+  still fails at the deadline, and the message names the late start
+  instead of a device the bios may not pass (review of PR 76). The
+  fallback does not wait: without `wchar` it cannot tell a writer that
+  has not entered from one that left, so a task in no `D` state stays
+  final; it has decided on no CI class (D5). Then `destroy` must end the
+  writer by SIGKILL within 5 s. A held write needs at least
+  (41,943,040 − 104,858) ÷ 1,048,576 ≈ 39.9 s (one 100 ms slice may pass
+  early).
   **Why a wait, and why 10 s.** The device counts a bio when blk-throttle
   dispatches it, the first one about (its size − 104,858) ÷ 1 MiB/s after
   the writer enters its write plus up to one slice of rounding, so at
