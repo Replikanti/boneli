@@ -103,6 +103,25 @@ D1's table gets one state; the other rows stay as they are:
   a full disk. Both fail closed; the outcome label is coarse until a
   classifying variant exists, which would need its own fault-matrix
   meaning (D4).
+- **Every `JobFailed` detail the application writes is capped** at
+  `MAX_DETAIL_BYTES` = 1 MiB (`boneli_app::cap_detail`). A longer detail
+  keeps its longest prefix that ends on a UTF-8 boundary and fits with
+  the marker ` [truncated, <n> bytes in all]`. Without a cap an outcome
+  the run accepted could fail its append: `git apply` prints a line per
+  patch it refuses, so a 35 MB diff of 40,000 patches to absent paths gave
+  a 9,588,938-byte detail (review of #91), above the 8 MiB line
+  (ADR-012, D3). The run would then end with `Err(Store)` and its log
+  at `FixWritten`. Closed, but an outcome the agent's output controls
+  would go unrecorded, which the verdict bound of D7 rules out for
+  verdicts. Why 1 MiB: JSON escapes a byte into at most 6 (`\u0000`,
+  the ratio ADR-012 D3 derives `MAX_LINE_BYTES` from), so a 1 MiB detail
+  takes at most 6 MiB, and the rest of a `JobFailed` line (the event
+  name, the keys and two `u64` numbers) is under 200 bytes; 2 MiB could
+  need 12 MiB. The cap is in the application, not in each adapter,
+  because every job port's failure, the forge's and git's alike, ends in
+  the same event. `oversized_git_error_is_recorded` writes a 9,588,938-byte
+  error of control characters through the file store and gets a recorded
+  `JobFailed` that replays.
 
 ### D3. Who evaluates
 
@@ -383,9 +402,15 @@ header has the same shape with `"version":2`.
   integration tests carry those cases.
 - Every patch check fetches the base and applies the diff once more,
   after the agent's own work and before the verifier's. The port has no
-  operation to release a checkout, so `GitCli` keeps both checkouts and
-  the fetched object store until the adapter drops. The composition root
-  (#32) decides the adapter's lifetime.
+  operation to release a checkout. `GitCli` has no `Drop` and its root is
+  the caller's (`GitCliConfig::root`), so every store it fetched stays on
+  disk after the adapter is dropped. Within one run that is one extra
+  copy of the base: the run emits `CheckPatch` once, and the applied tree
+  only adds the fix's objects to the same store. Across runs the disk use
+  grows with runs × base size, and the caller owns the cleanup: the
+  composition root (#32) must give each run its own `GitCli` root and
+  remove it after the run. A `Drop` that deletes the root is ruled out,
+  because the root is a path the caller chose.
 - The `JobFailed` label of a diff that does not apply is coarse (D2).
 - Log format version 2 strands no stored log: none exists outside tests,
   and a version 1 log past the fix fails closed.

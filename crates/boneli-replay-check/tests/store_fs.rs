@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use boneli_app::{
-    Clock, DebugRequest, DebugTicket, DebugTicketError, EventStore, Evidence, replay,
+    BranchName, CheckoutId, Clock, CommitInfo, DebugRequest, DebugTicket, DebugTicketError,
+    EventStore, Evidence, Git, GitError, MAX_DETAIL_BYTES, RelativePath, RepoUrl, replay,
 };
-use boneli_domain::{EvidenceRef, RunId};
+use boneli_domain::{
+    CommitSha, EventKind, EvidenceRef, Outcome, Patch, RunEvent, RunId, Stage, UnreadablePath,
+};
 use boneli_memory::{
     AgentRequest, ForgeRequest, MemoryAgent, MemoryEvidence, MemoryForge, MemoryGit,
     MemoryVerifier, SequentialIds, StepClock, VerifierRequest,
@@ -283,4 +286,103 @@ fn forge_gets_verified_bytes_on_fs_store() {
     assert_eq!(opened.test.content, verified.1);
     assert_eq!(store.get(&opened.diff.reference), Ok(verified.0));
     assert!(opened.diff.reference.as_str().starts_with("sha256:"));
+}
+
+/// `MemoryGit`, except that `apply` fails with a detail larger than a log
+/// line, as `GitCli` does for a diff of many patches that do not apply:
+/// one stderr line per patch. Control characters escape to 6 bytes each
+/// in JSON, the worst case of the cap's derivation (ADR-023, D2).
+struct OversizedApply(MemoryGit);
+
+/// The size the review measured for a 35 MB diff that does not apply.
+const OVERSIZED: usize = 9_588_938;
+
+impl Git for OversizedApply {
+    fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
+        self.0.fetch_base(repo, base)
+    }
+    fn read(
+        &self,
+        checkout: &CheckoutId,
+        path: &RelativePath,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        self.0.read(checkout, path)
+    }
+    fn snapshot(&self, checkout: &CheckoutId) -> Result<Vec<u8>, GitError> {
+        self.0.snapshot(checkout)
+    }
+    fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
+        self.0.diff(checkout, workspace)
+    }
+    fn apply(&self, _checkout: &CheckoutId, _diff: &[u8]) -> Result<CheckoutId, GitError> {
+        Err(GitError::Failed {
+            detail: "\u{1}".repeat(OVERSIZED),
+        })
+    }
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError> {
+        self.0.patch_between(base, after)
+    }
+    fn push(
+        &self,
+        checkout: &CheckoutId,
+        branch: &BranchName,
+        commit: &CommitInfo,
+    ) -> Result<CommitSha, GitError> {
+        self.0.push(checkout, branch, commit)
+    }
+}
+
+/// A git error over the log-line limit still ends the run with a recorded
+/// `JobFailed` (ADR-023, D2): the detail is capped, the append succeeds on
+/// the file store, and the stored log replays to the reported run.
+#[test]
+fn oversized_git_error_is_recorded() {
+    let scenario = hand_written()
+        .into_iter()
+        .find(|s| s.name == "delivered")
+        .expect("the scenario");
+    let tmp = TempDir::new("oversized-detail");
+    let jobs = Jobs::of(&scenario);
+    let git = OversizedApply(MemoryGit::new(git_commits()));
+    let store = FsStore::open(&tmp.0.join("store")).expect("open");
+    let report = DebugTicket {
+        agent: &jobs.agent,
+        verifier: &jobs.verifier,
+        forge: &jobs.forge,
+        git: &git,
+        events: &store,
+        evidence: &store,
+        clock: jobs.clock.as_ref(),
+        ids: &jobs.ids,
+    }
+    .run(scenario.requests[0].clone())
+    .expect("the run ends with a recorded outcome");
+    let Stage::Done(Outcome::JobFailed { awaiting, detail }) = report.run.stage() else {
+        panic!("a failed job expected: {:?}", report.run.stage());
+    };
+    assert_eq!(awaiting, EventKind::PatchChecked);
+    assert!(detail.len() <= MAX_DETAIL_BYTES, "{}", detail.len());
+    assert!(detail.starts_with("applying the diff failed: git failed: \u{1}"));
+    let total = "applying the diff failed: git failed: ".len() + OVERSIZED;
+    assert!(
+        detail.ends_with(&format!(" [truncated, {total} bytes in all]")),
+        "{}",
+        &detail[detail.len() - 60..]
+    );
+    let log = store.load(report.run.id()).expect("load");
+    assert!(matches!(
+        log.events.last(),
+        Some(RunEvent::JobFailed { detail: logged, .. }) if *logged == detail
+    ));
+    let (run, _) = replay(report.run.id(), &log).expect("replays");
+    assert_eq!(run, report.run);
+    assert_eq!(
+        jobs.verifier.requests().len(),
+        2,
+        "the fix is never verified"
+    );
 }

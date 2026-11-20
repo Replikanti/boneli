@@ -16,7 +16,8 @@
 //!
 //! A failure inside a job (the agent, the verifier, the forge, git, or
 //! loading or storing evidence) ends the run with a recorded `JobFailed`
-//! outcome. A
+//! outcome, its detail capped at [`MAX_DETAIL_BYTES`](crate::MAX_DETAIL_BYTES)
+//! so the event fits a log line (ADR-023, D2). A
 //! failure of the event store itself returns [`DebugTicketError::Store`] at
 //! once, and the log stays the prefix of accepted events.
 
@@ -41,7 +42,7 @@ use crate::evidence::Evidence;
 use crate::forge::{Attached, Forge, PullRequest};
 use crate::git::{Git, GitError, RepoUrl};
 use crate::ids::Ids;
-use crate::job::JobFailure;
+use crate::job::{JobFailure, cap_detail};
 use crate::store::{EventStore, RunStart, StoreError, replay};
 use crate::verifier::Verifier;
 
@@ -225,10 +226,11 @@ struct Input {
     patch_limits: PatchLimits,
 }
 
-/// A forge failure carries no usage (ADR-002, D3).
+/// A forge failure carries no usage (ADR-002, D3). Its detail is capped
+/// like every `JobFailed` detail ([`cap_detail`]).
 fn forge_failed(detail: String) -> RunEvent {
     RunEvent::JobFailed {
-        detail,
+        detail: cap_detail(detail),
         usage: Usage::default(),
     }
 }
@@ -584,7 +586,10 @@ impl DebugTicket<'_> {
         };
         match result {
             Ok(produced) => produced.into_event(usage),
-            Err(detail) => RunEvent::JobFailed { detail, usage },
+            Err(detail) => RunEvent::JobFailed {
+                detail: cap_detail(detail),
+                usage,
+            },
         }
     }
 

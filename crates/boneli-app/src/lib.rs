@@ -54,7 +54,7 @@ pub use forge::{Attached, Forge, ForgeRef, PullRequest};
 pub use git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
 pub use ids::Ids;
 pub use image::{ImageError, ImageRef, ImageStore, RootfsRef};
-pub use job::JobFailure;
+pub use job::{JobFailure, MAX_DETAIL_BYTES, cap_detail};
 pub use path::{RelativePath, TreePath, TreePathProblem, Uncitable};
 pub use sandbox::{
     Command, ExecResult, ExitStatus, Limits, Phase, Sandbox, SandboxError, SandboxId, SandboxSpec,

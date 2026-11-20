@@ -625,7 +625,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `VerifyFix` only on a `Pass`: a refusal ends it as
   `GateFailed(PatchRefused(violations))`, an empty refusal included, a
   path that is not UTF-8 as `GateFailed(PatchUnreadable)`, and a diff
-  that does not apply as `JobFailed` awaiting `PatchChecked`.
+  that does not apply as `JobFailed` awaiting `PatchChecked`. Every
+  `JobFailed` detail `DebugTicket` writes is capped at
+  `MAX_DETAIL_BYTES` (1 MiB, `cap_detail`), so it always fits a log line.
   `DebugTicket` gets the `Git` port; `DebugRequest` gets `repo` and
   `patch_limits`. Domain corpus 70 scenarios, app corpus 2,978
   (40 hand-written), git calls in the fault matrix.

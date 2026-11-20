@@ -15,6 +15,36 @@ use boneli_domain::values::is_blank;
 /// The detail of a failure that left neither error output nor a status.
 pub const NO_OUTPUT_NO_STATUS: &str = "the job failed with no error output and no status";
 
+/// The longest `JobFailed` detail `DebugTicket` records, in bytes: 1 MiB
+/// (ADR-023, D2). A stored line is at most 8 MiB (ADR-012, D3), and JSON
+/// escapes a byte into at most 6 (`\u0000`), so a 1 MiB detail takes at
+/// most 6 MiB and leaves 2 MiB for the rest of the line, which is under
+/// 200 bytes. 2 MiB would need up to 12 MiB. Details come from adapters
+/// that echo their input (a git error lists every patch of a diff that
+/// does not apply), so without a cap an outcome the run accepted could
+/// fail its append and go unrecorded.
+pub const MAX_DETAIL_BYTES: usize = 1_048_576;
+
+/// `detail` cut to at most [`MAX_DETAIL_BYTES`]: a longer one keeps its
+/// longest prefix that ends on a UTF-8 character boundary and fits with a
+/// marker that gives the original length,
+/// ` [truncated, <n> bytes in all]`. A detail within the cap is returned
+/// as it is. The marker is not blank, so a cut detail never is either.
+pub fn cap_detail(detail: String) -> String {
+    if detail.len() <= MAX_DETAIL_BYTES {
+        return detail;
+    }
+    let marker = format!(" [truncated, {} bytes in all]", detail.len());
+    let mut keep = MAX_DETAIL_BYTES.saturating_sub(marker.len());
+    while !detail.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut capped = detail;
+    capped.truncate(keep);
+    capped.push_str(&marker);
+    capped
+}
+
 /// Why a job failed, and what it cost before it failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobFailure {
@@ -109,6 +139,34 @@ mod tests {
                 assert!(!is_blank(failure.detail()), "{output:?} {status:?}");
             }
         }
+    }
+
+    #[test]
+    fn cap_detail_bounds_and_marks() {
+        let at = "x".repeat(MAX_DETAIL_BYTES);
+        assert_eq!(cap_detail(at.clone()), at);
+        assert_eq!(cap_detail(String::from("boom")), "boom");
+        let over = "x".repeat(MAX_DETAIL_BYTES + 1);
+        let capped = cap_detail(over);
+        assert!(capped.len() <= MAX_DETAIL_BYTES, "{}", capped.len());
+        assert!(capped.ends_with(" [truncated, 1048577 bytes in all]"));
+        assert!(capped.starts_with("xxx"));
+        // A 4-byte character across the cut is dropped whole: the cut at
+        // `MAX_DETAIL_BYTES - 34` falls one byte into it.
+        let marker = " [truncated, 1048582 bytes in all]";
+        assert_eq!(marker.len(), 34);
+        let mut wide = "x".repeat(MAX_DETAIL_BYTES - marker.len() - 1);
+        wide.push('\u{1F600}');
+        wide.push_str(&"y".repeat(37));
+        assert_eq!(wide.len(), MAX_DETAIL_BYTES + 6);
+        let capped = cap_detail(wide);
+        assert!(capped.len() <= MAX_DETAIL_BYTES);
+        assert!(!capped.contains('\u{1F600}'));
+        assert_eq!(capped.len(), MAX_DETAIL_BYTES - 1);
+        assert!(capped.ends_with(marker));
+        // Blank content is still not blank after the cut.
+        let blank = "\u{200B}".repeat(MAX_DETAIL_BYTES);
+        assert!(!is_blank(&cap_detail(blank)));
     }
 
     #[test]
