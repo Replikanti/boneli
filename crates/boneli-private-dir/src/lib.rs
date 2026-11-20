@@ -1,5 +1,5 @@
 //! Boneli support crate: the store-root rules that file-backed adapters
-//! share (ADR-021).
+//! share (ADR-021), and the root of the git adapter (ADR-024).
 //!
 //! A store root is a private directory under ancestors that no one else can
 //! rename: [`prepare_root`] checks a root, creates it `0o700` where it is
@@ -8,12 +8,17 @@
 //! ADR-012 D1 (`boneli-store-fs`), which held one copy each until #66. A
 //! consumer adds its own rules on the root's text through the `text_rule`
 //! argument; the overlay separators of `boneli-oci` stay there.
+//!
+//! [`create_new_root`] applies the same rules to a root that must not
+//! exist yet, the git adapter's (ADR-024): it is made by one non-recursive
+//! `mkdir` under its resolved, checked parent, and one that exists is an
+//! error.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Why a root was refused.
@@ -227,6 +232,59 @@ pub fn prepare_root(
         check_ancestors(parent, uid)?;
     }
     Ok(resolved)
+}
+
+/// Checks `root` and creates it, `0o700` whatever the umask, where it must
+/// not exist yet; returns it as created (ADR-024, D2):
+///
+/// - `root` must be absolute, without a `.` or `..` component, and pass
+///   `text_rule`;
+/// - its parent must exist; it is resolved, and it and each of its
+///   ancestors must pass the ancestor check of [`prepare_root`];
+/// - the root is the resolved parent joined with the root's name, which
+///   must pass `text_rule` too, and is made there by one non-recursive
+///   `mkdir`, so a root that exists in any form (a directory, a file, a
+///   symlink, a dangling one) is an [`Error::Io`] of kind
+///   [`io::ErrorKind::AlreadyExists`], and of two callers racing on one
+///   root exactly one succeeds. `/` has no parent and is that error too.
+///
+/// `text_rule` returns the reason it refuses a path; it sees the root as
+/// given, then as it will be created.
+pub fn create_new_root(
+    root: &Path,
+    text_rule: &dyn Fn(&Path) -> Result<(), &'static str>,
+) -> Result<PathBuf, Error> {
+    if !root.is_absolute() {
+        return Err(rule(root, "must be an absolute path"));
+    }
+    // The parent is resolved, and `..` would make the root's name refer to
+    // a directory other than the one checked.
+    if has_dot_component(root) {
+        return Err(rule(root, "must not have a `.` or `..` component"));
+    }
+    text_rule(root).map_err(|reason| rule(root, reason))?;
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        // Only `/` (and `//`) is left without either: it exists.
+        let fs_root = Path::new("/");
+        return Err(io_err(fs_root, io::ErrorKind::AlreadyExists.into()));
+    };
+    let uid = own_uid(root)?;
+    // Not created: the parent is the operator's configuration (ADR-024, D2).
+    let parent = parent.canonicalize().map_err(|e| io_err(parent, e))?;
+    check_ancestors(&parent, uid)?;
+    // Created where the check looked, not through `root` again: an
+    // ancestor link re-pointed since cannot redirect it (ADR-021, D3).
+    let prospective = parent.join(name);
+    text_rule(&prospective).map_err(|reason| rule(&prospective, reason))?;
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&prospective)
+        .map_err(|e| io_err(&prospective, e))?;
+    // The umask may have cleared bits of `0o700`; ADR-010 D7 states the
+    // mode, not the mode under some umask.
+    fs::set_permissions(&prospective, fs::Permissions::from_mode(0o700))
+        .map_err(|e| io_err(&prospective, e))?;
+    Ok(prospective)
 }
 
 #[cfg(test)]

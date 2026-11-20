@@ -63,8 +63,11 @@ use crate::workspace::{Kind, Workspace};
 pub struct GitCliConfig {
     /// The git binary, an absolute path; `PATH` is never searched.
     pub git: PathBuf,
-    /// The adapter's own directory, an absolute path. It must not exist;
-    /// `open` creates it with mode 0700.
+    /// The adapter's own directory, an absolute path without a `.` or `..`
+    /// component. It must not exist; its parent must, and the parent and
+    /// each of its ancestors must be a directory owned by root or the
+    /// runner and not writable by its group or others unless it is sticky.
+    /// `open` creates it with mode 0700 under the resolved parent (ADR-024).
     pub root: PathBuf,
     /// The URL forms `fetch_base` accepts.
     pub transports: Transports,
@@ -106,9 +109,18 @@ pub enum OpenError {
     GitNotAbsolute,
     /// The root is relative.
     RootNotAbsolute,
+    /// The root, or one of its ancestors at `path`, breaks a rule of
+    /// ADR-024.
+    Root {
+        /// The path that breaks it: the root as given or as it would be
+        /// created, or an ancestor.
+        path: PathBuf,
+        /// The rule.
+        reason: &'static str,
+    },
     /// The root already exists.
     RootExists,
-    /// The root could not be created.
+    /// The root could not be created; the error names the path.
     Io(std::io::Error),
     /// `git version` failed; the detail is its error.
     Git(String),
@@ -125,6 +137,9 @@ impl fmt::Display for OpenError {
         match self {
             OpenError::GitNotAbsolute => f.write_str("the git binary must be an absolute path"),
             OpenError::RootNotAbsolute => f.write_str("the adapter root must be an absolute path"),
+            OpenError::Root { path, reason } => {
+                write!(f, "adapter root {}: {reason}", path.display())
+            }
             OpenError::RootExists => f.write_str("the adapter root already exists"),
             OpenError::Io(e) => write!(f, "cannot create the adapter root: {e}"),
             OpenError::Git(detail) => write!(f, "git version failed: {detail}"),
@@ -201,6 +216,23 @@ impl Drop for Removed {
 fn private_dir(path: &Path) -> std::io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+/// Maps a refusal of `create_new_root` into `OpenError` (ADR-024, D3): an
+/// error of the support crate never reaches the adapter's public API.
+fn root_error(e: boneli_private_dir::Error) -> OpenError {
+    match e {
+        boneli_private_dir::Error::Rule { path, reason } => OpenError::Root { path, reason },
+        boneli_private_dir::Error::Io { source, .. }
+            if source.kind() == ErrorKind::AlreadyExists =>
+        {
+            OpenError::RootExists
+        }
+        boneli_private_dir::Error::Io { path, source } => OpenError::Io(std::io::Error::new(
+            source.kind(),
+            format!("{}: {source}", path.display()),
+        )),
+    }
 }
 
 fn failed(detail: impl Into<String>) -> GitError {
@@ -484,7 +516,9 @@ fn snapshot_config(sha256: bool) -> String {
 }
 
 impl GitCli {
-    /// Creates the root and checks the git version (ADR-010, D7).
+    /// Creates the root and checks the git version (ADR-010, D7). The root
+    /// is checked and created by the rules of ADR-024 before git runs, and
+    /// every later call uses it as created, under the resolved parent.
     pub fn open(config: GitCliConfig) -> Result<GitCli, OpenError> {
         if !config.git.is_absolute() {
             return Err(OpenError::GitNotAbsolute);
@@ -495,12 +529,10 @@ impl GitCli {
         if !config.root.is_absolute() {
             return Err(OpenError::RootNotAbsolute);
         }
-        let root = config.root;
-        match private_dir(&root) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(OpenError::RootExists),
-            Err(e) => return Err(OpenError::Io(e)),
-        }
+        // No text rule: a root may hold `:` and `#`, which the adapter
+        // quotes where git would read them as separators (ADR-010, D4).
+        let root = boneli_private_dir::create_new_root(&config.root, &|_: &Path| Ok(()))
+            .map_err(root_error)?;
         // Created here, so removed here if `open` fails.
         let mut guard = Removed::new(root.clone());
         let home = root.join("home");
@@ -537,7 +569,8 @@ impl GitCli {
         })
     }
 
-    /// The adapter's root.
+    /// The adapter's root, as created: under the resolved parent of the
+    /// configured one (ADR-024).
     pub fn root(&self) -> &Path {
         &self.root
     }

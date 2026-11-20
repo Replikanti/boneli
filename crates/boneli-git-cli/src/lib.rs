@@ -21,7 +21,9 @@
 //!   gets a cleared, fixed environment and command-scope config and names
 //!   its repository explicitly, so nothing in a workspace or in the host's
 //!   environment steers it; [`Transports`] limits the URLs `fetch_base`
-//!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`].
+//!   takes; [`GitCli::open`] refuses a git older than [`MIN_GIT_VERSION`]
+//!   and creates its root under a resolved parent whose ancestors no one
+//!   else can rename, by the rules of `boneli-private-dir` (ADR-024).
 //! - [`patch_between`] describes the change between two workspaces as the
 //!   patch policy's input (ADR-013, D1), or a
 //!   `boneli_domain::UnreadablePath` when a path it would carry is not
