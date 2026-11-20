@@ -1160,13 +1160,13 @@
    "title": "boneli-https: bound name resolution by the request deadline",
    "epic": null,
    "order": 44,
-   "state": "pr-review",
-   "owner": "f7d29cb8",
-   "user": "ylohnitram",
-   "machine": "df82df",
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
    "pr": 88,
    "note": "PR 1 #87 merged (resolver); PR 2 wiring next",
-   "updated_at": "2026-11-20T19:12:09+00:00",
+   "updated_at": "2026-11-20T22:10:44+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1177,8 +1177,8 @@
     "core"
    ],
    "manual": false,
-   "session": true,
-   "dispatched": true,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1288,7 +1288,7 @@
    "title": "boneli-https: std lookup scan misses turbofish, qualified-path and alias forms",
    "epic": null,
    "order": 49,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1297,7 +1297,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T22:04:16+00:00",
+   "updated_at": "2026-11-20T22:10:46+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1311,22 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:12:58+00:00",
-   "issue": 66,
-   "from": "ready",
-   "to": "claimed",
-   "by": "373fe023",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-20T15:27:28+00:00",
-   "issue": 66,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "373fe023",
-   "note": null
-  },
   {
    "at": "2026-11-20T15:55:17+00:00",
    "issue": 54,
@@ -1710,6 +1694,22 @@
    "to": "plan-review",
    "by": "3ebab419",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:10:44+00:00",
+   "issue": 81,
+   "from": "pr-review",
+   "to": "done",
+   "by": "f7d29cb8",
+   "note": null
+  },
+  {
+   "at": "2026-11-20T22:10:46+00:00",
+   "issue": 93,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -1739,12 +1739,11 @@
   57,
   69,
   80,
-  81,
   93,
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:08:20+00:00",
+ "updated_at": "2026-11-20T22:10:46+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
