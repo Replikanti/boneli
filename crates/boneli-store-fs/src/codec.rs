@@ -1,11 +1,23 @@
-//! The run log format, version 1 (ADR-012, D3): one JSON object per line,
-//! encoded and decoded by hand over `boneli_json::Value` (ADR-008).
+//! The run log format, version 2 (ADR-012, D3; ADR-023, D7): one JSON
+//! object per line, encoded and decoded by hand over `boneli_json::Value`
+//! (ADR-008).
 //!
 //! Line 1 is the header,
-//! `{"format":"boneli-run-log","version":1,"run":s,"budget":{"cost_micro_usd":n,"duration_ms":n},"previous":null|s}`;
+//! `{"format":"boneli-run-log","version":2,"run":s,"budget":{"cost_micro_usd":n,"duration_ms":n},"previous":null|s}`;
 //! every further line is one event, `{"event":"<RunEvent variant>", ...}`
 //! with the variant's fields in declaration order and named as in
-//! `boneli_domain`. Enums are their variant names, numbers `u64` lexemes.
+//! `boneli_domain`. Enums without data are their variant names, numbers
+//! `u64` lexemes. Enums with data (the patch check, its verdict, its
+//! violations and their payloads) are objects, `{"kind":"<variant>", ...}`
+//! with the variant's fields in declaration order; a payload that is an
+//! enum without data is named for its type (`problem`, `class`, `marker`).
+//!
+//! Version 2 added `PatchChecked` between `FixWritten` and `FixVerified`.
+//! Version 1 logs are read with the same decoder, except that a version 1
+//! log holding `FixWritten` or `PatchChecked` is refused: after
+//! `FixWritten` the run table of version 2 expects another event, so such a
+//! log would replay to another run ([`admits`]). New logs are written as
+//! version 2 only.
 //!
 //! Decoding is strict and fails closed: a wrong type, a missing or unknown
 //! key, an unknown variant, a number that is not a `u64` (or a `u32` for a
@@ -19,9 +31,13 @@
 use std::fmt;
 
 use boneli_app::RunStart;
+use std::num::NonZeroU32;
+
 use boneli_domain::{
-    Budget, CheckStatus, Citation, CitationStatus, CommitSha, EventKind, EvidenceRef, FixChecks,
-    RunEvent, RunId, TestStatus, Ticket, TicketSource, TriageVerdict, Usage,
+    Budget, ChangeProblem, CheckStatus, Citation, CitationProblem, CitationStatus, CommitSha,
+    EventKind, EvidenceRef, FixChecks, ForbiddenClass, LinkProblem, Marker, NotText, PatchCheck,
+    PatchLimits, PatchVerdict, PatchViolation, RunEvent, RunId, TestDisabling, TestStatus, Ticket,
+    TicketSource, TriageVerdict, UnreadablePath, Usage,
 };
 use boneli_json::{Limits, Object, Value};
 
@@ -30,9 +46,10 @@ use boneli_json::{Limits, Object, Value};
 /// ratio of 6 bytes per input byte; a longer event fails its append.
 pub const MAX_LINE_BYTES: usize = 8_388_608;
 
-/// The deepest nesting of a line: the schema's own depth, event →
-/// `citations` → citation and event → `verdict` → `questions` (ADR-012, D3).
-pub const MAX_DEPTH: usize = 3;
+/// The deepest nesting of a line: the schema's own depth, event → `check`
+/// → `verdict` → `violations` → violation → `problem` (ADR-023, D7; 3 in
+/// version 1, ADR-012 D3).
+pub const MAX_DEPTH: usize = 6;
 
 /// The most values in one line: 2^16, where the per-value memory term of
 /// ADR-008 D5 (136 B × 65,536 = 8.5 MiB) matches the byte term (ADR-012,
@@ -42,8 +59,39 @@ pub const MAX_VALUES: usize = 65_536;
 /// The `format` of the header.
 const FORMAT: &str = "boneli-run-log";
 
-/// The `version` of the header.
-const VERSION: u64 = 1;
+/// The version of a log's format, from its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Version {
+    /// ADR-012: no `PatchChecked`, `FixVerified` after `FixWritten`.
+    V1,
+    /// ADR-023: `PatchChecked` between `FixWritten` and `FixVerified`.
+    V2,
+}
+
+/// The version new logs are written in.
+pub(crate) const CURRENT: Version = Version::V2;
+
+fn version_number(version: Version) -> u64 {
+    match version {
+        Version::V1 => 1,
+        Version::V2 => 2,
+    }
+}
+
+/// Whether a log of `version` may hold an event of `kind`: a version 1
+/// log may not hold `FixWritten`, because the version 2 table expects
+/// `PatchChecked` after it where version 1 expected `FixVerified`, and it
+/// cannot hold `PatchChecked`, which version 1 did not have. A version 1
+/// log that ends before the fix still replays the same, so a previous-run
+/// lookup (ADR-004, D6) on it works.
+pub(crate) fn admits(version: Version, kind: EventKind) -> Result<(), Malformed> {
+    match (version, kind) {
+        (Version::V1, EventKind::FixWritten | EventKind::PatchChecked) => Err(Malformed::Line(
+            "a version 1 log cannot hold the fix: version 2 checks the patch after it",
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Why a line does not decode. Only static text, so no content of the line
 /// can reach an error detail.
@@ -165,6 +213,84 @@ const CITATION_STATUSES: [CitationStatus; 3] = [
     CitationStatus::Unverifiable,
 ];
 
+const CITATION_PROBLEMS: [CitationProblem; 10] = [
+    CitationProblem::BlankPath,
+    CitationProblem::AbsolutePath,
+    CitationProblem::Backslash,
+    CitationProblem::Nul,
+    CitationProblem::EmptyComponent,
+    CitationProblem::DotComponent,
+    CitationProblem::ParentComponent,
+    CitationProblem::LineZero,
+    CitationProblem::BlankQuote,
+    CitationProblem::NotOnBase,
+];
+const FORBIDDEN_CLASSES: [ForbiddenClass; 6] = [
+    ForbiddenClass::RepositoryMetadata,
+    ForbiddenClass::Ci,
+    ForbiddenClass::ContainerBuild,
+    ForbiddenClass::CodeOwners,
+    ForbiddenClass::GitConfig,
+    ForbiddenClass::Dependencies,
+];
+const NOT_TEXT: [NotText; 3] = [NotText::Nul, NotText::NotUtf8, NotText::BidiControl];
+
+fn citation_problem_name(problem: CitationProblem) -> &'static str {
+    match problem {
+        CitationProblem::BlankPath => "BlankPath",
+        CitationProblem::AbsolutePath => "AbsolutePath",
+        CitationProblem::Backslash => "Backslash",
+        CitationProblem::Nul => "Nul",
+        CitationProblem::EmptyComponent => "EmptyComponent",
+        CitationProblem::DotComponent => "DotComponent",
+        CitationProblem::ParentComponent => "ParentComponent",
+        CitationProblem::LineZero => "LineZero",
+        CitationProblem::BlankQuote => "BlankQuote",
+        CitationProblem::NotOnBase => "NotOnBase",
+    }
+}
+
+fn forbidden_class_name(class: ForbiddenClass) -> &'static str {
+    match class {
+        ForbiddenClass::RepositoryMetadata => "RepositoryMetadata",
+        ForbiddenClass::Ci => "Ci",
+        ForbiddenClass::ContainerBuild => "ContainerBuild",
+        ForbiddenClass::CodeOwners => "CodeOwners",
+        ForbiddenClass::GitConfig => "GitConfig",
+        ForbiddenClass::Dependencies => "Dependencies",
+    }
+}
+
+fn not_text_name(reason: NotText) -> &'static str {
+    match reason {
+        NotText::Nul => "Nul",
+        NotText::NotUtf8 => "NotUtf8",
+        NotText::BidiControl => "BidiControl",
+    }
+}
+
+fn marker_name(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Skip => "Skip",
+        Marker::Only => "Only",
+        Marker::Todo => "Todo",
+        Marker::Fixme => "Fixme",
+        Marker::SkipIf => "SkipIf",
+        Marker::RunIf => "RunIf",
+        Marker::Fails => "Fails",
+        Marker::Failing => "Failing",
+        Marker::Fail => "Fail",
+        Marker::Xit => "Xit",
+        Marker::Xtest => "Xtest",
+        Marker::Xdescribe => "Xdescribe",
+        Marker::Xcontext => "Xcontext",
+        Marker::Xspecify => "Xspecify",
+        Marker::Fit => "Fit",
+        Marker::Fdescribe => "Fdescribe",
+        Marker::Fcontext => "Fcontext",
+    }
+}
+
 /// The event's variant name, the value of its `event` key.
 fn kind_name(kind: EventKind) -> &'static str {
     match kind {
@@ -176,6 +302,7 @@ fn kind_name(kind: EventKind) -> &'static str {
         EventKind::RootCauseProposed => "RootCauseProposed",
         EventKind::CitationsChecked => "CitationsChecked",
         EventKind::FixWritten => "FixWritten",
+        EventKind::PatchChecked => "PatchChecked",
         EventKind::FixVerified => "FixVerified",
         EventKind::PullRequestOpened => "PullRequestOpened",
         EventKind::JobFailed => "JobFailed",
@@ -186,11 +313,169 @@ fn strings(items: &[String]) -> Value {
     Value::Array(items.iter().map(|s| Value::from(s.as_str())).collect())
 }
 
-/// The header of a run's log.
-pub(crate) fn encode_header(id: &RunId, start: &RunStart) -> Value {
+/// `{"kind":<name>}`, plus one payload member when the variant has one.
+fn kind_object(name: &'static str, payload: Option<(&'static str, &'static str)>) -> Value {
+    let mut o = Object::with_capacity(2);
+    o.insert("kind", name);
+    if let Some((key, value)) = payload {
+        o.insert(key, value);
+    }
+    Value::Object(o)
+}
+
+fn change_problem_value(problem: ChangeProblem) -> Value {
+    match problem {
+        ChangeProblem::OutOfOrder => kind_object("OutOfOrder", None),
+        ChangeProblem::Path(p) => kind_object("Path", Some(("problem", citation_problem_name(p)))),
+        ChangeProblem::NoChange => kind_object("NoChange", None),
+        ChangeProblem::EmptyLinkTarget => kind_object("EmptyLinkTarget", None),
+        ChangeProblem::NulInLinkTarget => kind_object("NulInLinkTarget", None),
+        ChangeProblem::BaseLinkMismatch => kind_object("BaseLinkMismatch", None),
+    }
+}
+
+fn link_problem_value(problem: LinkProblem) -> Value {
+    let class = |c| Some(("class", forbidden_class_name(c)));
+    match problem {
+        LinkProblem::NotUtf8 => kind_object("NotUtf8", None),
+        LinkProblem::TooLong => kind_object("TooLong", None),
+        LinkProblem::Absolute => kind_object("Absolute", None),
+        LinkProblem::WindowsForm => kind_object("WindowsForm", None),
+        LinkProblem::Escapes => kind_object("Escapes", None),
+        LinkProblem::ThroughLink => kind_object("ThroughLink", None),
+        LinkProblem::Into(c) => kind_object("Into", class(c)),
+        LinkProblem::Encloses(c) => kind_object("Encloses", class(c)),
+    }
+}
+
+fn test_disabling_value(reason: TestDisabling) -> Value {
+    match reason {
+        TestDisabling::Marker(m) => kind_object("Marker", Some(("marker", marker_name(m)))),
+        TestDisabling::DeletedTestFile => kind_object("DeletedTestFile", None),
+        TestDisabling::TestsRemoved => kind_object("TestsRemoved", None),
+        TestDisabling::TestConfigChanged => kind_object("TestConfigChanged", None),
+    }
+}
+
+/// A `usize` as its `u64` lexeme; every supported target has a `usize` of
+/// at most 64 bits, so `u64::MAX` is never written.
+fn index_value(index: usize) -> u64 {
+    u64::try_from(index).unwrap_or(u64::MAX)
+}
+
+/// One violation. The match is exhaustive, so a new variant does not
+/// compile until it has an encoding.
+fn violation_value(violation: &PatchViolation) -> Value {
+    let mut o = Object::with_capacity(3);
+    match violation {
+        PatchViolation::TooManyFiles { files, limit } => {
+            o.insert("kind", "TooManyFiles");
+            o.insert("files", index_value(*files));
+            o.insert("limit", u64::from(*limit));
+        }
+        PatchViolation::Empty => {
+            o.insert("kind", "Empty");
+        }
+        PatchViolation::Malformed { index, problem } => {
+            o.insert("kind", "Malformed");
+            o.insert("index", index_value(*index));
+            o.insert("problem", change_problem_value(*problem));
+        }
+        PatchViolation::BaseLinkMalformed { index, problem } => {
+            o.insert("kind", "BaseLinkMalformed");
+            o.insert("index", index_value(*index));
+            o.insert("problem", change_problem_value(*problem));
+        }
+        PatchViolation::TooManyLines { limit } => {
+            o.insert("kind", "TooManyLines");
+            o.insert("limit", u64::from(*limit));
+        }
+        PatchViolation::TooManyBytes { limit } => {
+            o.insert("kind", "TooManyBytes");
+            o.insert("limit", u64::from(*limit));
+        }
+        PatchViolation::Forbidden { index, class } => {
+            o.insert("kind", "Forbidden");
+            o.insert("index", index_value(*index));
+            o.insert("class", forbidden_class_name(*class));
+        }
+        PatchViolation::Gitlink { index } => {
+            o.insert("kind", "Gitlink");
+            o.insert("index", index_value(*index));
+        }
+        PatchViolation::NotText { index, reason } => {
+            o.insert("kind", "NotText");
+            o.insert("index", index_value(*index));
+            o.insert("reason", not_text_name(*reason));
+        }
+        PatchViolation::Link { index, problem } => {
+            o.insert("kind", "Link");
+            o.insert("index", index_value(*index));
+            o.insert("problem", link_problem_value(*problem));
+        }
+        PatchViolation::DisablesTests { index, reason } => {
+            o.insert("kind", "DisablesTests");
+            o.insert("index", index_value(*index));
+            o.insert("reason", test_disabling_value(*reason));
+        }
+    }
+    Value::Object(o)
+}
+
+fn patch_check_value(check: &PatchCheck) -> Value {
+    let mut o = Object::with_capacity(3);
+    match check {
+        PatchCheck::Judged { limits, verdict } => {
+            o.insert("kind", "Judged");
+            let mut l = Object::with_capacity(3);
+            l.insert(
+                "max_changed_files",
+                u64::from(limits.max_changed_files.get()),
+            );
+            l.insert(
+                "max_changed_lines",
+                u64::from(limits.max_changed_lines.get()),
+            );
+            l.insert(
+                "max_changed_bytes",
+                u64::from(limits.max_changed_bytes.get()),
+            );
+            o.insert("limits", Value::Object(l));
+            let mut v = Object::with_capacity(3);
+            match verdict {
+                PatchVerdict::Pass { files, lines } => {
+                    v.insert("kind", "Pass");
+                    v.insert("files", u64::from(*files));
+                    v.insert("lines", u64::from(*lines));
+                }
+                PatchVerdict::Reject(violations) => {
+                    v.insert("kind", "Reject");
+                    let list = violations.iter().map(violation_value).collect();
+                    v.insert("violations", Value::Array(list));
+                }
+            }
+            o.insert("verdict", Value::Object(v));
+        }
+        PatchCheck::Unreadable(path) => {
+            o.insert("kind", "Unreadable");
+            let mut p = Object::with_capacity(2);
+            let (kind, index) = match path {
+                UnreadablePath::Change { index } => ("Change", index),
+                UnreadablePath::BaseLink { index } => ("BaseLink", index),
+            };
+            p.insert("kind", kind);
+            p.insert("index", index_value(*index));
+            o.insert("path", Value::Object(p));
+        }
+    }
+    Value::Object(o)
+}
+
+/// The header of a run's log, in `version`.
+pub(crate) fn encode_header(id: &RunId, start: &RunStart, version: Version) -> Value {
     let mut o = Object::with_capacity(5);
     o.insert("format", FORMAT);
-    o.insert("version", VERSION);
+    o.insert("version", version_number(version));
     o.insert("run", id.as_str());
     o.insert("budget", budget_value(&start.budget));
     o.insert(
@@ -273,6 +558,10 @@ pub(crate) fn encode_event(event: &RunEvent) -> Value {
         }
         RunEvent::FixWritten { diff, usage } => {
             o.insert("diff", diff.as_str());
+            o.insert("usage", usage_value(usage));
+        }
+        RunEvent::PatchChecked { check, usage } => {
+            o.insert("check", patch_check_value(check));
             o.insert("usage", usage_value(usage));
         }
         RunEvent::FixVerified { checks, usage } => {
@@ -397,21 +686,240 @@ fn string_list(o: &Object, key: &'static str) -> Decoded<Vec<String>> {
         .collect()
 }
 
-/// The header: the run id and how the run started.
-pub(crate) fn decode_header(value: &Value) -> Decoded<(RunId, RunStart)> {
+/// The number at `key` as a `usize` (an index or a count).
+fn index(o: &Object, key: &'static str) -> Decoded<usize> {
+    usize::try_from(number(o, key)?).map_err(|_| Malformed::Field(key, "above usize::MAX"))
+}
+
+/// The number at `key` as a `u32`.
+fn number_u32(o: &Object, key: &'static str) -> Decoded<u32> {
+    u32::try_from(number(o, key)?).map_err(|_| Malformed::Field(key, "above u32::MAX"))
+}
+
+/// A patch limit: a `u32` that is not 0, as `PatchLimits` holds it.
+fn limit(o: &Object, key: &'static str) -> Decoded<NonZeroU32> {
+    NonZeroU32::new(number_u32(o, key)?).ok_or(Malformed::Field(key, "zero"))
+}
+
+/// The `kind` of the object at `value`; the caller checks its keys.
+fn kind_of<'a>(value: &'a Value, at: &'static str) -> Decoded<&'a str> {
+    value
+        .as_object()
+        .ok_or(Malformed::Field(at, "not an object"))?
+        .get("kind")
+        .ok_or(Malformed::Missing("kind"))?
+        .as_str()
+        .ok_or(Malformed::Field("kind", "not a string"))
+}
+
+const UNKNOWN_KIND: Malformed = Malformed::Field("kind", "an unknown variant");
+
+fn change_problem(value: &Value, at: &'static str) -> Decoded<ChangeProblem> {
+    let unit = |problem| object(value, at, &["kind"]).map(|_| problem);
+    match kind_of(value, at)? {
+        "OutOfOrder" => unit(ChangeProblem::OutOfOrder),
+        "Path" => {
+            let o = object(value, at, &["kind", "problem"])?;
+            let problem = named(o, "problem", &CITATION_PROBLEMS, citation_problem_name)?;
+            Ok(ChangeProblem::Path(problem))
+        }
+        "NoChange" => unit(ChangeProblem::NoChange),
+        "EmptyLinkTarget" => unit(ChangeProblem::EmptyLinkTarget),
+        "NulInLinkTarget" => unit(ChangeProblem::NulInLinkTarget),
+        "BaseLinkMismatch" => unit(ChangeProblem::BaseLinkMismatch),
+        _ => Err(UNKNOWN_KIND),
+    }
+}
+
+fn link_problem(value: &Value, at: &'static str) -> Decoded<LinkProblem> {
+    let unit = |problem| object(value, at, &["kind"]).map(|_| problem);
+    let class = || {
+        let o = object(value, at, &["kind", "class"])?;
+        named(o, "class", &FORBIDDEN_CLASSES, forbidden_class_name)
+    };
+    match kind_of(value, at)? {
+        "NotUtf8" => unit(LinkProblem::NotUtf8),
+        "TooLong" => unit(LinkProblem::TooLong),
+        "Absolute" => unit(LinkProblem::Absolute),
+        "WindowsForm" => unit(LinkProblem::WindowsForm),
+        "Escapes" => unit(LinkProblem::Escapes),
+        "ThroughLink" => unit(LinkProblem::ThroughLink),
+        "Into" => class().map(LinkProblem::Into),
+        "Encloses" => class().map(LinkProblem::Encloses),
+        _ => Err(UNKNOWN_KIND),
+    }
+}
+
+fn test_disabling(value: &Value, at: &'static str) -> Decoded<TestDisabling> {
+    let unit = |reason| object(value, at, &["kind"]).map(|_| reason);
+    match kind_of(value, at)? {
+        "Marker" => {
+            let o = object(value, at, &["kind", "marker"])?;
+            let marker = named(o, "marker", &Marker::ALL, marker_name)?;
+            Ok(TestDisabling::Marker(marker))
+        }
+        "DeletedTestFile" => unit(TestDisabling::DeletedTestFile),
+        "TestsRemoved" => unit(TestDisabling::TestsRemoved),
+        "TestConfigChanged" => unit(TestDisabling::TestConfigChanged),
+        _ => Err(UNKNOWN_KIND),
+    }
+}
+
+fn violation(value: &Value) -> Decoded<PatchViolation> {
+    let at = "violations";
+    let with = |keys: &[&'static str]| object(value, at, keys);
+    let violation = match kind_of(value, at)? {
+        "TooManyFiles" => {
+            let o = with(&["kind", "files", "limit"])?;
+            PatchViolation::TooManyFiles {
+                files: index(o, "files")?,
+                limit: number_u32(o, "limit")?,
+            }
+        }
+        "Empty" => {
+            with(&["kind"])?;
+            PatchViolation::Empty
+        }
+        "Malformed" => {
+            let o = with(&["kind", "index", "problem"])?;
+            PatchViolation::Malformed {
+                index: index(o, "index")?,
+                problem: change_problem(member(o, "problem")?, "problem")?,
+            }
+        }
+        "BaseLinkMalformed" => {
+            let o = with(&["kind", "index", "problem"])?;
+            PatchViolation::BaseLinkMalformed {
+                index: index(o, "index")?,
+                problem: change_problem(member(o, "problem")?, "problem")?,
+            }
+        }
+        "TooManyLines" => {
+            let o = with(&["kind", "limit"])?;
+            PatchViolation::TooManyLines {
+                limit: number_u32(o, "limit")?,
+            }
+        }
+        "TooManyBytes" => {
+            let o = with(&["kind", "limit"])?;
+            PatchViolation::TooManyBytes {
+                limit: number_u32(o, "limit")?,
+            }
+        }
+        "Forbidden" => {
+            let o = with(&["kind", "index", "class"])?;
+            PatchViolation::Forbidden {
+                index: index(o, "index")?,
+                class: named(o, "class", &FORBIDDEN_CLASSES, forbidden_class_name)?,
+            }
+        }
+        "Gitlink" => {
+            let o = with(&["kind", "index"])?;
+            PatchViolation::Gitlink {
+                index: index(o, "index")?,
+            }
+        }
+        "NotText" => {
+            let o = with(&["kind", "index", "reason"])?;
+            PatchViolation::NotText {
+                index: index(o, "index")?,
+                reason: named(o, "reason", &NOT_TEXT, not_text_name)?,
+            }
+        }
+        "Link" => {
+            let o = with(&["kind", "index", "problem"])?;
+            PatchViolation::Link {
+                index: index(o, "index")?,
+                problem: link_problem(member(o, "problem")?, "problem")?,
+            }
+        }
+        "DisablesTests" => {
+            let o = with(&["kind", "index", "reason"])?;
+            PatchViolation::DisablesTests {
+                index: index(o, "index")?,
+                reason: test_disabling(member(o, "reason")?, "reason")?,
+            }
+        }
+        _ => return Err(UNKNOWN_KIND),
+    };
+    Ok(violation)
+}
+
+fn patch_check(value: &Value) -> Decoded<PatchCheck> {
+    let at = "check";
+    match kind_of(value, at)? {
+        "Judged" => {
+            let o = object(value, at, &["kind", "limits", "verdict"])?;
+            let l = object(
+                member(o, "limits")?,
+                "limits",
+                &[
+                    "max_changed_files",
+                    "max_changed_lines",
+                    "max_changed_bytes",
+                ],
+            )?;
+            let limits = PatchLimits {
+                max_changed_files: limit(l, "max_changed_files")?,
+                max_changed_lines: limit(l, "max_changed_lines")?,
+                max_changed_bytes: limit(l, "max_changed_bytes")?,
+            };
+            let v = member(o, "verdict")?;
+            let verdict = match kind_of(v, "verdict")? {
+                "Pass" => {
+                    let p = object(v, "verdict", &["kind", "files", "lines"])?;
+                    PatchVerdict::Pass {
+                        files: number_u32(p, "files")?,
+                        lines: number_u32(p, "lines")?,
+                    }
+                }
+                "Reject" => {
+                    let r = object(v, "verdict", &["kind", "violations"])?;
+                    let violations = member(r, "violations")?
+                        .as_array()
+                        .ok_or(Malformed::Field("violations", "not an array"))?
+                        .iter()
+                        .map(violation)
+                        .collect::<Decoded<Vec<PatchViolation>>>()?;
+                    PatchVerdict::Reject(violations)
+                }
+                _ => return Err(UNKNOWN_KIND),
+            };
+            Ok(PatchCheck::Judged { limits, verdict })
+        }
+        "Unreadable" => {
+            let o = object(value, at, &["kind", "path"])?;
+            let p = member(o, "path")?;
+            let kind = kind_of(p, "path")?;
+            let index = index(object(p, "path", &["kind", "index"])?, "index")?;
+            let path = match kind {
+                "Change" => UnreadablePath::Change { index },
+                "BaseLink" => UnreadablePath::BaseLink { index },
+                _ => return Err(UNKNOWN_KIND),
+            };
+            Ok(PatchCheck::Unreadable(path))
+        }
+        _ => Err(UNKNOWN_KIND),
+    }
+}
+
+/// The header: the run id, how the run started and the log's version.
+pub(crate) fn decode_header(value: &Value) -> Decoded<(RunId, RunStart, Version)> {
     let o = value
         .as_object()
         .ok_or(Malformed::Line("the header is not an object"))?;
     if o.get("format").and_then(Value::as_str) != Some(FORMAT) {
         return Err(Malformed::Line("not a boneli run log"));
     }
-    if o.get("version")
+    let version = match o
+        .get("version")
         .and_then(Value::as_number)
         .map(|n| n.as_str())
-        != Some("1")
     {
-        return Err(Malformed::Line("an unsupported log version"));
-    }
+        Some("1") => Version::V1,
+        Some("2") => Version::V2,
+        _ => return Err(Malformed::Line("an unsupported log version")),
+    };
     let o = object(
         value,
         "header",
@@ -436,6 +944,7 @@ pub(crate) fn decode_header(value: &Value) -> Decoded<(RunId, RunStart)> {
             },
             previous,
         },
+        version,
     ))
 }
 
@@ -565,6 +1074,13 @@ pub(crate) fn decode_event(value: &Value) -> Decoded<RunEvent> {
                 usage: usage(o)?,
             }
         }
+        EventKind::PatchChecked => {
+            let o = object(value, "event", &["event", "check", "usage"])?;
+            RunEvent::PatchChecked {
+                check: patch_check(member(o, "check")?)?,
+                usage: usage(o)?,
+            }
+        }
         EventKind::FixVerified => {
             let o = object(value, "event", &["event", "checks", "usage"])?;
             let c = object(
@@ -672,10 +1188,11 @@ fn checked_line<T: PartialEq>(
     }
 }
 
-/// The header line of a new log, without its `\n`.
+/// The header line of a new log, in the [`CURRENT`] version, without its
+/// `\n`.
 pub(crate) fn header_line(id: &RunId, start: &RunStart) -> Result<Vec<u8>, Unwritable> {
-    let want = (id.clone(), start.clone());
-    checked_line(&encode_header(id, start), &want, decode_header)
+    let want = (id.clone(), start.clone(), CURRENT);
+    checked_line(&encode_header(id, start, CURRENT), &want, decode_header)
 }
 
 /// The line of an event, without its `\n`.
@@ -700,14 +1217,18 @@ fn read_line<T>(
     Ok(decoded)
 }
 
-/// The header of a stored log.
-pub(crate) fn read_header(line: &[u8]) -> Decoded<(RunId, RunStart)> {
-    read_line(line, decode_header, |(id, start)| encode_header(id, start))
+/// The header of a stored log, of either version.
+pub(crate) fn read_header(line: &[u8]) -> Decoded<(RunId, RunStart, Version)> {
+    read_line(line, decode_header, |(id, start, version)| {
+        encode_header(id, start, *version)
+    })
 }
 
-/// One stored event.
-pub(crate) fn read_event(line: &[u8]) -> Decoded<RunEvent> {
-    read_line(line, decode_event, encode_event)
+/// One stored event of a log in `version` ([`admits`]).
+pub(crate) fn read_event(line: &[u8], version: Version) -> Decoded<RunEvent> {
+    let event = read_line(line, decode_event, encode_event)?;
+    admits(version, event.kind())?;
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -767,11 +1288,273 @@ mod tests {
         ]
     }
 
+    /// The values from `first` on, each giving the next through `next`.
+    /// `next` matches every variant, so a new variant does not compile
+    /// until it is in the chain.
+    fn chain<T>(first: T, next: impl Fn(&T) -> Option<T>) -> Vec<T> {
+        let mut all = Vec::new();
+        let mut at = Some(first);
+        while let Some(value) = at {
+            at = next(&value);
+            all.push(value);
+        }
+        all
+    }
+
+    fn every_citation_problem() -> Vec<CitationProblem> {
+        use CitationProblem as P;
+        chain(P::BlankPath, |p| match p {
+            P::BlankPath => Some(P::AbsolutePath),
+            P::AbsolutePath => Some(P::Backslash),
+            P::Backslash => Some(P::Nul),
+            P::Nul => Some(P::EmptyComponent),
+            P::EmptyComponent => Some(P::DotComponent),
+            P::DotComponent => Some(P::ParentComponent),
+            P::ParentComponent => Some(P::LineZero),
+            P::LineZero => Some(P::BlankQuote),
+            P::BlankQuote => Some(P::NotOnBase),
+            P::NotOnBase => None,
+        })
+    }
+
+    fn every_forbidden_class() -> Vec<ForbiddenClass> {
+        use ForbiddenClass as C;
+        chain(C::RepositoryMetadata, |c| match c {
+            C::RepositoryMetadata => Some(C::Ci),
+            C::Ci => Some(C::ContainerBuild),
+            C::ContainerBuild => Some(C::CodeOwners),
+            C::CodeOwners => Some(C::GitConfig),
+            C::GitConfig => Some(C::Dependencies),
+            C::Dependencies => None,
+        })
+    }
+
+    fn every_not_text() -> Vec<NotText> {
+        chain(NotText::Nul, |r| match r {
+            NotText::Nul => Some(NotText::NotUtf8),
+            NotText::NotUtf8 => Some(NotText::BidiControl),
+            NotText::BidiControl => None,
+        })
+    }
+
+    fn every_marker() -> Vec<Marker> {
+        use Marker as M;
+        chain(M::Skip, |m| match m {
+            M::Skip => Some(M::Only),
+            M::Only => Some(M::Todo),
+            M::Todo => Some(M::Fixme),
+            M::Fixme => Some(M::SkipIf),
+            M::SkipIf => Some(M::RunIf),
+            M::RunIf => Some(M::Fails),
+            M::Fails => Some(M::Failing),
+            M::Failing => Some(M::Fail),
+            M::Fail => Some(M::Xit),
+            M::Xit => Some(M::Xtest),
+            M::Xtest => Some(M::Xdescribe),
+            M::Xdescribe => Some(M::Xcontext),
+            M::Xcontext => Some(M::Xspecify),
+            M::Xspecify => Some(M::Fit),
+            M::Fit => Some(M::Fdescribe),
+            M::Fdescribe => Some(M::Fcontext),
+            M::Fcontext => None,
+        })
+    }
+
+    /// Every `ChangeProblem`, `Path` with every `CitationProblem`.
+    fn every_change_problem() -> Vec<ChangeProblem> {
+        use ChangeProblem as P;
+        let variants = chain(P::OutOfOrder, |p| match p {
+            P::OutOfOrder => Some(P::Path(CitationProblem::BlankPath)),
+            P::Path(_) => Some(P::NoChange),
+            P::NoChange => Some(P::EmptyLinkTarget),
+            P::EmptyLinkTarget => Some(P::NulInLinkTarget),
+            P::NulInLinkTarget => Some(P::BaseLinkMismatch),
+            P::BaseLinkMismatch => None,
+        });
+        variants
+            .into_iter()
+            .flat_map(|p| match p {
+                P::Path(_) => every_citation_problem().into_iter().map(P::Path).collect(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// Every `LinkProblem`, `Into` and `Encloses` with every class.
+    fn every_link_problem() -> Vec<LinkProblem> {
+        use LinkProblem as P;
+        let variants = chain(P::NotUtf8, |p| match p {
+            P::NotUtf8 => Some(P::TooLong),
+            P::TooLong => Some(P::Absolute),
+            P::Absolute => Some(P::WindowsForm),
+            P::WindowsForm => Some(P::Escapes),
+            P::Escapes => Some(P::ThroughLink),
+            P::ThroughLink => Some(P::Into(ForbiddenClass::Ci)),
+            P::Into(_) => Some(P::Encloses(ForbiddenClass::Ci)),
+            P::Encloses(_) => None,
+        });
+        variants
+            .into_iter()
+            .flat_map(|p| match p {
+                P::Into(_) => every_forbidden_class().into_iter().map(P::Into).collect(),
+                P::Encloses(_) => every_forbidden_class()
+                    .into_iter()
+                    .map(P::Encloses)
+                    .collect(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// Every `TestDisabling`, `Marker` with every marker.
+    fn every_test_disabling() -> Vec<TestDisabling> {
+        use TestDisabling as D;
+        let variants = chain(D::Marker(Marker::Skip), |d| match d {
+            D::Marker(_) => Some(D::DeletedTestFile),
+            D::DeletedTestFile => Some(D::TestsRemoved),
+            D::TestsRemoved => Some(D::TestConfigChanged),
+            D::TestConfigChanged => None,
+        });
+        variants
+            .into_iter()
+            .flat_map(|d| match d {
+                D::Marker(_) => every_marker().into_iter().map(D::Marker).collect(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// Every `PatchViolation` with every value of every nested enum, and
+    /// the extremes of every number.
+    fn every_violation() -> Vec<PatchViolation> {
+        use PatchViolation as V;
+        let variants = chain(
+            V::TooManyFiles {
+                files: usize::MAX,
+                limit: u32::MAX,
+            },
+            |v| match v {
+                V::TooManyFiles { .. } => Some(V::Empty),
+                V::Empty => Some(V::Malformed {
+                    index: 0,
+                    problem: ChangeProblem::OutOfOrder,
+                }),
+                V::Malformed { .. } => Some(V::BaseLinkMalformed {
+                    index: 1,
+                    problem: ChangeProblem::OutOfOrder,
+                }),
+                V::BaseLinkMalformed { .. } => Some(V::TooManyLines { limit: 0 }),
+                V::TooManyLines { .. } => Some(V::TooManyBytes { limit: u32::MAX }),
+                V::TooManyBytes { .. } => Some(V::Forbidden {
+                    index: 2,
+                    class: ForbiddenClass::Ci,
+                }),
+                V::Forbidden { .. } => Some(V::Gitlink { index: usize::MAX }),
+                V::Gitlink { .. } => Some(V::NotText {
+                    index: 3,
+                    reason: NotText::Nul,
+                }),
+                V::NotText { .. } => Some(V::Link {
+                    index: 4,
+                    problem: LinkProblem::NotUtf8,
+                }),
+                V::Link { .. } => Some(V::DisablesTests {
+                    index: 5,
+                    reason: TestDisabling::DeletedTestFile,
+                }),
+                V::DisablesTests { .. } => None,
+            },
+        );
+        variants
+            .into_iter()
+            .flat_map(|v| match v {
+                V::Malformed { index, .. } => every_change_problem()
+                    .into_iter()
+                    .map(|problem| V::Malformed { index, problem })
+                    .collect(),
+                V::BaseLinkMalformed { index, .. } => every_change_problem()
+                    .into_iter()
+                    .map(|problem| V::BaseLinkMalformed { index, problem })
+                    .collect(),
+                V::Forbidden { index, .. } => every_forbidden_class()
+                    .into_iter()
+                    .map(|class| V::Forbidden { index, class })
+                    .collect(),
+                V::NotText { index, .. } => every_not_text()
+                    .into_iter()
+                    .map(|reason| V::NotText { index, reason })
+                    .collect(),
+                V::Link { index, .. } => every_link_problem()
+                    .into_iter()
+                    .map(|problem| V::Link { index, problem })
+                    .collect(),
+                V::DisablesTests { index, .. } => every_test_disabling()
+                    .into_iter()
+                    .map(|reason| V::DisablesTests { index, reason })
+                    .collect(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    fn limits(files: u32, lines: u32, bytes: u32) -> PatchLimits {
+        let n = |v| NonZeroU32::new(v).expect("a test limit is not 0");
+        PatchLimits {
+            max_changed_files: n(files),
+            max_changed_lines: n(lines),
+            max_changed_bytes: n(bytes),
+        }
+    }
+
+    /// Every shape of a patch check: both verdicts and their extremes,
+    /// every violation alone and all of them in one list, and both
+    /// unreadable paths at 0 and `usize::MAX`.
+    fn every_patch_check() -> Vec<PatchCheck> {
+        let mut checks = Vec::new();
+        for limits in [
+            PatchLimits::DEFAULT,
+            limits(1, 1, 1),
+            limits(u32::MAX, u32::MAX, u32::MAX),
+        ] {
+            for verdict in [
+                PatchVerdict::Pass { files: 0, lines: 0 },
+                PatchVerdict::Pass {
+                    files: u32::MAX,
+                    lines: u32::MAX,
+                },
+                PatchVerdict::Reject(vec![]),
+            ] {
+                checks.push(PatchCheck::Judged { limits, verdict });
+            }
+        }
+        for violation in every_violation() {
+            checks.push(PatchCheck::Judged {
+                limits: PatchLimits::DEFAULT,
+                verdict: PatchVerdict::Reject(vec![violation]),
+            });
+        }
+        checks.push(PatchCheck::Judged {
+            limits: PatchLimits::DEFAULT,
+            verdict: PatchVerdict::Reject(every_violation()),
+        });
+        for index in [0, usize::MAX] {
+            checks.push(PatchCheck::Unreadable(UnreadablePath::Change { index }));
+            checks.push(PatchCheck::Unreadable(UnreadablePath::BaseLink { index }));
+        }
+        checks
+    }
+
     /// Events of every kind, with every value of every enum, every text of
     /// [`texts`], zero and `u64::MAX` usage and a citation line of
-    /// `u32::MAX`.
+    /// `u32::MAX`, and every patch check of [`every_patch_check`].
     fn every_event() -> Vec<RunEvent> {
         let mut events = Vec::new();
+        for (k, check) in every_patch_check().into_iter().enumerate() {
+            events.push(RunEvent::PatchChecked {
+                check,
+                usage: usages()[k % 3],
+            });
+        }
         for (k, text) in texts().into_iter().enumerate() {
             let usage = usages()[k % 3];
             let source = SOURCES[k % SOURCES.len()];
@@ -896,7 +1679,7 @@ mod tests {
         for event in &events {
             let line = event_line(event).expect("writable");
             assert!(!line.contains(&b'\n'), "{event:?}");
-            assert_eq!(read_event(&line).as_ref(), Ok(event));
+            assert_eq!(read_event(&line, CURRENT).as_ref(), Ok(event));
         }
         assert_eq!(SOURCES.len(), 4);
         assert_eq!(TEST_STATUSES.len(), 6);
@@ -915,12 +1698,14 @@ mod tests {
             };
             let id = RunId::new(String::from(id));
             let line = header_line(&id, &start).expect("writable");
-            assert_eq!(read_header(&line), Ok((id, start)));
+            assert_eq!(read_header(&line), Ok((id, start, CURRENT)));
         }
     }
 
-    /// The on-disk format, pinned: a hand-written v1 log decodes to a known
-    /// `RunLog`, and encoding that log gives the bytes back exactly.
+    /// The on-disk format of version 1, pinned: a hand-written v1 log
+    /// decodes to a known `RunLog`, and encoding that log gives the bytes
+    /// back exactly. Its event lines are version 2 lines too; as a version
+    /// 1 log it holds `FixWritten`, which [`admits`] refuses there.
     #[test]
     fn golden_v1_log() {
         let golden = concat!(
@@ -1032,20 +1817,215 @@ mod tests {
             ],
         };
         let mut lines = golden.split_terminator('\n');
-        let (id, start) = read_header(lines.next().expect("header").as_bytes()).expect("header");
+        let (id, start, version) =
+            read_header(lines.next().expect("header").as_bytes()).expect("header");
         assert_eq!(id, RunId::new(String::from("run-7")));
+        assert_eq!(version, Version::V1);
+        let lines: Vec<&str> = lines.collect();
         let events: Vec<RunEvent> = lines
-            .map(|l| read_event(l.as_bytes()).expect("event"))
+            .iter()
+            .map(|l| read_event(l.as_bytes(), Version::V2).expect("event"))
             .collect();
         assert_eq!(RunLog { start, events }, want);
+        for (line, event) in lines.iter().zip(&want.events) {
+            let v1 = read_event(line.as_bytes(), Version::V1);
+            if event.kind() == EventKind::FixWritten {
+                assert!(v1.is_err(), "{line}");
+            } else {
+                assert_eq!(v1.as_ref(), Ok(event), "{line}");
+            }
+        }
 
-        let mut encoded = header_line(&id, &want.start).expect("header");
+        let mut encoded = serialize(&encode_header(&id, &want.start, Version::V1)).expect("header");
         encoded.push(b'\n');
         for event in &want.events {
             encoded.extend(event_line(event).expect("event"));
             encoded.push(b'\n');
         }
         assert_eq!(String::from_utf8(encoded).expect("UTF-8"), golden);
+    }
+
+    /// The on-disk format of version 2, pinned: the header and the three
+    /// shapes of `PatchChecked`, with payload objects at the deepest
+    /// nesting, decode to known events and encode back exactly.
+    #[test]
+    fn golden_v2_log() {
+        let golden = concat!(
+            r#"{"format":"boneli-run-log","version":2,"run":"run-8","budget":{"cost_micro_usd":5,"duration_ms":6},"previous":null}"#,
+            "\n",
+            r#"{"event":"PatchChecked","check":{"kind":"Judged","limits":{"max_changed_files":25,"max_changed_lines":1000,"max_changed_bytes":42000},"verdict":{"kind":"Pass","files":1,"lines":2}},"usage":{"cost_micro_usd":0,"duration_ms":1000}}"#,
+            "\n",
+            r#"{"event":"PatchChecked","check":{"kind":"Judged","limits":{"max_changed_files":2,"max_changed_lines":3,"max_changed_bytes":4},"verdict":{"kind":"Reject","violations":[{"kind":"TooManyLines","limit":3},{"kind":"Malformed","index":0,"problem":{"kind":"Path","problem":"Backslash"}},{"kind":"Link","index":1,"problem":{"kind":"Into","class":"Ci"}},{"kind":"DisablesTests","index":1,"reason":{"kind":"Marker","marker":"SkipIf"}},{"kind":"DisablesTests","index":1,"reason":{"kind":"TestsRemoved"}},{"kind":"NotText","index":1,"reason":"BidiControl"},{"kind":"Empty"}]}},"usage":{"cost_micro_usd":0,"duration_ms":7}}"#,
+            "\n",
+            r#"{"event":"PatchChecked","check":{"kind":"Unreadable","path":{"kind":"BaseLink","index":3}},"usage":{"cost_micro_usd":0,"duration_ms":0}}"#,
+            "\n",
+        );
+        let usage = |duration_ms| Usage {
+            cost_micro_usd: 0,
+            duration_ms,
+        };
+        let want = vec![
+            RunEvent::PatchChecked {
+                check: PatchCheck::Judged {
+                    limits: PatchLimits::DEFAULT,
+                    verdict: PatchVerdict::Pass { files: 1, lines: 2 },
+                },
+                usage: usage(1_000),
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Judged {
+                    limits: limits(2, 3, 4),
+                    verdict: PatchVerdict::Reject(vec![
+                        PatchViolation::TooManyLines { limit: 3 },
+                        PatchViolation::Malformed {
+                            index: 0,
+                            problem: ChangeProblem::Path(CitationProblem::Backslash),
+                        },
+                        PatchViolation::Link {
+                            index: 1,
+                            problem: LinkProblem::Into(ForbiddenClass::Ci),
+                        },
+                        PatchViolation::DisablesTests {
+                            index: 1,
+                            reason: TestDisabling::Marker(Marker::SkipIf),
+                        },
+                        PatchViolation::DisablesTests {
+                            index: 1,
+                            reason: TestDisabling::TestsRemoved,
+                        },
+                        PatchViolation::NotText {
+                            index: 1,
+                            reason: NotText::BidiControl,
+                        },
+                        PatchViolation::Empty,
+                    ]),
+                },
+                usage: usage(7),
+            },
+            RunEvent::PatchChecked {
+                check: PatchCheck::Unreadable(UnreadablePath::BaseLink { index: 3 }),
+                usage: usage(0),
+            },
+        ];
+        let mut lines = golden.split_terminator('\n');
+        let (id, start, version) =
+            read_header(lines.next().expect("header").as_bytes()).expect("header");
+        assert_eq!(version, Version::V2);
+        let events: Vec<RunEvent> = lines
+            .map(|l| read_event(l.as_bytes(), Version::V2).expect("event"))
+            .collect();
+        assert_eq!(events, want);
+        let mut encoded = header_line(&id, &start).expect("header");
+        encoded.push(b'\n');
+        for event in &want {
+            encoded.extend(event_line(event).expect("event"));
+            encoded.push(b'\n');
+        }
+        assert_eq!(String::from_utf8(encoded).expect("UTF-8"), golden);
+    }
+
+    /// Every value of every enum a patch check holds is listed for
+    /// decoding: the codec's tables equal the chains, which match every
+    /// variant, and every check round-trips as a canonical line.
+    #[test]
+    fn patch_checked_round_trips_every_variant() {
+        assert_eq!(CITATION_PROBLEMS.to_vec(), every_citation_problem());
+        assert_eq!(FORBIDDEN_CLASSES.to_vec(), every_forbidden_class());
+        assert_eq!(NOT_TEXT.to_vec(), every_not_text());
+        assert_eq!(Marker::ALL.to_vec(), every_marker());
+        assert_eq!(every_change_problem().len(), 15);
+        assert_eq!(every_link_problem().len(), 18);
+        assert_eq!(every_test_disabling().len(), 20);
+        // 5 variants without a nested enum, 15 + 15 + 6 + 3 + 18 + 20 with.
+        assert_eq!(every_violation().len(), 82);
+        for check in every_patch_check() {
+            let event = RunEvent::PatchChecked {
+                check,
+                usage: Usage::default(),
+            };
+            let line = event_line(&event).expect("writable");
+            assert_eq!(read_event(&line, Version::V2), Ok(event.clone()));
+            assert!(read_event(&line, Version::V1).is_err(), "{event:?}");
+        }
+    }
+
+    /// A patch check that does not decode exactly fails closed: a zero
+    /// limit, a number above `u32::MAX` where the domain holds a `u32`, an
+    /// unknown variant at every level, a missing or extra key, and a
+    /// payload enum written as a string.
+    #[test]
+    fn patch_checked_malformed_fails_closed() {
+        let line = |check: &str| {
+            format!(
+                r#"{{"event":"PatchChecked","check":{check},"usage":{{"cost_micro_usd":0,"duration_ms":0}}}}"#
+            )
+        };
+        let judged = |limits: &str, verdict: &str| {
+            line(&format!(
+                r#"{{"kind":"Judged","limits":{limits},"verdict":{verdict}}}"#
+            ))
+        };
+        let limits =
+            r#"{"max_changed_files":25,"max_changed_lines":1000,"max_changed_bytes":42000}"#;
+        let reject = |violation: &str| {
+            judged(
+                limits,
+                &format!(r#"{{"kind":"Reject","violations":[{violation}]}}"#),
+            )
+        };
+        let good = [
+            judged(limits, r#"{"kind":"Pass","files":1,"lines":2}"#),
+            reject(r#"{"kind":"TooManyLines","limit":4294967295}"#),
+            reject(r#"{"kind":"Link","index":0,"problem":{"kind":"TooLong"}}"#),
+            line(r#"{"kind":"Unreadable","path":{"kind":"Change","index":0}}"#),
+        ];
+        for text in &good {
+            assert!(read_event(text.as_bytes(), Version::V2).is_ok(), "{text}");
+        }
+        let bad = [
+            judged(
+                r#"{"max_changed_files":0,"max_changed_lines":1000,"max_changed_bytes":42000}"#,
+                r#"{"kind":"Pass","files":1,"lines":2}"#,
+            ),
+            judged(
+                r#"{"max_changed_files":4294967296,"max_changed_lines":1000,"max_changed_bytes":42000}"#,
+                r#"{"kind":"Pass","files":1,"lines":2}"#,
+            ),
+            judged(
+                r#"{"max_changed_files":25,"max_changed_lines":1000}"#,
+                r#"{"kind":"Pass","files":1,"lines":2}"#,
+            ),
+            judged(limits, r#"{"kind":"Pass","files":4294967296,"lines":2}"#),
+            judged(limits, r#"{"kind":"Pass","files":1,"lines":2,"extra":0}"#),
+            judged(limits, r#"{"kind":"Accept","files":1,"lines":2}"#),
+            judged(limits, r#"{"kind":"Reject","violations":{}}"#),
+            judged(limits, r#""Pass""#),
+            reject(r#"{"kind":"TooManyLines","limit":4294967296}"#),
+            reject(r#"{"kind":"TooManyLines","limit":-1}"#),
+            reject(r#"{"kind":"Gitlink","index":1.5}"#),
+            reject(r#"{"kind":"Gitlink"}"#),
+            reject(r#"{"kind":"Empty","index":0}"#),
+            reject(r#"{"kind":"Bogus","index":0}"#),
+            reject(r#""Empty""#),
+            reject(r#"{"kind":"Forbidden","index":0,"class":"Docs"}"#),
+            reject(r#"{"kind":"NotText","index":0,"reason":{"kind":"Nul"}}"#),
+            reject(r#"{"kind":"Link","index":0,"problem":"TooLong"}"#),
+            reject(r#"{"kind":"Link","index":0,"problem":{"kind":"Into"}}"#),
+            reject(r#"{"kind":"Link","index":0,"problem":{"kind":"TooLong","class":"Ci"}}"#),
+            reject(r#"{"kind":"Link","index":0,"problem":{"kind":"Sideways"}}"#),
+            reject(r#"{"kind":"Malformed","index":0,"problem":{"kind":"Path","problem":"Tab"}}"#),
+            reject(
+                r#"{"kind":"DisablesTests","index":0,"reason":{"kind":"Marker","marker":"skip"}}"#,
+            ),
+            line(r#"{"kind":"Unreadable","path":{"kind":"Tree","index":0}}"#),
+            line(r#"{"kind":"Unreadable","path":{"kind":"Change"}}"#),
+            line(r#"{"kind":"Unreadable","path":{"kind":"Change","index":18446744073709551616}}"#),
+            line(r#"{"kind":"Unknown"}"#),
+            line(r#"{"limits":{},"verdict":{}}"#),
+        ];
+        for text in &bad {
+            assert!(read_event(text.as_bytes(), Version::V2).is_err(), "{text}");
+        }
     }
 
     /// The deepest line of every kind, measured on the parser: each parses
@@ -1096,7 +2076,7 @@ mod tests {
             MARK.to_owned(),
         ];
         for line in lines {
-            let error = read_event(line.as_bytes()).expect_err("malformed");
+            let error = read_event(line.as_bytes(), CURRENT).expect_err("malformed");
             let shown = format!("{error} {error:?}");
             assert!(!shown.contains(MARK), "{shown}");
         }

@@ -10,11 +10,11 @@ use boneli_app::{
 };
 use boneli_domain::{EvidenceRef, RunId};
 use boneli_memory::{
-    AgentRequest, ForgeRequest, MemoryAgent, MemoryEvidence, MemoryForge, MemoryVerifier,
-    SequentialIds, StepClock, VerifierRequest,
+    AgentRequest, ForgeRequest, MemoryAgent, MemoryEvidence, MemoryForge, MemoryGit,
+    MemoryVerifier, SequentialIds, StepClock, VerifierRequest,
 };
 use boneli_replay_check::app::{
-    AppScenario, ClockSetup, ScriptedClock, hand_written, play, questions,
+    AppScenario, ClockSetup, ScriptedClock, git_commits, hand_written, play, questions,
 };
 use boneli_store_fs::FsStore;
 
@@ -44,6 +44,7 @@ struct Jobs {
     agent: MemoryAgent,
     verifier: MemoryVerifier,
     forge: MemoryForge,
+    git: MemoryGit,
     clock: Box<dyn Clock>,
     ids: SequentialIds,
 }
@@ -58,6 +59,7 @@ impl Jobs {
             agent: MemoryAgent::new(scenario.agent.clone()),
             verifier: MemoryVerifier::new(scenario.verifier.clone()),
             forge: MemoryForge::scripted(scenario.forge.clone()),
+            git: MemoryGit::new(git_commits()),
             clock,
             ids: SequentialIds::new(),
         }
@@ -72,6 +74,7 @@ impl Jobs {
             agent: &self.agent,
             verifier: &self.verifier,
             forge: &self.forge,
+            git: &self.git,
             events: store,
             evidence: store,
             clock: self.clock.as_ref(),
@@ -197,6 +200,52 @@ fn rerun_after_restart_reads_questions_from_disk() {
     assert_eq!(previous.run, RunId::new(String::from("run-1")));
     assert_eq!(previous.questions, questions());
     assert_eq!(second.run.id(), &RunId::new(String::from("run-2")));
+}
+
+/// A run logged in version 1 that ended with questions still answers a
+/// re-run (ADR-023, D7): its header is rewritten to version 1 before the
+/// store reopens, and the re-run's triage gets the questions from it.
+#[test]
+fn rerun_reads_questions_from_a_version_1_log() {
+    let scenario = hand_written()
+        .into_iter()
+        .find(|s| s.name == "rerun-after-questions")
+        .expect("the scenario");
+    let tmp = TempDir::new("rerun-v1");
+    let root = tmp.0.join("store");
+    let jobs = Jobs::of(&scenario);
+    {
+        let store = FsStore::open(&root).expect("open");
+        jobs.run(&store, scenario.requests[0].clone())
+            .expect("the first run");
+    }
+    let logs: Vec<PathBuf> = std::fs::read_dir(root.join("runs"))
+        .expect("list the logs")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    let [log] = logs.as_slice() else {
+        panic!("one log expected: {logs:?}");
+    };
+    let text = std::fs::read_to_string(log).expect("read");
+    assert!(text.starts_with("{\"format\":\"boneli-run-log\",\"version\":2,"));
+    let text = text.replacen("\"version\":2,", "\"version\":1,", 1);
+    std::fs::write(log, text).expect("write");
+    let store = FsStore::open(&root).expect("reopen");
+    let second = jobs
+        .run(&store, scenario.requests[1].clone())
+        .expect("the re-run");
+    assert_eq!(second.run.id(), &RunId::new(String::from("run-2")));
+    let previous = jobs
+        .agent
+        .requests()
+        .into_iter()
+        .filter_map(|r| match r {
+            AgentRequest::Triage(t) => t.previous,
+            _ => None,
+        })
+        .next()
+        .expect("the re-run's triage names the previous run");
+    assert_eq!(previous.questions, questions());
 }
 
 /// The forge gets the bytes the verifier checked (ADR-004, D9), read back

@@ -15,8 +15,8 @@ use crate::command::RunCommand;
 use crate::error::DomainError;
 use crate::event::{EventKind, RunEvent, TriageVerdict};
 use crate::gate::{
-    FixCheck, FixChecks, GateFailure, GateOutcome, fix_gate, reproduction_gate, root_cause_gate,
-    root_cause_precheck,
+    FixCheck, FixChecks, GateFailure, GateOutcome, fix_gate, patch_gate, reproduction_gate,
+    root_cause_gate, root_cause_precheck,
 };
 use crate::values::{Citation, CommitSha, EvidenceRef, RunId, Ticket, is_blank};
 
@@ -31,7 +31,7 @@ pub enum Stage {
     Reproduce,
     /// Root-cause analysis and citation verification.
     RootCause,
-    /// Writing the fix.
+    /// Writing the fix and checking it against the patch policy.
     Fix,
     /// Verifying the fix in a clean sandbox.
     Verify,
@@ -137,7 +137,7 @@ pub(crate) enum Record {
     Verified(Verified),
 }
 
-/// The nine states that wait for a job or forge result.
+/// The ten states that wait for a job or forge result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Waiting {
     Triage(Opened),
@@ -147,6 +147,7 @@ enum Waiting {
     RootCause(Reproduced),
     CitationCheck(Analyzed),
     FixWriting(Analyzed),
+    PatchCheck(Fixed),
     Verify(Fixed),
     Deliver(Verified),
 }
@@ -161,6 +162,7 @@ impl Waiting {
             Waiting::RootCause(_) => EventKind::RootCauseProposed,
             Waiting::CitationCheck(_) => EventKind::CitationsChecked,
             Waiting::FixWriting(_) => EventKind::FixWritten,
+            Waiting::PatchCheck(_) => EventKind::PatchChecked,
             Waiting::Verify(_) => EventKind::FixVerified,
             Waiting::Deliver(_) => EventKind::PullRequestOpened,
         }
@@ -171,7 +173,7 @@ impl Waiting {
             Waiting::Triage(_) | Waiting::Questions(_) => Stage::Triage,
             Waiting::ReproductionWriting(_) | Waiting::ReproductionCheck(_) => Stage::Reproduce,
             Waiting::RootCause(_) | Waiting::CitationCheck(_) => Stage::RootCause,
-            Waiting::FixWriting(_) => Stage::Fix,
+            Waiting::FixWriting(_) | Waiting::PatchCheck(_) => Stage::Fix,
             Waiting::Verify(_) => Stage::Verify,
             Waiting::Deliver(_) => Stage::Deliver,
         }
@@ -184,7 +186,7 @@ impl Waiting {
             }
             Waiting::ReproductionCheck(r) | Waiting::RootCause(r) => Record::Reproduced(r),
             Waiting::CitationCheck(a) | Waiting::FixWriting(a) => Record::Analyzed(a),
-            Waiting::Verify(f) => Record::Fixed(f),
+            Waiting::PatchCheck(f) | Waiting::Verify(f) => Record::Fixed(f),
             Waiting::Deliver(v) => Record::Verified(v),
         }
     }
@@ -518,13 +520,25 @@ fn advance(
             }
         }
         (Waiting::FixWriting(a), RunEvent::FixWritten { diff, .. }) => {
-            let command = RunCommand::VerifyFix {
+            let command = RunCommand::CheckPatch {
                 base: a.reproduced.opened.base.clone(),
                 diff: diff.clone(),
-                test: a.reproduced.test.clone(),
             };
             let f = Fixed { analyzed: a, diff };
-            (State::Waiting(Waiting::Verify(f)), vec![command])
+            (State::Waiting(Waiting::PatchCheck(f)), vec![command])
+        }
+        (Waiting::PatchCheck(f), RunEvent::PatchChecked { check, .. }) => {
+            match patch_gate(&check) {
+                GateOutcome::Pass => {
+                    let command = RunCommand::VerifyFix {
+                        base: f.analyzed.reproduced.opened.base.clone(),
+                        diff: f.diff.clone(),
+                        test: f.analyzed.reproduced.test.clone(),
+                    };
+                    (State::Waiting(Waiting::Verify(f)), vec![command])
+                }
+                GateOutcome::Fail(failure) => gate_failed(failure, Record::Fixed(f)),
+            }
         }
         (Waiting::Verify(f), RunEvent::FixVerified { checks, .. }) => {
             let v = Verified {

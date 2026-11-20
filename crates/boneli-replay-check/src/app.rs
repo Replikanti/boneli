@@ -7,7 +7,10 @@
 //! optional injected [`Fault`] and the requests, in order. [`play`] runs it
 //! with a fixed `Clock` and `SequentialIds` behind recording adapters and
 //! returns everything that is compared: each request's result, every run
-//! log, every recorded job request and every port call.
+//! log, every recorded job request, every diff `Git::apply` got and every
+//! port call. Every scenario runs on the same repository
+//! ([`git_commits`]), which the patch check fetches and applies the
+//! agent's diff to (ADR-023, D8).
 //!
 //! [`fault_scenarios`] derives the fault matrix from the hand-written
 //! scenarios. [`ScriptedClock`] knowingly breaks the `Clock` contract, to
@@ -16,27 +19,31 @@
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
+use std::num::NonZeroU32;
+
 use boneli_app::{
-    Agent, Clock, DataError, DebugReport, DebugRequest, DebugTicket, DebugTicketError, EventStore,
-    Evidence, EvidenceError, FixRequest, Forge, ForgeRef, GitError, Ids, ImageError, JobFailure,
-    PreviousRunError, PullRequest, ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog,
+    Agent, BranchName, CheckoutId, Clock, CommitInfo, DataError, DebugReport, DebugRequest,
+    DebugTicket, DebugTicketError, EventStore, Evidence, EvidenceError, FixRequest, Forge,
+    ForgeRef, Git, GitError, Ids, ImageError, JobFailure, PreviousRunError, PullRequest,
+    RelativePath, RepoUrl, ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog,
     RunStart, SandboxError, StoreError, TreePath, TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, CheckStatus, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef,
-    FixChecks, RunEvent, RunId, Stage, TestStatus, Ticket, TicketSource, TriageVerdict,
+    FixChecks, Patch, PatchLimits, RunEvent, RunId, Stage, TestStatus, Ticket, TicketSource,
+    TriageVerdict, UnreadablePath,
 };
 use boneli_memory::{
-    AgentRequest, AgentScript, ForgeRequest, ForgeScript, MemoryAgent, MemoryEventStore,
-    MemoryEvidence, MemoryForge, MemoryVerifier, Response, ScriptedFailure, SequentialIds,
-    StepClock, VerifierRequest, VerifierScript,
+    AgentRequest, AgentScript, ForgeRequest, ForgeScript, GitCommit, MemoryAgent, MemoryEventStore,
+    MemoryEvidence, MemoryForge, MemoryGit, MemoryVerifier, Response, ScriptedFailure,
+    SequentialIds, StepClock, Tree, VerifierRequest, VerifierScript, pack_diff,
 };
 
 /// The base commit of every scenario.
 pub const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// The budget of every scenario that does not test the budget: far above
-/// the largest spend of one corpus run (4 000 µUSD, 7 000 ms).
+/// the largest spend of one corpus run (4 000 µUSD, 8 000 ms).
 pub const BUDGET: Budget = Budget {
     cost_micro_usd: 1_000_000,
     duration_ms: 600_000,
@@ -46,7 +53,7 @@ pub const BUDGET: Budget = Budget {
 pub const AGENT_COST: u64 = 1_000;
 
 /// The step of the default clock: every measured job lasts 1 000 ms, so the
-/// delivered path's 7 measured jobs take 7 000 ms.
+/// delivered path's 8 measured jobs take 8 000 ms.
 pub const STEP_MS: u64 = 1_000;
 
 /// The first reading of the default clock. Not 0, so a backwards fault
@@ -113,6 +120,20 @@ pub enum Call {
     PostQuestions,
     /// `Forge::open_pull_request`.
     OpenPullRequest,
+    /// `Git::fetch_base`.
+    FetchBase,
+    /// `Git::read`.
+    Read,
+    /// `Git::snapshot`.
+    Snapshot,
+    /// `Git::diff`.
+    Diff,
+    /// `Git::apply`.
+    Apply,
+    /// `Git::patch_between`.
+    PatchBetween,
+    /// `Git::push`.
+    Push,
     /// `EventStore::create`.
     Create,
     /// `EventStore::append`.
@@ -142,6 +163,13 @@ impl Call {
             Call::VerifyFix => "verify-fix",
             Call::PostQuestions => "post-questions",
             Call::OpenPullRequest => "open-pull-request",
+            Call::FetchBase => "fetch-base",
+            Call::Read => "read",
+            Call::Snapshot => "snapshot",
+            Call::Diff => "diff",
+            Call::Apply => "apply",
+            Call::PatchBetween => "patch-between",
+            Call::Push => "push",
             Call::Create => "create",
             Call::Append => "append",
             Call::Load => "load",
@@ -153,8 +181,9 @@ impl Call {
     }
 
     /// Every way this call can fail: a job failure for the job ports, every
-    /// `StoreError` and `EvidenceError` variant for the stores, a backwards
-    /// reading for the clock. `Ids::run_id` cannot fail.
+    /// `GitError` variant for git, every `StoreError` and `EvidenceError`
+    /// variant for the stores, a backwards reading for the clock.
+    /// `Ids::run_id` cannot fail.
     pub fn fault_kinds(self) -> Vec<FaultKind> {
         match self {
             Call::Triage
@@ -166,6 +195,13 @@ impl Call {
             | Call::VerifyFix
             | Call::PostQuestions
             | Call::OpenPullRequest => vec![FaultKind::Fails],
+            Call::FetchBase
+            | Call::Read
+            | Call::Snapshot
+            | Call::Diff
+            | Call::Apply
+            | Call::PatchBetween
+            | Call::Push => every_git_error().into_iter().map(FaultKind::Git).collect(),
             Call::Create | Call::Append | Call::Load => every_store_error()
                 .into_iter()
                 .map(FaultKind::Store)
@@ -200,6 +236,24 @@ pub fn every_store_error() -> Vec<StoreError> {
     all
 }
 
+/// Every `GitError` variant, chained the same way.
+pub fn every_git_error() -> Vec<GitError> {
+    let mut all = Vec::new();
+    let mut next = Some(GitError::UnknownCommit);
+    while let Some(error) = next {
+        next = match &error {
+            GitError::UnknownCommit => Some(GitError::UnknownCheckout),
+            GitError::UnknownCheckout => Some(GitError::BranchExists),
+            GitError::BranchExists => Some(GitError::Failed {
+                detail: String::from(FAULT),
+            }),
+            GitError::Failed { .. } => None,
+        };
+        all.push(error);
+    }
+    all
+}
+
 /// Every `EvidenceError` variant, chained the same way.
 pub fn every_evidence_error() -> Vec<EvidenceError> {
     let mut all = Vec::new();
@@ -227,6 +281,8 @@ pub enum FaultKind {
     Store(StoreError),
     /// An evidence call returns this error.
     Evidence(EvidenceError),
+    /// A git call returns this error.
+    Git(GitError),
     /// The clock reads 1 ms below its previous reading.
     Backwards,
 }
@@ -244,6 +300,10 @@ impl FaultKind {
             FaultKind::Evidence(EvidenceError::NotFound) => "not-found",
             FaultKind::Evidence(EvidenceError::InvalidReference) => "invalid-reference",
             FaultKind::Evidence(EvidenceError::Corrupted) => "corrupted",
+            FaultKind::Git(GitError::UnknownCommit) => "unknown-commit",
+            FaultKind::Git(GitError::UnknownCheckout) => "unknown-checkout",
+            FaultKind::Git(GitError::BranchExists) => "branch-exists",
+            FaultKind::Git(GitError::Failed { .. }) => "git-failed",
             FaultKind::Backwards => "backwards",
         }
     }
@@ -281,6 +341,9 @@ pub struct Played {
     pub verifier: Vec<VerifierRequest>,
     /// The requests the forge received.
     pub forge: Vec<ForgeRequest>,
+    /// The diffs `Git::apply` received, in order: the bytes the patch
+    /// check judged.
+    pub applied: Vec<Vec<u8>>,
     /// Every port call, with the index of the request it belonged to.
     pub calls: Vec<(usize, Call)>,
 }
@@ -322,6 +385,7 @@ struct Recorder {
     fault: Option<Fault>,
     request: Mutex<usize>,
     calls: Mutex<Vec<(usize, Call)>>,
+    applied: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Recorder {
@@ -374,6 +438,13 @@ impl<P> Recording<'_, P> {
     ) -> Result<T, EvidenceError> {
         match self.recorder.record(call) {
             Some(FaultKind::Evidence(error)) => Err(error),
+            _ => run(),
+        }
+    }
+
+    fn git<T>(&self, call: Call, run: impl FnOnce() -> Result<T, GitError>) -> Result<T, GitError> {
+        match self.recorder.record(call) {
+            Some(FaultKind::Git(error)) => Err(error),
             _ => run(),
         }
     }
@@ -461,6 +532,48 @@ impl Evidence for Recording<'_, MemoryEvidence> {
     }
 }
 
+impl Git for Recording<'_, MemoryGit> {
+    fn fetch_base(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
+        self.git(Call::FetchBase, || self.inner.fetch_base(repo, base))
+    }
+    fn read(
+        &self,
+        checkout: &CheckoutId,
+        path: &RelativePath,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        self.git(Call::Read, || self.inner.read(checkout, path))
+    }
+    fn snapshot(&self, checkout: &CheckoutId) -> Result<Vec<u8>, GitError> {
+        self.git(Call::Snapshot, || self.inner.snapshot(checkout))
+    }
+    fn diff(&self, checkout: &CheckoutId, workspace: &[u8]) -> Result<Vec<u8>, GitError> {
+        self.git(Call::Diff, || self.inner.diff(checkout, workspace))
+    }
+    fn apply(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
+        self.recorder
+            .applied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(diff.to_vec());
+        self.git(Call::Apply, || self.inner.apply(checkout, diff))
+    }
+    fn patch_between(
+        &self,
+        base: &CheckoutId,
+        after: &CheckoutId,
+    ) -> Result<Result<Patch, UnreadablePath>, GitError> {
+        self.git(Call::PatchBetween, || self.inner.patch_between(base, after))
+    }
+    fn push(
+        &self,
+        checkout: &CheckoutId,
+        branch: &BranchName,
+        commit: &CommitInfo,
+    ) -> Result<CommitSha, GitError> {
+        self.git(Call::Push, || self.inner.push(checkout, branch, commit))
+    }
+}
+
 /// The scenario's clock, recording its readings; a `Backwards` fault reads
 /// 1 ms below the reading before it.
 struct RecordingClock<'a> {
@@ -508,6 +621,10 @@ pub fn play(scenario: &AppScenario) -> Played {
         inner: MemoryForge::scripted(scenario.forge.clone()),
         recorder: &recorder,
     };
+    let git = Recording {
+        inner: MemoryGit::new(git_commits()),
+        recorder: &recorder,
+    };
     let events = Recording {
         inner: MemoryEventStore::new(),
         recorder: &recorder,
@@ -533,6 +650,7 @@ pub fn play(scenario: &AppScenario) -> Played {
         agent: &agent,
         verifier: &verifier,
         forge: &forge,
+        git: &git,
         events: &events,
         evidence: &evidence,
         clock: &clock,
@@ -551,12 +669,18 @@ pub fn play(scenario: &AppScenario) -> Played {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
+    let applied = recorder
+        .applied
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     Played {
         results,
         logs: events.inner.logs(),
         agent: agent.inner.requests(),
         verifier: verifier.inner.requests(),
         forge: forge.inner.requests(),
+        applied,
         calls,
     }
 }
@@ -676,6 +800,64 @@ fn base() -> CommitSha {
     CommitSha::parse(BASE).expect("BASE is 40 lowercase hex digits")
 }
 
+/// The repository every scenario's base is fetched from.
+pub const REPO: &str = "https://git.example/invoices.git";
+
+/// The code the fix changes, with the bug on line 2. Short, because every
+/// diff is printed byte by byte in the replay output.
+pub const INVOICE: &str = "fn total(a: u64) -> u64 {\n    a + 1\n}\n";
+
+/// The fixed code: line 2 without the extra cent.
+pub const INVOICE_FIXED: &str = "fn total(a: u64) -> u64 {\n    a\n}\n";
+
+/// A test file of the base, so a fix can disable a test.
+pub const INVOICE_TEST: &str = "import { total } from \"../src/invoice\";
+
+test(\"three lines\", () => {
+  expect(total([1, 2, 3])).toBe(6);
+});
+";
+
+/// CI configuration of the base, a forbidden path (ADR-013, D4).
+pub const CI: &str = "on: push\njobs: {}\n";
+
+fn tree_path(path: &[u8]) -> TreePath {
+    TreePath::parse(path).expect("a corpus path is a tree path")
+}
+
+/// The repository's one commit, at [`BASE`].
+pub fn git_commits() -> Vec<GitCommit> {
+    let files: Tree = [
+        ("src/invoice.rs", INVOICE),
+        ("tests/invoice.test.ts", INVOICE_TEST),
+        (".github/workflows/ci.yml", CI),
+    ]
+    .into_iter()
+    .map(|(path, content)| (tree_path(path.as_bytes()), content.as_bytes().to_vec()))
+    .collect();
+    vec![GitCommit {
+        repo: RepoUrl::new(String::from(REPO)),
+        sha: base(),
+        files,
+    }]
+}
+
+/// A diff in `MemoryGit`'s format: each path with its new content, or
+/// `None` for a removal.
+pub fn diff_of(changes: &[(&[u8], Option<&str>)]) -> Vec<u8> {
+    let changes: Vec<(TreePath, Option<Vec<u8>>)> = changes
+        .iter()
+        .map(|(path, content)| (tree_path(path), content.map(|c| c.as_bytes().to_vec())))
+        .collect();
+    pack_diff(&changes)
+}
+
+/// The delivering agent's fix: one line of `src/invoice.rs` changed, so
+/// the policy passes it as one file and two lines.
+pub fn fix_diff() -> Vec<u8> {
+    diff_of(&[(b"src/invoice.rs", Some(INVOICE_FIXED))])
+}
+
 /// The ticket of every scenario.
 pub fn ticket() -> Ticket {
     Ticket {
@@ -729,8 +911,22 @@ fn request() -> DebugRequest {
     DebugRequest {
         ticket: ticket(),
         base: base(),
+        repo: RepoUrl::new(String::from(REPO)),
         budget: BUDGET,
+        patch_limits: PatchLimits::DEFAULT,
         previous: None,
+    }
+}
+
+/// The default request with a file limit of `files`.
+fn file_limit(files: u32) -> DebugRequest {
+    let files = NonZeroU32::new(files).expect("a corpus limit is not 0");
+    DebugRequest {
+        patch_limits: PatchLimits {
+            max_changed_files: files,
+            ..PatchLimits::DEFAULT
+        },
+        ..request()
     }
 }
 
@@ -794,7 +990,15 @@ fn agent_after(triage: Vec<Response<TriageReport>>) -> AgentScript {
         triage,
         write_reproduction: vec![written(b"test")],
         analyze_root_cause: vec![analyzed(citations())],
-        write_fix: vec![written(b"diff")],
+        write_fix: vec![written(&fix_diff())],
+    }
+}
+
+/// The delivering agent with another fix.
+fn fixing(diff: Vec<u8>) -> AgentScript {
+    AgentScript {
+        write_fix: vec![written(&diff)],
+        ..delivering_agent()
     }
 }
 
@@ -884,8 +1088,8 @@ pub fn fault_scenarios() -> Vec<AppScenario> {
 pub fn hand_written() -> Vec<AppScenario> {
     vec![
         scenario("delivered", vec![request()]),
-        scenario("delivered-at-limits", vec![limited(4_000, 7_000)]),
-        scenario("delivered-over-duration", vec![limited(1_000_000, 6_999)]),
+        scenario("delivered-at-limits", vec![limited(4_000, 8_000)]),
+        scenario("delivered-over-duration", vec![limited(1_000_000, 7_999)]),
         scenario("cost-exceeded-at-triage", vec![limited(999, 600_000)]),
         scenario("both-limits-crossed", vec![limited(999, 999)]),
         AppScenario {
@@ -1113,7 +1317,72 @@ pub fn hand_written() -> Vec<AppScenario> {
             ])]),
             ..scenario("blank-question", vec![request()])
         },
+        // The patch check (ADR-023, D8).
+        AppScenario {
+            agent: fixing(forbidden_fix()),
+            ..scenario("patch-forbidden-path", vec![request()])
+        },
+        AppScenario {
+            agent: fixing(diff_of(&[
+                (b"src/invoice.rs", Some(INVOICE_FIXED)),
+                (
+                    b"tests/invoice.test.ts",
+                    Some(&INVOICE_TEST.replace("test(", "test.skip(")),
+                ),
+            ])),
+            ..scenario("patch-disables-test", vec![request()])
+        },
+        AppScenario {
+            agent: fixing(two_file_fix()),
+            ..scenario("patch-over-file-limit", vec![file_limit(1)])
+        },
+        AppScenario {
+            agent: fixing(two_file_fix()),
+            ..scenario("patch-at-file-limit", vec![file_limit(2)])
+        },
+        AppScenario {
+            agent: fixing(Vec::new()),
+            ..scenario("patch-empty-fix", vec![request()])
+        },
+        AppScenario {
+            agent: fixing(diff_of(&[
+                (b"src/invoice.rs", Some(INVOICE_FIXED)),
+                (b"src/inv\xffoice.rs", Some(INVOICE_FIXED)),
+            ])),
+            ..scenario("patch-unreadable-path", vec![request()])
+        },
+        AppScenario {
+            agent: fixing(diff_of(&[(b"src/missing.rs", None)])),
+            ..scenario("patch-diff-does-not-apply", vec![request()])
+        },
+        scenario("patch-check-over-duration", vec![limited(1_000_000, 6_999)]),
+        AppScenario {
+            agent: fixing(forbidden_fix()),
+            ..scenario(
+                "patch-refused-over-duration",
+                vec![limited(1_000_000, 6_999)],
+            )
+        },
     ]
+}
+
+/// The fix plus an edit of the CI configuration.
+fn forbidden_fix() -> Vec<u8> {
+    diff_of(&[
+        (
+            b".github/workflows/ci.yml",
+            Some("on: push\njobs: {}\n# ok\n"),
+        ),
+        (b"src/invoice.rs", Some(INVOICE_FIXED)),
+    ])
+}
+
+/// The fix plus a new file: two changed files.
+fn two_file_fix() -> Vec<u8> {
+    diff_of(&[
+        (b"src/invoice.rs", Some(INVOICE_FIXED)),
+        (b"src/rounding.rs", Some("pub const CENT: u64 = 1;\n")),
+    ])
 }
 
 #[cfg(test)]

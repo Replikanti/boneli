@@ -503,6 +503,8 @@ D3's.
 - Nothing calls the policy yet. #68 wires it into the run with a `Git`
   port operation, its contract clause and mutant (ADR-004), an evaluation
   point between `FixWritten` and `VerifyFix` and a `GateFailure` for it.
+  ADR-023 closes this: the run checks every fix with the policy before it
+  is verified.
 
 ## Alternatives considered
 

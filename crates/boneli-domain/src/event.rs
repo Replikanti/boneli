@@ -2,13 +2,14 @@
 //!
 //! Every job result carries the job's [`Usage`]; the two forge results
 //! (`QuestionsPosted`, `PullRequestOpened`) and the ticket spend no agent
-//! budget and carry none.
+//! budget and carry none. `PatchChecked` is the patch policy's result
+//! between `FixWritten` and `FixVerified` (ADR-023, D1).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::budget::Usage;
-use crate::gate::{CitationStatus, FixChecks, TestStatus};
+use crate::gate::{CitationStatus, FixChecks, PatchCheck, TestStatus};
 use crate::values::{Citation, CommitSha, EvidenceRef, Ticket};
 
 /// The result of triage.
@@ -82,6 +83,14 @@ pub enum RunEvent {
         /// What the job consumed.
         usage: Usage,
     },
+    /// The patch policy judged the diff, applied to the base (ADR-023).
+    PatchChecked {
+        /// The limits it was judged against and the verdict, or the path
+        /// that left it nothing to judge.
+        check: PatchCheck,
+        /// What the job consumed.
+        usage: Usage,
+    },
     /// The fix was checked in a clean sandbox.
     FixVerified {
         /// The observations of the fix gate.
@@ -123,6 +132,8 @@ pub enum EventKind {
     CitationsChecked,
     /// [`RunEvent::FixWritten`].
     FixWritten,
+    /// [`RunEvent::PatchChecked`].
+    PatchChecked,
     /// [`RunEvent::FixVerified`].
     FixVerified,
     /// [`RunEvent::PullRequestOpened`].
@@ -133,7 +144,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 11] = [
+    pub const ALL: [EventKind; 12] = [
         EventKind::TicketReceived,
         EventKind::TriageFinished,
         EventKind::QuestionsPosted,
@@ -142,6 +153,7 @@ impl EventKind {
         EventKind::RootCauseProposed,
         EventKind::CitationsChecked,
         EventKind::FixWritten,
+        EventKind::PatchChecked,
         EventKind::FixVerified,
         EventKind::PullRequestOpened,
         EventKind::JobFailed,
@@ -160,6 +172,7 @@ impl RunEvent {
             RunEvent::RootCauseProposed { .. } => EventKind::RootCauseProposed,
             RunEvent::CitationsChecked { .. } => EventKind::CitationsChecked,
             RunEvent::FixWritten { .. } => EventKind::FixWritten,
+            RunEvent::PatchChecked { .. } => EventKind::PatchChecked,
             RunEvent::FixVerified { .. } => EventKind::FixVerified,
             RunEvent::PullRequestOpened { .. } => EventKind::PullRequestOpened,
             RunEvent::JobFailed { .. } => EventKind::JobFailed,
@@ -178,6 +191,7 @@ impl RunEvent {
             | RunEvent::RootCauseProposed { usage, .. }
             | RunEvent::CitationsChecked { usage, .. }
             | RunEvent::FixWritten { usage, .. }
+            | RunEvent::PatchChecked { usage, .. }
             | RunEvent::FixVerified { usage, .. }
             | RunEvent::JobFailed { usage, .. } => Some(*usage),
         }

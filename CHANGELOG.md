@@ -25,7 +25,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Blank caller input is a `DomainError`: ticket key or title, forge
   references, `JobFailed` details and evidence references.
 - `boneli_domain::scenarios`: 63 event sequences that the domain's unit
-  tests and the replay gate fold.
+  tests and the replay gate fold (70 with the patch check, ADR-023).
 - `boneli-replay-check`: a test-only root that folds the scenarios in two
   child processes and in its own, checks that address randomization is on,
   and compares the `Debug` output and the `Display` of every error byte for
@@ -615,6 +615,20 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `chmod`.
 - `boneli_git_cli::OpenError::Root` (#85, ADR-024): a root, or one of its
   ancestors, that breaks a root rule.
+- The patch policy in the run (part 2 of #68, ADR-023 accepted): after
+  `FixWritten` the run emits `CheckPatch`, and `DebugTicket` loads the
+  diff, fetches the base, applies the diff, describes the change with
+  `Git::patch_between` and judges it with `patch_policy` under the
+  request's limits. The result is the new event `PatchChecked { check,
+  usage }` (`PatchCheck::Judged { limits, verdict }` or
+  `PatchCheck::Unreadable`), and `patch_gate` lets the run go on to
+  `VerifyFix` only on a `Pass`: a refusal ends it as
+  `GateFailed(PatchRefused(violations))`, an empty refusal included, a
+  path that is not UTF-8 as `GateFailed(PatchUnreadable)`, and a diff
+  that does not apply as `JobFailed` awaiting `PatchChecked`.
+  `DebugTicket` gets the `Git` port; `DebugRequest` gets `repo` and
+  `patch_limits`. Domain corpus 70 scenarios, app corpus 2,978
+  (40 hand-written), git calls in the fault matrix.
 
 - `boneli-sys`: a statistics keeper per sandbox cgroup (ADR-007 D8,
   #54). The last step of `Cgroup::create` starts the thread
@@ -644,6 +658,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Root`, not an `ENOTDIR` `Io`. The root is created under the resolved
   parent, and `GitCli::root()` returns that path. An `Io` error names the
   path and keeps its kind.
+- Run log format version 2 in `boneli-store-fs` (ADR-023 D7): new logs
+  are written as version 2 with the `PatchChecked` encoding, and
+  `MAX_DEPTH` is 6 (was 3); `MAX_VALUES` and `MAX_LINE_BYTES` stay. A
+  version 1 log still loads unless it holds `FixWritten` or
+  `PatchChecked`, which would replay differently under the new run table,
+  and `append` refuses those two events on it. `DebugTicket` has a new
+  field `git` and `DebugRequest` the fields `repo` and `patch_limits`;
+  `RunEvent`, `EventKind`, `RunCommand` and `GateFailure` have new
+  variants (#68).
 - The root rules of `boneli-oci` and `boneli-store-fs` live in
   `boneli-private-dir` (#66, ADR-021); the error variants and texts of both
   adapters are unchanged. A missing root is created at the path the

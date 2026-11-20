@@ -8,6 +8,7 @@
 
 use alloc::vec::Vec;
 
+use crate::patch::{PatchLimits, PatchVerdict, PatchViolation, UnreadablePath};
 use crate::values::{Citation, CommitSha, is_blank};
 
 /// The result of one test run.
@@ -107,6 +108,22 @@ pub enum CitationProblem {
     NotOnBase,
 }
 
+/// What the patch check observed (ADR-023, D1): the policy's verdict and
+/// the limits it judged against, or the first path that left the policy
+/// nothing to judge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatchCheck {
+    /// The policy ran.
+    Judged {
+        /// The run's limits, as the policy got them.
+        limits: PatchLimits,
+        /// Its verdict.
+        verdict: PatchVerdict,
+    },
+    /// A path the patch would carry is not UTF-8 (ADR-023, D6).
+    Unreadable(UnreadablePath),
+}
+
 /// Why a gate did not pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateFailure {
@@ -143,6 +160,13 @@ pub enum GateFailure {
     FixCheckFailed(FixCheck),
     /// A fix check is unknown, or a required one is not configured.
     FixCheckInconclusive(FixCheck),
+    /// The patch policy refused the fix; every violation, in the policy's
+    /// order. Empty only when the verdict was a `Reject` without one, which
+    /// fails closed too (ADR-023, D2).
+    PatchRefused(Vec<PatchViolation>),
+    /// A path the patch would carry is not UTF-8, so the policy could not
+    /// judge it (ADR-023, D6).
+    PatchUnreadable(UnreadablePath),
 }
 
 /// The decision of one gate.
@@ -298,6 +322,26 @@ pub fn fix_gate(checks: &FixChecks) -> GateOutcome {
         Some(failure) => GateOutcome::Fail(failure),
         None => GateOutcome::Pass,
     }
+}
+
+/// Patch gate (ADR-023, D2): only a `Judged` check whose verdict is
+/// `Pass` passes. A `Reject` fails with its violations, an empty list
+/// included, and an unreadable path fails as such. The limits are not
+/// checked against the verdict: the application runs the policy with the
+/// limits it records, under the replay gate (ADR-023, D3).
+pub fn patch_gate(check: &PatchCheck) -> GateOutcome {
+    let failure = match check {
+        PatchCheck::Judged {
+            verdict: PatchVerdict::Pass { .. },
+            ..
+        } => return GateOutcome::Pass,
+        PatchCheck::Judged {
+            verdict: PatchVerdict::Reject(violations),
+            ..
+        } => GateFailure::PatchRefused(violations.clone()),
+        PatchCheck::Unreadable(path) => GateFailure::PatchUnreadable(*path),
+    };
+    GateOutcome::Fail(failure)
 }
 
 fn check_failure(field: FixCheck, status: CheckStatus, required: bool) -> Option<GateFailure> {
@@ -504,6 +548,42 @@ mod tests {
             FixCheck::PreviouslyGreenTests => checks.previously_green_tests = status,
             FixCheck::Lint => checks.lint = status,
             FixCheck::Typecheck => checks.typecheck = status,
+        }
+    }
+
+    #[test]
+    fn patch_gate_table() {
+        let limits = PatchLimits::DEFAULT;
+        let judged = |verdict| PatchCheck::Judged { limits, verdict };
+        for (files, lines) in [(1, 2), (0, 0), (u32::MAX, u32::MAX)] {
+            assert_eq!(
+                patch_gate(&judged(PatchVerdict::Pass { files, lines })),
+                GateOutcome::Pass,
+                "{files} {lines}"
+            );
+        }
+        let violations = vec![
+            PatchViolation::Empty,
+            PatchViolation::Gitlink { index: 3 },
+            PatchViolation::TooManyLines { limit: 7 },
+        ];
+        assert_eq!(
+            patch_gate(&judged(PatchVerdict::Reject(violations.clone()))),
+            GateOutcome::Fail(GateFailure::PatchRefused(violations))
+        );
+        // A `Reject` without a violation never passes (fail closed).
+        assert_eq!(
+            patch_gate(&judged(PatchVerdict::Reject(vec![]))),
+            GateOutcome::Fail(GateFailure::PatchRefused(vec![]))
+        );
+        for path in [
+            UnreadablePath::Change { index: 0 },
+            UnreadablePath::BaseLink { index: usize::MAX },
+        ] {
+            assert_eq!(
+                patch_gate(&PatchCheck::Unreadable(path)),
+                GateOutcome::Fail(GateFailure::PatchUnreadable(path))
+            );
         }
     }
 

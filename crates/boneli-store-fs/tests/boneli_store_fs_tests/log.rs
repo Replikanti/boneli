@@ -5,9 +5,11 @@ use std::time::Instant;
 
 use boneli_app::{EventStore, RunLog, RunStart, StoreError};
 use boneli_domain::{
-    Budget, CommitSha, EvidenceRef, RunEvent, RunId, Ticket, TicketSource, TriageVerdict, Usage,
+    Budget, CommitSha, EvidenceRef, ForbiddenClass, LinkProblem, Marker, NotText, PatchCheck,
+    PatchLimits, PatchVerdict, PatchViolation, RunEvent, RunId, TestDisabling, Ticket,
+    TicketSource, TriageVerdict, Usage,
 };
-use boneli_store_fs::{FsStore, MAX_LINE_BYTES, MAX_VALUES};
+use boneli_store_fs::{FsStore, MAX_DEPTH, MAX_LINE_BYTES, MAX_VALUES};
 
 use crate::support::{
     Fresh, TempDir, append_raw, id, log_path, marker, names_in, sha256_hex, start,
@@ -19,7 +21,7 @@ const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 /// The header line `create` writes for [`start`], without its `\n`.
 fn header_line(run: &str) -> String {
     format!(
-        "{{\"format\":\"boneli-run-log\",\"version\":1,\"run\":\"{run}\",\"budget\":{{\"cost_micro_usd\":1000000,\"duration_ms\":600000}},\"previous\":null}}"
+        "{{\"format\":\"boneli-run-log\",\"version\":2,\"run\":\"{run}\",\"budget\":{{\"cost_micro_usd\":1000000,\"duration_ms\":600000}},\"previous\":null}}"
     )
 }
 
@@ -160,8 +162,8 @@ fn header_run_mismatch_fails_closed() {
     assert_eq!(fresh.load(&a), Ok(log_of(vec![marker(1)])));
 }
 
-/// Version 2, version `1.0`, another format or a header with an extra key
-/// fails closed.
+/// Version 3, version 0, version `2.0`, another format or a header with an
+/// extra key fails closed.
 #[test]
 fn unknown_format_or_version_fails_closed() {
     let fresh = Fresh::new("format-version");
@@ -170,9 +172,11 @@ fn unknown_format_or_version_fails_closed() {
     let path = log_path(fresh.store.root(), &run);
     let good = header_line("run-1");
     for header in [
-        good.replace("\"version\":1", "\"version\":2"),
-        good.replace("\"version\":1", "\"version\":1.0"),
-        good.replace("\"version\":1", "\"version\":\"1\""),
+        good.replace("\"version\":2", "\"version\":3"),
+        good.replace("\"version\":2", "\"version\":0"),
+        good.replace("\"version\":2", "\"version\":2.0"),
+        good.replace("\"version\":2", "\"version\":\"2\""),
+        good.replace("\"version\":2", "\"version\":1.0"),
         good.replace("boneli-run-log", "boneli-run-log2"),
         good.replace(",\"previous\":null}", ",\"previous\":null,\"extra\":0}"),
         good.replace(",\"previous\":null}", "}"),
@@ -423,6 +427,189 @@ fn error_details_never_echo_content() {
         assert!(!shown.contains(SECRET), "{shown}");
         assert!(matches!(error, StoreError::Unavailable { .. }), "{shown}");
     }
+}
+
+/// The events of a run up to `CitationsChecked`, as version 1 had them.
+fn before_the_fix() -> Vec<RunEvent> {
+    let usage = Usage {
+        cost_micro_usd: 1,
+        duration_ms: 2,
+    };
+    vec![
+        RunEvent::TicketReceived {
+            ticket: Ticket {
+                source: TicketSource::GitHub,
+                key: String::from("BUG-1"),
+                title: String::from("t"),
+                body: String::new(),
+            },
+            base: CommitSha::parse(SHA).expect("sha"),
+        },
+        RunEvent::TriageFinished {
+            verdict: TriageVerdict::NeedsInformation {
+                questions: vec![String::from("Which record?")],
+            },
+            usage,
+        },
+        marker(1),
+    ]
+}
+
+fn fix_written() -> RunEvent {
+    RunEvent::FixWritten {
+        diff: EvidenceRef::parse("sha256:00").expect("reference"),
+        usage: Usage::default(),
+    }
+}
+
+fn patch_checked() -> RunEvent {
+    RunEvent::PatchChecked {
+        check: PatchCheck::Judged {
+            limits: PatchLimits::DEFAULT,
+            verdict: PatchVerdict::Pass { files: 1, lines: 2 },
+        },
+        usage: Usage::default(),
+    }
+}
+
+/// Turns the log's header into a version 1 header; the event lines are
+/// the same in both versions.
+fn make_version_1(path: &Path) {
+    let text = std::fs::read_to_string(path).expect("read");
+    let (header, rest) = text.split_once('\n').expect("a header line");
+    assert!(header.contains("\"version\":2,"), "{header}");
+    let header = header.replace("\"version\":2,", "\"version\":1,");
+    std::fs::write(path, format!("{header}\n{rest}")).expect("write");
+}
+
+/// A version 1 log that ends before `FixWritten` loads as written, so a
+/// previous-run lookup (ADR-004, D6) still finds its questions, and it
+/// takes appends of events version 1 allows.
+#[test]
+fn version_1_log_before_fix_written_loads() {
+    let fresh = Fresh::new("v1-loads");
+    let run = id("run-1");
+    fresh.create(&run, &start()).expect("create");
+    for event in before_the_fix() {
+        fresh.append(&run, &event).expect("append");
+    }
+    let path = log_path(fresh.store.root(), &run);
+    make_version_1(&path);
+    assert_eq!(fresh.load(&run), Ok(log_of(before_the_fix())));
+    fresh
+        .append(&run, &marker(2))
+        .expect("append to a version 1 log");
+    let mut events = before_the_fix();
+    events.push(marker(2));
+    assert_eq!(fresh.load(&run), Ok(log_of(events.clone())));
+    // The fix cannot be appended to it: the log would no longer load.
+    for event in [fix_written(), patch_checked()] {
+        let before = std::fs::read(&path).expect("read");
+        let refused = unavailable_detail(fresh.append(&run, &event));
+        assert!(refused.contains("version 1"), "{refused}");
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+    }
+    assert_eq!(fresh.load(&run), Ok(log_of(events)));
+}
+
+/// A version 1 log that holds `FixWritten` is refused: under version 2 the
+/// event after it replays differently.
+#[test]
+fn version_1_log_past_fix_written_is_refused() {
+    let fresh = Fresh::new("v1-fix");
+    let run = id("run-1");
+    fresh.create(&run, &start()).expect("create");
+    for event in before_the_fix() {
+        fresh.append(&run, &event).expect("append");
+    }
+    fresh.append(&run, &fix_written()).expect("append");
+    let path = log_path(fresh.store.root(), &run);
+    make_version_1(&path);
+    assert_fails_closed(&fresh, &run, &path, Some(5), "version 1 with FixWritten");
+}
+
+/// `PatchChecked`, which version 1 did not have, in a version 1 log is
+/// refused; the same lines under the version 2 header load.
+#[test]
+fn version_1_patch_checked_is_refused() {
+    let fresh = Fresh::new("v1-patch");
+    let run = id("run-1");
+    fresh.create(&run, &start()).expect("create");
+    fresh.append(&run, &marker(1)).expect("append");
+    fresh.append(&run, &patch_checked()).expect("append");
+    assert_eq!(
+        fresh.load(&run),
+        Ok(log_of(vec![marker(1), patch_checked()]))
+    );
+    let path = log_path(fresh.store.root(), &run);
+    make_version_1(&path);
+    assert_fails_closed(&fresh, &run, &path, Some(3), "version 1 with PatchChecked");
+}
+
+/// The worst-case `PatchChecked` line of ADR-023 D7: a size violation and,
+/// for each of `files` changes, the most violations one change can have
+/// (`Forbidden`, `Gitlink`, `NotText`, `Link` with a payload, every
+/// marker and the three other test families), each at its most values.
+fn worst_case_check(files: usize) -> RunEvent {
+    let mut violations = vec![PatchViolation::TooManyLines { limit: u32::MAX }];
+    for index in 0..files {
+        violations.push(PatchViolation::Forbidden {
+            index,
+            class: ForbiddenClass::Dependencies,
+        });
+        violations.push(PatchViolation::Gitlink { index });
+        violations.push(PatchViolation::NotText {
+            index,
+            reason: NotText::BidiControl,
+        });
+        violations.push(PatchViolation::Link {
+            index,
+            problem: LinkProblem::Encloses(ForbiddenClass::RepositoryMetadata),
+        });
+        for marker in Marker::ALL {
+            violations.push(PatchViolation::DisablesTests {
+                index,
+                reason: TestDisabling::Marker(marker),
+            });
+        }
+        for reason in [
+            TestDisabling::DeletedTestFile,
+            TestDisabling::TestsRemoved,
+            TestDisabling::TestConfigChanged,
+        ] {
+            violations.push(PatchViolation::DisablesTests { index, reason });
+        }
+    }
+    RunEvent::PatchChecked {
+        check: PatchCheck::Judged {
+            limits: PatchLimits::DEFAULT,
+            verdict: PatchVerdict::Reject(violations),
+        },
+        usage: Usage {
+            cost_micro_usd: u64::MAX,
+            duration_ms: u64::MAX,
+        },
+    }
+}
+
+/// The log-line bound of a verdict (ADR-023, D7): 17 values for the event
+/// and the size violation, 134 per change, so 488 changes are 65,409
+/// values and append, and 489 are 65,543, above `MAX_VALUES`, and are
+/// refused before the file is touched. The worst case nests at
+/// `MAX_DEPTH`.
+#[test]
+fn patch_verdict_line_bound() {
+    assert_eq!((MAX_VALUES, MAX_DEPTH), (65_536, 6));
+    assert_eq!(17 + 134 * 488, 65_409);
+    assert_eq!(17 + 134 * 489, 65_543);
+    let (fresh, run, path) = one_run("verdict-bound");
+    let fits = worst_case_check(488);
+    fresh.append(&run, &fits).expect("488 changes fit");
+    let before = std::fs::read(&path).expect("read");
+    let refused = unavailable_detail(fresh.append(&run, &worst_case_check(489)));
+    assert!(refused.contains("TooManyValues"), "{refused}");
+    assert_eq!(std::fs::read(&path).expect("read"), before);
+    assert_eq!(fresh.load(&run), Ok(log_of(vec![marker(1), fits])));
 }
 
 /// Logs written before the store is dropped load the same after a reopen;
