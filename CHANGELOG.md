@@ -496,6 +496,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   aarch64, and the `num-traits` build script are approved by ADR-016.
   ADR-005's post-quantum known limit points to ADR-016, which
   `docs/adr/README.md` now allows.
+- `boneli-https` (#38, ADR-017): certificate revocation by CRL. After
+  rustls has verified the chain, the CRL distribution points of the leaf
+  are read with a small DER reader of the crate's own, fetched over HTTP
+  (`https` points without a check of their own), cached per `TlsConfig`
+  for at most 24 hours since a fetch last returned them and never past
+  their `nextUpdate`, with a soft refresh that keeps a failing refresh
+  from failing connections before `nextUpdate`, and the chain is
+  verified again with rustls' `WebPkiServerVerifier`, leaf only. A
+  listed leaf fails with `Error::Revoked`, a leaf whose points yield no
+  list that settles it with `Error::RevocationUnknown` (fail closed, no
+  opt-out); a leaf without a point passes unchecked.
+  `TlsStream::revocation` reports what the check found, resumed sessions
+  are checked again, `TlsDial` bounds the fetch by its request deadline,
+  and `TlsConfig::with_crl_source` takes a `CrlSource` of the caller's.
+  Limits are public constants: 32 MiB per list, 64 MiB per cache, 62 s
+  per check. No new crate or edge. ADR-005's revocation known limit
+  points to ADR-017.
 
 ### Changed
 

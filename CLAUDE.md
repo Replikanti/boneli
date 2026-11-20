@@ -253,7 +253,11 @@ skips, without it or without the group. CI runs it in `check` on every
 PR. `tests/network.rs` checks the group against
 pq.cloudflareresearch.com and runs by hand before a change to
 `crates/boneli-https/src/pq.rs` or to the key exchange group lists of
-`TlsConfig` merges.
+`TlsConfig` merges. It also holds the revocation live tests (ADR-017):
+Let's Encrypt's revoked test site must fail with `Error::Revoked`, its
+valid one must be checked against its CRL, and the revocation status of
+the runner's hosts is printed; run them by hand before a change under
+`crates/boneli-https/src/revocation/` merges.
 
 ```sh
 cargo test -p boneli-https --test interop -- --ignored
