@@ -969,11 +969,11 @@
    "title": "boneli-oci: evict unused layers from the image cache",
    "epic": null,
    "order": 38,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "03af0ec4",
-   "pr": null,
+   "pr": 92,
    "note": "",
-   "updated_at": "2026-11-20T19:57:21+00:00",
+   "updated_at": "2026-11-20T21:39:10+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1214,14 +1214,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T13:20:03+00:00",
-   "issue": 79,
-   "from": "ready",
-   "to": "claimed",
-   "by": "0d47f612",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T13:27:24+00:00",
    "issue": 68,
@@ -1613,6 +1605,14 @@
    "to": "pr-review",
    "by": "47331c5b",
    "note": null
+  },
+  {
+   "at": "2026-11-20T21:39:10+00:00",
+   "issue": 56,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "03af0ec4",
+   "note": null
   }
  ],
  "open": [
@@ -1647,7 +1647,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T21:03:00+00:00",
+ "updated_at": "2026-11-20T21:39:10+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
