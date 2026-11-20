@@ -133,8 +133,11 @@ The numbers, each with its own reason:
 Step 5 creates the root at its *prospective resolved path*, not through
 the path as given, and runs the text rule on that path first. For every
 input without a concurrent change on the filesystem, the result (the
-returned path, or the error's variant, path and reason) is the same as
-the copies gave. Two side effects go away:
+returned path, or the error's variant and reason) is the same as the
+copies gave, and so is the error's path, with one exception: an `Io`
+error from creating the root names the prospective resolved path, not
+the path as given (`<d>/file/` reports `<d>/file`). No consumer matches
+on that path. Two side effects go away:
 
 - A root whose resolved path the text rule refuses is refused before it
   is created, so `<d>/link -> <d>/real:dir` leaves `real:dir` empty.
