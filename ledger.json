@@ -889,8 +889,8 @@
    "state": "pr-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR #78 open",
-   "updated_at": "2026-11-20T16:04:03+00:00",
+   "note": "PR 78 79cec85: QA ship-it after fix round 1; STOP 2: upstream kernel report decision",
+   "updated_at": "2026-11-20T16:24:49+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1167,14 +1167,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T04:28:10+00:00",
-   "issue": 38,
-   "from": "ready",
-   "to": "claimed",
-   "by": "14f36a32",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T05:00:50+00:00",
    "issue": 38,
@@ -1566,6 +1558,14 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #86 open"
+  },
+  {
+   "at": "2026-11-20T16:24:49+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "pr-review",
+   "by": "98fa59e8",
+   "note": "PR 78 79cec85: QA ship-it after fix round 1; STOP 2: upstream kernel report decision"
   }
  ],
  "open": [
@@ -1602,7 +1602,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T16:21:55+00:00",
+ "updated_at": "2026-11-20T16:24:49+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
