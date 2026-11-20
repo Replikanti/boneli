@@ -29,14 +29,24 @@
 //! - [`OciImageStore`] is the `ImageStore` adapter: it opens a private
 //!   root, pulls through the client, keeps documents and layers by digest
 //!   and hands out the layer directories and the image config of a pulled
-//!   root filesystem; [`StoreConfig`] holds the values ADR-009 states.
+//!   root filesystem as a [`Lease`]; [`StoreConfig`] holds the values
+//!   ADR-009 states.
+//!
+//! Locks (ADR-025): every store holds an owner lock under the root while
+//! it lives, which tells other stores, in any namespace and after a
+//! reboot, whether the owner of a temporary name is gone. Every user of a
+//! layer holds a [`LayerPin`] on it: a pull pins all layers of its image
+//! before it fetches one, and a [`Lease`] keeps them pinned while a
+//! sandbox uses them.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
 mod error;
 mod gzip;
 mod layers;
+mod lease;
 mod limits;
+mod lock;
 mod manifest;
 mod reference;
 mod registry;
@@ -52,7 +62,8 @@ mod zstd;
 // the registry client's callers keep their paths.
 pub use boneli_https::{Dial, Stream, TlsDial};
 pub use error::{Error, PullError};
-pub use layers::LayerCache;
+pub use layers::{LayerCache, LayerPin};
+pub use lease::Lease;
 pub use limits::{Budget, Limits};
 pub use manifest::{Descriptor, Document, Entry, ImageConfig, Index, Layer, Manifest};
 pub use reference::{Digest, Platform, Reference, RegistryHost, Repository};

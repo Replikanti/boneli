@@ -101,8 +101,11 @@ mod host {
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).expect("staging");
         let mounts = base_layer(&base);
+        // The lease pins the layers from before the mount until the sandbox
+        // is gone (ADR-025, D2).
+        let lease = store.lease(&rootfs).expect("lease");
         let mut layers = vec![base];
-        layers.extend(store.layers(&rootfs).expect("layers"));
+        layers.extend_from_slice(lease.layers());
         let paths = "/etc/gone,/etc/stays,/opq/old,/opq/new,/keep,/private,/private/a,\
                      /private/b,/pipe,/link";
         let seen = sandbox::probe(
@@ -287,7 +290,10 @@ mod host {
     /// without `--proc`), `getpid()` is 1 while `/proc/1` is the host's
     /// init. Judged by that `/proc`, this process's own staging name looks
     /// dead and a second `open` used to delete it mid-pull. Now `open`
-    /// judges no owner there, so every owned name stays (ADR-009, D8).
+    /// judges no owner there by `/proc`, so every owned name without an
+    /// owner lock file stays (ADR-009, D8); an owner whose lock file is
+    /// free is removed there too, since the lock does not read `/proc`
+    /// (ADR-025, D1).
     #[test]
     #[ignore = "host: needs an unprivileged user and PID namespace"]
     fn foreign_proc_judges_no_owner() {
@@ -340,9 +346,24 @@ mod host {
         for path in &kept {
             std::fs::create_dir_all(path.join("usr")).expect("staging");
         }
+        // An owner with a free lock file is dead whatever `/proc` shows
+        // (ADR-025, D1): its names go, then its lock file.
+        let token = crate::support::owner_token(&boot, ns, 4_194_302, start);
+        let lock = root.join("locks/owners").join(&token);
+        std::fs::write(&lock, b"").expect("owner lock");
+        let removed = [
+            layers.join(crate::support::owned_name(".tmp-", &token, 95)),
+            blobs.join(crate::support::owned_name(".tmp-", &token, 94)),
+        ];
+        for path in &removed {
+            std::fs::create_dir_all(path.join("usr")).expect("staging");
+        }
         drop(open(&root, &fake));
         for path in &kept {
             assert!(path.is_dir(), "{} was swept", path.display());
+        }
+        for path in removed.iter().chain([&lock]) {
+            assert!(!path.exists(), "{} was kept", path.display());
         }
         drop(first);
     }
@@ -747,8 +768,9 @@ mod network {
                     media
                 );
             }
-            let layers = store.layers(&rootfs).expect("layers");
-            let config = store.config(&rootfs).expect("config");
+            let lease = store.lease(&rootfs).expect("lease");
+            let layers = lease.layers().to_vec();
+            let config = lease.config().clone();
             let env: Vec<(&str, &str)> = config
                 .env
                 .iter()

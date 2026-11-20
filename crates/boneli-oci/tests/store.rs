@@ -373,7 +373,7 @@ fn unremovable_leftover_skipped() {
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
         .expect("pull");
-    assert_eq!(store.layers(&rootfs).expect("layers").len(), 3);
+    assert_eq!(store.lease(&rootfs).expect("lease").layers().len(), 3);
     drop(store);
     drop(open(&root, &fake));
 }
@@ -454,8 +454,8 @@ fn concurrent_pulls_two_stores() {
         });
         let ra = ra.expect("store a");
         assert_eq!(Ok(ra.clone()), rb);
-        let layers = a.layers(&ra).expect("layers");
-        assert_eq!(b.layers(&ra).expect("layers"), layers);
+        let layers = a.lease(&ra).expect("lease").layers().to_vec();
+        assert_eq!(b.lease(&ra).expect("lease").layers().to_vec(), layers);
         for (layer, want) in layers.iter().zip(["etc/base", "usr/bin/tool", "etc/top"]) {
             assert!(
                 layer.join(want).is_file(),
@@ -600,8 +600,9 @@ fn stale_tmp_rules() {
     }
 }
 
-/// A manifest that lists one `diff_id` twice: `layers` returns it once, at
-/// its topmost position.
+/// A manifest that lists one `diff_id` twice: a lease, from `pull_leased`
+/// or from `lease`, lists it once, at its topmost position, and holds its
+/// lock file once (one descriptor per distinct layer, ADR-025 D2).
 #[test]
 fn duplicate_diff_id_keeps_topmost() {
     let mut hub = Hub::default();
@@ -616,19 +617,33 @@ fn duplicate_diff_id_keeps_topmost() {
     let fake = hub_fake(hub);
     let tmp = TempDir::new("dup");
     let store = open(&tmp.path().join("store"), &fake);
-    let rootfs = store
-        .pull(&image_ref("library/dup", &pushed.index))
+    let pulled = store
+        .pull_leased(&image_ref("library/dup", &pushed.index))
         .expect("pull");
-    let layers = store.layers(&rootfs).expect("layers");
+    let lease = store.lease(pulled.rootfs()).expect("lease");
+    assert_eq!(lease.layers(), pulled.layers());
+    let layers = lease.layers().to_vec();
     let names: Vec<String> = layers
         .iter()
         .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
         .collect();
     let hex = |d: &str| d.trim_start_matches("sha256:").to_owned();
     assert_eq!(names, vec![hex(&b.diff_id), hex(&a.diff_id)]);
+    let locks: Vec<String> = std::fs::read_dir(store.root().join("locks/sha256"))
+        .expect("locks")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(locks.len(), 2, "{locks:?}");
+    let fds: Vec<PathBuf> = std::fs::read_dir("/proc/self/fd")
+        .expect("fds")
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|p| p.starts_with(store.root().join("locks/sha256")))
+        .collect();
+    // One descriptor per distinct layer for each of the two leases.
+    assert_eq!(fds.len(), 4, "{fds:?}");
 }
 
-/// `pull`, then `layers` and `config`; the store reopened, then `layers`
+/// `pull`, then `lease` and `config`; the store reopened, then `lease`
 /// and `config` again: equal. The config carries the runtime fields. An
 /// unknown or malformed `RootfsRef` is `Failed`.
 #[test]
@@ -641,7 +656,7 @@ fn rootfs_ref_round_trip() {
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
         .expect("pull");
-    let layers = store.layers(&rootfs).expect("layers");
+    let layers = store.lease(&rootfs).expect("lease").layers().to_vec();
     let config = store.config(&rootfs).expect("config");
     assert_eq!(layers.len(), 3);
     assert_eq!(config.user.as_deref(), Some("999"));
@@ -652,7 +667,10 @@ fn rootfs_ref_round_trip() {
     drop(store);
     let store = open(&root, &fake);
     let reopened = RootfsRef::new(rootfs.as_str().to_owned());
-    assert_eq!(store.layers(&reopened).expect("layers"), layers);
+    assert_eq!(
+        store.lease(&reopened).expect("lease").layers().to_vec(),
+        layers
+    );
     assert_eq!(store.config(&reopened).expect("config"), config);
 }
 
@@ -678,7 +696,7 @@ fn unknown_rootfs_refused() {
     ] {
         let rootfs = RootfsRef::new(bad.to_owned());
         for got in [
-            store.layers(&rootfs).map(|_| ()),
+            store.lease(&rootfs).map(|_| ()),
             store.config(&rootfs).map(|_| ()),
         ] {
             match got {
@@ -789,7 +807,7 @@ fn layers_live_under_the_root() {
         .pull(&image_ref("library/app", &pushed.index))
         .expect("pull");
     let base: PathBuf = store.root().join("layers/sha256");
-    for layer in store.layers(&rootfs).expect("layers") {
+    for layer in store.lease(&rootfs).expect("lease").layers().to_vec() {
         assert_eq!(layer.parent(), Some(base.as_path()));
     }
 }
