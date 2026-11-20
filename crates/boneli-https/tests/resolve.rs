@@ -1084,6 +1084,14 @@ const SOCKET_ADDR_ARGS: [(&str, &str); 2] = [
     ("resolve/exchange.rs", "server"),
 ];
 
+/// The number of socket-address calls in each file under `src/` that has
+/// any, exactly as the tree holds them: the resolver's bind and connect,
+/// and the test servers' binds to `127.0.0.1:0`. `SOCKET_ADDR_ARGS`
+/// checks a name, not a type, so a new call whose argument has an
+/// allowed name but holds a host name changes the count and fails.
+const SOCKET_ADDR_CALLS: [(&str, usize); 2] =
+    [("resolve/exchange.rs", 2), ("revocation/http.rs", 6)];
+
 /// One token of a Rust source file. Comments are dropped and each
 /// literal is one token, so a name or a `)` inside them is not seen.
 #[derive(Debug)]
@@ -1107,12 +1115,17 @@ struct Token {
     line: usize,
 }
 
+// Identifiers are ASCII here: a non-ASCII character outside comments and
+// literals is a lex error. rustc's identifiers also take characters that
+// are not alphanumeric (a combining mark glues `X` and `crate` into one
+// name), and it skips some that `char::is_whitespace` does not (U+200E),
+// so a lexer that guessed at them could split or join names differently.
 fn is_ident_start(c: char) -> bool {
-    c == '_' || c.is_alphabetic()
+    c == '_' || c.is_ascii_alphabetic()
 }
 
 fn is_ident_continue(c: char) -> bool {
-    c == '_' || c.is_alphanumeric()
+    c == '_' || c.is_ascii_alphanumeric()
 }
 
 /// The lexer's position in a source file.
@@ -1194,8 +1207,9 @@ impl Lexer {
 }
 
 /// The tokens of a Rust source file. An unterminated literal or block
-/// comment is an error, so the scan fails closed instead of skipping
-/// the rest of the file.
+/// comment, or a non-ASCII character outside comments and literals, is
+/// an error, so the scan fails closed instead of skipping the rest of
+/// the file.
 fn lex(text: &str) -> Result<Vec<Token>, String> {
     let mut lx = Lexer {
         chars: text.chars().collect(),
@@ -1205,7 +1219,12 @@ fn lex(text: &str) -> Result<Vec<Token>, String> {
     let mut out = Vec::new();
     while let Some(c) = lx.peek(0) {
         let line = lx.line;
-        let tok = if c.is_whitespace() {
+        let tok = if !c.is_ascii() {
+            return Err(format!(
+                "{line}: non-ASCII character U+{:04X} outside a comment or literal",
+                u32::from(c)
+            ));
+        } else if c.is_whitespace() {
             lx.bump();
             continue;
         } else if c == '/' && lx.peek(1) == Some('/') {
@@ -1334,7 +1353,7 @@ fn tokens_text(toks: &[Token]) -> String {
 ///   the socket in its argument too and never passes; a turbofish or the
 ///   function as a value has no `(` after the name.
 ///
-/// Source the lexer cannot end is one hit.
+/// Source the lexer refuses (see `lex`) is one hit.
 fn std_lookup_hits(file: &str, text: &str) -> (Vec<String>, usize) {
     let toks = match lex(text) {
         Ok(toks) => toks,
@@ -1416,13 +1435,30 @@ fn std_lookup_hits(file: &str, text: &str) -> (Vec<String>, usize) {
     (hits, allowed)
 }
 
+/// The hits of `std_lookup_hits` in the source of `file` under `src/`,
+/// and, once there are none, one more when its count of socket-address
+/// calls differs from `SOCKET_ADDR_CALLS` (0 for a file not listed).
+fn crate_file_hits(file: &str, text: &str) -> Vec<String> {
+    let (mut hits, allowed) = std_lookup_hits(file, text);
+    let expected = SOCKET_ADDR_CALLS
+        .iter()
+        .find(|(f, _)| *f == file)
+        .map_or(0, |(_, n)| *n);
+    if hits.is_empty() && allowed != expected {
+        hits.push(format!(
+            "{file}: {allowed} socket-address calls, SOCKET_ADDR_CALLS says {expected}"
+        ));
+    }
+    hits
+}
+
 /// No call site of the crate resolves with std any more (ADR-022, D7):
 /// `TlsDial`, `connect` and the CRL and OCSP fetches go through
 /// `Resolver`, so no `getaddrinfo` runs outside a deadline. Neither
 /// `ToSocketAddrs` nor a std function that takes it may appear, in any
-/// form, except in a call whose argument is a socket address
-/// (`std_lookup_hits`). The scan reads tokens, so comments and string
-/// literals may name them.
+/// form, except in the calls whose argument is a socket address that
+/// `SOCKET_ADDR_CALLS` counts (`crate_file_hits`). The scan reads
+/// tokens, so comments and string literals may name them.
 #[test]
 fn crate_has_no_std_lookup() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1430,19 +1466,19 @@ fn crate_has_no_std_lookup() {
     sources(&root, &mut files);
     assert!(files.len() >= 15, "{files:?}");
     let mut hits = Vec::new();
-    let mut allowed = 0;
+    let mut seen = Vec::new();
     for file in &files {
         let relative = file.strip_prefix(&root).expect("under src");
         let relative = relative.to_str().expect("UTF-8 path");
         let text = std::fs::read_to_string(file).expect("source");
-        let (found, socket_addrs) = std_lookup_hits(relative, &text);
-        hits.extend(found);
-        allowed += socket_addrs;
+        hits.extend(crate_file_hits(relative, &text));
+        seen.push(relative.to_string());
     }
     assert!(hits.is_empty(), "{hits:#?}");
-    // The scan sees the calls that are there: the resolver's bind and
-    // connect, and the test servers' binds to 127.0.0.1:0.
-    assert!(allowed >= 3, "{allowed} socket-address calls");
+    // Every file the count pins is there, so its calls were counted.
+    for (file, _) in SOCKET_ADDR_CALLS {
+        assert!(seen.iter().any(|s| s == file), "{file} not under src");
+    }
 }
 
 /// The scan's rule on the forms it must catch and the ones it must let
@@ -1536,8 +1572,12 @@ fn std_lookup_scan_rule() {
         ),
         ("dial.rs", "reconnect(host); bind_all(host)", 0),
         ("dial.rs", "let path = \"../x.rs\";", 0),
-        // Not std's method: a look-alike with a Cyrillic letter.
-        ("dial.rs", "conn\u{435}ct(host)", 0),
+        // Non-ASCII in comments and literals.
+        (
+            "dial.rs",
+            "// conn\u{435}ct\n/* \u{200E} */ let s = \"\u{e9}\"; let c = '\u{e9}';",
+            0,
+        ),
     ];
     for (file, text, calls) in through {
         let (hits, allowed) = std_lookup_hits(file, text);
@@ -1604,6 +1644,13 @@ fn lex_fails_closed_on_unterminated_input() {
         "b\"abc",
         "'\\n",
         "'",
+        // Non-ASCII outside comments and literals: a combining mark that
+        // rustc reads as part of `X\u{301}crate`, a left-to-right mark
+        // it reads as whitespace, a Cyrillic look-alike, a lifetime.
+        "X\u{301}crate::connect(host)",
+        "#[path\u{200E}= \"../x.rs\"] mod m;",
+        "conn\u{435}ct(host)",
+        "fn f<'\u{e9}>() {}",
     ] {
         assert!(lex(text).is_err(), "{text:?}");
         let (hits, allowed) = std_lookup_hits("dial.rs", text);
@@ -1619,9 +1666,8 @@ fn std_lookup_scan_catches_each_form_in_real_sources() {
     let file = "resolve/exchange.rs";
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
     let text = std::fs::read_to_string(path).expect("source");
-    let (hits, allowed) = std_lookup_hits(file, &text);
+    let hits = crate_file_hits(file, &text);
     assert!(hits.is_empty(), "{hits:#?}");
-    assert!(allowed >= 2, "{allowed} socket-address calls");
     let mutants = [
         // Method turbofish.
         "fn mutant(s: &UdpSocket, host: &str) -> io::Result<()> {\n    s.connect::<&str>(host)\n}",
@@ -1635,9 +1681,15 @@ fn std_lookup_scan_catches_each_form_in_real_sources() {
         "macro_rules! dial {\n    ($($t:tt)*) => { $($t)* };\n}",
         "include!(\"../../mutant.rs\");",
         "#[path = \"../../mutant.rs\"]\nmod mutant;",
+        // A combining mark that makes `X\u{301}crate` one name to rustc,
+        // and a left-to-right mark it reads as whitespace.
+        "use std::net::TcpStream as X\u{301}crate;\nfn mutant(host: &str) -> io::Result<X\u{301}crate> {\n    X\u{301}crate::connect(host)\n}",
+        "#[rustfmt::skip]\n#[path\u{200E}= \"../../mutant.rs\"]\nmod mutant;",
+        // An allowed argument name that holds a host name.
+        "fn mutant(server: &str) -> io::Result<std::net::TcpStream> {\n    std::net::TcpStream::connect(server)\n}",
     ];
     for mutant in mutants {
-        let (hits, _) = std_lookup_hits(file, &format!("{text}\n{mutant}\n"));
+        let hits = crate_file_hits(file, &format!("{text}\n{mutant}\n"));
         assert_eq!(hits.len(), 1, "{mutant}: {hits:#?}");
     }
 }

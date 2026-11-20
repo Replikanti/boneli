@@ -382,7 +382,8 @@ in resolv.conf(5).
   scan reads tokens and keys on the names `connect`, `bind` and
   `send_to` whatever path or alias comes before them, so it catches the
   turbofish, the qualified path and the alias, and it refuses
-  `macro_rules!`, `include!` and a `#[path]` module.
+  `macro_rules!`, `include!`, a `#[path]` module and a non-ASCII
+  character outside comments and literals.
 - `boneli-https` has a DNS message parser now, hostile input in an
   always-review crate; its tests sweep every truncation and every byte
   flip of a valid answer.
