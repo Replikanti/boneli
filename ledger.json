@@ -1108,11 +1108,11 @@
    "title": "Patch policy: disabled-test detection for Python and in-source .vue/.svelte tests",
    "epic": null,
    "order": 42,
-   "state": "stopped",
-   "owner": "62531680",
+   "state": "ready",
+   "owner": null,
    "pr": null,
-   "note": "scout NO-GO: start gate 'second stack once onboarding on TypeScript works' not met; #14 and #15 open",
-   "updated_at": "2026-11-20T22:05:50+00:00",
+   "note": "released",
+   "updated_at": "2026-11-20T22:16:57+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1123,10 +1123,10 @@
     "debugger"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T16:04:03+00:00",
-   "issue": 85,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-20T16:04:03+00:00",
    "issue": 54,
@@ -1710,6 +1702,14 @@
    "to": "plan-review",
    "by": "17f7a4ac",
    "note": null
+  },
+  {
+   "at": "2026-11-20T22:16:57+00:00",
+   "issue": 69,
+   "from": "stopped",
+   "to": "ready",
+   "by": "62531680",
+   "note": "released"
   }
  ],
  "open": [
@@ -1743,7 +1743,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:14:26+00:00",
+ "updated_at": "2026-11-20T22:16:57+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
