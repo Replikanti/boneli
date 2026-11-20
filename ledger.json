@@ -1186,13 +1186,13 @@
    "title": "boneli-https: revocation check for intermediate CAs",
    "epic": null,
    "order": 45,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
+   "state": "claimed",
+   "owner": "f11746bb",
+   "user": "ylohnitram",
+   "machine": "df82df",
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-20T11:44:34+00:00",
+   "note": "",
+   "updated_at": "2026-11-20T22:06:00+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1203,8 +1203,8 @@
     "core"
    ],
    "manual": false,
-   "session": null,
-   "dispatched": null,
+   "session": true,
+   "dispatched": true,
    "parked": null
   },
   {
@@ -1311,14 +1311,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T15:12:48+00:00",
-   "issue": 79,
-   "from": "pr-review",
-   "to": "done",
-   "by": "0d47f612",
-   "note": null
-  },
   {
    "at": "2026-11-20T15:12:50+00:00",
    "issue": 54,
@@ -1710,6 +1702,14 @@
    "to": "stopped",
    "by": "62531680",
    "note": "scout NO-GO: start gate 'second stack once onboarding on TypeScript works' not met; #14 and #15 open"
+  },
+  {
+   "at": "2026-11-20T22:06:00+00:00",
+   "issue": 80,
+   "from": "ready",
+   "to": "claimed",
+   "by": "f11746bb",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1744,7 +1744,7 @@
   94
  ],
  "xopen": [],
- "updated_at": "2026-11-20T22:05:50+00:00",
+ "updated_at": "2026-11-20T22:06:00+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
