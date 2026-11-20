@@ -454,9 +454,9 @@ jobs:
           fi
           echo "OK: no step called Python"
 
-  # Temporary (#54, M1; removed before the PR leaves draft): the buffered
+  # Temporary (#54, M2a; removed before the PR leaves draft): the buffered
   # writer sweep of diag_54 on 16 x86_64 copies (so that at least one lands
-  # on AWS) and 2 arm64 copies, with kernel trace events through sudo.
+  # on AWS) and 2 arm64 copies. No trace events, no sudo beyond host setup.
   diag-54:
     name: diag-54 (${{ matrix.arch }} ${{ matrix.copy }})
     runs-on: ${{ matrix.runner }}
@@ -496,7 +496,6 @@ jobs:
           echo "lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo absent)"
           echo "workspace fs: $(findmnt -no MAJ:MIN,SOURCE,FSTYPE,OPTIONS -T "$GITHUB_WORKSPACE" 2>/dev/null || echo absent)"
           lsblk -o NAME,MAJ:MIN,TYPE,FSTYPE,SIZE,MOUNTPOINTS || true
-          echo "tracefs: $(sudo -n sh -c 'ls /sys/kernel/tracing/events/writeback/balance_dirty_pages 2>&1 | tr "\n" " "')"
       - name: Build
         run: cargo test -p boneli-sys --no-run
       - name: Prepare the runner host
@@ -510,7 +509,7 @@ jobs:
       - name: diag_54
         run: |
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
-            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_DIAG_54=1 BONELI_SYS_DIAG_54_TRACE=1 \
+            env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_DIAG_54=1 \
             cargo test -p boneli-sys --test boneli_sys_tests -- --ignored --exact diag_54::buffered_sweep --nocapture
 
   audit:

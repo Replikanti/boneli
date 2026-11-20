@@ -750,8 +750,10 @@ pub const PROGRESS_EVERY: usize = 16 << 20;
 /// `BONELI_PROBE_DIRECT` says ([`IoDirect`]: by default with `O_DIRECT`
 /// where the file system takes it, else `fdatasync` after every write),
 /// then `fdatasync`s and prints the elapsed time. Before that final
-/// `fdatasync` it prints `loop_ms`. With `never` the loop also prints a
-/// `progress` key every [`PROGRESS_EVERY`] bytes (`<MiB written>:<ms since
+/// `fdatasync` it prints `loop_ms`. With `never` it prints `loop_start=1`
+/// right before the loop (only there, so the other modes' writers keep
+/// their 38 bytes of output before the write, ADR-007 D8), and the loop
+/// prints a `progress` key every [`PROGRESS_EVERY`] bytes (`<MiB written>:<ms since
 /// the start>:<slowest write of the span in µs>`), so a writer killed in
 /// the loop leaves its timeline, and after the loop it reads its own
 /// cgroup once: `file_dirty` and `file_writeback` (`loop_file_dirty`,
@@ -849,6 +851,9 @@ fn io_write() {
         *word = x.to_ne_bytes();
     }
     let progress = plan.direct == IoDirect::Never;
+    if progress {
+        put("loop_start", "1");
+    }
     let start = std::time::Instant::now();
     let mut written = 0;
     let mut slowest = std::time::Duration::ZERO;
