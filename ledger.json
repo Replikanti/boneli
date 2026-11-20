@@ -851,11 +851,11 @@
    "title": "boneli-sys: buffered writers under io.max are OOM-killed on the 7.0 CI kernels",
    "epic": null,
    "order": 36,
-   "state": "pr-review",
+   "state": "plan-review",
    "owner": "98fa59e8",
    "pr": 78,
-   "note": "PR #78 open",
-   "updated_at": "2026-11-20T13:06:07+00:00",
+   "note": "Trace round: cause found (memcg_rstat_updated stops at the sandbox, parent reads stop flushing); re-plan keeper on per-sandbox reads",
+   "updated_at": "2026-11-20T13:10:55+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1097,14 +1097,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-18T21:07:54+00:00",
-   "issue": 18,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "774fe1a9",
-   "note": null
-  },
   {
    "at": "2026-11-18T21:39:48+00:00",
    "issue": 18,
@@ -1496,6 +1488,14 @@
    "to": "claimed",
    "by": "7e33749a",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T13:10:55+00:00",
+   "issue": 54,
+   "from": "pr-review",
+   "to": "plan-review",
+   "by": "98fa59e8",
+   "note": "Trace round: cause found (memcg_rstat_updated stops at the sandbox, parent reads stop flushing); re-plan keeper on per-sandbox reads"
   }
  ],
  "open": [
@@ -1534,7 +1534,7 @@
   81
  ],
  "xopen": [],
- "updated_at": "2026-11-20T13:06:42+00:00",
+ "updated_at": "2026-11-20T13:10:55+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
