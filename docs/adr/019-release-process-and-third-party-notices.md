@@ -68,7 +68,10 @@ the sandbox needs Linux 5.19 (ADR-007, D3), and the distributions that ship
 such a kernel ship glibc 2.35 or newer (Ubuntu 22.04: 2.35, Debian 12:
 2.36). `ubuntu-latest` (24.04, glibc 2.39) would shut out Debian 12 and
 Ubuntu 22.04 for nothing. The build logs the highest glibc symbol version
-each binary references, so the floor is visible per release.
+each binary references, so the floor is visible per release: the dry run
+on the PR that adds this ADR built a `boneli-egress` that references
+`GLIBC_2.34` at most on both architectures. The promise stays 2.35, the
+builder's, so a later binary may use anything the builder has.
 
 Rejected: **musl** (static binaries without a glibc floor). `ring`'s build
 script needs a musl C cross compiler that the runners do not have (measured
@@ -154,8 +157,14 @@ published.
 
 ### D7. Timeouts
 
-`build` has a provisional timeout of 60 minutes until the dry run of the
-PR that adds this ADR is measured.
+`build` has a timeout of 7 minutes: three times the slower leg of the dry
+run on the PR that adds this ADR, rounded up. Measured 2026-11-20 without a
+build cache: x86_64 1 min 59 s, aarch64 2 min 17 s, each from checkout to
+upload, `cargo test --workspace --locked` (1,137 tests) included. The
+factor covers a slower runner or registry; a timeout fails the release
+before `publish`, so the cost of a too-tight bound is a re-run. The bound
+grows with the binaries: the PR that adds a package to
+`tools/release-packages` runs the dry run, which gives the new measurement.
 `publish` and `rehearsal` have 10 minutes: a few API calls and uploads of
 a few MiB, so this is a hang bound, not a measurement; neither job can run
 before merge.

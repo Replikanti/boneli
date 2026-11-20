@@ -39,8 +39,10 @@ jobs:
   build:
     name: build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # Provisional until the dry run of #22 is measured (ADR-019, D7).
-    timeout-minutes: 60
+    # 3 x the slower leg of the dry run of #22 (aarch64, 2 min 17 s, cold:
+    # no build cache), rounded up (ADR-019, D7). Re-measure on the dry run
+    # of a PR that adds a package to tools/release-packages.
+    timeout-minutes: 7
     strategy:
       fail-fast: false
       matrix:
