@@ -7,9 +7,13 @@
 //! keepers through the descriptor each holds on its sandbox's
 //! `memory.stat` for exactly its thread's life: other tests create
 //! cgroups, and with them keepers, at any time, so threads are counted
-//! only in the unit tests, which run alone.
+//! only in the unit tests, which run alone. What a keeper reads is
+//! followed through inotify `IN_ACCESS` events on the files themselves,
+//! which every successful read raises, whoever holds the descriptor.
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -51,12 +55,110 @@ fn descriptors_of(path: &Path) -> usize {
         .count()
 }
 
+/// An inotify instance that watches files for reads (`IN_ACCESS`), read
+/// without blocking.
+struct ReadWatch {
+    fd: OwnedFd,
+    /// The watch descriptor of each file, in the order given.
+    watches: Vec<i32>,
+}
+
+impl ReadWatch {
+    fn new(files: &[&Path]) -> ReadWatch {
+        // SAFETY: inotify_init1 takes flags only.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(
+            raw >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: raw is a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let watches = files
+            .iter()
+            .map(|f| {
+                let c = CString::new(f.as_os_str().as_bytes()).expect("a path without NUL");
+                // SAFETY: fd is an inotify descriptor, c a NUL-terminated path.
+                let wd =
+                    unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c.as_ptr(), libc::IN_ACCESS) };
+                assert!(
+                    wd >= 0,
+                    "inotify_add_watch {}: {}",
+                    f.display(),
+                    std::io::Error::last_os_error()
+                );
+                wd
+            })
+            .collect();
+        ReadWatch { fd, watches }
+    }
+
+    /// Drains the queue: for each file, whether it was read since the
+    /// last drain. inotify merges an event with an identical one still
+    /// queued, so this tells whether, not how often.
+    fn drain(&self) -> Vec<bool> {
+        let mut seen = vec![false; self.watches.len()];
+        // inotify_event is a 16-byte header plus a name, empty for a file
+        // watch; u64 elements keep the buffer aligned for it.
+        let mut buf = [0u64; 512];
+        loop {
+            // SAFETY: buf is valid writable memory of the length passed.
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buf),
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                assert_eq!(e.raw_os_error(), Some(libc::EAGAIN), "read inotify: {e}");
+                return seen;
+            }
+            let n = usize::try_from(n).expect("a byte count");
+            let bytes: Vec<u8> = buf.iter().flat_map(|w| w.to_ne_bytes()).take(n).collect();
+            let mut at = 0;
+            while at + 16 <= n {
+                let field = |i: usize| {
+                    u32::from_ne_bytes(bytes[at + i..at + i + 4].try_into().expect("4 bytes"))
+                };
+                let wd = field(0) as i32;
+                if let Some(i) = self.watches.iter().position(|w| *w == wd) {
+                    seen[i] = true;
+                }
+                at += 16 + field(12) as usize;
+            }
+        }
+    }
+}
+
+/// How many slots of 10 keeper periods a read pin watches: 1 s at 5 ms.
+const READ_SLOTS: usize = 20;
+
+/// Watches `files` for [`READ_SLOTS`] slots of 10 keeper periods each and
+/// returns, per file, in how many slots it was read.
+fn read_slots(files: &[&Path]) -> Vec<usize> {
+    let w = ReadWatch::new(files);
+    let mut slots = vec![0; files.len()];
+    for _ in 0..READ_SLOTS {
+        std::thread::sleep(10 * STATS_KEEPER_PERIOD);
+        for (n, read) in slots.iter_mut().zip(w.drain()) {
+            *n += usize::from(read);
+        }
+    }
+    slots
+}
+
 #[test]
 #[ignore = "host: cgroup v2 delegation (cpu, io, memory, pids)"]
 fn keeper_reads_its_own_sandbox() {
     // H4 (ADR-007 D8): a read of the parent's memory.stat stops flushing
-    // once a sandbox below it is flushable, so each keeper must hold its
-    // own sandbox's file and never the parent's.
+    // once a sandbox below it is flushable, so each keeper must read its
+    // own sandbox's file, every period, and never the parent's. The
+    // descriptors show what a keeper holds; the inotify reads show what it
+    // reads: a keeper that holds its own file but opens, reads and closes
+    // the parent's every period passed the descriptor checks alone (#54
+    // review, finding 2).
     let _alone = support::exclusive();
     let parent_stat = cgroup::parent().path().join("memory.stat");
     let parent_before = descriptors_of(&parent_stat);
@@ -70,6 +172,38 @@ fn keeper_reads_its_own_sandbox() {
         descriptors_of(&parent_stat),
         parent_before,
         "a keeper holds the parent's memory.stat"
+    );
+    // Each keeper reads its own file in at least 3 of 4 slots of 10
+    // periods (one read in ten is late at worst; a keeper that reads every
+    // period fills every slot), and the parent's file is read in at most
+    // a quarter of them (nothing in this test reads it; a host's monitor
+    // may, about once a second; a keeper that reads it every period fills
+    // every slot).
+    let slots = read_slots(&[&a_stat, &b_stat, &parent_stat]);
+    report(&format!(
+        "keeper_reads_its_own_sandbox: slots of {:?} with a read, of {READ_SLOTS}: \
+         sandbox a {}, sandbox b {}, parent {}; {:?} {:?}",
+        10 * STATS_KEEPER_PERIOD,
+        slots[0],
+        slots[1],
+        slots[2],
+        a.stats_keeper(),
+        b.stats_keeper()
+    ));
+    for (i, name) in ["a", "b"].iter().enumerate() {
+        assert!(
+            slots[i] * 4 >= READ_SLOTS * 3,
+            "the keeper of sandbox {name} read its memory.stat in {} of {READ_SLOTS} slots of \
+             10 periods: {:?}",
+            slots[i],
+            slots
+        );
+    }
+    assert!(
+        slots[2] * 4 <= READ_SLOTS,
+        "the parent's memory.stat was read in {} of {READ_SLOTS} slots of 10 periods: {:?}",
+        slots[2],
+        slots
     );
     a.destroy().expect("destroy");
     assert_eq!(descriptors_of(&a_stat), 0, "left after destroy");

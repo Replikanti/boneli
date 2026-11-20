@@ -1304,12 +1304,15 @@ code.
   written back under another cgroup: the throttle then uses that
   cgroup's count; the traces saw no foreign dirtying and one inode wb
   switch in 67 runs; not covered. (3) A kernel whose `memory.stat` read
-  stops flushing: the permanent tests fail with `OomKilled` and a keeper
-  report that shows reads; detection covers only the kernels CI runs,
-  and a runner kernel change shows in "Host features". Then the keeper
-  needs another flushing read or a flush-independent mechanism. (4) A
-  starved keeper: `late` and `max_gap` show it, and #8 must not
-  CPU-limit the runner's cgroup so hard that the keeper falls behind.
+  stops flushing: the permanent tests fail with `OomKilled`, which they
+  give only when the keeper's report taken after the writer's end shows
+  at least one read per 10 periods of the run and no gap over 10
+  periods; detection covers only the kernels CI runs, and a runner
+  kernel change shows in "Host features". Then the keeper needs another
+  flushing read or a flush-independent mechanism. (4) A starved keeper:
+  `late` and `max_gap` show it; an OOM kill with fewer reads or a longer
+  gap is `KeeperStalled`, not `OomKilled`, and #8 must not CPU-limit the
+  runner's cgroup so hard that the keeper falls behind.
 - **Alternatives weighed.** The parent read (H4: 67 traced kills at
   10 ms). The parent read plus a fallback that reads the sandboxes when
   `memory.current` grows while `file_dirty` stands still: it reacts a
@@ -1337,11 +1340,19 @@ code.
   whole write at least S ÷ `wbps` − 500 ms = 15,500 ms (one 100 ms
   throttle slice and 400 ms of timer slack), every byte on the `io.max`
   device, and at least max(1, ⌊loop ms ÷ (10 × P\*)⌋) keeper reads during
-  the loop (150 for a 7,500 ms loop). Verdicts in precedence:
-  `KeeperFailed`, `OomKilled`, `WriterFailed`, `NotBuffered`, `Escaped`,
-  `OffDevice`, `KeeperIdle`, `Held`. `keeper_reads_its_own_sandbox`
-  (each keeper holds exactly its own sandbox's `memory.stat`, none the
-  parent's, none left after `destroy` or a drop),
+  the loop (150 for a 7,500 ms loop). The keeper's report is taken before
+  the spawn, when the loop's end is printed and after the writer ended,
+  so a writer killed in its loop, which prints no loop end, still shows
+  what the keeper did. Verdicts in precedence: `KeeperFailed` (a failure
+  in any of the three reports), `KeeperStalled` (an OOM kill with fewer
+  than max(1, ⌊run ms ÷ (10 × P\*)⌋) reads from the spawn to the
+  writer's end, or a gap over 10 × P\*), `OomKilled`, `WriterFailed`,
+  `NotBuffered`, `Escaped`, `OffDevice`, `KeeperIdle`, `Held`.
+  `keeper_reads_its_own_sandbox` (each keeper holds exactly its own
+  sandbox's `memory.stat`, none the parent's, none left after `destroy`
+  or a drop, and, watched through inotify `IN_ACCESS`, each sandbox's
+  file is read in at least 15 of 20 slots of 10 × P\* and the parent's
+  in at most 5),
   `keeper_runs_while_cgroup_lives` and `keeper_cost_report` pin the
   lifecycle and the cost; the unit tests pin the schedule, the report,
   a refused start and a sticky failure. Mutation runs are listed in the
@@ -1370,6 +1381,16 @@ code.
   (2026-11-20):** 0 of 70 is accepted, and the deterministic pin
   `keeper_reads_its_own_sandbox` is the proof for the parent-read mutant;
   MK1 is the behavioral proof that the tests see a missing keeper.
+  **The pin, strengthened after review (#78):** as decided it checked
+  only which descriptors a keeper holds, so a keeper that held its own
+  file but opened, read and closed the parent's every period passed it
+  (and `keeper_runs_while_cgroup_lives`) on the dev host. It now also
+  watches the files through inotify `IN_ACCESS`, which every successful
+  read raises whoever reads, and needs each sandbox's file read in 15 of
+  20 slots of 10 periods and the parent's in at most 5. Measured on the
+  dev host: the keeper 20 of 20 and the parent 0; that mutant 0 and 20,
+  failed; a keeper holding the parent's file failed the descriptor
+  checks; a thread that reads nothing but reports reads 0 of 20, failed.
 - **For #8.** One keeper thread per sandbox, from `create` to the kill,
   at the CPU above. A Landlock ruleset applied to the runner must allow
   reading `memory.stat` below the parent at every `create`, or `create`

@@ -586,7 +586,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `io_limit_holds_buffered_writes_at_floor`,
   `buffered_writes_without_io_max_are_not_killed`,
   `keeper_reads_its_own_sandbox`, `keeper_runs_while_cgroup_lives` and
-  `keeper_cost_report`.
+  `keeper_cost_report`; the buffered tests tell a failed or stalled
+  keeper from an OOM kill the keeper could not prevent, and
+  `keeper_reads_its_own_sandbox` checks through inotify that each keeper
+  reads its own sandbox's file and not the parent's.
 
 ### Changed
 
