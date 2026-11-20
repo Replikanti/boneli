@@ -258,6 +258,9 @@ impl fmt::Debug for Revocation {
 /// A list fetched and parsed, before it settled anything.
 struct Fetched {
     verifier: Arc<WebPkiServerVerifier>,
+    /// SHA-256 of the DER, which tells two lists with the same
+    /// `thisUpdate` apart in the cache.
+    digest: [u8; 32],
     this_update: u64,
     next_update: u64,
     der_len: usize,
@@ -273,8 +276,8 @@ enum Verdict {
 
 /// What one distribution point gave.
 enum Outcome {
-    /// Not revoked, by this list.
-    Settled(RevocationStatus, Arc<WebPkiServerVerifier>),
+    /// Not revoked, by these lists.
+    Settled(RevocationStatus, Vec<Arc<WebPkiServerVerifier>>),
     Failed(CrlFailure),
 }
 
@@ -414,7 +417,7 @@ impl Revocation {
     fn cached_revocation(
         &self,
         urls: &[&CrlUrl],
-        used: &Arc<WebPkiServerVerifier>,
+        used: &[Arc<WebPkiServerVerifier>],
         leaf: &Leaf<'_>,
     ) -> crate::Result<()> {
         let Mode::On { cache, .. } = &self.mode else {
@@ -424,11 +427,16 @@ impl Revocation {
         let cached: Vec<(&CrlUrl, Arc<WebPkiServerVerifier>)> = {
             let cache = lock(cache);
             urls.iter()
-                .filter_map(|url| cache.peek(url.as_str(), leaf.secs).map(|v| (*url, v)))
+                .flat_map(|url| {
+                    cache
+                        .peek(url.as_str(), leaf.secs)
+                        .into_iter()
+                        .map(move |v| (*url, v))
+                })
                 .collect()
         };
         for (url, verifier) in cached {
-            if Arc::ptr_eq(&verifier, used) {
+            if used.iter().any(|u| Arc::ptr_eq(u, &verifier)) {
                 continue;
             }
             if let Verdict::Revoked = verify(&verifier, leaf) {
@@ -450,9 +458,9 @@ impl Revocation {
         };
         let lookup = lock(cache).lookup(url.as_str(), leaf.secs);
         match lookup {
-            Lookup::Fresh(verifier) => decide(url, verifier, leaf, false),
-            Lookup::Stale(verifier) => decide(url, verifier, leaf, true),
-            Lookup::Refresh(verifier, cached_this_update) => {
+            Lookup::Fresh(verifiers) => decide(url, verifiers, leaf, false),
+            Lookup::Stale(verifiers) => decide(url, verifiers, leaf, true),
+            Lookup::Refresh(verifiers, cached_this_update) => {
                 // A refresh succeeds only with a list that passes every
                 // check, settles the leaf and is not older than the cached
                 // one; anything else leaves the decision to the cached list.
@@ -461,8 +469,8 @@ impl Revocation {
                 {
                     match verify(&fetched.verifier, leaf) {
                         Verdict::Good => {
-                            let used = Arc::clone(&fetched.verifier);
-                            self.store(url, fetched, leaf.secs, false);
+                            let used = vec![Arc::clone(&fetched.verifier)];
+                            self.store(url, fetched, leaf.secs);
                             return Ok(Outcome::Settled(
                                 RevocationStatus::Checked {
                                     url: url.as_str().to_owned(),
@@ -471,13 +479,13 @@ impl Revocation {
                             ));
                         }
                         Verdict::Revoked => {
-                            self.store(url, fetched, leaf.secs, true);
+                            self.store(url, fetched, leaf.secs);
                             return Err(revoked(url));
                         }
                         Verdict::Expired(_) | Verdict::NotSettled(_) => {}
                     }
                 }
-                decide(url, verifier, leaf, true)
+                decide(url, verifiers, leaf, true)
             }
             Lookup::Missing => {
                 let fetched = match self.fetch(url, leaf) {
@@ -486,8 +494,8 @@ impl Revocation {
                 };
                 match verify(&fetched.verifier, leaf) {
                     Verdict::Good => {
-                        let used = Arc::clone(&fetched.verifier);
-                        self.store(url, fetched, leaf.secs, false);
+                        let used = vec![Arc::clone(&fetched.verifier)];
+                        self.store(url, fetched, leaf.secs);
                         Ok(Outcome::Settled(
                             RevocationStatus::Checked {
                                 url: url.as_str().to_owned(),
@@ -496,7 +504,7 @@ impl Revocation {
                         ))
                     }
                     Verdict::Revoked => {
-                        self.store(url, fetched, leaf.secs, true);
+                        self.store(url, fetched, leaf.secs);
                         Err(revoked(url))
                     }
                     Verdict::Expired(detail) => Ok(Outcome::Failed(CrlFailure::new(
@@ -541,6 +549,7 @@ impl Revocation {
             ));
         }
         let der_len = bytes.len();
+        let digest = crate::Sha256::digest(&bytes);
         // Read here because `build()` takes the bytes, and looked at only
         // once `build()` has accepted them: the reader's result counts
         // only for bytes webpki parsed (ADR-017, item 9).
@@ -561,23 +570,25 @@ impl Revocation {
         }
         Ok(Fetched {
             verifier,
+            digest,
             this_update,
             next_update,
             der_len,
         })
     }
 
-    /// Caches a list that settled the leaf; `revokes` when it listed it.
-    fn store(&self, url: &CrlUrl, fetched: Fetched, now: u64, revokes: bool) {
+    /// Caches a list that settled the leaf.
+    fn store(&self, url: &CrlUrl, fetched: Fetched, now: u64) {
         if let Mode::On { cache, .. } = &self.mode {
             let entry = Entry::new(
                 fetched.verifier,
+                fetched.digest,
                 fetched.this_update,
                 fetched.next_update,
                 fetched.der_len,
                 now,
             );
-            lock(cache).insert(url.as_str(), entry, now, revokes);
+            lock(cache).insert(url.as_str(), entry, now);
         }
     }
 }
@@ -601,35 +612,41 @@ fn validity_failure(
     None
 }
 
-/// A cached list's answer; `stale` when it is past its maximum age.
+/// The answer of a URL's cached lists; `stale` when they are past their
+/// maximum age. Any list that revokes the leaf wins; otherwise the leaf
+/// passes when at least one list settles it.
 fn decide(
     url: &CrlUrl,
-    verifier: Arc<WebPkiServerVerifier>,
+    verifiers: Vec<Arc<WebPkiServerVerifier>>,
     leaf: &Leaf<'_>,
     stale: bool,
 ) -> crate::Result<Outcome> {
-    let text = url.as_str().to_owned();
-    match verify(&verifier, leaf) {
-        Verdict::Good if stale => Ok(Outcome::Settled(
-            RevocationStatus::CheckedStale { url: text },
-            verifier,
-        )),
-        Verdict::Good => Ok(Outcome::Settled(
-            RevocationStatus::Checked { url: text },
-            verifier,
-        )),
-        Verdict::Revoked => Err(revoked(url)),
-        Verdict::Expired(detail) => Ok(Outcome::Failed(CrlFailure::new(
-            Some(url),
-            CrlFailureKind::Expired,
-            detail,
-        ))),
-        Verdict::NotSettled(detail) => Ok(Outcome::Failed(CrlFailure::new(
-            Some(url),
-            CrlFailureKind::NotSettled,
-            detail,
-        ))),
+    let mut good = Vec::new();
+    let mut failure = None;
+    for verifier in verifiers {
+        match verify(&verifier, leaf) {
+            Verdict::Revoked => return Err(revoked(url)),
+            Verdict::Good => good.push(verifier),
+            Verdict::Expired(detail) => {
+                failure.get_or_insert((CrlFailureKind::Expired, detail));
+            }
+            Verdict::NotSettled(detail) => {
+                failure.get_or_insert((CrlFailureKind::NotSettled, detail));
+            }
+        }
     }
+    if good.is_empty() {
+        let (kind, detail) =
+            failure.unwrap_or((CrlFailureKind::NotSettled, "no cached list".to_owned()));
+        return Ok(Outcome::Failed(CrlFailure::new(Some(url), kind, detail)));
+    }
+    let url = url.as_str().to_owned();
+    let status = if stale {
+        RevocationStatus::CheckedStale { url }
+    } else {
+        RevocationStatus::Checked { url }
+    };
+    Ok(Outcome::Settled(status, good))
 }
 
 /// webpki's verification of the chain with one list: leaf only, unknown
@@ -916,7 +933,11 @@ pub(crate) mod tests {
         assert_eq!(check(&r, GOOD, T0 + 172_800).expect("check"), checked());
         assert_eq!(script.calls(), 2);
         let after = entry(&r).expect("entry");
-        assert!(Arc::ptr_eq(&before.verifier, &after.verifier));
+        assert_eq!(after.lists.len(), 1);
+        assert!(Arc::ptr_eq(
+            &before.lists[0].verifier,
+            &after.lists[0].verifier
+        ));
         assert_eq!((after.confirmed_at, after.claimed_at), (T0 + 172_800, None));
     }
 
@@ -954,7 +975,11 @@ pub(crate) mod tests {
             assert_eq!(check(&r, GOOD, T0 + 86_400).expect("check"), stale(), "{i}");
             assert_eq!(script.calls(), 2, "{i}");
             let after = entry(&r).expect("entry");
-            assert!(Arc::ptr_eq(&before.verifier, &after.verifier), "{i}");
+            assert_eq!(after.lists.len(), 1, "{i}");
+            assert!(
+                Arc::ptr_eq(&before.lists[0].verifier, &after.lists[0].verifier),
+                "{i}"
+            );
             assert_eq!((after.this_update, after.confirmed_at), (T0, T0), "{i}");
         }
     }
@@ -1297,5 +1322,38 @@ pub(crate) mod tests {
         assert_revoked_by(check(&r, TWO_DP, T0 + 3_600), CRL2);
         assert_revoked_by(check(&r, TWO_DP, T0 + 3_600 + 86_400), CRL2);
         assert_revoked_by(check(&r, TWO_DP, T0 + 3_600 + 86_401), CRL2);
+    }
+
+    // The cache is shared by every leaf that names a URL. At a tie, a list
+    // that revokes the leaf being checked must not push out a list that
+    // revokes another leaf: `crl-ca-fresh.crl` lists 0x01, 0x20, 0x40 and
+    // 0x80, `crl-ca-idp.crl` has the same dates and lists only 0x80.
+
+    const REVOKED_FIRST: &[u8] = include_bytes!("../../tests/data/crl-revoked-first.pem");
+
+    #[test]
+    fn tie_for_one_leaf_keeps_revocations_of_another() {
+        let script = Script::new(vec![ok(FRESH), ok(IDP)]);
+        let r = revocation(script.clone());
+        assert_revoked(check(&r, REVOKED_FIRST, T0));
+        // 0x80 triggers the refresh, which returns the shorter list.
+        assert_revoked(check(&r, REVOKED, T0 + 86_400));
+        assert_revoked(check(&r, REVOKED_FIRST, T0 + 86_401));
+        assert_revoked(check(&r, REVOKED, T0 + 86_401));
+        assert_eq!(script.calls(), 2);
+        assert_eq!(entry(&r).expect("entry").lists.len(), 2);
+    }
+
+    #[test]
+    fn tie_for_one_leaf_keeps_revocations_of_another_reversed() {
+        let script = Script::new(vec![ok(IDP), ok(FRESH)]);
+        let r = revocation(script.clone());
+        assert_revoked(check(&r, REVOKED, T0));
+        assert_revoked(check(&r, REVOKED_FIRST, T0 + 86_400));
+        assert_revoked(check(&r, REVOKED, T0 + 86_401));
+        assert_revoked(check(&r, REVOKED_FIRST, T0 + 86_401));
+        // The good leaf passes both lists.
+        assert_eq!(check(&r, GOOD, T0 + 86_401).expect("check"), checked());
+        assert_eq!(script.calls(), 2);
     }
 }

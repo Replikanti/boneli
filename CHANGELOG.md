@@ -508,7 +508,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   list that settles it with `Error::RevocationUnknown` (fail closed, no
   opt-out); a leaf without a point passes unchecked. A revocation the
   cache holds for any of the leaf's points is never undone by an equal or
-  older list, from the same point or a mirror.
+  older list, from the same point or a mirror: the cache keeps every
+  distinct list accepted at a URL's newest `thisUpdate`.
   `TlsStream::revocation` reports what the check found, resumed sessions
   are checked again, `TlsDial` bounds the fetch by its request deadline,
   and `TlsConfig::with_crl_source` takes a `CrlSource` of the caller's.

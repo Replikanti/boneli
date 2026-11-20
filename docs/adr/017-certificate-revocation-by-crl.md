@@ -280,10 +280,13 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
 8. **The cache: maximum age and soft refresh (D5, decided at STOP 1,
    changed from the recommendation to cache until `nextUpdate`).** One
    cache per `TlsConfig` (clones share it), in memory for the life of the
-   process, keyed by the canonical URL. Each entry keeps the verifier,
-   `thisUpdate`, `nextUpdate`, its DER length, `confirmed_at` (the last
-   time a fetch returned this list or one with the same `thisUpdate`),
-   `claimed_at` (the last refresh attempt) and a use counter for eviction.
+   process, keyed by the canonical URL. Each entry keeps its lists (each
+   with its verifier, the SHA-256 of its DER, its `nextUpdate` and its DER
+   length; see the insert rules for why more than one), their common
+   `thisUpdate`, `confirmed_at` (the last time a fetch returned one of
+   these lists or another with the same `thisUpdate`), `claimed_at` (the
+   last refresh attempt) and a use counter for eviction. A leaf is checked
+   against every list of the entry; any revocation wins.
    All times are Unix seconds and every sum saturates.
    - **Fresh** while `now < nextUpdate` and `confirmed_at <= now <
      confirmed_at + 86,400`: used without a fetch. A clock moved back
@@ -295,7 +298,7 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
      succeeds when the fetched list passes the size, parse and date
      checks, settles the leaf and has a `thisUpdate` not earlier than the
      cached one: a later list replaces the entry, an equal one confirms it
-     (`confirmed_at = now`, verifier kept). Anything else is a failed
+     (`confirmed_at = now`) and joins it when its bytes are new. Anything else is a failed
      refresh: the cached list decides, and the next attempt waits until
      `claimed_at + 3,600`. A connection decided by a stale list reports
      `RevocationStatus::CheckedStale { url }`.
@@ -347,13 +350,23 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
      `nextUpdate` the later `thisUpdate` wins and an earlier one changes
      nothing (Microsoft's mirrors served lists 4 h apart in the same 10 s,
      so an older list on a refresh happens without an attacker). An equal
-     `thisUpdate` keeps the existing verifier and restarts its maximum
-     age, unless the new list revokes the leaf it settled: then the
-     revoking list replaces the entry. A CA may sign two different lists
-     with the same `thisUpdate` (the review of the first implementation
-     found that the equal case had assumed equal contents), and the
-     revoking one is the one that must stick. An expired entry is always
-     replaced.
+     `thisUpdate` restarts the entry's maximum age and adds the list to
+     the entry unless it holds the same bytes already (by SHA-256), so the
+     entry keeps every distinct list accepted at the newest `thisUpdate`
+     until each reaches its own `nextUpdate`. Why every one: a CA may sign
+     two different lists in the same second, and the entry is shared by
+     every leaf that names the URL, so any rule that keeps one of them
+     (the first, or the one that revokes the leaf being checked) can drop
+     a revocation of another leaf; the review of the first two
+     implementations found exactly that. Rejected: a tie-break by CRL
+     number, which does not settle two lists with equal numbers and
+     different bytes. The extra lists count against the 64 MiB cap like
+     any other; an entry is never evicted to make room for its own list,
+     so a list that does not fit beside its entry's other lists (more than
+     64 MiB at one `thisUpdate` for one URL) is not cached, and its
+     revocations hold only for the connection that fetched it. An entry
+     whose lists all reached their `nextUpdate` is gone; one whose lists
+     expire one by one keeps the rest.
    - **A revocation the cache holds is never undone** by an equal or older
      list, from the same point or from a mirror. Besides the insert rules,
      before any list's pass is returned the leaf is verified against
@@ -364,7 +377,8 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
      measured list), only for leaves with more than one point. Revocation
      is final for this purpose: a certificate on hold that its CA releases
      stays refused until the list that held it reaches its `nextUpdate`,
-     unless a newer list from the same point replaces it. Least recently used entries go past
+     unless a newer list from the same point replaces it. Least recently
+     used entries go past
      64 MiB. The mutex is never held while fetching or parsing; a poisoned
      one is recovered and the cache cleared, because the cache only saves
      fetches.
