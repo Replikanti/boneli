@@ -1074,13 +1074,13 @@
    "title": "boneli-https: bound name resolution by the request deadline",
    "epic": null,
    "order": 44,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "f7d29cb8",
    "user": "ylohnitram",
    "machine": "df82df",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-20T16:36:22+00:00",
+   "updated_at": "2026-11-20T16:53:19+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1167,14 +1167,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T10:12:34+00:00",
-   "issue": 54,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "98fa59e8",
-   "note": null
-  },
   {
    "at": "2026-11-20T10:37:27+00:00",
    "issue": 54,
@@ -1566,6 +1558,14 @@
    "to": "claimed",
    "by": "f7d29cb8",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-20T16:53:19+00:00",
+   "issue": 81,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "f7d29cb8",
+   "note": null
   }
  ],
  "open": [
@@ -1601,7 +1601,7 @@
   85
  ],
  "xopen": [],
- "updated_at": "2026-11-20T16:36:52+00:00",
+ "updated_at": "2026-11-20T16:53:19+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
