@@ -1,4 +1,5 @@
-//! Certificate revocation by CRL (ADR-017) and OCSP (ADR-020).
+//! Certificate revocation by CRL (ADR-017) and OCSP (ADR-020), of the
+//! leaf and of the intermediates on its verified path (ADR-027).
 //!
 //! After rustls has verified the chain in the handshake, the check reads
 //! the CRL distribution points of the verified leaf, fetches each CRL
@@ -12,14 +13,25 @@
 //! with the same outcomes; a leaf with neither passes unchecked (ADR-017,
 //! D2).
 //!
+//! Before the leaf, every intermediate on the path webpki verifies is
+//! checked against its issuer's CRL (`chain`, ADR-027), from the anchor
+//! side down, with a strict list parser of its own (`ca_list`), a cache of
+//! its own and a fetch budget per connection; a listed intermediate fails
+//! the connection with `Error::Revoked`, one whose points no list settles
+//! with `Error::RevocationUnknown`, and one without an `http` or `https`
+//! point passes unchecked (D2). The anchor is never checked.
+//!
 //! The check runs on `peer_certificates()` after the handshake, not in a
 //! verifier inside it, because rustls skips the verifier on resumed
 //! sessions but restores the peer chain from them (ADR-017, item 1).
 
+mod ca_list;
 mod cache;
+mod chain;
 mod der;
 mod http;
 mod ocsp;
+mod signature;
 mod url;
 
 pub use ocsp::{
@@ -42,6 +54,7 @@ use rustls::{CertificateError, RootCertStore};
 
 use crate::Error;
 use cache::{CrlCache, Entry, Lookup};
+use chain::CaCache;
 use ocsp::OcspCache;
 use url::Candidate;
 
@@ -101,15 +114,58 @@ pub const CRL_MAX_HEAD_BYTES: usize = 16_384;
 /// The most header fields in the response head of a fetch.
 pub const CRL_MAX_HEADERS: usize = 64;
 
+/// The largest CA list accepted, in bytes (1 MiB; ADR-027, D3): 486 times
+/// the largest measured list of an intermediate's issuer (2,157 B). A
+/// `Content-Length` above it fails before the body is read.
+pub const MAX_CA_CRL_BYTES: usize = 1_048_576;
+
+/// The most CA list fetches of one connection, refreshes included
+/// (ADR-027, D3): twice the measured cold-cache worst case of 4 (two
+/// intermediates, two URLs each), and room for webpki's maximum of six
+/// intermediates with one working URL each. Past it, a missing list fails
+/// closed with `RevocationFailureKind::LimitReached` and a due refresh is
+/// left to the cached list. The leaf's fetches do not count.
+pub const MAX_CA_CRL_FETCHES: usize = 8;
+
+/// The deadline of the intermediates' check of one connection, shared by
+/// all their URLs: the setup time plus `MAX_CA_CRL_FETCHES` lists at
+/// `MAX_CA_CRL_BYTES` at `CRL_MIN_RATE`, 38 s (ADR-027, D3). The leaf's
+/// check follows with its own deadline; a `TlsDial` request's deadline
+/// cuts both shorter.
+pub const CA_CRL_CHECK_DEADLINE: Duration = Duration::from_secs(
+    CRL_SETUP_TIME.as_secs() + (MAX_CA_CRL_FETCHES * MAX_CA_CRL_BYTES) as u64 / CRL_MIN_RATE,
+);
+
+/// The DER bytes one `TlsConfig`'s CA cache holds at most (16 MiB;
+/// ADR-027, D3): 16 lists at `MAX_CA_CRL_BYTES`. Least recently used
+/// lists go first.
+pub const CA_CRL_CACHE_MAX_BYTES: usize = 16_777_216;
+
 /// Where CRLs come from. Not a verifier hook: whatever a source returns is
-/// verified by webpki against the roots, the leaf's issuer and point, and
-/// the system clock (ADR-017, item 10). A source can make a connection
-/// fail, hand over an older CA-signed list that is still before its
-/// `nextUpdate` on a cold cache, or keep a cached list in use until its
-/// `nextUpdate` by failing every refresh, and nothing else.
+/// verified against the roots, the certificate's issuer and point, and
+/// the system clock: by webpki for a leaf (ADR-017, item 10), by
+/// `ca_list` for an intermediate (ADR-027). A source can make a
+/// connection fail, hand over an older CA-signed list that is still
+/// before its `nextUpdate` on a cold cache, or keep a cached list in use
+/// until its `nextUpdate` by failing every refresh, and nothing else.
 pub trait CrlSource: Send + Sync {
     /// The DER bytes at `url`, fetched by `deadline`.
     fn fetch(&self, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError>;
+
+    /// The DER bytes at `url`, fetched by `deadline`, where a body above
+    /// `cap` bytes may fail early as `CrlFetchError::TooLarge`: the fetch
+    /// of an intermediate's list (`MAX_CA_CRL_BYTES`, ADR-027). The
+    /// default is `fetch`; whatever a source returns is held to the cap
+    /// after the fetch anyway.
+    fn fetch_limited(
+        &self,
+        url: &CrlUrl,
+        cap: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        let _ = cap;
+        self.fetch(url, deadline)
+    }
 }
 
 /// Why a source returned no list or response; shared by `CrlSource` and
@@ -122,7 +178,8 @@ pub enum CrlFetchError {
     TimedOut,
     /// A status other than 200; redirects are not followed.
     Status(u16),
-    /// More than `MAX_CRL_BYTES`, or `MAX_OCSP_RESPONSE_BYTES` for OCSP.
+    /// More than `MAX_CRL_BYTES`, `MAX_CA_CRL_BYTES` for an
+    /// intermediate's list, or `MAX_OCSP_RESPONSE_BYTES` for OCSP.
     TooLarge,
     /// A response this client does not accept, such as a content coding
     /// or a head over its limits.
@@ -143,15 +200,17 @@ impl fmt::Display for CrlFetchError {
 
 impl std::error::Error for CrlFetchError {}
 
-/// What the revocation check of a connection found.
+/// What the revocation check of one certificate of a connection found:
+/// the leaf (`TlsStream::revocation`) or an intermediate
+/// (`TlsStream::intermediate_revocation`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevocationStatus {
-    /// The list at `url` settled the leaf as not revoked.
+    /// The list at `url` settled the certificate as not revoked.
     Checked {
         /// The canonical URL of the list.
         url: String,
     },
-    /// A cached list past its maximum age settled the leaf, because its
+    /// A cached list past its maximum age settled the certificate, because its
     /// refresh is failing or another connection is running it. The list is
     /// still before its `nextUpdate`; from then on the check fails closed.
     CheckedStale {
@@ -172,12 +231,14 @@ pub enum RevocationStatus {
         /// The canonical URL of the responder.
         url: String,
     },
-    /// The leaf names neither an `http` or `https` CRL distribution point
-    /// nor such an OCSP responder, so it passes unchecked (ADR-017, D2).
+    /// The certificate names neither an `http` or `https` CRL
+    /// distribution point nor, for a leaf, such an OCSP responder, so it
+    /// passes unchecked (ADR-017, D2; ADR-027, D2 for an intermediate).
     NoRevocationSource,
 }
 
-/// Why one distribution point or OCSP responder did not settle the leaf.
+/// Why one distribution point or OCSP responder did not settle a
+/// certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationFailureKind {
     /// Not a URL this client fetches, or the extension cannot be read.
@@ -188,16 +249,18 @@ pub enum RevocationFailureKind {
     TimedOut,
     /// A status other than 200.
     Status,
-    /// More than `MAX_CRL_BYTES` or `MAX_OCSP_RESPONSE_BYTES`.
+    /// More than `MAX_CRL_BYTES`, `MAX_CA_CRL_BYTES` or
+    /// `MAX_OCSP_RESPONSE_BYTES`.
     TooLarge,
-    /// Not a CRL webpki accepts or an OCSP response this client parses, or
-    /// its dates are reversed or missing.
+    /// Not a CRL webpki accepts (a leaf's) or `ca_list` accepts (an
+    /// intermediate's), or an OCSP response this client parses, or its
+    /// dates are reversed or missing.
     Malformed,
     /// At or past its `nextUpdate`.
     Expired,
-    /// A valid list that does not cover the leaf (another issuer, another
-    /// shard, a bad signature), or an OCSP response that names another
-    /// certificate.
+    /// A valid list that does not cover the certificate (another issuer,
+    /// another shard or scope, a bad signature), or an OCSP response that
+    /// names another certificate.
     NotSettled,
     /// An OCSP responder answered with an error status: `malformedRequest`,
     /// `internalError`, `tryLater`, `sigRequired` or `unauthorized`.
@@ -207,6 +270,9 @@ pub enum RevocationFailureKind {
     /// An OCSP response not signed by the leaf's issuer or a responder
     /// it authorized.
     BadSignature,
+    /// The connection's `MAX_CA_CRL_FETCHES` fetches of intermediates'
+    /// lists were spent before this one (ADR-027); nothing was fetched.
+    LimitReached,
 }
 
 impl fmt::Display for RevocationFailureKind {
@@ -223,11 +289,13 @@ impl fmt::Display for RevocationFailureKind {
             RevocationFailureKind::ResponderError => "responder error",
             RevocationFailureKind::UnknownCertificate => "unknown certificate",
             RevocationFailureKind::BadSignature => "bad signature",
+            RevocationFailureKind::LimitReached => "fetch limit reached",
         })
     }
 }
 
-/// One distribution point or OCSP responder that did not settle the leaf.
+/// One distribution point or OCSP responder that did not settle a
+/// certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevocationFailure {
     /// The canonical URL, when the point or responder was one.
@@ -285,10 +353,26 @@ enum Mode {
         roots: Arc<RootCertStore>,
         provider: Arc<CryptoProvider>,
         source: Arc<dyn CrlSource>,
-        cache: Mutex<CrlCache>,
+        cache: Mutex<LeafCache>,
+        /// The intermediates' lists (ADR-027): their own cache, so that a
+        /// URL that is a leaf's point and an intermediate's keeps both.
+        ca_cache: Mutex<CaCache>,
         ocsp_source: Arc<dyn OcspSource>,
         ocsp_cache: Mutex<OcspCache>,
     },
+}
+
+/// The cache of the leaves' lists, each kept as the webpki verifier built
+/// with it.
+type LeafCache = CrlCache<Arc<WebPkiServerVerifier>>;
+
+/// What the check of a connection found: the leaf's status and each
+/// intermediate's, the leaf's issuer first; no intermediate when a root
+/// issued the leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChainStatus {
+    pub(crate) leaf: RevocationStatus,
+    pub(crate) intermediates: Vec<RevocationStatus>,
 }
 
 impl fmt::Debug for Revocation {
@@ -347,7 +431,7 @@ fn deadline(limit: Duration, outer: Option<Instant>) -> Instant {
 impl Revocation {
     /// Checks revocation with lists from `source` and OCSP responses from
     /// `ocsp_source`, verified against `roots` with `provider`'s
-    /// algorithms: those of the handshake. Both caches start empty.
+    /// algorithms: those of the handshake. All three caches start empty.
     pub(crate) fn on(
         roots: Arc<RootCertStore>,
         provider: Arc<CryptoProvider>,
@@ -359,7 +443,8 @@ impl Revocation {
                 roots,
                 provider,
                 source,
-                cache: Mutex::new(CrlCache::new()),
+                cache: Mutex::new(CrlCache::new(CRL_CACHE_MAX_BYTES)),
+                ca_cache: Mutex::new(CrlCache::new(CA_CRL_CACHE_MAX_BYTES)),
                 ocsp_source,
                 ocsp_cache: Mutex::new(OcspCache::new()),
             },
@@ -372,7 +457,7 @@ impl Revocation {
     }
 
     /// The same check with `crl` or `ocsp` in place of its sources, where
-    /// given, and both caches empty. A check that is off stays off.
+    /// given, and all caches empty. A check that is off stays off.
     pub(crate) fn with_sources(
         &self,
         crl: Option<Arc<dyn CrlSource>>,
@@ -401,17 +486,89 @@ impl Revocation {
         chain: &[CertificateDer<'_>],
         name: &ServerName<'_>,
         outer: Option<Instant>,
+    ) -> crate::Result<ChainStatus> {
+        self.check_chain_at(chain, name, outer, UnixTime::now())
+    }
+
+    /// The leaf's status only, for the tests of the leaf's rules.
+    #[cfg(test)]
+    pub(crate) fn check_at(
+        &self,
+        chain: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        outer: Option<Instant>,
+        now: UnixTime,
     ) -> crate::Result<RevocationStatus> {
-        self.check_at(chain, name, outer, UnixTime::now())
+        self.check_chain_at(chain, name, outer, now)
+            .map(|status| status.leaf)
     }
 
     /// The check of a verified `chain` (leaf first) for `name` at `now`,
-    /// which is used throughout: the cache, the validity of each list or
-    /// answer and webpki's verification. `outer` cuts the check's deadline
-    /// shorter. A leaf with an `http` or `https` CRL point takes the CRL
-    /// path only; a leaf without one and with such an OCSP responder takes
-    /// the OCSP path (ADR-020, item 1).
-    pub(crate) fn check_at(
+    /// which is used throughout: the caches, the validity of each list or
+    /// answer and the path. First the intermediates on the path webpki
+    /// verifies, from the anchor side down, under `CA_CRL_CHECK_DEADLINE`
+    /// (ADR-027, item 1); then the leaf under its own deadline. `outer`
+    /// cuts both deadlines shorter. A chain of the leaf alone has no
+    /// intermediate to check: rustls verified it, so a root issued it.
+    pub(crate) fn check_chain_at(
+        &self,
+        chain: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        outer: Option<Instant>,
+        now: UnixTime,
+    ) -> crate::Result<ChainStatus> {
+        let Mode::On {
+            roots,
+            provider,
+            source,
+            ca_cache,
+            ..
+        } = &self.mode
+        else {
+            // Never reaches a caller: only the connection of an `https`
+            // CRL or OCSP fetch runs without a check.
+            return Ok(ChainStatus {
+                leaf: RevocationStatus::NoRevocationSource,
+                intermediates: Vec::new(),
+            });
+        };
+        let intermediates = match chain.split_first() {
+            Some((cert, sent)) if !sent.is_empty() => {
+                let algorithms = provider.signature_verification_algorithms.all;
+                let path =
+                    chain::verified_path(roots, algorithms, cert, sent, now).map_err(|detail| {
+                        Error::RevocationUnknown(vec![RevocationFailure::new(
+                            None,
+                            RevocationFailureKind::NotSettled,
+                            detail,
+                        )])
+                    })?;
+                let ctx = chain::Context {
+                    algorithms,
+                    source: source.as_ref(),
+                    cache: ca_cache,
+                };
+                chain::check_intermediates(
+                    &ctx,
+                    &path,
+                    MAX_CA_CRL_FETCHES,
+                    deadline(CA_CRL_CHECK_DEADLINE, outer),
+                    now.as_secs(),
+                )?
+            }
+            _ => Vec::new(),
+        };
+        let leaf = self.check_leaf(chain, name, outer, now)?;
+        Ok(ChainStatus {
+            leaf,
+            intermediates,
+        })
+    }
+
+    /// The leaf's check (ADR-017, ADR-020). A leaf with an `http` or
+    /// `https` CRL point takes the CRL path only; a leaf without one and
+    /// with such an OCSP responder takes the OCSP path (ADR-020, item 1).
+    fn check_leaf(
         &self,
         chain: &[CertificateDer<'_>],
         name: &ServerName<'_>,
@@ -790,7 +947,7 @@ fn verify(verifier: &WebPkiServerVerifier, leaf: &Leaf<'_>) -> Verdict {
     }
 }
 
-fn revoked(url: &CrlUrl) -> Error {
+pub(crate) fn revoked(url: &CrlUrl) -> Error {
     Error::Revoked {
         url: url.as_str().to_owned(),
     }
@@ -801,7 +958,7 @@ trait Clear {
     fn clear(&mut self);
 }
 
-impl Clear for CrlCache {
+impl<V: Clone> Clear for CrlCache<V> {
     fn clear(&mut self) {
         CrlCache::clear(self);
     }
@@ -996,7 +1153,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn entry(r: &Revocation) -> Option<Entry> {
+    fn entry(r: &Revocation) -> Option<Entry<Arc<WebPkiServerVerifier>>> {
         let Mode::On { cache, .. } = &r.mode else {
             panic!("off")
         };
@@ -1010,6 +1167,22 @@ pub(crate) mod tests {
             CRL_SETUP_TIME + Duration::from_secs(MAX_CRL_BYTES as u64 / CRL_MIN_RATE)
         );
         assert_eq!(CRL_CHECK_DEADLINE, Duration::from_secs(62));
+    }
+
+    #[test]
+    fn ca_check_deadline_is_38_seconds() {
+        assert_eq!(
+            CA_CRL_CHECK_DEADLINE,
+            CRL_SETUP_TIME
+                + Duration::from_secs(
+                    (MAX_CA_CRL_FETCHES * MAX_CA_CRL_BYTES) as u64 / CRL_MIN_RATE
+                )
+        );
+        assert_eq!(CA_CRL_CHECK_DEADLINE, Duration::from_secs(38));
+        assert_eq!(
+            (MAX_CA_CRL_BYTES, MAX_CA_CRL_FETCHES, CA_CRL_CACHE_MAX_BYTES),
+            (1_048_576, 8, 16_777_216)
+        );
     }
 
     #[test]
@@ -1092,10 +1265,7 @@ pub(crate) mod tests {
         assert_eq!(script.calls(), 2);
         let after = entry(&r).expect("entry");
         assert_eq!(after.lists.len(), 1);
-        assert!(Arc::ptr_eq(
-            &before.lists[0].verifier,
-            &after.lists[0].verifier
-        ));
+        assert!(Arc::ptr_eq(&before.lists[0].value, &after.lists[0].value));
         assert_eq!((after.confirmed_at, after.claimed_at), (T0 + 172_800, None));
     }
 
@@ -1135,7 +1305,7 @@ pub(crate) mod tests {
             let after = entry(&r).expect("entry");
             assert_eq!(after.lists.len(), 1, "{i}");
             assert!(
-                Arc::ptr_eq(&before.lists[0].verifier, &after.lists[0].verifier),
+                Arc::ptr_eq(&before.lists[0].value, &after.lists[0].value),
                 "{i}"
             );
             assert_eq!((after.this_update, after.confirmed_at), (T0, T0), "{i}");

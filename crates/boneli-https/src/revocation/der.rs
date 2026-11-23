@@ -3,7 +3,8 @@
 //! `thisUpdate` and `nextUpdate` of a CRL; and, for OCSP (ADR-020), the
 //! responder URLs of a certificate, the parts of a public key, and the
 //! reader and encoder `ocsp` builds its request and parses its response
-//! with.
+//! with; and, for the intermediates (ADR-027), a certificate's keyUsage.
+//! `ca_list` parses CA lists with this reader, strictly, as `ocsp` does.
 //!
 //! The certificate and CRL functions read only bytes webpki has accepted
 //! already: the leaf after the handshake verified it, the CRL after
@@ -37,7 +38,7 @@ pub(crate) const OCTET_STRING: u8 = 0x04;
 pub(crate) const NULL: u8 = 0x05;
 pub(crate) const OID: u8 = 0x06;
 pub(crate) const ENUMERATED: u8 = 0x0A;
-const UTC_TIME: u8 = 0x17;
+pub(crate) const UTC_TIME: u8 = 0x17;
 pub(crate) const GENERALIZED_TIME: u8 = 0x18;
 /// `[0]` constructed: the certificate version, a distribution point's
 /// name, `fullName` inside it; in OCSP, `responseBytes`, a version, the
@@ -59,6 +60,8 @@ const CONTEXT_3: u8 = 0xA3;
 const URI: u8 = 0x86;
 /// id-ce-cRLDistributionPoints, 2.5.29.31.
 const CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1D, 0x1F];
+/// id-ce-keyUsage, 2.5.29.15.
+const KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F];
 /// id-pe-authorityInfoAccess, 1.3.6.1.5.5.7.1.1.
 const AUTHORITY_INFO_ACCESS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
 /// id-ad-ocsp, 1.3.6.1.5.5.7.48.1.
@@ -257,6 +260,47 @@ pub(crate) fn ocsp_responder_uris(cert: &[u8]) -> Result<Vec<&[u8]>, DerError> {
         }
     }
     Ok(uris)
+}
+
+/// The keyUsage bits of a certificate (RFC 5280, 4.2.1.3): bit `n` of the
+/// BIT STRING is `1 << n` here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyUsage(u16);
+
+impl KeyUsage {
+    /// `cRLSign`, bit 6: the key may sign CRLs.
+    pub(crate) fn crl_sign(self) -> bool {
+        self.0 & (1 << 6) != 0
+    }
+}
+
+/// The certificate's keyUsage; `None` when it has none, which RFC 5280
+/// 4.2.1.3 leaves unrestricted. A second keyUsage extension, unused bits
+/// above 7, unused bits without a byte and more than the nine defined bits
+/// are errors.
+pub(crate) fn key_usage(cert: &[u8]) -> Result<Option<KeyUsage>, DerError> {
+    let Some(value) = extension(cert, KEY_USAGE, "two keyUsage extensions")? else {
+        return Ok(None);
+    };
+    let mut wrapper = Reader::new(value);
+    let bits = wrapper.expect(BIT_STRING)?;
+    wrapper.finish()?;
+    let (&unused, bytes) = bits.split_first().ok_or(DerError("an empty keyUsage"))?;
+    if unused > 7 || (bytes.is_empty() && unused != 0) {
+        return Err(DerError("a malformed keyUsage"));
+    }
+    if bytes.len() > 2 {
+        return Err(DerError("a keyUsage longer than nine bits"));
+    }
+    let mut usage = 0u16;
+    for (i, byte) in bytes.iter().enumerate() {
+        for bit in 0..8 {
+            if byte & (0x80 >> bit) != 0 {
+                usage |= 1 << (i * 8 + bit);
+            }
+        }
+    }
+    Ok(Some(KeyUsage(usage)))
 }
 
 /// The algorithm (the content of its AlgorithmIdentifier) and the key bits
@@ -786,6 +830,47 @@ mod tests {
         assert_eq!(ocsp_responder_uris(&cert), Ok(Vec::new()));
         // No extension at all.
         assert_eq!(ocsp_responder_uris(&cert_with(&[])), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn key_usage_of_fixtures() {
+        let usage = |pem: &[u8]| key_usage(&der(pem)).expect("keyUsage");
+        let ca = usage(include_bytes!("../../tests/data/chain-ca1.pem")).expect("present");
+        assert!(ca.crl_sign());
+        let no_crl_sign =
+            usage(include_bytes!("../../tests/data/chain-ca1-no-crl-sign.pem")).expect("present");
+        assert!(!no_crl_sign.crl_sign());
+        // digitalSignature only.
+        let leaf = usage(include_bytes!("../../tests/data/chain-leaf-ca1.pem")).expect("present");
+        assert_eq!(leaf, KeyUsage(1));
+        assert_eq!(key_usage(&cert_with(&[])), Ok(None));
+    }
+
+    fn key_usage_extension(bits: &[u8]) -> Vec<u8> {
+        let mut ext = tlv(OID, KEY_USAGE);
+        ext.extend(tlv(OCTET_STRING, &tlv(BIT_STRING, bits)));
+        tlv(SEQUENCE, &ext)
+    }
+
+    #[test]
+    fn key_usage_bits_and_refusals() {
+        let read = |bits: &[u8]| key_usage(&cert_with(&[key_usage_extension(bits)]));
+        // keyCertSign and cRLSign: bits 5 and 6, one unused bit.
+        assert_eq!(read(&[0x01, 0x06]), Ok(Some(KeyUsage(0x60))));
+        assert!(read(&[0x01, 0x06]).expect("ok").expect("some").crl_sign());
+        assert!(!read(&[0x02, 0x04]).expect("ok").expect("some").crl_sign());
+        // decipherOnly, bit 8, in a second byte.
+        assert_eq!(read(&[0x07, 0x00, 0x80]), Ok(Some(KeyUsage(0x100))));
+        assert_eq!(read(&[0x00]), Ok(Some(KeyUsage(0))));
+        assert!(read(&[]).is_err(), "no unused-bits byte");
+        assert!(read(&[0x08, 0x02]).is_err(), "eight unused bits");
+        assert!(read(&[0x01]).is_err(), "unused bits without a byte");
+        assert!(
+            read(&[0x00, 0x00, 0x00, 0x00]).is_err(),
+            "more than nine bits"
+        );
+        let two = cert_with(&[key_usage_extension(&[1, 6]), key_usage_extension(&[1, 6])]);
+        assert_eq!(key_usage(&two), Err(DerError("two keyUsage extensions")));
     }
 
     #[test]

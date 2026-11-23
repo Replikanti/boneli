@@ -374,7 +374,8 @@ Decided at #79 STOP 1 (2026-11-20), all three as the plan recommended:
   - The name resolution of a responder is not bounded by the deadline:
     Replikanti/boneli#81, as for CRL hosts. Closed by ADR-022
     (Replikanti/boneli#81).
-  - Intermediates are not checked: Replikanti/boneli#80.
+  - Intermediates are not checked: Replikanti/boneli#80. Closed by
+    ADR-027 (Replikanti/boneli#80).
   - A leaf with neither a CRL point nor an OCSP responder still passes
     unchecked (ADR-017, D2).
   - A cold cache during a responder outage fails closed (D1).

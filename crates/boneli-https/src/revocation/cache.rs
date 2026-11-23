@@ -1,6 +1,10 @@
-//! The CRL cache of one `TlsConfig` (ADR-017, item 8): keyed by the
-//! canonical URL, in memory for the life of the process, at most
-//! `CRL_CACHE_MAX_BYTES` of DER. An entry is fresh for `CRL_MAX_AGE_SECS`
+//! A CRL cache of one `TlsConfig` (ADR-017, item 8): keyed by the
+//! canonical URL, in memory for the life of the process, at most the byte
+//! cap it was made with (`CRL_CACHE_MAX_BYTES` for the leaves' lists,
+//! `CA_CRL_CACHE_MAX_BYTES` for the intermediates' lists, ADR-027) of
+//! DER. Each instance stores one kind of list: the leaf's a webpki
+//! verifier built with it, the intermediates' the DER that `ca_list`
+//! decides again for every certificate. An entry is fresh for `CRL_MAX_AGE_SECS`
 //! after a fetch last returned its lists, stale from then until their
 //! `nextUpdate` (one check claims the refresh, the others use the lists
 //! for `CRL_REFRESH_RETRY_SECS`), and a list is never used from its
@@ -19,18 +23,15 @@
 //! cache's mutex only around these calls, never across a fetch.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use rustls::client::WebPkiServerVerifier;
-
-use super::{CRL_CACHE_MAX_BYTES, CRL_MAX_AGE_SECS, CRL_REFRESH_RETRY_SECS};
+use super::{CRL_MAX_AGE_SECS, CRL_REFRESH_RETRY_SECS};
 
 /// One accepted list.
 #[derive(Clone, Debug)]
-pub(crate) struct List {
-    /// The verifier built with this list, the handshake's roots and
-    /// provider.
-    pub(crate) verifier: Arc<WebPkiServerVerifier>,
+pub(crate) struct List<V> {
+    /// The list as its check uses it: for a leaf the verifier built with
+    /// it, the handshake's roots and provider; for an intermediate its DER.
+    pub(crate) value: V,
     /// SHA-256 of the list's DER: two fetches of the same list are one.
     pub(crate) digest: [u8; 32],
     pub(crate) next_update: u64,
@@ -40,10 +41,10 @@ pub(crate) struct List {
 
 /// The lists of one URL.
 #[derive(Clone, Debug)]
-pub(crate) struct Entry {
+pub(crate) struct Entry<V> {
     /// Every distinct list accepted at `this_update`, in arrival order;
     /// never empty in the cache.
-    pub(crate) lists: Vec<List>,
+    pub(crate) lists: Vec<List<V>>,
     pub(crate) this_update: u64,
     /// The last time a fetch returned one of these lists or another with
     /// the same `thisUpdate`.
@@ -55,19 +56,19 @@ pub(crate) struct Entry {
     last_used: u64,
 }
 
-impl Entry {
+impl<V: Clone> Entry<V> {
     /// An entry of one list, confirmed at `now`.
     pub(crate) fn new(
-        verifier: Arc<WebPkiServerVerifier>,
+        value: V,
         digest: [u8; 32],
         this_update: u64,
         next_update: u64,
         der_len: usize,
         now: u64,
-    ) -> Entry {
+    ) -> Entry<V> {
         Entry {
             lists: vec![List {
-                verifier,
+                value,
                 digest,
                 next_update,
                 der_len,
@@ -84,8 +85,8 @@ impl Entry {
         self.lists.iter().map(|l| l.der_len).sum()
     }
 
-    fn verifiers(&self) -> Vec<Arc<WebPkiServerVerifier>> {
-        self.lists.iter().map(|l| Arc::clone(&l.verifier)).collect()
+    fn values(&self) -> Vec<V> {
+        self.lists.iter().map(|l| l.value.clone()).collect()
     }
 
     /// Drops the lists at or past their `nextUpdate`; the bytes freed.
@@ -138,33 +139,41 @@ pub(crate) fn window(
     Window::Claim
 }
 
-/// What the cache says about a URL at a time. The verifiers are all lists
-/// the entry holds; a leaf is checked against each.
+/// What the cache says about a URL at a time. The values are all lists
+/// the entry holds; a certificate is checked against each.
 #[derive(Clone, Debug)]
-pub(crate) enum Lookup {
+pub(crate) enum Lookup<V> {
     /// No usable list: none, or `now` is at or past the `nextUpdate` of
     /// every list.
     Missing,
     /// Within the maximum age: use them without a fetch.
-    Fresh(Vec<Arc<WebPkiServerVerifier>>),
+    Fresh(Vec<V>),
     /// Past the maximum age, and another check claimed the refresh less
     /// than `CRL_REFRESH_RETRY_SECS` ago: use them without a fetch.
-    Stale(Vec<Arc<WebPkiServerVerifier>>),
+    Stale(Vec<V>),
     /// Past the maximum age and claimed now by this caller, who fetches;
     /// the lists and their `thisUpdate` decide if the refresh fails.
-    Refresh(Vec<Arc<WebPkiServerVerifier>>, u64),
+    Refresh(Vec<V>, u64),
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct CrlCache {
-    entries: BTreeMap<String, Entry>,
+#[derive(Debug)]
+pub(crate) struct CrlCache<V> {
+    entries: BTreeMap<String, Entry<V>>,
     total: usize,
     clock: u64,
+    /// The DER bytes the entries may hold at most.
+    max_bytes: usize,
 }
 
-impl CrlCache {
-    pub(crate) fn new() -> CrlCache {
-        CrlCache::default()
+impl<V: Clone> CrlCache<V> {
+    /// An empty cache that holds at most `max_bytes` of DER.
+    pub(crate) fn new(max_bytes: usize) -> CrlCache<V> {
+        CrlCache {
+            entries: BTreeMap::new(),
+            total: 0,
+            clock: 0,
+            max_bytes,
+        }
     }
 
     /// Forgets every entry (a poisoned mutex: the cache only saves
@@ -181,7 +190,7 @@ impl CrlCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn get(&self, url: &str) -> Option<&Entry> {
+    pub(crate) fn get(&self, url: &str) -> Option<&Entry<V>> {
         self.entries.get(url)
     }
 
@@ -198,17 +207,17 @@ impl CrlCache {
     /// The lists cached for `url` while `now` is before their
     /// `nextUpdate`, fresh or stale, without claiming a refresh or
     /// counting a use.
-    pub(crate) fn peek(&self, url: &str, now: u64) -> Vec<Arc<WebPkiServerVerifier>> {
+    pub(crate) fn peek(&self, url: &str, now: u64) -> Vec<V> {
         self.entries.get(url).map_or_else(Vec::new, |e| {
             e.lists
                 .iter()
                 .filter(|l| now < l.next_update)
-                .map(|l| Arc::clone(&l.verifier))
+                .map(|l| l.value.clone())
                 .collect()
         })
     }
 
-    pub(crate) fn lookup(&mut self, url: &str, now: u64) -> Lookup {
+    pub(crate) fn lookup(&mut self, url: &str, now: u64) -> Lookup<V> {
         let tick = self.tick();
         let Some(entry) = self.entries.get_mut(url) else {
             return Lookup::Missing;
@@ -232,11 +241,11 @@ impl CrlCache {
             CRL_MAX_AGE_SECS,
             CRL_REFRESH_RETRY_SECS,
         ) {
-            Window::Fresh => Lookup::Fresh(entry.verifiers()),
-            Window::Waiting => Lookup::Stale(entry.verifiers()),
+            Window::Fresh => Lookup::Fresh(entry.values()),
+            Window::Waiting => Lookup::Stale(entry.values()),
             Window::Claim | Window::Expired => {
                 entry.claimed_at = Some(now);
-                Lookup::Refresh(entry.verifiers(), entry.this_update)
+                Lookup::Refresh(entry.values(), entry.this_update)
             }
         }
     }
@@ -249,8 +258,8 @@ impl CrlCache {
     /// adds the list unless the entry holds the same bytes already, so
     /// every distinct list at the newest `thisUpdate` stays, whichever
     /// leaf it was fetched for. Least recently used entries of other URLs
-    /// go until the list fits under `CRL_CACHE_MAX_BYTES`.
-    pub(crate) fn insert(&mut self, url: &str, entry: Entry, now: u64) {
+    /// go until the list fits under the cache's byte cap.
+    pub(crate) fn insert(&mut self, url: &str, entry: Entry<V>, now: u64) {
         let tick = self.tick();
         let mut freed = 0;
         self.entries.retain(|_, e| {
@@ -293,8 +302,8 @@ impl CrlCache {
         }
         let len = entry.der_len();
         if !self.make_room(url, len) {
-            // Larger than the whole cache; `MAX_CRL_BYTES` keeps this from
-            // happening.
+            // Larger than the whole cache; `MAX_CRL_BYTES` and
+            // `MAX_CA_CRL_BYTES` keep this from happening.
             return;
         }
         entry.confirmed_at = now;
@@ -307,7 +316,7 @@ impl CrlCache {
     /// Evicts least recently used entries other than `keep` until `need`
     /// more bytes fit; whether they do.
     fn make_room(&mut self, keep: &str, need: usize) -> bool {
-        while self.total.saturating_add(need) > CRL_CACHE_MAX_BYTES {
+        while self.total.saturating_add(need) > self.max_bytes {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -329,10 +338,14 @@ impl CrlCache {
 mod tests {
     use super::*;
 
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
 
-    use crate::revocation::MAX_CRL_BYTES;
+    use rustls::client::WebPkiServerVerifier;
+
     use crate::revocation::tests::verifier_for;
+    use crate::revocation::{CRL_CACHE_MAX_BYTES, MAX_CRL_BYTES};
+
+    type Cache = CrlCache<Arc<WebPkiServerVerifier>>;
 
     const T0: u64 = 1_767_225_600;
     const WEEK1_END: u64 = 1_767_830_400;
@@ -345,15 +358,19 @@ mod tests {
         )
     }
 
-    fn entry(this_update: u64, next_update: u64, der_len: usize) -> Entry {
+    fn entry(
+        this_update: u64,
+        next_update: u64,
+        der_len: usize,
+    ) -> Entry<Arc<WebPkiServerVerifier>> {
         Entry::new(verifier(), [0; 32], this_update, next_update, der_len, 0)
     }
 
-    fn first(entry: &Entry) -> &Arc<WebPkiServerVerifier> {
-        &entry.lists.first().expect("a list").verifier
+    fn first(entry: &Entry<Arc<WebPkiServerVerifier>>) -> &Arc<WebPkiServerVerifier> {
+        &entry.lists.first().expect("a list").value
     }
 
-    fn kind(lookup: &Lookup) -> &'static str {
+    fn kind<V>(lookup: &Lookup<V>) -> &'static str {
         match lookup {
             Lookup::Missing => "missing",
             Lookup::Fresh(_) => "fresh",
@@ -362,13 +379,13 @@ mod tests {
         }
     }
 
-    fn at(cache: &mut CrlCache, now: u64) -> &'static str {
+    fn at(cache: &mut Cache, now: u64) -> &'static str {
         kind(&cache.lookup("u", now))
     }
 
     #[test]
     fn fresh_until_next_update_exclusive() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), 1_767_787_200);
         assert_eq!(at(&mut cache, WEEK1_END - 1), "fresh");
         assert_eq!(at(&mut cache, WEEK1_END), "missing");
@@ -377,7 +394,7 @@ mod tests {
 
     #[test]
     fn max_age_and_retry_bounds_exclusive() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0);
         assert_eq!(at(&mut cache, T0 + 86_399), "fresh");
         assert_eq!(at(&mut cache, T0 + 86_400), "refresh");
@@ -389,10 +406,10 @@ mod tests {
 
     #[test]
     fn time_arithmetic_saturates() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, u64::MAX, 10), u64::MAX - 1);
         assert_eq!(at(&mut cache, u64::MAX - 1), "fresh");
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(0, u64::MAX, 10), 0);
         assert_eq!(at(&mut cache, u64::MAX - 1), "refresh");
         assert_eq!(at(&mut cache, u64::MAX - 1), "stale");
@@ -400,7 +417,7 @@ mod tests {
 
     #[test]
     fn clock_moved_back_refreshes() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 86_400);
         assert_eq!(
             at(&mut cache, T0),
@@ -416,7 +433,7 @@ mod tests {
 
     #[test]
     fn tie_keeps_existing_and_restarts_max_age() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         let original = entry(T0, WEEK1_END, 10);
         let kept = Arc::clone(first(&original));
         cache.insert("u", original, T0);
@@ -438,7 +455,7 @@ mod tests {
 
     #[test]
     fn overlapping_newer_list_replaces() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0);
         cache.insert("u", entry(T0 + 86_400, WEEK1_END + 86_400, 20), T0 + 3);
         let e = cache.get("u").expect("entry");
@@ -449,7 +466,7 @@ mod tests {
 
     #[test]
     fn older_list_does_not_replace_fresh() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0 + 86_400, WEEK1_END + 86_400, 20), T0 + 86_400);
         assert_eq!(at(&mut cache, T0 + 172_800), "refresh");
         cache.insert("u", entry(T0, WEEK1_END, 10), T0 + 172_801);
@@ -464,7 +481,7 @@ mod tests {
 
     #[test]
     fn expired_entry_is_replaced_even_by_older_list() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0 + 86_400, WEEK1_END, 20), T0 + 86_400);
         // At WEEK1_END the cached entry has expired; an older list that is
         // still valid then replaces it.
@@ -479,7 +496,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_over_64_mib() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("first", entry(T0, WEEK1_END, 30 * MIB), T0);
         cache.insert("second", entry(T0, WEEK1_END, 30 * MIB), T0);
         assert_eq!(kind(&cache.lookup("first", T0)), "fresh");
@@ -492,7 +509,7 @@ mod tests {
 
     #[test]
     fn single_entry_at_cap_fits() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("a", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0);
         cache.insert("b", entry(T0, WEEK1_END, MAX_CRL_BYTES), T0);
         assert_eq!(cache.total(), CRL_CACHE_MAX_BYTES);
@@ -503,8 +520,31 @@ mod tests {
     }
 
     #[test]
+    fn ca_cache_cap_is_inclusive() {
+        // The intermediates' cache (ADR-027): 16 lists at
+        // `MAX_CA_CRL_BYTES` fit exactly, a 17th evicts the least
+        // recently used.
+        use crate::revocation::{CA_CRL_CACHE_MAX_BYTES, MAX_CA_CRL_BYTES};
+        let mut cache: Cache = CrlCache::new(CA_CRL_CACHE_MAX_BYTES);
+        for i in 0..16 {
+            cache.insert(&format!("u{i}"), entry(T0, WEEK1_END, MAX_CA_CRL_BYTES), T0);
+        }
+        assert_eq!(cache.total(), CA_CRL_CACHE_MAX_BYTES);
+        assert_eq!(cache.len(), 16);
+        // u0 used last, so u1 is the least recently used.
+        assert_eq!(kind(&cache.lookup("u0", T0)), "fresh");
+        cache.insert("u16", entry(T0, WEEK1_END, MAX_CA_CRL_BYTES), T0);
+        assert_eq!(cache.len(), 16);
+        assert!(cache.get("u0").is_some());
+        assert!(cache.get("u1").is_none());
+        assert!(cache.get("u16").is_some());
+        assert_eq!(cache.total(), CA_CRL_CACHE_MAX_BYTES);
+        assert_eq!(CA_CRL_CACHE_MAX_BYTES, 16 * MAX_CA_CRL_BYTES);
+    }
+
+    #[test]
     fn tie_keeps_every_distinct_list() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0);
         let other = verifier_for(include_bytes!("../../tests/data/crl-ca-fresh.crl"));
         cache.insert(
@@ -514,7 +554,7 @@ mod tests {
         );
         let e = cache.get("u").expect("entry");
         assert_eq!(e.lists.len(), 2);
-        assert!(Arc::ptr_eq(&e.lists[1].verifier, &other));
+        assert!(Arc::ptr_eq(&e.lists[1].value, &other));
         assert_eq!((e.der_len(), e.confirmed_at), (40, T0 + 5));
         assert_eq!(cache.total(), 40);
         // Known bytes again: no third list, the age restarts.
@@ -541,7 +581,7 @@ mod tests {
 
     #[test]
     fn lists_of_one_entry_expire_one_by_one() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0);
         cache.insert(
             "u",
@@ -561,7 +601,7 @@ mod tests {
 
     #[test]
     fn peek_neither_claims_nor_outlives_next_update() {
-        let mut cache = CrlCache::new();
+        let mut cache = Cache::new(CRL_CACHE_MAX_BYTES);
         cache.insert("u", entry(T0, WEEK1_END, 10), T0);
         assert_eq!(cache.peek("u", T0 + 86_400).len(), 1, "stale entries count");
         assert_eq!(cache.get("u").expect("entry").claimed_at, None);

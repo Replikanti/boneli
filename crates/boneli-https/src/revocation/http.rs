@@ -4,7 +4,8 @@
 //! name lookup too (ADR-022). `Host` is the only field
 //! sent: no `User-Agent`, credentials or cookies. 200 only, no redirect
 //! followed, no `Content-Encoding`, the body read to its end under
-//! `MAX_CRL_BYTES` for a list and `MAX_OCSP_RESPONSE_BYTES` for an OCSP
+//! `MAX_CRL_BYTES` for a leaf's list, `MAX_CA_CRL_BYTES` for an
+//! intermediate's (ADR-027) and `MAX_OCSP_RESPONSE_BYTES` for an OCSP
 //! response, whose request travels in the path (RFC 6960, A.1). An
 //! `https` point or responder is fetched over this crate's TLS client with
 //! the same roots and without a revocation check of its own, which keeps
@@ -129,6 +130,17 @@ impl CrlSource for HttpSource {
     fn fetch(&self, url: &CrlUrl, deadline: Instant) -> Result<Vec<u8>, CrlFetchError> {
         self.fetch_path(url, url.path(), MAX_CRL_BYTES, deadline)
     }
+
+    /// An intermediate's list under its own cap (ADR-027): a
+    /// `Content-Length` above `cap` fails before the body is read.
+    fn fetch_limited(
+        &self,
+        url: &CrlUrl,
+        cap: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        self.fetch_path(url, url.path(), cap, deadline)
+    }
 }
 
 impl OcspSource for HttpSource {
@@ -215,6 +227,7 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     use crate::Roots;
+    use crate::revocation::MAX_CA_CRL_BYTES;
 
     const GUARD: Duration = Duration::from_secs(10);
 
@@ -446,6 +459,35 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(5));
         server.join().expect("server");
+    }
+
+    #[test]
+    fn http_source_ca_cap_stops_before_body() {
+        // An intermediate's list (ADR-027): a `Content-Length` one over
+        // `MAX_CA_CRL_BYTES` fails before any body byte.
+        let (addr, server) = server(|tcp| {
+            let _ = tcp.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_CA_CRL_BYTES + 1
+                )
+                .as_bytes(),
+            );
+            let _ = read_head(tcp);
+        });
+        let start = Instant::now();
+        assert_eq!(
+            source().fetch_limited(&url(addr, "/root.crl"), MAX_CA_CRL_BYTES, deadline()),
+            Err(CrlFetchError::TooLarge)
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        server.join().expect("server");
+        // At the cap the body is read.
+        let (addr, _server) = answer(ok_with(&vec![0u8; MAX_CA_CRL_BYTES]));
+        let body = source()
+            .fetch_limited(&url(addr, "/root.crl"), MAX_CA_CRL_BYTES, deadline())
+            .expect("fetch");
+        assert_eq!(body.len(), MAX_CA_CRL_BYTES);
     }
 
     #[test]

@@ -671,6 +671,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and to be the file the path names after locking (`Error::LockChanged`
   after 1,024 replacements); a pin waits at most 120 s for a removal
   (`Error::LockBusy`). Nothing is evicted yet.
+- `boneli-https` (#80, ADR-027): certificate revocation for the
+  intermediates on the verified path. Before the leaf, each intermediate
+  is checked against its issuer's CRL, from the anchor side down, with a
+  strict parser of its own that accepts the issuingDistributionPoint
+  without a name that every Let's Encrypt and GoDaddy CA list carries and
+  webpki refuses. A listed intermediate fails with `Error::Revoked`; one
+  that no list settles fails with `Error::RevocationUnknown` (fail closed,
+  no opt-out); one without an `http` or `https` point passes unchecked.
+  The anchor and the certificates a server sends beside the path are never
+  fetched for. The lists have a cache of their own with ADR-017's
+  staleness rules. New public items: `TlsStream::intermediate_revocation`,
+  `CrlSource::fetch_limited` (a provided method),
+  `RevocationFailureKind::LimitReached`, and the limits
+  `MAX_CA_CRL_BYTES` (1 MiB), `MAX_CA_CRL_FETCHES` (8 per connection),
+  `CA_CRL_CHECK_DEADLINE` (38 s) and `CA_CRL_CACHE_MAX_BYTES` (16 MiB). No
+  new crate or edge. The intermediates' known limits of ADR-017 and
+  ADR-020 point to ADR-027.
 
 ### Changed
 

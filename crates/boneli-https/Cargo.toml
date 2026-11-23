@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -49,8 +49,10 @@ ml-kem = { version = "0.3.4", default-features = false, features = ["zeroize"] }
 zeroize = { version = "1.9.1", default-features = false }
 # The verified path of a server's chain, for the leaf's issuer, and the
 # check of a delegated OCSP responder's certificate (`verify_for_usage`
-# with `id-kp-OCSPSigning`); ADR-020. Already in the graph through rustls;
-# a direct edge, no new crate. `alloc` for `VerifiedPath::issuer_spki`.
+# with `id-kp-OCSPSigning`); ADR-020. The same path gives the issuers of
+# the intermediates, whose CRLs ADR-027 checks. Already in the graph
+# through rustls; a direct edge, no new crate. `alloc` for
+# `VerifiedPath::issuer_spki`.
 rustls-webpki = { version = "0.103.17", default-features = false, features = ["alloc"] }
 # SHA-1 for OCSP CertIDs only (`digest::SHA1_FOR_LEGACY_USE_ONLY`): every
 # measured responder answers with a SHA-1 CertID (ADR-020). Already in the

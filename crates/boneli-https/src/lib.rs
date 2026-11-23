@@ -34,7 +34,15 @@
 //! answer is [`Error::Revoked`], and every answer that does not settle the
 //! leaf, an unreachable responder included, is
 //! [`Error::RevocationUnknown`]. A leaf with neither passes unchecked, which
-//! [`TlsStream::revocation`] reports. Resumed sessions are checked again.
+//! [`TlsStream::revocation`] reports. Before the leaf, each intermediate
+//! on the path webpki verifies is checked against its issuer's CRL
+//! (ADR-027), from the anchor side down, by the same fetch, cache and
+//! fail-closed rules, with at most [`MAX_CA_CRL_FETCHES`] fetches of at
+//! most [`MAX_CA_CRL_BYTES`] per connection; a listed intermediate is
+//! [`Error::Revoked`], and one without a fetchable point passes
+//! unchecked, which [`TlsStream::intermediate_revocation`] reports. The
+//! anchor is configured trust and never checked. Resumed sessions are
+//! checked again.
 //!
 //! The handshake has a total deadline, `ConnectOptions::handshake_timeout`,
 //! on top of the timeout of each read and write, so a peer that sends a
@@ -83,9 +91,10 @@ pub use resolve::{
     Resolver, ResolverConfig,
 };
 pub use revocation::{
-    CRL_CACHE_MAX_BYTES, CRL_CHECK_DEADLINE, CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT,
-    CRL_IO_TIMEOUT, CRL_MAX_AGE_SECS, CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, CRL_MIN_RATE,
-    CRL_REFRESH_RETRY_SECS, CRL_SETUP_TIME, CrlFetchError, CrlScheme, CrlSource, CrlUrl,
+    CA_CRL_CACHE_MAX_BYTES, CA_CRL_CHECK_DEADLINE, CRL_CACHE_MAX_BYTES, CRL_CHECK_DEADLINE,
+    CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT, CRL_IO_TIMEOUT, CRL_MAX_AGE_SECS,
+    CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, CRL_MIN_RATE, CRL_REFRESH_RETRY_SECS, CRL_SETUP_TIME,
+    CrlFetchError, CrlScheme, CrlSource, CrlUrl, MAX_CA_CRL_BYTES, MAX_CA_CRL_FETCHES,
     MAX_CRL_BYTES, MAX_CRL_URL_BYTES, MAX_CRL_URLS, MAX_OCSP_RESPONSE_BYTES,
     MAX_OCSP_RESPONSE_CERTS, MAX_OCSP_URLS, OCSP_CACHE_MAX_ENTRIES, OCSP_CHECK_DEADLINE,
     OCSP_MAX_AGE_SECS, OCSP_REFRESH_RETRY_SECS, OcspSource, RevocationFailure,
@@ -131,17 +140,18 @@ pub enum Error {
     Pem(pem::Error),
     /// A zero timeout or port.
     InvalidInput(&'static str),
-    /// The server's certificate is revoked: listed in the CRL at `url`
-    /// (ADR-017), or reported revoked by the OCSP responder at `url`
-    /// (ADR-020).
+    /// A certificate of the server's chain is revoked: the leaf or an
+    /// intermediate listed in the CRL at `url` (ADR-017, ADR-027), or the
+    /// leaf reported revoked by the OCSP responder at `url` (ADR-020).
     Revoked {
         /// The canonical URL of the list or the responder.
         url: String,
     },
-    /// The server's certificate names CRL distribution points or OCSP
-    /// responders and none of them settled whether it is revoked: each
-    /// failure with its URL and cause (ADR-017, item 4; ADR-020). The
-    /// check fails closed.
+    /// A certificate of the server's chain names CRL distribution points
+    /// or OCSP responders and none of them settled whether it is revoked:
+    /// each failure with its URL and cause (ADR-017, item 4; ADR-020); an
+    /// intermediate's details start with `intermediate k of n` (ADR-027).
+    /// The check fails closed.
     RevocationUnknown(Vec<RevocationFailure>),
 }
 
@@ -263,9 +273,10 @@ impl Roots {
 /// the given roots (ADR-005). The key exchange groups are, in this order,
 /// X25519MLKEM768 (TLS 1.3 only), X25519, P-256 and P-384 (ADR-016), or
 /// the last three for [`TlsConfig::classical`]. Server certificates are
-/// checked for revocation by CRL (ADR-017) or OCSP (ADR-020), with no
-/// switch to turn it off. Cheap to clone; clones share the session store
-/// and the CRL and OCSP caches, so share one per set of roots.
+/// checked for revocation by CRL (ADR-017) or OCSP (ADR-020), and their
+/// intermediates by CRL (ADR-027), with no switch to turn it off. Cheap
+/// to clone; clones share the session store and the CRL, CA and OCSP
+/// caches, so share one per set of roots.
 #[derive(Clone, Debug)]
 pub struct TlsConfig {
     client: Arc<ClientConfig>,
@@ -439,8 +450,9 @@ impl TlsConfig {
 /// [`CRL_CHECK_DEADLINE`], shared by all the leaf's CRL URLs, or
 /// [`OCSP_CHECK_DEADLINE`] for a leaf checked by OCSP: on a cold cache, or
 /// once a list or answer is due again, it adds at most that to `connect`
-/// and `connect_over` (ADR-017, item 7; ADR-020, item 7). A warm cache
-/// adds no I/O.
+/// and `connect_over` (ADR-017, item 7; ADR-020, item 7), after the
+/// intermediates' check with its own [`CA_CRL_CHECK_DEADLINE`] (ADR-027).
+/// A warm cache adds no I/O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
     connect_timeout: Duration,
@@ -597,11 +609,12 @@ fn handshake<S: Transport>(
             }
         }
     }
-    // rustls has verified the chain; now its revocation (ADR-017, item 1).
-    // Not inside the handshake: rustls skips the verifier when it resumes a
-    // session, but restores the peer's chain from it, so a resumed
-    // connection is checked here again. No application byte has been sent.
-    let revocation = match conn.peer_certificates() {
+    // rustls has verified the chain; now its revocation (ADR-017, item 1;
+    // ADR-027). Not inside the handshake: rustls skips the verifier when it
+    // resumes a session, but restores the peer's chain from it, so a
+    // resumed connection is checked here again. No application byte has
+    // been sent.
+    let status = match conn.peer_certificates() {
         Some(chain) => config.revocation.check(chain, &name, outer)?,
         None => {
             return Err(Error::RevocationUnknown(vec![RevocationFailure {
@@ -615,7 +628,8 @@ fn handshake<S: Transport>(
     framed.inner.set_write_timeout(Some(options.io_timeout))?;
     Ok(TlsStream {
         stream: StreamOwned::new(conn, framed),
-        revocation,
+        revocation: status.leaf,
+        intermediate_revocation: status.intermediates,
     })
 }
 
@@ -784,6 +798,7 @@ impl<S: Nonblocking> Nonblocking for Tunnel<S> {
 pub struct TlsStream<S: Read + Write> {
     stream: StreamOwned<ClientConnection, Framed<S>>,
     revocation: RevocationStatus,
+    intermediate_revocation: Vec<RevocationStatus>,
 }
 
 impl<S: Read + Write> TlsStream<S> {
@@ -814,6 +829,15 @@ impl<S: Read + Write> TlsStream<S> {
     /// tests and logs.
     pub fn revocation(&self) -> &RevocationStatus {
         &self.revocation
+    }
+
+    /// What the check of each intermediate on the verified path found
+    /// (ADR-027), the leaf's issuer first: checked against which list,
+    /// decided by a stale cached list, or an intermediate without a
+    /// fetchable point that passed unchecked. Empty when a root issued the
+    /// leaf. For tests and logs.
+    pub fn intermediate_revocation(&self) -> &[RevocationStatus] {
+        &self.intermediate_revocation
     }
 
     /// The protocol the server chose by ALPN, if any.
@@ -865,6 +889,7 @@ impl<S: Read + Write> fmt::Debug for TlsStream<S> {
         f.debug_struct("TlsStream")
             .field("protocol_version", &self.protocol_version())
             .field("revocation", &self.revocation)
+            .field("intermediate_revocation", &self.intermediate_revocation)
             .finish_non_exhaustive()
     }
 }

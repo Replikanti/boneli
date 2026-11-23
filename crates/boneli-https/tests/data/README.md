@@ -1,8 +1,8 @@
 # Test certificates and keys
 
 Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`,
-`tests/revocation.rs`, `tests/ocsp.rs` and the unit tests of
-`src/revocation/`, read with `include_bytes!`. The keys protect nothing:
+`tests/revocation.rs`, `tests/ocsp.rs`, `tests/intermediates.rs` and the
+unit tests of `src/revocation/`, read with `include_bytes!`. The keys protect nothing:
 they exist only so that a local test server can complete a TLS
 handshake, so that `RsaSha256Key` can be checked against OpenSSL, and so
 that tests can sign OCSP answers. No system trusts these CAs (the real
@@ -465,4 +465,193 @@ openssl ocsp -issuer cert-01 -cert cert-00 -no_nonce -reqout capture.req
 curl -s "$url/$(base64 -w0 capture.req | sed 's/+/%2B/g; s#/#%2F#g; s/=/%3D/g')" \
   -o capture.resp
 openssl ocsp -respin capture.resp -resp_text -noverify
+```
+
+## Revocation of intermediates (`tests/intermediates.rs`, `src/revocation/ca_list.rs`, ADR-027)
+
+A fourth test hierarchy: a root, six CAs in a line, each issued by the one
+before, and leaves under them. Every CA is `CA:TRUE` with `keyCertSign,
+cRLSign` and names two points for its issuer's list,
+`http://crl1.boneli.test/<issuer>.crl` and
+`http://crl2.boneli.test/<issuer>.crl` (`<issuer>` is `root`, `ca1` ...
+`ca5`); every leaf names one, `http://crl1.boneli.test/<issuer>.crl`. All
+CAs share one key, so a leaf or CA under "CA 1" verifies under any of
+CA 1's variants. The root's and the CAs' keys are kept (`test-only-`), so
+the tests build and sign lists at test time; they protect nothing. All
+validities are 2026-01-01 to 2126-01-01, every leaf has SAN
+`DNS:localhost, IP:127.0.0.1`, EKU serverAuth and the key `crl-leaf.key`.
+
+| File | What |
+| --- | --- |
+| `chain-root.pem` | "Boneli chain test root", self-signed, no point |
+| `test-only-chain-root.key` | its key, P-256, PKCS#8 |
+| `chain-ca1.pem` ... `chain-ca6.pem` | "Boneli chain test CA 1" ... "6", serials 0x11 ... 0x16, CA 1 issued by the root, each next one by the one before |
+| `test-only-chain-ca.key` | the key of every CA, P-256, PKCS#8 |
+| `chain-ca1-no-point.pem` | CA 1 without a CRL point, serial 0x21 |
+| `chain-ca1-ldap.pem` | CA 1 with an `ldap` point only, serial 0x22 |
+| `chain-ca1-five-urls.pem` | CA 1 with five points, `crl1` ... `crl5`, serial 0x23 |
+| `chain-ca1-no-crl-sign.pem` | CA 1 with `keyCertSign` only, serial 0x24: the issuer of `chain-ca2.pem` that may not sign lists |
+| `chain-stray-ca.pem` | "Boneli chain stray CA" under the root, point `http://169.254.169.254/x.crl`, serial 0x25, sent beside a path |
+| `chain-leaf-ca1.pem`, `chain-leaf-ca2.pem`, `chain-leaf-ca5.pem`, `chain-leaf-ca6.pem` | leaves under CA 1, 2, 5 and 6, serials 0x31, 0x32, 0x35, 0x36 |
+| `chain-leaf-ocsp-ca1.pem` | a leaf under CA 1 with OCSP `http://ocsp.boneli.test` and no CRL point, serial 0x37 |
+| `chain-leaf-none-ca1.pem` | a leaf under CA 1 with neither, serial 0x38 |
+| `chain-root-empty.crl` | the root's list from openssl, no entries, 2026-01-01 to 2126-01-01 |
+| `chain-root-lists-ca1.crl` | the same with a critical issuingDistributionPoint `onlyContainsCACerts` and no name (Let's Encrypt's and GoDaddy's form), listing 0x11 |
+
+Generated once with OpenSSL 3.5 from a directory holding a copy of
+`crl-leaf.key`, then copied here; regenerating creates new keys, and every
+file changes together. Rust for the generator stays rejected for the
+reason recorded above.
+
+```sh
+set -eu
+key() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1"; }
+key test-only-chain-root.key; key test-only-chain-ca.key
+openssl req -x509 -new -key test-only-chain-root.key -subj "/CN=Boneli chain test root" \
+  -not_before 20260101000000Z -not_after 21260101000000Z \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -out chain-root.pem
+cat > chain.cnf <<'CNF'
+[ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = dp1, dp2
+[ca_none]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+[ca_ldap]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = URI:ldap://ldap.boneli.test/cn=Boneli%20chain%20test%20root?certificateRevocationList
+[ca_five]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = URI:http://crl1.boneli.test/${ENV::ISSUER}.crl, URI:http://crl2.boneli.test/${ENV::ISSUER}.crl, URI:http://crl3.boneli.test/${ENV::ISSUER}.crl, URI:http://crl4.boneli.test/${ENV::ISSUER}.crl, URI:http://crl5.boneli.test/${ENV::ISSUER}.crl
+[ca_no_crl_sign]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign
+crlDistributionPoints = dp1, dp2
+[ca_stray]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+crlDistributionPoints = URI:http://169.254.169.254/x.crl
+[leaf]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+crlDistributionPoints = URI:http://crl1.boneli.test/${ENV::ISSUER}.crl
+[leaf_ocsp]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+authorityInfoAccess = OCSP;URI:http://ocsp.boneli.test
+[leaf_none]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+[dp1]
+fullname = URI:http://crl1.boneli.test/${ENV::ISSUER}.crl
+[dp2]
+fullname = URI:http://crl2.boneli.test/${ENV::ISSUER}.crl
+CNF
+cert() { # serial section subject key issuer-pem issuer-key issuer-name out
+  ISSUER=$7 openssl req -new -key "$4" -subj "/CN=$3" |
+    ISSUER=$7 openssl x509 -req -CA "$5" -CAkey "$6" -set_serial "$1" \
+      -not_before 20260101000000Z -not_after 21260101000000Z \
+      -extfile chain.cnf -extensions "$2" -out "$8"
+}
+ca() { # serial section n issuer-pem issuer-key issuer-name out
+  cert "$1" "$2" "Boneli chain test CA $3" test-only-chain-ca.key "$4" "$5" "$6" "$7"
+}
+ca 0x11 ca 1 chain-root.pem test-only-chain-root.key root chain-ca1.pem
+for n in 2 3 4 5 6; do
+  p=$((n - 1)); ca "0x1$n" ca "$n" "chain-ca$p.pem" test-only-chain-ca.key "ca$p" "chain-ca$n.pem"
+done
+ca 0x21 ca_none 1 chain-root.pem test-only-chain-root.key root chain-ca1-no-point.pem
+ca 0x22 ca_ldap 1 chain-root.pem test-only-chain-root.key root chain-ca1-ldap.pem
+ca 0x23 ca_five 1 chain-root.pem test-only-chain-root.key root chain-ca1-five-urls.pem
+ca 0x24 ca_no_crl_sign 1 chain-root.pem test-only-chain-root.key root chain-ca1-no-crl-sign.pem
+cert 0x25 ca_stray "Boneli chain stray CA" test-only-chain-ca.key chain-root.pem \
+  test-only-chain-root.key root chain-stray-ca.pem
+leaf() { # serial section n out
+  cert "$1" "$2" localhost crl-leaf.key "chain-ca$3.pem" test-only-chain-ca.key "ca$3" "$4"
+}
+leaf 0x31 leaf 1 chain-leaf-ca1.pem
+leaf 0x32 leaf 2 chain-leaf-ca2.pem
+leaf 0x35 leaf 5 chain-leaf-ca5.pem
+leaf 0x36 leaf 6 chain-leaf-ca6.pem
+leaf 0x37 leaf_ocsp 1 chain-leaf-ocsp-ca1.pem
+leaf 0x38 leaf_none 1 chain-leaf-none-ca1.pem
+# Two lists from openssl, an encoder independent of the tests' own.
+cat > ca.cnf <<'CNF'
+[ca]
+default_ca = test
+[test]
+database = index.txt
+crlnumber = crlnumber
+default_md = sha256
+crl_extensions = crl_ext
+[crl_ext]
+authorityKeyIdentifier = keyid:always
+[crl_ca_only]
+authorityKeyIdentifier = keyid:always
+issuingDistributionPoint = critical, @idp_ca_only
+[idp_ca_only]
+onlyCA = TRUE
+CNF
+gencrl() { # out serials...; $EXT names the extension section
+  out=$1; shift
+  : > index.txt
+  for s in "$@"; do
+    printf 'R\t21260101000000Z\t260101000000Z\t%s\tunknown\t/CN=x\n' "$s" >> index.txt
+  done
+  echo 01 > crlnumber
+  openssl ca -config ca.cnf ${EXT:+-crlexts "$EXT"} -gencrl \
+    -keyfile test-only-chain-root.key -cert chain-root.pem \
+    -crl_lastupdate 20260101000000Z -crl_nextupdate 21260101000000Z -out "$out.pem"
+  openssl crl -in "$out.pem" -outform DER -out "$out"
+}
+gencrl chain-root-empty.crl
+EXT=crl_ca_only gencrl chain-root-lists-ca1.crl 11
+```
+
+### Real captures of CA lists
+
+Public certificates and lists, captured on 2026-11-20 between 23:16 and
+23:18 UTC while implementing #80 (the lists at 23:18:12, 1,795,216,692);
+the unit tests check them at that time and at each list's `nextUpdate`.
+Each chain is what the server sent, leaf first.
+
+| File | What |
+| --- | --- |
+| `capture-isrgrootx1-chain.pem` | `valid-isrgrootx1.letsencrypt.org`: leaf, YR1, `Root YR` cross-signed by ISRG Root X1 |
+| `capture-microsoft-chain.pem` | `www.microsoft.com`: leaf, Microsoft TLS G2 RSA CA OCSP, `Microsoft TLS RSA Root G2` cross-signed by DigiCert Global Root G2 |
+| `capture-root-yr-superseded.pem` | the `Root YR` cross-sign that `x1.c.lencr.org` lists as superseded, serial `FAA6275DC258431D9766EC3045EF24AC`, from crt.sh (id 20947047101) |
+| `capture-crl-*.crl` | the 16 distinct lists the 26 intermediates of 46 hosts named: Amazon Root CA 1 and 3, DigiCert Global Root G2, GlobalSign R3 and R46, GoDaddy G2 and TLS Root R1, GTS R4, Let's Encrypt `x1`, `x2`, `ye` and `yr`, Microsoft TLS RSA Root G2, Sectigo E46 and R46, SSL.com TLS RSA Root 2022 |
+
+The measurement of ADR-027's Context, from an empty directory, with
+`hosts.txt` holding the 46 host names, one per line; `path` is a scratch
+Rust program, not committed, that runs `webpki::EndEntityCert::
+verify_for_usage` with `webpki-roots` 1.0.12 (`serverAuth`, no revocation)
+on a chain and writes the path's intermediates as `int<k>.der`, and that
+prints webpki's verdict on a list (`OwnedCertRevocationList::from_der`):
+
+```sh
+while read -r h; do
+  timeout 15 openssl s_client -connect "$h:443" -servername "$h" -showcerts </dev/null 2>/dev/null |
+    awk '/BEGIN CERT/,/END CERT/' > "$h.pem"
+  mkdir -p "path-$h"; path path "$h.pem" "path-$h"
+done < hosts.txt
+for f in path-*/int*.der; do
+  openssl x509 -inform DER -in "$f" -noout -subject -issuer -ext crlDistributionPoints -ocsp_uri
+done
+# Each distinct URL:
+curl -s -o list.crl -D list.head \
+  -w '%{http_code} %{time_connect} %{time_starttransfer} %{time_total} %{size_download} %{num_redirects}' "$url"
+openssl crl -inform DER -in list.crl -noout -text
+path crl list.crl
+curl -s 'https://crt.sh/?d=20947047101' > capture-root-yr-superseded.pem
 ```

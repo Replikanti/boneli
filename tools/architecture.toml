@@ -232,7 +232,7 @@ reason = "pki-types wipes private keys on drop"
 decision = "ADR-005"
 
 [external.rustls-webpki.pulled-by.boneli-https]
-reason = "the verified path and OCSP responder certificates (ADR-020)"
+reason = "the verified path, OCSP responder certificates (ADR-020) and the issuers of intermediates for their CRLs (ADR-027)"
 decision = "ADR-020"
 
 [external.ring.pulled-by.rustls-webpki]
