@@ -68,20 +68,50 @@ const POLL_MAX: Duration = Duration::from_millis(100);
 /// window). A close then releases nothing until the child's exec, so a
 /// dropped pin kept its layer from a trim, and a trim's dropped exclusive
 /// lock kept pins waiting. `LOCK_UN` acts on the description, whatever
-/// copies of it exist. Only the process that took the lock unlocks it
-/// (`pid`): a child forked without exec that unwinds through a frame
-/// holding a `Held` must not release the parent's lock, so it only closes
-/// its own copy (ADR-026, D1, with its pid-namespace caveat, #97).
+/// copies of it exist. Only the process that took the lock unlocks it: a
+/// child forked without exec that unwinds through a frame holding a `Held`
+/// must not release the parent's lock, so it only closes its own copy. The
+/// process is told by its pid and its pid namespace, since a sandbox child
+/// is pid 1 of a new namespace and so is a runner that is its namespace's
+/// init; an unreadable namespace link at either end keeps the lock, and
+/// the close alone runs (ADR-026, D1; ADR-028).
 #[derive(Debug)]
 pub(crate) struct Held {
     file: File,
     path: PathBuf,
+    owner: LockOwner,
+}
+
+/// The link whose `(st_dev, st_ino)` names the caller's pid namespace;
+/// `thread-self`, since `/proc/self` fails once the main thread has exited
+/// (#35).
+const PID_NS: &str = "/proc/thread-self/ns/pid";
+
+/// A process as the unlock check sees it (ADR-028): its pid and its pid
+/// namespace, `None` when the namespace link cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockOwner {
     pid: u32,
+    pid_ns: Option<(u64, u64)>,
+}
+
+impl LockOwner {
+    fn current() -> LockOwner {
+        LockOwner {
+            pid: std::process::id(),
+            pid_ns: fs::metadata(PID_NS).ok().map(|m| (m.dev(), m.ino())),
+        }
+    }
+
+    /// Whether `now` is the process this owner names, read at both ends.
+    fn is(&self, now: &LockOwner) -> bool {
+        self.pid_ns.is_some() && self == now
+    }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if std::process::id() == self.pid {
+        if self.owner.is(&LockOwner::current()) {
             // An error leaves the close to release it, as before.
             let _ = self.file.unlock();
         }
@@ -324,7 +354,7 @@ fn acquire(
                 return Ok(Exclusive::Held(Held {
                     file,
                     path: path.to_path_buf(),
-                    pid: std::process::id(),
+                    owner: LockOwner::current(),
                 }));
             }
             // Replaced or unlinked by an exclusive holder (or a symlink
@@ -607,5 +637,50 @@ mod tests {
         assert!(is_held(&missing));
         held.remove().expect("remove");
         assert!(!missing.exists());
+    }
+
+    /// A copy of a lock dropped by a process other than its owner, by pid
+    /// or by pid namespace (a sandbox child is pid 1 of a new namespace, as
+    /// a runner that is its namespace's init is of its own), and one whose
+    /// namespace could not be read, leave the lock held; the owner's own
+    /// drop releases it (ADR-028).
+    #[test]
+    fn foreign_drop_keeps_the_lock() {
+        let scratch = ScratchDir::new("lock-foreign-drop");
+        let path = scratch.path().join("lock");
+        let me = super::LockOwner::current();
+        assert!(me.pid_ns.is_some(), "the test host reads its pid namespace");
+        let foreign = [
+            super::LockOwner {
+                pid: me.pid.wrapping_add(1),
+                ..me
+            },
+            super::LockOwner {
+                pid_ns: me.pid_ns.map(|(d, i)| (d, i.wrapping_add(1))),
+                ..me
+            },
+            super::LockOwner { pid_ns: None, ..me },
+        ];
+        for owner in foreign {
+            let mut held = lock_shared(&path, far()).expect("shared");
+            held.owner = owner;
+            let copy = File::from(held.reopen_shared().expect("reopen"));
+            copy.unlock().expect("only the reopened copy holds");
+            let same = held.file.try_clone().expect("a copy of the description");
+            drop(held);
+            // The description survives in `same`; a drop that unlocked it
+            // would have released the lock.
+            assert!(
+                is_held(&path),
+                "{owner:?}: a foreign drop released the lock"
+            );
+            drop(same);
+            assert!(!is_held(&path));
+        }
+        let held = lock_shared(&path, far()).expect("shared");
+        let same = held.file.try_clone().expect("a copy");
+        drop(held);
+        assert!(!is_held(&path), "the owner's drop did not release the lock");
+        drop(same);
     }
 }

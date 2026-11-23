@@ -707,8 +707,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at most 120 s. The same pass removes corrupt layer entries, orphan
   sidecars, orphan `.type` files and lock files no layer needs. Every
   lock of the cache (owner, pin, eviction, trim) is now released by an
-  explicit unlock before its file closes, so a child another thread
-  spawns no longer keeps a dropped lease's layers pinned until its exec
+  explicit unlock before its file closes, only by the process that took
+  it, told by its pid and pid namespace (ADR-028), so a child another
+  thread spawns no longer keeps a dropped lease's layers pinned until its
+  exec
   (ADR-025 D3, the mechanism of ADR-026). The documents of an image
   whose layers are in use are never evicted (a document goes only under the exclusive lock
   of every layer it serves), so `pull` then `lease` works over the

@@ -295,7 +295,9 @@ default budget (PR 2).
   dropped exclusive locks. `LOCK_UN` acts on the description, whatever
   copies exist. Only the process that took a lock unlocks it, so a child
   forked without exec that unwinds through a lock only closes its copy
-  (ADR-026, D1, with its pid-namespace caveat, #97). Measured on the
+  (ADR-026, D1), told by its pid and its pid namespace, with an
+  unreadable namespace link at either end keeping the lock (ADR-028, the
+  same check as the store-fs lock). Measured on the
   development host: `locks_released_under_concurrent_spawns`, which drops
   a lease and ends a trim 300 times while a thread spawns `true` in a
   loop, kept a lock in 125 of 300 rounds before and in none of 6,000
