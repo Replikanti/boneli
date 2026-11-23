@@ -4,7 +4,7 @@
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::OpenError;
@@ -91,12 +91,48 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
 /// without exec runs on a copy of its parent's memory, so an unwinding
 /// panic there could drop a copy of this value; an unlock from it would
 /// release the parent's live lock, while its close only closes its own
-/// descriptor (ADR-026, D1).
+/// descriptor (ADR-026, D1). The process is told by its pid and its pid
+/// namespace, because a sandbox child is pid 1 of a new namespace and so
+/// is a runner that is its namespace's init (ADR-028).
 #[derive(Debug)]
 pub(crate) struct StoreLock {
     file: File,
-    /// The id of the process that took the lock.
-    owner: u32,
+    /// The process that took the lock.
+    owner: Owner,
+}
+
+/// The link whose `(st_dev, st_ino)` names the caller's pid namespace.
+/// `thread-self`, not `self`: `/proc/self` fails once the main thread has
+/// exited (#35), and every thread of a process shares its pid namespace.
+const PID_NS: &str = "/proc/thread-self/ns/pid";
+
+/// A process as the lock's owner check sees it (ADR-028): its pid and its
+/// pid namespace, `None` when the namespace link cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owner {
+    pid: u32,
+    pid_ns: Option<(u64, u64)>,
+}
+
+impl Owner {
+    /// The calling process. `fs::metadata` on a short literal path builds
+    /// the C string on the stack, so a drop in an unwinding forked child
+    /// allocates nothing here.
+    fn current() -> Owner {
+        Owner {
+            pid: std::process::id(),
+            pid_ns: fs::metadata(PID_NS).ok().map(|m| (m.dev(), m.ino())),
+        }
+    }
+}
+
+/// Whether `now` is the process that `recorded` took the lock in: the same
+/// pid in the same pid namespace. A link readable at one end and not at
+/// the other is a mismatch, so the drop keeps the lock (only its close
+/// runs, as before ADR-026); unreadable at both leaves the pid check of
+/// ADR-026 alone (ADR-028).
+fn owns(recorded: &Owner, now: &Owner) -> bool {
+    recorded == now
 }
 
 impl StoreLock {
@@ -106,7 +142,7 @@ impl StoreLock {
         match file.try_lock() {
             Ok(()) => Ok(StoreLock {
                 file,
-                owner: std::process::id(),
+                owner: Owner::current(),
             }),
             Err(TryLockError::WouldBlock) => Err(OpenError::InUse {
                 path: path.to_path_buf(),
@@ -118,8 +154,9 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        // A copy dropped in a forked child leaves the parent's lock alone.
-        if std::process::id() != self.owner {
+        // A copy dropped in a forked child, in this pid namespace or a new
+        // one, leaves the parent's lock alone.
+        if !owns(&self.owner, &Owner::current()) {
             return;
         }
         // An error is ignored: the close that follows still releases the
@@ -329,15 +366,19 @@ mod tests {
     /// A copy of the lock dropped in another process, as in a child forked
     /// without exec that unwinds, does not unlock: its owner is not that
     /// process. The test cannot fork without `unsafe`, so it builds the
-    /// copy with an owner id that is not this process's, which is what a
-    /// forked child's copy looks like from inside the child.
+    /// copy with an owner pid that is not this process's, in this pid
+    /// namespace, which is what a plain forked child's copy looks like from
+    /// inside the child.
     #[test]
     fn copy_dropped_in_another_process_keeps_the_lock() {
         let scratch = Scratch::new("foreign-drop");
         let (resolved, lock) = open(&scratch.root()).expect("open");
         let foreign = StoreLock {
             file: lock.try_clone().expect("dup the lock"),
-            owner: lock.owner.wrapping_add(1),
+            owner: Owner {
+                pid: lock.owner.pid.wrapping_add(1),
+                ..lock.owner
+            },
         };
         drop(foreign);
         match open(&scratch.root()) {
@@ -347,5 +388,111 @@ mod tests {
         drop(lock);
         let reopened = open(&scratch.root());
         assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
+
+    /// A copy whose owner has this process's pid in another pid namespace,
+    /// as a sandbox child (pid 1 of a new namespace) of a runner that is
+    /// pid 1 of its own has, does not unlock (#97, ADR-028). The pid-only
+    /// check of ADR-026 would release the live lock here.
+    #[test]
+    fn copy_in_another_pid_namespace_keeps_the_lock() {
+        let scratch = Scratch::new("foreign-ns-drop");
+        let (resolved, lock) = open(&scratch.root()).expect("open");
+        let (dev, ino) = lock.owner.pid_ns.expect("a readable pid namespace link");
+        let foreign = StoreLock {
+            file: lock.try_clone().expect("dup the lock"),
+            owner: Owner {
+                pid: lock.owner.pid,
+                pid_ns: Some((dev, ino.wrapping_add(1))),
+            },
+        };
+        drop(foreign);
+        match open(&scratch.root()) {
+            Err(OpenError::InUse { path }) => assert_eq!(path, resolved.join(LOCK)),
+            other => panic!("an open after a drop in another namespace gave {other:?}"),
+        }
+        drop(lock);
+        let reopened = open(&scratch.root());
+        assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
+
+    /// The owner check over every combination of pid and namespace,
+    /// including the unreadable link this host cannot produce (ADR-028).
+    #[test]
+    fn owner_comparison_table() {
+        let ns = Some((5, 4_026_531_836));
+        let owner = |pid, pid_ns| Owner { pid, pid_ns };
+        let cases = [
+            ("the owner itself", owner(1, ns), owner(1, ns), true),
+            (
+                "other pid, same namespace",
+                owner(1, ns),
+                owner(2, ns),
+                false,
+            ),
+            (
+                "same pid, other namespace inode",
+                owner(1, ns),
+                owner(1, Some((5, 4_026_533_368))),
+                false,
+            ),
+            (
+                "same pid and inode, other device",
+                owner(1, ns),
+                owner(1, Some((6, 4_026_531_836))),
+                false,
+            ),
+            (
+                "readable at acquire, unreadable at drop",
+                owner(1, ns),
+                owner(1, None),
+                false,
+            ),
+            (
+                "unreadable at acquire, readable at drop",
+                owner(1, None),
+                owner(1, ns),
+                false,
+            ),
+            (
+                "unreadable at both, same pid",
+                owner(1, None),
+                owner(1, None),
+                true,
+            ),
+            (
+                "unreadable at both, other pid",
+                owner(1, None),
+                owner(2, None),
+                false,
+            ),
+        ];
+        for (name, recorded, now, unlocks) in cases {
+            assert_eq!(owns(&recorded, &now), unlocks, "{name}");
+        }
+    }
+
+    /// A lock taken on one thread and dropped on another unlocks: the owner
+    /// is the process, not the thread, and `thread-self` names the same
+    /// namespace on every thread.
+    #[test]
+    fn drop_on_another_thread_unlocks() {
+        let scratch = Scratch::new("other-thread-drop");
+        let (_, lock) = open(&scratch.root()).expect("open");
+        std::thread::spawn(move || drop(lock))
+            .join()
+            .expect("the dropping thread");
+        let reopened = open(&scratch.root());
+        assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
+    }
+
+    /// The owner carries this process's pid namespace, the one
+    /// `/proc/self/ns/pid` names.
+    #[test]
+    fn owner_reads_the_pid_namespace() {
+        let meta = fs::metadata("/proc/self/ns/pid").expect("the pid namespace link");
+        let owner = Owner::current();
+        assert_eq!(owner.pid, std::process::id());
+        assert_eq!(owner.pid_ns, Some((meta.dev(), meta.ino())));
     }
 }

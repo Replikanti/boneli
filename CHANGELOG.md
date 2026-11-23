@@ -885,3 +885,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is between fork and exec and holds a copy of the lock. Only the process
   that took the lock unlocks it, so a copy dropped in a forked child
   leaves the parent's lock held.
+- `FsStore` (#97, ADR-028) tells the lock's owner by its pid and its pid
+  namespace: a copy dropped in a sandbox child, which is pid 1 of a new
+  namespace, no longer unlocks the store of a runner that is pid 1 of its
+  own.
