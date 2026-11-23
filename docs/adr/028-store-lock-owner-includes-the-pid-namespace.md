@@ -45,8 +45,8 @@ child does, so it differs in the same place.
 `acquire` records an `Owner { pid, pid_ns }`: `std::process::id()` and the
 `(st_dev, st_ino)` of `/proc/thread-self/ns/pid`, read with
 `fs::metadata`. The drop reads the same pair again and unlocks only when
-both are equal (`owns`, a plain equality of the two values). Everything
-else in ADR-026 D1 stays: the unlock before the close, the ignored
+the namespace was read at `acquire` and both are equal (`owns`; an
+unreadable link fails closed, D2). Everything else in ADR-026 D1 stays: the unlock before the close, the ignored
 `unlock` error, the wrapper from the moment the lock is taken.
 
 Why both fields: the pid alone is ADR-026's check, which this ADR exists
@@ -70,25 +70,35 @@ result is two integers. A drop in an unwinding forked child therefore
 adds one `stat` call (`statx` on glibc, `stat` on musl) and no heap use.
 `readlink` would allocate the target.
 
-### D2. An unreadable namespace link
+### D2. An unreadable namespace link fails closed
 
-`pid_ns` is `None` when the link cannot be read. Equality is over the
-`Option`s:
+`pid_ns` is `None` when the link cannot be read. The drop unlocks only
+when the link was read at `acquire` and the two values are equal, so an
+unreadable link at any end is a mismatch:
 
 - Readable at `acquire`, unreadable at the drop (a sandbox child after it
   replaced its mounts, so `/proc` is gone or another procfs): mismatch,
   the drop keeps the lock and only closes its descriptor, which is the
   behaviour before ADR-026 and the safe side.
 - Unreadable at `acquire`, readable at the drop: mismatch, same outcome.
-- Unreadable at both: the pid check of ADR-026 alone. This is the weak
-  spot of D1: there a pid-1 runner and its sandbox child are not told
-  apart. It needs a runner whose `/proc` has no namespace links: without
-  `/proc` at all `open` already fails, because the root rules read the
-  owner of `/proc/self` (ADR-012 D1, ADR-021), and the pid link exists
-  since Linux 3.8, far below the 5.19 the sandbox needs (ADR-007). What
-  remains is a `/proc` that hides the link (a hardened or emulated
-  procfs), which no supported deployment uses and no test can produce
-  here; the table of D3 pins the arm.
+- Unreadable at both: mismatch too, same outcome. With the pid alone a
+  pid-1 runner and its sandbox child are not told apart, and the review
+  of PR #101 reproduced the lock theft of #97 there: a runner that is
+  pid 1 with a `/proc` that holds `self` (which `open` needs for the root
+  rules, ADR-012 D1, ADR-021) but no `thread-self/ns/pid`, and a
+  `CLONE_NEWPID` child that drops its copy while unwinding. Falling back
+  to the pid check there would risk a stolen lock and a swept temporary
+  directory to save the cost below.
+
+The weak spot is the cost of failing closed: on a host where the link
+cannot be read, every drop only closes its descriptor, so the window of
+#94 is back there (a reopen gets `InUse` while a child spawned by another
+thread is between fork and exec and holds a copy) and nothing worse. It
+needs a `/proc` without the link: `/proc/thread-self` exists since Linux
+3.17 and the pid link since 3.8, both far below the 5.19 the sandbox
+needs (ADR-007), so only a `/proc` that hides them (a hardened or
+emulated procfs) gets there, which no supported deployment uses and no
+test can produce here; the table of D3 pins the arm.
 
 A mismatch for the real owner would bring #94's `InUse` window back for
 that store, never a stolen lock. The kernel gives a process one pid
@@ -109,8 +119,8 @@ namespace or a new dependency.
   ADR-026 it fails (the copy unlocks and the second `open` succeeds).
 - `owner_comparison_table`: `owns` over eight cases, the owner itself,
   another pid, another inode, another device, the three unreadable-link
-  arms of D2 and an unreadable link with another pid. It pins the arms
-  this host cannot produce.
+  arms of D2 and an unreadable link with another pid; only the owner
+  itself unlocks. It pins the arms this host cannot produce.
 - `copy_dropped_in_another_process_keeps_the_lock` (ADR-026 D3): adapted
   to an owner with another pid in this namespace, a plain forked child.
 - `drop_on_another_thread_unlocks`: a lock taken on one thread and
@@ -131,8 +141,9 @@ Mutation check, run before the PR with `cargo test -p boneli-store-fs
 | pid and inode only | `owner_comparison_table` |
 | pid and device only | `copy_in_another_pid_namespace_keeps_the_lock`, `owner_comparison_table` |
 | an unreadable link at either end unlocks | `owner_comparison_table` |
+| unreadable at both ends unlocks (plain equality, the first head of this PR) | `owner_comparison_table` |
 | the drop without the unlock | `unlock_on_drop_releases_while_a_child_holds_a_copy`, `failed_open_leaves_the_root_openable` |
-| the namespace never read (`pid_ns: None`) | `copy_in_another_pid_namespace_keeps_the_lock`, `owner_reads_the_pid_namespace` |
+| the namespace never read (`pid_ns: None`) | `copy_in_another_pid_namespace_keeps_the_lock`, `owner_reads_the_pid_namespace`, `unlock_on_drop_releases_while_a_child_holds_a_copy`, `failed_open_leaves_the_root_openable` |
 
 ## Consequences
 
@@ -141,8 +152,9 @@ Mutation check, run before the PR with `cargo test -p boneli-store-fs
 - One more system call (`stat`, D1) per `acquire` and one per store
   drop: a drop now makes three (`getpid`, `stat`, `flock`), `acquire` two
   (`getpid`, `stat`) besides the lock itself.
-- The owner check is as good as ADR-026's on a host without `/proc`
-  namespace links (D2).
+- On a host where the namespace link cannot be read the drop only closes,
+  so there a reopen can meet #94's `InUse` window again; the lock is
+  never released by a process that is not its owner (D2).
 - Unchanged: the lock primitive, the root rules (ADR-021), the run log and
   blob rules (ADR-012 D2 to D6), ADR-026 D2 and D3, and `boneli-oci`'s
   owner scheme (ADR-009 D8).

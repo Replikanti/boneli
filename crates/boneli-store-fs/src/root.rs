@@ -127,12 +127,12 @@ impl Owner {
 }
 
 /// Whether `now` is the process that `recorded` took the lock in: the same
-/// pid in the same pid namespace. A link readable at one end and not at
-/// the other is a mismatch, so the drop keeps the lock (only its close
-/// runs, as before ADR-026); unreadable at both leaves the pid check of
-/// ADR-026 alone (ADR-028).
+/// pid in the same pid namespace, read at both ends. An unreadable link,
+/// at either end or at both, is a mismatch, so the drop keeps the lock
+/// and only its close runs, as before ADR-026: without the namespace a
+/// pid-1 runner and its sandbox child look alike (ADR-028, D2).
 fn owns(recorded: &Owner, now: &Owner) -> bool {
-    recorded == now
+    recorded.pid_ns.is_some() && recorded == now
 }
 
 impl StoreLock {
@@ -458,7 +458,7 @@ mod tests {
                 "unreadable at both, same pid",
                 owner(1, None),
                 owner(1, None),
-                true,
+                false,
             ),
             (
                 "unreadable at both, other pid",
