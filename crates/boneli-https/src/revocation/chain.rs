@@ -17,13 +17,13 @@ use rustls::pki_types::{CertificateDer, SignatureVerificationAlgorithm, UnixTime
 
 use super::ca_list::{self, IssuerKey, Subject, Verdict};
 use super::cache::{CrlCache, Entry, Lookup};
-use super::der::{self, KeyUsage};
 use super::url::{self, Candidate, CrlUrl};
 use super::{
     CrlSource, MAX_CA_CRL_BYTES, MAX_CRL_URLS, RevocationFailure, RevocationFailureKind,
     RevocationStatus, lock, revoked,
 };
 use crate::Error;
+use crate::der::{self, KeyUsage};
 
 /// A CA list as the cache keeps it: its DER, decided again for every
 /// certificate it is used for, against that certificate's issuer key.
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(link.der, testing::pem_der(CA1));
         assert_eq!(link.serial, [0x11]);
         assert_eq!(
-            crate::revocation::der::encode(crate::revocation::der::SEQUENCE, &link.issuer),
+            crate::der::encode(crate::der::SEQUENCE, &link.issuer),
             testing::subject_name(ROOT)
         );
         // The anchor is the top one's issuer; its key usage is not read.

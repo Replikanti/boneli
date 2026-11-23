@@ -16,13 +16,13 @@ use std::slice;
 
 use rustls::pki_types::{CertificateDer, SignatureVerificationAlgorithm, TrustAnchor, UnixTime};
 
-use super::super::der::{
-    self, BIT_STRING, BOOLEAN, CONTEXT_0, CONTEXT_1, CONTEXT_2, DerError, ENUMERATED,
-    GENERALIZED_TIME, INTEGER, NULL, OCTET_STRING, OID, Reader, SEQUENCE,
-};
 use super::super::{RevocationFailureKind, signature};
 use super::MAX_OCSP_RESPONSE_CERTS;
 use super::request::CertId;
+use crate::der::{
+    self, BIT_STRING, BOOLEAN, CONTEXT_0, CONTEXT_1, CONTEXT_2, DerError, ENUMERATED,
+    GENERALIZED_TIME, INTEGER, NULL, OCTET_STRING, OID, Reader, SEQUENCE,
+};
 
 /// id-pkix-ocsp-basic, 1.3.6.1.5.5.7.48.1.1.
 const OCSP_BASIC: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];

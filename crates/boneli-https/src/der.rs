@@ -5,6 +5,9 @@
 //! reader and encoder `ocsp` builds its request and parses its response
 //! with; and, for the intermediates (ADR-027), a certificate's keyUsage.
 //! `ca_list` parses CA lists with this reader, strictly, as `ocsp` does.
+//! Outside `revocation/` (ADR-029), `keys` reads SubjectPublicKeyInfos
+//! and RSA moduli with it, and `codesign` the SANs and extensions of a
+//! code-signing leaf and the TBS it rebuilds for embedded SCTs.
 //!
 //! The certificate and CRL functions read only bytes webpki has accepted
 //! already: the leaf after the handshake verified it, the CRL after
@@ -12,7 +15,10 @@
 //! certificate or miss a point, but never accept a certificate a CRL
 //! lists: webpki decides that. The OCSP response is different: its parse
 //! decides (ADR-020), so `ocsp::response` reads it with this reader
-//! strictly and checks its signature over the raw bytes.
+//! strictly and checks its signature over the raw bytes. So do the SANs
+//! and extensions `codesign` reads from a verified leaf: the identity
+//! checks of ADR-029 decide on them, so they are read strictly, and a
+//! leaf they cannot read is refused.
 //!
 //! Definite lengths only, in their minimal encoding, at most four length
 //! bytes; low tag numbers only. No index can panic: every slice comes from
@@ -49,13 +55,13 @@ pub(crate) const CONTEXT_0: u8 = 0xA0;
 pub(crate) const CONTEXT_1: u8 = 0xA1;
 /// `[1]` and `[2]` primitive: the unique IDs of a certificate, and
 /// `reasons` of a distribution point (`[1]`, a BIT STRING).
-const CONTEXT_1_PRIMITIVE: u8 = 0x81;
-const CONTEXT_2_PRIMITIVE: u8 = 0x82;
+pub(crate) const CONTEXT_1_PRIMITIVE: u8 = 0x81;
+pub(crate) const CONTEXT_2_PRIMITIVE: u8 = 0x82;
 /// `[2]` constructed: a distribution point's `cRLIssuer`; in OCSP, a
 /// responder ID by key hash.
 pub(crate) const CONTEXT_2: u8 = 0xA2;
 /// `[3]` constructed: the extensions of a certificate.
-const CONTEXT_3: u8 = 0xA3;
+pub(crate) const CONTEXT_3: u8 = 0xA3;
 /// `uniformResourceIdentifier [6] IA5String`, implicitly tagged.
 const URI: u8 = 0x86;
 /// id-ce-cRLDistributionPoints, 2.5.29.31.
@@ -142,6 +148,17 @@ impl<'a> Reader<'a> {
         } else {
             Err(DerError("trailing bytes"))
         }
+    }
+
+    /// The next element, whole: tag, length and value, whatever its tag.
+    pub(crate) fn read_tlv(&mut self) -> Result<&'a [u8], DerError> {
+        let before = self.data;
+        self.read()?;
+        let used = before.len() - self.data.len();
+        before
+            .split_at_checked(used)
+            .map(|(whole, _)| whole)
+            .ok_or(DerError("truncated"))
     }
 
     /// The next element with `tag`, whole: tag, length and value. For
@@ -342,6 +359,31 @@ pub(crate) fn encode(tag: u8, value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A GeneralizedTime, whole, for Unix seconds (proleptic Gregorian): for
+/// the test builders of OCSP responses and code-signing leaves.
+#[cfg(test)]
+pub(crate) fn encode_generalized_time(secs: u64) -> Vec<u8> {
+    let days = secs / 86_400;
+    let rest = secs % 86_400;
+    // Days to a civil date (H. Hinnant's algorithm), from 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let text = format!(
+        "{year:04}{month:02}{day:02}{:02}{:02}{:02}Z",
+        rest / 3_600,
+        rest / 60 % 60,
+        rest % 60
+    );
+    encode(GENERALIZED_TIME, text.as_bytes())
+}
+
 /// `CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint`.
 fn points(value: &[u8]) -> Result<Vec<&[u8]>, DerError> {
     let mut wrapper = Reader::new(value);
@@ -489,30 +531,30 @@ mod tests {
     }
 
     const CERTS: [&[u8]; 11] = [
-        include_bytes!("../../tests/data/crl-good.pem"),
-        include_bytes!("../../tests/data/crl-revoked.pem"),
-        include_bytes!("../../tests/data/crl-revoked-first.pem"),
-        include_bytes!("../../tests/data/crl-two-dp.pem"),
-        include_bytes!("../../tests/data/crl-five-urls.pem"),
-        include_bytes!("../../tests/data/crl-ldap-only.pem"),
-        include_bytes!("../../tests/data/crl-reasons-only.pem"),
-        include_bytes!("../../tests/data/crl-dps.pem"),
-        include_bytes!("../../tests/data/crl-stray.pem"),
-        include_bytes!("../../tests/data/crl-ca.pem"),
-        include_bytes!("../../tests/data/leaf.pem"),
+        include_bytes!("../tests/data/crl-good.pem"),
+        include_bytes!("../tests/data/crl-revoked.pem"),
+        include_bytes!("../tests/data/crl-revoked-first.pem"),
+        include_bytes!("../tests/data/crl-two-dp.pem"),
+        include_bytes!("../tests/data/crl-five-urls.pem"),
+        include_bytes!("../tests/data/crl-ldap-only.pem"),
+        include_bytes!("../tests/data/crl-reasons-only.pem"),
+        include_bytes!("../tests/data/crl-dps.pem"),
+        include_bytes!("../tests/data/crl-stray.pem"),
+        include_bytes!("../tests/data/crl-ca.pem"),
+        include_bytes!("../tests/data/leaf.pem"),
     ];
 
     const CRLS: [&[u8]; 10] = [
-        include_bytes!("../../tests/data/crl-ca-fresh.crl"),
-        include_bytes!("../../tests/data/crl-ca-empty.crl"),
-        include_bytes!("../../tests/data/crl-ca-week1.crl"),
-        include_bytes!("../../tests/data/crl-ca-day2.crl"),
-        include_bytes!("../../tests/data/crl-ca-idp.crl"),
-        include_bytes!("../../tests/data/crl-ca-other-shard.crl"),
-        include_bytes!("../../tests/data/crl-ca-v1.crl"),
-        include_bytes!("../../tests/data/crl-ca-reversed.crl"),
-        include_bytes!("../../tests/data/crl-ca-forged.crl"),
-        include_bytes!("../../tests/data/crl-ca-empty.crl"),
+        include_bytes!("../tests/data/crl-ca-fresh.crl"),
+        include_bytes!("../tests/data/crl-ca-empty.crl"),
+        include_bytes!("../tests/data/crl-ca-week1.crl"),
+        include_bytes!("../tests/data/crl-ca-day2.crl"),
+        include_bytes!("../tests/data/crl-ca-idp.crl"),
+        include_bytes!("../tests/data/crl-ca-other-shard.crl"),
+        include_bytes!("../tests/data/crl-ca-v1.crl"),
+        include_bytes!("../tests/data/crl-ca-reversed.crl"),
+        include_bytes!("../tests/data/crl-ca-forged.crl"),
+        include_bytes!("../tests/data/crl-ca-empty.crl"),
     ];
 
     fn uris(pem: &[u8]) -> Vec<String> {
@@ -527,7 +569,7 @@ mod tests {
     #[test]
     fn cdp_order_and_skips() {
         assert_eq!(
-            uris(include_bytes!("../../tests/data/crl-dps.pem")),
+            uris(include_bytes!("../tests/data/crl-dps.pem")),
             [
                 "http://crl.boneli.test/a.crl",
                 "ldap://ldap.boneli.test/cn=a",
@@ -535,23 +577,23 @@ mod tests {
             ]
         );
         assert_eq!(
-            uris(include_bytes!("../../tests/data/crl-good.pem")),
+            uris(include_bytes!("../tests/data/crl-good.pem")),
             ["http://crl.boneli.test/ca.crl"]
         );
         assert_eq!(
-            uris(include_bytes!("../../tests/data/crl-two-dp.pem")),
+            uris(include_bytes!("../tests/data/crl-two-dp.pem")),
             [
                 "http://crl1.boneli.test/ca.crl",
                 "http://crl2.boneli.test/ca.crl"
             ]
         );
         assert_eq!(
-            uris(include_bytes!("../../tests/data/crl-five-urls.pem")).len(),
+            uris(include_bytes!("../tests/data/crl-five-urls.pem")).len(),
             5
         );
-        assert!(uris(include_bytes!("../../tests/data/crl-reasons-only.pem")).is_empty());
-        assert!(uris(include_bytes!("../../tests/data/leaf.pem")).is_empty());
-        assert!(uris(include_bytes!("../../tests/data/crl-ca.pem")).is_empty());
+        assert!(uris(include_bytes!("../tests/data/crl-reasons-only.pem")).is_empty());
+        assert!(uris(include_bytes!("../tests/data/leaf.pem")).is_empty());
+        assert!(uris(include_bytes!("../tests/data/crl-ca.pem")).is_empty());
     }
 
     #[test]
@@ -568,11 +610,11 @@ mod tests {
 
     /// Leaves with an authorityInfoAccess extension (ADR-020).
     const AIA_CERTS: [&[u8]; 5] = [
-        include_bytes!("../../tests/data/ocsp-good.pem"),
-        include_bytes!("../../tests/data/ocsp-three-urls.pem"),
-        include_bytes!("../../tests/data/ocsp-ldap-only.pem"),
-        include_bytes!("../../tests/data/ocsp-and-crl.pem"),
-        include_bytes!("../../tests/data/capture-e36-chain.pem"),
+        include_bytes!("../tests/data/ocsp-good.pem"),
+        include_bytes!("../tests/data/ocsp-three-urls.pem"),
+        include_bytes!("../tests/data/ocsp-ldap-only.pem"),
+        include_bytes!("../tests/data/ocsp-and-crl.pem"),
+        include_bytes!("../tests/data/capture-e36-chain.pem"),
     ];
 
     #[test]
@@ -607,7 +649,7 @@ mod tests {
 
     #[test]
     fn every_byte_flip_returns() {
-        let cert = der(include_bytes!("../../tests/data/crl-dps.pem"));
+        let cert = der(include_bytes!("../tests/data/crl-dps.pem"));
         for i in 0..cert.len() {
             for bit in 0..8 {
                 let mut flipped = cert.clone();
@@ -615,7 +657,7 @@ mod tests {
                 let _ = distribution_point_uris(&flipped);
             }
         }
-        let cert = der(include_bytes!("../../tests/data/ocsp-good.pem"));
+        let cert = der(include_bytes!("../tests/data/ocsp-good.pem"));
         for i in 0..cert.len() {
             for bit in 0..8 {
                 let mut flipped = cert.clone();
@@ -774,11 +816,11 @@ mod tests {
         };
         // caIssuers comes first in this leaf and is skipped.
         assert_eq!(
-            uris(include_bytes!("../../tests/data/ocsp-good.pem")),
+            uris(include_bytes!("../tests/data/ocsp-good.pem")),
             ["http://ocsp.boneli.test"]
         );
         assert_eq!(
-            uris(include_bytes!("../../tests/data/ocsp-three-urls.pem")),
+            uris(include_bytes!("../tests/data/ocsp-three-urls.pem")),
             [
                 "http://ocsp1.boneli.test",
                 "http://ocsp2.boneli.test/",
@@ -786,10 +828,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            uris(include_bytes!("../../tests/data/capture-e36-chain.pem")),
+            uris(include_bytes!("../tests/data/capture-e36-chain.pem")),
             ["http://ocsp.sectigo.com"]
         );
-        assert!(uris(include_bytes!("../../tests/data/crl-good.pem")).is_empty());
+        assert!(uris(include_bytes!("../tests/data/crl-good.pem")).is_empty());
     }
 
     #[test]
@@ -835,13 +877,13 @@ mod tests {
     #[test]
     fn key_usage_of_fixtures() {
         let usage = |pem: &[u8]| key_usage(&der(pem)).expect("keyUsage");
-        let ca = usage(include_bytes!("../../tests/data/chain-ca1.pem")).expect("present");
+        let ca = usage(include_bytes!("../tests/data/chain-ca1.pem")).expect("present");
         assert!(ca.crl_sign());
         let no_crl_sign =
-            usage(include_bytes!("../../tests/data/chain-ca1-no-crl-sign.pem")).expect("present");
+            usage(include_bytes!("../tests/data/chain-ca1-no-crl-sign.pem")).expect("present");
         assert!(!no_crl_sign.crl_sign());
         // digitalSignature only.
-        let leaf = usage(include_bytes!("../../tests/data/chain-leaf-ca1.pem")).expect("present");
+        let leaf = usage(include_bytes!("../tests/data/chain-leaf-ca1.pem")).expect("present");
         assert_eq!(leaf, KeyUsage(1));
         assert_eq!(key_usage(&cert_with(&[])), Ok(None));
     }
@@ -875,7 +917,7 @@ mod tests {
 
     #[test]
     fn spki_parts_of_fixture() {
-        let ca = der(include_bytes!("../../tests/data/ocsp-ca.pem"));
+        let ca = der(include_bytes!("../tests/data/ocsp-ca.pem"));
         let cert = rustls::pki_types::CertificateDer::from(ca);
         let ee = webpki::EndEntityCert::try_from(&cert).expect("cert");
         let spki = ee.subject_public_key_info();

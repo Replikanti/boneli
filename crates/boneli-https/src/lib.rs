@@ -70,12 +70,26 @@
 //! and the system's random source as [`fill_random`], for GitHub App
 //! tokens and branch names (ADR-014, D4).
 //!
+//! For image signatures it exports signature verification and
+//! code-signing chains (ADR-029): [`PublicKey`] verifies ECDSA P-256 and
+//! P-384, Ed25519 and RSA signatures with the one algorithm its kind
+//! fixes, through the same webpki algorithms of ring that verify the
+//! handshake; [`verify_code_signing`] verifies a Fulcio leaf for
+//! `id-kp-codeSigning` at a time the caller chooses and reads its SANs and
+//! extensions; [`CodeSigningCert::verify_embedded_sct`] verifies its
+//! embedded SCTs against the caller's CT logs (RFC 6962). The Sigstore
+//! formats around them (signatures, bundles, Rekor entries, the trusted
+//! root) are not this crate's (ADR-029, S3).
+//!
 //! [`Dial`] is the seam HTTPS clients connect through, one connection per
 //! request under a deadline that holds below TLS; [`TlsDial`] is the real
 //! one (ADR-009, D10; moved here from `boneli-oci` by ADR-014, D4).
 #![doc(test(attr(forbid(unsafe_code))))]
 
+mod codesign;
+mod der;
 mod dial;
+mod keys;
 mod pq;
 mod random;
 mod resolve;
@@ -83,7 +97,9 @@ mod revocation;
 mod rsa;
 mod sha256;
 
+pub use codesign::{CertError, CodeSigningCert, CtLog, San, SctError, verify_code_signing};
 pub use dial::{Dial, Stream, Timed, TlsDial};
+pub use keys::{KeyKind, MAX_PUBLIC_KEY_PEM_LEN, PublicKey, PublicKeyError, SignatureError};
 pub use random::{RandomFailed, fill_random};
 pub use resolve::{
     DNS_DEFAULT_ATTEMPTS, DNS_DEFAULT_NDOTS, DNS_DEFAULT_TRY_TIMEOUT, DNS_MAX_ATTEMPTS,

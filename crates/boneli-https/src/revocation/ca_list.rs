@@ -16,11 +16,11 @@
 
 use rustls::pki_types::SignatureVerificationAlgorithm;
 
-use super::der::{
+use super::signature;
+use crate::der::{
     self, BIT_STRING, BOOLEAN, CONTEXT_0, CONTEXT_1, DerError, ENUMERATED, GENERALIZED_TIME,
     INTEGER, KeyUsage, OCTET_STRING, OID, Reader, SEQUENCE, UTC_TIME,
 };
-use super::signature;
 
 #[cfg(test)]
 pub(crate) mod testing;
