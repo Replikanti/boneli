@@ -468,7 +468,8 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
     that name an OCSP responder by ADR-020 (Replikanti/boneli#79); a leaf
     with neither still passes unchecked.
   - Intermediates are not checked (D3):
-    Replikanti/boneli#80, filed at #38 STOP 2.
+    Replikanti/boneli#80, filed at #38 STOP 2. Closed by ADR-027
+    (Replikanti/boneli#80).
   - No CRL fetch through a proxy. `boneli-https` has no proxy support
     for its own connections either, so a host that needs a proxy cannot
     use the client at all today; this ADR adds no new case. When proxy

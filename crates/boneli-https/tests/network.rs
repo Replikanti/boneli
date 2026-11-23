@@ -11,8 +11,11 @@
 //! a revoked and a valid leaf whose CRLs come from a real CA over the
 //! real network path, which no loopback test reaches. Revocation by OCSP
 //! (ADR-020, item 12): the six forge hosts whose leaves name only an OCSP
-//! responder must be checked by Sectigo's. Name resolution (ADR-022): the
-//! own resolver must agree with the system's on the runner's hosts. Run
+//! responder must be checked by Sectigo's. Intermediates (ADR-027): each
+//! one on the verified path of Let's Encrypt's, GitHub's and the runner's
+//! hosts must be checked against its issuer's list. Name resolution
+//! (ADR-022): the own resolver must agree with the system's on the
+//! runner's hosts. Run
 //! them by hand before a change under `src/revocation/` or `src/resolve/`
 //! merges:
 //!
@@ -145,6 +148,111 @@ fn forge_hosts_checked_by_ocsp() {
     assert!(
         wrong.is_empty(),
         "not checked by Sectigo's responder: {wrong:?}"
+    );
+}
+
+/// ADR-027, item 12: the intermediates of real chains are checked against
+/// their issuers' lists over the real network path.
+#[test]
+#[ignore = "network: reaches Let's Encrypt, GitHub, the runner's hosts and their CA lists"]
+fn intermediates_checked_live() {
+    let config = TlsConfig::new(Roots::mozilla()).expect("config");
+    let checked = |status: &RevocationStatus, host: &str| match status {
+        RevocationStatus::Checked { url } => url.contains(host),
+        _ => false,
+    };
+
+    let tls = connect(
+        "valid-isrgrootx1.letsencrypt.org",
+        443,
+        &config,
+        &live_options(),
+    )
+    .expect("valid-isrgrootx1");
+    println!(
+        "valid-isrgrootx1: leaf {:?}, intermediates {:?}",
+        tls.revocation(),
+        tls.intermediate_revocation()
+    );
+    let found = tls.intermediate_revocation();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(checked(&found[0], "yr.c.lencr.org"), "{found:?}");
+    assert!(checked(&found[1], "x1.c.lencr.org"), "{found:?}");
+    assert!(
+        matches!(tls.revocation(), RevocationStatus::Checked { .. }),
+        "{:?}",
+        tls.revocation()
+    );
+
+    // The intermediates pass, then the leaf is refused by its own list.
+    match connect(
+        "revoked-isrgrootx1.letsencrypt.org",
+        443,
+        &config,
+        &live_options(),
+    ) {
+        Err(Error::Revoked { url }) => {
+            println!("revoked-isrgrootx1: revoked by {url}");
+            assert!(
+                !url.contains("x1.c.lencr.org") && !url.contains("yr.c.lencr.org"),
+                "{url}"
+            );
+        }
+        other => panic!("expected Error::Revoked, got {other:?}"),
+    }
+
+    let tls = connect("github.com", 443, &config, &live_options()).expect("github.com");
+    println!(
+        "github.com: leaf {:?}, intermediates {:?}",
+        tls.revocation(),
+        tls.intermediate_revocation()
+    );
+    assert!(
+        matches!(tls.intermediate_revocation(), [s] if checked(s, "crl.sectigo.com")),
+        "{:?}",
+        tls.intermediate_revocation()
+    );
+    assert!(
+        matches!(tls.revocation(), RevocationStatus::OcspChecked { .. }),
+        "{:?}",
+        tls.revocation()
+    );
+
+    let mut wrong = Vec::new();
+    for host in [
+        "api.github.com",
+        "ghcr.io",
+        "gitlab.com",
+        "registry-1.docker.io",
+        "auth.docker.io",
+        "production.cloudflare.docker.com",
+        "pkg-containers.githubusercontent.com",
+        "api.anthropic.com",
+    ] {
+        match connect(host, 443, &config, &live_options()) {
+            Ok(tls) => {
+                println!(
+                    "{host}: leaf {:?}, intermediates {:?}",
+                    tls.revocation(),
+                    tls.intermediate_revocation()
+                );
+                let all_checked = tls
+                    .intermediate_revocation()
+                    .iter()
+                    .all(|s| matches!(s, RevocationStatus::Checked { .. }));
+                if tls.intermediate_revocation().is_empty() || !all_checked {
+                    wrong.push(host);
+                }
+            }
+            Err(e) => {
+                println!("{host}: {e}");
+                wrong.push(host);
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "not every intermediate checked: {wrong:?}"
     );
 }
 

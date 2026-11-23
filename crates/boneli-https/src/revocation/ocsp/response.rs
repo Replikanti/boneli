@@ -16,11 +16,11 @@ use std::slice;
 
 use rustls::pki_types::{CertificateDer, SignatureVerificationAlgorithm, TrustAnchor, UnixTime};
 
-use super::super::RevocationFailureKind;
 use super::super::der::{
     self, BIT_STRING, BOOLEAN, CONTEXT_0, CONTEXT_1, CONTEXT_2, DerError, ENUMERATED,
     GENERALIZED_TIME, INTEGER, NULL, OCTET_STRING, OID, Reader, SEQUENCE,
 };
+use super::super::{RevocationFailureKind, signature};
 use super::MAX_OCSP_RESPONSE_CERTS;
 use super::request::CertId;
 
@@ -241,26 +241,20 @@ fn signed_by_authorized(
     })
 }
 
-/// Whether the key of `spki` signed the response: webpki's rule, every
-/// algorithm whose signature id equals the response's and whose key id
-/// equals the key's is tried. None matching is a bad signature, so an
-/// algorithm the handshake does not accept (SHA-1, BR SC-053) never
-/// verifies.
+/// Whether the key of `spki` signed the response, by the rule of
+/// `signature::verified`.
 fn signed_by(
     spki: &[u8],
     basic: &Basic<'_>,
     algorithms: &[&dyn SignatureVerificationAlgorithm],
 ) -> bool {
-    let Ok((key_algorithm, key)) = der::spki_parts(spki) else {
-        return false;
-    };
-    algorithms
-        .iter()
-        .filter(|a| {
-            a.signature_alg_id().as_ref() == basic.signature_algorithm
-                && a.public_key_alg_id().as_ref() == key_algorithm
-        })
-        .any(|a| a.verify_signature(key, basic.tbs, basic.signature).is_ok())
+    signature::verified(
+        spki,
+        basic.signature_algorithm,
+        basic.tbs,
+        basic.signature,
+        algorithms,
+    )
 }
 
 /// `OCSPResponse` down to the `BasicOCSPResponse`.

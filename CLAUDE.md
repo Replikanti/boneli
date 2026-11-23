@@ -261,7 +261,9 @@ Let's Encrypt's revoked test site must fail with `Error::Revoked`, its
 valid one must be checked against its CRL, and the revocation status of
 the runner's hosts is printed. For OCSP (ADR-020) the six forge hosts
 whose leaves name only an OCSP responder (GitHub, GHCR, GitLab) must be
-`OcspChecked` by Sectigo's responder, and the crate's `ocsp::live` tests
+`OcspChecked` by Sectigo's responder, and for the intermediates (ADR-027)
+`intermediates_checked_live` checks Let's Encrypt's, GitHub's and the
+runner's chains against their CA lists; the crate's `ocsp::live` tests
 check SSL.com's revoked test leaves and two delegated responders
 (`pypi.org`, `www.microsoft.com`) through the OCSP path directly. Run
 them by hand before a change under `crates/boneli-https/src/revocation/`

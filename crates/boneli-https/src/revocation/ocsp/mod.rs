@@ -16,7 +16,7 @@ mod response;
 #[cfg(test)]
 mod live;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 pub(crate) use cache::OcspCache;
 pub(crate) use request::get_path;
