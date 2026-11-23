@@ -1204,10 +1204,16 @@ impl Lexer {
 }
 
 /// The tokens of a Rust source file. An unterminated literal or block
-/// comment, or a non-ASCII character outside comments and literals, is
-/// an error, so the scan fails closed instead of skipping the rest of
-/// the file.
+/// comment, a non-ASCII character outside comments and literals, or a
+/// file that starts with `#!` but not with `#![`, is an error, so the
+/// scan fails closed instead of skipping the rest of the file. rustc
+/// drops the first line of a file as a shebang when the first token
+/// after `#!` (doc comments count, other comments do not) is not `[`,
+/// so `#! /*` would hide the file behind a comment only the scan sees.
 fn lex(text: &str) -> Result<Vec<Token>, String> {
+    if text.starts_with("#!") && !text.starts_with("#![") {
+        return Err("1: `#!` not followed by `[` (a shebang line to rustc)".to_string());
+    }
     let mut lx = Lexer {
         chars: text.chars().collect(),
         at: 0,
@@ -1641,6 +1647,7 @@ fn lex_ignores_comments_and_literals() {
     assert_eq!(idents("fn f<'a>(x: &'a str) {}"), ["fn", "f", "x", "str"]);
     assert_eq!(idents("'outer: loop {}"), ["loop"]);
     assert_eq!(idents("r#connect r#fn"), ["connect", "fn"]);
+    assert_eq!(idents("#![allow(x)]\ny"), ["allow", "x", "y"]);
     let toks = lex("r#fn fn").expect("lex");
     assert!(matches!(&toks[0].tok, Tok::Ident { raw: true, .. }));
     assert!(matches!(&toks[1].tok, Tok::Ident { raw: false, .. }));
@@ -1679,6 +1686,11 @@ fn lex_fails_closed_on_unterminated_input() {
         "#[path\u{200E}= \"../x.rs\"] mod m;",
         "conn\u{435}ct(host)",
         "fn f<'\u{e9}>() {}",
+        // A first line rustc drops as a shebang: anything but `#![`.
+        "#! /*\nTcpStream::connect(host)\n// */",
+        "#! /** */ [ /*\nTcpStream::connect(host)\n// */",
+        "#!/usr/bin/env rustc\nx",
+        "#! [allow(x)]",
     ] {
         assert!(lex(text).is_err(), "{text:?}");
         let (hits, allowed) = std_lookup_hits("dial.rs", text);
@@ -1722,7 +1734,16 @@ fn std_lookup_scan_catches_each_form_in_real_sources() {
         let hits = crate_file_hits(file, &format!("{text}\n{mutant}\n"));
         assert_eq!(hits.len(), 1, "{mutant}: {hits:#?}");
     }
-    // The counted calls edited in place. Without its turbofish a call is
+    // A first line rustc drops as a shebang, which would hide the file
+    // from the scan behind a block comment that its last line ends. The
+    // hit is the shebang, not the count: a file without counted calls
+    // would have no count to miss.
+    for prefix in ["#! /*\n", "#! /** */ [ /*\n"] {
+        let hits = crate_file_hits(file, &format!("{prefix}{text}\n// */\n"));
+        assert_eq!(hits.len(), 1, "{prefix:?}: {hits:#?}");
+        assert!(hits[0].contains("`#!`"), "{prefix:?}: {hits:#?}");
+    }
+    // The counted calls edited in place.Without its turbofish a call is
     // a hit. With it, rebinding `server` to a `String` in front of the
     // call does not compile (E0308), so a rebinding mutant that compiles
     // drops the turbofish too.
