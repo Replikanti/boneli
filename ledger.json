@@ -1339,16 +1339,16 @@
    "title": "boneli-store-fs: the store lock's owner check compares pids across pid namespaces",
    "epic": null,
    "order": 51,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "36e4fbcc",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 101,
    "note": "",
-   "updated_at": "2026-11-23T21:14:33+00:00",
+   "updated_at": "2026-11-23T21:40:46+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1360,14 +1360,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T19:12:09+00:00",
-   "issue": 81,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "f7d29cb8",
-   "note": null
-  },
   {
    "at": "2026-11-20T19:13:48+00:00",
    "issue": 68,
@@ -1759,6 +1751,14 @@
    "to": "done",
    "by": "f11746bb",
    "note": null
+  },
+  {
+   "at": "2026-11-23T21:40:46+00:00",
+   "issue": 97,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "36e4fbcc",
+   "note": null
   }
  ],
  "open": [
@@ -1791,7 +1791,7 @@
   98
  ],
  "xopen": [],
- "updated_at": "2026-11-23T21:21:27+00:00",
+ "updated_at": "2026-11-23T21:40:46+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
