@@ -1339,16 +1339,16 @@
    "title": "boneli-store-fs: the store lock's owner check compares pids across pid namespaces",
    "epic": null,
    "order": 51,
-   "state": "pr-review",
-   "owner": "36e4fbcc",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 101,
    "note": "",
-   "updated_at": "2026-11-23T21:40:46+00:00",
+   "updated_at": "2026-11-23T22:14:05+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1360,14 +1360,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T19:13:48+00:00",
-   "issue": 68,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "47331c5b",
-   "note": null
-  },
   {
    "at": "2026-11-20T19:16:41+00:00",
    "issue": 56,
@@ -1759,6 +1751,14 @@
    "to": "pr-review",
    "by": "36e4fbcc",
    "note": null
+  },
+  {
+   "at": "2026-11-23T22:14:05+00:00",
+   "issue": 97,
+   "from": "pr-review",
+   "to": "done",
+   "by": "36e4fbcc",
+   "note": null
   }
  ],
  "open": [
@@ -1787,11 +1787,10 @@
   56,
   57,
   69,
-  97,
   98
  ],
  "xopen": [],
- "updated_at": "2026-11-23T21:40:46+00:00",
+ "updated_at": "2026-11-23T22:14:08+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
