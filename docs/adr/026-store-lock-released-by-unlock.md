@@ -71,7 +71,8 @@ its own id. A pid is only unique within its pid namespace: the sandbox
 child runs in a new one as pid 1, so when the runner is itself pid 1 of
 its namespace the ids match and the check does not tell them apart. That
 needs a child that unwinds as well and is not a documented deployment;
-the guard on the namespace identity is #97.
+the guard on the namespace identity is #97. ADR-028 closes it: the owner is
+the pid and the pid namespace.
 
 ### D2. After a crash the lock lasts at most until a child's exec
 
