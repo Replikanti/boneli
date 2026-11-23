@@ -505,9 +505,19 @@ default budget (PR 2).
   a manifest's config's; for an index, the union over its manifests that
   are on disk. A document that does not parse, or whose config is not on
   disk, serves no layer, since no lease can be built from it, and goes in
-  its turn. The locks are taken with `try_lock` only (a missing lock file
-  means no pin), held while the document and its `.type` are unlinked,
-  and then released, never removed: they are the layers' own.
+  its turn. The locks are taken with `try_lock` only, held while the
+  document and its `.type` are unlinked, and then released, never
+  removed: they are the layers' own. A layer with no lock file yet (the
+  first pull of an image, a layer from before this ADR, a lock file a
+  trim removed) gets one, created and held like the others (review of
+  #99, round 2): a missing file is no proof that nobody pins the layer,
+  since a pin that creates it after the trim looked and before the unlink
+  would pass its re-check and then lose the config it relies on. Held,
+  the new file makes that pin wait; it sees the document gone and the
+  pull resolves again. A lock file created this way for a layer that is
+  not in the store lives only in `locks/sha256/` (nothing is created
+  under `layers/`) and is removed by the lock-file pass at the end of the
+  same trim, once nobody holds it, like any orphan lock file.
 - A pull keeps its documents, and a lease reads them, before either pins
   the layers, so a trim in between can still evict them. Both check again
   once pinned: a pull whose documents went resolves again, which fetches

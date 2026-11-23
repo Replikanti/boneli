@@ -472,14 +472,18 @@ fn read_capped(path: &Path, max: u64) -> Option<Vec<u8>> {
 
 /// The exclusive locks of every layer in `ids`, or `None` when one of them
 /// is held (or its lock file cannot be judged, fail closed): the document
-/// is in use. A missing lock file means no pin, and nothing to hold.
+/// is in use. A missing lock file is created and held like any other
+/// (review of #99, round 2): a pin that created it after this look and
+/// before the unlink would pass its re-check, and the document would go
+/// under it. A lock file created here for a layer that is not in the
+/// store is released, not removed, and the lock-file pass at the end of
+/// the same trim removes it once nobody holds it.
 fn lock_all(locks: &Path, ids: &BTreeSet<String>) -> Option<Vec<Held>> {
     let mut held = Vec::new();
     for id in ids {
-        match lock::try_exclusive_existing(&locks.join(id)) {
+        match lock::try_exclusive(&locks.join(id)) {
             Ok(Exclusive::Held(h)) => held.push(h),
-            Ok(Exclusive::Missing) => {}
-            Ok(Exclusive::Busy) | Err(_) => return None,
+            Ok(Exclusive::Busy | Exclusive::Missing) | Err(_) => return None,
         }
     }
     Some(held)
@@ -614,6 +618,8 @@ fn trim_locked(
                     }
                     None => Vec::new(),
                 };
+                #[cfg(test)]
+                tests::before_lock("document");
                 // The document first, then its type: the reverse of `put`,
                 // and a document without its type reads as absent.
                 match fs::remove_file(&unit.path) {
@@ -850,6 +856,86 @@ pub(crate) mod tests {
     }
 
     const SIDECAR: &str = "bytes 1\nentries 0\nskipped-devices 0\n";
+
+    /// Review of #99, round 2: a layer of a document's image with no lock
+    /// file yet (the first pull of an image, a layer from before ADR-025, a
+    /// lock file cleaned up) must be held all the same while the document
+    /// goes. Otherwise a pin that creates the lock file between the trim's
+    /// locks and its unlink passes the pull's or lease's re-check, and the
+    /// trim then deletes the config the pin's holder relies on. The pin
+    /// here runs on another thread, as a pull would, from the seam right
+    /// before the unlink. The invariant: a re-check that saw the document
+    /// finds it still there after the trim. With the lock file created and
+    /// held by the trim, the pin waits, then sees the document gone and
+    /// resolves again; the lock file the trim created goes in the same
+    /// trim, and nothing is created under `layers/`.
+    #[test]
+    fn missing_lock_file_is_held_while_a_document_goes() {
+        use std::sync::mpsc;
+        let scratch = ScratchDir::new("evict-missing-lock");
+        let root = scratch.path().to_path_buf();
+        let _cache = LayerCache::new(&root).expect("cache");
+        boneli_private_dir::create(&root.join("blobs/sha256")).expect("blobs");
+        let layer = format!("{:064x}", 7);
+        let config = format!(
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer}"]}}}}"#
+        );
+        let doc = root.join("blobs/sha256").join(format!("{:064x}", 9));
+        std::fs::write(&doc, config).expect("config");
+        std::fs::write(
+            root.join("blobs/sha256").join(format!("{:064x}.type", 9)),
+            "application/vnd.oci.image.config.v1+json",
+        )
+        .expect("type");
+        let lock_path = root.join("locks/sha256").join(&layer);
+        assert!(!lock_path.exists());
+        let layers_before = names(&root.join("layers/sha256"));
+
+        type Pinner = std::thread::JoinHandle<bool>;
+        let pinner: std::rc::Rc<std::cell::RefCell<Option<Pinner>>> = Default::default();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let slot = std::rc::Rc::clone(&pinner);
+        let (path, document) = (lock_path.clone(), doc.clone());
+        BEFORE_LOCK.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |what: &str| {
+                if what != "document" || slot.borrow().is_some() {
+                    return;
+                }
+                // A pull's `pin_all`, then its re-check of the documents,
+                // and the pin held until the test lets go.
+                let (path, document) = (path.clone(), document.clone());
+                let release_rx = std::sync::Arc::clone(&release_rx);
+                let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
+                *slot.borrow_mut() = Some(std::thread::spawn(move || {
+                    let held = crate::lock::lock_shared(&path, far()).expect("pin");
+                    let present = document.is_file();
+                    let _ = pinned_tx.send(());
+                    let _ = release_rx.lock().expect("release").recv();
+                    drop(held);
+                    present
+                }));
+                // Pinned at once, or waiting for the trim's lock.
+                let _ = pinned_rx.recv_timeout(Duration::from_millis(300));
+            }));
+        });
+        let report = trim_now(&root, 1);
+        BEFORE_LOCK.with(|seam| *seam.borrow_mut() = None);
+        report.expect("trim");
+        release_tx.send(()).expect("let the pin go");
+        let pinner = pinner.borrow_mut().take().expect("the seam ran");
+        let seen_by_recheck = pinner.join().expect("pinner");
+        assert!(
+            !seen_by_recheck || doc.is_file(),
+            "a pin's re-check saw the config, and the trim deleted it after all"
+        );
+        trim_now(&root, 1).expect("trim");
+        assert!(
+            names(&root.join("locks/sha256")).is_empty(),
+            "the lock file the trim created stayed"
+        );
+        assert_eq!(names(&root.join("layers/sha256")), layers_before);
+    }
 
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(60)
