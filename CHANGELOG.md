@@ -705,7 +705,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sidecar's and the lock file's unlink, and its tree is removed only after
   the locks are released; trims are serialized by `locks/trim`, waited for
   at most 120 s. The same pass removes corrupt layer entries, orphan
-  sidecars, orphan `.type` files and lock files no layer needs.
+  sidecars, orphan `.type` files and lock files no layer needs. Every
+  lock of the cache (owner, pin, eviction, trim) is now released by an
+  explicit unlock before its file closes, so a child another thread
+  spawns no longer keeps a dropped lease's layers pinned until its exec
+  (ADR-025 D3, the mechanism of ADR-026).
 
 ### Changed
 

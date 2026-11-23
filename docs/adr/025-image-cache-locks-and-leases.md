@@ -283,6 +283,24 @@ default budget (PR 2).
     once the holder unlinks and releases).
 - `flock` locks belong to the open file description, so two stores in one
   process exclude each other the same way two processes do.
+- **Every lock is released by an explicit `LOCK_UN` before its file
+  closes** (the flake of #99 in CI, the mechanism of ADR-026). A child
+  that any thread forks or spawns holds a copy of every descriptor until
+  it execs, and the sandbox's launch runs its setup in that window, so a
+  release by `close` alone lasted until some other thread's child exec'd.
+  A trim right after a lease's drop found the layers still pinned
+  (`host::mounted_layers_survive_trim` failed once on arm64 next to a
+  parallel sandbox launch), and a pin after a trim waited for the trim's
+  dropped exclusive locks. `LOCK_UN` acts on the description, whatever
+  copies exist. Only the process that took a lock unlocks it, so a child
+  forked without exec that unwinds through a lock only closes its copy
+  (ADR-026, D1, with its pid-namespace caveat, #97). Measured on the
+  development host: `locks_released_under_concurrent_spawns`, which drops
+  a lease and ends a trim 300 times while a thread spawns `true` in a
+  loop, kept a lock in 125 of 300 rounds before and in none of 6,000
+  rounds (20 runs) after, under a 300 % CPU cap with four spinners; the
+  host suite failed 1 of 40 runs before and 0 of 100 after under the same
+  load.
 - Unsupported roots, where locks taken by two users of the root do not
   see each other:
   - NFS and CIFS emulate `flock` with POSIX byte-range locks, which belong

@@ -906,3 +906,58 @@ fn failed_pull_trims() {
     );
     assert!(!is_held(&root.join("locks/sha256").join(hex(&ok.diff_id))));
 }
+
+/// The flake of #99's CI (`host::mounted_layers_survive_trim` on arm64):
+/// a `flock` lock belongs to the open file description, and a child that
+/// another thread forks holds a copy of every descriptor until it execs
+/// (ADR-026). A lock released only by closing its descriptor stays held
+/// for that window, so a trim right after a lease's drop found the layers
+/// pinned, and a pin right after a trim found `locks/trim` or a layer
+/// lock still taken. Here one thread spawns `true` in a loop while the
+/// test drops a lease and ends a trim, 300 times: every lock must be free
+/// at once, which only an explicit unlock gives.
+#[test]
+fn locks_released_under_concurrent_spawns() {
+    let (hub, pushed, layers) = app_hub();
+    let fake = Fake::new(move |s| hub.handle(s));
+    let tmp = TempDir::new("release-spawns");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let rootfs = store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let locks: Vec<PathBuf> = layers
+        .iter()
+        .map(|l| root.join("locks/sha256").join(hex(&l.diff_id)))
+        .collect();
+    let trim_lock = root.join("locks/trim");
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(mut child) = std::process::Command::new("true").spawn() {
+                    let _ = child.wait();
+                }
+            }
+        });
+        let mut failures = Vec::new();
+        for round in 0..300 {
+            let lease = store.lease(&rootfs).expect("lease");
+            drop(lease);
+            if let Some(held) = locks.iter().find(|p| is_held(p)) {
+                failures.push(format!("round {round}: {} after the lease", held.display()));
+            }
+            store.trim().expect("trim");
+            if is_held(&trim_lock) {
+                failures.push(format!("round {round}: the trim lock after the trim"));
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            failures.is_empty(),
+            "{} of 300 rounds kept a lock: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(5)]
+        );
+    });
+}

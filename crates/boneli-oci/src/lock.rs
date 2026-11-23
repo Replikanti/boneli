@@ -58,12 +58,34 @@ const POLL_MIN: Duration = Duration::from_millis(1);
 /// seconds, and about 1,200 wake-ups over a whole [`LOCK_WAIT`].
 const POLL_MAX: Duration = Duration::from_millis(100);
 
-/// A lock held on a lock file; dropping it closes the file and releases
-/// the lock.
+/// A lock held on a lock file; dropping it releases the lock by an
+/// explicit `LOCK_UN`, then closes the file.
+///
+/// Not by the close alone (the flake of #99, the mechanism of ADR-026): a
+/// `flock` lock belongs to the open file description, and a child that
+/// any thread of this process forks or spawns holds a copy of every
+/// descriptor until it execs (the sandbox's launch runs its setup in that
+/// window). A close then releases nothing until the child's exec, so a
+/// dropped pin kept its layer from a trim, and a trim's dropped exclusive
+/// lock kept pins waiting. `LOCK_UN` acts on the description, whatever
+/// copies of it exist. Only the process that took the lock unlocks it
+/// (`pid`): a child forked without exec that unwinds through a frame
+/// holding a `Held` must not release the parent's lock, so it only closes
+/// its own copy (ADR-026, D1, with its pid-namespace caveat, #97).
 #[derive(Debug)]
 pub(crate) struct Held {
     file: File,
     path: PathBuf,
+    pid: u32,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if std::process::id() == self.pid {
+            // An error leaves the close to release it, as before.
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 impl Held {
@@ -100,17 +122,15 @@ impl Held {
     }
 
     /// Unlinks the lock file while the lock is still held, then releases
-    /// it. Only an exclusive holder calls this (D3): a shared locker that
-    /// opened the file before the unlink sees the mismatch once it gets
-    /// the lock, and tries again on a new file.
+    /// it (the drop). Only an exclusive holder calls this (D3): a shared
+    /// locker that opened the file before the unlink sees the mismatch
+    /// once it gets the lock, and tries again on a new file.
     pub(crate) fn remove(self) -> Result<(), Error> {
-        let result = match fs::remove_file(&self.path) {
+        match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(lock_err(&self.path, e)),
-        };
-        drop(self.file);
-        result
+        }
     }
 }
 
@@ -304,6 +324,7 @@ fn acquire(
                 return Ok(Exclusive::Held(Held {
                     file,
                     path: path.to_path_buf(),
+                    pid: std::process::id(),
                 }));
             }
             // Replaced or unlinked by an exclusive holder (or a symlink
