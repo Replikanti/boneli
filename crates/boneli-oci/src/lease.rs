@@ -13,9 +13,9 @@ use crate::manifest::ImageConfig;
 
 /// A pulled root filesystem with its layers pinned: while the lease lives,
 /// no store removes one of its layers. One descriptor per distinct layer;
-/// dropping the lease stamps each layer as used now, so a sandbox that ran
-/// for hours does not look hours old to the next trim, and then releases
-/// them (ADR-025, D5). The Sandbox adapter (#8) holds it
+/// dropping the lease stamps each layer and each of the image's documents
+/// as used now, so a sandbox that ran for hours does not look hours old to
+/// the next trim, and then releases them (ADR-025, D5). The Sandbox adapter (#8) holds it
 /// from before the layers are mounted until the sandbox is destroyed.
 ///
 /// Built by [`crate::OciImageStore::pull_leased`] and
@@ -26,6 +26,9 @@ pub struct Lease {
     layers: Vec<PathBuf>,
     config: ImageConfig,
     pins: Vec<LayerPin>,
+    /// The image's documents on disk (index, manifest, config), stamped
+    /// with the layers when the lease is dropped.
+    documents: Vec<PathBuf>,
 }
 
 impl Lease {
@@ -35,12 +38,14 @@ impl Lease {
         layers: Vec<PathBuf>,
         config: ImageConfig,
         pins: Vec<LayerPin>,
+        documents: Vec<PathBuf>,
     ) -> Lease {
         Lease {
             rootfs,
             layers,
             config,
             pins,
+            documents,
         }
     }
 
@@ -81,14 +86,19 @@ impl Lease {
 }
 
 impl Drop for Lease {
-    /// Stamps every layer's sidecar while the pins are still held (the
-    /// fields drop after this), best effort: a failure only changes the
-    /// eviction order (ADR-025, D5).
+    /// Stamps every layer's sidecar and every document while the pins are
+    /// still held (the fields drop after this), best effort: a failure
+    /// only changes the eviction order (ADR-025, D5). Without the
+    /// documents, the image used last would be the first that can no
+    /// longer be leased (review of #99).
     fn drop(&mut self) {
         for layer in &self.layers {
             let mut sidecar = layer.as_os_str().to_owned();
             sidecar.push(".stats");
             evict::stamp(std::path::Path::new(&sidecar));
+        }
+        for document in &self.documents {
+            evict::stamp(document);
         }
     }
 }

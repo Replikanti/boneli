@@ -709,7 +709,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lock of the cache (owner, pin, eviction, trim) is now released by an
   explicit unlock before its file closes, so a child another thread
   spawns no longer keeps a dropped lease's layers pinned until its exec
-  (ADR-025 D3, the mechanism of ADR-026).
+  (ADR-025 D3, the mechanism of ADR-026). The documents of an image
+  whose layers are in use are never evicted (a document goes only under the exclusive lock
+  of every layer it serves), so `pull` then `lease` works over the
+  budget, and a pull or lease checks its documents again once pinned. A
+  lease's drop stamps the image's documents as well as its layers. A layer
+  whose stamp moved between the scan and its lock is skipped. The trees a
+  pull's trim evicts are removed on a thread of their own after the pull
+  mutex is released.
 
 ### Changed
 

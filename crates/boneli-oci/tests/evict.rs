@@ -190,21 +190,27 @@ fn budget_bound_is_inclusive() {
     }
 }
 
-/// A leased image larger than the budget stays, everything else goes, and
-/// the report shows the store over its budget (D5, decision 1 of #56 STOP 1).
+/// A leased image larger than the budget stays with its documents,
+/// everything else goes, and the report shows the store over its budget
+/// (D5, decision 1 of #56 STOP 1). The port's path works over the budget
+/// (review of #99): a `pull` whose own trim ran under a budget of 1 returns
+/// a `RootfsRef` that leases, and while that lease lives the config reads
+/// and a second lease (a verification sandbox) succeeds.
 #[test]
 fn in_use_over_budget_is_soft() {
     let (hub, pushed, layers) = app_hub();
     let fake = Fake::new(move |s| hub.handle(s));
     let tmp = TempDir::new("soft");
     let root = tmp.path().join("store");
-    let store = open(&root, &fake);
+    let store = open_with(&root, &fake, 1);
+    let rootfs = store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull over the budget");
     let lease = store
-        .pull_leased(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .lease(&rootfs)
+        .expect("lease after a pull over the budget");
     let other = plant_layer(&root, &hex_of(1), 10, 0, at(1));
-    let small = open_with(&root, &no_requests(), 1);
-    let report = small.trim().expect("trim");
+    let report = store.trim().expect("trim");
     assert!(report.after > report.budget, "{report:?}");
     assert_eq!(report.skipped_in_use, 3, "{report:?}");
     assert!(!exists(&other), "an unused layer stayed");
@@ -215,11 +221,106 @@ fn in_use_over_budget_is_soft() {
             "a leased layer went"
         );
     }
-    assert!(
-        names_in(&root.join("blobs/sha256")).is_empty(),
-        "documents stayed under a budget of 1"
+    let blobs = root.join("blobs/sha256");
+    for d in [&pushed.index, &pushed.manifest, &pushed.config] {
+        assert!(
+            blobs.join(hex(d)).is_file(),
+            "{d}, a leased image's document, went"
+        );
+    }
+    assert_eq!(
+        store.config(&rootfs).expect("config of a live lease"),
+        *lease.config()
     );
-    assert_eq!(lease.layers().len(), 3);
+    let second = store.lease(&rootfs).expect("a second lease of a live one");
+    assert_eq!(second.layers(), lease.layers());
+    drop((lease, second));
+    let report = store.trim().expect("trim");
+    assert_eq!(report.after, 0, "{report:?}");
+    assert!(names_in(&blobs).is_empty());
+}
+
+/// Two leased images that together exceed the budget keep their
+/// documents: each one's config reads and each one leases again, while an
+/// unleased image's documents go.
+#[test]
+fn documents_of_leased_images_kept() {
+    let (mut hub, a, _) = app_hub();
+    let b = push(&mut hub, "library/b", &[Layer::file("b", &[7u8; 4096])], "");
+    let c = push(&mut hub, "library/c", &[Layer::file("c", b"c\n")], "");
+    let fake = Fake::new(move |s| hub.handle(s));
+    let tmp = TempDir::new("leased-docs");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let la = store
+        .pull_leased(&image_ref("library/app", &a.index))
+        .expect("pull a");
+    let lb = store
+        .pull_leased(&image_ref("library/b", &b.index))
+        .expect("pull b");
+    store
+        .pull(&image_ref("library/c", &c.index))
+        .expect("pull c");
+    let small = open_with(&root, &fake, 1);
+    let blobs = root.join("blobs/sha256");
+    for (lease, pushed) in [(&la, &a), (&lb, &b)] {
+        for d in [&pushed.index, &pushed.manifest, &pushed.config] {
+            assert!(blobs.join(hex(d)).is_file(), "{d} of a leased image went");
+        }
+        assert!(small.config(lease.rootfs()).is_ok());
+        assert!(small.lease(lease.rootfs()).is_ok());
+    }
+    for d in [&c.index, &c.manifest, &c.config] {
+        assert!(
+            !exists(&blobs.join(hex(d))),
+            "{d} of an unleased image stayed"
+        );
+    }
+}
+
+/// Dropping a lease stamps the image's documents too, not only its layers
+/// (review of #99): the image used last is the newest, and the next trim
+/// that must free a unit takes a colder one.
+#[test]
+fn lease_drop_stamps_documents() {
+    let (hub, pushed, _) = app_hub();
+    let fake = Fake::new(move |s| hub.handle(s));
+    let tmp = TempDir::new("lease-doc-stamps");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let blobs = root.join("blobs/sha256");
+    let docs: Vec<PathBuf> = [&pushed.index, &pushed.manifest, &pushed.config]
+        .iter()
+        .map(|d| blobs.join(hex(d)))
+        .collect();
+    let past = at(1_000);
+    let pulled = store
+        .pull_leased(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    let rootfs = pulled.rootfs().clone();
+    for d in &docs {
+        set_mtime(d, past);
+    }
+    drop(pulled);
+    for d in &docs {
+        assert!(
+            mtime(d) > past,
+            "a pulled lease's drop did not stamp {}",
+            d.display()
+        );
+    }
+    let leased = store.lease(&rootfs).expect("lease");
+    for d in &docs[1..] {
+        set_mtime(d, past);
+    }
+    drop(leased);
+    for d in &docs[1..] {
+        assert!(
+            mtime(d) > past,
+            "a lease's drop did not stamp {}",
+            d.display()
+        );
+    }
 }
 
 /// Least recently used first.
@@ -778,8 +879,8 @@ fn zero_budget_refused() {
     assert!(!exists(&root));
 }
 
-/// A budget of 1 keeps only what is in use: the layers of a leased image
-/// stay, the other image's layers and every document go.
+/// A budget of 1 keeps only what is in use: the layers and documents of a
+/// leased image stay, the other image's layers and documents go.
 #[test]
 fn budget_one_keeps_only_in_use() {
     let (mut hub, pushed, layers) = app_hub();
@@ -801,10 +902,16 @@ fn budget_one_keeps_only_in_use() {
         .collect();
     want.sort();
     assert_eq!(names_in(&root.join("layers/sha256")), want);
-    assert!(names_in(&root.join("blobs/sha256")).is_empty());
+    let mut docs: Vec<String> = [&pushed.index, &pushed.manifest, &pushed.config]
+        .iter()
+        .flat_map(|d| [hex(d), format!("{}.type", hex(d))])
+        .collect();
+    docs.sort();
+    assert_eq!(names_in(&root.join("blobs/sha256")), docs);
     drop(lease);
     small.trim().expect("trim");
     assert!(names_in(&root.join("layers/sha256")).is_empty());
+    assert!(names_in(&root.join("blobs/sha256")).is_empty());
 }
 
 /// The default budget is one largest admissible image with its documents
@@ -960,4 +1067,79 @@ fn locks_released_under_concurrent_spawns() {
             &failures[..failures.len().min(5)]
         );
     });
+}
+
+/// The documents a pull kept before it pinned its layers can be evicted in
+/// that window; once pinned, the pull checks and resolves again, so the
+/// `RootfsRef` it returns leases (review of #99). Here a second store's
+/// trim with a budget of 1 runs while the pull waits for its config blob,
+/// after the index and the manifest are kept.
+#[test]
+fn documents_evicted_before_the_pins_are_kept_again() {
+    let (hub, pushed, _) = app_hub();
+    let gate = Gate::new();
+    let (tx, rx) = mpsc::channel();
+    let armed = AtomicBool::new(true);
+    let reached = Mutex::new(tx);
+    let config_blob = pushed.config.clone();
+    let fake = {
+        let gate = Arc::clone(&gate);
+        Fake::new(move |s| {
+            if s.target.ends_with(&config_blob)
+                && s.header("authorization").is_some()
+                && armed.swap(false, Ordering::SeqCst)
+            {
+                let _ = reached.lock().expect("reached").send(());
+                gate.wait();
+            }
+            hub.handle(s)
+        })
+    };
+    let tmp = TempDir::new("docs-before-pins");
+    let root = tmp.path().join("store");
+    let store = open(&root, &fake);
+    let image = image_ref("library/app", &pushed.index);
+    let blobs = root.join("blobs/sha256");
+    std::thread::scope(|s| {
+        let pull = s.spawn(|| store.pull(&image));
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the pull reached the config blob");
+        let kept = blobs.join(hex(&pushed.manifest)).is_file();
+        drop(open_with(&root, &no_requests(), 1));
+        let evicted = !blobs.join(hex(&pushed.manifest)).exists();
+        gate.release();
+        let rootfs = pull.join().expect("thread").expect("pull");
+        assert!(
+            kept && evicted,
+            "the window was not hit: kept {kept}, evicted {evicted}"
+        );
+        store
+            .lease(&rootfs)
+            .expect("the RootfsRef of a pull whose documents were evicted before its pins");
+    });
+}
+
+/// The trees a pull's trim evicts are removed after the pull returns, off
+/// the pull mutex (D6, review of #99), and they do go.
+#[test]
+fn pull_trim_removes_trees_later() {
+    let (hub, pushed, _) = app_hub();
+    let fake = Fake::new(move |s| hub.handle(s));
+    let tmp = TempDir::new("pull-removes-later");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, 1);
+    let unrelated = plant_layer(&root, &hex_of(1), 10, 3, at(1));
+    store
+        .pull(&image_ref("library/app", &pushed.index))
+        .expect("pull");
+    assert!(!exists(&unrelated), "the pull's trim did not evict");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !dot_names(&root).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the evicted tree was never removed: {:?}",
+            dot_names(&root)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

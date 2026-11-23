@@ -24,7 +24,9 @@ use std::time::{Instant, SystemTime};
 
 use crate::error::Error;
 use crate::layers::{self, Judge, Liveness, Owner};
-use crate::lock::{self, Exclusive};
+use crate::lock::{self, Exclusive, Held};
+use crate::manifest::{self, Document};
+use crate::reference::Digest;
 use crate::store::BLOCK_ALLOWANCE;
 
 /// What one trim found and did (ADR-025, D5). Byte totals are the
@@ -249,7 +251,14 @@ fn evict_layer(dirs: &Dirs, hex: &str, expect: LayerState) -> Result<Evicted, Er
     };
     reached(Step::Locked);
     let state = layer_state(&dirs.layers, hex).map_err(|e| cache_err(&dirs.layers, e))?;
-    if state.kind() != expect.kind() {
+    // A committed layer must also carry the stamp the scan sorted it by: a
+    // pull or lease that used it in between made it recent, and it waits
+    // for a later trim (review of #99).
+    let same = match expect {
+        LayerState::Committed { .. } => state == expect,
+        _ => state.kind() == expect.kind(),
+    };
+    if !same {
         return Ok(Evicted::Changed);
     }
     reached(Step::Checked);
@@ -319,37 +328,166 @@ fn names(dir: &Path) -> Result<BTreeSet<String>, Error> {
     Ok(out)
 }
 
+/// How a trim reads the documents it must map to their layers (D7): the
+/// store's document limits.
+#[derive(Clone, Copy)]
+pub(crate) struct DocumentRules<'a> {
+    /// The limits a document is parsed under (ADR-009, D12).
+    pub(crate) limits: &'a boneli_json::Limits,
+    /// The most layers a manifest may list.
+    pub(crate) max_layers: usize,
+}
+
+/// The trees a trim renamed out of the listed names, to be removed once it
+/// holds no lock (D3). Dropped without [`Doomed::remove`], they stay as
+/// owned names of this process, which the sweep removes once it is gone.
+#[derive(Debug, Default)]
+#[must_use = "the trees stay on disk until they are removed"]
+pub(crate) struct Doomed(Vec<PathBuf>);
+
+impl Doomed {
+    /// Whether there is nothing to remove.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Removes the trees, each one tried even after a failure. Outside
+    /// every lock: they are owned names of this process, which the cache
+    /// never lists.
+    pub(crate) fn remove(self) {
+        for tree in &self.0 {
+            let _ = layers::remove_tree_bounded(tree);
+            reached(Step::Removed);
+        }
+    }
+}
+
 /// Trims the store at `root` to `budget` (ADR-025, D5 to D7). The caller
 /// holds this process's owner lock (a `LayerCache`), which keeps the trees
-/// renamed here from being judged dead. Waits for `locks/trim` until
-/// `deadline` (`Error::LockBusy` after it). Fails only when a store
-/// directory cannot be listed or the trim lock cannot be taken; an entry it
-/// cannot handle is skipped.
-pub(crate) fn trim(root: &Path, budget: u64, deadline: Instant) -> Result<TrimReport, Error> {
+/// renamed here from being judged dead, and removes the returned
+/// [`Doomed`] trees, when and where it suits it (D6). Waits for
+/// `locks/trim` until `deadline` (`Error::LockBusy` after it). Fails only
+/// when a store directory cannot be listed or the trim lock cannot be
+/// taken; an entry it cannot handle is skipped.
+pub(crate) fn trim(
+    root: &Path,
+    budget: u64,
+    deadline: Instant,
+    rules: DocumentRules<'_>,
+) -> (Doomed, Result<TrimReport, Error>) {
     let dirs = Dirs {
         layers: root.join("layers").join("sha256"),
         blobs: root.join("blobs").join("sha256"),
         locks: layers::layer_locks_dir(root),
     };
-    let trim_lock = lock::lock_exclusive(&root.join("locks").join("trim"), deadline)?;
+    let trim_lock = match lock::lock_exclusive(&root.join("locks").join("trim"), deadline) {
+        Ok(held) => held,
+        Err(e) => return (Doomed::default(), Err(e)),
+    };
     let mut report = TrimReport {
         budget,
         ..TrimReport::default()
     };
     let mut doomed = Vec::new();
-    let result = trim_locked(&dirs, &mut report, &mut doomed);
+    let result = trim_locked(&dirs, rules, &mut report, &mut doomed);
     drop(trim_lock);
-    // Outside every lock: the trees are owned names of this process, which
-    // the cache never lists.
-    for tree in &doomed {
-        let _ = layers::remove_tree_bounded(tree);
-        reached(Step::Removed);
+    (Doomed(doomed), result.map(|()| report))
+}
+
+/// The `diff_id`s, as lock file names, of the image the document at
+/// `path` belongs to (D7): a config's own, a manifest's config's, and for
+/// an index the union over its manifests on disk. Empty for a document
+/// that does not parse or whose config is not on disk: no lease can be
+/// built from it, so nothing it serves is in use.
+fn document_layers(blobs: &Path, path: &Path, rules: DocumentRules<'_>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let read = |path: &Path| -> Option<(Vec<u8>, Option<String>)> {
+        let bytes = read_capped(path, rules.limits.max_bytes() as u64)?;
+        let mut type_name = path.as_os_str().to_owned();
+        type_name.push(".type");
+        let content_type = read_capped(Path::new(&type_name), crate::store::MAX_TYPE_BYTES)
+            .and_then(|t| String::from_utf8(t).ok())
+            .filter(|t| !t.is_empty());
+        Some((bytes, content_type))
+    };
+    let config_ids = |digest: &Digest, out: &mut BTreeSet<String>| {
+        if let Some((bytes, _)) = read(&blobs.join(digest.hex()))
+            && let Ok(config) = manifest::parse_config(&bytes, rules.limits)
+        {
+            out.extend(config.diff_ids.iter().map(|d| d.hex().to_owned()));
+        }
+    };
+    let manifest_ids = |path: &Path, out: &mut BTreeSet<String>| -> bool {
+        let Some((bytes, content_type)) = read(path) else {
+            return false;
+        };
+        match manifest::parse_document(
+            &bytes,
+            content_type.as_deref(),
+            rules.limits,
+            rules.max_layers,
+        ) {
+            Ok(Document::Manifest(m)) => {
+                config_ids(&m.config.digest, out);
+                true
+            }
+            Ok(Document::Index(index)) => {
+                for entry in &index.manifests {
+                    let p = blobs.join(entry.descriptor.digest.hex());
+                    if let Some((bytes, ct)) = read(&p)
+                        && let Ok(Document::Manifest(m)) = manifest::parse_document(
+                            &bytes,
+                            ct.as_deref(),
+                            rules.limits,
+                            rules.max_layers,
+                        )
+                    {
+                        config_ids(&m.config.digest, out);
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    };
+    if !manifest_ids(path, &mut out)
+        && let Some((bytes, _)) = read(path)
+        && let Ok(config) = manifest::parse_config(&bytes, rules.limits)
+    {
+        out.extend(config.diff_ids.iter().map(|d| d.hex().to_owned()));
     }
-    result.map(|()| report)
+    out
+}
+
+/// The bytes of `path`, `None` if it cannot be read or is longer than `max`.
+fn read_capped(path: &Path, max: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
+}
+
+/// The exclusive locks of every layer in `ids`, or `None` when one of them
+/// is held (or its lock file cannot be judged, fail closed): the document
+/// is in use. A missing lock file means no pin, and nothing to hold.
+fn lock_all(locks: &Path, ids: &BTreeSet<String>) -> Option<Vec<Held>> {
+    let mut held = Vec::new();
+    for id in ids {
+        match lock::try_exclusive_existing(&locks.join(id)) {
+            Ok(Exclusive::Held(h)) => held.push(h),
+            Ok(Exclusive::Missing) => {}
+            Ok(Exclusive::Busy) | Err(_) => return None,
+        }
+    }
+    Some(held)
 }
 
 fn trim_locked(
     dirs: &Dirs,
+    rules: DocumentRules<'_>,
     report: &mut TrimReport,
     doomed: &mut Vec<PathBuf>,
 ) -> Result<(), Error> {
@@ -461,6 +599,21 @@ fn trim_locked(
                 }
             }
             UnitKind::Blob { typed } => {
+                // A document goes only under the exclusive lock of every
+                // layer of its image: never while one of them is pinned
+                // (D7, review of #99). The locks are held until both
+                // files are gone and then released, not removed: they
+                // are the layers' own.
+                let _held = match typed {
+                    Some(_) => {
+                        let ids = document_layers(&dirs.blobs, &unit.path, rules);
+                        match lock_all(&dirs.locks, &ids) {
+                            Some(held) => held,
+                            None => continue,
+                        }
+                    }
+                    None => Vec::new(),
+                };
                 // The document first, then its type: the reverse of `put`,
                 // and a document without its type reads as absent.
                 match fs::remove_file(&unit.path) {
@@ -684,7 +837,7 @@ pub(crate) mod tests {
                     .expect("commit the sidecar");
             }));
         });
-        let report = trim(root, u64::MAX, far()).expect("trim");
+        let report = trim_now(root, u64::MAX).expect("trim");
         BEFORE_LOCK.with(|seam| *seam.borrow_mut() = None);
         assert_eq!(report.removed_layers, 0, "{report:?}");
         for hex in [&bare, &orphan] {
@@ -700,6 +853,67 @@ pub(crate) mod tests {
 
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// A trim of `root` to `budget` under the store's document limits,
+    /// with its trees removed, as `OciImageStore::trim` does.
+    fn trim_now(root: &Path, budget: u64) -> Result<super::TrimReport, crate::error::Error> {
+        let limits = boneli_json::Limits::new(4_194_304, 16, 65_536).expect("limits");
+        let (doomed, result) = trim(
+            root,
+            budget,
+            far(),
+            super::DocumentRules {
+                limits: &limits,
+                max_layers: 128,
+            },
+        );
+        doomed.remove();
+        result
+    }
+
+    /// A committed layer by hand: `<hex>` with a file and a sidecar of
+    /// 1 byte and no entry (4,097 accounted bytes), stamped `secs` after the
+    /// epoch.
+    fn plant(layers: &Path, hex: &str, secs: u64) {
+        std::fs::create_dir(layers.join(hex)).expect("layer");
+        std::fs::write(layers.join(hex).join("f"), b"x").expect("file");
+        let sidecar = layers.join(format!("{hex}.stats"));
+        std::fs::write(&sidecar, SIDECAR).expect("sidecar");
+        std::fs::File::open(&sidecar)
+            .and_then(|f| f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)))
+            .expect("stamp");
+    }
+
+    /// Step 2 of D7 compares the stamp too (review of #99): a layer that a
+    /// pull or lease used between the scan and the lock is no longer the
+    /// least recently used, and is skipped in this trim; the next one in
+    /// the order goes instead.
+    #[test]
+    fn restamped_layer_skipped_under_the_lock() {
+        let scratch = ScratchDir::new("evict-restamp");
+        let root = scratch.path();
+        let _cache = LayerCache::new(root).expect("cache");
+        boneli_private_dir::create(&root.join("blobs/sha256")).expect("blobs");
+        let layers = root.join("layers/sha256");
+        let old = format!("{:064x}", 1);
+        let newer = format!("{:064x}", 2);
+        plant(&layers, &old, 10);
+        plant(&layers, &newer, 20);
+        let used = layers.join(format!("{old}.stats"));
+        let target = old.clone();
+        BEFORE_LOCK.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |hex: &str| {
+                if hex == target {
+                    super::stamp(&used);
+                }
+            }));
+        });
+        let report = trim_now(root, 4_097).expect("trim");
+        BEFORE_LOCK.with(|seam| *seam.borrow_mut() = None);
+        assert_eq!(report.removed_layers, 1, "{report:?}");
+        assert!(layers.join(&old).is_dir(), "the layer used just now went");
+        assert!(!layers.join(&newer).exists(), "the older one stayed");
     }
 
     /// A ustar archive of `entries`: a directory where the data is `None`.
@@ -773,7 +987,7 @@ pub(crate) mod tests {
         if step.starts_with("sweep-") {
             sweep(root, &Judge::current().expect("judge")).expect("sweep");
         } else {
-            trim(root, 1, far()).expect("trim");
+            trim_now(root, 1).expect("trim");
         }
     }
 
@@ -884,6 +1098,15 @@ pub(crate) mod tests {
             let layers = root.join("layers/sha256");
             match step {
                 Step::Renamed | Step::Synced | Step::SidecarRemoved | Step::Released => {
+                    // The sidecar goes only after the rename is durable
+                    // (QA of #99: kills the unlink moved before step 3).
+                    assert_eq!(
+                        layers
+                            .join(format!("{}.stats", crate::layers::hex(&id)))
+                            .exists(),
+                        matches!(step, Step::Renamed | Step::Synced),
+                        "{step:?}: the sidecar"
+                    );
                     let moved = temps(&layers);
                     assert_eq!(moved.len(), 1, "{step:?}: {moved:?}");
                     assert_eq!(
@@ -912,7 +1135,7 @@ pub(crate) mod tests {
 
             // The next open.
             sweep(root, &Judge::current().expect("judge")).expect("sweep");
-            trim(root, u64::MAX, far()).expect("trim");
+            trim_now(root, u64::MAX).expect("trim");
             for dir in [&layers, &blobs] {
                 let dots: Vec<String> = names(dir)
                     .into_iter()

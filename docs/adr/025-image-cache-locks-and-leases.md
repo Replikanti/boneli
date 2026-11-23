@@ -246,7 +246,8 @@ default budget (PR 2).
     which ties the bound to one disk and still makes a waiter wait for
     work it does not need.
   - Which exclusive holds remain, and how long they last: eviction's steps
-    above (D7); the sweep's, the same shape (D1); and the
+    above (D7), and the layer locks a trim holds while it unlinks one
+    document and its `.type` (D7); the sweep's, the same shape (D1); and the
     removal of an idle owner lock file, a `try_lock` and an unlink. The
     longest step of any of them is the `fsync` of a directory. On ext4
     with `data=ordered` that commits the running journal transaction,
@@ -362,11 +363,16 @@ default budget (PR 2).
   - on a cache hit in a pull and on a commit;
   - in `lease`, and when a `Lease` is dropped, while its pins are still
     held, so a sandbox that ran for 10 h does not look 10 h old to the
-    next trim;
+    next trim. The drop stamps the image's documents too (its index when
+    the lease came from a pull, its manifest and its config), not only its
+    layers (review of #99): otherwise the image used last would be the
+    first one the store can no longer lease by its `RootfsRef`, while its
+    layers stayed;
   - when a document is read (`Kept::get`).
 - Ties are broken by path bytes, so the order is deterministic.
-- Pinned layers are skipped. The budget is **inclusive**: a total equal to
-  it evicts nothing, one byte more evicts.
+- Pinned layers are skipped, and so are the documents of an image one of
+  whose layers is pinned (D7). The budget is **inclusive**: a total equal
+  to it evicts nothing, one byte more evicts.
 - Nothing is time-based: no TTL and no minimum age, so there are no ages
   to justify. A TTL removes images that fit the budget (a needless
   refetch) and keeps images that do not (the disk fills). kubelet's image
@@ -375,9 +381,9 @@ default budget (PR 2).
   changes only the order (a stamp in the future goes last), never what is
   safe to remove: that is decided by the locks alone.
 - **Soft over data in use** (#56 STOP 1, decision 1): when the pinned
-  layers alone exceed the budget, the trim removes everything else, the
-  pull still succeeds, and `TrimReport::after` is above
-  `TrimReport::budget`. A hard budget would fail a run after its bytes are
+  layers and their images' documents alone exceed the budget, the trim
+  removes everything else, the pull still succeeds, its `RootfsRef`
+  leases, and `TrimReport::after` is above `TrimReport::budget`. A hard budget would fail a run after its bytes are
   downloaded, for a sizing problem; kubelet's image GC is soft too.
 
 ### D6. Trigger
@@ -396,6 +402,26 @@ default budget (PR 2).
   longest a directory `fsync`, the same steps the 120 s of D3 is sized
   for, and it removes the trees only after it released the trim lock; so
   the waiting time does not depend on how fast a tree is removed either.
+- **Where the trees are removed** (review of #99). Rename-first leaves the
+  removal independent of every lock, so it runs where it costs least:
+  - after a pull's trim, on a thread of its own that the pull starts once
+    it has released the store's pull mutex. The pull returns, and the
+    pulls queued behind it go on, as soon as the evicted trees are
+    unlisted: removing 8 node:22-sized images (8 × 34,097 = 272,776
+    entries, from D8's count; a `chmod` per directory and an unlink per
+    file), the review's example of a large pull near the budget, inside the
+    mutex would hold every pull and `config` of that store for as long as
+    the disk takes. The thread holds a clone of the store's cache, so the
+    owner lock that keeps the trees from being judged dead lives until
+    they are gone; if no thread can be started, the trees stay as owned
+    names of the process and the first sweep after it is gone removes
+    them;
+  - in `trim()` and at `open`, before they return, outside every lock:
+    their caller asked for the trim, holds no mutex of the store, and
+    `TrimReport` describes a store whose trees are gone.
+  - Rejected: a bound on the removal inside the mutex. The trees left over
+    at the bound need a remover anyway, and the pull still waits up to the
+    bound for work it does not need.
 - At `open` and at a pull's end, a trim that runs out of that wait is
   skipped, not an error: the store that holds the trim lock, or the next
   trim, does the work, and failing an `open` or a pull whose own work is
@@ -434,8 +460,12 @@ default budget (PR 2).
      missing (a layer committed before this ADR has none), and the inode
      check of D3. `WouldBlock`: the layer is in use, and is skipped.
   2. Check again that the layer is what the scan found: committed, with a
-     sidecar that parses. A pull could have committed or used it between
-     the scan and the lock; one that changed is left alone.
+     sidecar that parses, the same accounted bytes and **the same stamp**.
+     A pull or lease could have committed or used it between the scan and
+     the lock, which takes as long as the scan and the evictions before
+     it (each with a directory `fsync`); a layer whose stamp moved is no
+     longer the least recently used, and is skipped in this trim, which
+     goes on to the next unit in its order (review of #99).
   3. Rename `layers/sha256/<hex>` to `layers/sha256/.tmp-<own token>.<n>`,
      an owned name of the trimming process. That name has exactly the
      staging length (132 characters), so every path in the tree is as long
@@ -462,16 +492,37 @@ default budget (PR 2).
     store, removes the tree (the sweep of D1, judged by the trimmer's
     owner lock) and the orphans (its trim). Nothing here waits for #33's
     orphan sweep.
-- Documents: the document is unlinked first, then its `.type` (the reverse
-  of `put`). A document without a type already reads as absent and is
-  fetched again (ADR-009 D8), and an orphan `.type` goes at the next trim.
-  A document is not pinned: a pull in flight uses the documents it holds
-  in memory, and a `lease` of a root filesystem whose documents were
-  evicted is `Failed`, so the caller pulls again (only the documents are
-  fetched while the layers are cached). The one race left is benign: a
-  trim can remove the `.type` a concurrent `put` has written and not yet
-  followed by its document; that document then reads as absent and is
-  fetched again.
+- **Documents of an image in use stay** (review of #99). A lease by
+  `RootfsRef`, and `config`, read the manifest and the config from disk,
+  so a pinned image whose documents went would be unusable: under a
+  budget smaller than one image, a pull's own trim would delete the
+  documents it had just kept, and `pull` then `lease` would never succeed.
+  The rule: a document is evicted only while the trim holds the exclusive
+  lock of every layer of the image it serves, the same in-use test as for
+  a layer (D2), so never while a pull, a lease or a pin descriptor holds
+  one of them. Which layers a document serves is read from the documents
+  themselves, under the store's document limits: a config's `diff_ids`;
+  a manifest's config's; for an index, the union over its manifests that
+  are on disk. A document that does not parse, or whose config is not on
+  disk, serves no layer, since no lease can be built from it, and goes in
+  its turn. The locks are taken with `try_lock` only (a missing lock file
+  means no pin), held while the document and its `.type` are unlinked,
+  and then released, never removed: they are the layers' own.
+- A pull keeps its documents, and a lease reads them, before either pins
+  the layers, so a trim in between can still evict them. Both check again
+  once pinned: a pull whose documents went resolves again, which fetches
+  and keeps the missing ones while its pins hold them; a lease whose
+  documents went is `Failed` and tells the caller to pull again. A live
+  lease therefore always has its documents on disk. With no pin held, a
+  `lease` of a root filesystem whose documents were evicted is `Failed`,
+  and the caller pulls again (only the documents are fetched while the
+  layers are cached).
+- Documents are unlinked document first, then `.type` (the reverse of
+  `put`). A document without a type already reads as absent and is fetched
+  again (ADR-009 D8), and an orphan `.type` goes at the next trim. The one
+  race left is benign: a trim can remove the `.type` a concurrent `put`
+  has written and not yet followed by its document; that document then
+  reads as absent and is fetched again.
 - The same pass removes, whatever the budget, through the same steps under
   the layer's exclusive lock: corrupt entries (a hex name that is not a
   directory, or a directory without a sidecar that parses; today such an
