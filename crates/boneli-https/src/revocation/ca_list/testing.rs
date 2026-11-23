@@ -7,10 +7,10 @@ use rustls::SignatureScheme;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use super::super::der::{
+use super::super::ocsp::testing::gtime;
+use crate::der::{
     self, BIT_STRING, BOOLEAN, CONTEXT_0, ENUMERATED, INTEGER, OCTET_STRING, OID, SEQUENCE,
 };
-use super::super::ocsp::testing::gtime;
 
 pub(crate) const ROOT: &[u8] = include_bytes!("../../../tests/data/chain-root.pem");
 pub(crate) const ROOT_KEY: &[u8] = include_bytes!("../../../tests/data/test-only-chain-root.key");

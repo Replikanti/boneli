@@ -30,9 +30,10 @@ use rustls::pki_types::SignatureVerificationAlgorithm;
 use super::url::{self, Candidate, CrlUrl};
 use super::{
     CRL_CONNECT_TIMEOUT, CRL_HANDSHAKE_TIMEOUT, CRL_IO_TIMEOUT, CRL_MIN_RATE, CrlFetchError, Leaf,
-    RevocationFailure, RevocationFailureKind, RevocationStatus, der, lock,
+    RevocationFailure, RevocationFailureKind, RevocationStatus, lock,
 };
 use crate::Error;
+use crate::der;
 use cache::{Entry, Lookup};
 use request::CertId;
 use response::{Issuer, Status};

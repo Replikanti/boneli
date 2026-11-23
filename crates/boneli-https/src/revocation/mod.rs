@@ -28,7 +28,6 @@
 mod ca_list;
 mod cache;
 mod chain;
-mod der;
 mod http;
 mod ocsp;
 mod signature;
@@ -53,6 +52,7 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, ServerName
 use rustls::{CertificateError, RootCertStore};
 
 use crate::Error;
+use crate::der;
 use cache::{CrlCache, Entry, Lookup};
 use chain::CaCache;
 use ocsp::OcspCache;

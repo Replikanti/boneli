@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
-use super::super::{HttpSource, Leaf, RevocationStatus, der};
+use super::super::{HttpSource, Leaf, RevocationStatus};
 use super::{Context, OcspCache, candidates, check};
+use crate::der;
 use crate::{ConnectOptions, Error, Roots, TlsConfig};
 
 fn options() -> ConnectOptions {

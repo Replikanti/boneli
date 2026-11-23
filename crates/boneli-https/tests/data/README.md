@@ -1,11 +1,13 @@
 # Test certificates and keys
 
 Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`,
-`tests/revocation.rs`, `tests/ocsp.rs`, `tests/intermediates.rs` and the
-unit tests of `src/revocation/`, read with `include_bytes!`. The keys protect nothing:
-they exist only so that a local test server can complete a TLS
-handshake, so that `RsaSha256Key` can be checked against OpenSSL, and so
-that tests can sign OCSP answers. No system trusts these CAs (the real
+`tests/revocation.rs`, `tests/ocsp.rs`, `tests/intermediates.rs`,
+`tests/keys.rs`, `tests/codesign.rs` and the unit tests of
+`src/revocation/` and `src/codesign.rs`, read with `include_bytes!`. The
+keys protect nothing: they exist only so that a local test server can
+complete a TLS handshake, so that `RsaSha256Key` and `PublicKey` can be
+checked against OpenSSL, and so that tests can sign OCSP answers,
+code-signing leaves and SCTs. No system trusts these CAs (the real
 captures at the end are public certificates of real hosts), and no
 GitHub App or other account has any of these keys. The signing keys say
 so in their names (`test-only-`).
@@ -654,4 +656,125 @@ curl -s -o list.crl -D list.head \
 openssl crl -inform DER -in list.crl -noout -text
 path crl list.crl
 curl -s 'https://crt.sh/?d=20947047101' > capture-root-yr-superseded.pem
+```
+
+## Image signatures (`tests/keys.rs`, `tests/codesign.rs`, `src/codesign/`, ADR-029)
+
+Public keys of each `KeyKind`, signatures OpenSSL made with them, the
+refused keys, and a code-signing test PKI whose leaves the unit tests of
+`src/codesign.rs` build and sign at test time (`src/codesign/testing.rs`).
+
+| File | What |
+| --- | --- |
+| `pubkey-message.txt` | the message every `pubkey-*.sig` signs, 64 bytes, no newline |
+| `pubkey-p256.pem`, `pubkey-p256.sig` | ECDSA P-256 key, ECDSA-SHA256 signature (DER) |
+| `pubkey-p256-sha384.sig` | the same key's valid ECDSA-SHA384 signature, which `PublicKey` must refuse: the kind fixes SHA-256 |
+| `pubkey-p384.pem`, `pubkey-p384.sig` | ECDSA P-384 key, ECDSA-SHA384 signature |
+| `pubkey-ed25519.pem`, `pubkey-ed25519.sig` | Ed25519 key and signature |
+| `pubkey-rsa2048.pem`, `pubkey-rsa2048.sig` | RSA 2048-bit key, RSASSA-PKCS1-v1_5 SHA-256 signature |
+| `pubkey-rsa8192.pem`, `pubkey-rsa8192.sig` | RSA 8192-bit key (1,491 bytes of PEM, the largest accepted), the same scheme |
+| `pubkey-p521.pem`, `pubkey-rsa1024.pem`, `pubkey-dsa.pem` | refused keys: P-521, RSA below 2048 bits, DSA |
+| `codesign-root.pem` | "Boneli code-signing test root", P-384, 2026-01-01 to 2126-01-01 |
+| `codesign-intermediate.pem` | "Boneli code-signing test intermediate", signed by the root, `CA:TRUE, pathlen:0`, EKU codeSigning, as Sigstore's public-good intermediate |
+| `codesign-intermediate-no-eku.pem` | the same key under another name, without an EKU |
+| `test-only-codesign-ca.key` | the key of both intermediates, P-384, PKCS#8: it signs the leaves at test time |
+| `test-only-ct-log.key`, `codesign-ct-log.pem` | the test CT log's key, P-256, and its public key: it signs the embedded SCTs |
+
+The private keys of the `pubkey-*` files and the root's key are not kept;
+ECDSA signatures are randomized, so regenerating changes every file and
+they change together. The unit tests' leaves carry `pubkey-p256.pem`'s
+key (`pubkey-p521.pem`'s for the refused one). Generated once with
+OpenSSL 3.5, from an empty directory, then copied here; Rust for the
+generator stays rejected for the reason recorded above:
+
+```sh
+ec() { openssl genpkey -algorithm EC -pkeyopt "ec_paramgen_curve:$1" -out "$2"; }
+# Keys for each KeyKind, and the refused ones.
+ec P-256 p256.key; ec P-384 p384.key; ec P-521 p521.key
+openssl genpkey -algorithm ED25519 -out ed25519.key
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out rsa2048.key
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:8192 -out rsa8192.key
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:1024 -out rsa1024.key
+openssl genpkey -genparam -algorithm DSA -pkeyopt dsa_paramgen_bits:2048 -out dsa.param
+openssl genpkey -paramfile dsa.param -out dsa.key
+for k in p256 p384 p521 ed25519 rsa2048 rsa8192 rsa1024 dsa; do
+  openssl pkey -in "$k.key" -pubout -out "pubkey-$k.pem"
+done
+printf '%s' 'Boneli public key test message: the image digest and its signer.' > pubkey-message.txt
+openssl dgst -sha256 -sign p256.key -out pubkey-p256.sig pubkey-message.txt
+openssl dgst -sha384 -sign p256.key -out pubkey-p256-sha384.sig pubkey-message.txt
+openssl dgst -sha384 -sign p384.key -out pubkey-p384.sig pubkey-message.txt
+openssl pkeyutl -sign -rawin -inkey ed25519.key -in pubkey-message.txt -out pubkey-ed25519.sig
+openssl dgst -sha256 -sign rsa2048.key -out pubkey-rsa2048.sig pubkey-message.txt
+openssl dgst -sha256 -sign rsa8192.key -out pubkey-rsa8192.sig pubkey-message.txt
+# The code-signing test PKI: a P-384 root, an intermediate with codeSigning,
+# the same key under a second name without an EKU, and a CT log key.
+ec P-384 root.key; ec P-384 test-only-codesign-ca.key; ec P-256 test-only-ct-log.key
+openssl req -x509 -new -key root.key -subj "/CN=Boneli code-signing test root" \
+  -not_before 20260101000000Z -not_after 21260101000000Z \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -out codesign-root.pem
+printf '%s\n' "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  "keyUsage=critical,keyCertSign,cRLSign" "extendedKeyUsage=codeSigning" > ca.ext
+printf '%s\n' "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  "keyUsage=critical,keyCertSign,cRLSign" > ca-no-eku.ext
+inter() {
+  openssl req -new -key test-only-codesign-ca.key -subj "/CN=$1" |
+    openssl x509 -req -CA codesign-root.pem -CAkey root.key -set_serial "$2" \
+      -not_before 20260101000000Z -not_after 21260101000000Z -extfile "$3" -out "$4"
+}
+inter "Boneli code-signing test intermediate" 2 ca.ext codesign-intermediate.pem
+inter "Boneli code-signing test intermediate without EKU" 3 ca-no-eku.ext codesign-intermediate-no-eku.pem
+openssl pkey -in test-only-ct-log.key -pubout -out codesign-ct-log.pem
+rm p256.key p384.key p521.key ed25519.key rsa2048.key rsa8192.key rsa1024.key dsa.key dsa.param root.key ca.ext ca-no-eku.ext
+```
+
+`openssl pkey -pubin -in pubkey-p256.pem -out k.pem && openssl dgst -sha256
+-verify k.pem -signature pubkey-p256.sig pubkey-message.txt` checks a
+signature independently of Boneli (`-sha384` for P-384; `openssl pkeyutl
+-verify -pubin -inkey pubkey-ed25519.pem -rawin -in pubkey-message.txt
+-sigfile pubkey-ed25519.sig` for Ed25519).
+
+### Real Sigstore captures (known answers)
+
+Public certificates and keys of Sigstore's public-good instance, and the
+Fulcio leaves of two real image signatures, captured on 2026-11-23:
+
+| File | What |
+| --- | --- |
+| `sigstore-fulcio-intermediate.pem` | "sigstore-intermediate" (O=sigstore.dev), P-384, 2022-04-13 to 2031-10-05, EKU codeSigning, `CA:TRUE, pathlen:0`: the first certificate of the second `certificateAuthorities` entry of `trusted_root.json` |
+| `sigstore-fulcio-root.pem` | "sigstore" (O=sigstore.dev), P-384, 2021-10-07 to 2031-10-05: the second certificate of that entry |
+| `sigstore-ctfe-2022.pem` | the public key of `ctfe.sigstore.dev/2022`, P-256, log ID `dd3d306a…29ee8e` = SHA-256 of the key, valid from 2022-10-20 |
+| `sigstore-leaf-kubernetes.pem` | the leaf of the `.sig` of `registry.k8s.io/pause:3.10` (index `sha256:ee6521f2…8199917a`, served by `europe-west3-docker.pkg.dev/k8s-artifacts-prod/images/pause`): SAN `email:krel-trust@k8s-releng-prod.iam.gserviceaccount.com`, issuer `https://accounts.google.com`, valid 2024-05-23 21:35:28 to 21:45:28 UTC, one SCT from the 2022 log at 21:35:28.451; Rekor `integratedTime` 1716500129 |
+| `sigstore-leaf-chainguard.pem` | the leaf of the `.sig` of `chainguard/node` on Docker Hub (index `sha256:3fb5318a58807dec0f2ece547efbe8d62c67b7b2fd91a16795b98651d6385dbe`): SAN `URI:https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main`, issuer `https://token.actions.githubusercontent.com`, valid 2026-11-23 21:48:05 to 21:58:05 UTC, P-256 signed with ECDSA-SHA384, one SCT from the 2022 log at 21:48:05.986; Rekor `integratedTime` 1795470488 |
+
+Chainguard signs its images again from time to time and replaces the
+`.sig` tag, so a later capture of the same digest gives another leaf
+(the one of 2026-11-20 had `integratedTime` 1795194128); the `.sig`
+manifests captured here had SHA-256 `1b5166e7…0f421acf` (Kubernetes,
+5,924 bytes) and `b36df08e…3c6c0777` (Chainguard, 9,958 bytes), and
+`trusted_root.json` `6494e21e…6bc0b66` (6,787 bytes). From an empty
+directory, with `jq`:
+
+```sh
+curl -sS -o trusted_root.json \
+  https://raw.githubusercontent.com/sigstore/root-signing/main/targets/trusted_root.json
+cert() { jq -r ".certificateAuthorities[1].certChain.certificates[$1].rawBytes" trusted_root.json |
+  base64 -d | openssl x509 -inform DER -out "$2"; }
+cert 0 sigstore-fulcio-intermediate.pem; cert 1 sigstore-fulcio-root.pem
+jq -r '.ctlogs[] | select(.baseUrl == "https://ctfe.sigstore.dev/2022") | .publicKey.rawBytes' \
+  trusted_root.json | base64 -d | openssl pkey -pubin -inform DER -out sigstore-ctfe-2022.pem
+acc='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json'
+# registry.k8s.io answers 307 to a regional Artifact Registry host.
+k8s=https://europe-west3-docker.pkg.dev/v2/k8s-artifacts-prod/images/pause/manifests
+curl -sS -H "Accept: $acc" -o k8s-sig.json \
+  "$k8s/sha256-ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a.sig"
+tok=$(curl -fsS 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:chainguard/node:pull' | jq -r .token)
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o cg-sig.json \
+  https://registry-1.docker.io/v2/chainguard/node/manifests/sha256-3fb5318a58807dec0f2ece547efbe8d62c67b7b2fd91a16795b98651d6385dbe.sig
+leaf() { jq -r '.layers[0].annotations["dev.sigstore.cosign/certificate"]' "$1" > "$2"; }
+leaf k8s-sig.json sigstore-leaf-kubernetes.pem; leaf cg-sig.json sigstore-leaf-chainguard.pem
+jq -r '.layers[0].annotations["dev.sigstore.cosign/bundle"]' k8s-sig.json | jq .Payload.integratedTime
+openssl verify -CAfile sigstore-fulcio-root.pem -untrusted sigstore-fulcio-intermediate.pem \
+  -attime 1716500129 sigstore-leaf-kubernetes.pem
 ```

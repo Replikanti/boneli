@@ -719,6 +719,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose stamp moved between the scan and its lock is skipped. The trees a
   pull's trim evicts are removed on a thread of their own after the pull
   mutex is released.
+- `boneli-https` (part 1 of #57, ADR-029, proposed): the primitives for
+  image signatures. `PublicKey` reads one `PUBLIC KEY` PEM section (at
+  most `MAX_PUBLIC_KEY_PEM_LEN`, 8,192 bytes) or a DER
+  SubjectPublicKeyInfo of ECDSA P-256 or P-384, Ed25519 or RSA with 2048
+  to 8192 bits, and verifies with the one algorithm its kind fixes
+  (ECDSA-SHA256, ECDSA-SHA384, Ed25519, RSASSA-PKCS1-v1_5 with SHA-256);
+  `key_id` is the RFC 6962 log ID. `verify_code_signing` verifies a leaf
+  through the caller's intermediates to the caller's roots with webpki
+  for `id-kp-codeSigning` at a time the caller gives, and the
+  `CodeSigningCert` it returns reads the SANs (email, URI; a non-ASCII
+  one refuses the leaf), the raw value of any extension (an OID twice
+  refuses the leaf) and verifies the embedded SCTs against the caller's
+  CT logs and their windows (RFC 6962, precertificate TBS rebuilt without
+  the SCT list). Known answers: the Fulcio leaves of the Kubernetes
+  `pause:3.10` and Chainguard `node` signatures against Sigstore's
+  public-good chain and CT log. The DER reader moved from
+  `src/revocation/der.rs` to `src/der.rs`. No new crate or edge.
 
 ### Changed
 
