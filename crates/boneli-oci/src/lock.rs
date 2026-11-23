@@ -15,8 +15,10 @@
 //! in the meantime, and the caller tries again, at most [`LOCK_ATTEMPTS`]
 //! times. Only an exclusive holder ever unlinks a lock file. A path that
 //! is not a regular file is an error, never followed. Shared lockers wait
-//! up to a deadline ([`LOCK_WAIT`]); exclusive lockers only ever try, so no
-//! lock cycle can form. Every file is opened by std, with `O_CLOEXEC`, so
+//! up to a deadline ([`LOCK_WAIT`]); exclusive lockers of layer and owner
+//! locks only ever try, and the one exclusive lock that is waited for,
+//! `locks/trim` (ADR-025, D6), is held by a trim that never waits for
+//! another lock, so no lock cycle can form. Every file is opened by std, with `O_CLOEXEC`, so
 //! no sandbox inherits a lock by accident; a lease hands out descriptors
 //! for that on purpose ([`crate::Lease::pin_descriptors`]).
 
@@ -56,12 +58,64 @@ const POLL_MIN: Duration = Duration::from_millis(1);
 /// seconds, and about 1,200 wake-ups over a whole [`LOCK_WAIT`].
 const POLL_MAX: Duration = Duration::from_millis(100);
 
-/// A lock held on a lock file; dropping it closes the file and releases
-/// the lock.
+/// A lock held on a lock file; dropping it releases the lock by an
+/// explicit `LOCK_UN`, then closes the file.
+///
+/// Not by the close alone (the flake of #99, the mechanism of ADR-026): a
+/// `flock` lock belongs to the open file description, and a child that
+/// any thread of this process forks or spawns holds a copy of every
+/// descriptor until it execs (the sandbox's launch runs its setup in that
+/// window). A close then releases nothing until the child's exec, so a
+/// dropped pin kept its layer from a trim, and a trim's dropped exclusive
+/// lock kept pins waiting. `LOCK_UN` acts on the description, whatever
+/// copies of it exist. Only the process that took the lock unlocks it: a
+/// child forked without exec that unwinds through a frame holding a `Held`
+/// must not release the parent's lock, so it only closes its own copy. The
+/// process is told by its pid and its pid namespace, since a sandbox child
+/// is pid 1 of a new namespace and so is a runner that is its namespace's
+/// init; an unreadable namespace link at either end keeps the lock, and
+/// the close alone runs (ADR-026, D1; ADR-028).
 #[derive(Debug)]
 pub(crate) struct Held {
     file: File,
     path: PathBuf,
+    owner: LockOwner,
+}
+
+/// The link whose `(st_dev, st_ino)` names the caller's pid namespace;
+/// `thread-self`, since `/proc/self` fails once the main thread has exited
+/// (#35).
+const PID_NS: &str = "/proc/thread-self/ns/pid";
+
+/// A process as the unlock check sees it (ADR-028): its pid and its pid
+/// namespace, `None` when the namespace link cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockOwner {
+    pid: u32,
+    pid_ns: Option<(u64, u64)>,
+}
+
+impl LockOwner {
+    fn current() -> LockOwner {
+        LockOwner {
+            pid: std::process::id(),
+            pid_ns: fs::metadata(PID_NS).ok().map(|m| (m.dev(), m.ino())),
+        }
+    }
+
+    /// Whether `now` is the process this owner names, read at both ends.
+    fn is(&self, now: &LockOwner) -> bool {
+        self.pid_ns.is_some() && self == now
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if self.owner.is(&LockOwner::current()) {
+            // An error leaves the close to release it, as before.
+            let _ = self.file.unlock();
+        }
+    }
 }
 
 impl Held {
@@ -98,17 +152,15 @@ impl Held {
     }
 
     /// Unlinks the lock file while the lock is still held, then releases
-    /// it. Only an exclusive holder calls this (D3): a shared locker that
-    /// opened the file before the unlink sees the mismatch once it gets
-    /// the lock, and tries again on a new file.
+    /// it (the drop). Only an exclusive holder calls this (D3): a shared
+    /// locker that opened the file before the unlink sees the mismatch
+    /// once it gets the lock, and tries again on a new file.
     pub(crate) fn remove(self) -> Result<(), Error> {
-        let result = match fs::remove_file(&self.path) {
+        match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(lock_err(&self.path, e)),
-        };
-        drop(self.file);
-        result
+        }
     }
 }
 
@@ -142,20 +194,49 @@ pub(crate) fn try_exclusive_existing(path: &Path) -> Result<Exclusive, Error> {
     acquire(path, Mode::TryExclusive, Create::No, &mut |_, _| {})
 }
 
+/// Tries the exclusive lock on the lock file at `path`, creating the file
+/// where it is missing, without waiting: a layer committed by a build
+/// before ADR-025 has no lock file, and is evicted under one all the same
+/// (ADR-025, D7). Never [`Exclusive::Missing`].
+pub(crate) fn try_exclusive(path: &Path) -> Result<Exclusive, Error> {
+    acquire(path, Mode::TryExclusive, Create::Yes, &mut |_, _| {})
+}
+
+/// Takes the exclusive lock on `path`, creating the file where it is
+/// missing, and waits while anyone else holds a lock on it, until
+/// `deadline` ([`Error::LockBusy`] after it). Only the trim lock
+/// `locks/trim` is taken this way (ADR-025, D6); its holder never waits
+/// for a layer lock, so no lock cycle can form.
+pub(crate) fn lock_exclusive(path: &Path, deadline: Instant) -> Result<Held, Error> {
+    match acquire(path, Mode::Exclusive(deadline), Create::Yes, &mut |_, _| {})? {
+        Exclusive::Held(held) => Ok(held),
+        // As in `lock_shared`: neither answer comes back.
+        Exclusive::Busy | Exclusive::Missing => Err(Error::LockChanged(path.to_path_buf())),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// Wait for the shared lock until the deadline.
     Shared(Instant),
+    /// Wait for the exclusive lock until the deadline.
+    Exclusive(Instant),
     TryExclusive,
 }
 
-/// Waits for the shared lock on `file` until `deadline`, polling
-/// `try_lock_shared` with pauses from [`POLL_MIN`] doubling to
-/// [`POLL_MAX`]. std's `lock_shared` has no timeout.
-fn wait_shared(file: &File, path: &Path, deadline: Instant) -> Result<(), Error> {
+/// Waits for the shared (or, with `exclusive`, the exclusive) lock on
+/// `file` until `deadline`, polling `try_lock_shared` (`try_lock`) with
+/// pauses from [`POLL_MIN`] doubling to [`POLL_MAX`]. std's `lock_shared`
+/// and `lock` have no timeout.
+fn wait_for(file: &File, path: &Path, deadline: Instant, exclusive: bool) -> Result<(), Error> {
     let mut pause = POLL_MIN;
     loop {
-        match file.try_lock_shared() {
+        let tried = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match tried {
             Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(e)) => return Err(lock_err(path, e)),
@@ -260,7 +341,8 @@ fn acquire(
             return Err(not_regular(path));
         }
         match mode {
-            Mode::Shared(deadline) => wait_shared(&file, path, deadline)?,
+            Mode::Shared(deadline) => wait_for(&file, path, deadline, false)?,
+            Mode::Exclusive(deadline) => wait_for(&file, path, deadline, true)?,
             Mode::TryExclusive => match file.try_lock() {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => return Ok(Exclusive::Busy),
@@ -272,6 +354,7 @@ fn acquire(
                 return Ok(Exclusive::Held(Held {
                     file,
                     path: path.to_path_buf(),
+                    owner: LockOwner::current(),
                 }));
             }
             // Replaced or unlinked by an exclusive holder (or a symlink
@@ -512,5 +595,92 @@ mod tests {
         assert!(is_held(&path), "the copy holds the file on its own");
         drop(other);
         assert!(!is_held(&path));
+    }
+
+    /// The trim lock (ADR-025, D6): `lock_exclusive` creates a missing
+    /// file `0o600`, waits while a shared or exclusive lock is held
+    /// elsewhere, only until its deadline (`LockBusy`), and gets the lock
+    /// once the other holder lets go. `try_exclusive` creates a missing
+    /// file, as an eviction does for a layer committed before ADR-025.
+    #[test]
+    fn exclusive_wait_is_bounded() {
+        let scratch = ScratchDir::new("lock-exclusive");
+        let path = scratch.path().join("trim");
+        let held = super::lock_exclusive(&path, far()).expect("created and locked");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o600
+        );
+        let started = Instant::now();
+        let wait = Duration::from_millis(300);
+        match super::lock_exclusive(&path, started + wait) {
+            Err(Error::LockBusy(p)) => assert_eq!(p, path),
+            other => panic!("waited past an exclusive holder: {other:?}"),
+        }
+        assert!(started.elapsed() >= wait);
+        drop(held);
+        let shared = File::open(&path).expect("open");
+        shared.lock_shared().expect("shared");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(shared);
+        });
+        let held = super::lock_exclusive(&path, far()).expect("locked once free");
+        releaser.join().expect("releaser");
+        assert!(is_held(&path));
+        drop(held);
+
+        let missing = scratch.path().join("layer");
+        let Ok(Exclusive::Held(held)) = super::try_exclusive(&missing) else {
+            panic!("a missing lock file is created and locked");
+        };
+        assert!(is_held(&missing));
+        held.remove().expect("remove");
+        assert!(!missing.exists());
+    }
+
+    /// A copy of a lock dropped by a process other than its owner, by pid
+    /// or by pid namespace (a sandbox child is pid 1 of a new namespace, as
+    /// a runner that is its namespace's init is of its own), and one whose
+    /// namespace could not be read, leave the lock held; the owner's own
+    /// drop releases it (ADR-028).
+    #[test]
+    fn foreign_drop_keeps_the_lock() {
+        let scratch = ScratchDir::new("lock-foreign-drop");
+        let path = scratch.path().join("lock");
+        let me = super::LockOwner::current();
+        assert!(me.pid_ns.is_some(), "the test host reads its pid namespace");
+        let foreign = [
+            super::LockOwner {
+                pid: me.pid.wrapping_add(1),
+                ..me
+            },
+            super::LockOwner {
+                pid_ns: me.pid_ns.map(|(d, i)| (d, i.wrapping_add(1))),
+                ..me
+            },
+            super::LockOwner { pid_ns: None, ..me },
+        ];
+        for owner in foreign {
+            let mut held = lock_shared(&path, far()).expect("shared");
+            held.owner = owner;
+            let copy = File::from(held.reopen_shared().expect("reopen"));
+            copy.unlock().expect("only the reopened copy holds");
+            let same = held.file.try_clone().expect("a copy of the description");
+            drop(held);
+            // The description survives in `same`; a drop that unlocked it
+            // would have released the lock.
+            assert!(
+                is_held(&path),
+                "{owner:?}: a foreign drop released the lock"
+            );
+            drop(same);
+            assert!(!is_held(&path));
+        }
+        let held = lock_shared(&path, far()).expect("shared");
+        let same = held.file.try_clone().expect("a copy");
+        drop(held);
+        assert!(!is_held(&path), "the owner's drop did not release the lock");
+        drop(same);
     }
 }

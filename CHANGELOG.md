@@ -654,11 +654,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reads its own sandbox's file and not the parent's.
 
 - `boneli-oci`: locks and leases in the image cache, part 1 of #56
-  (ADR-025, proposed). Every store holds a shared lock on its owner lock
+  (ADR-025). Every store holds a shared lock on its owner lock
   file `locks/owners/<token>` while it lives, and `open` judges each owner
   of a temporary name by an exclusive `try_lock` on it: free means gone,
-  in any PID or time namespace and after a reboot, and its names and then
-  its lock file are removed; without a lock file the `/proc` rule of
+  in any PID or time namespace and after a reboot, and its names are taken
+  over (renamed to the judge's own, durably), its lock file removed and
+  then the names removed; without a lock file the `/proc` rule of
   ADR-009 D8 still decides. A pull pins every layer of its image
   (`locks/sha256/<hex>`, `LayerCache::pin`, `LayerPin`) before it checks
   the cache or requests a layer blob. `OciImageStore::pull_leased` and
@@ -670,7 +671,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   layers stay pinned after its runner is killed. Lock files are checked to be regular files
   and to be the file the path names after locking (`Error::LockChanged`
   after 1,024 replacements); a pin waits at most 120 s for a removal
-  (`Error::LockBusy`). Nothing is evicted yet.
+  (`Error::LockBusy`).
 - `boneli-https` (#80, ADR-027): certificate revocation for the
   intermediates on the verified path. Before the leaf, each intermediate
   is checked against its issuer's CRL, from the anchor side down, with a
@@ -688,6 +689,36 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CA_CRL_CHECK_DEADLINE` (38 s) and `CA_CRL_CACHE_MAX_BYTES` (16 MiB). No
   new crate or edge. The intermediates' known limits of ADR-017 and
   ADR-020 point to ADR-027.
+- `boneli-oci`: eviction from the image cache, part 2 of #56 (ADR-025
+  D4 to D8, accepted). A trim at `open`, at the end of every pull (failed
+  ones too, before their pins drop) and in `OciImageStore::trim` evicts
+  the least recently used layers, documents and kept layer blobs that
+  nobody pins until the accounted bytes (uncompressed bytes plus
+  `BLOCK_ALLOWANCE`, 4,096, per entry and per file) are at or under
+  `StoreConfig::cache_budget`, by default `CACHE_BUDGET_BYTES`
+  (21,488,017,408, one largest admissible image with its documents); a
+  budget of 0 is refused. Layers in use stay, so the budget is soft over
+  them, and `TrimReport` shows what a trim found and did. Last use is the
+  mtime of a layer's sidecar or a blob's file, stamped on a cache hit, a
+  commit, a lease, a lease's drop and a document read. A layer is evicted
+  under its exclusive lock by a rename to an owned name, an `fsync`, the
+  sidecar's and the lock file's unlink, and its tree is removed only after
+  the locks are released; trims are serialized by `locks/trim`, waited for
+  at most 120 s. The same pass removes corrupt layer entries, orphan
+  sidecars, orphan `.type` files and lock files no layer needs. Every
+  lock of the cache (owner, pin, eviction, trim) is now released by an
+  explicit unlock before its file closes, only by the process that took
+  it, told by its pid and pid namespace (ADR-028), so a child another
+  thread spawns no longer keeps a dropped lease's layers pinned until its
+  exec
+  (ADR-025 D3, the mechanism of ADR-026). The documents of an image
+  whose layers are in use are never evicted (a document goes only under the exclusive lock
+  of every layer it serves), so `pull` then `lease` works over the
+  budget, and a pull or lease checks its documents again once pinned. A
+  lease's drop stamps the image's documents as well as its layers. A layer
+  whose stamp moved between the scan and its lock is skipped. The trees a
+  pull's trim evicts are removed on a thread of their own after the pull
+  mutex is released.
 
 ### Changed
 

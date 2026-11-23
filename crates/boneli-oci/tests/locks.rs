@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
-use boneli_oci::OciImageStore;
+use boneli_oci::{LayerCache, OciImageStore};
 
 use support::TempDir;
 use support::images::{Layer, config, open, push};
@@ -172,13 +172,23 @@ fn owner_lock_decides_in_every_namespace() {
     }
 }
 
+const JUDGE_CHILD: &str = "BONELI_OCI_JUDGE_CHILD";
+
 /// A dead owner (free lock file) one of whose names cannot be removed: a
 /// staging tree deeper than `PATH_MAX`, as a root reached through a
-/// shorter path can leave. Its other names go, the deep one and the lock
-/// file stay, and once the tree can be removed the next `open` removes it
-/// and then the lock file.
+/// shorter path can leave. The judge, a child process here, takes every
+/// name over before it removes any (ADR-025, D3: a judge never removes a
+/// tree while it holds a lock): the dead owner's names and lock file are
+/// gone, and the deep tree is the judge's own now, under a `.tmp-` name of
+/// the staging length. Once the judge is gone and the tree can be removed,
+/// the next `open` removes it and then the judge's lock file.
 #[test]
-fn owner_lock_kept_while_names_remain() {
+fn unremovable_name_moves_to_the_judge() {
+    if let Some(root) = std::env::var_os(JUDGE_CHILD) {
+        let fake = Fake::new(|_| unreachable!("open makes no request"));
+        drop(open(Path::new(&root), &fake));
+        return;
+    }
     let fake = Fake::new(|_| unreachable!("open makes no request"));
     let tmp = TempDir::new("owner-remain");
     let root = tmp.path().join("store");
@@ -200,30 +210,59 @@ fn owner_lock_kept_while_names_remain() {
     std::fs::create_dir_all(&bottom).expect("the deep tree");
     std::fs::rename(&short, &deep).expect("rename");
 
-    drop(open(&root, &fake));
-    for path in &names {
-        assert!(!exists(path), "{} was kept", path.display());
+    let out = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "unremovable_name_moves_to_the_judge",
+            "--test-threads=1",
+        ])
+        .env(JUDGE_CHILD, &root)
+        .output()
+        .expect("spawn the judge");
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    for path in names.iter().chain([&deep, &lock]) {
+        assert!(
+            !exists(path),
+            "{} stayed with the dead owner",
+            path.display()
+        );
     }
+    let layers = root.join("layers/sha256");
+    let left: Vec<String> = names_in(&layers)
+        .into_iter()
+        .filter(|n| n.starts_with(".tmp-"))
+        .collect();
+    assert_eq!(left.len(), 1, "the deep tree is the judge's: {left:?}");
+    let moved = layers.join(&left[0]);
+    assert!(moved.is_dir());
+    assert_eq!(left[0].len(), LayerCache::STAGING_NAME_LEN);
+    let judge = left[0]
+        .strip_prefix(".tmp-")
+        .and_then(|r| r.get(..106))
+        .expect("the judge's token")
+        .to_owned();
     assert!(
-        deep.is_dir(),
-        "the deep name is gone, so the test proves nothing"
+        exists(&owner_lock(&root, &judge)),
+        "the judge's lock went with a name left"
     );
-    assert!(exists(&lock), "the lock file went while a name remained");
 
     // Made removable: its first level moved out to a short path.
-    let first = std::fs::read_dir(&deep)
+    let first = std::fs::read_dir(&moved)
         .expect("list")
         .next()
         .expect("a child")
         .expect("entry")
         .path();
     std::fs::rename(&first, tmp.path().join("moved")).expect("move out");
-    drop(open(&root, &fake));
-    assert!(!exists(&deep), "the next judge did not try again");
+    let store = open(&root, &fake);
+    assert!(!exists(&moved), "the next judge did not try again");
     assert!(
-        !exists(&lock),
-        "the lock file stayed once its names were gone"
+        !exists(&owner_lock(&root, &judge)),
+        "the judge's lock file stayed once its names were gone"
     );
+    assert_eq!(names_in(&root.join("locks/owners")).len(), 1);
+    drop(store);
 }
 
 const IDLE_CHILD: &str = "BONELI_OCI_IDLE_OWNER_CHILD";

@@ -14,11 +14,18 @@
 //!   into the root, held shared while its store lives (ADR-025, D1).
 //! - `locks/sha256/<hex>`: the lock file of the layer `<hex>`, held shared
 //!   by every pull and lease that uses the layer (ADR-025, D2).
+//! - `locks/trim`: held exclusively by the one trim running on the root
+//!   (ADR-025, D6).
 //!
 //! Temporary names in both directories carry their owner (boot id, PID
 //! and time namespaces, pid, start time); `open` removes those whose owner
 //! is gone, by its owner lock or, without one, by `/proc`, and leaves the
 //! rest.
+//!
+//! A trim at `open`, at the end of every pull and in
+//! [`OciImageStore::trim`] keeps the accounted bytes under the store's
+//! budget by evicting what was used least recently and is not pinned
+//! (ADR-025, D4 to D7).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -32,10 +39,11 @@ use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
 use boneli_https::{ConnectOptions, Dial, Roots, Sha256, TlsConfig, TlsDial};
 
 use crate::error::{Error, PullError, failed, root_err};
-use crate::layers::{self, Judge, LayerCache, LayerPin, Liveness, Owner};
+use crate::evict::{self, DocumentRules, Doomed, TrimReport};
+use crate::layers::{self, Judge, LayerCache, LayerPin};
 use crate::lease::Lease;
 use crate::limits::{Budget, Limits};
-use crate::lock::{self, Exclusive};
+use crate::lock;
 use crate::manifest::{self, Descriptor, Document, ImageConfig};
 use crate::reference::{Digest, Reference};
 use crate::registry::{Client, Documents, FetchLimits, Fetched, Registry, Timeouts, select};
@@ -83,7 +91,24 @@ pub const MIN_RATE: u64 = 1_048_576;
 
 /// The longest `Content-Type` a kept document's `.type` file may hold: a
 /// response head's limit.
-const MAX_TYPE_BYTES: u64 = MAX_HEAD_BYTES as u64;
+pub(crate) const MAX_TYPE_BYTES: u64 = MAX_HEAD_BYTES as u64;
+
+/// The bytes a trim charges for each file and each tar entry on top of its
+/// size (ADR-025, D4): the default block size of ext4, XFS and btrfs, so a
+/// file of `s` bytes takes at most `s + 4,095` bytes of data blocks.
+/// Measured on 12 Docker Hub layers, tar bytes alone fall short of `du`
+/// by 2.2-6.6 % per image, and with this allowance the count is 7.6-10.0 %
+/// above `du` on btrfs and 8.5-11.2 % above it on tmpfs.
+pub const BLOCK_ALLOWANCE: u64 = 4_096;
+
+/// The default cache budget (ADR-025, D8): the largest image D7 admits,
+/// with an allowance for each of its entries and layers (sidecars), and its
+/// index, manifest and config, each with its `.type`. The smallest budget
+/// at which such an image stays cached once its lease ends; about 16
+/// images the size of node:22.
+pub const CACHE_BUDGET_BYTES: u64 = MAX_IMAGE_BYTES
+    + BLOCK_ALLOWANCE * (MAX_IMAGE_ENTRIES + MAX_LAYERS as u64)
+    + 3 * (MAX_DOCUMENT_BYTES as u64 + MAX_TYPE_BYTES + 2 * BLOCK_ALLOWANCE);
 
 /// What a store pulls from and how: the registries, the limits and where
 /// connections go.
@@ -102,6 +127,10 @@ pub struct StoreConfig {
     /// Where connections go: [`TlsDial`] in production, built from the
     /// TLS config and the connect timeouts.
     pub dial: Box<dyn Dial + Send + Sync>,
+    /// The accounted bytes (ADR-025, D4) a trim keeps the store at or
+    /// under, inclusive, apart from data in use (D5);
+    /// [`CACHE_BUDGET_BYTES`] by default (D8). `open` refuses 0.
+    pub cache_budget: u64,
 }
 
 impl StoreConfig {
@@ -132,6 +161,7 @@ impl StoreConfig {
             )?,
             timeouts: Timeouts::new(IO_TIMEOUT, SETUP_TIMEOUT, MIN_RATE)?,
             dial,
+            cache_budget: CACHE_BUDGET_BYTES,
         })
     }
 
@@ -160,6 +190,7 @@ impl std::fmt::Debug for StoreConfig {
             .field("limits", &self.limits)
             .field("fetch", &self.fetch)
             .field("timeouts", &self.timeouts)
+            .field("cache_budget", &self.cache_budget)
             .finish_non_exhaustive()
     }
 }
@@ -205,90 +236,6 @@ fn cache_err(path: &Path, source: io::Error) -> Error {
         path: path.to_path_buf(),
         source,
     }
-}
-
-/// Removes the names in `dirs` that carry an owner (ADR-009, D8) whose
-/// owner is gone, then the owner lock files no name needs any more
-/// (ADR-025, D1). The names are grouped by owner, and each owner is judged
-/// once:
-///
-/// - Its lock file `owners/<token>` exists and an exclusive `try_lock`
-///   gets it: the owner is gone, in whatever namespace or boot it ran.
-///   Its names are removed, and the lock file is unlinked, still locked,
-///   once every one of them is gone; otherwise it stays, and the next
-///   judge tries again.
-/// - The lock is held: the owner is alive, and its names stay.
-/// - There is no lock file: the names come from a build before ADR-025,
-///   and the `/proc` rule of ADR-009 D8 decides through `judge`, as it did.
-/// - The lock path is not a regular file, or cannot be read: nothing is
-///   concluded, and the names stay (fail closed).
-///
-/// Then every lock file in `owners/` named by a token that no name carries
-/// is removed when its exclusive lock can be taken: an owner that left no
-/// name and is gone. Names that carry no owner stay, in both places.
-///
-/// A name whose removal fails stays too, whatever the error: it is a dot
-/// name, never read as a layer or a blob, so it costs disk, while failing
-/// `open` for it would leave the store unopenable until someone removed it
-/// by hand. An error is another store's sweep that removed it first, or a
-/// tree that cannot be removed by path (one deeper than `PATH_MAX` under
-/// this root's path, left by a process that reached the root through a
-/// shorter one).
-fn sweep(dirs: &[&Path], owners: &Path, judge: &Judge) -> Result<(), Error> {
-    let mut by_owner: BTreeMap<String, (Owner, Vec<PathBuf>)> = BTreeMap::new();
-    for dir in dirs {
-        for entry in fs::read_dir(dir).map_err(|e| cache_err(dir, e))? {
-            let entry = entry.map_err(|e| cache_err(dir, e))?;
-            let name = entry.file_name();
-            let Some(owner) = name.to_str().and_then(Owner::of_name) else {
-                continue;
-            };
-            by_owner
-                .entry(owner.token())
-                .or_insert_with(|| (owner, Vec::new()))
-                .1
-                .push(entry.path());
-        }
-    }
-    for (token, (owner, names)) in &by_owner {
-        match lock::try_exclusive_existing(&owners.join(token)) {
-            Ok(Exclusive::Held(held)) => {
-                if remove_all(names) {
-                    let _ = held.remove();
-                }
-            }
-            Ok(Exclusive::Missing) if owner.liveness(judge) == Liveness::Dead => {
-                remove_all(names);
-            }
-            Ok(Exclusive::Missing | Exclusive::Busy) | Err(_) => {}
-        }
-    }
-    for entry in fs::read_dir(owners).map_err(|e| cache_err(owners, e))? {
-        let entry = entry.map_err(|e| cache_err(owners, e))?;
-        let name = entry.file_name();
-        let Some(token) = name.to_str().filter(|t| Owner::of_token(t).is_some()) else {
-            continue;
-        };
-        if by_owner.contains_key(token) {
-            continue;
-        }
-        if let Ok(Exclusive::Held(held)) = lock::try_exclusive_existing(&entry.path()) {
-            let _ = held.remove();
-        }
-    }
-    Ok(())
-}
-
-/// Removes every path in `names`, each one tried even after a failure,
-/// and tells whether all of them are gone.
-fn remove_all(names: &[PathBuf]) -> bool {
-    let mut all = true;
-    for name in names {
-        if layers::remove_tree_bounded(name).is_err() {
-            all = false;
-        }
-    }
-    all
 }
 
 /// Checks that the filesystem under `dir` holds the overlay format of D1:
@@ -351,8 +298,14 @@ impl OciImageStore {
     ///   files no name needs any more (D8; ADR-025, D1);
     /// - its filesystem must keep exact names (D8) and hold the overlay
     ///   format (0:0 whiteouts, `user.*` xattrs, D1), or `open` fails
-    ///   here rather than in a pull.
+    ///   here rather than in a pull;
+    /// - then the store is trimmed to `config.cache_budget`, so a lowered
+    ///   budget applies at once (ADR-025, D6). A budget of 0 is refused
+    ///   first, before anything is created.
     pub fn open(root: &Path, config: StoreConfig) -> Result<OciImageStore, Error> {
+        if config.cache_budget == 0 {
+            return Err(Error::InvalidLimits("cache budget"));
+        }
         let resolved =
             boneli_private_dir::prepare_root(root, &overlay_text_rule).map_err(root_err)?;
 
@@ -372,14 +325,78 @@ impl OciImageStore {
         // (ADR-025, D1).
         let cache = LayerCache::new(&resolved)?;
         let judge = Judge::current()?;
-        sweep(&[&blobs, &layer_dir], &owners, &judge)?;
+        evict::sweep(&resolved, &judge)?;
         probe_overlay_format(&layer_dir)?;
-        Ok(OciImageStore {
+        let store = OciImageStore {
             root: resolved,
             cache,
             config,
             lock: Mutex::new(()),
-        })
+        };
+        store.trim_quietly()?;
+        Ok(store)
+    }
+
+    /// Trims the store to its budget (ADR-025, D5 to D7): evicts the least
+    /// recently used layers, documents and kept layer blobs nobody uses
+    /// until the accounted bytes are at or under `cache_budget`, and
+    /// removes corrupt layer entries, orphan sidecars, orphan `.type`
+    /// files and lock files no layer needs. Layers in use are skipped, so
+    /// the store stays over its budget while they alone exceed it.
+    ///
+    /// Trims of every store on the root are serialized; this one waits up
+    /// to 120 s for another one to finish (`Error::LockBusy` after it). It
+    /// fails only when a store directory cannot be listed or the trim
+    /// lock cannot be taken. `open` and every pull trim too; the runner
+    /// (#33) calls this after a lease ends.
+    /// The trees the trim renamed out are removed before this returns,
+    /// outside every lock.
+    pub fn trim(&self) -> Result<TrimReport, Error> {
+        let (doomed, result) = self.trim_deferred();
+        doomed.remove();
+        result
+    }
+
+    /// A trim whose renamed trees the caller removes (ADR-025, D6).
+    fn trim_deferred(&self) -> (Doomed, Result<TrimReport, Error>) {
+        evict::trim(
+            &self.root,
+            self.config.cache_budget,
+            Instant::now() + lock::LOCK_WAIT,
+            DocumentRules {
+                limits: self.config.fetch.document_limits(),
+                max_layers: self.config.fetch.max_layers(),
+            },
+        )
+    }
+
+    /// Removes the trees a pull's trim renamed out on a thread of their
+    /// own, so the pull returns, and the pulls queued on the store's mutex
+    /// go on, without waiting for a removal whose length depends on the
+    /// disk and the trees (ADR-025, D6, review of #99). The thread holds a
+    /// clone of the cache, so this process's owner lock, which keeps the
+    /// trees from being judged dead, lives until they are gone. If no
+    /// thread can be started, the trees stay as owned names of this
+    /// process, and the first sweep after it is gone removes them.
+    fn remove_later(&self, doomed: Doomed) {
+        if doomed.is_empty() {
+            return;
+        }
+        let owner = self.cache.clone();
+        let _ = std::thread::Builder::new()
+            .name("boneli-oci-evict".to_owned())
+            .spawn(move || {
+                doomed.remove();
+                drop(owner);
+            });
+    }
+
+    /// The trim of `open` and of a pull's end: a trim that waited out its
+    /// deadline behind another store's is skipped (that store, or the next
+    /// trim, does the work), rather than failing an `open` or a pull
+    /// whose own work is done (ADR-025, D6).
+    fn trim_quietly(&self) -> Result<(), Error> {
+        quietly(self.trim())
     }
 
     /// The resolved root.
@@ -401,13 +418,14 @@ impl OciImageStore {
     /// it never waits for a pull. The caller holds it from before the
     /// layers are mounted until the sandbox is gone.
     pub fn lease(&self, rootfs: &RootfsRef) -> Result<Lease, ImageError> {
-        let config = self.image_config(rootfs)?;
+        let (config, documents) = self.image_documents(rootfs)?;
         let pins = self
             .pin_all(&config.diff_ids)
             .map_err(|e| failed_image(format!("{}: {e}", rootfs.as_str())))?;
         for diff_id in pins.keys() {
             match self.cache.cached(diff_id.bytes()) {
-                Ok(Some(_)) => {}
+                // A lease is a use (ADR-025, D5).
+                Ok(Some(_)) => evict::stamp(&self.cache.sidecar_path(diff_id.bytes())),
                 Ok(None) => {
                     return Err(failed_image(format!(
                         "{} needs layer {diff_id}, which is not in the store; pull the image again",
@@ -417,7 +435,17 @@ impl OciImageStore {
                 Err(e) => return Err(failed_image(e.to_string())),
             }
         }
-        Ok(self.leased(rootfs.clone(), config, pins))
+        // The documents were read before the pins were taken; a trim in
+        // between may have evicted them. From here on the pins keep them
+        // (ADR-025, D7), so a live lease can always be leased again.
+        if let Some(gone) = documents.iter().find(|d| !d.is_file()) {
+            return Err(failed_image(format!(
+                "{}: document {} was evicted; pull the image again",
+                rootfs.as_str(),
+                gone.display()
+            )));
+        }
+        Ok(self.leased(rootfs.clone(), config, pins, documents))
     }
 
     /// Pulls `image` like [`ImageStore::pull`] and hands the pins the pull
@@ -425,8 +453,12 @@ impl OciImageStore {
     /// the pull and the sandbox (ADR-025, D2). The lease is built from the
     /// manifest and config the pull holds in memory.
     pub fn pull_leased(&self, image: &ImageRef) -> Result<Lease, ImageError> {
-        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.pull_locked(image).map_err(to_image)
+        let (result, doomed) = {
+            let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            self.pull_locked(image)
+        };
+        self.remove_later(doomed);
+        result.map_err(to_image)
     }
 
     /// One pin for each distinct layer of `diff_ids`, all taken within one
@@ -445,12 +477,14 @@ impl OciImageStore {
     }
 
     /// The lease of `rootfs` with `config` over `pins`, which hold every
-    /// layer of `config`.
+    /// layer of `config`; `documents` are the image's documents on disk,
+    /// which the lease stamps when it is dropped.
     fn leased(
         &self,
         rootfs: RootfsRef,
         config: ImageConfig,
         pins: BTreeMap<Digest, LayerPin>,
+        documents: Vec<PathBuf>,
     ) -> Lease {
         let mut seen = BTreeSet::new();
         let mut layers: Vec<PathBuf> = config
@@ -461,17 +495,28 @@ impl OciImageStore {
             .map(|diff_id| self.cache.layer_path(diff_id.bytes()))
             .collect();
         layers.reverse();
-        Lease::new(rootfs, layers, config, pins.into_values().collect())
+        Lease::new(
+            rootfs,
+            layers,
+            config,
+            pins.into_values().collect(),
+            documents,
+        )
     }
 
     /// The image config of `rootfs`: platform, `diff_ids` and the runtime
     /// fields the sandbox starts the image with.
     pub fn config(&self, rootfs: &RootfsRef) -> Result<ImageConfig, ImageError> {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.image_config(rootfs)
+        self.image_documents(rootfs).map(|(config, _)| config)
     }
 
-    fn image_config(&self, rootfs: &RootfsRef) -> Result<ImageConfig, ImageError> {
+    /// The image config of `rootfs` and the paths of its manifest and
+    /// config.
+    fn image_documents(
+        &self,
+        rootfs: &RootfsRef,
+    ) -> Result<(ImageConfig, Vec<PathBuf>), ImageError> {
         let unknown = || failed_image(format!("unknown rootfs {:?}", rootfs.as_str()));
         let digest = Digest::parse(rootfs.as_str()).map_err(|_| unknown())?;
         let mut kept = Kept { store: self };
@@ -496,11 +541,38 @@ impl OciImageStore {
                     m.config.digest
                 ))
             })?;
-        manifest::parse_config(&config.bytes, self.config.fetch.document_limits())
-            .map_err(|e| failed_image(format!("config {}: {e}", m.config.digest)))
+        let parsed = manifest::parse_config(&config.bytes, self.config.fetch.document_limits())
+            .map_err(|e| failed_image(format!("config {}: {e}", m.config.digest)))?;
+        Ok((
+            parsed,
+            vec![self.blob_path(&digest), self.blob_path(&m.config.digest)],
+        ))
     }
 
-    fn pull_locked(&self, image: &ImageRef) -> Result<Lease, PullError> {
+    /// A pull, then a trim while the pull's pins are still held, on
+    /// success and on failure alike: a trim never removes a layer this pull
+    /// found or committed, and a failed pull's committed layers stay for
+    /// the retry (ADR-025, D6). A pull's own error wins over the trim's.
+    ///
+    /// The trees the trim renamed out come back to the caller, which
+    /// removes them once the pull mutex is released (D6).
+    fn pull_locked(&self, image: &ImageRef) -> (Result<Lease, PullError>, Doomed) {
+        let mut pins = BTreeMap::new();
+        let pulled = self.pull_pinned(image, &mut pins);
+        let (doomed, trimmed) = self.trim_deferred();
+        let result = pulled.and_then(|(rootfs, config, documents)| {
+            quietly(trimmed).map_err(pull_err)?;
+            Ok(self.leased(rootfs, config, pins, documents))
+        });
+        (result, doomed)
+    }
+
+    /// The pull itself: the pins it takes go into `pins`, which outlives it.
+    fn pull_pinned(
+        &self,
+        image: &ImageRef,
+        pins: &mut BTreeMap<Digest, LayerPin>,
+    ) -> Result<(RootfsRef, ImageConfig, Vec<PathBuf>), PullError> {
         let reference = Reference::parse(&image.name, &image.digest, &image.platform)?;
         let registry = select(
             &self.config.registries,
@@ -517,7 +589,22 @@ impl OciImageStore {
         // Every layer is pinned before the cache is checked and before any
         // layer blob is requested, so no other store removes a layer this
         // pull is about to use (ADR-025, D2).
-        let pins = self.pin_all(&resolved.config.diff_ids).map_err(pull_err)?;
+        *pins = self.pin_all(&resolved.config.diff_ids).map_err(pull_err)?;
+        // The documents were kept before the pins were taken, and a trim
+        // in between may have evicted them; from here on the pins keep
+        // them (ADR-025, D7). Resolved again, the missing ones are fetched
+        // and kept once more, so the `RootfsRef` this pull returns can be
+        // leased.
+        let mut documents: Vec<PathBuf> = resolved
+            .index
+            .iter()
+            .chain([&resolved.manifest_digest, &resolved.manifest.config.digest])
+            .map(|d| self.blob_path(d))
+            .collect();
+        documents.dedup();
+        if documents.iter().any(|d| !d.is_file()) {
+            client.resolve_with(&reference, &mut Kept { store: self })?;
+        }
         let mut budget = Budget::new(self.config.limits.clone());
         let repo = reference.repository();
         for (layer, diff_id) in resolved
@@ -539,7 +626,7 @@ impl OciImageStore {
             )?;
         }
         let rootfs = RootfsRef::new(format!("sha256:{}", resolved.manifest_digest.hex()));
-        Ok(self.leased(rootfs, resolved.config, pins))
+        Ok((rootfs, resolved.config, documents))
     }
 
     /// Makes sure the layer `pin` pins is committed and charges it to
@@ -558,7 +645,10 @@ impl OciImageStore {
         budget: &mut Budget,
     ) -> Result<(), PullError> {
         let diff_id = Digest::from_bytes(*pin.diff_id());
+        // A cache hit and a commit are uses (ADR-025, D5).
+        let sidecar = self.cache.sidecar_path(pin.diff_id());
         if let Some(stats) = self.cache.cached(pin.diff_id()).map_err(pull_err)? {
+            evict::stamp(&sidecar);
             return budget.charge(&stats).map_err(pull_err);
         }
         let blob = self.blob_path(&descriptor.digest);
@@ -574,6 +664,7 @@ impl OciImageStore {
                 budget,
             )
             .map_err(|e| failed(format!("layer {diff_id} (blob {}): {e}", descriptor.digest)))?;
+        evict::stamp(&sidecar);
         match fs::remove_file(&blob) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -656,6 +747,8 @@ impl Documents for Kept<'_> {
                 return Ok(None);
             }
         };
+        // A read is a use (ADR-025, D5).
+        evict::stamp(&path);
         Ok(Some(Fetched {
             bytes,
             content_type,
@@ -712,6 +805,15 @@ fn write_durably(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
         let _ = fs::remove_file(&temp);
     }
     result.map_err(|e| cache_err(dest, e))
+}
+
+/// A trim's result as `open` and a pull's end take it: a trim that waited
+/// out its deadline behind another store's is skipped (ADR-025, D6).
+fn quietly(result: Result<TrimReport, Error>) -> Result<(), Error> {
+    match result {
+        Ok(_) | Err(Error::LockBusy(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn pull_err(e: Error) -> PullError {
