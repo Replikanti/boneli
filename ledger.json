@@ -980,11 +980,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "b6fae515",
-   "pr": null,
+   "pr": 107,
    "note": "parked: one large task too many for its holder's profile; opens again when there is a place",
-   "updated_at": "2026-11-23T22:48:13+00:00",
+   "updated_at": "2026-11-23T23:27:32+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1465,14 +1465,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-20T22:00:38+00:00",
-   "issue": 55,
-   "from": "implementing",
-   "to": "implementing",
-   "by": "ae67d3e8",
-   "note": "plan approved; implementation waits for PR #88 (ADR-022 resolver) to merge, PR 1 builds on its with_resolver"
-  },
-  {
    "at": "2026-11-20T22:04:16+00:00",
    "issue": 94,
    "from": null,
@@ -1863,6 +1855,14 @@
    "to": "pr-review",
    "by": "785e81ac",
    "note": null
+  },
+  {
+   "at": "2026-11-23T23:27:32+00:00",
+   "issue": 57,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "b6fae515",
+   "note": null
   }
  ],
  "open": [
@@ -1897,7 +1897,7 @@
   105
  ],
  "xopen": [],
- "updated_at": "2026-11-23T22:56:19+00:00",
+ "updated_at": "2026-11-23T23:27:32+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
