@@ -1187,13 +1187,13 @@
    "title": "boneli-https: revocation check for intermediate CAs",
    "epic": null,
    "order": 45,
-   "state": "pr-review",
-   "owner": "f11746bb",
-   "user": "ylohnitram",
-   "machine": "df82df",
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
    "pr": 100,
    "note": "",
-   "updated_at": "2026-11-23T20:57:37+00:00",
+   "updated_at": "2026-11-23T21:21:25+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1204,8 +1204,8 @@
     "core"
    ],
    "manual": false,
-   "session": true,
-   "dispatched": true,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1360,14 +1360,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T19:11:42+00:00",
-   "issue": 57,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "b6fae515",
-   "note": null
-  },
   {
    "at": "2026-11-20T19:12:09+00:00",
    "issue": 81,
@@ -1759,6 +1751,14 @@
    "to": "implementing",
    "by": "36e4fbcc",
    "note": null
+  },
+  {
+   "at": "2026-11-23T21:21:25+00:00",
+   "issue": 80,
+   "from": "pr-review",
+   "to": "done",
+   "by": "f11746bb",
+   "note": null
   }
  ],
  "open": [
@@ -1787,12 +1787,11 @@
   56,
   57,
   69,
-  80,
   97,
   98
  ],
  "xopen": [],
- "updated_at": "2026-11-23T21:14:33+00:00",
+ "updated_at": "2026-11-23T21:21:27+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
