@@ -335,9 +335,11 @@ the digest binds the bytes and mirrors are legitimate.
     unrestricted; Sigstore's public-good intermediate carries the EKU, so
     only a private Fulcio whose intermediate lacks it is refused.
   - SCTs issued through a precertificate signing certificate (RFC 6962
-    3.1's special issuer) do not verify, because the issuer key hash is
-    the leaf's issuer on the path; Fulcio signs its precertificates with
-    its CA key directly.
+    3.1's special issuer) are untested. By RFC 6962 3.2 they verify with
+    this code, because the log signs the final issuer's key hash and a TBS
+    whose issuer is the final issuer, which is what the reconstruction
+    from the leaf yields; no fixture exercises it, since Fulcio signs its
+    precertificates with its CA key directly.
   - Notation, cosign `.att`, `intoto` 0.0.2 entries, `messageSignature`
     bundles, bundles before v0.3, signatures stored in another repository
     (`COSIGN_REPOSITORY`), the policy's configuration file format (#32,
