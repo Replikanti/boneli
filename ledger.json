@@ -1006,11 +1006,11 @@
    "title": "boneli-oci: evict unused layers from the image cache",
    "epic": null,
    "order": 38,
-   "state": "pr-review",
-   "owner": "03af0ec4",
+   "state": "done",
+   "owner": null,
    "pr": 99,
    "note": "PR #99 open",
-   "updated_at": "2026-11-20T23:32:02+00:00",
+   "updated_at": "2026-11-23T22:38:06+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1021,10 +1021,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1360,14 +1360,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T19:16:41+00:00",
-   "issue": 56,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "03af0ec4",
-   "note": null
-  },
   {
    "at": "2026-11-20T19:41:26+00:00",
    "issue": 68,
@@ -1759,6 +1751,14 @@
    "to": "done",
    "by": "36e4fbcc",
    "note": null
+  },
+  {
+   "at": "2026-11-23T22:38:06+00:00",
+   "issue": 56,
+   "from": "pr-review",
+   "to": "done",
+   "by": "03af0ec4",
+   "note": null
   }
  ],
  "open": [
@@ -1784,13 +1784,12 @@
   45,
   49,
   55,
-  56,
   57,
   69,
   98
  ],
  "xopen": [],
- "updated_at": "2026-11-23T22:14:08+00:00",
+ "updated_at": "2026-11-23T22:38:09+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
