@@ -980,11 +980,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "b6fae515",
    "pr": 107,
-   "note": "parked: one large task too many for its holder's profile; opens again when there is a place",
-   "updated_at": "2026-11-23T23:27:32+00:00",
+   "note": "PR 1 #107 merged; PR 2 boneli-sigstore",
+   "updated_at": "2026-11-23T23:46:43+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1466,14 +1466,6 @@
  "log": [
   {
    "at": "2026-11-20T22:04:16+00:00",
-   "issue": 94,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
-  {
-   "at": "2026-11-20T22:04:16+00:00",
    "issue": 93,
    "from": null,
    "to": "ready",
@@ -1863,6 +1855,14 @@
    "to": "pr-review",
    "by": "b6fae515",
    "note": null
+  },
+  {
+   "at": "2026-11-23T23:46:43+00:00",
+   "issue": 57,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "b6fae515",
+   "note": "PR 1 #107 merged; PR 2 boneli-sigstore"
   }
  ],
  "open": [
@@ -1897,7 +1897,7 @@
   105
  ],
  "xopen": [],
- "updated_at": "2026-11-23T23:27:32+00:00",
+ "updated_at": "2026-11-23T23:46:43+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
