@@ -1315,16 +1315,16 @@
    "title": "boneli-oci: check whether the image cache locks stay held through a child between fork and exec",
    "epic": null,
    "order": 50,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "785e81ac",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 106,
    "note": "",
-   "updated_at": "2026-11-23T22:40:37+00:00",
+   "updated_at": "2026-11-23T22:56:19+00:00",
    "priority": "P2",
    "size": "small",
    "deps": [],
@@ -1464,14 +1464,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T22:00:17+00:00",
-   "issue": 55,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "ae67d3e8",
-   "note": null
-  },
   {
    "at": "2026-11-20T22:00:38+00:00",
    "issue": 55,
@@ -1863,6 +1855,14 @@
    "to": "blocked",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-23T22:56:19+00:00",
+   "issue": 98,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "785e81ac",
+   "note": null
   }
  ],
  "open": [
@@ -1897,7 +1897,7 @@
   105
  ],
  "xopen": [],
- "updated_at": "2026-11-23T22:50:36+00:00",
+ "updated_at": "2026-11-23T22:56:19+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
