@@ -25,7 +25,6 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read};
-use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +33,7 @@ use std::time::Instant;
 
 use crate::error::{Error, root_err};
 use crate::limits::Budget;
-use crate::lock::{self, Held};
+use crate::lock::{self, Held, Reopened};
 use crate::unpack::{Compression, LayerStats, unpack};
 
 /// The layer cache under a store root.
@@ -67,9 +66,10 @@ impl LayerPin {
     /// A second pin on the same layer as a descriptor of its own: a new
     /// read-only open file description of the lock file with its own
     /// shared lock (ADR-025, D2). It pins the layer as long as any process
-    /// holds it, and its release never releases this pin.
-    pub(crate) fn descriptor(&self) -> Result<OwnedFd, Error> {
-        self.held.reopen_shared()
+    /// holds it, and its release never releases this pin. Kept in `into`
+    /// until it is handed on.
+    pub(crate) fn descriptor(&self, into: &mut Reopened) -> Result<(), Error> {
+        self.held.reopen_shared(into)
     }
 }
 

@@ -1,6 +1,7 @@
 //! The lease of a pulled root filesystem (ADR-025, D2): its layer
 //! directories, its image config and a pin on each of its layers.
 
+use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
@@ -9,6 +10,7 @@ use boneli_app::RootfsRef;
 use crate::error::Error;
 use crate::evict;
 use crate::layers::LayerPin;
+use crate::lock::Reopened;
 use crate::manifest::ImageConfig;
 
 /// A pulled root filesystem with its layers pinned: while the lease lives,
@@ -79,10 +81,27 @@ impl Lease {
     /// descriptor pins its layer while any process holds it, after this
     /// lease is dropped and after the runner is gone; whoever holds it can
     /// release only its own pin (`close`, `LOCK_UN`), never this lease's.
-    /// Each carries `O_CLOEXEC` until the caller hands it on.
+    /// Each carries `O_CLOEXEC` until the caller hands it on. When one
+    /// fails, the pins already taken are released by an explicit unlock,
+    /// not the close alone (#98).
     pub fn pin_descriptors(&self) -> Result<Vec<OwnedFd>, Error> {
-        self.pins.iter().map(LayerPin::descriptor).collect()
+        descriptors(&self.pins, &mut |_| {})
     }
+}
+
+/// [`Lease::pin_descriptors`] over `pins`, with `reopened(file)` run right
+/// after each new pin is taken: a no-op in production, the seam a test
+/// hands a copy of a pin to a child through.
+fn descriptors(pins: &[LayerPin], reopened: &mut dyn FnMut(&File)) -> Result<Vec<OwnedFd>, Error> {
+    // An error drops `taken`, which unlocks the pins already made (#98).
+    let mut taken = Reopened::new();
+    for pin in pins {
+        pin.descriptor(&mut taken)?;
+        if let Some(file) = taken.last() {
+            reopened(file);
+        }
+    }
+    Ok(taken.hand_on())
 }
 
 impl Drop for Lease {
@@ -100,5 +119,48 @@ impl Drop for Lease {
         for document in &self.documents {
             evict::stamp(document);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Error;
+    use crate::layers::{LayerCache, hex, layer_locks_dir};
+    use crate::lock::tests::{Holder, is_held};
+    use crate::scratch::ScratchDir;
+
+    /// A pin `pin_descriptors` took before a later one failed is released
+    /// by an explicit unlock, not by the close alone, so a child that a
+    /// thread spawned, holding a copy of it until its exec, does not keep
+    /// the layer from a trim (#98). The second layer's lock file is
+    /// replaced, so its reopen fails with `LockChanged`.
+    #[test]
+    fn abandoned_pin_descriptors_are_released_with_a_child_copy() {
+        let scratch = ScratchDir::new("lease-abandoned");
+        let root = scratch.path();
+        let cache = LayerCache::new(root).expect("cache");
+        let (first, second) = ([1; 32], [2; 32]);
+        let pins = [
+            cache.pin(&first).expect("pin the first layer"),
+            cache.pin(&second).expect("pin the second layer"),
+        ];
+        let first_lock = layer_locks_dir(root).join(hex(&first));
+        let second_lock = layer_locks_dir(root).join(hex(&second));
+        std::fs::remove_file(&second_lock).expect("unlink");
+        std::fs::write(&second_lock, b"").expect("re-create");
+        let mut holders = Vec::new();
+        match super::descriptors(&pins, &mut |file| holders.push(Holder::spawn(file))) {
+            Err(Error::LockChanged(p)) => assert_eq!(p, second_lock),
+            other => panic!("the second reopen must fail: {other:?}"),
+        }
+        assert_eq!(holders.len(), 1, "one pin taken before the failure");
+        let [first_pin, second_pin] = pins;
+        drop(first_pin);
+        assert!(
+            !is_held(&first_lock),
+            "the child's copy of the abandoned pin kept the layer locked"
+        );
+        drop(second_pin);
+        drop(holders);
     }
 }

@@ -923,6 +923,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-oci` (#98) releases a lock it took on a lock file that was
   replaced before the inode check by an explicit unlock as well, before
   it tries again: a child spawned by another thread no longer keeps that
-  stale lock held until its exec. Pinned, with deterministic tests that a
-  dropped shared, exclusive or removed cache lock is free at once while a
-  child holds a copy of it, and that every lock file is `O_CLOEXEC`.
+  stale lock held until its exec. The same holds for the pins
+  `Lease::pin_descriptors` took before a later one failed. Pinned, with
+  deterministic tests that a dropped shared, exclusive or removed cache
+  lock and an abandoned pin descriptor are free at once while a child
+  holds a copy of it, that `remove` unlinks before it unlocks, and that
+  every lock file is `O_CLOEXEC`.
