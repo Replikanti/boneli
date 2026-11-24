@@ -1491,7 +1491,7 @@
    "title": "boneli-oci: verify cosign .att SLSA v0.2 provenance for rules with claims",
    "epic": null,
    "order": 57,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "6cc0788e",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1500,7 +1500,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-24T09:47:27+00:00",
+   "updated_at": "2026-11-24T16:41:28+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1564,14 +1564,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T22:50:36+00:00",
-   "issue": 103,
-   "from": "ready",
-   "to": "blocked",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-23T22:50:36+00:00",
    "issue": 102,
@@ -1963,6 +1955,14 @@
    "to": "implementing",
    "by": "ecf725cc",
    "note": null
+  },
+  {
+   "at": "2026-11-24T16:41:28+00:00",
+   "issue": 114,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "6cc0788e",
+   "note": null
   }
  ],
  "open": [
@@ -1996,7 +1996,7 @@
   117
  ],
  "xopen": [],
- "updated_at": "2026-11-24T16:41:02+00:00",
+ "updated_at": "2026-11-24T16:41:28+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
