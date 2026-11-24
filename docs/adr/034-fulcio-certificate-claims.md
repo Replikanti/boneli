@@ -292,7 +292,8 @@ list in every set of certificate claims (D2); an optional repository ID
   run, now only for that run's repository, ref, commit and trigger. What
   the steps did with the code stays outside what a signature can say;
   SLSA Build L3 provenance (`slsa-github-generator`, cosign `.att`) is
-  #114.
+  #114. ADR-036 reads it under rules with claims, and these certificate
+  claims apply to its leaf.
 - Only GitHub Actions' issuer. Other issuers' meanings of these OIDs are
   not modeled; a trust with another issuer cannot have certificate
   claims. Closure: an ADR per issuer with a captured leaf, when a user

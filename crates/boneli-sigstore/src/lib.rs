@@ -27,10 +27,11 @@
 //! Ref Fulcio wrote into the leaf from the OIDC token (exact, or a prefix
 //! ending in `/`), the repository's numeric ID, the calling workflow file
 //! (the path in the Build Config URI), and a required list of build
-//! triggers. They apply to every keyless carrier, `.sig` layers
+//! triggers. They apply to every keyless carrier, `.sig` and `.att` layers
 //! included, and are read only from a leaf webpki verified. An opt-in
-//! statement agreement also makes an SLSA statement's builder, source
-//! repository, ref and source commit equal what the certificate says.
+//! statement agreement also makes an SLSA v1 statement's builder, source
+//! repository, ref and source commit equal what the certificate says; a
+//! v0.2 statement under it is refused (ADR-036).
 //!
 //! Finding the evidence is the caller's job (`boneli-oci` reads the
 //! registry); everything here is pure, reads no clock, no file and no

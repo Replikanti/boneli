@@ -283,8 +283,10 @@ pub(crate) fn check(
         }
         None => None,
     };
-    if let (Some(agreement), Some(source)) = (agreement, source) {
-        agrees(&provenance, source, agreement)?;
+    // GitHub's build type always names its ref; a v0.2 statement never
+    // reaches here under the agreement (above).
+    if let (Some(agreement), Some((repository, Some(git_ref)))) = (agreement, source) {
+        agrees(&provenance, (repository, git_ref), agreement)?;
     }
     if claims
         .builder_id
@@ -331,7 +333,7 @@ pub(crate) fn check(
 /// `git+<1.12>@<1.14>`, every one of them with the `gitCommit` 1.13.
 fn agrees(
     provenance: &Provenance<'_>,
-    (repository, git_ref): (&str, Option<&str>),
+    (repository, git_ref): (&str, &str),
     agreement: &Agreement<'_>,
 ) -> Result<(), Refusal> {
     let disagrees = |ext| Refusal::CertificateClaim(CertificateRefusal::StatementDisagrees(ext));
@@ -341,7 +343,7 @@ fn agrees(
     if repository != agreement.repository {
         return Err(disagrees(Extension::SourceRepositoryUri));
     }
-    if git_ref != Some(agreement.git_ref) {
+    if git_ref != agreement.git_ref {
         return Err(disagrees(Extension::SourceRepositoryRef));
     }
     let uri = format!("git+{}@{}", agreement.repository, agreement.git_ref);

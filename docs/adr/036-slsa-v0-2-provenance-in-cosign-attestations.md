@@ -298,13 +298,24 @@ superseded by item 4 here. The rest of ADR-031 stands.
   generator's, so any workflow of the source repository at a matching
   ref that calls the generator passes; for v1 the SAN names the
   workflow. Whoever can create a matching ref can also edit the release
-  workflow at that ref, so the gap adds little against them. Closure:
-  #113 adds Fulcio's Build Config URI (1.3.6.1.4.1.57264.1.18), which
-  Fulcio writes from the OIDC token (measured on 4 `.att` certificates).
+  workflow at that ref, so the gap adds little against them. Closed by
+  ADR-034 (#113), which landed before this ADR merged: certificate claims
+  apply to the `.att` leaf like any keyless carrier, and its workflow-path
+  rule binds Fulcio's Build Config URI (1.3.6.1.4.1.57264.1.18), written
+  from the OIDC token (measured on 4 `.att` certificates;
+  `certificate_claims_on_attestation`).
 - The trigger: as for v1 (ADR-031, known limits), the ref and the source
-  commit name the built code only for some triggers. Closure: #113's
-  Build Trigger extension (1.20), measured `push` on the `.att`
-  certificates.
+  commit name the built code only for some triggers. Closed by ADR-034's
+  trigger list over Build Trigger (1.20), measured `push` on the `.att`
+  certificates, under certificate claims.
+- ADR-034's statement agreement is defined for GitHub's v1 build type
+  only, so a v0.2 statement under it is refused (`UnknownBuildType`): the
+  container generator's builder ID is the generator's workflow, its
+  material digest is `sha1` and not `gitCommit`, and no ADR maps them
+  onto 1.9 and 1.13 yet. Certificate claims without the agreement bind the
+  same repository, ref and workflow from the leaf. Closure: a successor
+  ADR with the mapping and a captured `.att` that meets it, when a rule
+  needs the statement and the leaf tied together for v0.2.
 - Workflow inputs and `vars` (D1): a non-empty `event_inputs` refuses, so
   a project that releases through `workflow_dispatch` with inputs cannot
   pass a claims rule; `vars` is not read. Closure: a successor ADR when a
@@ -362,7 +373,11 @@ mutants; one survived the first pass (`configSource` read from
 `invocation` when missing, refused either way but as another refusal)
 and is killed by a test added for it. Review of PR #122 found that a
 host-wide repository prefix passed the item 4 guard; the owner rule now in
-item 4 closes it, and its 12 mutants are killed. Live on x86_64 (local run):
+item 4 closes it, and its 12 mutants are killed. After the rebase onto
+ADR-034, the merged checks in `verify.rs` and `provenance.rs` (the
+attestation dispatch with the agreement, the v0.2 refusal under it, the
+owner rule) were mutated again with ADR-034's tests included: 25 of 25
+killed. Live on x86_64 (local run):
 `provenance_v02_on_ghcr` pulls flux-cli with its 4 layers in 26.1 s over
 19 connections and refuses it under another source repository with
 `.att sha256:467ee9c3…5b9f7ac5: 1 listed, 1 candidates (layer 0: the

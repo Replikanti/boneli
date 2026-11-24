@@ -808,7 +808,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under a trust without claims is refused (`AttestationNeedsClaims`), so
   rules without claims send the requests they sent before. Pointer files
   hold up to 48 lines and an `attest` kind. Rekor `intoto` entries are
-  refused (`EntryKind`, #118). Live test `provenance_v02_on_ghcr`
+  refused (`EntryKind`, #118). Fulcio certificate claims (ADR-034) apply
+  to the `.att` leaf; their statement agreement refuses a v0.2 statement
+  (`UnknownBuildType`). Live test `provenance_v02_on_ghcr`
   (flux-cli v2.4.0 on GHCR) in `oci-acceptance`.
 - Image references an agent chose (#105, ADR-032, accepted):
   `boneli_app::ImageOrigin` (`Operator` or `Agent`, no default),

@@ -792,3 +792,62 @@ fn attestation_texts() {
         "a trust that lists SLSA provenance v0.2 needs an exact source repository, or a repository prefix or material that names an owner"
     );
 }
+
+/// Fulcio certificate claims (ADR-034) apply to the `.att` leaf as to
+/// every keyless carrier: flux-cli's leaf names the caller's repository
+/// (1.12), its tag ref (1.14), its release workflow (1.18) and `push`
+/// (1.20), so the rule passes, and another trigger or workflow file is
+/// refused by the leaf. The statement agreement is defined for GitHub's v1
+/// build type only, so a v0.2 statement under it is `UnknownBuildType`;
+/// certificate claims without provenance claims leave an attestation
+/// counting for nothing.
+#[test]
+fn certificate_claims_on_attestation() {
+    let certificate = |trigger: &str, path: &str| {
+        boneli_sigstore::CertificateClaims::new(
+            exact(real::FLUX_REPOSITORY),
+            prefix("refs/tags/"),
+            vec![trigger.to_owned()],
+        )
+        .expect("certificate claims")
+        .with_workflow_path(path)
+        .expect("workflow path")
+    };
+    let release = ".github/workflows/release.yaml";
+    let with = |claims: boneli_sigstore::CertificateClaims| {
+        flux_trust()
+            .with_certificate_claims(claims)
+            .expect("with certificate claims")
+    };
+    assert_eq!(
+        flux_verify(&with(certificate("push", release))),
+        FLUX_ACCEPTED
+    );
+    assert_eq!(
+        flux_verify(&with(certificate("release", release))),
+        Err(Refusal::CertificateClaim(
+            boneli_sigstore::CertificateRefusal::Mismatch(boneli_sigstore::Extension::BuildTrigger)
+        ))
+    );
+    assert_eq!(
+        flux_verify(&with(certificate("push", ".github/workflows/other.yaml"))),
+        Err(Refusal::CertificateClaim(
+            boneli_sigstore::CertificateRefusal::Mismatch(
+                boneli_sigstore::Extension::BuildConfigUri
+            )
+        ))
+    );
+    assert_eq!(
+        flux_verify(&with(
+            certificate("push", release).with_statement_agreement()
+        )),
+        Err(Refusal::UnknownBuildType)
+    );
+    let without_claims = real::slsa_v02_keyless(real::generator_identity())
+        .with_certificate_claims(certificate("push", release))
+        .expect("certificate claims alone");
+    assert_eq!(
+        flux_verify(&without_claims),
+        Err(Refusal::AttestationNeedsClaims)
+    );
+}
