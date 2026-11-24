@@ -377,7 +377,7 @@ after the acceptance run.
      after a pull under the second. 32 is every candidate the two
      carriers can list for one subject at once (2 × `MAX_SIGNATURES`),
      so while the listings stay as they are no rule's evidence is pushed
-     out, at 4,800 bytes per file at most. Two stores that add a line at
+     out, at 4,832 bytes per file at most. Two stores that add a line at
      once may lose one; its rule then discovers again.
    - **Kept documents and their type** (review of PR 3). A kept
      document's bytes are its digest's, but its `.type` is what the
@@ -432,8 +432,8 @@ the digest binds the bytes and mirrors are legitimate.
 - **`MAX_KEPT` = 32 lines per pointer file (PR 3, review).** 2 ×
   `MAX_SIGNATURES`: every candidate both carriers can list for one
   subject at once, so rules with different trusts never push out each
-  other's evidence while the listings stay; at most 150 bytes a line,
-  4,800 bytes a file (`MAX_POINTER_BYTES` = 8,192 read). Lower lets
+  other's evidence while the listings stay; at most 151 bytes a line,
+  4,832 bytes a file (`MAX_POINTER_BYTES` = 8,192 read). Lower lets
   enough rules over one digest send each other's warm pulls to the
   network; higher only keeps lines no listing can produce.
 - **`MAX_SIGNATURES` = 16 per carrier listing per subject (PR 3).**

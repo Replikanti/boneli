@@ -76,8 +76,8 @@ const SIG_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, applicatio
 /// first.
 pub(crate) const MAX_KEPT: usize = 2 * MAX_SIGNATURES;
 
-/// The longest pointer file read: [`MAX_KEPT`] lines of at most 150 bytes
-/// (`bundle`, two digests, two spaces and a newline) are 4,800 bytes.
+/// The longest pointer file read: [`MAX_KEPT`] lines of at most 151 bytes
+/// (`bundle`, two digests, two spaces and a newline) are 4,832 bytes.
 pub(crate) const MAX_POINTER_BYTES: u64 = 8_192;
 
 /// The evidence a pull verified for one subject, as its pointer file names
