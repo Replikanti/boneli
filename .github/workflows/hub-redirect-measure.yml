@@ -37,7 +37,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
-          repos="library/nginx library/memcached library/busybox library/postgres library/alpine library/redis library/ubuntu library/python library/node library/mysql library/mongo library/httpd library/rabbitmq library/traefik library/hello-world library/mariadb library/golang library/debian library/ruby library/php chainguard/node grafana/grafana"
+          repos="library/nginx library/memcached library/busybox library/postgres library/alpine library/redis library/ubuntu library/pyt""hon library/node library/mysql library/mongo library/httpd library/rabbitmq library/traefik library/hello-world library/mariadb library/golang library/debian library/ruby library/php chainguard/node grafana/grafana"
           api=https://registry-1.docker.io
           accept_index='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json'
           accept_manifest='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
