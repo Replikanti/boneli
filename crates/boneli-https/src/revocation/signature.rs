@@ -3,7 +3,7 @@
 
 use rustls::pki_types::SignatureVerificationAlgorithm;
 
-use super::der;
+use crate::der;
 
 /// Whether the key of the whole `SubjectPublicKeyInfo` `spki` signed
 /// `signed` with `signature` under `signature_algorithm` (the content of

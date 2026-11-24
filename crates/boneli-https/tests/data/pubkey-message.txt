@@ -1,0 +1,1 @@
+Boneli public key test message: the image digest and its signer.

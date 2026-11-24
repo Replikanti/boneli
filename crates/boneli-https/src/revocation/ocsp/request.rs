@@ -3,8 +3,8 @@
 //! nonce, which no measured responder echoes), no signature; sent as a GET
 //! with the request in the path (RFC 6960, A.1).
 
-use super::super::der::{self, INTEGER, OCTET_STRING, SEQUENCE};
 use super::super::url::CrlUrl;
+use crate::der::{self, INTEGER, OCTET_STRING, SEQUENCE};
 
 /// `AlgorithmIdentifier { id-sha1, NULL }`, whole: what openssl sends and
 /// every measured responder answers with.

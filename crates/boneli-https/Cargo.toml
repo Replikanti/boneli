@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, and ring's SHA-256, RS256 signatures and random source."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, ring's SHA-256, RS256 signatures and random source, and signature verification and code-signing chains for image signatures."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,6 +29,8 @@ boneli-http.workspace = true
 # (`RsaSha256Key`, `fill_random`, ADR-014); none of them needs a feature.
 # Nor does revocation by CRL (ADR-017): `WebPkiServerVerifier` with CRLs
 # is part of the `ring` and `std` features above.
+# Signature verification for image signatures (`PublicKey`, ADR-029)
+# uses the webpki algorithms of the same provider; no feature either.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Mozilla's root certificates, compiled in, so trust does not depend on the
 # host's CA bundle (ADR-005).
@@ -50,9 +52,10 @@ zeroize = { version = "1.9.1", default-features = false }
 # The verified path of a server's chain, for the leaf's issuer, and the
 # check of a delegated OCSP responder's certificate (`verify_for_usage`
 # with `id-kp-OCSPSigning`); ADR-020. The same path gives the issuers of
-# the intermediates, whose CRLs ADR-027 checks. Already in the graph
-# through rustls; a direct edge, no new crate. `alloc` for
-# `VerifiedPath::issuer_spki`.
+# the intermediates, whose CRLs ADR-027 checks. The code-signing chains of
+# image signatures (`verify_code_signing`, `id-kp-codeSigning`, ADR-029)
+# go through `verify_for_usage` too. Already in the graph through rustls;
+# a direct edge, no new crate. `alloc` for `VerifiedPath::issuer_spki`.
 rustls-webpki = { version = "0.103.17", default-features = false, features = ["alloc"] }
 # SHA-1 for OCSP CertIDs only (`digest::SHA1_FOR_LEGACY_USE_ONLY`): every
 # measured responder answers with a SHA-1 CertID (ADR-020). Already in the
