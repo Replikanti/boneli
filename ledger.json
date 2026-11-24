@@ -1485,41 +1485,61 @@
     "core"
    ],
    "manual": false
+  },
+  {
+   "issue": 114,
+   "title": "boneli-oci: verify cosign .att SLSA v0.2 provenance for rules with claims",
+   "epic": null,
+   "order": 57,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-24T08:26:31+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    104
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
+  },
+  {
+   "issue": 113,
+   "title": "boneli-sigstore: match Fulcio certificate source repository and ref extensions under Required",
+   "epic": null,
+   "order": 58,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-24T08:26:31+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    104
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T23:32:02+00:00",
-   "issue": 56,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #99 open"
-  },
-  {
-   "at": "2026-11-20T23:32:02+00:00",
-   "issue": 98,
-   "from": "ready",
-   "to": "claimed",
-   "by": "785e81ac",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-20T23:32:02+00:00",
-   "issue": 97,
-   "from": "ready",
-   "to": "claimed",
-   "by": "36e4fbcc",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-20T23:40:42+00:00",
-   "issue": 94,
-   "from": "pr-review",
-   "to": "done",
-   "by": "3ebab419",
-   "note": null
-  },
   {
    "at": "2026-11-23T20:35:36+00:00",
    "issue": 97,
@@ -1887,6 +1907,38 @@
    "to": "implementing",
    "by": "88ef9d69",
    "note": null
+  },
+  {
+   "at": "2026-11-24T08:26:31+00:00",
+   "issue": 114,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-24T08:26:31+00:00",
+   "issue": 113,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-24T08:26:31+00:00",
+   "issue": 114,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-24T08:26:31+00:00",
+   "issue": 113,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -1916,10 +1968,12 @@
   102,
   103,
   104,
-  105
+  105,
+  113,
+  114
  ],
  "xopen": [],
- "updated_at": "2026-11-24T08:24:55+00:00",
+ "updated_at": "2026-11-24T08:26:31+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
