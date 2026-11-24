@@ -46,14 +46,7 @@ impl Evidence {
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Refusal::PayloadTooLarge);
         }
-        let one = |key: &str| -> Result<Option<&str>, Refusal> {
-            let mut values = annotations.iter().filter(|(k, _)| *k == key);
-            let first = values.next().map(|(_, v)| *v);
-            match values.next() {
-                Some(_) => Err(Refusal::MalformedAnnotations),
-                None => Ok(first),
-            }
-        };
+        let one = |key: &str| annotation(annotations, key);
         let signature = one(SIGNATURE_ANNOTATION)?.ok_or(Refusal::MalformedAnnotations)?;
         let signature = base64::decode(signature.as_bytes()).ok_or(Refusal::MalformedSignature)?;
         let certificate = match one(CERTIFICATE_ANNOTATION)? {
@@ -79,6 +72,20 @@ impl Evidence {
     }
 }
 
+/// The value of `key` among `annotations`, if any; a key that occurs
+/// twice refuses (`MalformedAnnotations`), so the layer has one reading.
+pub(crate) fn annotation<'a>(
+    annotations: &[(&str, &'a str)],
+    key: &str,
+) -> Result<Option<&'a str>, Refusal> {
+    let mut values = annotations.iter().filter(|(k, _)| *k == key);
+    let first = values.next().map(|(_, v)| *v);
+    match values.next() {
+        Some(_) => Err(Refusal::MalformedAnnotations),
+        None => Ok(first),
+    }
+}
+
 /// The digest a simple-signing payload names (module doc).
 fn signed_digest(payload: &[u8]) -> Result<[u8; 32], Refusal> {
     let value = json::parse(payload, MAX_PAYLOAD_BYTES).ok_or(Refusal::MalformedPayload)?;
@@ -93,7 +100,7 @@ fn signed_digest(payload: &[u8]) -> Result<[u8; 32], Refusal> {
 }
 
 /// The Rekor entry of a [`BUNDLE_ANNOTATION`].
-fn legacy_entry(text: &[u8]) -> Option<TlogEntry> {
+pub(crate) fn legacy_entry(text: &[u8]) -> Option<TlogEntry> {
     let value = json::parse(text, MAX_BUNDLE_BYTES)?;
     let set = json::base64(&value, "SignedEntryTimestamp")?;
     let payload = json::object(&value, "Payload")?;

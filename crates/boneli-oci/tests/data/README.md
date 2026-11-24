@@ -12,7 +12,8 @@ later pull without a `Required` rule to it, byte for byte.
 
 Captured on 2026-11-24 through the anonymous registry API. The digests
 are the ones ADR-029 measured on 2026-11-20, and jq's the one ADR-031
-measured on 2026-11-24; `sigstore-trusted-root.json`
+measured on 2026-11-24, and flux-cli's the one ADR-036 measured on
+2026-11-24; `sigstore-trusted-root.json`
 and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 (same SHA-256), where their sources are listed.
 
@@ -37,6 +38,11 @@ and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 | `jq.referrers-tag.json` | `1b9c2acf…3fc2ba60` | GHCR's answer to the tag `sha256-<index hex>` (the referrers API answers `404`, and so does the amd64 manifest's tag): one SLSA provenance v1 bundle referrer, 496 bytes |
 | `jq.referrer.json` | `07f60e20…c3855de3` | that referrer's manifest, 831 bytes |
 | `jq.bundle.json` | `98860952…703ed018` | its bundle: GitHub's keyless artifact attestation, the file `jq-1.8.2.bundle.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
+| `flux.index.json` | `a9cb966c…3471fd1f` | the index of `ghcr.io/fluxcd/flux-cli:v2.4.0`, a Docker manifest list of 1,079 bytes (ADR-036) |
+| `flux.amd64.json` | `722bdf66…61c90386` | its `linux/amd64` manifest (Docker schema 2, 1,162 bytes) |
+| `flux.amd64-config.json` | `9b0c4fef…e14e2bd8` | that manifest's config |
+| `flux.att.json` | `467ee9c3…5b9f7ac5` | the cosign `.att` manifest of the index (the tag `sha256-<index hex>.att`; the amd64 manifest's answers 404): one SLSA v0.2 layer, the file `flux-cli-2.4.0.att.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
+| `flux.envelope.json` | `f12badd9…56be214b` | its DSSE envelope, the file `flux-cli-2.4.0.envelope.json` there |
 
 From an empty directory, with `jq`:
 
@@ -80,6 +86,17 @@ curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o jq.referrer.json \
   "$gh/manifests/$(jq -r '.manifests[0].digest' jq.referrers-tag.json)"
 curl -sSL -H "Authorization: Bearer $tok" -o jq.bundle.json \
   "$gh/blobs/$(jq -r '.layers[0].digest' jq.referrer.json)"
+gh=https://ghcr.io/v2/fluxcd/flux-cli
+tok=$(curl -fsS 'https://ghcr.io/token?scope=repository:fluxcd/flux-cli:pull' | jq -r .token)
+fd=a9cb966cddc1a0c56dc0d57dda485d9477dd397f8b45f222717b24663471fd1f
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o flux.index.json "$gh/manifests/sha256:$fd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o flux.amd64.json \
+  "$gh/manifests/$(jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest' flux.index.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o flux.amd64-config.json \
+  "$gh/blobs/$(jq -r .config.digest flux.amd64.json)"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o flux.att.json "$gh/manifests/sha256-$fd.att"
+curl -sSL -H "Authorization: Bearer $tok" -o flux.envelope.json \
+  "$gh/blobs/$(jq -r '.layers[0].digest' flux.att.json)"
 ```
 
 ## Test keys

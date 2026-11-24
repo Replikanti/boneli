@@ -169,9 +169,11 @@ connection), and `signatures_elsewhere` pulls signed
 images from GHCR, `cgr.dev` and Artifact Registry;
 `provenance_claims_on_ghcr` pulls jq from GHCR under a rule with SLSA
 provenance claims and refuses it under another source repository
-(ADR-031), and `certificate_claims_on_ghcr` pulls it under Fulcio
+(ADR-031), `certificate_claims_on_ghcr` pulls it under Fulcio
 certificate claims with the statement agreement and refuses it under
-another build trigger (ADR-034); CI runs them in the weekly
+another build trigger (ADR-034), and `provenance_v02_on_ghcr` does the
+same as `provenance_claims_on_ghcr` for flux-cli's SLSA v0.2 provenance
+in a cosign `.att` (ADR-036); CI runs them in the weekly
 `oci-acceptance` workflow, not on every PR.
 
 ```sh

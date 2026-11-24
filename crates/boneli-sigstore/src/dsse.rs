@@ -1,11 +1,13 @@
-//! DSSE's pre-authentication encoding and the in-toto Statement v1 it
-//! carries (ADR-029, S5).
+//! DSSE's pre-authentication encoding and the in-toto statement it carries
+//! (ADR-029, S5; ADR-036).
 //!
 //! A DSSE signature is over `PAE(payloadType, payload)`, so the payload
 //! type is signed too: `DSSEv1 <len> <type> <len> <payload>`, lengths in
 //! bytes as ASCII decimal. Only `application/vnd.in-toto+json` is
-//! accepted, and the payload must be a Statement v1 (`_type` byte for
-//! byte). What it signs is its `subject` list: a subject matches by
+//! accepted, and the statement's `_type` must be one the caller admits,
+//! byte for byte: Statement v1 in a bundle, v0.1 or v1 in a cosign `.att`
+//! (ADR-036: every measured `.att` is v0.1, no measured bundle is). What
+//! it signs is its `subject` list: a subject matches by
 //! `digest.sha256`, 64 lower-case hex digits compared byte for byte, and
 //! other algorithms or forms never match. Its `predicateType` must be on
 //! the trust's list; the predicate itself is evaluated only under a trust
@@ -18,8 +20,10 @@ use crate::{MAX_BUNDLE_BYTES, hex, json};
 
 /// The one DSSE payload type accepted.
 pub const IN_TOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
-/// The one statement type accepted.
+/// in-toto Statement v1, the one statement type a bundle may carry.
 pub const STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
+/// in-toto Statement v0.1, admitted in a cosign `.att` only (ADR-036).
+pub const STATEMENT_V01: &str = "https://in-toto.io/Statement/v0.1";
 
 /// `PAE(payload_type, payload)` of the DSSE specification.
 pub fn pae(payload_type: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -44,13 +48,13 @@ pub(crate) struct Statement {
     pub(crate) predicate_type: String,
 }
 
-/// Reads an in-toto Statement v1.
-pub(crate) fn statement(payload: &[u8]) -> Result<Statement, Refusal> {
+/// Reads an in-toto statement whose `_type` is one of `types`.
+pub(crate) fn statement(payload: &[u8], types: &[&str]) -> Result<Statement, Refusal> {
     let value = json::parse(payload, MAX_BUNDLE_BYTES).ok_or(Refusal::MalformedStatement)?;
     if value.as_object().is_none() {
         return Err(Refusal::MalformedStatement);
     }
-    if json::string(&value, "_type") != Some(STATEMENT_V1) {
+    if !json::string(&value, "_type").is_some_and(|t| types.contains(&t)) {
         return Err(Refusal::StatementType);
     }
     let subjects = json::array(&value, "subject").ok_or(Refusal::MalformedStatement)?;

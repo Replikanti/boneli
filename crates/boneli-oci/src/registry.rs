@@ -356,14 +356,16 @@ enum Kind {
 }
 
 /// A tag a signature lookup reads, built only from a digest (ADR-029):
-/// cosign's `sha256-<hex>.sig` or the referrers tag schema's
-/// `sha256-<hex>`.
+/// cosign's `sha256-<hex>.sig` and `sha256-<hex>.att` (ADR-036), or the
+/// referrers tag schema's `sha256-<hex>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignatureTag {
     /// `sha256-<hex>.sig`.
     Sig(Digest),
     /// `sha256-<hex>`, the fallback when the referrers API answers `404`.
     Referrers(Digest),
+    /// `sha256-<hex>.att`, cosign's attestations (ADR-036).
+    Att(Digest),
 }
 
 impl SignatureTag {
@@ -371,6 +373,7 @@ impl SignatureTag {
         match self {
             SignatureTag::Sig(d) => format!("sha256-{}.sig", d.hex()),
             SignatureTag::Referrers(d) => format!("sha256-{}", d.hex()),
+            SignatureTag::Att(d) => format!("sha256-{}.att", d.hex()),
         }
     }
 }
@@ -1103,4 +1106,32 @@ fn copy_exact(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignatureTag;
+    use crate::reference::Digest;
+
+    /// Each signature tag is built from a digest only: `sha256-<64 hex>`
+    /// with cosign's `.sig` or `.att` suffix, or none for the referrers
+    /// tag schema.
+    #[test]
+    fn att_tag_text() {
+        let digest = Digest::from_bytes([0xAB; 32]);
+        let hex = "ab".repeat(32);
+        assert_eq!(
+            SignatureTag::Att(digest).text(),
+            format!("sha256-{hex}.att")
+        );
+        assert_eq!(
+            SignatureTag::Sig(digest).text(),
+            format!("sha256-{hex}.sig")
+        );
+        assert_eq!(
+            SignatureTag::Referrers(digest).text(),
+            format!("sha256-{hex}")
+        );
+        assert_eq!(SignatureTag::Att(digest).text().len(), 75);
+    }
 }

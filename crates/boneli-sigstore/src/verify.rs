@@ -26,10 +26,16 @@
 //!   them (`fulcio`), on every carrier, before any statement is read.
 //! - **Claims (ADR-031):** under a trust with [`Claims`], a cosign layer
 //!   is refused before any other check (it carries no provenance), and a
-//!   bundle whose signature passed must also meet the claims
-//!   (`provenance`), after agreeing with the certificate when the
+//!   bundle or attestation whose signature passed must also meet the
+//!   claims (`provenance`), after agreeing with the certificate when the
 //!   certificate claims ask for it. A trust without claims never reads
 //!   the predicate.
+//! - **Attestations (ADR-036):** a cosign `.att` layer counts only under a
+//!   trust with claims; without them it is refused before any other check
+//!   (`AttestationNeedsClaims`), so the verdict over kept evidence never
+//!   differs from a cold pull's, which does not ask for `.att` then. Past
+//!   that it is checked exactly as a bundle: predicate type, subject,
+//!   signature, certificate claims, then the claims.
 //!
 //! No step reads the wall clock: the only time is the log's, so the same
 //! inputs give the same verdict forever.
@@ -51,6 +57,9 @@ use crate::root::TrustedRoot;
 pub const COSIGN_SIGN_PREDICATE: &str = "https://sigstore.dev/cosign/sign/v1";
 /// The predicate type of SLSA provenance v1, opt-in.
 pub const SLSA_PROVENANCE_V1_PREDICATE: &str = "https://slsa.dev/provenance/v1";
+/// The predicate type of SLSA provenance v0.2, opt-in and only under
+/// claims (ADR-036).
+pub const SLSA_PROVENANCE_V02_PREDICATE: &str = "https://slsa.dev/provenance/v0.2";
 
 /// Fulcio's OIDC issuer extensions: 1.3.6.1.4.1.57264.1.1, the raw
 /// issuer bytes (deprecated), and 1.3.6.1.4.1.57264.1.8, a DER
@@ -59,8 +68,9 @@ const ISSUER_V1: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x01,
 const ISSUER_V2: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x01, 0x08];
 
 /// One candidate signature, parsed from a cosign layer
-/// ([`Evidence::from_cosign_layer`]) or a bundle
-/// ([`Evidence::from_bundle`]).
+/// ([`Evidence::from_cosign_layer`]), a bundle
+/// ([`Evidence::from_bundle`]) or a cosign attestation layer
+/// ([`Evidence::from_cosign_attestation`]).
 ///
 /// `Debug` shows the form only, never the evidence's content.
 #[derive(Clone)]
@@ -77,23 +87,31 @@ pub(crate) enum Form {
         certificate: Option<Vec<u8>>,
         tlog: Option<TlogEntry>,
     },
-    Bundle {
-        payload: Vec<u8>,
-        /// PAE(payloadType, payload): the signed bytes.
-        message: Vec<u8>,
-        signature: Vec<u8>,
-        certificate: Option<Vec<u8>>,
-        statement: Statement,
-        tlogs: Vec<TlogEntry>,
-    },
+    Bundle(Dsse),
+    Attestation(Dsse),
+}
+
+/// A DSSE envelope over an in-toto statement, with what verifies it: the
+/// content of a bundle and of a cosign attestation alike.
+#[derive(Clone)]
+pub(crate) struct Dsse {
+    pub(crate) payload: Vec<u8>,
+    /// PAE(payloadType, payload): the signed bytes.
+    pub(crate) message: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) certificate: Option<Vec<u8>>,
+    pub(crate) statement: Statement,
+    pub(crate) tlogs: Vec<TlogEntry>,
 }
 
 impl fmt::Debug for Evidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (form, keyless) = match &self.form {
-            Form::Cosign { certificate, .. } => ("cosign", certificate.is_some()),
-            Form::Bundle { certificate, .. } => ("bundle", certificate.is_some()),
+        let form = match &self.form {
+            Form::Cosign { .. } => "cosign",
+            Form::Bundle(_) => "bundle",
+            Form::Attestation(_) => "attestation",
         };
+        let keyless = self.is_keyless();
         f.debug_struct("Evidence")
             .field("form", &form)
             .field("keyless", &keyless)
@@ -105,9 +123,9 @@ impl Evidence {
     /// Whether the evidence carries a signing certificate.
     pub fn is_keyless(&self) -> bool {
         match &self.form {
-            Form::Cosign { certificate, .. } | Form::Bundle { certificate, .. } => {
-                certificate.is_some()
-            }
+            Form::Cosign { certificate, .. }
+            | Form::Bundle(Dsse { certificate, .. })
+            | Form::Attestation(Dsse { certificate, .. }) => certificate.is_some(),
         }
     }
 
@@ -115,13 +133,15 @@ impl Evidence {
     fn message(&self) -> &[u8] {
         match &self.form {
             Form::Cosign { payload, .. } => payload,
-            Form::Bundle { message, .. } => message,
+            Form::Bundle(dsse) | Form::Attestation(dsse) => &dsse.message,
         }
     }
 
     fn signature(&self) -> &[u8] {
         match &self.form {
-            Form::Cosign { signature, .. } | Form::Bundle { signature, .. } => signature,
+            Form::Cosign { signature, .. }
+            | Form::Bundle(Dsse { signature, .. })
+            | Form::Attestation(Dsse { signature, .. }) => signature,
         }
     }
 }
@@ -195,13 +215,29 @@ impl Trust {
     }
 
     /// This trust with SLSA provenance `claims` (ADR-031): it then admits
-    /// only SLSA v1 statements that meet them. Refused unless the predicate
-    /// list is exactly [`SLSA_PROVENANCE_V1_PREDICATE`]: a claim list next
-    /// to another predicate type could never be met by that type's
-    /// statements, and a cosign layer would carry none.
+    /// only SLSA statements that meet them, v1 and, when listed, v0.2 from
+    /// a cosign attestation (ADR-036). Refused unless the predicate list
+    /// holds [`SLSA_PROVENANCE_V1_PREDICATE`] or
+    /// [`SLSA_PROVENANCE_V02_PREDICATE`] or both, each once, and nothing
+    /// else: a claim list next to another predicate type could never be
+    /// met by that type's statements, and a cosign layer would carry none.
+    /// A list with v0.2 also needs a repository or material claim
+    /// (`ClaimsWithoutSource`): the v0.2 producer's identity is a builder
+    /// workflow every project shares, so a builder or ref claim alone
+    /// would accept any project's image.
     pub fn with_claims(self, claims: Claims) -> Result<Trust, ConfigError> {
-        if self.predicate_types != [SLSA_PROVENANCE_V1_PREDICATE] {
+        let types = &self.predicate_types;
+        let known =
+            |t: &String| t == SLSA_PROVENANCE_V1_PREDICATE || t == SLSA_PROVENANCE_V02_PREDICATE;
+        let repeated = types
+            .iter()
+            .enumerate()
+            .any(|(i, t)| types[..i].contains(t));
+        if types.is_empty() || !types.iter().all(known) || repeated {
             return Err(ConfigError::ClaimsPredicateTypes);
+        }
+        if types.iter().any(|t| t == SLSA_PROVENANCE_V02_PREDICATE) && !claims.names_source() {
+            return Err(ConfigError::ClaimsWithoutSource);
         }
         Ok(Trust {
             claims: Some(claims),
@@ -273,6 +309,9 @@ pub enum Accepted {
 /// Whether `evidence` signs the image digest `subject` (SHA-256) under
 /// `trust` (module doc).
 pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<Accepted, Refusal> {
+    if matches!(evidence.form, Form::Attestation(_)) && trust.claims.is_none() {
+        return Err(Refusal::AttestationNeedsClaims);
+    }
     match &evidence.form {
         Form::Cosign { digest, .. } => {
             if trust.claims.is_some() {
@@ -282,7 +321,7 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
                 return Err(Refusal::SubjectMismatch);
             }
         }
-        Form::Bundle { statement, .. } => {
+        Form::Bundle(Dsse { statement, .. }) | Form::Attestation(Dsse { statement, .. }) => {
             if !trust.predicate_types.contains(&statement.predicate_type) {
                 return Err(Refusal::PredicateType);
             }
@@ -303,8 +342,15 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
         None => None,
     };
     // Only a statement a trusted signer signed is read for its claims.
-    if let (Some(claims), Form::Bundle { payload, .. }) = (&trust.claims, &evidence.form) {
-        provenance::check(payload, claims, agreement.as_ref())?;
+    if let (Some(claims), Form::Bundle(dsse) | Form::Attestation(dsse)) =
+        (&trust.claims, &evidence.form)
+    {
+        provenance::check(
+            &dsse.payload,
+            &dsse.statement.predicate_type,
+            claims,
+            agreement.as_ref(),
+        )?;
     }
     Ok(accepted)
 }
@@ -358,13 +404,20 @@ fn keyless(
             },
             certificate,
         ),
-        Form::Bundle {
+        Form::Bundle(Dsse {
             payload,
             signature,
             certificate: Some(certificate),
             tlogs,
             ..
-        } => {
+        })
+        | Form::Attestation(Dsse {
+            payload,
+            signature,
+            certificate: Some(certificate),
+            tlogs,
+            ..
+        }) => {
             let [entry] = tlogs.as_slice() else {
                 return Err(Refusal::TlogEntries);
             };

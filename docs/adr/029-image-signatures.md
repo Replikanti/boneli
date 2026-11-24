@@ -586,6 +586,8 @@ the digest binds the bytes and mirrors are legitimate.
     #33), registry allowlist presets for GHCR and `cgr.dev`, re-checking
     handles in `layers()` and `config()` after a policy change, signing,
     and private registries (#55) are out of scope (recorded here only).
+    ADR-036 reads cosign `.att` attestations with SLSA v0.2 provenance
+    under rules with claims.
 
 ## Alternatives considered
 

@@ -1061,6 +1061,35 @@ pub fn keyed_layer(key: &Key, payload: &[u8]) -> Vec<(String, String)> {
     )]
 }
 
+/// A keyed DSSE envelope as cosign's `.att` layer holds it: `key` signs
+/// the PAE of `statement`, `keyid` empty.
+pub fn keyed_envelope(key: &Key, statement: &[u8]) -> Value {
+    let signature = key.sign(&pae(IN_TOTO_PAYLOAD_TYPE.as_bytes(), statement));
+    obj(vec![
+        ("payload", s(&base64::encode(statement))),
+        ("payloadType", s(IN_TOTO_PAYLOAD_TYPE)),
+        (
+            "signatures",
+            Value::Array(vec![obj(vec![
+                ("keyid", s("")),
+                ("sig", s(&base64::encode(&signature))),
+            ])]),
+        ),
+    ])
+}
+
+/// The annotations of a keyed `.att` layer as cosign writes them: an
+/// empty signature annotation and the predicate type.
+pub fn keyed_attestation_annotations(predicate_type: &str) -> Vec<(String, String)> {
+    vec![
+        (SIGNATURE_ANNOTATION.to_owned(), String::new()),
+        (
+            boneli_sigstore::PREDICATE_TYPE_ANNOTATION.to_owned(),
+            predicate_type.to_owned(),
+        ),
+    ]
+}
+
 // ---- Trusts -----------------------------------------------------------
 
 pub fn trusted_root(value: &Value) -> std::sync::Arc<boneli_sigstore::TrustedRoot> {

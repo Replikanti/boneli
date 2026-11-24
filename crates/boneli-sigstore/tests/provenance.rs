@@ -1183,7 +1183,7 @@ fn claim_refusal_texts() {
         ),
         (
             ConfigError::ClaimsPredicateTypes,
-            "a trust with claims must list exactly the SLSA provenance v1 predicate type",
+            "a trust with claims must list SLSA provenance v1 or v0.2, each at most once, and nothing else",
         ),
     ];
     for (error, text) in config {

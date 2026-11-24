@@ -27,7 +27,7 @@ use boneli_json::Value;
 use crate::dsse::{self, IN_TOTO_PAYLOAD_TYPE};
 use crate::error::Refusal;
 use crate::rekor::TlogEntry;
-use crate::verify::{Evidence, Form};
+use crate::verify::{Dsse, Evidence, Form};
 use crate::{MAX_BUNDLE_BYTES, json};
 
 /// The one bundle media type accepted.
@@ -84,16 +84,16 @@ impl Evidence {
             return Err(Refusal::DsseShape);
         };
         let signature = json::base64(one, "sig").ok_or(Refusal::MalformedSignature)?;
-        let statement = dsse::statement(&payload)?;
+        let statement = dsse::statement(&payload, &[dsse::STATEMENT_V1])?;
         Ok(Evidence {
-            form: Form::Bundle {
+            form: Form::Bundle(Dsse {
                 message: dsse::pae(payload_type.as_bytes(), &payload),
                 payload,
                 signature,
                 certificate,
                 statement,
                 tlogs,
-            },
+            }),
         })
     }
 }

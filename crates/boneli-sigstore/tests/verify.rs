@@ -679,7 +679,7 @@ fn refusal_texts() {
         ),
         (
             Refusal::StatementType,
-            "the payload is not an in-toto statement v1",
+            "the payload is not an in-toto statement of an accepted type",
         ),
         (Refusal::PredicateType, "the predicate type is not trusted"),
         (

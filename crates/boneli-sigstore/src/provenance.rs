@@ -1,10 +1,13 @@
-//! SLSA provenance v1 claims (ADR-031): what a `Required` rule may ask of
-//! a signed SLSA v1 statement beyond its predicate type.
+//! SLSA provenance claims (ADR-031, ADR-036): what a `Required` rule may
+//! ask of a signed SLSA statement beyond its predicate type.
 //!
 //! [`check`] runs only after [`verify`](crate::verify) has accepted the
 //! statement's predicate type, its subject and its signature, so it never
 //! reads a predicate nobody trusted signed. It reads the DSSE payload
-//! again under the limits it already passed and checks, in this order:
+//! again under the limits it already passed, with the reader of its
+//! predicate type: SLSA v0.2 goes to [`v02`] (ADR-036), and every other
+//! type to the v1 reader below, since v1 is the only other type a trust
+//! with claims admits. The v1 reader checks, in this order:
 //!
 //! 1. **The generic SLSA v1 shape.** `predicate`, `buildDefinition`,
 //!    `buildType`, `externalParameters`, `runDetails`, `builder` and
@@ -29,6 +32,10 @@
 //! 5. **The claims:** builder, repository, ref, then the materials in rule
 //!    order; the first that fails is the refusal.
 //!
+//! Both readers give the same three things (builder ID, source repository
+//! and optional ref, dependencies), and one claim matcher decides; a ref
+//! claim against a statement whose source names no ref is not met.
+//!
 //! Matching is byte for byte after JSON unescaping, with no normalization:
 //! `.git`, `http://`, other case and trailing whitespace never match. A
 //! [`ClaimMatch::Prefix`] ends in `/`, and what follows it must be a
@@ -42,7 +49,12 @@ use boneli_json::{Object, Value};
 use crate::error::{ConfigError, Refusal};
 use crate::fulcio::{Agreement, CertificateRefusal, Extension};
 use crate::identity::printable;
+use crate::verify::SLSA_PROVENANCE_V02_PREDICATE;
 use crate::{MAX_BUNDLE_BYTES, json};
+
+mod v02;
+
+pub use v02::SLSA_GITHUB_GENERATOR_CONTAINER_BUILD_TYPE;
 
 /// The build type of GitHub's artifact attestations
 /// (`actions/buildtypes`, `workflow/v1`).
@@ -126,6 +138,13 @@ impl Claims {
             materials,
         })
     }
+
+    /// Whether a source repository or a material claim is set: what binds
+    /// a statement to one project when the signer's identity does not
+    /// (ADR-036, `ClaimsWithoutSource`).
+    pub(crate) fn names_source(&self) -> bool {
+        self.repository.is_some() || !self.materials.is_empty()
+    }
 }
 
 /// A repository or ref rule's text is non-empty printable ASCII without
@@ -146,7 +165,8 @@ pub(crate) fn check_match(rule: &ClaimMatch) -> Result<(), ConfigError> {
 /// Which claim a statement failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimRefusal {
-    /// `runDetails.builder.id` is not the rule's.
+    /// The builder ID (`runDetails.builder.id` in v1, `builder.id` in
+    /// v0.2) is not the rule's.
     BuilderId,
     /// The source repository does not meet the rule.
     SourceRepository,
@@ -192,23 +212,36 @@ struct Dependency<'a> {
 /// What the reader takes from a statement.
 struct Provenance<'a> {
     builder_id: &'a str,
-    /// `workflow.repository` and `workflow.ref` of GitHub's build type;
-    /// `None` for any other build type.
-    source: Option<(&'a str, &'a str)>,
+    /// The source repository and its ref, where the build type says where
+    /// they sit: `workflow.repository` and `workflow.ref` of GitHub's
+    /// build type (the ref always set), the two parts of the container
+    /// generator's `configSource.uri` (ADR-036); `None` for any other
+    /// build type.
+    source: Option<(&'a str, Option<&'a str>)>,
     dependencies: Vec<Dependency<'a>>,
 }
 
-/// Whether the signed statement `payload` meets `claims` (module doc),
-/// after it agrees with the certificate's `agreement` if one is given
-/// (ADR-034).
+/// Whether the signed statement `payload`, of `predicate_type`, meets
+/// `claims` (module doc), after it agrees with the certificate's
+/// `agreement` if one is given (ADR-034).
 pub(crate) fn check(
     payload: &[u8],
+    predicate_type: &str,
     claims: &Claims,
     agreement: Option<&Agreement<'_>>,
 ) -> Result<(), Refusal> {
     let statement = json::parse(payload, MAX_BUNDLE_BYTES).ok_or(Refusal::MalformedProvenance)?;
-    let provenance = read(&statement)?;
+    let v02 = predicate_type == SLSA_PROVENANCE_V02_PREDICATE;
+    let provenance = if v02 {
+        v02::read(&statement)?
+    } else {
+        read(&statement)?
+    };
     let source = match provenance.source {
+        // The agreement is defined for GitHub's build type only (ADR-034,
+        // item 5): the container generator's v0.2 fields have no reading
+        // against Fulcio's yet (ADR-036, known limits).
+        Some(_) if v02 && agreement.is_some() => return Err(Refusal::UnknownBuildType),
         Some(source) => Some(source),
         None if agreement.is_some() || claims.repository.is_some() || claims.git_ref.is_some() => {
             return Err(Refusal::UnknownBuildType);
@@ -231,7 +264,7 @@ pub(crate) fn check(
         return Err(Refusal::Claim(ClaimRefusal::SourceRepository));
     }
     if let (Some(rule), Some((_, git_ref))) = (&claims.git_ref, source)
-        && !meets(rule, git_ref)
+        && !git_ref.is_some_and(|r| meets(rule, r))
     {
         return Err(Refusal::Claim(ClaimRefusal::SourceRef));
     }
@@ -263,7 +296,7 @@ pub(crate) fn check(
 /// `git+<1.12>@<1.14>`, every one of them with the `gitCommit` 1.13.
 fn agrees(
     provenance: &Provenance<'_>,
-    (repository, git_ref): (&str, &str),
+    (repository, git_ref): (&str, Option<&str>),
     agreement: &Agreement<'_>,
 ) -> Result<(), Refusal> {
     let disagrees = |ext| Refusal::CertificateClaim(CertificateRefusal::StatementDisagrees(ext));
@@ -273,7 +306,7 @@ fn agrees(
     if repository != agreement.repository {
         return Err(disagrees(Extension::SourceRepositoryUri));
     }
-    if git_ref != agreement.git_ref {
+    if git_ref != Some(agreement.git_ref) {
         return Err(disagrees(Extension::SourceRepositoryRef));
     }
     let uri = format!("git+{}@{}", agreement.repository, agreement.git_ref);
@@ -318,7 +351,8 @@ fn read(statement: &Value) -> Result<Provenance<'_>, Refusal> {
             .ok_or(MALFORMED)?,
     };
     let source = if build_type == GITHUB_WORKFLOW_BUILD_TYPE {
-        Some(github_source(external)?)
+        let (repository, git_ref) = github_source(external)?;
+        Some((repository, Some(git_ref)))
     } else {
         None
     };
@@ -398,6 +432,7 @@ fn under(value: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ClaimMatch, Claims, Material, check, under};
+    use crate::SLSA_PROVENANCE_V1_PREDICATE;
 
     /// The runner's real statement, from its bundle.
     fn runner_statement() -> Vec<u8> {
@@ -437,9 +472,13 @@ mod tests {
     fn truncated_statements_never_panic() {
         let statement = runner_statement();
         let claims = runner_claims();
-        assert_eq!(check(&statement, &claims, None), Ok(()));
+        let v1 = SLSA_PROVENANCE_V1_PREDICATE;
+        assert_eq!(check(&statement, v1, &claims, None), Ok(()));
         for n in 0..statement.len() {
-            assert!(check(&statement[..n], &claims, None).is_err(), "prefix {n}");
+            assert!(
+                check(&statement[..n], v1, &claims, None).is_err(),
+                "prefix {n}"
+            );
         }
     }
 

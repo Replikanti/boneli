@@ -8,14 +8,20 @@ name: oci-acceptance
 # before any layer request. And of ADR-031 (#104): pull jq 1.8.2 from GHCR
 # under a `Required` rule with SLSA provenance claims, and refuse it under
 # another source repository before any layer is committed
-# (`provenance_claims_on_ghcr`, 12 GHCR manifest, tag and referrers
-# requests per architecture per run: 5 for the pull that passes, 7 for
-# the one refused, counted from the test's code path). And of ADR-034
-# (#113): pull jq 1.8.2 under Fulcio certificate claims with the
-# statement agreement, and refuse it under another build trigger
-# (`certificate_claims_on_ghcr`, 12 more GHCR requests per architecture
-# per run, the same 5 and 7: the rule has provenance claims too, so the
-# code path is `provenance_claims_on_ghcr`'s). And of ADR-032
+# (`provenance_claims_on_ghcr`, 14 GHCR manifest, tag and referrers
+# requests per architecture per run: 5 for the pull that passes, 9 for
+# the one refused, 2 of them the `.att` tags ADR-036 adds under claims
+# when the referrers find nothing; counted from the test's code path).
+# And of ADR-034 (#113): pull jq 1.8.2 under Fulcio certificate claims
+# with the statement agreement, and refuse it under another build trigger
+# (`certificate_claims_on_ghcr`, 14 more GHCR requests per architecture
+# per run, the same 5 and 9: the rule has provenance claims too, so the
+# code path is `provenance_claims_on_ghcr`'s). And of ADR-036 (#114):
+# pull flux-cli v2.4.0 from GHCR under a rule with SLSA v0.2 claims, its
+# cosign `.att` from slsa-github-generator, and refuse it under another
+# source repository (`provenance_v02_on_ghcr`, 13 GHCR manifest, tag and
+# referrers requests per architecture per run: 5 for the pull that
+# passes, 8 for the one refused). And of ADR-032
 # (#105): node:22 and postgres:17 pull as references the agent chose under
 # the documented exemption docker.io + library/, and the agent's node:22
 # with no exemption is refused with no connection, so the Docker Hub

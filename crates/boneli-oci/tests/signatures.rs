@@ -21,8 +21,10 @@ use boneli_oci::{
 };
 use boneli_sigstore::{
     BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, CertificateClaims, ClaimMatch, Claims,
-    IN_TOTO_PAYLOAD_TYPE, Identity, Material, SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE,
-    SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot, base64, pae,
+    DSSE_ENVELOPE_MEDIA_TYPE, IN_TOTO_PAYLOAD_TYPE, Identity, Material, PREDICATE_TYPE_ANNOTATION,
+    SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE, SLSA_GITHUB_GENERATOR_CONTAINER_BUILD_TYPE,
+    SLSA_PROVENANCE_V1_PREDICATE, SLSA_PROVENANCE_V02_PREDICATE, SanRule, Trust, TrustedRoot,
+    base64, pae,
 };
 
 use support::TempDir;
@@ -3594,4 +3596,933 @@ fn agent_required_rule_most_specific_of_its_registry() {
         exempted_scope(policy.decide("docker.io", &repo(REPO), ImageOrigin::Agent)).as_deref(),
         Some("docker.io library/")
     );
+}
+
+// ---------------------------------------------------------------------
+// SLSA provenance v0.2 in cosign `.att` (ADR-036)
+// ---------------------------------------------------------------------
+
+const FLUX_REPO: &str = "fluxcd/flux-cli";
+const FLUX_INDEX: &[u8] = include_bytes!("data/flux.index.json");
+const FLUX_AMD64: &[u8] = include_bytes!("data/flux.amd64.json");
+const FLUX_CONFIG: &[u8] = include_bytes!("data/flux.amd64-config.json");
+const FLUX_ATT: &[u8] = include_bytes!("data/flux.att.json");
+const FLUX_ENVELOPE: &[u8] = include_bytes!("data/flux.envelope.json");
+const GENERATOR: &str = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.0.0";
+const FLUX_SOURCE: &str = "https://github.com/fluxcd/flux2";
+const FLUX_MATERIAL: &str = "git+https://github.com/fluxcd/flux2@refs/tags/v2.4.0";
+const FLUX_COMMIT: &str = "5350425cdcd5fa015337e09fa502153c0275bd4b";
+const ACME_COMMIT: &str = "8cfa1049f86781d141056082d73802d56cd2b433";
+
+/// flux-cli v2.4.0's real index (a Docker manifest list), amd64 manifest
+/// and config, and its `.att` manifest and envelope (captured
+/// 2026-11-24). No referrers and no layer blob: those requests are
+/// answered `404`.
+fn flux_hub() -> Hub {
+    let mut hub = Hub::default();
+    hub.document(FLUX_REPO, media::DOCKER_LIST, FLUX_INDEX);
+    hub.document(FLUX_REPO, media::DOCKER_MANIFEST, FLUX_AMD64);
+    hub.blob(FLUX_REPO, FLUX_CONFIG);
+    hub.blob(FLUX_REPO, FLUX_ENVELOPE);
+    hub.tag(
+        FLUX_REPO,
+        &format!("{}.att", tag_of(&digest_of(FLUX_INDEX))),
+        media::MANIFEST,
+        FLUX_ATT,
+    );
+    hub
+}
+
+/// The generator's keyless trust over the public-good root, v0.2 only,
+/// with the claims of the plan and `repository` as the source-repository
+/// claim.
+fn flux_trust(repository: &str) -> Arc<Trust> {
+    let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+    let identity = Identity::new(GITHUB_ACTIONS, SanRule::Uri(GENERATOR.to_owned())).expect("id");
+    let claims = Claims::new(
+        Some(GENERATOR),
+        Some(ClaimMatch::Exact(repository.to_owned())),
+        Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+        vec![Material::new(FLUX_MATERIAL, "sha1", FLUX_COMMIT).expect("material")],
+    )
+    .expect("claims");
+    Arc::new(
+        Trust::new(
+            Vec::new(),
+            Some((root, vec![identity])),
+            vec![SLSA_PROVENANCE_V02_PREDICATE.to_owned()],
+        )
+        .expect("trust")
+        .with_claims(claims)
+        .expect("with claims"),
+    )
+}
+
+/// A container-generator SLSA v0.2 statement (Statement v0.1) over
+/// `subject` whose source repository is `repository`.
+fn v02_statement(subject: &str, repository: &str) -> Vec<u8> {
+    let uri = format!("git+{repository}@refs/tags/v1.0.0");
+    format!(
+        r#"{{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"{SLSA_PROVENANCE_V02_PREDICATE}","subject":[{{"name":"index.docker.io/{REPO}","digest":{{"sha256":"{}"}}}}],"predicate":{{"builder":{{"id":"{GENERATOR}"}},"buildType":"{SLSA_GITHUB_GENERATOR_CONTAINER_BUILD_TYPE}","invocation":{{"configSource":{{"uri":"{uri}","digest":{{"sha1":"{ACME_COMMIT}"}},"entryPoint":".github/workflows/release.yml"}},"parameters":{{}},"environment":{{}}}},"metadata":{{}},"materials":[{{"uri":"{uri}","digest":{{"sha1":"{ACME_COMMIT}"}}}}]}}}}"#,
+        subject.trim_start_matches("sha256:")
+    )
+    .into_bytes()
+}
+
+/// A keyed DSSE envelope by `signer` over `statement`, as an `.att` layer
+/// holds it.
+fn envelope(signer: &Signer, statement: &[u8]) -> Vec<u8> {
+    let sig = signer.sign(&pae(IN_TOTO_PAYLOAD_TYPE.as_bytes(), statement));
+    format!(
+        r#"{{"payload":"{}","payloadType":"{IN_TOTO_PAYLOAD_TYPE}","signatures":[{{"keyid":"","sig":"{sig}"}}]}}"#,
+        base64::encode(statement)
+    )
+    .into_bytes()
+}
+
+/// An `.att` layer descriptor for `envelope` (added to the hub) with this
+/// media type, predicate annotation and descriptor size.
+fn att_layer_with(
+    hub: &mut Hub,
+    envelope: &[u8],
+    media_type: &str,
+    predicate: &str,
+    size: usize,
+) -> String {
+    let digest = hub.blob(REPO, envelope);
+    format!(
+        r#"{{"mediaType":"{media_type}","digest":"{digest}","size":{size},"annotations":{{"{SIGNATURE_ANNOTATION}":"","{PREDICATE_TYPE_ANNOTATION}":"{predicate}"}}}}"#
+    )
+}
+
+/// An `.att` layer by `signer` over a v0.2 statement for `over` whose
+/// source is `repository`.
+fn att_layer(hub: &mut Hub, signer: &Signer, over: &str, repository: &str) -> String {
+    let e = envelope(signer, &v02_statement(over, repository));
+    let size = e.len();
+    att_layer_with(
+        hub,
+        &e,
+        DSSE_ENVELOPE_MEDIA_TYPE,
+        SLSA_PROVENANCE_V02_PREDICATE,
+        size,
+    )
+}
+
+/// Tags `layers` as the `.att` of `subject`.
+fn attest(hub: &mut Hub, subject: &str, layers: &[String]) -> String {
+    let tag = format!("{}.att", tag_of(subject));
+    hub.tag(REPO, &tag, media::MANIFEST, &sig_manifest(layers))
+}
+
+/// The test signer's key, SLSA v0.2 only, with an exact source-repository
+/// claim of `repository`; without claims if `None`.
+fn v02_keyed(repository: Option<&str>) -> Arc<Trust> {
+    let trust = Trust::new(
+        vec![PublicKey::from_pem(SIGNER_PUB).expect("key")],
+        None,
+        vec![SLSA_PROVENANCE_V02_PREDICATE.to_owned()],
+    )
+    .expect("trust");
+    Arc::new(match repository {
+        None => trust,
+        Some(repository) => trust
+            .with_claims(
+                Claims::new(
+                    None,
+                    Some(ClaimMatch::Exact(repository.to_owned())),
+                    None,
+                    vec![],
+                )
+                .expect("claims"),
+            )
+            .expect("with claims"),
+    })
+}
+
+fn v02_policy() -> SignaturePolicy {
+    required(v02_keyed(Some(ACME_SOURCE)))
+}
+
+/// Whether the fake saw a request for an `.att` tag.
+fn att_requested(fake: &Fake) -> bool {
+    fake.seen().iter().any(|s| s.target.ends_with(".att"))
+}
+
+/// The authorized requests for signature evidence and `blobs` in order.
+fn evidence_requests(fake: &Fake, blobs: &[&str]) -> Vec<String> {
+    targets(&fake.seen())
+        .into_iter()
+        .filter(|t| {
+            t.contains("/referrers/")
+                || t.contains("sha256-")
+                || blobs.iter().any(|b| t.ends_with(&format!("/blobs/{b}")))
+        })
+        .collect()
+}
+
+/// flux-cli's real `.att` through the fake registry: with the plan's
+/// claims the pull goes on to its first layer (answered `404`); with
+/// another source repository it is refused before any layer request, the
+/// detail names `.att` and the claim. Neither asks for a `.sig`.
+#[test]
+fn real_attestation_through_att_tag() {
+    let index = digest_of(FLUX_INDEX);
+    let compact: String = std::str::from_utf8(FLUX_AMD64)
+        .expect("utf-8")
+        .split_whitespace()
+        .collect();
+    let first_layer = nth_digest(compact.as_bytes(), 1);
+    let att = digest_of(FLUX_ATT);
+    for (repository, passes) in [
+        (FLUX_SOURCE, true),
+        ("https://github.com/fluxcd/other", false),
+    ] {
+        let fake = hub_fake(flux_hub());
+        let tmp = TempDir::new("flux");
+        let store = open_with(
+            &tmp.path().join("store"),
+            &fake,
+            required(flux_trust(repository)),
+        );
+        let detail = match store.pull(&image_ref(FLUX_REPO, &index)) {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        let reached = targets(&fake.seen())
+            .iter()
+            .any(|t| t.ends_with(&format!("/blobs/{first_layer}")));
+        assert_eq!(reached, passes, "{detail}");
+        assert!(!sig_requested(&fake), "{:?}", targets(&fake.seen()));
+        assert!(att_requested(&fake));
+        if passes {
+            assert!(!detail.contains("signature policy"), "{detail}");
+        } else {
+            assert!(detail.starts_with("signature policy: "), "{detail}");
+            assert!(
+                detail.contains(&format!(
+                    "{index}: .att {att}: 1 listed, 1 candidates (layer 0: the provenance's source repository does not meet the rule)"
+                )),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// An image whose only evidence is a keyed `.att` passes under a claims
+/// rule, after exactly the referrers request, the referrers tag, the
+/// `.att` tag and the envelope.
+#[test]
+fn att_only_image_passes_under_claims() {
+    let (mut hub, pushed) = app_hub();
+    let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    let envelope_digest = nth_digest(layer.as_bytes(), 0);
+    attest(&mut hub, &pushed.index, &[layer]);
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    passed(result, &pushed);
+    let tag = tag_of(&pushed.index);
+    assert_eq!(
+        evidence_requests(&fake, &[&envelope_digest]),
+        [
+            format!("/v2/{REPO}/referrers/{}", pushed.index),
+            format!("/v2/{REPO}/manifests/{tag}"),
+            format!("/v2/{REPO}/manifests/{tag}.att"),
+            format!("/v2/{REPO}/blobs/{envelope_digest}"),
+        ]
+    );
+    assert!(!sig_requested(&fake));
+}
+
+/// Under rules without claims, an image with `.att`, `.sig` and referrers
+/// never has its `.att` asked for: the request log equals the one without
+/// the `.att` tag byte for byte, whether the pull passes or is refused,
+/// and no detail names `.att`.
+#[test]
+fn att_requested_only_under_claims() {
+    for (trust, passes) in [(keyed(&[SIGNER_PUB]), true), (keyed(&[OTHER_PUB]), false)] {
+        let mut logs = Vec::new();
+        for with_att in [true, false] {
+            let (mut hub, pushed) = app_hub();
+            sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+            sign(&mut hub, "bundle", &signer(), &pushed.index, &pushed.index);
+            if with_att {
+                let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+                attest(&mut hub, &pushed.index, &[layer]);
+            }
+            let fake = hub_fake(hub);
+            let (tmp, result) = pull_once(&fake, required(Arc::clone(&trust)), &pushed.index);
+            if passes {
+                passed(result, &pushed);
+            } else {
+                let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+                assert!(!detail.contains(".att"), "{detail}");
+            }
+            assert!(!att_requested(&fake));
+            logs.push(request_log(&fake.seen()));
+        }
+        assert_eq!(logs[0], logs[1]);
+    }
+}
+
+/// Under claims, a v1 referrer that passes ends the check: no `.att`
+/// request, with the v1 list and with `[v1, v0.2]` alike.
+#[test]
+fn claims_bundle_pass_requests_unchanged() {
+    let both = || {
+        Arc::new(
+            Trust::new(
+                vec![PublicKey::from_pem(SIGNER_PUB).expect("key")],
+                None,
+                vec![
+                    SLSA_PROVENANCE_V1_PREDICATE.to_owned(),
+                    SLSA_PROVENANCE_V02_PREDICATE.to_owned(),
+                ],
+            )
+            .expect("trust")
+            .with_claims(
+                Claims::new(
+                    None,
+                    Some(ClaimMatch::Exact(ACME_SOURCE.to_owned())),
+                    None,
+                    vec![],
+                )
+                .expect("claims"),
+            )
+            .expect("with claims"),
+        )
+    };
+    for trust in [slsa_keyed(Some(ACME_SOURCE)), both()] {
+        let (mut hub, pushed) = app_hub();
+        let entry = slsa_referrer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+        list(&mut hub, &pushed.index, &[entry]);
+        let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+        attest(&mut hub, &pushed.index, &[layer]);
+        let fake = hub_fake(hub);
+        let (_tmp, result) = pull_once(&fake, required(trust), &pushed.index);
+        passed(result, &pushed);
+        assert!(!att_requested(&fake), "{:?}", targets(&fake.seen()));
+    }
+}
+
+/// The `.att` layer cap is inclusive: 0 layers are refused with no
+/// candidate; 16 with the valid one last pass after fetching all 16; 17
+/// fetch none and say why.
+#[test]
+fn att_cap_inclusive() {
+    let (mut hub, pushed) = app_hub();
+    attest(&mut hub, &pushed.index, &[]);
+    let fake = hub_fake(hub);
+    let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+    let att = digest_of(&sig_manifest(&[]));
+    assert!(
+        detail.contains(&format!(
+            "{}: .att {att}: 0 listed, 0 candidates",
+            pushed.index
+        )),
+        "{detail}"
+    );
+    for listed in [16, 17] {
+        let (mut hub, pushed) = app_hub();
+        // Distinct statements, so each layer is its own envelope.
+        let mut layers: Vec<String> = (0..listed - 1)
+            .map(|i| {
+                att_layer(
+                    &mut hub,
+                    &other(),
+                    &pushed.index,
+                    &format!("{ACME_SOURCE}{i}"),
+                )
+            })
+            .collect();
+        layers.push(att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE));
+        let digests: Vec<String> = layers.iter().map(|l| nth_digest(l.as_bytes(), 0)).collect();
+        attest(&mut hub, &pushed.index, &layers);
+        let fake = hub_fake(hub);
+        let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+        let fetched = digests
+            .iter()
+            .filter(|d| {
+                targets(&fake.seen())
+                    .iter()
+                    .any(|t| t.ends_with(d.as_str()))
+            })
+            .count();
+        if listed == 16 {
+            passed(result, &pushed);
+            assert_eq!(fetched, 16);
+        } else {
+            let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+            assert!(detail.contains(".att sha256:"), "{detail}");
+            assert!(detail.contains("17 layers, more than 16"), "{detail}");
+            assert_eq!(fetched, 0);
+        }
+    }
+}
+
+/// A layer is a candidate only with exactly the DSSE media type and a
+/// predicate annotation exactly on the trust's list: look-alikes are never
+/// fetched.
+#[test]
+fn att_layer_filter_exact() {
+    let (mut hub, pushed) = app_hub();
+    let e = envelope(&signer(), &v02_statement(&pushed.index, ACME_SOURCE));
+    let mut layers = Vec::new();
+    for predicate in [
+        "https://slsa.dev/provenance/v0.2 ",
+        "https://slsa.dev/provenance/V0.2",
+        "https://slsa.dev/provenance/v0.2/",
+        "https://\u{455}lsa.dev/provenance/v0.2",
+        "https://slsa.dev/provenance/v0.2\u{200d}",
+        SLSA_PROVENANCE_V1_PREDICATE,
+    ] {
+        // Each look-alike over its own copy of the envelope, so a fetch
+        // would be seen per layer.
+        let mut copy = e.clone();
+        copy.extend(std::iter::repeat_n(b' ', layers.len() + 1));
+        let size = copy.len();
+        layers.push(att_layer_with(
+            &mut hub,
+            &copy,
+            DSSE_ENVELOPE_MEDIA_TYPE,
+            predicate,
+            size,
+        ));
+    }
+    for media_type in [
+        "application/vnd.dsse.envelope.v1+json; charset=utf-8",
+        "application/vnd.dsse.envelope.v2+json",
+        "application/vnd.in-toto+json",
+    ] {
+        let mut copy = e.clone();
+        copy.extend(std::iter::repeat_n(b' ', layers.len() + 1));
+        let size = copy.len();
+        layers.push(att_layer_with(
+            &mut hub,
+            &copy,
+            media_type,
+            SLSA_PROVENANCE_V02_PREDICATE,
+            size,
+        ));
+    }
+    let digests: Vec<String> = layers.iter().map(|l| nth_digest(l.as_bytes(), 0)).collect();
+    let listed = layers.len();
+    attest(&mut hub, &pushed.index, &layers);
+    let fake = hub_fake(hub);
+    let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+    assert!(
+        detail.contains(&format!("{listed} listed, 0 candidates")),
+        "{detail}"
+    );
+    for d in digests {
+        assert!(
+            !targets(&fake.seen()).iter().any(|t| t.ends_with(&d)),
+            "fetched {d}"
+        );
+    }
+}
+
+/// An envelope whose descriptor says 4,194,304 bytes is requested; one
+/// byte more is refused before the request.
+#[test]
+fn att_envelope_cap_before_fetch() {
+    for (size, requested) in [(4_194_304, true), (4_194_305, false)] {
+        let (mut hub, pushed) = app_hub();
+        let e = envelope(&signer(), &v02_statement(&pushed.index, ACME_SOURCE));
+        let layer = att_layer_with(
+            &mut hub,
+            &e,
+            DSSE_ENVELOPE_MEDIA_TYPE,
+            SLSA_PROVENANCE_V02_PREDICATE,
+            size,
+        );
+        let d = nth_digest(layer.as_bytes(), 0);
+        attest(&mut hub, &pushed.index, &[layer]);
+        let fake = hub_fake(hub);
+        let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        let seen = targets(&fake.seen()).iter().any(|t| t.ends_with(&d));
+        assert_eq!(seen, requested, "{size}: {detail}");
+        if !requested {
+            assert!(
+                detail.contains("more than the limit of 4194304"),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// The valid layer first or last of 16 passes; with two valid layers the
+/// first passes and the second is never fetched.
+#[test]
+fn att_valid_at_head_and_tail() {
+    for at in [0, 15] {
+        let (mut hub, pushed) = app_hub();
+        let layers: Vec<String> = (0..16)
+            .map(|i| {
+                let by = if i == at { signer() } else { other() };
+                att_layer(&mut hub, &by, &pushed.index, ACME_SOURCE)
+            })
+            .collect();
+        attest(&mut hub, &pushed.index, &layers);
+        let fake = hub_fake(hub);
+        let (_tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+        passed(result, &pushed);
+    }
+    let (mut hub, pushed) = app_hub();
+    let first = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    // Another valid statement: another repository-matching envelope.
+    let e = envelope(
+        &signer(),
+        &v02_statement(&pushed.index, ACME_SOURCE)
+            .into_iter()
+            .chain(*b" ")
+            .collect::<Vec<u8>>(),
+    );
+    let size = e.len();
+    let second = att_layer_with(
+        &mut hub,
+        &e,
+        DSSE_ENVELOPE_MEDIA_TYPE,
+        SLSA_PROVENANCE_V02_PREDICATE,
+        size,
+    );
+    let second_digest = nth_digest(second.as_bytes(), 0);
+    assert_ne!(nth_digest(first.as_bytes(), 0), second_digest);
+    attest(&mut hub, &pushed.index, &[first, second]);
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    passed(result, &pushed);
+    assert!(
+        !targets(&fake.seen())
+            .iter()
+            .any(|t| t.ends_with(&second_digest))
+    );
+}
+
+/// The same envelope in two layers is fetched once and both are counted
+/// and verified.
+#[test]
+fn att_duplicate_layers_fetched_once() {
+    let (mut hub, pushed) = app_hub();
+    let bad = att_layer(&mut hub, &other(), &pushed.index, ACME_SOURCE);
+    let d = nth_digest(bad.as_bytes(), 0);
+    attest(&mut hub, &pushed.index, &[bad.clone(), bad]);
+    let fake = hub_fake(hub);
+    let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+    assert!(
+        detail.contains("2 listed, 2 candidates (layer 0: no trusted key verifies the signature, layer 1: no trusted key verifies the signature)"),
+        "{detail}"
+    );
+    let fetched = targets(&fake.seen())
+        .iter()
+        .filter(|t| t.ends_with(&d))
+        .count();
+    assert_eq!(fetched, 1);
+}
+
+/// An `.att` on the platform manifest only passes on the second subject,
+/// after the index's three carriers.
+#[test]
+fn att_on_platform_manifest_passes() {
+    let (mut hub, pushed) = app_hub();
+    let layer = att_layer(&mut hub, &signer(), &pushed.manifest, ACME_SOURCE);
+    let d = nth_digest(layer.as_bytes(), 0);
+    let tag = format!("{}.att", tag_of(&pushed.manifest));
+    hub.tag(REPO, &tag, media::MANIFEST, &sig_manifest(&[layer]));
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+    passed(result, &pushed);
+    let (index, manifest) = (tag_of(&pushed.index), tag_of(&pushed.manifest));
+    assert_eq!(
+        evidence_requests(&fake, &[&d]),
+        [
+            format!("/v2/{REPO}/referrers/{}", pushed.index),
+            format!("/v2/{REPO}/manifests/{index}"),
+            format!("/v2/{REPO}/manifests/{index}.att"),
+            format!("/v2/{REPO}/referrers/{}", pushed.manifest),
+            format!("/v2/{REPO}/manifests/{manifest}"),
+            format!("/v2/{REPO}/manifests/{manifest}.att"),
+            format!("/v2/{REPO}/blobs/{d}"),
+        ]
+    );
+}
+
+/// `.att` discovery errors never pass: a status, a deadline, a malformed
+/// manifest, an index answered for the tag; each is noted and nothing is
+/// fetched. A store that cannot keep the `.att` manifest fails the pull.
+#[test]
+fn att_discovery_errors_fail_closed() {
+    let (mut hub, pushed) = app_hub();
+    let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    let d = nth_digest(layer.as_bytes(), 0);
+    attest(&mut hub, &pushed.index, &[layer]);
+    let att = format!("{}.att", tag_of(&pushed.index));
+    let index_doc = hub.manifests[REPO][&pushed.index].1.clone();
+    let breakers: [(&str, Breaker); 4] = [
+        ("500", |_| Some(Reply::status(500))),
+        ("deadline", |_| {
+            Some(Reply::Trickle {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".to_vec(),
+                chunks: vec![b"x".to_vec(); 4],
+                delay: Duration::from_millis(800),
+            })
+        }),
+        ("malformed", |_| {
+            Some(Reply::http(
+                200,
+                &[("Content-Type", media::MANIFEST)],
+                br#"{"schemaVersion":2,"layers":7}"#,
+            ))
+        }),
+        ("401 after authorization", |s| {
+            s.header("authorization")
+                .map(|_| Reply::http(401, &[("WWW-Authenticate", &challenge_for(REPO))], b""))
+        }),
+    ];
+    for (name, breaker) in breakers {
+        let base = hub.clone();
+        let broken = att.clone();
+        let fake =
+            Fake::new(
+                move |s| match s.target.ends_with(&broken).then(|| breaker(s)).flatten() {
+                    Some(reply) => reply,
+                    None => base.handle(s),
+                },
+            );
+        let mut config = config_with(&fake, v02_policy());
+        config.timeouts =
+            Timeouts::new(Duration::from_secs(5), Duration::from_secs(1), 1 << 30).expect("t");
+        let tmp = TempDir::new("att-errors");
+        let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+        let result = store
+            .pull(&image_ref(REPO, &pushed.index))
+            .map(|r| r.rootfs.as_str().to_owned());
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        assert!(
+            detail.contains(&format!("{}: .att", pushed.index)),
+            "{name}: {detail}"
+        );
+        assert!(
+            !targets(&fake.seen()).iter().any(|t| t.ends_with(&d)),
+            "{name}"
+        );
+    }
+    // The tag answered with an image index: a parser note; with the
+    // subject's own image manifest: listed but no candidate.
+    for (doc, content_type, note) in [
+        (index_doc, media::INDEX, "not an image manifest"),
+        (
+            hub.manifests[REPO][&pushed.manifest].1.clone(),
+            media::MANIFEST,
+            "3 listed, 0 candidates",
+        ),
+    ] {
+        let mut answer = hub.clone();
+        answer.tag(REPO, &att, content_type, &doc);
+        let fake = hub_fake(answer);
+        let (tmp, result) = pull_once(&fake, v02_policy(), &pushed.index);
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        assert!(detail.contains(note), "{note}: {detail}");
+        assert!(!targets(&fake.seen()).iter().any(|t| t.ends_with(&d)));
+    }
+    // A store that cannot keep the envelope: a first pull whose envelope
+    // request failed kept the `.att` manifest only; with the store made
+    // read-only, the next pull fetches the envelope and fails for the
+    // store, not as a refused candidate.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = hub.clone();
+        let envelope_path = format!("/blobs/{d}");
+        let failing = Fake::new(move |s| {
+            if s.target.ends_with(&envelope_path) {
+                Reply::status(500)
+            } else {
+                base.handle(s)
+            }
+        });
+        let tmp = TempDir::new("att-envelope-store");
+        let root = tmp.path().join("store");
+        let refused =
+            open_with(&root, &failing, v02_policy()).pull(&image_ref(REPO, &pushed.index));
+        assert!(refused.is_err());
+        let fake = hub_fake(hub.clone());
+        let blobs = root.join("blobs/sha256");
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let result = open_with(&root, &fake, v02_policy()).pull(&image_ref(REPO, &pushed.index));
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        match result {
+            Err(ImageError::Failed { detail }) => {
+                assert!(!detail.starts_with("signature policy"), "{detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(targets(&fake.seen()).iter().any(|t| t.ends_with(&d)));
+    }
+    // A store that cannot keep the `.att` manifest: the pull fails for the
+    // store, not as a refused candidate, before the envelope is fetched.
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("att-store");
+    let root = tmp.path().join("store");
+    open_with(&root, &fake, SignaturePolicy::off())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("off");
+    let blobs = root.join("blobs/sha256");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let before = fake.seen().len();
+    let result = open_with(&root, &fake, v02_policy()).pull(&image_ref(REPO, &pushed.index));
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    match result {
+        Err(ImageError::Failed { detail }) => {
+            assert!(!detail.starts_with("signature policy"), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let new: Vec<String> = fake.seen()[before..]
+        .iter()
+        .map(|s| s.target.clone())
+        .collect();
+    assert!(new.iter().any(|t| t.ends_with(&att)), "{new:?}");
+    assert!(!new.iter().any(|t| t.ends_with(&d)), "{new:?}");
+}
+
+/// An `.att` answer that is another image's document served with another
+/// `Content-Type` never spoils that image, as for `.sig`.
+#[test]
+fn att_answer_never_spoils_a_document() {
+    let (mut hub, victim) = app_hub();
+    let evil = push(&mut hub, "evil/x", &[Layer::file("etc/evil", b"e\n")], "");
+    let victim_index = hub.manifests[REPO][&victim.index].1.clone();
+    hub.tag(
+        "evil/x",
+        &format!("{}.att", tag_of(&evil.index)),
+        media::MANIFEST,
+        &victim_index,
+    );
+    let fake = hub_fake(hub);
+    let policy = rules(vec![rule(
+        RepoScope::Exact(repo("evil/x")),
+        Requirement::Required(v02_keyed(Some(ACME_SOURCE))),
+    )]);
+    let tmp = TempDir::new("att-spoil");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, policy);
+    store
+        .pull(&image_ref(REPO, &victim.index))
+        .expect("victim first");
+    assert!(store.pull(&image_ref("evil/x", &evil.index)).is_err());
+    assert!(att_requested(&fake));
+    let before = fake.seen().len();
+    store.pull(&image_ref(REPO, &victim.index)).expect("victim");
+    assert_eq!(fake.seen().len(), before, "the victim's copy was replaced");
+    let kept_type = std::fs::read_to_string(root.join("blobs/sha256").join(format!(
+        "{}.type",
+        victim.index.trim_start_matches("sha256:")
+    )))
+    .expect("type");
+    assert_eq!(kept_type, media::INDEX);
+}
+
+/// A pull that passed through `.att` is warm: no request, and the pointer
+/// line is an `attest` line.
+#[test]
+fn warm_attestation_pull_offline() {
+    let (mut hub, pushed) = app_hub();
+    let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    attest(&mut hub, &pushed.index, &[layer]);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("warm-att");
+    let root = tmp.path().join("store");
+    open_with(&root, &fake, v02_policy())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("cold");
+    let pointer = std::fs::read_to_string(
+        root.join("signatures/sha256")
+            .join(pushed.index.trim_start_matches("sha256:")),
+    )
+    .expect("pointer");
+    assert!(pointer.starts_with("attest sha256:"), "{pointer}");
+    assert_eq!(pointer.len(), 151, "{pointer}");
+    let before = fake.seen().len();
+    open_with(&root, &fake, v02_policy())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("warm");
+    assert_eq!(
+        fake.seen().len(),
+        before,
+        "{:?}",
+        targets(&fake.seen()[before..])
+    );
+}
+
+/// An `attest` line kept by a claims rule counts for nothing under a rule
+/// without claims: it is refused as such, discovery runs as in #104 (no
+/// `.att` request), and the verdict equals a cold pull's under that rule,
+/// refused without a `.sig` and passing with one.
+#[test]
+fn attestation_kept_line_needs_claims() {
+    for with_sig in [false, true] {
+        let (mut hub, pushed) = app_hub();
+        let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+        attest(&mut hub, &pushed.index, &[layer]);
+        if with_sig {
+            sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+        }
+        let without = || required(keyed(&[SIGNER_PUB]));
+        let cold = {
+            let fake = hub_fake(hub.clone());
+            pull_once(&fake, without(), &pushed.index).1.is_ok()
+        };
+        assert_eq!(cold, with_sig);
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("kept-att");
+        let root = tmp.path().join("store");
+        open_with(&root, &fake, v02_policy())
+            .pull(&image_ref(REPO, &pushed.index))
+            .expect("under claims");
+        let before = fake.seen().len();
+        let warm = open_with(&root, &fake, without()).pull(&image_ref(REPO, &pushed.index));
+        assert_eq!(warm.is_ok(), cold);
+        assert!(
+            !fake.seen()[before..]
+                .iter()
+                .any(|s| s.target.ends_with(".att")),
+            "{:?}",
+            targets(&fake.seen()[before..])
+        );
+        if let Err(ImageError::Failed { detail }) = warm {
+            assert!(
+                detail.contains(
+                    "kept evidence: a cosign attestation counts only under a rule with provenance claims"
+                ),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// The trim removes an `attest` line whose envelope is gone; the next
+/// pull discovers it again.
+#[test]
+fn trim_removes_dangling_attest_pointer() {
+    let (mut hub, pushed) = app_hub();
+    let layer = att_layer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    let d = nth_digest(layer.as_bytes(), 0);
+    attest(&mut hub, &pushed.index, &[layer]);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("dangling-att");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, v02_policy());
+    store.pull(&image_ref(REPO, &pushed.index)).expect("cold");
+    let pointer = root
+        .join("signatures/sha256")
+        .join(pushed.index.trim_start_matches("sha256:"));
+    store.trim().expect("trim");
+    assert!(pointer.is_file(), "a complete pointer was removed");
+    std::fs::remove_file(
+        root.join("blobs/sha256")
+            .join(d.trim_start_matches("sha256:")),
+    )
+    .expect("evict the envelope");
+    store.trim().expect("trim");
+    assert!(!pointer.exists(), "a dangling pointer stayed");
+    store
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("discovered again");
+    assert!(pointer.is_file());
+}
+
+/// A kept `attest` line is checked as discovery checks it: a pointer that
+/// names a kept `.att` manifest of 17 layers, or an envelope whose layer
+/// is not of the DSSE media type, is refused, though the envelope it names
+/// verifies; the pull then discovers and is refused as a cold pull is.
+#[test]
+fn kept_attest_line_checked() {
+    for case in ["17 layers", "media type"] {
+        let (mut hub, pushed) = app_hub();
+        // One envelope over both subjects, valid under the rule.
+        let statement = String::from_utf8(v02_statement(&pushed.index, ACME_SOURCE))
+            .expect("utf-8")
+            .replacen(
+                "\"subject\":[",
+                &format!(
+                    "\"subject\":[{{\"name\":\"x\",\"digest\":{{\"sha256\":\"{}\"}}}},",
+                    pushed.manifest.trim_start_matches("sha256:")
+                ),
+                1,
+            );
+        let e = envelope(&signer(), statement.as_bytes());
+        let size = e.len();
+        let good = att_layer_with(
+            &mut hub,
+            &e,
+            DSSE_ENVELOPE_MEDIA_TYPE,
+            SLSA_PROVENANCE_V02_PREDICATE,
+            size,
+        );
+        let e_digest = nth_digest(good.as_bytes(), 0);
+        let index_layers: Vec<String> = if case == "17 layers" {
+            let mut layers = vec![good.clone()];
+            layers.extend((0..16).map(|i| {
+                att_layer(
+                    &mut hub,
+                    &other(),
+                    &pushed.index,
+                    &format!("{ACME_SOURCE}{i}"),
+                )
+            }));
+            layers
+        } else {
+            vec![good.replace(DSSE_ENVELOPE_MEDIA_TYPE, "application/vnd.in-toto+json")]
+        };
+        let index_att = attest(&mut hub, &pushed.index, &index_layers);
+        // The platform manifest's `.att` lets the first pull pass, so the
+        // envelope is kept.
+        let mut with_manifest_att = hub.clone();
+        with_manifest_att.tag(
+            REPO,
+            &format!("{}.att", tag_of(&pushed.manifest)),
+            media::MANIFEST,
+            &sig_manifest(std::slice::from_ref(&good)),
+        );
+        let tmp = TempDir::new("kept-attest-checked");
+        let root = tmp.path().join("store");
+        open_with(&root, &hub_fake(with_manifest_att), v02_policy())
+            .pull(&image_ref(REPO, &pushed.index))
+            .expect("passes on the platform manifest");
+        let pointers = root.join("signatures/sha256");
+        let blobs = root.join("blobs/sha256");
+        assert!(
+            blobs
+                .join(index_att.trim_start_matches("sha256:"))
+                .is_file()
+        );
+        assert!(blobs.join(e_digest.trim_start_matches("sha256:")).is_file());
+        std::fs::remove_file(pointers.join(pushed.manifest.trim_start_matches("sha256:")))
+            .expect("drop the manifest's pointer");
+        std::fs::write(
+            pointers.join(pushed.index.trim_start_matches("sha256:")),
+            format!("attest {index_att} {e_digest}\n"),
+        )
+        .expect("pointer");
+        let fake = hub_fake(hub);
+        let result = open_with(&root, &fake, v02_policy())
+            .pull(&image_ref(REPO, &pushed.index))
+            .map(|r| r.rootfs.as_str().to_owned());
+        let detail = match result {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{case}: {other:?}"),
+        };
+        let kept = if case == "17 layers" {
+            "kept evidence: too many layers"
+        } else {
+            "kept evidence: the manifest has no such layer"
+        };
+        assert!(detail.contains(kept), "{case}: {detail}");
+        assert!(att_requested(&fake), "{case}");
+    }
 }
