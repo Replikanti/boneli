@@ -606,4 +606,9 @@ refuses each under another identity. Learned on the way: GHCR lists
 referrers with `"platform": null` and also answers the platform
 manifest's `sha256-<hex>` tag with a real listing (cosign signs both),
 and `cgr.dev` redirects blobs to `*.r2.cloudflarestorage.com`. The
-`oci-acceptance` run on the PR: see the PR.
+`oci-acceptance` run on PR 3 (run 45315915777) passes
+`signatures_on_docker_hub`, `signatures_elsewhere` and
+`node_and_postgres_run_in_sandbox` on x86_64 and arm64: `chainguard/node`
+from Docker Hub in 7.9 s (x86_64) and 16.9 s (arm64), cosign from GHCR in
+6.7 s and 14.1 s, `chainguard/node` from `cgr.dev` in 9.1 s and 17.0 s,
+`pause:3.10` in 4.7 s and 6.4 s, and `library/node` refused on both.
