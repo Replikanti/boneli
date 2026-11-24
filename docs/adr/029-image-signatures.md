@@ -427,7 +427,10 @@ the digest binds the bytes and mirrors are legitimate.
   - A URI prefix trusts everyone who can run the workflow at a matching
     ref. `…@refs/tags/` trusts whoever may push tags to the signer's
     repository, `…@refs/heads/` whoever may push branches, and an org or
-    repository prefix ending in `/` every workflow and ref under it. What
+    repository prefix ending in `/` every workflow and ref under it. A
+    prefix is as broad as the operator writes it: under the GitHub issuer
+    `https://github.com/` (or `https://`) trusts every repository on
+    GitHub, and nothing refuses such a rule. What
     makes `@refs/tags/` mean "releases" is the signer's tag protection,
     which boneli cannot see. It stays open by design: an operator who
     needs less trust writes the exact SAN of a protected branch or of one
