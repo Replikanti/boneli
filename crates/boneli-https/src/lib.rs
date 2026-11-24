@@ -68,7 +68,10 @@
 //! so content addressing adds no crate and ring stays in this crate. For
 //! the same reason it exports ring's RS256 signatures as [`RsaSha256Key`]
 //! and the system's random source as [`fill_random`], for GitHub App
-//! tokens and branch names (ADR-014, D4).
+//! tokens and branch names (ADR-014, D4). [`EcdsaP256Key`] signs with
+//! ECDSA P-256 through the same provider, so tests outside this crate can
+//! sign TUF fixtures with the one scheme `boneli-tuf` accepts (ADR-033,
+//! S4).
 //!
 //! For image signatures it exports signature verification and
 //! code-signing chains (ADR-029): [`PublicKey`] verifies ECDSA P-256 and
@@ -89,6 +92,7 @@
 mod codesign;
 mod der;
 mod dial;
+mod ecdsa;
 mod keys;
 mod pq;
 mod random;
@@ -99,6 +103,7 @@ mod sha256;
 
 pub use codesign::{CertError, CodeSigningCert, CtLog, San, SctError, verify_code_signing};
 pub use dial::{Dial, Stream, Timed, TlsDial};
+pub use ecdsa::EcdsaP256Key;
 pub use keys::{KeyKind, MAX_PUBLIC_KEY_PEM_LEN, PublicKey, PublicKeyError, SignatureError};
 pub use random::{RandomFailed, fill_random};
 pub use resolve::{

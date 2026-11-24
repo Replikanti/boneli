@@ -1,6 +1,6 @@
 # Test certificates and keys
 
-Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`,
+Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`, `tests/ecdsa.rs`,
 `tests/revocation.rs`, `tests/ocsp.rs`, `tests/intermediates.rs`,
 `tests/keys.rs`, `tests/codesign.rs` and the unit tests of
 `src/revocation/` and `src/codesign.rs`, read with `include_bytes!`. The
@@ -86,6 +86,32 @@ regenerating the 2048-bit key changes it, so the two 2048-bit files and
 the signature change together; the other keys stand alone. `openssl pkey -in test-only-rsa-2048-pkcs8.key -pubout | openssl
 dgst -sha256 -verify /dev/stdin -signature rs256-test-only.sig
 rs256-message.txt` checks it independently of Boneli.
+
+## ECDSA P-256 signing keys (`tests/ecdsa.rs`, ADR-033 S4)
+
+`EcdsaP256Key` signs with `test-only-p256.key` from the table above; the
+other files are keys it must refuse, and the public key OpenSSL derives
+from the signing key, which its signatures must verify under.
+
+| File | What |
+| --- | --- |
+| `test-only-p256.pub.pem` | the public key of `test-only-p256.key` (`PUBLIC KEY`), derived by OpenSSL |
+| `test-only-p256-sec1.key` | the same P-256 key in SEC1 (`EC PRIVATE KEY`): refused, PKCS#8 only |
+| `test-only-p384.key` | ECDSA P-384 key, PKCS#8: refused, P-256 only |
+| `test-only-ed25519.key` | Ed25519 key, PKCS#8: refused |
+
+Generated once with OpenSSL 3.5, from this directory:
+
+```sh
+openssl pkey -in test-only-p256.key -pubout -out test-only-p256.pub.pem
+openssl ec -in test-only-p256.key -out test-only-p256-sec1.key
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out test-only-p384.key
+openssl genpkey -algorithm ED25519 -out test-only-ed25519.key
+```
+
+ECDSA signatures are randomized, so there is no signature to pin; the
+test checks that `EcdsaP256Key::public_key` equals OpenSSL's public key
+and that every signature verifies under it.
 
 ## Hybrid key exchange values (`x25519mlkem768-kat.txt`, ADR-016)
 
