@@ -380,7 +380,7 @@ pub(crate) fn trim(
         blobs: root.join("blobs").join("sha256"),
         locks: layers::layer_locks_dir(root),
     };
-    let trim_lock = match lock::lock_exclusive(&root.join("locks").join("trim"), deadline) {
+    let trim_lock = match lock::exclusive(&root.join("locks").join("trim"), deadline) {
         Ok(held) => held,
         Err(e) => return (Doomed::default(), Err(e)),
     };
@@ -908,7 +908,7 @@ pub(crate) mod tests {
                 let release_rx = std::sync::Arc::clone(&release_rx);
                 let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
                 *slot.borrow_mut() = Some(std::thread::spawn(move || {
-                    let held = crate::lock::lock_shared(&path, far()).expect("pin");
+                    let held = crate::lock::shared(&path, far()).expect("pin");
                     let present = document.is_file();
                     let _ = pinned_tx.send(());
                     let _ = release_rx.lock().expect("release").recv();

@@ -1017,7 +1017,7 @@ fn failed_pull_trims() {
 /// The flake of #99's CI (`host::mounted_layers_survive_trim` on arm64):
 /// a `flock` lock belongs to the open file description, and a child that
 /// another thread forks holds a copy of every descriptor until it execs
-/// (ADR-026). A lock released only by closing its descriptor stays held
+/// (ADR-030, D1). A lock released only by closing its descriptor stays held
 /// for that window, so a trim right after a lease's drop found the layers
 /// pinned, and a pin right after a trim found `locks/trim` or a layer
 /// lock still taken. Here one thread spawns `true` in a loop while the

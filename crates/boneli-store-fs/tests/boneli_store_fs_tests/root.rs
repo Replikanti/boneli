@@ -280,7 +280,7 @@ fn temp_leftovers_swept_on_open() {
 /// A reopen does not fail while another thread of the process spawns
 /// processes: a child holds a copy of every descriptor from fork to exec,
 /// the lock's included, and the drop must release the lock anyway (#94,
-/// ADR-026). Probabilistic before the fix; the deterministic pin is the
+/// ADR-030, D1). Probabilistic before the fix; the deterministic pin is the
 /// unit test `unlock_on_drop_releases_while_a_child_holds_a_copy`.
 #[test]
 fn reopen_survives_concurrent_spawns() {

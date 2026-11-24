@@ -92,7 +92,7 @@ impl std::error::Error for OpenError {
 pub struct FsStore {
     root: PathBuf,
     /// The exclusive lock on `<root>/lock`, released when the store drops,
-    /// by an explicit unlock (ADR-026).
+    /// by an explicit unlock in the process that took it (ADR-030).
     _lock: root::StoreLock,
     log_lock: Mutex<()>,
     next_temp: AtomicU64,

@@ -6,11 +6,11 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use boneli_app::RootfsRef;
+use boneli_private_dir::lock::HandOff;
 
 use crate::error::Error;
 use crate::evict;
 use crate::layers::LayerPin;
-use crate::lock::Reopened;
 use crate::manifest::ImageConfig;
 
 /// A pulled root filesystem with its layers pinned: while the lease lives,
@@ -83,7 +83,7 @@ impl Lease {
     /// release only its own pin (`close`, `LOCK_UN`), never this lease's.
     /// Each carries `O_CLOEXEC` until the caller hands it on. When one
     /// fails, the pins already taken are released by an explicit unlock,
-    /// not the close alone (#98).
+    /// not the close alone (#98; the rule of ADR-030, D1).
     pub fn pin_descriptors(&self) -> Result<Vec<OwnedFd>, Error> {
         descriptors(&self.pins, &mut |_| {})
     }
@@ -93,8 +93,9 @@ impl Lease {
 /// after each new pin is taken: a no-op in production, the seam a test
 /// hands a copy of a pin to a child through.
 fn descriptors(pins: &[LayerPin], reopened: &mut dyn FnMut(&File)) -> Result<Vec<OwnedFd>, Error> {
-    // An error drops `taken`, which unlocks the pins already made (#98).
-    let mut taken = Reopened::new();
+    // An error drops `taken`, which unlocks the pins already made (#98,
+    // ADR-030).
+    let mut taken = HandOff::new();
     for pin in pins {
         pin.descriptor(&mut taken)?;
         if let Some(file) = taken.last() {

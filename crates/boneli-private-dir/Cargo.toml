@@ -1,6 +1,6 @@
 [package]
 name = "boneli-private-dir"
-description = "Boneli support crate: the store-root rules that file-backed adapters share, a private root under ancestors no one else can rename (ADR-021), and the new root of the git adapter (ADR-024)."
+description = "Boneli support crate: the store-root rules that file-backed adapters share, a private root under ancestors no one else can rename (ADR-021), the new root of the git adapter (ADR-024), and the one file-lock type (ADR-030)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,3 +14,11 @@ workspace = true
 # No dependencies: the rules need only std (`std::fs` and the Unix
 # `MetadataExt`/`DirBuilderExt` extensions), and a support crate that every
 # file-backed adapter links stays without edges of its own (ADR-021, D1).
+
+[features]
+# `lock::Foreign` and `FileLock::copy_as`, the copies of a lock that tests
+# of the owner check drop (ADR-030, D4). Only `[dev-dependencies]` enable
+# it; resolver 3 keeps dev-dependency features out of normal builds, and a
+# copy made through it can only fail to unlock, never unlock a lock it
+# does not own.
+test-seam = []

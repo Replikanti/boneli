@@ -31,9 +31,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use boneli_private_dir::lock::HandOff;
+
 use crate::error::{Error, root_err};
 use crate::limits::Budget;
-use crate::lock::{self, Held, Reopened};
+use crate::lock::{self, Held};
 use crate::unpack::{Compression, LayerStats, unpack};
 
 /// The layer cache under a store root.
@@ -68,7 +70,7 @@ impl LayerPin {
     /// shared lock (ADR-025, D2). It pins the layer as long as any process
     /// holds it, and its release never releases this pin. Kept in `into`
     /// until it is handed on.
-    pub(crate) fn descriptor(&self, into: &mut Reopened) -> Result<(), Error> {
+    pub(crate) fn descriptor(&self, into: &mut HandOff) -> Result<(), Error> {
         self.held.reopen_shared(into)
     }
 }
@@ -138,7 +140,7 @@ impl LayerCache {
             boneli_private_dir::create(dir).map_err(root_err)?;
         }
         let owner = Owner::current()?;
-        let owner_lock = Arc::new(lock::lock_shared(
+        let owner_lock = Arc::new(lock::shared(
             &owners.join(owner.token()),
             Instant::now() + lock::LOCK_WAIT,
         )?);
@@ -191,7 +193,7 @@ impl LayerCache {
     ) -> Result<LayerPin, Error> {
         Ok(LayerPin {
             diff_id: *diff_id,
-            held: lock::lock_shared(&self.layer_lock_path(diff_id), deadline)?,
+            held: lock::shared(&self.layer_lock_path(diff_id), deadline)?,
         })
     }
 

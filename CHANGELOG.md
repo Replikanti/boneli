@@ -943,6 +943,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kernels, that AWS throttles buffered writeback under `io.max`, and how
   long a destroy takes to release the page cache.
 
+- `boneli-private-dir` (part 1 of #109, ADR-030 proposed) holds the one
+  file-lock type of the workspace, `boneli_private_dir::lock`: `FileLock`
+  for a lock its process keeps, `HandOff` for locks taken to be handed to
+  another process, one release with the one owner check (pid and pid
+  namespace) for both, and the bounded wait. `boneli-store-fs` and
+  `boneli-oci` take their locks through it instead of a copy each
+  (`StoreLock`, `Held`, `Reopened`); the rule, the lock-file protocols and
+  every error to callers are unchanged. The feature `test-seam`, enabled
+  only by the two crates' dev-dependencies, builds the foreign copies of
+  a lock that the owner-check tests drop.
+
 ### Fixed
 
 - `FsStore` (#94, ADR-026) releases its lock by an explicit unlock when it
