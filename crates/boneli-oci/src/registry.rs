@@ -5,7 +5,7 @@
 //! - Every request goes to an allowlisted host: the registry's API host,
 //!   one of its token hosts, or (for blob redirects only) a host under one
 //!   of its redirect suffixes, matched on a dot boundary, or one of its
-//!   exact redirect hosts, compared whole (ADR-033). `https` only,
+//!   exact redirect hosts, compared whole (ADR-035). `https` only,
 //!   certificates verified by the `Dial` (D10).
 //! - `Authorization` goes to the API host and port only, never to a token
 //!   or redirect host.
@@ -107,7 +107,7 @@ impl Registry {
     /// blobs redirected to `production.cloudfront.docker.com`. And, from
     /// GitHub-hosted runners only, some blobs redirected to the S3 host
     /// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, admitted
-    /// as an exact host (ADR-033: MEASUREMENT-TBD).
+    /// as an exact host (ADR-035: MEASUREMENT-TBD).
     pub fn docker_hub() -> Registry {
         Registry {
             name: "docker.io".to_owned(),
@@ -122,7 +122,7 @@ impl Registry {
 
     /// This registry with `hosts` as its exact redirect hosts, replacing
     /// any before: a blob request may also be redirected to one of them,
-    /// compared whole, port 443 only (ADR-033). Each entry is a name in
+    /// compared whole, port 443 only (ADR-035). Each entry is a name in
     /// the grammar of ADR-003 as the URL parser returns it: lowercase, no
     /// port, no IP address, no leading `.` (that is a suffix, see
     /// [`Registry::new`]). An empty list admits no host.
@@ -168,7 +168,7 @@ impl Registry {
 
     /// Whether a blob request may go to `url`: the API host, or on port
     /// 443 a host strictly under a redirect suffix or equal to an exact
-    /// redirect host (ADR-033). A suffix starts with `.` and a host never
+    /// redirect host (ADR-035). A suffix starts with `.` and a host never
     /// does (ADR-003 grammar), so `ends_with` alone means strictly under,
     /// on a label boundary.
     fn redirect_allowed(&self, url: &Url) -> bool {

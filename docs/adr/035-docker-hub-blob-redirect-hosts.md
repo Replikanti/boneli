@@ -1,4 +1,4 @@
-# ADR-033: Docker Hub's blob redirect hosts
+# ADR-035: Docker Hub's blob redirect hosts
 
 - Status: accepted
 - Date: 2026-11-24

@@ -1126,7 +1126,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- `boneli-oci` (#117, ADR-033, accepted): a Docker Hub blob request that
+- `boneli-oci` (#117, ADR-035, accepted): a Docker Hub blob request that
   Docker Hub redirects to its S3 host
   `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com` is followed
   instead of failing the pull with "not on the allowlist". The host is

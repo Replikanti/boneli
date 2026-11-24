@@ -917,7 +917,7 @@ mod network {
 
     /// Whether Docker Hub serves blobs from `host` after a redirect: its
     /// CDN under `.docker.com`, or the S3 host it sends some requests from
-    /// GitHub-hosted runners to (ADR-033).
+    /// GitHub-hosted runners to (ADR-035).
     fn is_hub_blob_host(host: &str) -> bool {
         host.ends_with(".docker.com")
             || host == "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"
