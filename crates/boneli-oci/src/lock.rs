@@ -20,7 +20,10 @@
 //! `locks/trim` (ADR-025, D6), is held by a trim that never waits for
 //! another lock, so no lock cycle can form. Every file is opened by std, with `O_CLOEXEC`, so
 //! no sandbox inherits a lock by accident; a lease hands out descriptors
-//! for that on purpose ([`crate::Lease::pin_descriptors`]).
+//! for that on purpose ([`crate::Lease::pin_descriptors`]). Every lock is
+//! released by an explicit unlock, from the moment it is taken, a retry's
+//! too ([`Held`]), and so is a lease's descriptor until it is handed on
+//! ([`Reopened`]); a descriptor handed on is released by whoever holds it.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
@@ -131,8 +134,10 @@ impl Held {
     /// descriptor carries `O_CLOEXEC`; the caller clears it where it hands
     /// the descriptor on. Opened only once the path is checked to still name
     /// the locked file (no exclusive holder can unlink it while `self`
-    /// holds the shared lock), and checked again once open.
-    pub(crate) fn reopen_shared(&self) -> Result<OwnedFd, Error> {
+    /// holds the shared lock), and checked again once open. Kept in `into`
+    /// from the moment it is locked, so one abandoned before its handoff
+    /// is released by an unlock too ([`Reopened`]).
+    pub(crate) fn reopen_shared(&self, into: &mut Reopened) -> Result<(), Error> {
         let held = self.file.metadata().map_err(|e| lock_err(&self.path, e))?;
         let same = |m: &fs::Metadata| m.dev() == held.dev() && m.ino() == held.ino();
         match fs::symlink_metadata(&self.path) {
@@ -145,7 +150,10 @@ impl Held {
             return Err(Error::LockChanged(self.path.clone()));
         }
         match file.try_lock_shared() {
-            Ok(()) => Ok(OwnedFd::from(file)),
+            Ok(()) => {
+                into.files.push(file);
+                Ok(())
+            }
             Err(TryLockError::WouldBlock) => Err(Error::LockBusy(self.path.clone())),
             Err(TryLockError::Error(e)) => Err(lock_err(&self.path, e)),
         }
@@ -156,10 +164,69 @@ impl Held {
     /// locker that opened the file before the unlink sees the mismatch
     /// once it gets the lock, and tries again on a new file.
     pub(crate) fn remove(self) -> Result<(), Error> {
-        match fs::remove_file(&self.path) {
+        self.remove_with(&mut |_| {})
+    }
+
+    /// [`Held::remove`], with `unlinked(path)` run after the unlink and
+    /// before the release: a no-op in production, the seam a test checks
+    /// the order through.
+    fn remove_with(self, unlinked: &mut dyn FnMut(&Path)) -> Result<(), Error> {
+        let removed = match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(lock_err(&self.path, e)),
+        };
+        unlinked(&self.path);
+        drop(self);
+        removed
+    }
+}
+
+/// Descriptors with a shared lock of their own, taken by
+/// [`Held::reopen_shared`] and not yet handed on. Dropped, each is
+/// released by an explicit `LOCK_UN`, in the process that took it only,
+/// as a [`Held`] is (ADR-026, D1; ADR-028): a pin that an error abandons
+/// before its handoff, such as one [`crate::Lease::pin_descriptors`]
+/// took before a later reopen failed, is free at once while a child holds
+/// a copy of it (#98). [`Reopened::hand_on`] gives them up; from then on
+/// whoever holds a descriptor releases it, by `close` or `LOCK_UN`.
+#[derive(Debug)]
+pub(crate) struct Reopened {
+    files: Vec<File>,
+    owner: LockOwner,
+}
+
+impl Reopened {
+    /// None yet, owned by the calling process.
+    pub(crate) fn new() -> Reopened {
+        Reopened {
+            files: Vec::new(),
+            owner: LockOwner::current(),
+        }
+    }
+
+    /// The descriptor reopened last.
+    pub(crate) fn last(&self) -> Option<&File> {
+        self.files.last()
+    }
+
+    /// The descriptors, in the order they were taken, no longer released
+    /// by this value.
+    pub(crate) fn hand_on(mut self) -> Vec<OwnedFd> {
+        std::mem::take(&mut self.files)
+            .into_iter()
+            .map(OwnedFd::from)
+            .collect()
+    }
+}
+
+impl Drop for Reopened {
+    fn drop(&mut self) {
+        if self.owner.is(&LockOwner::current()) {
+            for file in &self.files {
+                // As in `Held`: an error leaves the close to release it.
+                let _ = file.unlock();
+            }
         }
     }
 }
@@ -329,6 +396,19 @@ fn acquire(
     create: Create,
     between: &mut dyn FnMut(u32, &Path),
 ) -> Result<Exclusive, Error> {
+    acquire_with(path, mode, create, between, &mut |_, _| {})
+}
+
+/// [`acquire`], with `after_lock(attempt, file)` run right after the lock
+/// is taken, before the inode check: the seam a test hands a copy of a
+/// lock on a replaced file to a child through.
+fn acquire_with(
+    path: &Path,
+    mode: Mode,
+    create: Create,
+    between: &mut dyn FnMut(u32, &Path),
+    after_lock: &mut dyn FnMut(u32, &File),
+) -> Result<Exclusive, Error> {
     for attempt in 0..LOCK_ATTEMPTS {
         let file = match open(path, create)? {
             Opened::File(file) => file,
@@ -349,16 +429,21 @@ fn acquire(
                 Err(TryLockError::Error(e)) => return Err(lock_err(path, e)),
             },
         }
+        after_lock(attempt, &file);
+        // Wrapped from the moment the lock is taken (ADR-026, D1), so a
+        // lock on a replaced file and one an error abandons are released
+        // by the drop's unlock too, not by the close alone (#98).
+        let held = Held {
+            file,
+            path: path.to_path_buf(),
+            owner: LockOwner::current(),
+        };
         match fs::symlink_metadata(path) {
             Ok(now) if now.dev() == opened.dev() && now.ino() == opened.ino() => {
-                return Ok(Exclusive::Held(Held {
-                    file,
-                    path: path.to_path_buf(),
-                    owner: LockOwner::current(),
-                }));
+                return Ok(Exclusive::Held(held));
             }
             // Replaced or unlinked by an exclusive holder (or a symlink
-            // planted, which the next attempt refuses).
+            // planted, which the next attempt refuses); `held` drops here.
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(lock_err(path, e)),
@@ -368,10 +453,12 @@ fn acquire(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::{File, TryLockError};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
+    use std::process::{Child, Command, Stdio};
 
     use std::time::{Duration, Instant};
 
@@ -384,12 +471,26 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
-    fn is_held(path: &Path) -> bool {
-        match File::open(path).expect("open").try_lock() {
-            Ok(()) => false,
+    /// Whether a lock is held on the file at `path`. A probe that got the
+    /// lock unlocks it before it closes, so a child another test spawns
+    /// cannot keep it held (#98).
+    pub(crate) fn is_held(path: &Path) -> bool {
+        let probe = File::open(path).expect("open");
+        match probe.try_lock() {
+            Ok(()) => {
+                probe.unlock().expect("unlock the probe");
+                false
+            }
             Err(TryLockError::WouldBlock) => true,
             Err(TryLockError::Error(e)) => panic!("{e}"),
         }
+    }
+
+    /// `held.reopen_shared`, handed on as a `File`.
+    fn reopen(held: &super::Held) -> File {
+        let mut taken = super::Reopened::new();
+        held.reopen_shared(&mut taken).expect("reopen");
+        File::from(taken.hand_on().pop().expect("one descriptor"))
     }
 
     /// Replaces the lock file at `path` by a new one, as an exclusive
@@ -548,6 +649,7 @@ mod tests {
         assert!(took >= wait, "gave up early: {took:?}");
         assert!(took < wait + Duration::from_secs(2), "overslept: {took:?}");
         // A deadline already past still tries once.
+        holder.unlock().expect("unlock");
         drop(holder);
         let held = lock_shared(&path, Instant::now()).expect("free, so locked at once");
         assert!(is_held(&path));
@@ -587,12 +689,13 @@ mod tests {
         let scratch = ScratchDir::new("lock-reopen");
         let path = scratch.path().join("lock");
         let held = lock_shared(&path, far()).expect("shared");
-        let other = File::from(held.reopen_shared().expect("reopen"));
+        let other = reopen(&held);
         other.unlock().expect("unlock the copy");
         assert!(is_held(&path), "the copy's release released the original");
         other.lock_shared().expect("lock the copy again");
         drop(held);
         assert!(is_held(&path), "the copy holds the file on its own");
+        other.unlock().expect("unlock the copy");
         drop(other);
         assert!(!is_held(&path));
     }
@@ -664,7 +767,7 @@ mod tests {
         for owner in foreign {
             let mut held = lock_shared(&path, far()).expect("shared");
             held.owner = owner;
-            let copy = File::from(held.reopen_shared().expect("reopen"));
+            let copy = reopen(&held);
             copy.unlock().expect("only the reopened copy holds");
             let same = held.file.try_clone().expect("a copy of the description");
             drop(held);
@@ -674,6 +777,9 @@ mod tests {
                 is_held(&path),
                 "{owner:?}: a foreign drop released the lock"
             );
+            // Released by an unlock, not the close alone, which a child
+            // another test spawns could delay (#98).
+            same.unlock().expect("unlock the copy");
             drop(same);
             assert!(!is_held(&path));
         }
@@ -682,5 +788,209 @@ mod tests {
         drop(held);
         assert!(!is_held(&path), "the owner's drop did not release the lock");
         drop(same);
+    }
+
+    /// A child that holds a copy of a lock's open file description, as one
+    /// a thread spawned holds it between fork and exec (#98): `sleep` with
+    /// the copy as its stdin, killed and reaped on drop.
+    pub(crate) struct Holder(Child);
+
+    impl Holder {
+        pub(crate) fn spawn(file: &File) -> Holder {
+            let copy = file.try_clone().expect("dup the lock");
+            let child = Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::from(copy))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn sleep");
+            Holder(child)
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn exclusive_held(path: &Path) -> super::Held {
+        match super::try_exclusive_existing(path) {
+            Ok(Exclusive::Held(held)) => held,
+            other => panic!("{}: {other:?}", path.display()),
+        }
+    }
+
+    /// A shared lock dropped while a child holds a copy of its description
+    /// is free at once: an exclusive try gets it (#98).
+    #[test]
+    fn shared_drop_releases_while_a_child_holds_a_copy() {
+        let scratch = ScratchDir::new("lock-shared-child");
+        let path = scratch.path().join("lock");
+        let held = lock_shared(&path, far()).expect("shared");
+        let _holder = Holder::spawn(&held.file);
+        drop(held);
+        assert!(!is_held(&path), "the child's copy kept the lock");
+        drop(exclusive_held(&path));
+    }
+
+    /// The same for the exclusive locks: an eviction's try and the trim
+    /// lock's wait (#98).
+    #[test]
+    fn exclusive_drop_releases_while_a_child_holds_a_copy() {
+        let scratch = ScratchDir::new("lock-exclusive-child");
+        let path = scratch.path().join("lock");
+        std::fs::write(&path, b"").expect("lock file");
+        let held = exclusive_held(&path);
+        let _holder = Holder::spawn(&held.file);
+        drop(held);
+        assert!(
+            !is_held(&path),
+            "try_exclusive: the child's copy kept the lock"
+        );
+        let trim = scratch.path().join("trim");
+        let held = super::lock_exclusive(&trim, far()).expect("trim lock");
+        let _holder = Holder::spawn(&held.file);
+        drop(held);
+        assert!(
+            !is_held(&trim),
+            "lock_exclusive: the child's copy kept the lock"
+        );
+    }
+
+    /// `remove` with a child holding a copy: the file is gone, and its
+    /// inode, still open through a handle taken before, is unlocked (#98).
+    #[test]
+    fn remove_releases_while_a_child_holds_a_copy() {
+        let scratch = ScratchDir::new("lock-remove-child");
+        let path = scratch.path().join("lock");
+        std::fs::write(&path, b"").expect("lock file");
+        let stale = File::open(&path).expect("open before remove");
+        let held = exclusive_held(&path);
+        let _holder = Holder::spawn(&held.file);
+        held.remove().expect("remove");
+        assert!(!path.exists());
+        stale.try_lock().expect("the removed file is unlocked");
+    }
+
+    /// `remove` unlinks the file while the lock is still held, and only
+    /// then unlocks it (D3): a shared locker that got the lock between an
+    /// unlock and the unlink would pass its inode check on a file about to
+    /// go, and pin a layer under a lock no later eviction sees. At the
+    /// seam between the two steps the path is gone and a description
+    /// opened before still finds the inode locked; after it, free.
+    #[test]
+    fn remove_unlinks_before_it_unlocks() {
+        let scratch = ScratchDir::new("lock-remove-order");
+        let path = scratch.path().join("lock");
+        std::fs::write(&path, b"").expect("lock file");
+        let stale = File::open(&path).expect("open before remove");
+        let held = exclusive_held(&path);
+        let mut seen = 0;
+        held.remove_with(&mut |p| {
+            seen += 1;
+            assert!(!p.exists(), "the seam ran before the unlink");
+            assert!(
+                matches!(stale.try_lock_shared(), Err(TryLockError::WouldBlock)),
+                "unlocked before the unlink"
+            );
+        })
+        .expect("remove");
+        assert_eq!(seen, 1);
+        stale.try_lock().expect("the removed file is unlocked");
+    }
+
+    /// While the lock lives, a child's copy changes nothing: an exclusive
+    /// try is `Busy`, so the unlock on drop releases nothing early.
+    #[test]
+    fn live_lock_stays_held_with_a_child_copy() {
+        let scratch = ScratchDir::new("lock-live-child");
+        let path = scratch.path().join("lock");
+        let held = lock_shared(&path, far()).expect("shared");
+        let _holder = Holder::spawn(&held.file);
+        assert!(matches!(
+            super::try_exclusive_existing(&path),
+            Ok(Exclusive::Busy)
+        ));
+        drop(held);
+    }
+
+    /// A lock taken on a file that an exclusive holder replaced between our
+    /// open and our lock is released before the retry, also while a child
+    /// holds a copy of it: the lock is wrapped from the moment it is taken
+    /// (ADR-026, D1), not only once the inode check passed (#98). For every
+    /// mode; the stale inode stays reachable through a handle opened
+    /// before the replacement.
+    #[test]
+    fn replaced_file_lock_is_released_with_a_child_copy() {
+        let scratch = ScratchDir::new("lock-replaced-child");
+        let path = scratch.path().join("lock");
+        for (mode, create) in [
+            (Mode::Shared(far()), Create::Yes),
+            (Mode::Exclusive(far()), Create::Yes),
+            (Mode::TryExclusive, Create::No),
+        ] {
+            std::fs::write(&path, b"").expect("lock file");
+            let mut stale = None;
+            let mut holders = Vec::new();
+            let got = super::acquire_with(
+                &path,
+                mode,
+                create,
+                &mut |attempt, p| {
+                    if attempt == 0 {
+                        stale = Some(File::open(p).expect("open the file to replace"));
+                        replace(p);
+                    }
+                },
+                &mut |attempt, file| {
+                    if attempt == 0 {
+                        holders.push(Holder::spawn(file));
+                    }
+                },
+            )
+            .expect("acquired");
+            let Exclusive::Held(held) = got else {
+                panic!("{mode:?}: {got:?}");
+            };
+            assert_eq!(holders.len(), 1, "{mode:?}: locked the replaced file once");
+            let stale = stale.expect("replaced");
+            stale
+                .try_lock()
+                .unwrap_or_else(|e| panic!("{mode:?}: the replaced file is still locked: {e:?}"));
+            drop(held);
+            drop(holders);
+        }
+    }
+
+    /// Every lock file is `O_CLOEXEC` (octal 02000000 in the `flags:` line
+    /// of `/proc/self/fdinfo`), whether opened or created, so a child's
+    /// copy lives only from fork to exec, also after a crash of the
+    /// holder (ADR-026, D2).
+    #[test]
+    fn lock_file_is_close_on_exec() {
+        let scratch = ScratchDir::new("lock-cloexec");
+        let created = lock_shared(&scratch.path().join("created"), far()).expect("created");
+        let existing = scratch.path().join("existing");
+        std::fs::write(&existing, b"").expect("lock file");
+        let opened = exclusive_held(&existing);
+        for held in [&created, &opened] {
+            let info =
+                std::fs::read_to_string(format!("/proc/self/fdinfo/{}", held.file.as_raw_fd()))
+                    .expect("fdinfo");
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .expect("a flags line");
+            let flags = u32::from_str_radix(flags.trim(), 8).expect("octal flags");
+            assert_ne!(
+                flags & 0o2000000,
+                0,
+                "{}: flags {flags:o}",
+                held.path().display()
+            );
+        }
     }
 }
