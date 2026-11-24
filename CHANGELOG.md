@@ -809,6 +809,24 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writing it to the run log is #14's. New contract clauses
   `agent-origin-refused` and `exemption-reported`, each case with its
   mutant; `MemoryImageStore::with_agent_exemptions`.
+- `boneli-tuf` (part 1 of #103, ADR-033 proposed): a new support crate for
+  keeping Sigstore's `trusted_root.json` current through TUF, without an
+  external crate. This part is the pure core: `canonical` (the canonical
+  form TUF signs: sorted keys, no whitespace, only `\` and `"` escaped,
+  control characters raw, integers within `i64` only), thresholds over
+  distinct SPKI of ECDSA P-256 keys under scheme `ecdsa-sha2-nistp256`
+  (every other key and every bad signature counts zero), and
+  `TrustedSet` with the root chain (TUF 5.3): own threshold, the trusted
+  root's threshold, version N+1 by checked add, `_type`, strict
+  `expires`, the newest root not expired at the caller's start time, and
+  the fast-forward signal when the timestamp or snapshot keys change.
+  Byte caps per role and JSON limits 16 / 65,536. Known answers: Sigstore's
+  roots v5 to v16 chain; v3 and v4 are refused as pins.
+- `boneli_https::EcdsaP256Key` (ADR-033, S4): ECDSA P-256 signing through
+  ring's key provider, PKCS#8 only, input wiped, so `boneli-tuf`'s tests
+  sign fixtures with the one scheme production accepts.
+  `KeyError::NotEcdsaP256` is new, and `KeyError::SignFailed` now reads
+  "the signature failed".
 
 ### Changed
 

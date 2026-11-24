@@ -1,0 +1,29 @@
+[package]
+name = "boneli-tuf"
+description = "Boneli support crate: a client for Sigstore's TUF repository that keeps the operator's trusted_root.json current, on our own canonical form, ECDSA P-256 thresholds and root chain (ADR-033)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No external crate (ADR-033, item 1): tough, tuf, sigstore-tuf and tuffet
+# all pull crates that deny.toml bans.
+[dependencies]
+# Public keys and their signature check (`PublicKey`, ECDSA P-256 over
+# ring) and SHA-256 (`Sha256`): the one crate that holds ring. A support
+# crate, no new external edge.
+boneli-https.workspace = true
+# Parses TUF metadata under per-role limits, duplicate keys refused, and
+# keeps numbers as lexemes, which the canonical form needs (ADR-008). A
+# support crate, no new external edge.
+boneli-json.workspace = true
+# The RFC 3339 reader for `expires` (`boneli_sigstore::time::parse`), so
+# the workspace has one; later the last check before `trusted_root.json`
+# is installed (`TrustedRoot::from_json`, ADR-033 item 6). A support
+# crate, no new external edge.
+boneli-sigstore.workspace = true

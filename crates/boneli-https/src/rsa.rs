@@ -17,7 +17,9 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 /// rule, so no message carries key bytes or a parser's quote of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyError {
-    /// The input is longer than [`RsaSha256Key::MAX_PEM_LEN`].
+    /// The input is longer than [`RsaSha256Key::MAX_PEM_LEN`] (or
+    /// [`EcdsaP256Key::MAX_PEM_LEN`](crate::EcdsaP256Key::MAX_PEM_LEN),
+    /// the same number).
     TooLarge,
     /// The input does not hold exactly one PEM section.
     NotOneSection,
@@ -35,6 +37,11 @@ pub enum KeyError {
     NotRsa,
     /// Signing failed.
     SignFailed,
+    /// For [`EcdsaP256Key`](crate::EcdsaP256Key): the one section is not an
+    /// unencrypted PKCS#8 `PRIVATE KEY` holding an ECDSA P-256 key that
+    /// ring accepts: a SEC1 `EC PRIVATE KEY`, a P-384, RSA or Ed25519 key,
+    /// or an encrypted key.
+    NotEcdsaP256,
 }
 
 impl fmt::Display for KeyError {
@@ -48,7 +55,10 @@ impl fmt::Display for KeyError {
             KeyError::CorruptPem => "the PEM section is corrupt",
             KeyError::Rejected => "not an RSA private key of 2048, 3072 or 4096 bits",
             KeyError::NotRsa => "the private key is not an RSA key",
-            KeyError::SignFailed => "the RSA signature failed",
+            KeyError::SignFailed => "the signature failed",
+            KeyError::NotEcdsaP256 => {
+                "the PEM section must be an unencrypted PKCS#8 PRIVATE KEY of ECDSA P-256"
+            }
         })
     }
 }
@@ -121,19 +131,19 @@ impl fmt::Debug for RsaSha256Key {
 
 /// Fills `buf` with zeros in a way the optimizer keeps (best effort,
 /// without `unsafe`).
-fn wipe(buf: &mut [u8]) {
+pub(crate) fn wipe(buf: &mut [u8]) {
     buf.fill(0);
     std::hint::black_box(buf);
 }
 
 /// The lines of `pem`, ending at LF or CR as in the rustls PEM parser, so
 /// both see the same lines.
-fn lines(pem: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn lines(pem: &[u8]) -> impl Iterator<Item = &[u8]> {
     pem.split(|b| *b == b'\n' || *b == b'\r')
 }
 
 /// Whether `line` opens a PEM section.
-fn begins_section(line: &[u8]) -> bool {
+pub(crate) fn begins_section(line: &[u8]) -> bool {
     line.starts_with(b"-----BEGIN ")
 }
 
@@ -141,7 +151,7 @@ fn begins_section(line: &[u8]) -> bool {
 /// traditional encryption, which keeps the `RSA PRIVATE KEY` label. The
 /// rustls parser would feed them to base64 and report corrupt PEM; the
 /// file is not corrupt, it is encrypted.
-fn has_encryption_headers(pem: &[u8]) -> bool {
+pub(crate) fn has_encryption_headers(pem: &[u8]) -> bool {
     lines(pem)
         .skip_while(|line| !begins_section(line))
         .skip(1)

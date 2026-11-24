@@ -170,6 +170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-tuf"
+version = "0.0.0"
+dependencies = [
+ "boneli-https",
+ "boneli-json",
+ "boneli-sigstore",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
