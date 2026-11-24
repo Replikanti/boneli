@@ -50,8 +50,10 @@
 //! [`StoreConfig::signatures`] names the registries and repositories whose
 //! images must carry a signature that `boneli-sigstore` verifies under a
 //! `boneli_sigstore::Trust`: a cosign `.sig` layer or a Sigstore bundle
-//! v0.3 found through the referrers API or its tag schema, over the digest
-//! the reference names or the platform manifest it selects. Under a
+//! v0.3 found through the referrers API or its tag schema, and, only under
+//! a trust with provenance claims, a cosign `.att` attestation (ADR-036),
+//! over the digest the reference names or the platform manifest it
+//! selects. Under a
 //! [`Requirement::Required`] rule the pull is `Failed` before any layer
 //! blob is requested unless one candidate verifies; the evidence that
 //! verified is kept and verified again, offline, on every later pull. The

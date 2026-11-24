@@ -629,7 +629,7 @@ mod network {
     };
     use boneli_sigstore::{
         COSIGN_SIGN_PREDICATE, CertificateClaims, ClaimMatch, Claims, Identity, Material,
-        SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot,
+        SLSA_PROVENANCE_V1_PREDICATE, SLSA_PROVENANCE_V02_PREDICATE, SanRule, Trust, TrustedRoot,
     };
     use boneli_sys::ExitStatus;
 
@@ -1423,6 +1423,118 @@ mod network {
                     );
                 }
                 other => panic!("jq must be refused: {other:?}"),
+            }
+            let committed = std::fs::read_dir(root.join("layers/sha256"))
+                .map(|dir| {
+                    dir.filter_map(Result::ok)
+                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(committed, 0, "a layer was committed");
+        }
+    }
+
+    /// `ghcr.io/fluxcd/flux-cli` v2.4.0, the index whose `.att` ADR-036
+    /// measured and whose manifest and envelope the offline tests hold.
+    const FLUX: &str = "sha256:a9cb966cddc1a0c56dc0d57dda485d9477dd397f8b45f222717b24663471fd1f";
+
+    /// The generator's keyless SLSA v0.2 trust: its exact SAN at v2.0.0,
+    /// with the builder, the source repository `repository`, a tag ref and
+    /// the release commit as claims (ADR-036).
+    fn flux_provenance(repository: &str) -> Requirement {
+        let generator = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.0.0";
+        let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+        let identity = Identity::new(
+            "https://token.actions.githubusercontent.com",
+            SanRule::Uri(generator.to_owned()),
+        )
+        .expect("identity");
+        let claims = Claims::new(
+            Some(generator),
+            Some(ClaimMatch::Exact(repository.to_owned())),
+            Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+            vec![
+                Material::new(
+                    "git+https://github.com/fluxcd/flux2@refs/tags/v2.4.0",
+                    "sha1",
+                    "5350425cdcd5fa015337e09fa502153c0275bd4b",
+                )
+                .expect("material"),
+            ],
+        )
+        .expect("claims");
+        Requirement::Required(Arc::new(
+            Trust::new(
+                Vec::new(),
+                Some((root, vec![identity])),
+                vec![SLSA_PROVENANCE_V02_PREDICATE.to_owned()],
+            )
+            .expect("trust")
+            .with_claims(claims)
+            .expect("with claims"),
+        ))
+    }
+
+    /// The acceptance of ADR-036 on GHCR: under a `Required` rule whose
+    /// trust has SLSA v0.2 provenance claims, flux-cli v2.4.0 pulls with
+    /// every layer committed (its cosign `.att` from slsa-github-generator);
+    /// under the same rule with another source repository it is refused
+    /// before any layer is committed, and the detail names `.att` and the
+    /// claim.
+    #[test]
+    #[ignore = "network: pulls fluxcd/flux-cli from ghcr.io"]
+    fn provenance_v02_on_ghcr() {
+        let ghcr = Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("ghcr");
+        for repository in [
+            "https://github.com/fluxcd/flux2",
+            "https://github.com/fluxcd/other",
+        ] {
+            let dial = recording();
+            let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+            config.registries = vec![Registry::docker_hub(), ghcr.clone()];
+            config.signatures = SignaturePolicy::new(
+                Requirement::Off,
+                vec![rule(
+                    "ghcr.io",
+                    RepoScope::Exact(Repository::parse("fluxcd/flux-cli").expect("repository")),
+                    flux_provenance(repository),
+                )],
+            )
+            .expect("policy");
+            let tmp = TempDir::new("network-provenance-v02");
+            let root = tmp.path().join("store");
+            let store = OciImageStore::open(&root, config).expect("open");
+            if repository.ends_with("/flux2") {
+                pull_signed(&store, &dial, "ghcr.io/fluxcd/flux-cli", FLUX);
+                continue;
+            }
+            let refused = store.pull(&ImageRef {
+                name: "ghcr.io/fluxcd/flux-cli".to_owned(),
+                digest: FLUX.to_owned(),
+                platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
+            });
+            println!(
+                "oci-acceptance provenance ghcr.io/fluxcd/flux-cli under another repository: {refused:?}"
+            );
+            match refused {
+                Err(ImageError::Failed { detail }) => {
+                    assert!(detail.starts_with("signature policy: "), "{detail}");
+                    assert!(detail.contains(".att"), "{detail}");
+                    assert!(
+                        detail
+                            .contains("the provenance's source repository does not meet the rule"),
+                        "{detail}"
+                    );
+                }
+                other => panic!("flux-cli must be refused: {other:?}"),
             }
             let committed = std::fs::read_dir(root.join("layers/sha256"))
                 .map(|dir| {

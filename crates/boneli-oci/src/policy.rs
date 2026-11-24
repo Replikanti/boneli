@@ -36,10 +36,11 @@ pub enum Requirement {
     /// Only an image a candidate signature verifies for under this trust
     /// is unpacked; errors, absences and caps never let it pass. A trust
     /// with provenance claims (`Trust::with_claims`) admits only SLSA v1
-    /// statements that meet them (ADR-031); one with Fulcio certificate
-    /// claims (`Trust::with_certificate_claims`) admits only keyless
-    /// signatures, `.sig` layers included, whose leaf meets them
-    /// (ADR-034).
+    /// statements and, when its predicate list names it, SLSA v0.2 ones,
+    /// from referrers and from cosign `.att`, that meet them (ADR-031,
+    /// ADR-036); one with Fulcio certificate claims
+    /// (`Trust::with_certificate_claims`) admits only keyless signatures,
+    /// `.sig` layers and `.att` included, whose leaf meets them (ADR-034).
     Required(Arc<Trust>),
 }
 

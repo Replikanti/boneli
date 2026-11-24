@@ -1,5 +1,5 @@
 //! Signature discovery and the check of a `Required` rule (ADR-029, S1,
-//! S6 and item 9).
+//! S6 and item 9; ADR-036).
 //!
 //! The subjects are the digest the reference names and, when it names an
 //! index, the platform manifest the pull selected; nothing else counts.
@@ -13,7 +13,7 @@
 //!    it is verified again under the current trust. A missing, malformed
 //!    or dangling pointer is absent. A pull of an image already in the
 //!    store whose evidence still verifies makes no request (S6).
-//! 2. **Discovery,** subject by subject, two carriers in order:
+//! 2. **Discovery,** subject by subject, up to three carriers in order:
 //!    - cosign's tag `sha256-<hex>.sig`: each layer of media type
 //!      [`SIMPLE_SIGNING_MEDIA_TYPE`] of at most [`MAX_PAYLOAD_BYTES`] is
 //!      a candidate, its payload fetched by digest; a rule whose trust has
@@ -26,7 +26,14 @@
 //!      candidate; its manifest must name the subject and that artifact
 //!      type, and its one layer is the bundle. A tag that answers with the
 //!      subject itself (GHCR answers `sha256-<hex>` with the image's own
-//!      index where no referrer exists, measured) lists nothing.
+//!      index where no referrer exists, measured) lists nothing;
+//!    - only under a trust with provenance claims, cosign's tag
+//!      `sha256-<hex>.att` (ADR-036): each layer of media type
+//!      [`DSSE_ENVELOPE_MEDIA_TYPE`] whose `predicateType` annotation is
+//!      on the trust's list is a candidate, its envelope (at most
+//!      [`MAX_BUNDLE_BYTES`]) fetched by digest. A rule without claims
+//!      never asks for it, so its requests are those of ADR-029 and
+//!      ADR-031.
 //!
 //!    [`MAX_SIGNATURES`] is checked on each carrier's raw listing before
 //!    anything listed is fetched. Every artifact fetched is kept, and a
@@ -44,8 +51,8 @@ use std::path::{Path, PathBuf};
 
 use boneli_json::{Object, Value};
 use boneli_sigstore::{
-    BUNDLE_V03_MEDIA_TYPE, Evidence, MAX_BUNDLE_BYTES, MAX_PAYLOAD_BYTES,
-    SIMPLE_SIGNING_MEDIA_TYPE, Trust, verify,
+    BUNDLE_V03_MEDIA_TYPE, DSSE_ENVELOPE_MEDIA_TYPE, Evidence, MAX_BUNDLE_BYTES, MAX_PAYLOAD_BYTES,
+    PREDICATE_TYPE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE, Trust, verify,
 };
 
 use crate::error::{PullError, failed};
@@ -54,7 +61,7 @@ use crate::reference::{Digest, Repository};
 use crate::registry::{Client, Documents, Fetched, SignatureTag};
 
 /// The most entries one carrier's listing may have per subject: the layers
-/// of a `.sig` manifest, the entries of a referrers listing. Inclusive: 16
+/// of a `.sig` or `.att` manifest, the entries of a referrers listing. Inclusive: 16
 /// are all examined, 17 make that carrier yield no candidate and fetch
 /// none of them. Measured: 1 to 2 per digest (Kubernetes 1, Chainguard 1,
 /// cosign 2.4.1 and 3.0.2 2 each, `latest` 2 referrers); 16 is 8 times
@@ -67,20 +74,22 @@ pub const MAX_SIGNATURES: usize = 16;
 /// type, as cosign writes it.
 pub(crate) const PREDICATE_ANNOTATION: &str = "dev.sigstore.bundle.predicateType";
 
-/// The `Accept` field of a `.sig` request: the two manifest kinds.
+/// The `Accept` field of a `.sig` or `.att` request: the two manifest
+/// kinds.
 const SIG_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
 /// The most evidence one subject's pointer file names: one line per
 /// evidence that passed under some rule, so rules with different trusts
-/// over one digest each keep theirs (review of PR 3). 32 is every
-/// candidate both carriers can list for one subject at once (2 ×
-/// [`MAX_SIGNATURES`]), so no rule's evidence is pushed out while the
-/// registry's listings stay as they are; past it the oldest line goes
-/// first.
-pub(crate) const MAX_KEPT: usize = 2 * MAX_SIGNATURES;
+/// over one digest each keep theirs (review of PR 3). 48 is every
+/// candidate the three carriers can list for one subject at once (3 ×
+/// [`MAX_SIGNATURES`], ADR-036), so no rule's evidence is pushed out
+/// while the registry's listings stay as they are; past it the oldest
+/// line goes first.
+pub(crate) const MAX_KEPT: usize = 3 * MAX_SIGNATURES;
 
 /// The longest pointer file read: [`MAX_KEPT`] lines of at most 151 bytes
-/// (`bundle`, two digests, two spaces and a newline) are 4,832 bytes.
+/// (a six-letter kind, two digests, two spaces and a newline) are 7,248
+/// bytes.
 pub(crate) const MAX_POINTER_BYTES: u64 = 8_192;
 
 /// The evidence a pull verified for one subject, as its pointer file names
@@ -91,6 +100,9 @@ pub(crate) enum Pointer {
     Legacy { manifest: Digest, payload: Digest },
     /// A referrer manifest and its bundle.
     Bundle { manifest: Digest, bundle: Digest },
+    /// An `.att` manifest and the envelope of the layer that verified
+    /// (ADR-036).
+    Attestation { manifest: Digest, envelope: Digest },
 }
 
 impl Pointer {
@@ -99,6 +111,9 @@ impl Pointer {
         match self {
             Pointer::Legacy { manifest, payload } => format!("legacy {manifest} {payload}\n"),
             Pointer::Bundle { manifest, bundle } => format!("bundle {manifest} {bundle}\n"),
+            Pointer::Attestation { manifest, envelope } => {
+                format!("attest {manifest} {envelope}\n")
+            }
         }
     }
 
@@ -125,6 +140,10 @@ impl Pointer {
             "bundle" => Some(Pointer::Bundle {
                 manifest: first,
                 bundle: second,
+            }),
+            "attest" => Some(Pointer::Attestation {
+                manifest: first,
+                envelope: second,
             }),
             _ => None,
         }
@@ -176,6 +195,7 @@ impl Pointer {
         match *self {
             Pointer::Legacy { manifest, payload } => [manifest, payload],
             Pointer::Bundle { manifest, bundle } => [manifest, bundle],
+            Pointer::Attestation { manifest, envelope } => [manifest, envelope],
         }
     }
 }
@@ -413,6 +433,12 @@ impl Check<'_, '_> {
             if found.is_none() {
                 found = self.referrers(subject, &mut notes)?;
             }
+            // cosign `.att` counts only under claims (ADR-036), and comes
+            // last, so an image that passes through referrers sends the
+            // requests of ADR-031.
+            if found.is_none() && self.trust.claims().is_some() {
+                found = self.attestations(subject, &mut notes)?;
+            }
             if let Some(pointer) = found {
                 self.keep(subject, pointer)?;
                 return Ok(());
@@ -496,6 +522,23 @@ impl Check<'_, '_> {
                 }) {
                     let pairs = pairs(&layer.annotations);
                     match Evidence::from_cosign_layer(&pairs, &blob.bytes)
+                        .and_then(|e| verify(&e, subject.bytes(), self.trust))
+                    {
+                        Ok(_) => return Ok(KeptOutcome::Pass),
+                        Err(refusal) => last = Some(refusal.to_string()),
+                    }
+                }
+            }
+            Pointer::Attestation { envelope, .. } => {
+                if artifact.layers.len() > MAX_SIGNATURES {
+                    return Ok(KeptOutcome::Refused("too many layers".to_owned()));
+                }
+                for layer in artifact.layers.iter().filter(|l| {
+                    l.descriptor.digest == envelope
+                        && l.descriptor.media_type == DSSE_ENVELOPE_MEDIA_TYPE
+                }) {
+                    let pairs = pairs(&layer.annotations);
+                    match Evidence::from_cosign_attestation(&pairs, &blob.bytes)
                         .and_then(|e| verify(&e, subject.bytes(), self.trust))
                     {
                         Ok(_) => return Ok(KeptOutcome::Pass),
@@ -621,6 +664,80 @@ impl Check<'_, '_> {
         }
         notes.push(format!(
             "{subject}: .sig {manifest}: {listed} listed{}",
+            parenthesized(&reasons)
+        ));
+        Ok(None)
+    }
+
+    /// The `.att` carrier of `subject` (module doc, step 2; ADR-036), asked
+    /// only under a trust with claims.
+    fn attestations(
+        &mut self,
+        subject: &Digest,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<Pointer>, PullError> {
+        let tag = SignatureTag::Att(*subject);
+        let fetched = match self.client.get_tag_document(self.repo, tag, SIG_ACCEPT) {
+            Ok(Some(fetched)) => fetched,
+            Ok(None) => {
+                notes.push(format!("{subject}: .att: none"));
+                return Ok(None);
+            }
+            Err(e) => {
+                notes.push(format!("{subject}: .att: {}", e.detail()));
+                return Ok(None);
+            }
+        };
+        let manifest = Digest::of(&fetched.bytes);
+        let artifact = match parse_artifact(&fetched, self.limits) {
+            Ok(artifact) => artifact,
+            Err(why) => {
+                notes.push(format!("{subject}: .att {manifest}: {why}"));
+                return Ok(None);
+            }
+        };
+        self.keep_absent(&manifest, &fetched)?;
+        let listed = artifact.layers.len();
+        if listed > MAX_SIGNATURES {
+            notes.push(format!(
+                "{subject}: .att {manifest}: {listed} layers, more than {MAX_SIGNATURES}"
+            ));
+            return Ok(None);
+        }
+        let mut reasons = Vec::new();
+        let mut candidates = 0;
+        for (i, layer) in artifact.layers.iter().enumerate() {
+            let candidate = layer.descriptor.media_type == DSSE_ENVELOPE_MEDIA_TYPE
+                && annotation(&layer.annotations, PREDICATE_TYPE_ANNOTATION)
+                    .is_some_and(|p| self.trust.predicate_types().iter().any(|t| t == p));
+            if !candidate {
+                continue;
+            }
+            candidates += 1;
+            // A second layer with the same envelope reads the kept copy.
+            let envelope = match self.blob(&layer.descriptor, MAX_BUNDLE_BYTES) {
+                Ok(envelope) => envelope,
+                Err(Fault::Store(e)) => return Err(e),
+                Err(Fault::Registry(e)) => {
+                    reasons.push(format!("layer {i}: {}", e.detail()));
+                    continue;
+                }
+            };
+            let pairs = pairs(&layer.annotations);
+            match Evidence::from_cosign_attestation(&pairs, &envelope.bytes)
+                .and_then(|e| verify(&e, subject.bytes(), self.trust))
+            {
+                Ok(_) => {
+                    return Ok(Some(Pointer::Attestation {
+                        manifest,
+                        envelope: layer.descriptor.digest,
+                    }));
+                }
+                Err(refusal) => reasons.push(format!("layer {i}: {refusal}")),
+            }
+        }
+        notes.push(format!(
+            "{subject}: .att {manifest}: {listed} listed, {candidates} candidates{}",
             parenthesized(&reasons)
         ));
         Ok(None)
@@ -809,9 +926,10 @@ mod tests {
     /// the whole documents parse.
     #[test]
     fn truncated_inputs_never_panic() {
-        let manifests: [&[u8]; 2] = [
+        let manifests: [&[u8]; 3] = [
             include_bytes!("../tests/data/chainguard-node.sig.json"),
             include_bytes!("../tests/data/cosign.referrer.json"),
+            include_bytes!("../tests/data/flux.att.json"),
         ];
         let listing: &[u8] = include_bytes!("../tests/data/cosign.referrers-tag.json");
         for doc in manifests {
@@ -851,6 +969,10 @@ mod tests {
                 manifest: digest(3),
                 bundle: digest(4),
             },
+            Pointer::Attestation {
+                manifest: digest(5),
+                envelope: digest(6),
+            },
         ] {
             let text = pointer.render();
             assert_eq!(Pointer::parse(text.as_bytes()), Some(pointer));
@@ -875,7 +997,9 @@ mod tests {
                 format!("{line} \n"),
                 text.replacen(' ', "  ", 1),
                 text.replacen("legacy", "Legacy", 1)
-                    .replacen("bundle", "Bundle", 1),
+                    .replacen("bundle", "Bundle", 1)
+                    .replacen("attest", "Attest", 1),
+                text.replacen("attest", "attestation", 1),
                 text.replacen("sha256:", "sha512:", 1),
                 upper,
                 format!("{line} {}\n", digest(5)),
@@ -896,6 +1020,16 @@ mod tests {
             .render(),
             format!("legacy {} {}\n", digest(1), digest(2))
         );
+        let attest = Pointer::Attestation {
+            manifest: digest(5),
+            envelope: digest(6),
+        };
+        assert_eq!(
+            attest.render(),
+            format!("attest {} {}\n", digest(5), digest(6))
+        );
+        assert_eq!(attest.render().len(), 151);
+        assert_eq!(attest.blobs(), [digest(5), digest(6)]);
     }
 
     fn artifact(json: &str, content_type: Option<&str>) -> Result<(), &'static str> {
@@ -970,6 +1104,10 @@ mod tests {
     #[test]
     fn pointer_file_lines_exact_and_capped() {
         use super::MAX_KEPT;
+        // Three carriers of 16 each (ADR-036); 48 lines of 151 bytes fit
+        // the read cap.
+        assert_eq!(MAX_KEPT, 48);
+        assert_eq!(MAX_KEPT * 151, 7_248);
         let lines: Vec<Pointer> = (0..MAX_KEPT as u8 + 1)
             .map(|n| Pointer::Bundle {
                 manifest: digest(n),

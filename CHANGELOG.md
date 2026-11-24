@@ -792,6 +792,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused under claims, and `boneli-oci` does not ask for the `.sig` tag of
   a rule with claims. A trust without claims behaves as before. Live test
   `provenance_claims_on_ghcr` (jq 1.8.2 on GHCR) in `oci-acceptance`.
+- SLSA v0.2 provenance in cosign attestations (#114, ADR-036, accepted):
+  under a trust with claims, `boneli-oci` asks for the tag
+  `sha256-<hex>.att` after the referrers found nothing, and
+  `boneli_sigstore::Evidence::from_cosign_attestation` reads a layer of it
+  (a DSSE envelope with cosign's certificate and Rekor annotations,
+  Statement v0.1 or v1), verified as a bundle is. A trust with claims may
+  list SLSA v1 and v0.2 (`SLSA_PROVENANCE_V02_PREDICATE`); with v0.2 it
+  needs an exact repository claim, or a repository prefix or `git+`
+  material that names an owner (`ConfigError::ClaimsWithoutSource`).
+  The v0.2 reader knows slsa-github-generator's container build type: the
+  builder ID, `configSource.uri` split into repository and ref, and
+  `materials`; non-empty workflow-dispatch inputs refuse
+  (`Refusal::WorkflowInputs`), `vars` are accepted unread. An attestation
+  under a trust without claims is refused (`AttestationNeedsClaims`), so
+  rules without claims send the requests they sent before. Pointer files
+  hold up to 48 lines and an `attest` kind. Rekor `intoto` entries are
+  refused (`EntryKind`, #118). Fulcio certificate claims (ADR-034) apply
+  to the `.att` leaf; their statement agreement refuses a v0.2 statement
+  (`UnknownBuildType`). Live test `provenance_v02_on_ghcr`
+  (flux-cli v2.4.0 on GHCR) in `oci-acceptance`.
 - Image references an agent chose (#105, ADR-032, accepted):
   `boneli_app::ImageOrigin` (`Operator` or `Agent`, no default),
   `ImageExemption` and `Pulled`. In `boneli-oci`, an agent's reference is

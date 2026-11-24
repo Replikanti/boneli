@@ -42,9 +42,16 @@ pub enum Refusal {
     /// The DSSE envelope has not exactly one signature, or another
     /// `payloadType` than in-toto's.
     DsseShape,
+    /// A cosign attestation's DSSE envelope is longer than
+    /// [`MAX_BUNDLE_BYTES`](crate::MAX_BUNDLE_BYTES).
+    EnvelopeTooLarge,
+    /// A cosign attestation's DSSE envelope is not JSON of the envelope's
+    /// shape, or its payload is not canonical base64.
+    MalformedEnvelope,
     /// The DSSE payload is not an in-toto statement.
     MalformedStatement,
-    /// The statement's `_type` is not in-toto Statement v1.
+    /// The statement's `_type` is not one the carrier admits: Statement v1
+    /// in a bundle, v0.1 or v1 in a cosign attestation.
     StatementType,
     /// The statement's predicate type is not on the trust's list.
     PredicateType,
@@ -94,12 +101,18 @@ pub enum Refusal {
     /// The rule has provenance claims and the evidence is a cosign
     /// simple-signing layer, which carries none (ADR-031).
     NotProvenance,
-    /// The SLSA v1 predicate lacks a field the reader models, or one has
-    /// the wrong type.
+    /// The evidence is a cosign attestation and the rule has no provenance
+    /// claims (ADR-036).
+    AttestationNeedsClaims,
+    /// The SLSA predicate lacks a field the reader models, or one has the
+    /// wrong type.
     MalformedProvenance,
-    /// The statement names GitHub's build type with an external
-    /// parameter that type does not define.
+    /// The statement names a known build type with a parameter or
+    /// invocation member that type does not define.
     UnknownParameters,
+    /// The SLSA v0.2 statement of the container generator records
+    /// non-empty workflow-dispatch inputs (ADR-036, D1).
+    WorkflowInputs,
     /// The rule has a repository or ref claim and the statement's build
     /// type is not one whose source the reader knows.
     UnknownBuildType,
@@ -126,8 +139,10 @@ impl fmt::Display for Refusal {
             Refusal::BundleVersion => "the bundle is not a Sigstore bundle v0.3",
             Refusal::MessageSignature => "the bundle holds a message signature, not DSSE",
             Refusal::DsseShape => "the DSSE envelope is not one in-toto signature",
+            Refusal::EnvelopeTooLarge => "the DSSE envelope is too large",
+            Refusal::MalformedEnvelope => "the DSSE envelope is malformed",
             Refusal::MalformedStatement => "the in-toto statement is malformed",
-            Refusal::StatementType => "the payload is not an in-toto statement v1",
+            Refusal::StatementType => "the payload is not an in-toto statement of an accepted type",
             Refusal::PredicateType => "the predicate type is not trusted",
             Refusal::SubjectMismatch => "the signature is not over this digest",
             Refusal::NoTrustedKey => "no trusted key verifies the signature",
@@ -157,9 +172,15 @@ impl fmt::Display for Refusal {
             Refusal::NotProvenance => {
                 "the rule requires SLSA provenance claims, which a simple-signing signature does not carry"
             }
+            Refusal::AttestationNeedsClaims => {
+                "a cosign attestation counts only under a rule with provenance claims"
+            }
             Refusal::MalformedProvenance => "the SLSA provenance predicate is malformed",
             Refusal::UnknownParameters => {
                 "the provenance has external parameters its build type does not define"
+            }
+            Refusal::WorkflowInputs => {
+                "the provenance records workflow inputs, which can change what was built"
             }
             Refusal::UnknownBuildType => {
                 "the provenance's build type is not one whose source the rule can read"
@@ -223,8 +244,8 @@ pub enum ConfigError {
     ClaimPrefixWithoutBoundary,
     /// A material digest is empty or not lower-case hex.
     MaterialDigestNotHex,
-    /// A trust with claims does not list exactly the SLSA provenance v1
-    /// predicate type.
+    /// A trust with claims lists a predicate type other than SLSA
+    /// provenance v1 and v0.2, one of them twice, or none.
     ClaimsPredicateTypes,
     /// Certificate claims list no build trigger (ADR-034).
     TriggersEmpty,
@@ -244,6 +265,11 @@ pub enum ConfigError {
     /// A workflow-path rule is set with neither a source repository rule
     /// (1.12) nor a repository ID (1.15).
     WorkflowPathWithoutRepository,
+    /// A trust with claims lists SLSA provenance v0.2 and no claim names an
+    /// owner: neither an exact repository, nor a repository prefix of at
+    /// least `<scheme>://<host>/<owner>/`, nor a `git+` repository material
+    /// whose repository names one (ADR-036, item 4).
+    ClaimsWithoutSource,
 }
 
 impl fmt::Display for ConfigError {
@@ -274,7 +300,10 @@ impl fmt::Display for ConfigError {
             ConfigError::ClaimPrefixWithoutBoundary => "a claim prefix does not end in /",
             ConfigError::MaterialDigestNotHex => "a material digest is not lower-case hex",
             ConfigError::ClaimsPredicateTypes => {
-                "a trust with claims must list exactly the SLSA provenance v1 predicate type"
+                "a trust with claims must list SLSA provenance v1 or v0.2, each at most once, and nothing else"
+            }
+            ConfigError::ClaimsWithoutSource => {
+                "a trust that lists SLSA provenance v0.2 needs an exact source repository, or a repository prefix or material that names an owner"
             }
             ConfigError::TriggersEmpty => "certificate claims list no trigger",
             ConfigError::RepositoryIdNotDecimal => {

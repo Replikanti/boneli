@@ -262,7 +262,9 @@ against the statement as filed (Fulcio's certificate extensions follow in
 - cosign `.att` and SLSA v0.2, where the isolated-builder (L3) provenance
   of `slsa-github-generator` lives, are not read, so claims cannot be
   checked where they would mean the most (1 of the 20 measured
-  repositories). Closure: #114.
+  repositories). Closure: #114. ADR-036 closes it for slsa-github-generator's
+  container build type and widens item 1's predicate list to SLSA v1 and
+  v0.2.
 - The ref and the source commit say which code a run built only for the
   triggers listed in item 4 (`push`, `release`, `pull_request`,
   `workflow_dispatch`, `schedule`), and only when the steps build the

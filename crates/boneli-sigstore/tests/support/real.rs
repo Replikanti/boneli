@@ -222,3 +222,107 @@ pub const CHAINGUARD_REPOSITORY: &str = "https://github.com/chainguard-images/im
 pub const CHAINGUARD_REF: &str = "refs/heads/main";
 pub const CHAINGUARD_TRIGGER: &str = "push";
 pub const CHAINGUARD_REPOSITORY_ID: &str = "563510952";
+
+// ---- SLSA provenance v0.2 in cosign `.att` (ADR-036) ---------------------
+
+pub const FLUX_ATT: &[u8] = include_bytes!("../data/flux-cli-2.4.0.att.json");
+pub const FLUX_ENVELOPE: &[u8] = include_bytes!("../data/flux-cli-2.4.0.envelope.json");
+pub const FLUX_273_ATT: &[u8] = include_bytes!("../data/flux-cli-2.7.3.att.json");
+pub const FLUX_273_ENVELOPE: &[u8] = include_bytes!("../data/flux-cli-2.7.3.envelope.json");
+pub const ARGOCD_ATT: &[u8] = include_bytes!("../data/argocd-2.10.0.att.json");
+pub const ARGOCD_ENVELOPE: &[u8] = include_bytes!("../data/argocd-2.10.0.envelope.json");
+
+/// The SHA-256 of the captured `.att` manifests and envelopes, as
+/// `tests/data/README.md` lists them.
+pub const FLUX_ATT_SHA256: [u8; 32] =
+    hex32("467ee9c3451f2f8d7a9f0e9c34eaaf11798ecfa8061d985a828450185b9f7ac5");
+pub const FLUX_ENVELOPE_SHA256: [u8; 32] =
+    hex32("f12badd94a7463a534fb297d33d0d5c276a62efda34811b285f637a156be214b");
+pub const FLUX_273_ATT_SHA256: [u8; 32] =
+    hex32("c3da921964eaf4a7c0ef8904d58d227653a89a6e69bf43206a7f1e67ec8bffb7");
+pub const FLUX_273_ENVELOPE_SHA256: [u8; 32] =
+    hex32("fa11fca232195ae71e8388cc26fe9642746b39e992f2b36f9772e4b7b93f2d67");
+pub const ARGOCD_ATT_SHA256: [u8; 32] =
+    hex32("954ee0e643ac0c7a5e28b7297849469602c983f4de910766f8daace4c776d1b9");
+pub const ARGOCD_ENVELOPE_SHA256: [u8; 32] =
+    hex32("cd15fe3cca5f6b94aba70a1f60d710de838f83f9c136f34e4d4cf19622478294");
+
+/// `ghcr.io/fluxcd/flux-cli` v2.4.0's and v2.7.3's index digests, and
+/// `quay.io/argoproj/argocd` v2.10.0's: the statements' subjects.
+pub const FLUX_DIGEST: [u8; 32] =
+    hex32("a9cb966cddc1a0c56dc0d57dda485d9477dd397f8b45f222717b24663471fd1f");
+pub const FLUX_273_DIGEST: [u8; 32] =
+    hex32("334f73637220fe587fcc8439f35a841c92c44d4695895fd04c77731bd418f14e");
+pub const ARGOCD_DIGEST: [u8; 32] =
+    hex32("13cdc24e2218bb74fe6ec988c8045c7afc3043f24601e33b20ee78b787440baa");
+
+/// slsa-github-generator's container workflow at v2.0.0: the SAN of the
+/// flux-cli v2.4.0 certificate and its statement's `builder.id`.
+pub const GENERATOR_V200: &str = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.0.0";
+/// The same workflow at any tag, as an identity prefix.
+pub const GENERATOR_PREFIX: &str = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/";
+pub const FLUX_REPOSITORY: &str = "https://github.com/fluxcd/flux2";
+pub const FLUX_REF: &str = "refs/tags/v2.4.0";
+pub const FLUX_MATERIAL: &str = "git+https://github.com/fluxcd/flux2@refs/tags/v2.4.0";
+pub const FLUX_COMMIT: &str = "5350425cdcd5fa015337e09fa502153c0275bd4b";
+pub const FLUX_273_MATERIAL: &str = "git+https://github.com/fluxcd/flux2@refs/tags/v2.7.3";
+pub const FLUX_273_COMMIT: &str = "b6e76ca2534f76dcb8dd94fb057cdfa923c3b641";
+pub const ARGOCD_REPOSITORY: &str = "https://github.com/argoproj/argo-cd";
+
+/// Rekor's integrated time and log index of the two `dsse` entries.
+pub const FLUX_INTEGRATED: u64 = 1_727_714_974;
+pub const FLUX_LOG_INDEX: u64 = 135_502_222;
+pub const FLUX_273_INTEGRATED: u64 = 1_761_669_969;
+pub const FLUX_273_LOG_INDEX: u64 = 649_299_369;
+
+/// The evidence of the first layer of an `.att` manifest and its envelope.
+pub fn attestation(manifest: &[u8], envelope: &[u8]) -> Result<Evidence, boneli_sigstore::Refusal> {
+    Evidence::from_cosign_attestation(&pairs(&annotations(manifest)), envelope)
+}
+
+pub fn flux() -> Evidence {
+    attestation(FLUX_ATT, FLUX_ENVELOPE).expect("flux-cli v2.4.0 attestation")
+}
+
+pub fn flux_273() -> Evidence {
+    attestation(FLUX_273_ATT, FLUX_273_ENVELOPE).expect("flux-cli v2.7.3 attestation")
+}
+
+pub fn argocd() -> Evidence {
+    attestation(ARGOCD_ATT, ARGOCD_ENVELOPE).expect("argocd v2.10.0 attestation")
+}
+
+/// The in-toto statement flux-cli v2.4.0's envelope signs, parsed.
+pub fn flux_statement() -> Value {
+    let envelope = json(FLUX_ENVELOPE);
+    let payload = envelope
+        .get("payload")
+        .and_then(Value::as_str)
+        .expect("payload");
+    json(&boneli_sigstore::base64::decode(payload.as_bytes()).expect("base64"))
+}
+
+/// A keyless trust over the public-good root for `identity`, with the
+/// SLSA v0.2 predicate type only.
+pub fn slsa_v02_keyless(identity: Identity) -> Trust {
+    Trust::new(
+        Vec::new(),
+        Some((public_good(), vec![identity])),
+        vec![boneli_sigstore::SLSA_PROVENANCE_V02_PREDICATE.to_owned()],
+    )
+    .expect("trust")
+}
+
+/// The generator's exact SAN at v2.0.0.
+pub fn generator_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(GENERATOR_V200.to_owned())).expect("identity")
+}
+
+/// The generator's SAN at any tag.
+pub fn generator_prefix_identity() -> Identity {
+    Identity::new(
+        GITHUB_ACTIONS,
+        SanRule::UriPrefix(GENERATOR_PREFIX.to_owned()),
+    )
+    .expect("identity")
+}
