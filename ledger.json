@@ -1363,16 +1363,16 @@
    "title": "boneli-oci: force Required for image references an agent chose",
    "epic": null,
    "order": 52,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "8009a7a8",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T04:20:21+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T04:20:35+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1389,16 +1389,16 @@
    "title": "boneli-sigstore: check SLSA provenance predicate claims (builder, source, materials) under Required",
    "epic": null,
    "order": 53,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "88ef9d69",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T04:20:21+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T04:20:35+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1415,16 +1415,16 @@
    "title": "boneli-sigstore: TUF client that keeps the operator's trusted_root.json current",
    "epic": null,
    "order": 54,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "7ee136eb",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T04:20:21+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T04:20:35+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1488,30 +1488,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T22:18:23+00:00",
-   "issue": 94,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "3ebab419",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T22:33:38+00:00",
-   "issue": 80,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "f11746bb",
-   "note": null
-  },
-  {
-   "at": "2026-11-20T22:42:44+00:00",
-   "issue": 93,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "17f7a4ac",
-   "note": null
-  },
   {
    "at": "2026-11-20T22:49:27+00:00",
    "issue": 56,
@@ -1887,6 +1863,30 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-24T04:20:35+00:00",
+   "issue": 105,
+   "from": "ready",
+   "to": "claimed",
+   "by": "8009a7a8",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T04:20:35+00:00",
+   "issue": 104,
+   "from": "ready",
+   "to": "claimed",
+   "by": "88ef9d69",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T04:20:35+00:00",
+   "issue": 103,
+   "from": "ready",
+   "to": "claimed",
+   "by": "7ee136eb",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1920,7 +1920,7 @@
   109
  ],
  "xopen": [],
- "updated_at": "2026-11-24T04:20:21+00:00",
+ "updated_at": "2026-11-24T04:20:35+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
