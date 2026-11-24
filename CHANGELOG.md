@@ -792,7 +792,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused under claims, and `boneli-oci` does not ask for the `.sig` tag of
   a rule with claims. A trust without claims behaves as before. Live test
   `provenance_claims_on_ghcr` (jq 1.8.2 on GHCR) in `oci-acceptance`.
-- SLSA v0.2 provenance in cosign attestations (#114, ADR-036, proposed):
+- SLSA v0.2 provenance in cosign attestations (#114, ADR-036, accepted):
   under a trust with claims, `boneli-oci` asks for the tag
   `sha256-<hex>.att` after the referrers found nothing, and
   `boneli_sigstore::Evidence::from_cosign_attestation` reads a layer of it

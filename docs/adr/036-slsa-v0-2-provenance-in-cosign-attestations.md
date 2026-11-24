@@ -1,6 +1,6 @@
 # ADR-036: SLSA v0.2 provenance in cosign attestations
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -335,7 +335,7 @@ fixtures refuse with the claim named), and the `oci-acceptance` run on
 the PR for #114 passes `network::provenance_v02_on_ghcr` and
 `network::provenance_claims_on_ghcr` on x86_64 and arm64.
 
-**Result (2026-11-24, before the `oci-acceptance` run).** The known
+**Result (2026-11-24).** The known
 answers pass: flux-cli v2.4.0 (index `sha256:a9cb966c…3471fd1f`) and
 v2.7.3 (`sha256:334f7363…d418f14e`, non-empty `vars`) verify against the
 committed public-good root and meet their claims, argocd v2.10.0 is
@@ -351,4 +351,11 @@ and is killed by a test added for it. Live on x86_64 (local run):
 `.att sha256:467ee9c3…5b9f7ac5: 1 listed, 1 candidates (layer 0: the
 provenance's source repository does not meet the rule)`, the `.sig` not
 examined and no layer committed; `provenance_claims_on_ghcr` still
-passes, its refused pull now noting `.att: none` for both subjects.
+passes, its refused pull now noting `.att: none` for both subjects. The
+`oci-acceptance` run on the PR (run 45454495884) passes
+`provenance_v02_on_ghcr` on x86_64 (flux-cli in 10.7 s) and arm64
+(9.3 s), next to `provenance_claims_on_ghcr`, `signatures_on_docker_hub`,
+`signatures_elsewhere` and `node_and_postgres_run_in_sandbox`; its first
+x86_64 attempt failed in `signatures_elsewhere` on a connection timeout
+to `ghcr.io` during the cosign pull, a rule without claims whose
+requests this change leaves as they were, and the rerun passed.
