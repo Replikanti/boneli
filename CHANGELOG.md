@@ -736,6 +736,24 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `pause:3.10` and Chainguard `node` signatures against Sigstore's
   public-good chain and CT log. The DER reader moved from
   `src/revocation/der.rs` to `src/der.rs`. No new crate or edge.
+- `boneli-sigstore` (part 2 of #57, ADR-029, proposed): a new support
+  crate on `boneli-https` and `boneli-json`, without an external crate,
+  that verifies Sigstore image signatures offline. `Evidence` reads a
+  cosign simple-signing layer (annotations and payload, at most
+  `MAX_PAYLOAD_BYTES`, 65,536 bytes) or a Sigstore bundle v0.3 with a
+  DSSE in-toto statement (at most `MAX_BUNDLE_BYTES`, 4 MiB);
+  `TrustedRoot::from_json` reads `trusted_root.json` (at most 1 MiB; log
+  IDs recomputed, `keyDetails` checked, duplicates and reversed windows
+  refused, Rekor v2 logs left out); `Identity` is an exact OIDC issuer
+  with an exact email, an exact URI or a URI prefix ending in `/`;
+  `verify` checks the signed digest and predicate type, then a trusted
+  key, or the Fulcio chain at Rekor's integrated time, an embedded SCT,
+  the Rekor v1 SET over JCS bytes built here and the entry body, and the
+  identity. Refusals are fixed reasons. Known answers: the Kubernetes
+  `pause:3.10` and Chainguard `node` keyless signatures and cosign
+  `latest`'s keyed bundle against Sigstore's public-good root and
+  cosign's release key. Registered in `roles.support`; no new external
+  edge.
 
 ### Changed
 

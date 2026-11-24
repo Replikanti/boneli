@@ -92,8 +92,8 @@ Measured on 2026-11-20 through the anonymous registry API (and on
 ## Decision
 
 The decisions of STOP 1 (S1 to S6), all as recommended, then what each
-of the three PRs of #57 builds. PR 1 builds item 7 and the limits it
-names; items 8 and 9 follow in PR 2 and PR 3, and this ADR becomes
+of the three PRs of #57 builds. PR 1 builds item 7 and PR 2 item 8, each
+with the limits it names; item 9 follows in PR 3, and this ADR becomes
 `accepted` in PR 3 after the acceptance run.
 
 1. **What counts as a signature (S1).** cosign's legacy `.sig` tag with
@@ -117,14 +117,24 @@ names; items 8 and 9 follow in PR 2 and PR 3, and this ADR becomes
    root is `trusted_root.json` supplied by the operator as bytes, with no
    embedded copy and no TUF client. An identity is the OIDC issuer,
    matched exactly, plus the SAN: an exact email, an exact URI, or a URI
-   prefix that ends in `/` or `@`; no regex. Rekor v2 entries and
-   TSA-only time are refused (follow-up). Basis: a Fulcio leaf lives 10
+   prefix that ends in `/`; no regex. Rekor v2 entries and TSA-only
+   time are refused (follow-up). Basis: a Fulcio leaf lives 10
    minutes (both measured leaves), so its validity can only be checked at
    the log's time, never at the wall clock; every measured 2026 signature
    is in Rekor v1 with a SET; Fulcio's documented SAN form for GitHub
    workflows is `<workflow>@<ref>`, so a workflow that releases from tags
    gets a SAN ending in `@refs/tags/<version>`, and exact matching alone
-   would need a policy edit for every release.
+   would need a policy edit for every release. **Changed at review of PR
+   2 (operator decision):** STOP 1 accepted `/` or `@` as the prefix
+   boundary; `@` is dropped. A prefix ending in `@` (`…/release.yaml@`)
+   trusts every ref the workflow can run at, any branch, any commit SHA
+   and `refs/pull/N/merge`, so anyone who may push a branch to the
+   repository could add `id-token: write` on that branch and sign as the
+   release workflow: the SAN is the `job_workflow_ref` of GitHub's OIDC
+   token, which names the ref the job ran at. Tag releases are covered by `…@refs/tags/`, which ends in
+   `/`, and a protected branch by its exact SAN (`…@refs/heads/main`);
+   `…@refs/heads/` trusts every branch and has to be written out on
+   purpose.
 
 3. **Where the code lives (S3).** The ring- and webpki-backed primitives
    go into `boneli-https`, where ring already is (ADR-005, ADR-009 D6,
@@ -206,12 +216,100 @@ names; items 8 and 9 follow in PR 2 and PR 3, and this ADR becomes
      unchanged but for `read_tlv`, wider visibility of three tag
      constants and a test-only time encoder shared with the OCSP tests.
 
-8. **The Sigstore formats (PR 2)**, in `boneli-sigstore`: strict base64
-   and RFC 3339 readers, `TrustedRoot::from_json` (log IDs recomputed from
-   the keys, duplicates and reversed windows refused), identities,
-   DSSE/in-toto, cosign simple signing, bundles v0.3, Rekor SETs over
-   JCS bytes we build ourselves, and `verify` with fixed `Refusal`
-   reasons that echo no certificate, SAN or payload text.
+8. **The Sigstore formats (PR 2)**, in the support crate `boneli-sigstore`
+   (dependencies `boneli-https` and `boneli-json`, no external crate).
+   Every reader is strict where its output decides, and every refusal is
+   a fixed `Refusal` or `ConfigError` reason that echoes no certificate,
+   SAN, key or payload text.
+   - **Encodings.** Base64 of RFC 4648 section 4 with padding, canonical
+     trailing bits and nothing outside the alphabet, so every value has
+     one encoding and the SET's rebuilt bytes equal the input. RFC 3339
+     only as `YYYY-MM-DDTHH:MM:SS[.f{1,9}]Z` from 1970 on, no leap second;
+     a sub-millisecond fraction rounds a window's start up and its end
+     down. Digests and log IDs in lower-case hex only. Certificates in
+     annotations and Rekor bodies only as Go's `pem.Encode` writes them
+     (one `CERTIFICATE` block, `\n`, lines of at most 64). Integers: JSON
+     numbers in cosign's annotation, protobuf int64 strings in canonical
+     decimal in bundles, both from 0 to `i64::MAX` (Rekor's type).
+   - **`TrustedRoot::from_json`.** Media type
+     `application/vnd.dev.sigstore.trustedroot+json;version=0.1` byte for
+     byte; `tlogs`, `certificateAuthorities` and `ctlogs` (absent means
+     empty, as protobuf JSON omits empty lists); `timestampAuthorities`,
+     `baseUrl`, `uri` and `subject` are not read. Each log: `hashAlgorithm`
+     `SHA2_256`, a key `PublicKey` supports, `keyDetails` naming that key's
+     kind, `validFor.start` required. A CA: its chain, the last
+     certificate the anchor and the others the only intermediates, and
+     its window. No log ID twice across Rekor and CT logs, no reversed
+     window. **Learned in PR 2:** the public-good root's Rekor v2 log
+     (`log2025-1`) carries its signed-note key ID as `logId.keyId`, not
+     the SHA-256 of its key, so a Rekor log whose `keyId` is not that
+     hash is read, checked and left out (a v2 log issues no SET, and
+     entries are looked up by the SHA-256 of the key, never by the file's
+     `keyId`); a CT log with such a `keyId` refuses the file, because RFC
+     6962 defines the log ID so. A left-out key still counts for the
+     duplicate check, so the same key once kept and once left out is
+     refused like any duplicate (review of PR 2; the public-good root has
+     no such pair and reads). A key of a kind `PublicKey` does not
+     support refuses the whole file: the operator keeps the file that
+     worked.
+   - **Identities.** Issuer and SAN text non-empty and from `!` to `~`; a
+     `UriPrefix` ends in `/` (S2, `@` dropped at review); byte-exact
+     matching, an email rule never matches a URI SAN and the reverse.
+   - **cosign layers** (`Evidence::from_cosign_layer`): the signature
+     annotation required, the certificate optional (absent or empty is a
+     keyed signature), the Rekor bundle annotation optional; a key the
+     reader uses that occurs twice refuses the layer; the chain annotation
+     is never read. The payload: at most `MAX_PAYLOAD_BYTES`,
+     `critical.type` exact, `critical.image.docker-manifest-digest` exact
+     form.
+   - **Bundles** (`Evidence::from_bundle`): media type
+     `application/vnd.dev.sigstore.bundle.v0.3+json` only; a
+     `messageSignature` is refused; exactly one of `certificate` and
+     `publicKey` (whose hint is not read, so it cannot pick a key);
+     `x509CertificateChain`, the v0.1/v0.2 field, is refused as a version
+     mismatch rather than ignored, so a chain sent along is never parsed;
+     DSSE with in-toto's payload type and exactly one signature over PAE;
+     an in-toto Statement v1 whose subjects match by `digest.sha256`; each
+     log entry's `kindVersion` must name its body's kind and version, as
+     sigstore-go requires.
+   - **Rekor v1** (`rekor.rs`). The SET is verified under the key of the
+     root's Rekor log whose key SHA-256 is the entry's log ID, inside
+     that log's window, over the JCS bytes
+     `{"body":…,"integratedTime":…,"logID":…,"logIndex":…}` that we build
+     from validated parts; the real Kubernetes, Chainguard and cosign
+     entries verify (`jcs_matches_rekor`). The body must say what the
+     evidence says, field by field as sigstore-go's `VerifyTlogEntry`
+     compares Rekor v1 entries: `hashedrekord` 0.0.1 for a cosign layer
+     (SHA-256 of the payload, the signature, the certificate DER) and
+     `dsse` 0.0.1 for a bundle (SHA-256 of the DSSE payload, exactly one
+     signature with the certificate as verifier). The `dsse` body's
+     `envelopeHash` is not checked: Rekor hashed the envelope as cosign
+     submitted it, and the bundle carries no copy of those bytes.
+   - **`verify(evidence, subject, trust)`.** What is signed first: the
+     payload's digest, or the statement's predicate type on the trust's
+     list and one subject naming the digest. Then any trusted key that
+     verifies the signature over the signed bytes passes (keyed). A
+     keyless candidate needs a certificate, exactly one log entry with an
+     inclusion promise, an integrated time that fits milliseconds in a
+     `u64`, the Rekor check above, a CA whose window holds the integrated
+     time and whose chain webpki verifies the certificate through at that
+     time (overlapping windows: any such CA), an embedded SCT from a CT
+     log of the root, the certificate's key verifying the signature,
+     exactly one SAN, the issuer from 1.3.6.1.4.1.57264.1.8 (a DER
+     UTF8String) else 1.1 (both present and different refused), and a
+     matching identity. `Trust::new` refuses a trust with neither keys nor
+     a keyless part, a keyless part without identities, and a predicate
+     type that is empty or not printable ASCII; an empty predicate list
+     admits cosign layers only.
+   - **Fixtures** (`crates/boneli-sigstore/tests/data/README.md`):
+     captured again on 2026-11-24 with the same SHA-256 for both `.sig`
+     manifests and `trusted_root.json` as on 2026-11-20 and 2026-11-23;
+     cosign's `latest` is now v3.1.4 (index `sha256:0f061548…`), its first
+     bundle referrer a keyed DSSE whose key hint is the SHA-256 of
+     `release-cosign.pub`'s SPKI (checked). The synthetic instance (RSA
+     root, intermediate with the Code Signing EKU, Fulcio-shaped leaves
+     with issuer extensions and SCTs, test CT log and Rekor) is built at
+     test time and signed with `RsaSha256Key`.
 
 9. **Discovery and policy (PR 3)**, in `boneli-oci`: the `.sig` tag, the
    referrers API with the tag-schema fallback (only on 404), the strict
@@ -267,7 +365,9 @@ the digest binds the bytes and mirrors are legitimate.
   that. Peak memory is D12's, about 16.5 MiB, one document at a time.
   Lower refuses provenance with large material lists; higher only costs
   memory. SBOM referrers are never fetched, because the predicate filter
-  comes first.
+  comes first. The JSON documents nested in one (the in-toto statement,
+  a Rekor entry body, cosign's bundle annotation) are read under the
+  same three limits: each is part of a document of at most that size.
 - **Trusted root: at most 1,048,576 B, depth 16, 65,536 values (PR 2).**
   Measured 6,787 B, depth 7, 85 values. It grows by about 1 KB per rotated
   key or CA, so 1 MiB is 154 times today's size. Lower risks refusing a
@@ -299,11 +399,21 @@ the digest binds the bytes and mirrors are legitimate.
   `KeyKind`, `PublicKeyError`, `SignatureError`, `MAX_PUBLIC_KEY_PEM_LEN`,
   `verify_code_signing`, `CodeSigningCert`, `San`, `CtLog`, `CertError`
   and `SctError`, all with fixed algorithms and no switch to skip a check.
+- PR 2 adds the support crate `boneli-sigstore` (`roles.support` in
+  `tools/architecture.toml`) with edges to `boneli-https` and
+  `boneli-json` only, so the external graph is unchanged. It is pure: no
+  clock, file, network or thread, and the same bytes give the same
+  verdict forever.
 - We own a security-critical verifier. Mitigations: every check has a
   negative test and a mutant that a named test kills (PR 1: 23 mutants
-  over `keys.rs` and `codesign.rs`, all killed); the real Kubernetes and
-  Chainguard leaves are known answers against the public-good chain and
-  CT log; the reviewer runs on every PR.
+  over `keys.rs` and `codesign.rs`, all killed; PR 2: 73 mutants over
+  every check of `boneli-sigstore`, all killed, the one survivor of the
+  first run, PEM line length, by a test added for it); the real Kubernetes
+  and Chainguard leaves are known answers against the public-good chain
+  and CT log (PR 1), and the whole Kubernetes and Chainguard keyless
+  signatures and cosign's keyed bundle pass `verify` against the
+  public-good root and cosign's release key (PR 2); the reviewer runs on
+  every PR.
 - Rebuilt bytes can only cause refusals: the precertificate TBS (PR 1)
   and the SET's JCS bytes (PR 2) feed a signature check, and the known
   answers prove that valid inputs pass. The readers whose output decides
@@ -314,9 +424,32 @@ the digest binds the bytes and mirrors are legitimate.
     and an `Off` rule under a `Required` prefix is an exemption by
     design. Forcing `Required` for references an agent chose is a
     follow-up issue (filed at STOP 1).
+  - A URI prefix trusts everyone who can run the workflow at a matching
+    ref. `…@refs/tags/` trusts whoever may push tags to the signer's
+    repository, `…@refs/heads/` whoever may push branches, and an org or
+    repository prefix ending in `/` every workflow and ref under it. A
+    prefix is as broad as the operator writes it: under the GitHub issuer
+    `https://github.com/` (or `https://`) trusts every repository on
+    GitHub, and nothing refuses such a rule. What
+    makes `@refs/tags/` mean "releases" is the signer's tag protection,
+    which boneli cannot see. It stays open by design: an operator who
+    needs less trust writes the exact SAN of a protected branch or of one
+    tag.
   - Rotation depends on the operator replacing `trusted_root.json`; a
     stale file refuses signatures from new logs or CAs, which fails
     closed. A TUF client is a follow-up issue (filed at STOP 1).
+  - A `trusted_root.json` that holds a key of a kind `PublicKey` does
+    not support, or any other defect, refuses the whole file (PR 2); the
+    one entry left out instead is a Rekor log whose `keyId` is not its
+    key's SHA-256 (a v2 log, item 8). Skipping unreadable entries would
+    hide an operator's mistake behind refusals that name no cause. If
+    Sigstore adds such a key, the operator keeps the previous file until
+    this crate supports the kind; signatures from the new log or CA are
+    refused meanwhile (fails closed).
+  - A keyless signature needs exactly one log entry with an inclusion
+    promise (PR 2). Every measured signature has one; a bundle with two
+    would make the integrated time ambiguous, so it is refused rather
+    than tried entry by entry.
   - A signer that moves to Rekor v2 or to TSA time is refused until the
     follow-up issue (filed at STOP 1) lands.
   - A SET is Rekor's signed promise, and boneli has no witness for it;
@@ -374,6 +507,10 @@ the digest binds the bytes and mirrors are legitimate.
   input would choose it.
 - **Exact SAN matching only.** Rejected: a tag-released workflow's SAN
   changes with every release.
+- **`@` as a prefix boundary** (accepted at STOP 1, dropped at the
+  review of PR 2 by the operator). Rejected: `…/release.yaml@` trusts every
+  ref of the workflow, branches, commit SHAs and pull request merge refs
+  included (item 2).
 
 ## Accept when
 
