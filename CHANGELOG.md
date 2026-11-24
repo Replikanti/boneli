@@ -779,6 +779,19 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence is gone. `open` refuses a rule for a registry the store does
   not pull from (`Error::InvalidPolicy`). Live tests on Docker Hub, GHCR,
   `cgr.dev` and Artifact Registry in `oci-acceptance`.
+- SLSA provenance claims (#104, ADR-031, accepted): a `boneli_sigstore::Trust` may
+  carry `Claims` (`Trust::with_claims`, only on a trust whose predicate
+  list is exactly SLSA provenance v1): an exact builder ID, a source
+  repository and ref (exact, or a prefix ending in `/` followed by a plain
+  path), and resolved dependencies by URI and one digest. Such a trust
+  admits only SLSA v1 statements that meet them, checked after the
+  signature: the predicate is read strictly (every modeled field of its
+  type, GitHub's build type with no undefined external parameter, another
+  build type refused for a repository or ref claim), matching is byte for
+  byte, and every refusal names its claim in fixed text. A cosign layer is
+  refused under claims, and `boneli-oci` does not ask for the `.sig` tag of
+  a rule with claims. A trust without claims behaves as before. Live test
+  `provenance_claims_on_ghcr` (jq 1.8.2 on GHCR) in `oci-acceptance`.
 
 ### Changed
 

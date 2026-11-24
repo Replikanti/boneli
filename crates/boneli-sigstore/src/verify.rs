@@ -21,6 +21,11 @@
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
 //!   and different is refused); and an identity matching issuer and SAN.
 //!
+//! - **Claims (ADR-031):** under a trust with [`Claims`], a cosign layer
+//!   is refused before any other check (it carries no provenance), and a
+//!   bundle whose signature passed must also meet the claims
+//!   (`provenance`). A trust without claims never reads the predicate.
+//!
 //! No step reads the wall clock: the only time is the log's, so the same
 //! inputs give the same verdict forever.
 
@@ -32,6 +37,7 @@ use boneli_https::{CertError, CodeSigningCert, PublicKey, verify_code_signing};
 use crate::dsse::Statement;
 use crate::error::{ConfigError, Refusal};
 use crate::identity::{Identity, printable};
+use crate::provenance::{self, Claims};
 use crate::rekor::{self, Expected, TlogEntry};
 use crate::root::TrustedRoot;
 
@@ -115,27 +121,33 @@ impl Evidence {
 }
 
 /// What a rule trusts: keys, a keyless part (a trusted root and the
-/// identities it may vouch for), and the predicate types a bundle's
-/// statement may have.
+/// identities it may vouch for), the predicate types a bundle's statement
+/// may have, and optionally the SLSA provenance claims it must meet
+/// (ADR-031).
 ///
-/// `Debug` shows the counts only.
+/// `Debug` shows the counts only, and `claims: true` when claims are set.
 #[derive(Clone)]
 pub struct Trust {
     keys: Vec<PublicKey>,
     keyless: Option<(Arc<TrustedRoot>, Vec<Identity>)>,
     predicate_types: Vec<String>,
+    claims: Option<Claims>,
 }
 
 impl fmt::Debug for Trust {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Trust")
-            .field("keys", &self.keys.len())
+        let mut out = f.debug_struct("Trust");
+        out.field("keys", &self.keys.len())
             .field(
                 "identities",
                 &self.keyless.as_ref().map_or(0, |(_, ids)| ids.len()),
             )
-            .field("predicate_types", &self.predicate_types.len())
-            .finish()
+            .field("predicate_types", &self.predicate_types.len());
+        // Named only when set, so a trust without claims reads as in #57.
+        if self.claims.is_some() {
+            out.field("claims", &true);
+        }
+        out.finish()
     }
 }
 
@@ -161,12 +173,33 @@ impl Trust {
             keys,
             keyless,
             predicate_types,
+            claims: None,
         })
     }
 
     /// The predicate types a bundle's statement may have.
     pub fn predicate_types(&self) -> &[String] {
         &self.predicate_types
+    }
+
+    /// This trust with SLSA provenance `claims` (ADR-031): it then admits
+    /// only SLSA v1 statements that meet them. Refused unless the predicate
+    /// list is exactly [`SLSA_PROVENANCE_V1_PREDICATE`]: a claim list next
+    /// to another predicate type could never be met by that type's
+    /// statements, and a cosign layer would carry none.
+    pub fn with_claims(self, claims: Claims) -> Result<Trust, ConfigError> {
+        if self.predicate_types != [SLSA_PROVENANCE_V1_PREDICATE] {
+            return Err(ConfigError::ClaimsPredicateTypes);
+        }
+        Ok(Trust {
+            claims: Some(claims),
+            ..self
+        })
+    }
+
+    /// The SLSA provenance claims, if any.
+    pub fn claims(&self) -> Option<&Claims> {
+        self.claims.as_ref()
     }
 }
 
@@ -194,6 +227,9 @@ pub enum Accepted {
 pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<Accepted, Refusal> {
     match &evidence.form {
         Form::Cosign { digest, .. } => {
+            if trust.claims.is_some() {
+                return Err(Refusal::NotProvenance);
+            }
             if digest != subject {
                 return Err(Refusal::SubjectMismatch);
             }
@@ -207,6 +243,17 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
             }
         }
     }
+    let accepted = signature(evidence, trust)?;
+    // Only a statement a trusted signer signed is read for its claims.
+    if let (Some(claims), Form::Bundle { payload, .. }) = (&trust.claims, &evidence.form) {
+        provenance::check(payload, claims)?;
+    }
+    Ok(accepted)
+}
+
+/// The signature checks of [`verify`], after the subject check: a trusted
+/// key, else the keyless path.
+fn signature(evidence: &Evidence, trust: &Trust) -> Result<Accepted, Refusal> {
     let message = evidence.message();
     let signature = evidence.signature();
     if let Some(key) = trust

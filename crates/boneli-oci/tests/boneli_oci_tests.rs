@@ -622,7 +622,10 @@ mod network {
         CONNECT_TIMEOUT, Dial, HANDSHAKE_TIMEOUT, IO_TIMEOUT, OciImageStore, PolicyRule, Registry,
         RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Stream, TlsDial,
     };
-    use boneli_sigstore::{COSIGN_SIGN_PREDICATE, Identity, SanRule, Trust, TrustedRoot};
+    use boneli_sigstore::{
+        COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, Identity, Material,
+        SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot,
+    };
     use boneli_sys::ExitStatus;
 
     use crate::support::TempDir;
@@ -1176,6 +1179,118 @@ mod network {
                     other => panic!("{name} must be refused: {other:?}"),
                 }
             }
+        }
+    }
+
+    /// `ghcr.io/jqlang/jq:1.8.2`, the index whose SLSA provenance ADR-031
+    /// measured and whose bundle the offline tests hold.
+    const JQ: &str = "sha256:b9c68867e5766576263a222e91db3de422d802069c7af70440e667a95344e486";
+
+    /// jq's keyless SLSA trust: its tag-release workflow by SAN prefix,
+    /// with the source repository `repository`, a tag ref and the release
+    /// commit as claims (ADR-031).
+    fn jq_provenance(repository: &str) -> Requirement {
+        let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+        let identity = Identity::new(
+            "https://token.actions.githubusercontent.com",
+            SanRule::UriPrefix(
+                "https://github.com/jqlang/jq/.github/workflows/ci.yml@refs/tags/".to_owned(),
+            ),
+        )
+        .expect("identity");
+        let claims = Claims::new(
+            None,
+            Some(ClaimMatch::Exact(repository.to_owned())),
+            Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+            vec![
+                Material::new(
+                    "git+https://github.com/jqlang/jq@refs/tags/jq-1.8.2",
+                    "gitCommit",
+                    "34f7186b86743a083a589741b6cea95293524108",
+                )
+                .expect("material"),
+            ],
+        )
+        .expect("claims");
+        Requirement::Required(Arc::new(
+            Trust::new(
+                Vec::new(),
+                Some((root, vec![identity])),
+                vec![SLSA_PROVENANCE_V1_PREDICATE.to_owned()],
+            )
+            .expect("trust")
+            .with_claims(claims)
+            .expect("with claims"),
+        ))
+    }
+
+    /// The acceptance of ADR-031 on GHCR: under a `Required` rule whose
+    /// trust has SLSA provenance claims, jq 1.8.2 pulls with every layer
+    /// committed (its GitHub artifact attestation, found through the tag
+    /// schema); under the same rule with another source repository it is
+    /// refused before any layer is committed, and the detail names the
+    /// claim.
+    #[test]
+    #[ignore = "network: pulls jqlang/jq from ghcr.io"]
+    fn provenance_claims_on_ghcr() {
+        let ghcr = Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("ghcr");
+        for repository in [
+            "https://github.com/jqlang/jq",
+            "https://github.com/jqlang/other",
+        ] {
+            let dial = recording();
+            let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+            config.registries = vec![Registry::docker_hub(), ghcr.clone()];
+            config.signatures = SignaturePolicy::new(
+                Requirement::Off,
+                vec![rule(
+                    "ghcr.io",
+                    RepoScope::Exact(Repository::parse("jqlang/jq").expect("repository")),
+                    jq_provenance(repository),
+                )],
+            )
+            .expect("policy");
+            let tmp = TempDir::new("network-provenance");
+            let root = tmp.path().join("store");
+            let store = OciImageStore::open(&root, config).expect("open");
+            if repository.ends_with("/jq") {
+                pull_signed(&store, &dial, "ghcr.io/jqlang/jq", JQ);
+                continue;
+            }
+            let refused = store.pull(&ImageRef {
+                name: "ghcr.io/jqlang/jq".to_owned(),
+                digest: JQ.to_owned(),
+                platform: platform().to_owned(),
+            });
+            println!(
+                "oci-acceptance provenance ghcr.io/jqlang/jq under another repository: {refused:?}"
+            );
+            match refused {
+                Err(ImageError::Failed { detail }) => {
+                    assert!(detail.starts_with("signature policy: "), "{detail}");
+                    assert!(
+                        detail
+                            .contains("the provenance's source repository does not meet the rule"),
+                        "{detail}"
+                    );
+                    assert!(detail.contains(".sig: not examined"), "{detail}");
+                }
+                other => panic!("jq must be refused: {other:?}"),
+            }
+            let committed = std::fs::read_dir(root.join("layers/sha256"))
+                .map(|dir| {
+                    dir.filter_map(Result::ok)
+                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(committed, 0, "a layer was committed");
         }
     }
 }

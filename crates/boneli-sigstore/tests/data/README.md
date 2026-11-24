@@ -17,6 +17,8 @@ so these are the signatures whose leaves boneli-https holds.
 | `chainguard-node.payload.json` | `c2be04e4…9f24936a` | its simple-signing payload (239 bytes) |
 | `cosign-latest.bundle.json` | `53aebb2c…d8d3ee9a` | the first Sigstore bundle v0.3 referrer of `ghcr.io/sigstore/cosign/cosign:latest` (index `sha256:0f061548…48f69c2d`, cosign v3.1.4), reached through the tag `sha256-<index hex>` (GHCR's referrers API answers 404): referrer manifest `sha256:9c257e53…8ebc439f`, bundle 4,537 bytes, keyed DSSE with predicate `https://sigstore.dev/cosign/sign/v1`, Rekor v1 `dsse` 0.0.1 entry 3341383598 |
 | `release-cosign.pub` | `f4cea466…4179f126` | cosign's release key, `release/release-cosign.pub` of `sigstore/cosign`; the SHA-256 of its SPKI is the bundle's `publicKey.hint` (`tests/verify.rs` checks it) |
+| `actions-runner.bundle.json` | `3a9ba514…37124876` | the SLSA provenance v1 bundle of `ghcr.io/actions/actions-runner` (index `sha256:6d0b2d80…b8c31300`, ADR-031), the one referrer listed by the tag `sha256-<index hex>`: referrer manifest `sha256:8a56a057…7c3ca515`, bundle 10,794 bytes, keyless GitHub artifact attestation (`docker-publish.yml@refs/heads/main`), Rekor v1 `dsse` 0.0.1 entry 3816483043, integrated time 1794424176; statement 1,026 bytes |
+| `jq-1.8.2.bundle.json` | `98860952…703ed018` | the SLSA provenance v1 bundle of `ghcr.io/jqlang/jq:1.8.2` (index `sha256:b9c68867…5344e486`, ADR-031), reached the same way: referrer manifest `sha256:07f60e20…c3855de3`, bundle 10,151 bytes, keyless (`ci.yml@refs/tags/jq-1.8.2`), Rekor v1 `dsse` 0.0.1 entry 1884124456, integrated time 1781962736; statement 964 bytes |
 
 From an empty directory, with `jq`:
 
@@ -46,11 +48,23 @@ curl -sSL -H "Authorization: Bearer $tok" -o cosign-latest.bundle.json \
   "$gh/blobs/$(jq -r '.layers[0].digest' referrer.json)"
 curl -sS -o release-cosign.pub \
   https://raw.githubusercontent.com/sigstore/cosign/main/release/release-cosign.pub
+slsa() { # repository, index digest, output
+  gh=https://ghcr.io/v2/$1
+  tok=$(curl -fsS "https://ghcr.io/token?scope=repository:$1:pull" | jq -r .token)
+  curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o referrers.json "$gh/manifests/sha256-$2"
+  curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o referrer.json \
+    "$gh/manifests/$(jq -r '[.manifests[] | select(.annotations["dev.sigstore.bundle.predicateType"] == "https://slsa.dev/provenance/v1")][0].digest' referrers.json)"
+  curl -sSL -H "Authorization: Bearer $tok" -o "$3" "$gh/blobs/$(jq -r '.layers[0].digest' referrer.json)"
+}
+slsa actions/actions-runner 6d0b2d80d80f143f77dcb676e50920100bbb547e39e883454d57f45ab8c31300 actions-runner.bundle.json
+slsa jqlang/jq b9c68867e5766576263a222e91db3de422d802069c7af70440e667a95344e486 jq-1.8.2.bundle.json
 ```
 
 Chainguard signs its images again from time to time and replaces the
 `.sig` tag, and `latest` moves with every cosign release; a later capture
-may differ, and these files then stay as they are.
+may differ, and these files then stay as they are. The two SLSA bundles
+attest fixed index digests, so a later capture gives the same bytes while
+GitHub keeps them; if it differs, the files and the hashes above stay.
 
 ## Synthetic test instance
 

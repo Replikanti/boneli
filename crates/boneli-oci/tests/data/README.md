@@ -11,7 +11,8 @@ later pull without a `Required` rule to it, byte for byte.
 ## Real captures (known answers)
 
 Captured on 2026-11-24 through the anonymous registry API. The digests
-are the ones ADR-029 measured on 2026-11-20; `sigstore-trusted-root.json`
+are the ones ADR-029 measured on 2026-11-20, and jq's the one ADR-031
+measured on 2026-11-24; `sigstore-trusted-root.json`
 and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 (same SHA-256), where their sources are listed.
 
@@ -30,6 +31,12 @@ and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 | `cosign.bundle.json` | `53aebb2c…d8d3ee9a` | its bundle (keyed DSSE, cosign's release key) |
 | `sigstore-trusted-root.json` | `6494e21e…e6bc0b66` | Sigstore's public-good `trusted_root.json` |
 | `release-cosign.pub` | `f4cea466…4179f126` | cosign's release key |
+| `jq.index.json` | `b9c68867…5344e486` | the index of `ghcr.io/jqlang/jq:1.8.2`, a Docker manifest list of 2,397 bytes (ADR-031) |
+| `jq.amd64.json` | `1e7ad54d…d119029a` | its `linux/amd64` manifest (Docker schema 2, 697 bytes) |
+| `jq.amd64-config.json` | `ac37bcf3…debd25be` | that manifest's config |
+| `jq.referrers-tag.json` | `1b9c2acf…3fc2ba60` | GHCR's answer to the tag `sha256-<index hex>` (the referrers API answers `404`, and so does the amd64 manifest's tag): one SLSA provenance v1 bundle referrer, 496 bytes |
+| `jq.referrer.json` | `07f60e20…c3855de3` | that referrer's manifest, 831 bytes |
+| `jq.bundle.json` | `98860952…703ed018` | its bundle: GitHub's keyless artifact attestation, the file `jq-1.8.2.bundle.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
 
 From an empty directory, with `jq`:
 
@@ -59,6 +66,20 @@ curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o cosign.referrer.js
   "$gh/manifests/$(jq -r '.manifests[0].digest' cosign.referrers-tag.json)"
 curl -sSL -H "Authorization: Bearer $tok" -o cosign.bundle.json \
   "$gh/blobs/$(jq -r '.layers[0].digest' cosign.referrer.json)"
+acc="$acc, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+gh=https://ghcr.io/v2/jqlang/jq
+tok=$(curl -fsS 'https://ghcr.io/token?scope=repository:jqlang/jq:pull' | jq -r .token)
+jd=b9c68867e5766576263a222e91db3de422d802069c7af70440e667a95344e486
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o jq.index.json "$gh/manifests/sha256:$jd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o jq.amd64.json \
+  "$gh/manifests/$(jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest' jq.index.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o jq.amd64-config.json \
+  "$gh/blobs/$(jq -r .config.digest jq.amd64.json)"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o jq.referrers-tag.json "$gh/manifests/sha256-$jd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o jq.referrer.json \
+  "$gh/manifests/$(jq -r '.manifests[0].digest' jq.referrers-tag.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o jq.bundle.json \
+  "$gh/blobs/$(jq -r '.layers[0].digest' jq.referrer.json)"
 ```
 
 ## Test keys

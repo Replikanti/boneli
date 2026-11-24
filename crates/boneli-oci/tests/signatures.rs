@@ -20,8 +20,9 @@ use boneli_oci::{
     SignaturePolicy, StoreConfig, Timeouts,
 };
 use boneli_sigstore::{
-    BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, IN_TOTO_PAYLOAD_TYPE, Identity,
-    SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE, SanRule, Trust, TrustedRoot, base64, pae,
+    BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, IN_TOTO_PAYLOAD_TYPE,
+    Identity, Material, SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE,
+    SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot, base64, pae,
 };
 
 use support::TempDir;
@@ -50,6 +51,12 @@ const COSIGN_REFERRERS: &[u8] = include_bytes!("data/cosign.referrers-tag.json")
 const COSIGN_REFERRER: &[u8] = include_bytes!("data/cosign.referrer.json");
 const COSIGN_BUNDLE: &[u8] = include_bytes!("data/cosign.bundle.json");
 const COSIGN_RELEASE_KEY: &[u8] = include_bytes!("data/release-cosign.pub");
+const JQ_INDEX: &[u8] = include_bytes!("data/jq.index.json");
+const JQ_AMD64: &[u8] = include_bytes!("data/jq.amd64.json");
+const JQ_CONFIG: &[u8] = include_bytes!("data/jq.amd64-config.json");
+const JQ_REFERRERS: &[u8] = include_bytes!("data/jq.referrers-tag.json");
+const JQ_REFERRER: &[u8] = include_bytes!("data/jq.referrer.json");
+const JQ_BUNDLE: &[u8] = include_bytes!("data/jq.bundle.json");
 
 const REPO: &str = "library/app";
 const GITHUB_ACTIONS: &str = "https://token.actions.githubusercontent.com";
@@ -200,6 +207,12 @@ fn sign_legacy(hub: &mut Hub, subject: &str, layers: &[String]) -> String {
 
 /// An in-toto statement v1 over `subjects` with `predicate`.
 fn statement(subjects: &[&str], predicate: &str) -> Vec<u8> {
+    statement_with_body(subjects, predicate, "{}")
+}
+
+/// An in-toto statement v1 over `subjects` with `predicate` and the
+/// predicate body `body` (JSON).
+fn statement_with_body(subjects: &[&str], predicate: &str, body: &str) -> Vec<u8> {
     let subjects: Vec<String> = subjects
         .iter()
         .map(|d| {
@@ -210,7 +223,7 @@ fn statement(subjects: &[&str], predicate: &str) -> Vec<u8> {
         })
         .collect();
     format!(
-        r#"{{"_type":"https://in-toto.io/Statement/v1","subject":[{}],"predicateType":"{predicate}","predicate":{{}}}}"#,
+        r#"{{"_type":"https://in-toto.io/Statement/v1","subject":[{}],"predicateType":"{predicate}","predicate":{body}}}"#,
         subjects.join(",")
     )
     .into_bytes()
@@ -2277,4 +2290,275 @@ fn sig_answer_never_replaces_a_kept_manifest() {
     let before = fake.seen().len();
     store.pull(&image_ref(repo, &digest)).expect("docker again");
     assert_eq!(fake.seen().len(), before, "the kept manifest was replaced");
+}
+
+// ---------------------------------------------------------------------
+// SLSA provenance claims (ADR-031)
+// ---------------------------------------------------------------------
+
+const JQ_REPO: &str = "jqlang/jq";
+const JQ_SAN_PREFIX: &str = "https://github.com/jqlang/jq/.github/workflows/ci.yml@refs/tags/";
+const JQ_SOURCE: &str = "https://github.com/jqlang/jq";
+const JQ_MATERIAL: &str = "git+https://github.com/jqlang/jq@refs/tags/jq-1.8.2";
+const JQ_COMMIT: &str = "34f7186b86743a083a589741b6cea95293524108";
+const ACME_SOURCE: &str = "https://github.com/acme/app";
+const ACME_BUILDER: &str =
+    "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main";
+
+/// jq 1.8.2's real index (a Docker manifest list), amd64 manifest and
+/// config, and GHCR's listing for the tag `sha256-<index hex>` with its
+/// one SLSA referrer and bundle (captured 2026-11-24). No layer blob: a
+/// layer request is answered `404`.
+fn jq_hub() -> Hub {
+    let mut hub = Hub::default();
+    hub.document(JQ_REPO, media::DOCKER_LIST, JQ_INDEX);
+    hub.document(JQ_REPO, media::DOCKER_MANIFEST, JQ_AMD64);
+    hub.document(JQ_REPO, media::MANIFEST, JQ_REFERRER);
+    hub.blob(JQ_REPO, JQ_CONFIG);
+    hub.blob(JQ_REPO, JQ_BUNDLE);
+    hub.tag(
+        JQ_REPO,
+        &tag_of(&digest_of(JQ_INDEX)),
+        media::INDEX,
+        JQ_REFERRERS,
+    );
+    hub
+}
+
+/// jq's keyless trust over the public-good root (its tag-release
+/// workflow by SAN prefix), SLSA only, with the claims of the plan and
+/// `repository` as the source-repository claim.
+fn jq_trust(repository: &str) -> Arc<Trust> {
+    let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+    let identity =
+        Identity::new(GITHUB_ACTIONS, SanRule::UriPrefix(JQ_SAN_PREFIX.to_owned())).expect("id");
+    let claims = Claims::new(
+        None,
+        Some(ClaimMatch::Exact(repository.to_owned())),
+        Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+        vec![Material::new(JQ_MATERIAL, "gitCommit", JQ_COMMIT).expect("material")],
+    )
+    .expect("claims");
+    Arc::new(
+        Trust::new(
+            Vec::new(),
+            Some((root, vec![identity])),
+            vec![SLSA_PROVENANCE_V1_PREDICATE.to_owned()],
+        )
+        .expect("trust")
+        .with_claims(claims)
+        .expect("with claims"),
+    )
+}
+
+/// A GitHub-shaped SLSA v1 statement over `subject` whose source
+/// repository is `repository`.
+fn slsa_statement(subject: &str, repository: &str) -> Vec<u8> {
+    let body = format!(
+        r#"{{"buildDefinition":{{"buildType":"https://actions.github.io/buildtypes/workflow/v1","externalParameters":{{"workflow":{{"ref":"refs/heads/main","repository":"{repository}","path":".github/workflows/release.yml"}}}},"resolvedDependencies":[]}},"runDetails":{{"builder":{{"id":"{ACME_BUILDER}"}}}}}}"#
+    );
+    statement_with_body(&[subject], SLSA_PROVENANCE_V1_PREDICATE, &body)
+}
+
+/// A referrer of `subject` holding a keyed SLSA bundle by `signer` whose
+/// source is `repository`; returns its listing entry.
+fn slsa_referrer(hub: &mut Hub, signer: &Signer, subject: &str, repository: &str) -> String {
+    let b = bundle(signer, &slsa_statement(subject, repository));
+    referrer_with(
+        hub,
+        subject,
+        &b,
+        BUNDLE_V03_MEDIA_TYPE,
+        SLSA_PROVENANCE_V1_PREDICATE,
+    )
+}
+
+/// The test signer's key, SLSA only, with an exact source-repository
+/// claim of `repository`; without claims if `None`.
+fn slsa_keyed(repository: Option<&str>) -> Arc<Trust> {
+    let trust = Trust::new(
+        vec![PublicKey::from_pem(SIGNER_PUB).expect("key")],
+        None,
+        vec![SLSA_PROVENANCE_V1_PREDICATE.to_owned()],
+    )
+    .expect("trust");
+    Arc::new(match repository {
+        None => trust,
+        Some(repository) => trust
+            .with_claims(
+                Claims::new(
+                    None,
+                    Some(ClaimMatch::Exact(repository.to_owned())),
+                    None,
+                    vec![],
+                )
+                .expect("claims"),
+            )
+            .expect("with claims"),
+    })
+}
+
+/// Whether the fake saw a request for a `.sig` tag.
+fn sig_requested(fake: &Fake) -> bool {
+    fake.seen().iter().any(|s| s.target.ends_with(".sig"))
+}
+
+/// jq's real SLSA provenance through GHCR's tag schema: with claims it
+/// meets, the pull goes on to its first layer (answered `404`); with a
+/// source-repository claim it does not meet, it is refused before any
+/// layer request and the detail names the claim. Neither asks for a
+/// `.sig`.
+#[test]
+fn real_provenance_through_fallback_tag() {
+    let index = digest_of(JQ_INDEX);
+    // Pretty-printed, unlike the documents `nth_digest` reads.
+    let compact: String = std::str::from_utf8(JQ_AMD64)
+        .expect("utf-8")
+        .split_whitespace()
+        .collect();
+    let first_layer = nth_digest(compact.as_bytes(), 1);
+    for (repository, passes) in [
+        (JQ_SOURCE, true),
+        ("https://github.com/jqlang/other", false),
+    ] {
+        let fake = hub_fake(jq_hub());
+        let tmp = TempDir::new("jq");
+        let store = open_with(
+            &tmp.path().join("store"),
+            &fake,
+            required(jq_trust(repository)),
+        );
+        let detail = match store.pull(&image_ref(JQ_REPO, &index)) {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        let reached = targets(&fake.seen())
+            .iter()
+            .any(|t| t.ends_with(&format!("/blobs/{first_layer}")));
+        assert_eq!(reached, passes, "{detail}");
+        assert!(!sig_requested(&fake), "{:?}", targets(&fake.seen()));
+        if passes {
+            assert!(!detail.contains("signature policy"), "{detail}");
+        } else {
+            assert!(detail.starts_with("signature policy: "), "{detail}");
+            assert!(
+                detail.contains(&format!(
+                    "{index}: referrers tag: 1 listed, 1 candidates (entry 0: the provenance's source repository does not meet the rule)"
+                )),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// Under a rule with claims, an image signed only by a trusted keyed
+/// `.sig` is refused, the `.sig` tag never requested and the detail says
+/// why; under the same trust without claims it passes as in #57.
+#[test]
+fn claims_rule_skips_sig_carrier() {
+    for claims in [true, false] {
+        let (mut hub, pushed) = app_hub();
+        sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+        let fake = hub_fake(hub);
+        let trust = slsa_keyed(claims.then_some(ACME_SOURCE));
+        let (tmp, result) = pull_once(&fake, required(trust), &pushed.index);
+        if claims {
+            let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+            assert!(
+                detail.contains(&format!(
+                    "{}: .sig: not examined, the rule has provenance claims",
+                    pushed.index
+                )),
+                "{detail}"
+            );
+            assert!(!sig_requested(&fake), "{:?}", targets(&fake.seen()));
+        } else {
+            passed(result, &pushed);
+            assert!(sig_requested(&fake));
+        }
+    }
+}
+
+/// Two SLSA referrers: the first fails the claims, the second meets them,
+/// and the pull passes.
+#[test]
+fn claims_second_candidate_passes() {
+    let (mut hub, pushed) = app_hub();
+    let first = slsa_referrer(
+        &mut hub,
+        &signer(),
+        &pushed.index,
+        "https://github.com/acme/other",
+    );
+    let second = slsa_referrer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    list(&mut hub, &pushed.index, &[first, second]);
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(
+        &fake,
+        required(slsa_keyed(Some(ACME_SOURCE))),
+        &pushed.index,
+    );
+    passed(result, &pushed);
+    // The first alone is refused.
+    let (mut hub, pushed) = app_hub();
+    let first = slsa_referrer(
+        &mut hub,
+        &signer(),
+        &pushed.index,
+        "https://github.com/acme/other",
+    );
+    list(&mut hub, &pushed.index, &[first]);
+    let fake = hub_fake(hub);
+    let (tmp, result) = pull_once(
+        &fake,
+        required(slsa_keyed(Some(ACME_SOURCE))),
+        &pushed.index,
+    );
+    let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+    assert!(
+        detail.contains("the provenance's source repository does not meet the rule"),
+        "{detail}"
+    );
+}
+
+/// The kept evidence is checked against the current rule's claims: after
+/// rule A's pass, rule B (another repository) on the same store is
+/// refused and the detail names the claim for the kept evidence; rule A
+/// again pulls warm with no request.
+#[test]
+fn warm_pull_rechecks_claims() {
+    let (mut hub, pushed) = app_hub();
+    let entry = slsa_referrer(&mut hub, &signer(), &pushed.index, ACME_SOURCE);
+    list(&mut hub, &pushed.index, &[entry]);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("warm-claims");
+    let root = tmp.path().join("store");
+    let a = || required(slsa_keyed(Some(ACME_SOURCE)));
+    open_with(&root, &fake, a())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("cold under A");
+    let b = required(slsa_keyed(Some("https://github.com/acme/other")));
+    let detail = match open_with(&root, &fake, b).pull(&image_ref(REPO, &pushed.index)) {
+        Err(ImageError::Failed { detail }) => detail,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        detail.contains("kept evidence: the provenance's source repository does not meet the rule"),
+        "{detail}"
+    );
+    let before = fake.seen().len();
+    let store = open_with(&root, &fake, a());
+    assert_eq!(
+        store
+            .pull(&image_ref(REPO, &pushed.index))
+            .expect("warm under A")
+            .as_str(),
+        pushed.manifest
+    );
+    assert_eq!(
+        fake.seen().len(),
+        before,
+        "{:?}",
+        targets(&fake.seen()[before..])
+    );
 }

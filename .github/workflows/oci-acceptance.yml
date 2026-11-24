@@ -5,16 +5,21 @@ name: oci-acceptance
 # sandbox. And of ADR-029 (#57): pull signed images under a `Required`
 # signature rule (chainguard/node on Docker Hub and cgr.dev, cosign on
 # GHCR, pause through Artifact Registry) and refuse the unsigned node:22
-# before any layer request. Weekly, because registry changes (a
-# garbage-collected digest, a CDN host move, the token flow, a signature
-# replaced) show up within 7 days at 13 Docker Hub manifest, tag and
-# referrers requests per architecture per run (4 before ADR-029, counted
-# from the tests' code paths), far below the measured anonymous limit of
-# 100 per hour. Never on code paths and not a required check, so
-# a Docker Hub outage cannot block a code PR. `pull_request` is limited to
-# this file: GitHub dispatches `workflow_dispatch` only for workflows
-# already on the default branch, so the PR that adds or edits this file
-# runs it before merge.
+# before any layer request. And of ADR-031 (#104): pull jq 1.8.2 from GHCR
+# under a `Required` rule with SLSA provenance claims, and refuse it under
+# another source repository before any layer is committed
+# (`provenance_claims_on_ghcr`, 12 GHCR manifest, tag and referrers
+# requests per architecture per run: 5 for the pull that passes, 7 for
+# the one refused, counted from the test's code path). Weekly, because
+# registry changes (a garbage-collected digest, a CDN host move, the token
+# flow, a signature replaced) show up within 7 days at 13 Docker Hub
+# manifest, tag and referrers requests per architecture per run (4 before
+# ADR-029, counted from the tests' code paths), far below the measured
+# anonymous limit of 100 per hour. Never on code paths and not a required
+# check, so a Docker Hub outage cannot block a code PR. `pull_request` is
+# limited to this file: GitHub dispatches `workflow_dispatch` only for
+# workflows already on the default branch, so the PR that adds or edits
+# this file runs it before merge.
 on:
   schedule:
     # Mondays 05:17 UTC, off the hour to spread scheduler load.
