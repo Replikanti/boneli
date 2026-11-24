@@ -1491,16 +1491,16 @@
    "title": "boneli-oci: verify cosign .att SLSA v0.2 provenance for rules with claims",
    "epic": null,
    "order": 57,
-   "state": "pr-review",
-   "owner": "6cc0788e",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 122,
    "note": "PR #122 open",
-   "updated_at": "2026-11-24T18:02:03+00:00",
+   "updated_at": "2026-11-24T20:26:48+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1567,7 +1567,7 @@
    "title": "boneli-sigstore: verify Rekor intoto 0.0.1 entries for cosign .att attestations",
    "epic": null,
    "order": 60,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1576,7 +1576,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T16:50:55+00:00",
+   "updated_at": "2026-11-24T20:26:49+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1590,22 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T02:25:22+00:00",
-   "issue": 109,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "9f12be0c",
-   "note": null
-  },
-  {
-   "at": "2026-11-24T02:47:24+00:00",
-   "issue": 109,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "9f12be0c",
-   "note": "PR 1 #110 merged b0fda3e; PR 2 (file-lock rule) in progress"
-  },
   {
    "at": "2026-11-24T03:03:52+00:00",
    "issue": 57,
@@ -1989,6 +1973,22 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #124 open"
+  },
+  {
+   "at": "2026-11-24T20:26:48+00:00",
+   "issue": 114,
+   "from": "pr-review",
+   "to": "done",
+   "by": "6cc0788e",
+   "note": null
+  },
+  {
+   "at": "2026-11-24T20:26:49+00:00",
+   "issue": 118,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2017,12 +2017,11 @@
   69,
   102,
   103,
-  114,
   117,
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T20:13:44+00:00",
+ "updated_at": "2026-11-24T20:26:49+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
