@@ -1,4 +1,4 @@
-//! Fulcio certificate claims (ADR-033): what a `Required` rule may ask of
+//! Fulcio certificate claims (ADR-034): what a `Required` rule may ask of
 //! the extensions Fulcio wrote into a GitHub Actions leaf from the OIDC
 //! token, beyond the issuer and the SAN of ADR-029 S2.
 //!
@@ -41,7 +41,7 @@ use crate::identity::printable;
 use crate::provenance::{ClaimMatch, check_match, meets};
 
 /// GitHub Actions' OIDC issuer: the only one whose meaning of these
-/// extensions this module knows (ADR-033).
+/// extensions this module knows (ADR-034).
 pub const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// A Fulcio extension the reader models, in OID order.

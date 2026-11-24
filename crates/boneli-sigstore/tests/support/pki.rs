@@ -48,7 +48,7 @@ const RSA_SHA256: &[u8] = &[
 ];
 
 /// GitHub Actions' OIDC issuer, and the claims of the leaf
-/// [`LeafSpec::github`] builds (ADR-033).
+/// [`LeafSpec::github`] builds (ADR-034).
 pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 pub const GH_WORKFLOW: &str =
     "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main";
@@ -374,7 +374,7 @@ pub struct LeafSpec {
     /// Whole extensions put before every other one.
     pub first: Vec<Vec<u8>>,
     /// Whole extensions put after the issuer extensions (Fulcio's
-    /// certificate claims, ADR-033).
+    /// certificate claims, ADR-034).
     pub extra: Vec<Vec<u8>>,
     /// Whole extensions put after the SCT list. Every SCT is signed over
     /// the TBS with all extensions but the list, in their final order.
@@ -421,7 +421,7 @@ impl LeafSpec {
         }
     }
 
-    /// A GitHub Actions leaf (ADR-033): a URI SAN `san`, both issuer
+    /// A GitHub Actions leaf (ADR-034): a URI SAN `san`, both issuer
     /// extensions naming [`GITHUB_ISSUER`], and well-formed Build Signer
     /// URI (1.9), Source Repository URI (1.12), Digest (1.13), Ref (1.14),
     /// Identifier (1.15) and Build Trigger (1.20) of `acme/app`.

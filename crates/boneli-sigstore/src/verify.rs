@@ -21,7 +21,7 @@
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
 //!   and different is refused); and an identity matching issuer and SAN.
 //!
-//! - **Certificate claims (ADR-033):** under a trust with
+//! - **Certificate claims (ADR-034):** under a trust with
 //!   [`CertificateClaims`], the keyless leaf that passed must also meet
 //!   them (`fulcio`), on every carrier, before any statement is read.
 //! - **Claims (ADR-031):** under a trust with [`Claims`], a cosign layer
@@ -129,7 +129,7 @@ impl Evidence {
 /// What a rule trusts: keys, a keyless part (a trusted root and the
 /// identities it may vouch for), the predicate types a bundle's statement
 /// may have, and optionally the SLSA provenance claims (ADR-031) and the
-/// Fulcio certificate claims (ADR-033) it must meet.
+/// Fulcio certificate claims (ADR-034) it must meet.
 ///
 /// `Debug` shows the counts only, `claims: true` when claims are set and
 /// `certificate_claims: true` when certificate claims are.
@@ -214,7 +214,7 @@ impl Trust {
         self.claims.as_ref()
     }
 
-    /// This trust with Fulcio certificate `claims` (ADR-033): its keyless
+    /// This trust with Fulcio certificate `claims` (ADR-034): its keyless
     /// signatures then pass only from leaves that meet them. Refused for a
     /// trust with keys (a keyed signature has no certificate), unless
     /// every identity's issuer is exactly [`GITHUB_ACTIONS_ISSUER`] (other

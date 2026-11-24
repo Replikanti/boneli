@@ -2576,7 +2576,7 @@ fn warm_pull_rechecks_claims() {
 }
 
 // ---------------------------------------------------------------------
-// Fulcio certificate claims (ADR-033)
+// Fulcio certificate claims (ADR-034)
 // ---------------------------------------------------------------------
 
 const CG_SOURCE: &str = "https://github.com/chainguard-images/images";

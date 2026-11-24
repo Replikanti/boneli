@@ -1346,7 +1346,7 @@ mod network {
     }
 
     /// jq's SLSA trust of `jq_provenance` with Fulcio certificate claims
-    /// (ADR-033): the source repository exactly, a tag ref, the repository
+    /// (ADR-034): the source repository exactly, a tag ref, the repository
     /// ID and the trigger list `triggers`, with the statement agreement.
     fn jq_certificate(triggers: &str) -> Requirement {
         let Requirement::Required(trust) = jq_provenance("https://github.com/jqlang/jq") else {
@@ -1368,7 +1368,7 @@ mod network {
         ))
     }
 
-    /// The acceptance of ADR-033 on GHCR: under a `Required` rule whose
+    /// The acceptance of ADR-034 on GHCR: under a `Required` rule whose
     /// trust has SLSA provenance claims, Fulcio certificate claims and the
     /// statement agreement, jq 1.8.2 pulls with every layer committed;
     /// under the trigger list `[release]` it is refused before any layer is

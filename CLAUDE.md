@@ -171,7 +171,7 @@ images from GHCR, `cgr.dev` and Artifact Registry;
 provenance claims and refuses it under another source repository
 (ADR-031), and `certificate_claims_on_ghcr` pulls it under Fulcio
 certificate claims with the statement agreement and refuses it under
-another build trigger (ADR-033); CI runs them in the weekly
+another build trigger (ADR-034); CI runs them in the weekly
 `oci-acceptance` workflow, not on every PR.
 
 ```sh

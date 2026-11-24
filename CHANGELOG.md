@@ -827,7 +827,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sign fixtures with the one scheme production accepts.
   `KeyError::NotEcdsaP256` is new, and `KeyError::SignFailed` now reads
   "the signature failed".
-- Fulcio certificate claims (#113, ADR-033, accepted): a keyless
+- Fulcio certificate claims (#113, ADR-034, accepted): a keyless
   `boneli_sigstore::Trust` of GitHub Actions identities may carry
   `CertificateClaims` (`Trust::with_certificate_claims`): the Source
   Repository URI (1.12) and Ref (1.14) Fulcio wrote into the leaf (exact,

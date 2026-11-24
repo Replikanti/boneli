@@ -22,7 +22,7 @@
 //! 3. **Another build type** refuses a repository or ref claim: where the
 //!    source sits is defined per build type, and GitHub's is the only one
 //!    measured. Builder and material claims are generic SLSA v1 fields.
-//! 4. **The statement agreement** (ADR-033), when the trust's certificate
+//! 4. **The statement agreement** (ADR-034), when the trust's certificate
 //!    claims ask for it: `builder.id`, the source repository, the ref and
 //!    the source commit must equal what Fulcio wrote into the certificate
 //!    (`fulcio`); it needs GitHub's build type (`UnknownBuildType`).
@@ -130,7 +130,7 @@ impl Claims {
 
 /// A repository or ref rule's text is non-empty printable ASCII without
 /// spaces, and a prefix ends in `/` (also for Fulcio's certificate claims,
-/// ADR-033).
+/// ADR-034).
 pub(crate) fn check_match(rule: &ClaimMatch) -> Result<(), ConfigError> {
     match rule {
         ClaimMatch::Exact(text) | ClaimMatch::Prefix(text) if !printable(text) => {
@@ -200,7 +200,7 @@ struct Provenance<'a> {
 
 /// Whether the signed statement `payload` meets `claims` (module doc),
 /// after it agrees with the certificate's `agreement` if one is given
-/// (ADR-033).
+/// (ADR-034).
 pub(crate) fn check(
     payload: &[u8],
     claims: &Claims,
@@ -258,7 +258,7 @@ pub(crate) fn check(
 }
 
 /// Whether the statement says what Fulcio wrote from the same OIDC
-/// token (ADR-033): `builder.id` is 1.9, the source repository 1.12, the
+/// token (ADR-034): `builder.id` is 1.9, the source repository 1.12, the
 /// ref 1.14, and at least one resolved dependency has the URI
 /// `git+<1.12>@<1.14>`, every one of them with the `gitCommit` 1.13.
 fn agrees(

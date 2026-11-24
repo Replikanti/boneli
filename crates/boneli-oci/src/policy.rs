@@ -39,7 +39,7 @@ pub enum Requirement {
     /// statements that meet them (ADR-031); one with Fulcio certificate
     /// claims (`Trust::with_certificate_claims`) admits only keyless
     /// signatures, `.sig` layers included, whose leaf meets them
-    /// (ADR-033).
+    /// (ADR-034).
     Required(Arc<Trust>),
 }
 

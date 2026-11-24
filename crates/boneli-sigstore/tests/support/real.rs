@@ -207,7 +207,7 @@ pub fn jq_identity() -> Identity {
     Identity::new(GITHUB_ACTIONS, SanRule::UriPrefix(JQ_PREFIX.to_owned())).expect("identity")
 }
 
-// ---- Fulcio certificate claims (ADR-033) ---------------------------------
+// ---- Fulcio certificate claims (ADR-034) ---------------------------------
 
 /// What Fulcio wrote into the three GitHub leaves: Source Repository URI
 /// (1.12), Ref (1.14), Identifier (1.15) and Build Trigger (1.20). The

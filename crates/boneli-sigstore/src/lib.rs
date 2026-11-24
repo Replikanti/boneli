@@ -19,7 +19,7 @@
 //! never read.
 //!
 //! A trust of GitHub Actions identities may also carry Fulcio certificate
-//! claims ([`CertificateClaims`], ADR-033): the Source Repository URI and
+//! claims ([`CertificateClaims`], ADR-034): the Source Repository URI and
 //! Ref Fulcio wrote into the leaf from the OIDC token (exact, or a prefix
 //! ending in `/`), the repository's numeric ID, the Build Config URI (the
 //! calling workflow file), and a required list of build triggers. They apply to every keyless carrier, `.sig` layers
@@ -39,7 +39,7 @@
 //! Out of scope (ADR-029): Rekor v2 entries, RFC 3161 timestamps as the
 //! time source, inclusion proofs and checkpoints, `messageSignature`
 //! bundles and bundles before v0.3, Notation, cosign `.att` and SLSA v0.2,
-//! certificate claims under issuers other than GitHub Actions (ADR-033),
+//! certificate claims under issuers other than GitHub Actions (ADR-034),
 //! and keeping `trusted_root.json` current (TUF).
 #![doc(test(attr(forbid(unsafe_code))))]
 

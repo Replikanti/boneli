@@ -1,4 +1,4 @@
-//! Fulcio certificate claims (ADR-033): the three real GitHub leaves as
+//! Fulcio certificate claims (ADR-034): the three real GitHub leaves as
 //! known answers, then one test per edge case of the plan over synthetic
 //! GitHub leaves of `support::pki` (`LeafSpec::github`), on keyless cosign
 //! layers and keyless bundles.

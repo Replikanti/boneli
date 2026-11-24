@@ -106,7 +106,7 @@ pub enum Refusal {
     /// A claim of the rule is not met.
     Claim(ClaimRefusal),
     /// A Fulcio certificate claim of the rule is not met, or the
-    /// statement disagrees with the certificate (ADR-033).
+    /// statement disagrees with the certificate (ADR-034).
     CertificateClaim(CertificateRefusal),
 }
 
@@ -226,7 +226,7 @@ pub enum ConfigError {
     /// A trust with claims does not list exactly the SLSA provenance v1
     /// predicate type.
     ClaimsPredicateTypes,
-    /// Certificate claims list no build trigger (ADR-033).
+    /// Certificate claims list no build trigger (ADR-034).
     TriggersEmpty,
     /// A repository ID is not ASCII digits without a leading zero.
     RepositoryIdNotDecimal,

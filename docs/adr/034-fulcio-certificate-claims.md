@@ -1,4 +1,4 @@
-# ADR-033: Fulcio certificate claims
+# ADR-034: Fulcio certificate claims
 
 - Status: accepted
 - Date: 2026-11-24
