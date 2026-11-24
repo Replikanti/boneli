@@ -1389,16 +1389,16 @@
    "title": "boneli-sigstore: check SLSA provenance predicate claims (builder, source, materials) under Required",
    "epic": null,
    "order": 53,
-   "state": "pr-review",
-   "owner": "88ef9d69",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 115,
    "note": "PR #115 open",
-   "updated_at": "2026-11-24T08:56:50+00:00",
+   "updated_at": "2026-11-24T09:24:45+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1491,7 +1491,7 @@
    "title": "boneli-oci: verify cosign .att SLSA v0.2 provenance for rules with claims",
    "epic": null,
    "order": 57,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1500,7 +1500,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T08:26:31+00:00",
+   "updated_at": "2026-11-24T09:24:47+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1517,7 +1517,7 @@
    "title": "boneli-sigstore: match Fulcio certificate source repository and ref extensions under Required",
    "epic": null,
    "order": 58,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1526,7 +1526,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T08:26:31+00:00",
+   "updated_at": "2026-11-24T09:24:47+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1540,30 +1540,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T20:57:37+00:00",
-   "issue": 80,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "f11746bb",
-   "note": null
-  },
-  {
-   "at": "2026-11-23T21:14:33+00:00",
-   "issue": 97,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "36e4fbcc",
-   "note": null
-  },
-  {
-   "at": "2026-11-23T21:21:25+00:00",
-   "issue": 80,
-   "from": "pr-review",
-   "to": "done",
-   "by": "f11746bb",
-   "note": null
-  },
   {
    "at": "2026-11-23T21:40:46+00:00",
    "issue": 97,
@@ -1939,6 +1915,30 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #116 open"
+  },
+  {
+   "at": "2026-11-24T09:24:45+00:00",
+   "issue": 104,
+   "from": "pr-review",
+   "to": "done",
+   "by": "88ef9d69",
+   "note": null
+  },
+  {
+   "at": "2026-11-24T09:24:47+00:00",
+   "issue": 114,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-24T09:24:47+00:00",
+   "issue": 113,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -1967,13 +1967,12 @@
   69,
   102,
   103,
-  104,
   105,
   113,
   114
  ],
  "xopen": [],
- "updated_at": "2026-11-24T09:14:47+00:00",
+ "updated_at": "2026-11-24T09:24:47+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
