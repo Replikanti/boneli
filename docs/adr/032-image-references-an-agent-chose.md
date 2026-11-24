@@ -1,6 +1,6 @@
 # ADR-032: Image references an agent chose
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -374,19 +374,21 @@ reported exemption, and `network::signatures_on_docker_hub`, which now
 also refuses the agent's `node:22` with no connection, on x86_64 and
 arm64.
 
-**Result (PR #116, 2026-11-24).** The fake-registry tests pass: 19 origin
+**Result (PR #116, 2026-11-24).** The fake-registry tests pass: 22 origin
 tests in `crates/boneli-oci/tests/signatures.rs`, the contract with the
 two new clauses on both adapters, and every mutant killed (the 3 contract
-mutants and 13 hand mutants over `decide`, `with_agent_exemptions`,
-`ExemptScope::parse`, `open`, the store wiring and the memory adapter).
-Live on x86_64 (local run) and in the `oci-acceptance` run on PR #116
-(run 45361409402) on x86_64 and arm64: `node:22` and `postgres:17` pull
-as agent references under the preset, each reporting `docker.io` /
-`library/`, and run (`v22.23.5`, PostgreSQL 17.12); with no exemption the
-agent's `node:22` is refused with no connection; the `Required` and
-`signatures_elsewhere` checks of ADR-029 pass unchanged. The run's first
-x86_64 attempt failed in the network tests before any check of this ADR
-because Docker Hub redirected layer blobs to
-`docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, a host outside
-the Docker Hub redirect allowlist of ADR-009 D10, for the ADR-029
+mutants and 17 hand mutants over `decide`, `with_agent_exemptions`,
+`ExemptScope::parse`, `open`, the store wiring, the named document's
+fetch and the memory adapter). Live on x86_64 (local run, before the
+review fixes) and in the `oci-acceptance` run on the rebased head of
+PR #116 (run 45366860253) on x86_64 and arm64: `node:22` and
+`postgres:17` pull as agent references under the preset, each reporting
+`docker.io` / `library/`, and run; with no exemption the agent's
+`node:22` is refused with no connection; the checks of ADR-029 and
+ADR-031 pass unchanged. The review of PR #116 found S3's `Off` shadowing
+and the warm-cache hand-over that S6 closes, both fixed before this
+result. An earlier run on the PR (45361409402) failed once on x86_64
+before any check of this ADR, because Docker Hub redirected layer blobs
+to `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, a host
+outside the redirect allowlist of ADR-009 D10, for the ADR-029
 `chainguard/node` pull as for `node:22`; the rerun of that job passed.

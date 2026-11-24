@@ -792,7 +792,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused under claims, and `boneli-oci` does not ask for the `.sig` tag of
   a rule with claims. A trust without claims behaves as before. Live test
   `provenance_claims_on_ghcr` (jq 1.8.2 on GHCR) in `oci-acceptance`.
-- Image references an agent chose (#105, ADR-032, proposed):
+- Image references an agent chose (#105, ADR-032, accepted):
   `boneli_app::ImageOrigin` (`Operator` or `Agent`, no default),
   `ImageExemption` and `Pulled`. In `boneli-oci`, an agent's reference is
   checked under the `Required` rule that covers it, passes under an
