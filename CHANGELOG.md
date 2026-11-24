@@ -779,7 +779,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evidence is gone. `open` refuses a rule for a registry the store does
   not pull from (`Error::InvalidPolicy`). Live tests on Docker Hub, GHCR,
   `cgr.dev` and Artifact Registry in `oci-acceptance`.
-- SLSA provenance claims (#104, ADR-031): a `boneli_sigstore::Trust` may
+- SLSA provenance claims (#104, ADR-031, accepted): a `boneli_sigstore::Trust` may
   carry `Claims` (`Trust::with_claims`, only on a trust whose predicate
   list is exactly SLSA provenance v1): an exact builder ID, a source
   repository and ref (exact, or a prefix ending in `/` followed by a plain

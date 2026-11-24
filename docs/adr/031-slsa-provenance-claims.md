@@ -1,6 +1,6 @@
 # ADR-031: SLSA provenance claims
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -291,3 +291,19 @@ The known answers pass (the runner and jq attestations verify and meet
 their claims, and the issue's five negative fixtures refuse), and the
 `oci-acceptance` run on the PR for #104 passes
 `network::provenance_claims_on_ghcr` on x86_64 and arm64.
+
+**Result (2026-11-24).** The known answers pass: GitHub's attestations
+of `actions/actions-runner` (index `sha256:6d0b2d80…b8c31300`) and
+`jqlang/jq:1.8.2` (`sha256:b9c68867…5344e486`) verify against the
+committed public-good root and meet their claims, and the five negative
+fixtures refuse with the claim named. The hand-applied mutation pass of
+the PR kills 42 of 43 mutants; the one left was equivalent (a non-empty
+check the segment rule already makes) and its clause was removed. Live
+on x86_64 (local run): `provenance_claims_on_ghcr` pulls jq with both
+layers in 5.2 s over 15 connections and refuses it under another source
+repository with `referrers tag: 1 listed, 1 candidates (entry 0: the
+provenance's source repository does not meet the rule)`, the `.sig`
+not examined, and no layer committed. The `oci-acceptance` run on the PR (run
+45360452215) passes `provenance_claims_on_ghcr` on x86_64 (jq in 5.1 s)
+and arm64 (6.2 s), next to `signatures_on_docker_hub`,
+`signatures_elsewhere` and `node_and_postgres_run_in_sandbox`.
