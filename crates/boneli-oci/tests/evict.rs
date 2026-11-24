@@ -133,7 +133,12 @@ fn dot_names(root: &Path) -> Vec<String> {
 fn is_held(path: &Path) -> bool {
     let file = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     match file.try_lock() {
-        Ok(()) => false,
+        // Unlocked before the close: a child that another test spawns
+        // could hold a copy and keep the probe's lock (#98).
+        Ok(()) => {
+            file.unlock().expect("unlock the probe");
+            false
+        }
         Err(TryLockError::WouldBlock) => true,
         Err(TryLockError::Error(e)) => panic!("{}: {e}", path.display()),
     }
@@ -841,6 +846,9 @@ fn orphan_lock_files_removed_when_free() {
             "a committed layer's lock went"
         );
     }
+    // Released by an unlock, not the close alone, which a child that
+    // another test spawns could delay (#98).
+    holder.unlock().expect("unlock");
     drop(holder);
     store.trim().expect("trim");
     assert!(!exists(&held));

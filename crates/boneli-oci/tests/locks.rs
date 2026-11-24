@@ -60,7 +60,12 @@ fn owner_lock(root: &Path, token: &str) -> PathBuf {
 fn is_held(path: &Path) -> bool {
     let file = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     match file.try_lock() {
-        Ok(()) => false,
+        // Unlocked before the close: a child that another test spawns
+        // could hold a copy and keep the probe's lock (#98).
+        Ok(()) => {
+            file.unlock().expect("unlock the probe");
+            false
+        }
         Err(TryLockError::WouldBlock) => true,
         Err(TryLockError::Error(e)) => panic!("{}: {e}", path.display()),
     }
@@ -165,6 +170,9 @@ fn owner_lock_decides_in_every_namespace() {
         assert!(exists(path), "{} was removed", path.display());
     }
 
+    // Released by an unlock, not the close alone, which a child that
+    // another test spawns could delay (#98).
+    holder.unlock().expect("unlock");
     drop(holder);
     drop(open(&root, &fake));
     for path in held_names.iter().chain([&held_lock]) {
