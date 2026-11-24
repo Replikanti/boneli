@@ -36,24 +36,24 @@ residential connection in the EU: an anonymous token from
 `auth.docker.io`, the `latest` index of 22 repositories (the 20 `library/`
 repositories with the most pulls: nginx, memcached, busybox, postgres,
 alpine, redis, ubuntu, python, node, mysql, mongo, httpd, rabbitmq,
-traefik, hello-world,
-mariadb, golang, debian, ruby, php; plus `chainguard/node` and
-`grafana/grafana`), their linux/amd64 and linux/arm64 manifests (24
-images), the config and every layer: 191 distinct blobs, each requested 3
-times at `registry-1.docker.io/v2/<repo>/blobs/<digest>` without following
-the redirect. 573 requests, 573 `307` to
-`production.cloudfront.docker.com`, none to an `amazonaws.com` host. The
-blob that failed in CI went to CloudFront 3 times of 3. Docker's firewall
-allowlist page names `registry-1.docker.io` and
-`production.cloudfront.docker.com` and no S3 bucket: the S3 host is
-undocumented behavior that depends on where (or when) the client asks.
+traefik, hello-world, mariadb, golang, debian, ruby, php; plus
+`chainguard/node` and `grafana/grafana`), their linux/amd64 and
+linux/arm64 manifests (24 images), the config and every layer: 191
+distinct blobs, each requested 3 times at
+`registry-1.docker.io/v2/<repo>/blobs/<digest>` without following the
+redirect. 573 requests, 573 `307` to `production.cloudfront.docker.com`,
+none to an `amazonaws.com` host. The blob that failed in CI went to
+CloudFront 3 times of 3. Docker's firewall allowlist page names
+`registry-1.docker.io` and `production.cloudfront.docker.com` and no S3
+bucket: the S3 host is undocumented behavior that depends on where (or
+when) the client asks.
 
 **From the runners** (the measurement this ADR rests on): a temporary
 workflow on PR #119 ran the same method with `curl` and `jq` on both
 GitHub-hosted runner architectures, `ubuntu-latest` (x86_64) and
 `ubuntu-24.04-arm` (arm64): the 22 repositories, both platforms, every
 config and layer blob, the first hop only, 3 rounds 10 minutes apart per
-job, and the whole run again more than 6 hours later. Each job made 66
+job, and the first run again 6 hours later (its attempt 2). Each job made 66
 manifest requests (22 indexes, 44 manifests) and found 327 distinct
 blobs, counted per repository and digest (the local measurement above
 counted 191 on the same day; how it deduplicated is not recorded), so a
@@ -64,19 +64,25 @@ round is 327 requests and a run 981 per architecture.
 | 45440408062 | 2026-11-24 16:44-17:06 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
 | 45448071309 | 2026-11-24 17:24-17:46 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
 | 45448490888 | 2026-11-24 17:26-17:48 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
-RUN-LATE-ROW
+| 45473258310 | 2026-11-24 19:44-20:07 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
+| 45440408062, attempt 2 | 2026-11-24 22:45-23:09 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
 
-Every first-hop answer was `307`. The first CloudFront hit of each job
-answered `Range: bytes=0-0` with `206` and no further redirect.
-RUN2-TEXT
+Every first-hop answer was `307`. The first CloudFront hit of each of the
+10 jobs answered `Range: bytes=0-0` with `206` and no further redirect. In
+all, 4,905 requests per architecture over 5 runs between 16:44 and 23:09
+UTC, 9,810 in total, and none went to an S3 host.
 
 **Reading.** If the S3 redirect were a steady per-request rate of about
-0.9 % (D4), a run of 981 requests would have shown none with probability
-`0.991^981` = 0.00014. It showed none on both architectures, so the
-redirect is not a steady rate: it comes in episodes (a time window, a
-CloudFront failover) or depends on something about the request that
-neither measurement reproduced. Its only evidence remains the two logged
-failures, and the admitted set is the one host they name.
+0.9 % (D4), a single run of 981 requests would have shown none with
+probability `0.991^981` = 0.00014. Five runs showed none on either
+architecture, so the redirect is not a steady rate: it comes in episodes
+(a time window, a CloudFront failover) or depends on something about the
+request that neither measurement reproduced. One such difference is
+known: `curl` sends a `User-Agent` and the client sends none; the blob
+that failed in CI, requested from the residential connection without a
+`User-Agent`, still went to CloudFront 3 times of 3 (2026-11-24). Its
+only evidence remains the two logged failures, and the admitted set is
+the one host they name.
 
 The S3 host's certificate is `CN=s3.amazonaws.com`, issued by
 `Amazon RSA 2048 M01`, with `*.s3.dualstack.us-east-1.amazonaws.com` among
@@ -93,11 +99,12 @@ Docker's bucket from anyone else's.
 
 | Host | Seen | Where |
 |------|------|-------|
-| `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com` | HOST-COUNTS | GitHub-hosted runners |
+| `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com` | 3 blob requests in 2 of 16 `oci-acceptance` attempts (runs 45210635062 and 45361409402); 0 of 9,810 measured requests | GitHub-hosted x86_64 runners |
 
-The admitted set is exactly the measured set. A host the measurement did
-not show is not added by guess, not even another region or endpoint form
-of the same bucket.
+The admitted set is exactly the set Docker Hub was seen to use: the one
+S3 host both logged failures name, and no other. A host no run showed is
+not added by guess, not even another region or endpoint form of the same
+bucket.
 
 ### D2. Matching
 
@@ -145,10 +152,11 @@ connects, and that matters on its own:
 - **Sample size.** 2 failures in 16 x86_64 attempts, about 16 blob
   requests each, is about 0.9 % of requests if they are independent
   (`1 - 0.875^(1/16)`). 500 requests see at least one S3 redirect with
-  probability `1 - 0.991^500` = 99 %, so the measurement was sized for at least 500
-  per architecture and run. A run made 981 (3 rounds of 327): at 0.9 % it
-  sees one with probability 99.99 %, and two runs (1,962 requests) still
-  see a rate 3 times lower (0.3 %) with 99.7 %. Fewer would risk a clean
+  probability `1 - 0.991^500` = 99 %, so the measurement was sized for at
+  least 500 per architecture and run. A run made 981 (3 rounds of 327): at
+  0.9 % it sees one with probability 99.99 %, and two runs (1,962
+  requests) still see a rate 3 times lower (0.3 %) with 99.7 %; five runs
+  made 4,905. Fewer would risk a clean
   sample that proves nothing; more costs only runner time, which is free
   for a public repository. The clean runs refute the independence
   assumption itself (Context, Reading), which is the finding: the rate is
@@ -165,10 +173,11 @@ connects, and that matters on its own:
   (a list 18 times larger would fail every connection to the host closed).
   The intermediate's list `http://crl.rootca1.amazontrust.com/rootca1.crl`
   is 969 bytes, under the 1 MiB cap per CA list of ADR-027. Measured
-  2026-11-24; `registry-1.docker.io` already uses the same Amazon chain and
-  lists. `intermediates_checked_live` in `crates/boneli-https/tests/network.rs`
-  now connects to the S3 host and passed: leaf `Checked` by the r2m01
-  list, intermediate `Checked` by the rootca1 list.
+  2026-11-24; `registry-1.docker.io` already uses the same Amazon chain
+  and lists. `intermediates_checked_live` in
+  `crates/boneli-https/tests/network.rs` now connects to the S3 host and
+  passed: leaf `Checked` by the r2m01 list, intermediate `Checked` by the
+  rootca1 list.
 
 ## Consequences
 
@@ -212,4 +221,15 @@ tests in `crates/boneli-oci/tests/registry.rs` pass
 `s3_tampered_blob_never_cached`, `redirect_chain_cloudfront_then_s3`), and
 `intermediates_checked_live` passes with the S3 host.
 
-**Result (PR #119, 2026-11-24).** RESULT-TBD
+**Result (PR #119, 2026-11-24).** The runner measurement is recorded: 5
+runs, 9,810 first-hop requests, all to CloudFront (Context). The 6
+fake-registry tests pass, with the existing
+`redirect_suffix_dot_boundary`, `redirect_limit_10_ok_11_refused` and
+`authorization_only_to_registry_host` unchanged, and 6 hand mutants of
+`redirect_allowed` and `with_redirect_hosts` are killed: equality turned
+into `ends_with`, and each of the leading `.`, port, IPv6, IPv4 and
+lowercase checks removed (`redirect_hosts_grammar` checks the reason each
+refusal names). `intermediates_checked_live` passes with the S3 host.
+`oci-acceptance` passed on x86_64 and arm64 on this PR (runs 45448071359
+and 45473258117); no S3 redirect occurred in them, so criterion 3 of #117
+rests on the fake-registry tests.

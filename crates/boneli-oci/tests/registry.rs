@@ -758,32 +758,62 @@ fn redirect_hosts_grammar() {
         plain(),
         "an empty list admits nothing"
     );
-    for host in [
-        ".s3.dualstack.us-east-1.amazonaws.com",
-        ".amazonaws.com",
-        "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:443",
-        "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:8443",
-        "",
-        " ",
-        "Docker-Images-Prod.s3.dualstack.us-east-1.amazonaws.com",
-        "DOCKER-IMAGES-PROD.S3.DUALSTACK.US-EAST-1.AMAZONAWS.COM",
-        "52.216.0.1",
-        "[2600:1fa0::1]",
-        "2600:1fa0::1",
-        "user@docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
-        "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
-        "docker_images_prod.s3.dualstack.us-east-1.amazonaws.com",
-        "*.s3.dualstack.us-east-1.amazonaws.com",
-        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
-        "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/x",
-        "docker-images-pr\u{43e}d.s3.dualstack.us-east-1.amazonaws.com",
+    // Each refusal with the reason it names; "" where the URL grammar of
+    // ADR-003 refuses the entry before the exact-host checks.
+    for (host, reason) in [
+        (".s3.dualstack.us-east-1.amazonaws.com", "not a suffix"),
+        (".amazonaws.com", "not a suffix"),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:443",
+            "without a port",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:8443",
+            "without a port",
+        ),
+        ("", ""),
+        (" ", ""),
+        (
+            "Docker-Images-Prod.s3.dualstack.us-east-1.amazonaws.com",
+            "lowercase",
+        ),
+        (
+            "DOCKER-IMAGES-PROD.S3.DUALSTACK.US-EAST-1.AMAZONAWS.COM",
+            "lowercase",
+        ),
+        ("52.216.0.1", "not an IP address"),
+        ("[2600:1fa0::1]", "not an IP address"),
+        ("2600:1fa0::1", ""),
+        (
+            "user@docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
+            "",
+        ),
+        (
+            "docker_images_prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        ("*.s3.dualstack.us-east-1.amazonaws.com", ""),
+        (
+            "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/x",
+            "",
+        ),
+        (
+            "docker-images-pr\u{43e}d.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
     ] {
         match plain().with_redirect_hosts(&[S3, host]) {
             Err(boneli_oci::Error::InvalidRegistry(detail)) => {
                 assert!(detail.contains(&format!("{host:?}")), "{host:?}: {detail}");
-                if host.starts_with('.') {
-                    assert!(detail.contains("not a suffix"), "{host:?}: {detail}");
-                }
+                assert!(detail.contains(reason), "{host:?}: {detail}");
             }
             other => panic!("{host:?}: expected InvalidRegistry, got {other:?}"),
         }

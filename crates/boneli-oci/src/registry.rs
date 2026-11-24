@@ -138,8 +138,11 @@ impl Registry {
             }
             let (host, port) = url::host_port(text)
                 .map_err(|e| Error::InvalidRegistry(format!("{text:?}: {e}")))?;
-            if port.is_some() || host.contains(':') || host.parse::<Ipv4Addr>().is_ok() {
+            if port.is_some() {
                 return Err(refuse("a name without a port"));
+            }
+            if host.contains(':') || host.parse::<Ipv4Addr>().is_ok() {
+                return Err(refuse("a name, not an IP address"));
             }
             if host != *text {
                 return Err(refuse("lowercase"));
