@@ -257,7 +257,8 @@ against the statement as filed (Fulcio's certificate extensions follow in
   certificate extensions (1.9 Build Signer URI, 1.12 Source Repository
   URI, 1.14 Source Repository Ref), which Fulcio writes from the OIDC
   token rather than the job, and which also cover `.sig` signatures such
-  as Chainguard's.
+  as Chainguard's. ADR-033 adds these certificate claims and an opt-in
+  agreement of the statement with the certificate.
 - cosign `.att` and SLSA v0.2, where the isolated-builder (L3) provenance
   of `slsa-github-generator` lives, are not read, so claims cannot be
   checked where they would mean the most (1 of the 20 measured
@@ -278,6 +279,7 @@ against the statement as filed (Fulcio's certificate extensions follow in
   build is a reusable workflow called by its release workflow).
   Closure: #113 adds Fulcio's Build Trigger extension (1.20), which
   Fulcio writes from the token's `event_name`, the caller's event.
+  ADR-033 makes a trigger list part of every set of certificate claims.
 
 ## Alternatives considered
 

@@ -827,6 +827,25 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sign fixtures with the one scheme production accepts.
   `KeyError::NotEcdsaP256` is new, and `KeyError::SignFailed` now reads
   "the signature failed".
+- Fulcio certificate claims (#113, ADR-033, accepted): a keyless
+  `boneli_sigstore::Trust` of GitHub Actions identities may carry
+  `CertificateClaims` (`Trust::with_certificate_claims`): the Source
+  Repository URI (1.12) and Ref (1.14) Fulcio wrote into the leaf (exact,
+  or a prefix ending in `/` followed by a plain path), an optional exact
+  repository ID (1.15), and a required list of build triggers (1.20). They
+  are read only from a leaf webpki verified, on every keyless carrier, so
+  `boneli-oci` keeps examining `.sig` under them, and before any statement
+  is parsed; every modeled extension present must be one minimal DER
+  UTF8String of non-empty UTF-8, and the deprecated raw extensions are
+  never read. The opt-in statement agreement
+  (`CertificateClaims::with_statement_agreement`, on a trust with #104's
+  claims) requires the SLSA statement's builder ID, source repository, ref
+  and source commit to equal extensions 1.9, 1.12, 1.14 and 1.13. A trust
+  with keys or with another issuer is refused at configuration; a trust
+  without certificate claims reads nothing beyond the issuer, as before.
+  Refusals name the extension in fixed text (`Refusal::CertificateClaim`).
+  Live test `certificate_claims_on_ghcr` (jq 1.8.2 on GHCR) in
+  `oci-acceptance`.
 
 ### Changed
 

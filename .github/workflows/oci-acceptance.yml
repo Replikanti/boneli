@@ -10,7 +10,12 @@ name: oci-acceptance
 # another source repository before any layer is committed
 # (`provenance_claims_on_ghcr`, 12 GHCR manifest, tag and referrers
 # requests per architecture per run: 5 for the pull that passes, 7 for
-# the one refused, counted from the test's code path). And of ADR-032
+# the one refused, counted from the test's code path). And of ADR-033
+# (#113): pull jq 1.8.2 under Fulcio certificate claims with the
+# statement agreement, and refuse it under another build trigger
+# (`certificate_claims_on_ghcr`, 12 more GHCR requests per architecture
+# per run, the same 5 and 7: the rule has provenance claims too, so the
+# code path is `provenance_claims_on_ghcr`'s). And of ADR-032
 # (#105): node:22 and postgres:17 pull as references the agent chose under
 # the documented exemption docker.io + library/, and the agent's node:22
 # with no exemption is refused with no connection, so the Docker Hub

@@ -206,3 +206,19 @@ pub fn runner_identity() -> Identity {
 pub fn jq_identity() -> Identity {
     Identity::new(GITHUB_ACTIONS, SanRule::UriPrefix(JQ_PREFIX.to_owned())).expect("identity")
 }
+
+// ---- Fulcio certificate claims (ADR-033) ---------------------------------
+
+/// What Fulcio wrote into the three GitHub leaves: Source Repository URI
+/// (1.12), Ref (1.14), Identifier (1.15) and Build Trigger (1.20). The
+/// runner's repository and ref are `RUNNER_REPOSITORY` and `RUNNER_REF`,
+/// jq's repository `JQ_REPOSITORY`.
+pub const RUNNER_TRIGGER: &str = "workflow_dispatch";
+pub const RUNNER_REPOSITORY_ID: &str = "184286875";
+pub const JQ_REF: &str = "refs/tags/jq-1.8.2";
+pub const JQ_TRIGGER: &str = "push";
+pub const JQ_REPOSITORY_ID: &str = "5101141";
+pub const CHAINGUARD_REPOSITORY: &str = "https://github.com/chainguard-images/images";
+pub const CHAINGUARD_REF: &str = "refs/heads/main";
+pub const CHAINGUARD_TRIGGER: &str = "push";
+pub const CHAINGUARD_REPOSITORY_ID: &str = "563510952";

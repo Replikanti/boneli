@@ -22,7 +22,11 @@
 //! 3. **Another build type** refuses a repository or ref claim: where the
 //!    source sits is defined per build type, and GitHub's is the only one
 //!    measured. Builder and material claims are generic SLSA v1 fields.
-//! 4. **The claims:** builder, repository, ref, then the materials in rule
+//! 4. **The statement agreement** (ADR-033), when the trust's certificate
+//!    claims ask for it: `builder.id`, the source repository, the ref and
+//!    the source commit must equal what Fulcio wrote into the certificate
+//!    (`fulcio`); it needs GitHub's build type (`UnknownBuildType`).
+//! 5. **The claims:** builder, repository, ref, then the materials in rule
 //!    order; the first that fails is the refusal.
 //!
 //! Matching is byte for byte after JSON unescaping, with no normalization:
@@ -36,6 +40,7 @@ use std::fmt;
 use boneli_json::{Object, Value};
 
 use crate::error::{ConfigError, Refusal};
+use crate::fulcio::{Agreement, CertificateRefusal, Extension};
 use crate::identity::printable;
 use crate::{MAX_BUNDLE_BYTES, json};
 
@@ -112,15 +117,7 @@ impl Claims {
             return Err(ConfigError::ClaimNotAscii);
         }
         for rule in [&repository, &git_ref].into_iter().flatten() {
-            match rule {
-                ClaimMatch::Exact(text) | ClaimMatch::Prefix(text) if !printable(text) => {
-                    return Err(ConfigError::ClaimNotAscii);
-                }
-                ClaimMatch::Prefix(text) if !text.ends_with('/') => {
-                    return Err(ConfigError::ClaimPrefixWithoutBoundary);
-                }
-                _ => {}
-            }
+            check_match(rule)?;
         }
         Ok(Claims {
             builder_id: builder_id.map(str::to_owned),
@@ -128,6 +125,21 @@ impl Claims {
             git_ref,
             materials,
         })
+    }
+}
+
+/// A repository or ref rule's text is non-empty printable ASCII without
+/// spaces, and a prefix ends in `/` (also for Fulcio's certificate claims,
+/// ADR-033).
+pub(crate) fn check_match(rule: &ClaimMatch) -> Result<(), ConfigError> {
+    match rule {
+        ClaimMatch::Exact(text) | ClaimMatch::Prefix(text) if !printable(text) => {
+            Err(ConfigError::ClaimNotAscii)
+        }
+        ClaimMatch::Prefix(text) if !text.ends_with('/') => {
+            Err(ConfigError::ClaimPrefixWithoutBoundary)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -186,17 +198,26 @@ struct Provenance<'a> {
     dependencies: Vec<Dependency<'a>>,
 }
 
-/// Whether the signed statement `payload` meets `claims` (module doc).
-pub(crate) fn check(payload: &[u8], claims: &Claims) -> Result<(), Refusal> {
+/// Whether the signed statement `payload` meets `claims` (module doc),
+/// after it agrees with the certificate's `agreement` if one is given
+/// (ADR-033).
+pub(crate) fn check(
+    payload: &[u8],
+    claims: &Claims,
+    agreement: Option<&Agreement<'_>>,
+) -> Result<(), Refusal> {
     let statement = json::parse(payload, MAX_BUNDLE_BYTES).ok_or(Refusal::MalformedProvenance)?;
     let provenance = read(&statement)?;
     let source = match provenance.source {
         Some(source) => Some(source),
-        None if claims.repository.is_some() || claims.git_ref.is_some() => {
+        None if agreement.is_some() || claims.repository.is_some() || claims.git_ref.is_some() => {
             return Err(Refusal::UnknownBuildType);
         }
         None => None,
     };
+    if let (Some(agreement), Some(source)) = (agreement, source) {
+        agrees(&provenance, source, agreement)?;
+    }
     if claims
         .builder_id
         .as_ref()
@@ -232,6 +253,46 @@ pub(crate) fn check(payload: &[u8], claims: &Claims) -> Result<(), Refusal> {
         if !listed {
             return Err(Refusal::Claim(ClaimRefusal::MaterialMissing(i)));
         }
+    }
+    Ok(())
+}
+
+/// Whether the statement says what Fulcio wrote from the same OIDC
+/// token (ADR-033): `builder.id` is 1.9, the source repository 1.12, the
+/// ref 1.14, and at least one resolved dependency has the URI
+/// `git+<1.12>@<1.14>`, every one of them with the `gitCommit` 1.13.
+fn agrees(
+    provenance: &Provenance<'_>,
+    (repository, git_ref): (&str, &str),
+    agreement: &Agreement<'_>,
+) -> Result<(), Refusal> {
+    let disagrees = |ext| Refusal::CertificateClaim(CertificateRefusal::StatementDisagrees(ext));
+    if provenance.builder_id != agreement.builder {
+        return Err(disagrees(Extension::BuildSignerUri));
+    }
+    if repository != agreement.repository {
+        return Err(disagrees(Extension::SourceRepositoryUri));
+    }
+    if git_ref != agreement.git_ref {
+        return Err(disagrees(Extension::SourceRepositoryRef));
+    }
+    let uri = format!("git+{}@{}", agreement.repository, agreement.git_ref);
+    let mut listed = false;
+    for dependency in &provenance.dependencies {
+        if dependency.uri != Some(uri.as_str()) {
+            continue;
+        }
+        listed = true;
+        let commit = dependency
+            .digest
+            .and_then(|d| d.get("gitCommit"))
+            .and_then(Value::as_str);
+        if commit != Some(agreement.commit) {
+            return Err(disagrees(Extension::SourceRepositoryDigest));
+        }
+    }
+    if !listed {
+        return Err(disagrees(Extension::SourceRepositoryDigest));
     }
     Ok(())
 }
@@ -310,7 +371,7 @@ fn github_source(external: &Value) -> Result<(&str, &str), Refusal> {
 }
 
 /// Whether `value` meets `rule`.
-fn meets(rule: &ClaimMatch, value: &str) -> bool {
+pub(crate) fn meets(rule: &ClaimMatch, value: &str) -> bool {
     match rule {
         ClaimMatch::Exact(want) => want == value,
         ClaimMatch::Prefix(prefix) => under(value, prefix),
@@ -376,9 +437,9 @@ mod tests {
     fn truncated_statements_never_panic() {
         let statement = runner_statement();
         let claims = runner_claims();
-        assert_eq!(check(&statement, &claims), Ok(()));
+        assert_eq!(check(&statement, &claims, None), Ok(()));
         for n in 0..statement.len() {
-            assert!(check(&statement[..n], &claims).is_err(), "prefix {n}");
+            assert!(check(&statement[..n], &claims, None).is_err(), "prefix {n}");
         }
     }
 

@@ -169,8 +169,10 @@ connection), and `signatures_elsewhere` pulls signed
 images from GHCR, `cgr.dev` and Artifact Registry;
 `provenance_claims_on_ghcr` pulls jq from GHCR under a rule with SLSA
 provenance claims and refuses it under another source repository
-(ADR-031); CI runs them in the weekly `oci-acceptance` workflow, not on
-every PR.
+(ADR-031), and `certificate_claims_on_ghcr` pulls it under Fulcio
+certificate claims with the statement agreement and refuses it under
+another build trigger (ADR-033); CI runs them in the weekly
+`oci-acceptance` workflow, not on every PR.
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \

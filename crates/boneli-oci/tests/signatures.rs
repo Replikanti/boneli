@@ -20,8 +20,8 @@ use boneli_oci::{
     Registry, RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Timeouts,
 };
 use boneli_sigstore::{
-    BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, IN_TOTO_PAYLOAD_TYPE,
-    Identity, Material, SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE,
+    BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, CertificateClaims, ClaimMatch, Claims,
+    IN_TOTO_PAYLOAD_TYPE, Identity, Material, SIGNATURE_ANNOTATION, SIMPLE_SIGNING_MEDIA_TYPE,
     SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot, base64, pae,
 };
 
@@ -2573,6 +2573,175 @@ fn warm_pull_rechecks_claims() {
         "{:?}",
         targets(&fake.seen()[before..])
     );
+}
+
+// ---------------------------------------------------------------------
+// Fulcio certificate claims (ADR-033)
+// ---------------------------------------------------------------------
+
+const CG_SOURCE: &str = "https://github.com/chainguard-images/images";
+
+/// Chainguard's keyless trust (its workflow's exact SAN) with certificate
+/// claims its real leaf meets but for `triggers`.
+fn chainguard_certificate_trust(triggers: &[&str]) -> Arc<Trust> {
+    let claims = CertificateClaims::new(
+        Some(ClaimMatch::Exact(CG_SOURCE.to_owned())),
+        Some(ClaimMatch::Exact("refs/heads/main".to_owned())),
+        triggers.iter().map(|t| (*t).to_owned()).collect(),
+    )
+    .expect("certificate claims")
+    .with_repository_id("563510952")
+    .expect("repository id");
+    let trust = chainguard_trust(SanRule::Uri(CHAINGUARD_WORKFLOW.to_owned()));
+    Arc::new(
+        Trust::clone(&trust)
+            .with_certificate_claims(claims)
+            .expect("with certificate claims"),
+    )
+}
+
+fn chainguard_certificate_policy(triggers: &[&str]) -> SignaturePolicy {
+    rules(vec![rule(
+        RepoScope::Prefix("chainguard/".to_owned()),
+        Requirement::Required(chainguard_certificate_trust(triggers)),
+    )])
+}
+
+/// Whether the fake saw a request for Chainguard's first layer.
+fn chainguard_layer_requested(fake: &Fake) -> bool {
+    let layer = chainguard_first_layer();
+    targets(&fake.seen())
+        .iter()
+        .any(|t| t.ends_with(&format!("/blobs/{layer}")))
+}
+
+const CG_TRIGGER_REFUSAL: &str =
+    "the certificate's Fulcio Build Trigger (1.3.6.1.4.1.57264.1.20) does not meet the rule";
+
+/// Certificate claims alone keep the `.sig` carrier: Chainguard's real
+/// keyless `.sig` is requested and passes on to its first layer (answered
+/// `404`); with the trigger list `[schedule]` it is refused before any
+/// layer request, and the detail names the build trigger, not "not
+/// examined".
+#[test]
+fn certificate_claims_examine_sig() {
+    for (triggers, passes) in [(&["push"][..], true), (&["schedule"][..], false)] {
+        let fake = hub_fake(chainguard_hub(CG_REPO, CG_DIGEST));
+        let tmp = TempDir::new("certificate-claims");
+        let store = open_with(
+            &tmp.path().join("store"),
+            &fake,
+            chainguard_certificate_policy(triggers),
+        );
+        let detail = match store.pull(&image_ref(CG_REPO, CG_DIGEST)) {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        assert!(sig_requested(&fake), "{:?}", targets(&fake.seen()));
+        assert_eq!(chainguard_layer_requested(&fake), passes, "{detail}");
+        assert!(!detail.contains("not examined"), "{detail}");
+        if passes {
+            assert!(!detail.contains("signature policy"), "{detail}");
+        } else {
+            assert!(detail.starts_with("signature policy: "), "{detail}");
+            assert!(
+                detail.contains(&format!(": 1 listed (layer 0: {CG_TRIGGER_REFUSAL})")),
+                "{detail}"
+            );
+        }
+    }
+}
+
+/// The kept evidence is checked against the current rule's certificate
+/// claims: after `[push]` passed, `[schedule]` on the same store is
+/// refused, naming the build trigger for the kept evidence, before any
+/// layer request; `[push]` again passes on the kept evidence with no
+/// signature request.
+#[test]
+fn warm_pull_rechecks_certificate_claims() {
+    let fake = hub_fake(chainguard_hub(CG_REPO, CG_DIGEST));
+    let tmp = TempDir::new("warm-certificate-claims");
+    let root = tmp.path().join("store");
+    let pull =
+        |triggers: &[&str]| match open_with(&root, &fake, chainguard_certificate_policy(triggers))
+            .pull(&image_ref(CG_REPO, CG_DIGEST))
+        {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+    let detail = pull(&["push"]);
+    assert!(!detail.contains("signature policy"), "{detail}");
+    let before = fake.seen().len();
+    let detail = pull(&["schedule"]);
+    assert!(
+        detail.contains(&format!("kept evidence: {CG_TRIGGER_REFUSAL}")),
+        "{detail}"
+    );
+    let layer = chainguard_first_layer();
+    assert!(
+        !targets(&fake.seen()[before..])
+            .iter()
+            .any(|t| t.ends_with(&layer)),
+        "a layer was requested under [schedule]"
+    );
+    let before = fake.seen().len();
+    let detail = pull(&["push"]);
+    assert!(!detail.contains("signature policy"), "{detail}");
+    let seen = targets(&fake.seen()[before..]);
+    assert!(!seen.iter().any(|t| t.ends_with(".sig")), "{seen:?}");
+    assert!(
+        seen.iter().any(|t| t.ends_with(&format!("/blobs/{layer}"))),
+        "{seen:?}"
+    );
+}
+
+/// jq's real attestation through GHCR's tag schema under #104's claims,
+/// certificate claims and the statement agreement passes on to its first
+/// layer (answered `404`); under the trigger list `[release]` it is
+/// refused before any layer request, naming the build trigger.
+#[test]
+fn jq_agreement_through_fallback_tag() {
+    let index = digest_of(JQ_INDEX);
+    let compact: String = std::str::from_utf8(JQ_AMD64)
+        .expect("utf-8")
+        .split_whitespace()
+        .collect();
+    let first_layer = nth_digest(compact.as_bytes(), 1);
+    for (triggers, passes) in [("push", true), ("release", false)] {
+        let claims = CertificateClaims::new(
+            Some(ClaimMatch::Exact(JQ_SOURCE.to_owned())),
+            Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+            vec![triggers.to_owned()],
+        )
+        .expect("certificate claims")
+        .with_repository_id("5101141")
+        .expect("repository id")
+        .with_statement_agreement();
+        let trust = Arc::new(
+            Trust::clone(&jq_trust(JQ_SOURCE))
+                .with_certificate_claims(claims)
+                .expect("with certificate claims"),
+        );
+        let fake = hub_fake(jq_hub());
+        let tmp = TempDir::new("jq-agreement");
+        let store = open_with(&tmp.path().join("store"), &fake, required(trust));
+        let detail = match store.pull(&image_ref(JQ_REPO, &index)) {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        let reached = targets(&fake.seen())
+            .iter()
+            .any(|t| t.ends_with(&format!("/blobs/{first_layer}")));
+        assert_eq!(reached, passes, "{detail}");
+        if !passes {
+            assert!(
+                detail.contains(&format!(
+                    "{index}: referrers tag: 1 listed, 1 candidates (entry 0: {CG_TRIGGER_REFUSAL})"
+                )),
+                "{detail}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
