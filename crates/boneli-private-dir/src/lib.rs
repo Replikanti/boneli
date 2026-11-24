@@ -1,5 +1,6 @@
 //! Boneli support crate: the store-root rules that file-backed adapters
-//! share (ADR-021), and the root of the git adapter (ADR-024).
+//! share (ADR-021), the root of the git adapter (ADR-024) and the one
+//! file-lock type of the workspace (ADR-030).
 //!
 //! A store root is a private directory under ancestors that no one else can
 //! rename: [`prepare_root`] checks a root, creates it `0o700` where it is
@@ -13,6 +14,10 @@
 //! exist yet, the git adapter's (ADR-024): it is made by one non-recursive
 //! `mkdir` under its resolved, checked parent, and one that exists is an
 //! error.
+//!
+//! [`lock`] holds the one file-lock type of the workspace (ADR-030): a
+//! `flock` lock wrapped from the moment it is taken and released by an
+//! explicit unlock, in the process that took it only.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 use std::fmt;
@@ -20,6 +25,8 @@ use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+pub mod lock;
 
 /// Why a root was refused.
 #[derive(Debug)]

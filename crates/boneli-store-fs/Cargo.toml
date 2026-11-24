@@ -28,3 +28,9 @@ boneli-https.workspace = true
 # The store-root rules of ADR-009 D8 and ADR-012 D1, shared with
 # boneli-oci (ADR-021). A support crate, no external edge.
 boneli-private-dir.workspace = true
+
+[dev-dependencies]
+# The same crate with its test seam, `lock::Foreign` and `FileLock::copy_as`,
+# which the tests of the lock owner check drop copies through (ADR-030, D4).
+# Dev-only, so normal builds never see the feature (resolver 3).
+boneli-private-dir = { workspace = true, features = ["test-seam"] }

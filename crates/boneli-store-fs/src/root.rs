@@ -2,10 +2,12 @@
 //! directory syncs. The root rules, shared with `boneli-oci`, live in
 //! `boneli-private-dir` (ADR-021).
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+use boneli_private_dir::lock::{FileLock, Kind, TakeError};
 
 use crate::OpenError;
 
@@ -80,89 +82,32 @@ fn check_store_dir(dir: &Path) -> Result<(), OpenError> {
 }
 
 /// The store's exclusive lock on `<root>/lock` (ADR-012, D1), released by an
-/// explicit unlock when it drops, not by the close alone (ADR-026). `flock`
-/// belongs to the open file description, and a child process spawned by any
-/// thread holds a copy of that description from fork until exec (the file
-/// is `O_CLOEXEC`, so exec closes it). A close while such a copy lives
-/// leaves the lock held, and a reopen gets `InUse`; an unlock acts on the
+/// explicit unlock when it drops, not by the close alone. `flock` belongs to
+/// the open file description, and a child process spawned by any thread
+/// holds a copy of that description from fork until exec (the file is
+/// `O_CLOEXEC`, so exec closes it). A close while such a copy lives leaves
+/// the lock held, and a reopen gets `InUse`; an unlock acts on the
 /// description, so it releases the lock whatever copies exist (#94).
 ///
-/// Only the process that took the lock unlocks it. A process forked
-/// without exec runs on a copy of its parent's memory, so an unwinding
-/// panic there could drop a copy of this value; an unlock from it would
-/// release the parent's live lock, while its close only closes its own
-/// descriptor (ADR-026, D1). The process is told by its pid and its pid
-/// namespace, because a sandbox child is pid 1 of a new namespace and so
-/// is a runner that is its namespace's init (ADR-028).
+/// Only the process that took the lock unlocks it, told by its pid and its
+/// pid namespace (#97): a copy dropped in a child forked without exec, in
+/// this pid namespace or a new one, leaves the parent's lock alone. The
+/// release and the owner check are the shared type's ([`FileLock`],
+/// ADR-030, D1).
 #[derive(Debug)]
-pub(crate) struct StoreLock {
-    file: File,
-    /// The process that took the lock.
-    owner: Owner,
-}
-
-/// The link whose `(st_dev, st_ino)` names the caller's pid namespace.
-/// `thread-self`, not `self`: `/proc/self` fails once the main thread has
-/// exited (#35), and every thread of a process shares its pid namespace.
-const PID_NS: &str = "/proc/thread-self/ns/pid";
-
-/// A process as the lock's owner check sees it (ADR-028): its pid and its
-/// pid namespace, `None` when the namespace link cannot be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Owner {
-    pid: u32,
-    pid_ns: Option<(u64, u64)>,
-}
-
-impl Owner {
-    /// The calling process. `fs::metadata` on a short literal path builds
-    /// the C string on the stack, so a drop in an unwinding forked child
-    /// allocates nothing here.
-    fn current() -> Owner {
-        Owner {
-            pid: std::process::id(),
-            pid_ns: fs::metadata(PID_NS).ok().map(|m| (m.dev(), m.ino())),
-        }
-    }
-}
-
-/// Whether `now` is the process that `recorded` took the lock in: the same
-/// pid in the same pid namespace, read at both ends. An unreadable link,
-/// at either end or at both, is a mismatch, so the drop keeps the lock
-/// and only its close runs, as before ADR-026: without the namespace a
-/// pid-1 runner and its sandbox child look alike (ADR-028, D2).
-fn owns(recorded: &Owner, now: &Owner) -> bool {
-    recorded.pid_ns.is_some() && recorded == now
-}
+pub(crate) struct StoreLock(FileLock);
 
 impl StoreLock {
     /// Takes the lock on `file` at `path` without waiting: `InUse` while
     /// another store, in this process or another, holds it.
     fn acquire(file: File, path: &Path) -> Result<StoreLock, OpenError> {
-        match file.try_lock() {
-            Ok(()) => Ok(StoreLock {
-                file,
-                owner: Owner::current(),
-            }),
-            Err(TryLockError::WouldBlock) => Err(OpenError::InUse {
+        match FileLock::try_take(file, Kind::Exclusive) {
+            Ok(lock) => Ok(StoreLock(lock)),
+            Err(TakeError::Busy) => Err(OpenError::InUse {
                 path: path.to_path_buf(),
             }),
-            Err(TryLockError::Error(e)) => Err(io_err(path, e)),
+            Err(TakeError::Io(e)) => Err(io_err(path, e)),
         }
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        // A copy dropped in a forked child, in this pid namespace or a new
-        // one, leaves the parent's lock alone.
-        if !owns(&self.owner, &Owner::current()) {
-            return;
-        }
-        // An error is ignored: the close that follows still releases the
-        // lock when no child holds a copy, and a drop has no caller to
-        // report to.
-        let _ = self.file.unlock();
     }
 }
 
@@ -177,7 +122,7 @@ pub(crate) fn open(root: &Path) -> Result<(PathBuf, StoreLock), OpenError> {
 /// [`open`], with `after_lock` called on the locked file right after the
 /// lock is taken. [`open`] passes a no-op; the tests give a child a copy of
 /// the lock there, so a failing `open` is checked with a copy alive
-/// (ADR-026, D3).
+/// (ADR-030, D6).
 fn open_with(
     root: &Path,
     after_lock: &mut dyn FnMut(&File),
@@ -203,7 +148,7 @@ fn open_with(
         });
     }
     let lock = StoreLock::acquire(lock, &lock_path)?;
-    after_lock(&lock.file);
+    after_lock(lock.0.file());
 
     let runs = resolved.join(RUNS);
     let evidence = resolved.join(EVIDENCE);
@@ -224,6 +169,7 @@ fn open_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boneli_private_dir::lock::Foreign;
     use std::os::fd::{AsRawFd, RawFd};
     use std::process::{Child, Command, Stdio};
 
@@ -231,13 +177,13 @@ mod tests {
     /// a child to hold, and its descriptor for `/proc/self/fdinfo`.
     impl StoreLock {
         fn try_clone(&self) -> io::Result<File> {
-            self.file.try_clone()
+            self.0.file().try_clone()
         }
     }
 
     impl AsRawFd for StoreLock {
         fn as_raw_fd(&self) -> RawFd {
-            self.file.as_raw_fd()
+            self.0.file().as_raw_fd()
         }
     }
 
@@ -321,7 +267,7 @@ mod tests {
 
     /// The lock descriptor is `O_CLOEXEC` (octal 02000000 in the `flags:`
     /// line of `/proc/self/fdinfo`), so a child's copy lives only from
-    /// fork to exec, also after a crash of the store's process (ADR-026).
+    /// fork to exec, also after a crash of the store's process (ADR-030, D1).
     #[test]
     fn lock_file_is_close_on_exec() {
         let scratch = Scratch::new("cloexec");
@@ -366,20 +312,14 @@ mod tests {
     /// A copy of the lock dropped in another process, as in a child forked
     /// without exec that unwinds, does not unlock: its owner is not that
     /// process. The test cannot fork without `unsafe`, so it builds the
-    /// copy with an owner pid that is not this process's, in this pid
-    /// namespace, which is what a plain forked child's copy looks like from
-    /// inside the child.
+    /// copy through the shared type's test seam with an owner pid that is
+    /// not this process's, in this pid namespace, which is what a plain
+    /// forked child's copy looks like from inside the child (ADR-030, D4).
     #[test]
     fn copy_dropped_in_another_process_keeps_the_lock() {
         let scratch = Scratch::new("foreign-drop");
         let (resolved, lock) = open(&scratch.root()).expect("open");
-        let foreign = StoreLock {
-            file: lock.try_clone().expect("dup the lock"),
-            owner: Owner {
-                pid: lock.owner.pid.wrapping_add(1),
-                ..lock.owner
-            },
-        };
+        let foreign = StoreLock(lock.0.copy_as(Foreign::OtherPid).expect("dup the lock"));
         drop(foreign);
         match open(&scratch.root()) {
             Err(OpenError::InUse { path }) => assert_eq!(path, resolved.join(LOCK)),
@@ -392,20 +332,21 @@ mod tests {
 
     /// A copy whose owner has this process's pid in another pid namespace,
     /// as a sandbox child (pid 1 of a new namespace) of a runner that is
-    /// pid 1 of its own has, does not unlock (#97, ADR-028). The pid-only
-    /// check of ADR-026 would release the live lock here.
+    /// pid 1 of its own has, does not unlock (#97). The pid-only check of
+    /// #94 would release the live lock here.
     #[test]
     fn copy_in_another_pid_namespace_keeps_the_lock() {
         let scratch = Scratch::new("foreign-ns-drop");
         let (resolved, lock) = open(&scratch.root()).expect("open");
-        let (dev, ino) = lock.owner.pid_ns.expect("a readable pid namespace link");
-        let foreign = StoreLock {
-            file: lock.try_clone().expect("dup the lock"),
-            owner: Owner {
-                pid: lock.owner.pid,
-                pid_ns: Some((dev, ino.wrapping_add(1))),
-            },
-        };
+        assert!(
+            fs::metadata("/proc/thread-self/ns/pid").is_ok(),
+            "a readable pid namespace link"
+        );
+        let foreign = StoreLock(
+            lock.0
+                .copy_as(Foreign::OtherPidNamespace)
+                .expect("dup the lock"),
+        );
         drop(foreign);
         match open(&scratch.root()) {
             Err(OpenError::InUse { path }) => assert_eq!(path, resolved.join(LOCK)),
@@ -414,62 +355,6 @@ mod tests {
         drop(lock);
         let reopened = open(&scratch.root());
         assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
-    }
-
-    /// The owner check over every combination of pid and namespace,
-    /// including the unreadable link this host cannot produce (ADR-028).
-    #[test]
-    fn owner_comparison_table() {
-        let ns = Some((5, 4_026_531_836));
-        let owner = |pid, pid_ns| Owner { pid, pid_ns };
-        let cases = [
-            ("the owner itself", owner(1, ns), owner(1, ns), true),
-            (
-                "other pid, same namespace",
-                owner(1, ns),
-                owner(2, ns),
-                false,
-            ),
-            (
-                "same pid, other namespace inode",
-                owner(1, ns),
-                owner(1, Some((5, 4_026_533_368))),
-                false,
-            ),
-            (
-                "same pid and inode, other device",
-                owner(1, ns),
-                owner(1, Some((6, 4_026_531_836))),
-                false,
-            ),
-            (
-                "readable at acquire, unreadable at drop",
-                owner(1, ns),
-                owner(1, None),
-                false,
-            ),
-            (
-                "unreadable at acquire, readable at drop",
-                owner(1, None),
-                owner(1, ns),
-                false,
-            ),
-            (
-                "unreadable at both, same pid",
-                owner(1, None),
-                owner(1, None),
-                false,
-            ),
-            (
-                "unreadable at both, other pid",
-                owner(1, None),
-                owner(2, None),
-                false,
-            ),
-        ];
-        for (name, recorded, now, unlocks) in cases {
-            assert_eq!(owns(&recorded, &now), unlocks, "{name}");
-        }
     }
 
     /// A lock taken on one thread and dropped on another unlocks: the owner
@@ -484,15 +369,5 @@ mod tests {
             .expect("the dropping thread");
         let reopened = open(&scratch.root());
         assert!(reopened.is_ok(), "reopen gave {:?}", reopened.err());
-    }
-
-    /// The owner carries this process's pid namespace, the one
-    /// `/proc/self/ns/pid` names.
-    #[test]
-    fn owner_reads_the_pid_namespace() {
-        let meta = fs::metadata("/proc/self/ns/pid").expect("the pid namespace link");
-        let owner = Owner::current();
-        assert_eq!(owner.pid, std::process::id());
-        assert_eq!(owner.pid_ns, Some((meta.dev(), meta.ino())));
     }
 }

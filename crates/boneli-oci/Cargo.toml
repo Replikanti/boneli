@@ -45,6 +45,11 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 # (ADR-021). A support crate, no external edge.
 boneli-private-dir.workspace = true
 
+[dev-dependencies]
+# The same crate with its test seam, `lock::Foreign` and `FileLock::copy_as`,
+# which the tests of the lock owner check drop copies through (ADR-030, D4).
+# Dev-only, so normal builds never see the feature (resolver 3).
+boneli-private-dir = { workspace = true, features = ["test-seam"] }
 
 # Its own `main`: the process whose main thread has exited comes from
 # `boneli_sys::exit_main_thread`, which only a main thread can call, and
