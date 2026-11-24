@@ -88,6 +88,15 @@ harness. Rust workspace, hexagonal architecture. Public repository
    contract suite in `boneli_app::contract` that the real adapters reuse;
    every clause has a mutant in `boneli-replay-check` that fails it
    (ADR-004).
+8. **File locks only through `boneli_private_dir::lock`** (ADR-030), rule
+   `file-lock`: its `FileLock` and `HandOff` hold the release rule (unlock
+   before close, only the owner unlocks, owner = pid + pid namespace).
+   Everywhere else the check fails raw lock names (`flock`, `LOCK_EX`,
+   ...) and the `File` lock methods; Mutex and stdio locks pass only as
+   `Mutex::lock(&m)`, `m.lock().unwrap_or_else(PoisonError::into_inner)`,
+   `m.try_lock().as_deref()` or `io::stdout().lock()`, never inside a
+   macro. `#[cfg(test)] mod` blocks and integration tests under `tests/`
+   are not scanned.
 
 ## Validation (CI equivalent — run before every commit)
 

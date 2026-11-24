@@ -978,6 +978,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every error to callers are unchanged. The feature `test-seam`, enabled
   only by the two crates' dev-dependencies, builds the foreign copies of
   a lock that the owner-check tests drop.
+- Architecture rule `file-lock` (part 2 of #109, ADR-030 accepted): a
+  file-lock call outside `boneli_private_dir::lock`, the file
+  `[check] file-lock` names, fails the check: raw `flock`/`fcntl` lock
+  names anywhere, the `File` lock methods in method and path position,
+  any lock name inside a macro, and redefinitions of `Mutex`,
+  `PoisonError` or `io` (also as a dependency rename or a lib name).
+  Mutex and stdio locks take one of four forms the compiler proves are
+  not `File`'s; 53 lines in `boneli-replay-check`, `boneli-sys`,
+  `boneli-git-cli` and `boneli-https` were rewritten to them without a
+  change in behaviour. `#[cfg(test)]` modules and integration tests are
+  not scanned. ADR-026 and ADR-028 are superseded by ADR-030.
 
 ### Fixed
 

@@ -1,0 +1,2 @@
+# the support crate holds the exempt file, but a second file of it locks too
+file-lock

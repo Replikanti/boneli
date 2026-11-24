@@ -507,7 +507,10 @@ static LEAKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new()
 /// could not remove, in this process so far. `destroy` also returned the
 /// error with the path; a drop reported it on stderr (ADR-007, D8).
 pub fn leaked_cgroups() -> Vec<PathBuf> {
-    LEAKED.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    LEAKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 impl Cgroup {
@@ -880,7 +883,7 @@ impl Drop for Cgroup {
 fn record_leak(path: &Path) {
     LEAKED
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(path.to_path_buf());
 }
 

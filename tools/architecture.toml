@@ -64,6 +64,11 @@ no-std-target = "x86_64-unknown-none"
 # cloned child aborts it mid-setup). forbid, because an inner #![allow]
 # in the source overrides deny.
 unsafe-lints = ["rust.unsafe_op_in_unsafe_fn", "clippy.undocumented_unsafe_blocks", "clippy.multiple_unsafe_ops_per_block", "clippy.unwrap_used"]
+# The one file that may take file locks (rule file-lock, ADR-030 D5): the
+# shared lock type, which holds the release rule of ADR-030 D1. Everywhere
+# else a raw lock name or a lock method call that is not a proven Mutex or
+# stdio form fails. Without this key no file is exempt.
+file-lock = "crates/boneli-private-dir/src/lock.rs"
 
 [external.libc]
 reason = "syscall declarations (namespaces, mount, seccomp, Landlock)"

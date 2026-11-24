@@ -1,6 +1,6 @@
 # ADR-026: The store lock is released by an explicit unlock
 
-- Status: accepted
+- Status: superseded by ADR-030
 - Date: 2026-11-20
 
 ## Context

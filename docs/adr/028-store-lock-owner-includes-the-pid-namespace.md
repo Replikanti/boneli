@@ -1,6 +1,6 @@
 # ADR-028: The store lock's owner is a pid in a pid namespace
 
-- Status: accepted
+- Status: superseded by ADR-030
 - Date: 2026-11-23
 
 ## Context

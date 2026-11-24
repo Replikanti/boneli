@@ -24,7 +24,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::raw::c_int;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -182,8 +182,8 @@ struct Shared {
 }
 
 impl Shared {
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    fn guard(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -218,7 +218,7 @@ impl StatsKeeper {
             }
         }
         {
-            let mut s = shared.lock();
+            let mut s = shared.guard();
             let State { report, last, .. } = &mut *s;
             note_read(report, last, at, at.elapsed(), false);
         }
@@ -249,7 +249,7 @@ impl StatsKeeper {
     /// `Err(Error::StatsKeeper)` once a read failed.
     #[cfg(test)]
     pub(crate) fn check(&self) -> Result<()> {
-        match self.shared.lock().report.failed {
+        match self.shared.guard().report.failed {
             Some(errno) => Err(Error::StatsKeeper { errno }),
             None => Ok(()),
         }
@@ -257,16 +257,20 @@ impl StatsKeeper {
 
     /// The report so far.
     pub(crate) fn report(&self) -> KeeperReport {
-        self.shared.lock().report
+        self.shared.guard().report
     }
 
     /// Stops the thread and joins it; a second call does nothing. The
     /// thread holds only `Arc<Shared>` and its descriptor, never the
     /// keeper, so the join never waits on itself.
     pub(crate) fn stop(&self) {
-        self.shared.lock().stop = true;
+        self.shared.guard().stop = true;
         self.shared.wake.notify_all();
-        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(t) = thread {
             // A panic in the thread already ended it; nothing to report.
             let _ = t.join();
@@ -286,7 +290,7 @@ impl Drop for StatsKeeper {
 fn run(shared: &Shared, fd: &OwnedFd, first: Instant, period: Duration) {
     let mut buf = [0u8; READ_BUF];
     let mut deadline = first;
-    let mut s = shared.lock();
+    let mut s = shared.guard();
     loop {
         if s.stop {
             s.report.cpu = thread_cpu();
@@ -311,7 +315,7 @@ fn run(shared: &Shared, fd: &OwnedFd, first: Instant, period: Duration) {
                 let r = read_stat(fd, &mut buf);
                 let took = at.elapsed();
                 let cpu = thread_cpu();
-                s = shared.lock();
+                s = shared.guard();
                 s.report.cpu = cpu;
                 match r {
                     Ok(_) => {
@@ -508,7 +512,7 @@ mod tests {
         let k = StatsKeeper::inert();
         assert!(k.check().is_ok());
         assert_eq!(k.report(), KeeperReport::default());
-        k.shared.lock().report.failed = Some(libc::ENODEV);
+        k.shared.guard().report.failed = Some(libc::ENODEV);
         assert!(matches!(
             k.check(),
             Err(Error::StatsKeeper {

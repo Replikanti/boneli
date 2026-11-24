@@ -1,0 +1,2 @@
+# a dependency renamed to io would make io::stdout() a function of that crate
+file-lock

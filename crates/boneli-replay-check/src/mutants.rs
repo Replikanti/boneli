@@ -110,7 +110,7 @@ impl StoreMutant {
                 RunId::new(last.to_owned())
             }
             StoreBug::SharedLog => {
-                let mut first = self.first.lock().expect("not poisoned");
+                let mut first = Mutex::lock(&self.first).expect("not poisoned");
                 first.get_or_insert_with(|| id.clone()).clone()
             }
             _ => id.clone(),
@@ -219,7 +219,7 @@ struct EvidenceMutant {
 
 impl EvidenceMutant {
     fn overwritten(&self, reference: &EvidenceRef) -> Option<Vec<u8>> {
-        let on_disk = self.on_disk.lock().expect("not poisoned");
+        let on_disk = Mutex::lock(&self.on_disk).expect("not poisoned");
         on_disk
             .iter()
             .rev()
@@ -244,9 +244,7 @@ fn evidence_mutant(bug: EvidenceBug) -> impl Fn() -> EvidenceMutant {
 /// every mutant but `SkipsIntegrity` then rejects that reference as
 /// `Corrupted`, as `MemoryEvidence` does after re-deriving the reference.
 fn tamper_mutant(store: &EvidenceMutant, reference: &EvidenceRef, content: &[u8]) {
-    store
-        .on_disk
-        .lock()
+    Mutex::lock(&store.on_disk)
         .expect("not poisoned")
         .push((reference.clone(), content.to_vec()));
 }
@@ -261,14 +259,14 @@ impl Evidence for EvidenceMutant {
             EvidenceBug::Truncates => self.inner.put(&content[..content.len().min(1 << 16)]),
             EvidenceBug::NoDedup => {
                 // Salt every put, then strip the salt again on get.
-                let mut puts = self.puts.lock().expect("not poisoned");
+                let mut puts = Mutex::lock(&self.puts).expect("not poisoned");
                 *puts += 1;
                 let mut salted = puts.to_be_bytes().to_vec();
                 salted.extend_from_slice(content);
                 self.inner.put(&salted)
             }
             EvidenceBug::KeyedByLength => {
-                let mut seen = self.by_length.lock().expect("not poisoned");
+                let mut seen = Mutex::lock(&self.by_length).expect("not poisoned");
                 if let Some((_, reference)) = seen.iter().find(|(len, _)| *len == content.len()) {
                     return Ok(reference.clone());
                 }
@@ -278,7 +276,7 @@ impl Evidence for EvidenceMutant {
             }
             EvidenceBug::CounterReferences => {
                 let inner = self.inner.put(content)?;
-                let mut aliases = self.aliases.lock().expect("not poisoned");
+                let mut aliases = Mutex::lock(&self.aliases).expect("not poisoned");
                 if let Some((alias, _)) = aliases.iter().find(|(_, i)| *i == inner) {
                     return Ok(alias.clone());
                 }
@@ -309,7 +307,7 @@ impl Evidence for EvidenceMutant {
                 }
             }
             EvidenceBug::CounterReferences => {
-                let aliases = self.aliases.lock().expect("not poisoned");
+                let aliases = Mutex::lock(&self.aliases).expect("not poisoned");
                 match aliases.iter().find(|(alias, _)| alias == reference) {
                     Some((_, inner)) => self.inner.get(inner),
                     None => Err(EvidenceError::NotFound),
@@ -330,7 +328,7 @@ struct BackwardsClock {
 
 impl Clock for BackwardsClock {
     fn now_ms(&self) -> u64 {
-        let mut readings = self.readings.lock().expect("not poisoned");
+        let mut readings = Mutex::lock(&self.readings).expect("not poisoned");
         *readings += 1;
         let now = self.inner.now_ms();
         if *readings == 500 { now - 1_001 } else { now }
@@ -345,7 +343,7 @@ struct BlankOnceIds {
 
 impl Ids for BlankOnceIds {
     fn run_id(&self) -> RunId {
-        let mut issued = self.issued.lock().expect("not poisoned");
+        let mut issued = Mutex::lock(&self.issued).expect("not poisoned");
         *issued += 1;
         if *issued == 2 {
             RunId::new(String::from("\u{200B}"))
@@ -362,7 +360,7 @@ struct SixteenBitIds {
 
 impl Ids for SixteenBitIds {
     fn run_id(&self) -> RunId {
-        let mut next = self.next.lock().expect("not poisoned");
+        let mut next = Mutex::lock(&self.next).expect("not poisoned");
         let n = *next;
         *next = n.wrapping_add(1);
         RunId::new(format!("run-{n}"))
@@ -577,7 +575,7 @@ struct SandboxMutant {
 impl Sandbox for SandboxMutant {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError> {
         let id = self.inner.create(spec)?;
-        let mut issued = self.issued.lock().expect("not poisoned");
+        let mut issued = Mutex::lock(&self.issued).expect("not poisoned");
         issued.push(id.clone());
         match self.bug {
             SandboxBug::SameId => Ok(issued[0].clone()),
@@ -607,7 +605,7 @@ impl Sandbox for SandboxMutant {
             }
             (SandboxBug::MissingIsEmpty, Err(SandboxError::NotFound)) => Ok(Vec::new()),
             (SandboxBug::SharedWorkspace, Err(SandboxError::NotFound)) => {
-                let issued = self.issued.lock().expect("not poisoned").clone();
+                let issued = Mutex::lock(&self.issued).expect("not poisoned").clone();
                 issued
                     .iter()
                     .find_map(|other| self.inner.copy_out(other, path).ok())
@@ -637,7 +635,7 @@ struct PooledSandbox {
 
 impl PooledSandbox {
     fn inner_of(&self, id: &SandboxId) -> Result<SandboxId, SandboxError> {
-        let live = self.live.lock().expect("not poisoned");
+        let live = Mutex::lock(&self.live).expect("not poisoned");
         live.iter()
             .find(|(outer, _)| outer == id)
             .map(|(_, inner)| inner.clone())
@@ -647,15 +645,15 @@ impl PooledSandbox {
 
 impl Sandbox for PooledSandbox {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError> {
-        let pooled = self.pool.lock().expect("not poisoned").pop();
+        let pooled = Mutex::lock(&self.pool).expect("not poisoned").pop();
         let inner = match pooled {
             Some(inner) => inner,
             None => self.inner.create(spec)?,
         };
-        let mut issued = self.issued.lock().expect("not poisoned");
+        let mut issued = Mutex::lock(&self.issued).expect("not poisoned");
         *issued += 1;
         let outer = SandboxId::new(format!("pooled-{issued}"));
-        let mut live = self.live.lock().expect("not poisoned");
+        let mut live = Mutex::lock(&self.live).expect("not poisoned");
         live.push((outer.clone(), inner));
         Ok(outer)
     }
@@ -675,11 +673,10 @@ impl Sandbox for PooledSandbox {
 
     fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError> {
         let inner = self.inner_of(id)?;
-        self.live
-            .lock()
+        Mutex::lock(&self.live)
             .expect("not poisoned")
             .retain(|(outer, _)| outer != id);
-        self.pool.lock().expect("not poisoned").push(inner);
+        Mutex::lock(&self.pool).expect("not poisoned").push(inner);
         Ok(())
     }
 }
@@ -960,7 +957,7 @@ impl contract::git::Remote<GitMutant> for MutantRemote {
         repo: &RepoUrl,
         branch: &BranchName,
     ) -> Result<Option<(CommitSha, Vec<CommitSha>)>, String> {
-        let remote = adapter.remote.lock().expect("not poisoned");
+        let remote = Mutex::lock(&adapter.remote).expect("not poisoned");
         let shown = remote
             .iter()
             .rev()
@@ -975,7 +972,7 @@ struct MutantTripwire;
 
 impl contract::git::Tripwire<GitMutant> for MutantTripwire {
     fn tripped(&self, adapter: &GitMutant) -> Result<Vec<String>, String> {
-        let ran = *adapter.ran.lock().expect("not poisoned");
+        let ran = *Mutex::lock(&adapter.ran).expect("not poisoned");
         Ok(if ran {
             vec![String::from("a hook from the workspace")]
         } else {
@@ -987,7 +984,7 @@ impl contract::git::Tripwire<GitMutant> for MutantTripwire {
 impl GitMutant {
     /// The repository and base a checkout was fetched from.
     fn origin(&self, checkout: &CheckoutId) -> Option<(RepoUrl, CommitSha)> {
-        let origins = self.origins.lock().expect("not poisoned");
+        let origins = Mutex::lock(&self.origins).expect("not poisoned");
         origins
             .iter()
             .find(|(c, _, _)| c == checkout)
@@ -996,13 +993,13 @@ impl GitMutant {
 
     /// Notes that `checkout` came from `repo` at `base`.
     fn record(&self, checkout: &CheckoutId, repo: RepoUrl, base: CommitSha) {
-        let mut origins = self.origins.lock().expect("not poisoned");
+        let mut origins = Mutex::lock(&self.origins).expect("not poisoned");
         origins.push((checkout.clone(), repo, base));
     }
 
     /// What the remote shows for `branch` instead of `MemoryGit`'s state.
     fn show(&self, repo: RepoUrl, branch: &BranchName, tip: CommitSha, parents: Vec<CommitSha>) {
-        let mut remote = self.remote.lock().expect("not poisoned");
+        let mut remote = Mutex::lock(&self.remote).expect("not poisoned");
         remote.push((repo, branch.clone(), tip, parents));
     }
 
@@ -1010,19 +1007,19 @@ impl GitMutant {
     fn fetch(&self, repo: &RepoUrl, base: &CommitSha) -> Result<CheckoutId, GitError> {
         if let GitBug::PoisonsBase = self.bug {
             let fetched = self.inner.fetch_base(repo, base)?;
-            let last = self.last_diff.lock().expect("not poisoned").clone();
+            let last = Mutex::lock(&self.last_diff).expect("not poisoned").clone();
             return match last {
                 Some(diff) => self.inner.apply(&fetched, &diff),
                 None => Ok(fetched),
             };
         }
-        let adopted = *self.adopted.lock().expect("not poisoned");
+        let adopted = *Mutex::lock(&self.adopted).expect("not poisoned");
         match (self.bug, self.inner.fetch_base(repo, base)) {
             (GitBug::UnknownIsOk, Err(GitError::UnknownCommit)) => {
                 Ok(CheckoutId::new(String::from("checkout-0")))
             }
             (GitBug::AdoptsIntoNewCheckouts, Ok(fetched)) if adopted => {
-                let mut tainted = self.tainted.lock().expect("not poisoned");
+                let mut tainted = Mutex::lock(&self.tainted).expect("not poisoned");
                 tainted.push(fetched.clone());
                 Ok(fetched)
             }
@@ -1031,7 +1028,7 @@ impl GitMutant {
     }
 
     fn resolve(&self, checkout: &CheckoutId) -> CheckoutId {
-        let moved = self.moved.lock().expect("not poisoned");
+        let moved = Mutex::lock(&self.moved).expect("not poisoned");
         moved
             .iter()
             .rev()
@@ -1092,7 +1089,7 @@ impl Git for GitMutant {
         let mut changed = true;
         match self.bug {
             GitBug::RunsMetadata if tree.keys().any(is_hook) => {
-                *self.ran.lock().expect("not poisoned") = true;
+                *Mutex::lock(&self.ran).expect("not poisoned") = true;
             }
             GitBug::DropsNewFiles => tree.retain(|path, _| base.contains_key(path)),
             GitBug::DropsRemovals => {
@@ -1132,13 +1129,13 @@ impl Git for GitMutant {
             self.inner.diff(&from, workspace)?
         };
         let adopted = {
-            let mut adopted = self.adopted.lock().expect("not poisoned");
+            let mut adopted = Mutex::lock(&self.adopted).expect("not poisoned");
             let before = *adopted;
             *adopted |= sees_metadata;
             before
         };
         let tainted = {
-            let mut tainted = self.tainted.lock().expect("not poisoned");
+            let mut tainted = Mutex::lock(&self.tainted).expect("not poisoned");
             let before = tainted.contains(checkout);
             let per_checkout = matches!(self.bug, GitBug::AdoptsPerCheckout | GitBug::RunsOnRediff);
             if per_checkout && sees_metadata && !before {
@@ -1147,7 +1144,7 @@ impl Git for GitMutant {
             before
         };
         if let (GitBug::RunsOnRediff, true) = (self.bug, tainted) {
-            *self.ran.lock().expect("not poisoned") = true;
+            *Mutex::lock(&self.ran).expect("not poisoned") = true;
         }
         Ok(match self.bug {
             GitBug::Header => [HEADER, &diff].concat(),
@@ -1280,7 +1277,7 @@ impl Git for GitMutant {
 impl GitMutant {
     /// `apply` with the bugs that change it.
     fn apply_with_bug(&self, checkout: &CheckoutId, diff: &[u8]) -> Result<CheckoutId, GitError> {
-        *self.last_diff.lock().expect("not poisoned") = Some(diff.to_vec());
+        *Mutex::lock(&self.last_diff).expect("not poisoned") = Some(diff.to_vec());
         let from = self.resolve(checkout);
         match self.bug {
             GitBug::IgnoresDiff => self.inner.apply(&from, &[]),
@@ -1304,13 +1301,13 @@ impl GitMutant {
                     extra.push(1);
                     put_field(&mut extra, b"before the refusal");
                     let written = self.inner.apply(&from, &extra)?;
-                    let mut moved = self.moved.lock().expect("not poisoned");
+                    let mut moved = Mutex::lock(&self.moved).expect("not poisoned");
                     moved.push((checkout.clone(), written));
                     Err(error)
                 }
                 other => other,
             },
-            GitBug::AdoptsOnApply if *self.adopted.lock().expect("not poisoned") => {
+            GitBug::AdoptsOnApply if *Mutex::lock(&self.adopted).expect("not poisoned") => {
                 let mut extra = Vec::new();
                 put_field(&mut extra, b"adopted");
                 extra.push(1);
@@ -1319,7 +1316,7 @@ impl GitMutant {
             }
             GitBug::InPlace => {
                 let applied = self.inner.apply(&from, diff)?;
-                let mut moved = self.moved.lock().expect("not poisoned");
+                let mut moved = Mutex::lock(&self.moved).expect("not poisoned");
                 moved.push((checkout.clone(), applied));
                 Ok(checkout.clone())
             }
@@ -1494,7 +1491,7 @@ impl ImageStore for ImageMutant {
                 Ok(RootfsRef::new(String::from("rootfs-tampered")))
             }
             (ImageBug::CachesTampered, Err(ImageError::Failed { detail })) => {
-                let mut pulls = self.pulls.lock().expect("not poisoned");
+                let mut pulls = Mutex::lock(&self.pulls).expect("not poisoned");
                 *pulls += 1;
                 if *pulls == 1 {
                     Err(ImageError::Failed { detail })
@@ -1503,7 +1500,7 @@ impl ImageStore for ImageMutant {
                 }
             }
             (ImageBug::NewRootfsPerPull, Ok(rootfs)) => {
-                let mut pulls = self.pulls.lock().expect("not poisoned");
+                let mut pulls = Mutex::lock(&self.pulls).expect("not poisoned");
                 *pulls += 1;
                 Ok(RootfsRef::new(format!("{}-{pulls}", rootfs.as_str())))
             }
@@ -1570,9 +1567,7 @@ impl DataMutant {
     /// The copy whose data a handle reaches.
     fn data_of(&self, copy: &DatabaseCopy) -> DatabaseCopy {
         match self.bug {
-            DataBug::SharedData => self
-                .first
-                .lock()
+            DataBug::SharedData => Mutex::lock(&self.first)
                 .expect("not poisoned")
                 .clone()
                 .unwrap_or_else(|| copy.clone()),
@@ -1594,7 +1589,7 @@ impl DataSnapshot for DataMutant {
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            let mut named = self.named.lock().expect("not poisoned");
+            let mut named = Mutex::lock(&self.named).expect("not poisoned");
             if let Some((_, copy)) = named.iter().find(|(name, _)| *name == last) {
                 return Ok(copy.clone());
             }
@@ -1603,7 +1598,7 @@ impl DataSnapshot for DataMutant {
             return Ok(copy);
         }
         let copy = self.inner.copy(snapshot, run)?;
-        let mut first = self.first.lock().expect("not poisoned");
+        let mut first = Mutex::lock(&self.first).expect("not poisoned");
         let first = first.get_or_insert_with(|| copy.clone()).clone();
         match self.bug {
             DataBug::SameCopy => Ok(first),

@@ -1,0 +1,1 @@
+# file-lock calls in a cfg(test) module pass: no production build compiles it

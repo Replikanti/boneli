@@ -303,7 +303,9 @@ default budget (PR 2).
   loop, kept a lock in 125 of 300 rounds before and in none of 6,000
   rounds (20 runs) after, under a 300 % CPU cap with four spinners; the
   host suite failed 1 of 40 runs before and 0 of 100 after under the same
-  load.
+  load. ADR-030 states this rule, the owner check and the poll pauses of
+  the shared wait once for every file lock of the workspace, and
+  supersedes them here.
 - Unsupported roots, where locks taken by two users of the root do not
   see each other:
   - NFS and CIFS emulate `flock` with POSIX byte-range locks, which belong
