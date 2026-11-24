@@ -3,7 +3,13 @@
 //! crate pulls crates that `deny.toml` bans.
 //!
 //! The workflow is the TUF specification's (5.1 to 5.7), top-level roles
-//! only. This is the pure core the refresh stands on:
+//! only. [`refresh_trusted_root`] runs it: it fetches each file through
+//! the caller's `boneli_https::Dial` ([`Repository`], [`Timeouts`]), keeps
+//! the TUF state in a private trust directory under its lock, starts from
+//! the operator's pinned [`InitialRoot`] once, and installs
+//! `trusted_root.json` by rename only after every step and
+//! `TrustedRoot::from_json` passed ([`Outcome`], [`RefreshError`]). It
+//! spawns no thread. Under it is the pure core:
 //!
 //! - [`canonical`]: the canonical form TUF metadata is signed over:
 //!   sorted keys, no whitespace, only `\` and `"` escaped, control
@@ -24,19 +30,24 @@
 //!   lookup (5.7) in top-level `targets` only, which yields a
 //!   [`TargetFile`] to check the fetched bytes with.
 //!
-//! Nothing here reads a clock, a file or the network: the caller passes
-//! the bytes and the update's start time (5.1). Every refusal is an
-//! [`Error`] with a fixed reason that echoes no metadata text.
+//! The core reads no clock, file or network: the caller passes the bytes
+//! and the update's start time (5.1), and the refresh reads no clock
+//! either. Every refusal is an [`Error`] with a fixed reason that echoes no
+//! metadata text.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod canonical;
 mod envelope;
 mod error;
 mod expires;
+mod fetch;
 mod key;
 mod meta;
+mod refresh;
+mod repository;
 mod root;
 mod snapshot;
+mod state;
 mod targets;
 mod threshold;
 mod timestamp;
@@ -44,7 +55,12 @@ mod trusted;
 
 pub use canonical::canonical;
 pub use error::Error;
+pub use fetch::{InvalidTimeouts, MAX_HEAD_BYTES, MAX_HEADERS, Timeouts};
 pub use meta::MetaFile;
+pub use refresh::{
+    InitialRoot, Outcome, Refresh, RefreshError, Report, Step, refresh_trusted_root,
+};
+pub use repository::{Repository, RepositoryError};
 pub use root::Root;
 pub use targets::TargetFile;
 pub use trusted::TrustedSet;
@@ -83,3 +99,11 @@ pub const MAX_JSON_DEPTH: usize = 16;
 /// caps bound memory first for root and timestamp, this one for snapshot
 /// and targets (ADR-033, limits).
 pub const MAX_JSON_VALUES: usize = 65_536;
+
+/// The most new roots one refresh verifies and stores: 32. Sigstore
+/// rotated 15 times in about 5.3 years (about 2.8 a year, inferred from
+/// expiry dates), so 32 is about 11 years of lag. A 33rd new root stops
+/// the run with an error, the 32 stay stored, and the next run goes on
+/// from there: the cap bounds one run (at most 33 root requests), not how
+/// far behind a trust directory may be (ADR-033, limits).
+pub const MAX_ROOT_ROTATIONS: usize = 32;

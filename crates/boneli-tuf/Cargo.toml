@@ -15,8 +15,9 @@ workspace = true
 # all pull crates that deny.toml bans.
 [dependencies]
 # Public keys and their signature check (`PublicKey`, ECDSA P-256 over
-# ring) and SHA-256 (`Sha256`): the one crate that holds ring. A support
-# crate, no new external edge.
+# ring), SHA-256 (`Sha256`), and the `Dial` seam with its deadline wrapper
+# `Timed` that the refresh fetches through (ADR-033, item 7): the one crate
+# that holds ring. A support crate, no new external edge.
 boneli-https.workspace = true
 # Parses TUF metadata under per-role limits, duplicate keys refused, and
 # keeps numbers as lexemes, which the canonical form needs (ADR-008). A
@@ -24,7 +25,15 @@ boneli-https.workspace = true
 boneli-json.workspace = true
 # The RFC 3339 reader for `expires` (`boneli_sigstore::time::parse`), so
 # the workspace has one, and the cap on the `trusted_root.json` target
-# (`MAX_TRUSTED_ROOT_BYTES`); later the last check before the file is
+# (`MAX_TRUSTED_ROOT_BYTES`), and the last check before the file is
 # installed (`TrustedRoot::from_json`, ADR-033 item 6). A support crate,
 # no new external edge.
 boneli-sigstore.workspace = true
+# The HTTP/1.1 client the refresh fetches with (`Connection`, ADR-003),
+# over the `Dial` of boneli-https, as boneli-oci and boneli-forge-github
+# fetch (ADR-033, item 7). A support crate, no new external edge.
+boneli-http.workspace = true
+# The trust directory's root rules (`prepare_root`, ADR-021) and the
+# refresh's lock (`FileLock`, ADR-030): ADR-033, item 6. A support crate,
+# no new external edge.
+boneli-private-dir.workspace = true

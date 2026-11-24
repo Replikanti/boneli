@@ -27,8 +27,8 @@ core = ["boneli-domain", "boneli-app"]
 # boneli-sigstore verifies Sigstore signatures for every adapter that pulls
 # signed artifacts (ADR-029, S3), on boneli-https and boneli-json only.
 # boneli-tuf keeps the operator's trusted_root.json current from Sigstore's
-# TUF repository (ADR-033), on boneli-https, boneli-json and
-# boneli-sigstore; no external crate.
+# TUF repository (ADR-033), on boneli-https, boneli-http, boneli-json,
+# boneli-private-dir and boneli-sigstore; no external crate.
 support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-toml", "boneli-private-dir", "boneli-sigstore", "boneli-tuf"]
 # Composition roots: wire adapters, nothing depends on them.
 # boneli-replay-check is the test-only root of ADR-002: the two-process

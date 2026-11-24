@@ -1,6 +1,6 @@
 # ADR-033: Keeping Sigstore's trusted root current through TUF
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -75,11 +75,10 @@ Measured on 2026-11-24, anonymously, over HTTP/1.1 from a developer host:
 
 ## Decision
 
-The client is built in three PRs under #103: PR 1 the canonical form,
+The client was built in three PRs under #103: PR 1 the canonical form,
 signatures, thresholds and the root chain; PR 2 timestamp, snapshot,
 targets and the target; PR 3 the refresh with its fetches and trust
-directory, the live run, and the acceptance of this ADR. Items marked
-"(PR 3)" are decided here and built there.
+directory, the live run, and the acceptance of this ADR.
 
 1. **Own code**, in the support crate `boneli-tuf`, on `boneli-https`
    (`PublicKey`, `Sha256`, and later `Dial`), `boneli-json` and
@@ -95,12 +94,15 @@ directory, the live run, and the acceptance of this ADR. Items marked
      root must be signed by a threshold of N's root keys and by a
      threshold of its own; have version exactly N+1 (a checked add, so
      `i64::MAX` has no successor and nothing is fetched); have `_type`
-     `root`; and be persisted before the next one is fetched (PR 3). The
+     `root`; and be persisted before the next one is fetched. The
      expiry of intermediate roots is not checked; the newest root must
      not be expired (5.3.10). When a new root changes the key material or
      the threshold of timestamp or snapshot against its predecessor, the
      stored timestamp and snapshot are dropped (5.3.11, fast-forward
-     recovery); the signal is sticky over one update. Sigstore changed
+     recovery); the signal is sticky over one update. The refresh deletes
+     them before it stores the root that changed the keys: a run that
+     stops after storing that root would otherwise leave them to the next
+     run, whose set starts from that root and sees no change. Sigstore changed
      the timestamp key 5 times. The pure core enforces the drop as well:
      after such a root it refuses to load a stored timestamp or snapshot
      (`OnlineKeysChanged`), so a copy that still verifies (only the
@@ -191,7 +193,7 @@ directory, the live run, and the acceptance of this ADR. Items marked
      canonical form has no floats.
    - The bytes that are verified are the canonical form of the parsed
      `signed` value, and every field read comes from that same value.
-5. **The initial root** (PR 3) is an operator input,
+5. **The initial root** is an operator input,
    `InitialRoot::new(bytes, sha256_hex)`. The bytes must hash to the pin
    and pass their own root threshold.
    - It is used only when the trust directory has no stored root yet, and
@@ -205,37 +207,77 @@ directory, the live run, and the acceptance of this ADR. Items marked
      the operator cannot see and did not verify.
    - The earliest Sigstore root the rules accept as a pin is v5: v1 to v4
      carry hex keys, which count zero, and v1 to v3 a non-TUF `expires`.
-6. **Trust directory** (PR 3, S5). One private directory under the rules
+6. **Trust directory** (S5). One private directory under the rules
    of ADR-021 (`boneli_private_dir::prepare_root`) holds
    `trusted_root.json`, which the verifier's configuration (#32) reads;
    `tuf/root.json`, `tuf/timestamp.json` and `tuf/snapshot.json`, the
-   fetched bytes unchanged; `tuf/pin`; and `tuf/lock`.
-   - The whole refresh holds `FileLock::try_take(Kind::Exclusive)`
-     (ADR-030); a second refresh fails at `Lock` with "busy".
+   fetched bytes unchanged; `tuf/pin`; and `lock`.
+   - The whole refresh holds `FileLock::try_take(Kind::Exclusive)` on
+     `<dir>/lock` (ADR-030); a second refresh fails at `Lock` with
+     "busy". The lock is outside `tuf/` because the remedy below removes
+     `tuf/`: a lock inside it would go with it, and a refresh started
+     after the removal, with a new pin, would set up a new `tuf/` while
+     the old refresh still runs and later writes its root there, next to
+     the new pin (review of PR 3). `tuf/` must be a directory, not a
+     symlink.
+   - Before every read and write the refresh checks that the trust
+     directory, `tuf/` and `lock` still have the `st_dev` and `st_ino` it
+     locked, and fails at `Lock` otherwise. That covers removing the whole
+     trust directory during a run: a refresh started after it creates a
+     new directory and a new lock, and the old one then writes nothing
+     into it. std has no `openat`, so a window stays open: from the check
+     through the whole write it guards (the temporary file is created by
+     path, written, synced and renamed). It is no trust gap. Only `tuf/`
+     removed (the documented remedy) cannot reach it: the lock stays
+     held, so no other refresh recreates `tuf/`, and a write into the
+     removed one fails. It is reachable only when the whole trust
+     directory is removed and a new refresh recreates it inside that
+     span. The directory is `0700` and the runner's, under ancestors no one
+     else can rename (ADR-021), so only the runner's own uid can do that,
+     and that uid can already write `trusted_root.json` directly.
    - Writes go to a temporary name in the same directory with
      `create_new` and mode 0600, then `sync_all`, rename, and a sync of
-     the directory. A temporary file left by a crashed run is removed
-     under the lock.
+     the directory. The temporary name is `.tmp-<name>`, one per file,
+     because under the lock no other refresh writes; every `.tmp-` name
+     in the two directories is a crashed run's and is removed under the
+     lock.
+   - The pin is recorded before the initial root is stored, so a stored
+     root always has one. A recorded pin other than the initial root's,
+     and a stored root without a pin, fail at `InitialRoot` and name the
+     remedy (remove `tuf/`).
    - A stored root that does not parse or verify against itself fails the
-     refresh at `Root` and names the remedy (remove `tuf/`). A stored
-     timestamp or snapshot that fails to parse or verify under the
-     current root is ignored, and its expiry is never checked, so it
-     serves only for rollback checks.
+     refresh at `Root` and names the remedy (remove `tuf/`); it never
+     falls back to the pin. A stored timestamp or snapshot that fails to
+     parse or verify under the current root, or is above its role's cap,
+     is ignored, and its expiry is never checked, so it serves only for
+     rollback checks. Only verdicts on the copy are ignored: the core's
+     `OutOfOrder` from such a load fails the refresh, because it means
+     the refresh called the core out of its order, and ignoring it would
+     drop the rollback checks without a trace.
    - `trusted_root.json` is replaced only after every TUF step passed, the
      target's length and SHA-256 matched, and `TrustedRoot::from_json`
-     read it. When the file on disk already has the target's length and
-     SHA-256, nothing is fetched or written (`Outcome::Unchanged`). TUF
-     state advances as the specification persists it, and the output file
-     stays untouched on every failure.
-7. **Fetches** (PR 3) go through `boneli_https::Dial` (`TlsDial` in
+     read it. When the file on disk is a regular file with the target's
+     length and SHA-256, nothing is fetched or written
+     (`Outcome::Unchanged`); a symlink there is never followed, and the
+     rename replaces it. TUF state advances as the specification persists
+     it. On every failure before the rename the old file stays as it was.
+     After the rename only the sync of the directory can fail: the
+     refresh then reports `Write` with the new, fully verified file in
+     place, and the next run finds it current (`Outcome::Unchanged`)
+     while the repository still lists it, or installs the target again if
+     a crash lost the rename.
+7. **Fetches** go through `boneli_https::Dial` (`TlsDial` in
    production, so revocation by ADR-017, ADR-020 and ADR-027 and name
    resolution by ADR-022 apply under each request's deadline), as the
    clients of `boneli-oci` and `boneli-forge-github` do: one `GET` per
    file with `Host` only; `200` only, except `404` for `N+1.root.json`,
-   which ends the chain; every other status and every redirect is an
+   which ends the chain (the fetch reports a `404`, and the caller decides
+   that it ends only the root chain); every other status and every redirect is an
    error naming the file; a content coding other than `identity` is
-   refused; the body has a cap per role and is read exactly when its
-   length is known. The repository is
+   refused; a `Content-Length` above the cap or other than the listed
+   length fails before the body is read; the body has a cap per role and
+   is read exactly when its length is known. A length the referring
+   metadata lists above the role's cap is refused before the request. The repository is
    `Repository::parse("https://<host>[:port][/<prefix>]")`: https only,
    no userinfo, query, fragment or percent sign, prefix segments
    `[A-Za-z0-9._~-]+` and not `.` or `..`, host in ADR-003's grammar.
@@ -249,8 +291,9 @@ directory, the live run, and the acceptance of this ADR. Items marked
    days after the freeze. Run it also whenever a signature is refused for
    an unknown log or CA.
 9. **Errors.** The pure core's `Error` and the refresh's
-   `RefreshError { step, detail }` (PR 3; `step` one of `Lock`,
-   `InitialRoot`, `Root(version)`, `Timestamp`, `Snapshot(version)`,
+   `RefreshError { step, detail }` (`step` one of `Lock`,
+   `InitialRoot`, `Root(version)` (`Root(None)` for the stored root, whose
+   version is unknown when it does not parse), `Timestamp`, `Snapshot(version)`,
    `Targets(version)`, `Target`, `TrustedRoot`, `Write`) carry fixed
    reasons that echo file names, role names, versions, statuses, sizes
    and hosts, never metadata text.
@@ -268,11 +311,11 @@ test.
 | `MAX_TARGETS_BYTES` | 1,048,576 | Measured 4,942 bytes (212 times). At 287 bytes per target about 3,650 targets. |
 | Target length | at most `boneli_sigstore::MAX_TRUSTED_ROOT_BYTES` (1,048,576) | ADR-029's own cap on the file this target becomes; checked against the targets entry before the request, so a larger file is never fetched. |
 | `MAX_JSON_DEPTH` / `MAX_JSON_VALUES` | 16 / 65,536 | ADR-009 D12's document limits, also ADR-029's: the same parser over documents of the same scale. Measured at most 7 / 124, so 2.3 and 528 times that. A depth below 7 refuses today's targets. Under the root and timestamp caps the value limit is never reached (two bytes per value at least); it bounds snapshot and targets. |
-| Response head (PR 3) | 16,384 bytes / 64 fields | D12. Measured 735 bytes / 20, so 22 and 3.2 times that. |
-| `MAX_ROOT_ROTATIONS` (PR 3) | 32 per run | 15 rotations measured in about 5.3 years (inferred about 2.8 a year), so 32 is about 11 years of lag. A run verifies and persists at most 32 new roots; a 33rd `200` stops it with an error (the 32 roots stay) and the next run continues. The cap bounds one run (at most 33 root requests), not how far behind a directory may be. |
-| Timeouts (PR 3) | connect 10 s, handshake 10 s, io 30 s, setup 30 s, `min_rate` 1,048,576 B/s | D12's values and reasons. `setup` is 63 times the slowest measured TUF fetch (0.47 s). With the measured connect and TLS of about 0.1 s it leaves about 29.9 s for the leaf's CRL inside the first request: about 29.9 MiB at `min_rate`, 93 times the measured 335,587 bytes. The CRL is cached per `TlsConfig` for 24 h, so one run fetches it once. |
-| Deadline per fetch (PR 3) | `setup + size / min_rate`, `size` the cap, or the exact length when listed | Root 30 + 65,536 / 1,048,576 = 30.0625 s. Timestamp 30.015625 s. Snapshot and targets 31 s. Target at most 31 s. |
-| Worst-case run (PR 3) | 37 requests, 1,115 s | A server that trickles every answer to its deadline: 33 × 30.0625 (roots) + 30.015625 + 31 + 31 + 31 = 1,115.08 s, about 18.6 min. An honest run is 5 requests (root 404, timestamp, snapshot, targets, target), 1.06 s measured; a run that finds `trusted_root.json` current makes 4. |
+| Response head | 16,384 bytes / 64 fields | D12. Measured 735 bytes / 20, so 22 and 3.2 times that. |
+| `MAX_ROOT_ROTATIONS` | 32 per run | 15 rotations measured in about 5.3 years (inferred about 2.8 a year), so 32 is about 11 years of lag. A run verifies and persists at most 32 new roots; a 33rd `200` stops it with an error (the 32 roots stay) and the next run continues. The cap bounds one run (at most 33 root requests), not how far behind a directory may be. |
+| Timeouts | connect 10 s, handshake 10 s, io 30 s, setup 30 s, `min_rate` 1,048,576 B/s | D12's values and reasons. `setup` is 63 times the slowest measured TUF fetch (0.47 s). With the measured connect and TLS of about 0.1 s it leaves about 29.9 s for the leaf's CRL inside the first request: about 29.9 MiB at `min_rate`, 93 times the measured 335,587 bytes. The CRL is cached per `TlsConfig` for 24 h, so one run fetches it once. |
+| Deadline per fetch | `setup + size / min_rate`, `size` the cap, or the exact length when listed | Root 30 + 65,536 / 1,048,576 = 30.0625 s. Timestamp 30.015625 s. Snapshot and targets 31 s. Target at most 31 s. |
+| Worst-case run | 37 requests, 1,115 s | A server that trickles every answer to its deadline: 33 × 30.0625 (roots) + 30.015625 + 31 + 31 + 31 = 1,115.08 s, about 18.6 min. An honest run is 5 requests (root 404, timestamp, snapshot, targets, target), 1.06 s measured; a run that finds `trusted_root.json` current makes 4. |
 
 `EcdsaP256Key::MAX_PEM_LEN` is 16,384 bytes: a P-256 key is 241 bytes of
 PKCS#8 PEM and 643 bytes with OpenSSL's text dump in front, so the cap is
@@ -289,7 +332,7 @@ fixed sentence of `KeyError::TooLarge` stays true for both key types.
   target is byte for byte ADR-029's fixture; the reviewer reads every PR
   of the crate.
 - A canonical-form or format mismatch can only refuse: the known answers
-  prove that today's repository passes, and the weekly live run (PR 3)
+  prove that today's repository passes, and the weekly live run
   catches upstream drift within a week, for example a new key type in a
   threshold position, `trusted_root.json` moved into a delegation, or a
   changed `expires` form. Failure is closed: the old file stays.
@@ -345,3 +388,20 @@ PR 3 lands: a refresh from the pinned Sigstore v16 against
 `tuf-repo-cdn.sigstore.dev` installs a `trusted_root.json` whose SHA-256
 equals the target's, by hand and in the weekly `oci-acceptance` workflow
 on both architectures, and every mutant of the three PRs is killed.
+
+Met on 2026-11-24 with PR 3:
+
+- **By hand** (`cargo test -p boneli-tuf --test network -- --ignored`,
+  developer host, `TlsDial` with the Mozilla roots): from the pinned v16
+  into an empty trust directory in 1.9 s with 5 requests (`17.root.json`
+  404, timestamp v843, snapshot v166, targets v14, the target). The
+  installed `trusted_root.json` is 6,787 bytes with SHA-256 `6494e21e…`,
+  the target's, and byte for byte ADR-029's fixture. A second run found it
+  current (`Outcome::Unchanged`) in 1.0 s with 4 requests.
+- **In `oci-acceptance`** on x86_64 and arm64, the step "Refresh
+  Sigstore's trusted root through TUF" of PR 3's own run (the workflow
+  runs on a PR that edits it): the same versions and the same SHA-256 on
+  both, the first run in 0.81 s (x86_64) and 0.72 s (arm64), the second
+  `Outcome::Unchanged`.
+- **Mutants:** 38 in PR 1, 44 in PR 2 and 55 in PR 3, each run against
+  the crate's whole suite; all killed (the tables are in the PR bodies).

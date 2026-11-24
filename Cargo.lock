@@ -173,8 +173,10 @@ dependencies = [
 name = "boneli-tuf"
 version = "0.0.0"
 dependencies = [
+ "boneli-http",
  "boneli-https",
  "boneli-json",
+ "boneli-private-dir",
  "boneli-sigstore",
 ]
 
