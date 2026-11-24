@@ -3,7 +3,7 @@
 //! crate pulls crates that `deny.toml` bans.
 //!
 //! The workflow is the TUF specification's (5.1 to 5.7), top-level roles
-//! only. This part holds the pure core that every later step stands on:
+//! only. This is the pure core the refresh stands on:
 //!
 //! - [`canonical`]: the canonical form TUF metadata is signed over:
 //!   sorted keys, no whitespace, only `\` and `"` escaped, control
@@ -15,7 +15,14 @@
 //!   and the root chain (5.3): each next root is signed by a threshold of
 //!   the trusted root's keys and of its own, has version N+1 exactly and
 //!   type `root`; the newest must not be expired; a change to the
-//!   timestamp or snapshot keys raises the fast-forward signal (5.3.11).
+//!   timestamp or snapshot keys raises the fast-forward signal (5.3.11)
+//!   and drops the stored timestamp and snapshot;
+//! - on top of it the timestamp (5.4), the snapshot (5.5) and the
+//!   top-level targets (5.6), each with its threshold, type, version
+//!   rules and expiry, the snapshot and targets also with the length and
+//!   SHA-256 the referring file lists ([`MetaFile`]); and the target
+//!   lookup (5.7) in top-level `targets` only, which yields a
+//!   [`TargetFile`] to check the fetched bytes with.
 //!
 //! Nothing here reads a clock, a file or the network: the caller passes
 //! the bytes and the update's start time (5.1). Every refusal is an
@@ -27,13 +34,19 @@ mod envelope;
 mod error;
 mod expires;
 mod key;
+mod meta;
 mod root;
+mod snapshot;
+mod targets;
 mod threshold;
+mod timestamp;
 mod trusted;
 
 pub use canonical::canonical;
 pub use error::Error;
+pub use meta::MetaFile;
 pub use root::Root;
+pub use targets::TargetFile;
 pub use trusted::TrustedSet;
 
 /// The largest `root.json` accepted: 65,536 bytes. The largest Sigstore

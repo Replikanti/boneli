@@ -822,6 +822,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the fast-forward signal when the timestamp or snapshot keys change.
   Byte caps per role and JSON limits 16 / 65,536. Known answers: Sigstore's
   roots v5 to v16 chain; v3 and v4 are refused as pins.
+- `boneli-tuf` (part 2 of #103, ADR-033 still proposed): the rest of the
+  pure core. `TrustedSet` verifies the timestamp (TUF 5.4: threshold,
+  `_type`, no rollback of its version or of the snapshot version it
+  names, an equal version re-checked, not expired, never under an
+  expired root), the snapshot (5.5: length and SHA-256 as the timestamp
+  lists them, version equal to its entry, no entry of the stored
+  snapshot dropped or lowered, not expired) and the top-level targets
+  (5.6), and looks up a target byte-exact in top-level `targets`, never
+  in a delegation (5.7: `TargetFile` with its exact length, at most
+  `boneli_sigstore::MAX_TRUSTED_ROOT_BYTES`, and SHA-256, and `verify`).
+  Stored timestamp and snapshot copies load for rollback checks only and
+  are refused after a root rotated the online keys (5.3.11); calls out of
+  the update order fail with `OutOfOrder`. Hash maps must hold `sha256`
+  (64 lower-case hex); other algorithms are not read. Known answers:
+  Sigstore's timestamp v842, snapshot v166 and targets v14 verify under
+  root v16, and the `trusted_root.json` target is `boneli-sigstore`'s
+  fixture.
 - `boneli_https::EcdsaP256Key` (ADR-033, S4): ECDSA P-256 signing through
   ring's key provider, PKCS#8 only, input wiped, so `boneli-tuf`'s tests
   sign fixtures with the one scheme production accepts.
