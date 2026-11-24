@@ -374,8 +374,10 @@ Met on 2026-11-24 with PR 3:
   installed `trusted_root.json` is 6,787 bytes with SHA-256 `6494e21e…`,
   the target's, and byte for byte ADR-029's fixture. A second run found it
   current (`Outcome::Unchanged`) in 1.0 s with 4 requests.
-- **In `oci-acceptance`** on x86_64 and arm64: the step "Refresh
-  Sigstore's trusted root through TUF", first run on PR 3 itself (the
-  workflow runs on a PR that edits it).
+- **In `oci-acceptance`** on x86_64 and arm64, the step "Refresh
+  Sigstore's trusted root through TUF" of PR 3's own run (the workflow
+  runs on a PR that edits it): the same versions and the same SHA-256 on
+  both, the first run in 0.81 s (x86_64) and 0.72 s (arm64), the second
+  `Outcome::Unchanged`.
 - **Mutants:** 38 in PR 1, 44 in PR 2 and 51 in PR 3, each run against
   the crate's whole suite; all killed (the tables are in the PR bodies).
