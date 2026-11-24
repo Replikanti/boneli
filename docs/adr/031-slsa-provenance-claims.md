@@ -120,11 +120,12 @@ against the statement as filed (Fulcio's certificate extensions follow in
      token carries it (a branch, a tag or `refs/pull/N/merge`). It names
      the code the run built only when the trigger's ref is the code
      built: `push` (branch or tag), `release`, `pull_request`,
-     `workflow_dispatch` and `schedule`. Every other trigger, among them
-     `pull_request_target`, `workflow_run`, `issue_comment`, `issues`
-     and `discussion`, gets the base or default branch as its ref and
-     that branch's commit as `gitCommit`, whatever code its steps check
-     out (see Known limits). A prefix is allowed because
+     `workflow_dispatch` and `schedule`, and then only when the steps
+     build the commit the run started on. Every other trigger counts as
+     unknown: some, among them `pull_request_target`, `workflow_run`,
+     `issue_comment`, `issues` and `discussion`, get the base or default
+     branch as their ref and that branch's commit as `gitCommit`,
+     whatever code their steps check out (see Known limits). A prefix is allowed because
      3 of the 5 measured producers have a ref that moves with every
      release, the reason S2 allows a URI prefix.
    - **Materials**, by URI and one digest: an entry of
@@ -263,10 +264,12 @@ against the statement as filed (Fulcio's certificate extensions follow in
   repositories). Closure: #114.
 - The ref and the source commit say which code a run built only for the
   triggers listed in item 4 (`push`, `release`, `pull_request`,
-  `workflow_dispatch`, `schedule`). Any other trigger, such as
-  `pull_request_target`, `workflow_run`, `issue_comment` or `issues`,
-  carries the base or default branch as its ref and that branch's
-  commit as `gitCommit`, so a rule with ref `refs/heads/main` and that
+  `workflow_dispatch`, `schedule`), and only when the steps build the
+  commit the run started on; a step that checks out other code is the
+  first known limit above. Any other trigger is treated as unknown, and
+  some, such as `pull_request_target`, `workflow_run`, `issue_comment`
+  or `issues`, carry the base or default branch as their ref and that
+  branch's commit as `gitCommit`, so a rule with ref `refs/heads/main` and that
   commit as a material accepts an image such a run built from a fork's
   code. Only the trigger tells these runs apart. The gap is open when
   the signing workflow, or any workflow that calls it as a reusable
