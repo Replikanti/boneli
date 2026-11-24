@@ -1415,16 +1415,16 @@
    "title": "boneli-sigstore: TUF client that keeps the operator's trusted_root.json current",
    "epic": null,
    "order": 54,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "7ee136eb",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": 123,
-   "note": "PR 2/3 merged (#123); next PR 3 (I/O refresh, live test, ADR accept)",
-   "updated_at": "2026-11-24T19:09:46+00:00",
+   "pr": 124,
+   "note": "PR #124 open",
+   "updated_at": "2026-11-24T20:13:44+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1590,14 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T01:41:11+00:00",
-   "issue": 57,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "b6fae515",
-   "note": "PR 1 #107, PR 2 #108 merged; PR 3 boneli-oci"
-  },
   {
    "at": "2026-11-24T02:25:22+00:00",
    "issue": 109,
@@ -1989,6 +1981,14 @@
    "to": "done",
    "by": "1806fc84",
    "note": null
+  },
+  {
+   "at": "2026-11-24T20:13:44+00:00",
+   "issue": 103,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #124 open"
   }
  ],
  "open": [
@@ -2022,7 +2022,7 @@
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T19:42:46+00:00",
+ "updated_at": "2026-11-24T20:13:44+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
