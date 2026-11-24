@@ -745,7 +745,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TrustedRoot::from_json` reads `trusted_root.json` (at most 1 MiB; log
   IDs recomputed, `keyDetails` checked, duplicates and reversed windows
   refused, Rekor v2 logs left out); `Identity` is an exact OIDC issuer
-  with an exact email, an exact URI or a URI prefix ending in `/` or `@`;
+  with an exact email, an exact URI or a URI prefix ending in `/`;
   `verify` checks the signed digest and predicate type, then a trusted
   key, or the Fulcio chain at Rekor's integrated time, an embedded SCT,
   the Rekor v1 SET over JCS bytes built here and the entry body, and the

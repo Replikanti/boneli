@@ -117,14 +117,24 @@ with the limits it names; item 9 follows in PR 3, and this ADR becomes
    root is `trusted_root.json` supplied by the operator as bytes, with no
    embedded copy and no TUF client. An identity is the OIDC issuer,
    matched exactly, plus the SAN: an exact email, an exact URI, or a URI
-   prefix that ends in `/` or `@`; no regex. Rekor v2 entries and
-   TSA-only time are refused (follow-up). Basis: a Fulcio leaf lives 10
+   prefix that ends in `/`; no regex. Rekor v2 entries and TSA-only
+   time are refused (follow-up). Basis: a Fulcio leaf lives 10
    minutes (both measured leaves), so its validity can only be checked at
    the log's time, never at the wall clock; every measured 2026 signature
    is in Rekor v1 with a SET; Fulcio's documented SAN form for GitHub
    workflows is `<workflow>@<ref>`, so a workflow that releases from tags
    gets a SAN ending in `@refs/tags/<version>`, and exact matching alone
-   would need a policy edit for every release.
+   would need a policy edit for every release. **Changed at review of PR
+   2 (operator decision):** STOP 1 accepted `/` or `@` as the prefix
+   boundary; `@` is dropped. A prefix ending in `@` (`…/release.yaml@`)
+   trusts every ref the workflow can run at, any branch, any commit SHA
+   and `refs/pull/N/merge`, so anyone who may push a branch to the
+   repository could add `id-token: write` on that branch and sign as the
+   release workflow: the SAN is the `job_workflow_ref` of GitHub's OIDC
+   token, which names the ref the job ran at. Tag releases are covered by `…@refs/tags/`, which ends in
+   `/`, and a protected branch by its exact SAN (`…@refs/heads/main`);
+   `…@refs/heads/` trusts every branch and has to be written out on
+   purpose.
 
 3. **Where the code lives (S3).** The ring- and webpki-backed primitives
    go into `boneli-https`, where ring already is (ADR-005, ADR-009 D6,
@@ -236,12 +246,15 @@ with the limits it names; item 9 follows in PR 3, and this ADR becomes
      hash is read, checked and left out (a v2 log issues no SET, and
      entries are looked up by the SHA-256 of the key, never by the file's
      `keyId`); a CT log with such a `keyId` refuses the file, because RFC
-     6962 defines the log ID so. A key of a kind `PublicKey` does not
+     6962 defines the log ID so. A left-out key still counts for the
+     duplicate check, so the same key once kept and once left out is
+     refused like any duplicate (review of PR 2; the public-good root has
+     no such pair and reads). A key of a kind `PublicKey` does not
      support refuses the whole file: the operator keeps the file that
      worked.
    - **Identities.** Issuer and SAN text non-empty and from `!` to `~`; a
-     `UriPrefix` ends in `/` or `@`; byte-exact matching, an email rule
-     never matches a URI SAN and the reverse.
+     `UriPrefix` ends in `/` (S2, `@` dropped at review); byte-exact
+     matching, an email rule never matches a URI SAN and the reverse.
    - **cosign layers** (`Evidence::from_cosign_layer`): the signature
      annotation required, the certificate optional (absent or empty is a
      keyed signature), the Rekor bundle annotation optional; a key the
@@ -393,7 +406,7 @@ the digest binds the bytes and mirrors are legitimate.
   verdict forever.
 - We own a security-critical verifier. Mitigations: every check has a
   negative test and a mutant that a named test kills (PR 1: 23 mutants
-  over `keys.rs` and `codesign.rs`, all killed; PR 2: 71 mutants over
+  over `keys.rs` and `codesign.rs`, all killed; PR 2: 73 mutants over
   every check of `boneli-sigstore`, all killed, the one survivor of the
   first run, PEM line length, by a test added for it); the real Kubernetes
   and Chainguard leaves are known answers against the public-good chain
@@ -411,6 +424,14 @@ the digest binds the bytes and mirrors are legitimate.
     and an `Off` rule under a `Required` prefix is an exemption by
     design. Forcing `Required` for references an agent chose is a
     follow-up issue (filed at STOP 1).
+  - A URI prefix trusts everyone who can run the workflow at a matching
+    ref. `…@refs/tags/` trusts whoever may push tags to the signer's
+    repository, `…@refs/heads/` whoever may push branches, and an org or
+    repository prefix ending in `/` every workflow and ref under it. What
+    makes `@refs/tags/` mean "releases" is the signer's tag protection,
+    which boneli cannot see. It stays open by design: an operator who
+    needs less trust writes the exact SAN of a protected branch or of one
+    tag.
   - Rotation depends on the operator replacing `trusted_root.json`; a
     stale file refuses signatures from new logs or CAs, which fails
     closed. A TUF client is a follow-up issue (filed at STOP 1).
@@ -483,6 +504,10 @@ the digest binds the bytes and mirrors are legitimate.
   input would choose it.
 - **Exact SAN matching only.** Rejected: a tag-released workflow's SAN
   changes with every release.
+- **`@` as a prefix boundary** (accepted at STOP 1, dropped at the
+  review of PR 2 by the operator). Rejected: `…/release.yaml@` trusts every
+  ref of the workflow, branches, commit SHAs and pull request merge refs
+  included (item 2).
 
 ## Accept when
 

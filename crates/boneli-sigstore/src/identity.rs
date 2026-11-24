@@ -1,16 +1,22 @@
 //! Keyless identities (ADR-029, S2): the OIDC issuer Fulcio recorded,
 //! matched exactly, and the certificate's one SAN, matched as an exact
-//! email, an exact URI, or a URI prefix that ends in `/` or `@`. No regex
+//! email, an exact URI, or a URI prefix that ends in `/`. No regex
 //! and no normalization: comparison is byte for byte, so a look-alike
 //! (another script's letter, a percent-encoding, other case) never
 //! matches.
 //!
 //! Why a prefix: a GitHub workflow's SAN is `<workflow>@<ref>`, and a
 //! workflow that releases from tags gets a new `@refs/tags/<version>` with
-//! every release. The boundary rule keeps a prefix from crossing into a
-//! sibling: `https://github.com/acme/` cannot match
-//! `https://github.com/acme-evil/x`, and `…/release.yaml@` cannot match
-//! `…/release.yaml-evil@…`.
+//! every release, which `…/release.yaml@refs/tags/` covers. The boundary
+//! rule keeps a prefix from crossing into a sibling:
+//! `https://github.com/acme/` cannot match `https://github.com/acme-evil/x`.
+//!
+//! Why only `/`: a prefix ending in `@` (`…/release.yaml@`) would trust
+//! every ref the workflow can run at, any branch, any commit SHA and
+//! `refs/pull/N/merge`, so anyone who may push a branch to the repository
+//! could sign as the release workflow. The ref class is written out
+//! instead (`@refs/tags/`, or `@refs/heads/` on purpose), and a protected
+//! branch is trusted by its exact SAN.
 
 use boneli_https::San;
 
@@ -23,7 +29,7 @@ pub enum SanRule {
     Email(String),
     /// A URI SAN equal to this.
     Uri(String),
-    /// A URI SAN that starts with this, which ends in `/` or `@`.
+    /// A URI SAN that starts with this, which ends in `/`.
     UriPrefix(String),
 }
 
@@ -37,7 +43,7 @@ pub struct Identity {
 impl Identity {
     /// An identity. The issuer and the SAN text must be non-empty and
     /// printable ASCII without spaces (`!` to `~`), and a `UriPrefix` must
-    /// end in `/` or `@`.
+    /// end in `/` (module doc).
     pub fn new(issuer: &str, san: SanRule) -> Result<Identity, ConfigError> {
         let text = match &san {
             SanRule::Email(t) | SanRule::Uri(t) | SanRule::UriPrefix(t) => t,
@@ -46,7 +52,7 @@ impl Identity {
             return Err(ConfigError::IdentityNotAscii);
         }
         if let SanRule::UriPrefix(prefix) = &san
-            && !(prefix.ends_with('/') || prefix.ends_with('@'))
+            && !prefix.ends_with('/')
         {
             return Err(ConfigError::PrefixWithoutBoundary);
         }

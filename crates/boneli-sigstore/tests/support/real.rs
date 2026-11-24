@@ -30,7 +30,7 @@ pub const GITHUB_ACTIONS: &str = "https://token.actions.githubusercontent.com";
 pub const CHAINGUARD_WORKFLOW: &str =
     "https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main";
 pub const CHAINGUARD_PREFIX: &str =
-    "https://github.com/chainguard-images/images/.github/workflows/release.yaml@";
+    "https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/";
 
 /// The Rekor `integratedTime`s of the two keyless signatures.
 pub const KUBERNETES_INTEGRATED: u64 = 1_716_500_129;

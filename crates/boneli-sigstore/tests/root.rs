@@ -73,6 +73,35 @@ fn duplicate_log_id_refused() {
         Value::Array(vec![log_instance(&pki.rekor_key, EPOCH_2020, None)]),
     );
     assert_eq!(read(&v).err(), Some(ConfigError::RootDuplicateLogId));
+    // The same key once kept and once left out (a keyId that is not its
+    // SHA-256), in either order.
+    let mut left_out = log_instance(&pki.rekor_key, EPOCH_2020, None);
+    set(
+        &mut left_out,
+        &["logId", "keyId"],
+        s(&base64::encode(&pki.other_key.id())),
+    );
+    let kept = log_instance(&pki.rekor_key, EPOCH_2020, None);
+    for pair in [
+        vec![kept.clone(), left_out.clone()],
+        vec![left_out.clone(), kept.clone()],
+    ] {
+        let mut v = root_value(&pki);
+        set(&mut v, &["tlogs"], Value::Array(pair));
+        assert_eq!(read(&v).err(), Some(ConfigError::RootDuplicateLogId));
+    }
+    // A left-out Rekor key that is also a CT log's.
+    let mut v = root_value(&pki);
+    let mut ct_as_v2 = log_instance(&pki.ct_key, EPOCH_2020, None);
+    set(
+        &mut ct_as_v2,
+        &["logId", "keyId"],
+        s(&base64::encode(&pki.other_key.id())),
+    );
+    set(&mut v, &["tlogs"], Value::Array(vec![kept, ct_as_v2]));
+    assert_eq!(read(&v).err(), Some(ConfigError::RootDuplicateLogId));
+    // The public-good root has no such duplicate and still reads.
+    assert!(TrustedRoot::from_json(real::TRUSTED_ROOT).is_ok());
 }
 
 #[test]
@@ -294,6 +323,6 @@ fn config_error_texts() {
     );
     assert_eq!(
         ConfigError::PrefixWithoutBoundary.to_string(),
-        "a SAN prefix does not end in / or @"
+        "a SAN prefix does not end in /"
     );
 }

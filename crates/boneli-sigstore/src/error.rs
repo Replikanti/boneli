@@ -175,7 +175,7 @@ pub enum ConfigError {
     RootCertificate,
     /// An identity's issuer or SAN is empty or not printable ASCII.
     IdentityNotAscii,
-    /// A SAN prefix does not end in `/` or `@`.
+    /// A SAN prefix does not end in `/`.
     PrefixWithoutBoundary,
     /// A trust has neither keys nor a keyless part.
     TrustEmpty,
@@ -202,7 +202,7 @@ impl fmt::Display for ConfigError {
             ConfigError::IdentityNotAscii => {
                 "an identity's issuer or SAN is empty or not printable ASCII"
             }
-            ConfigError::PrefixWithoutBoundary => "a SAN prefix does not end in / or @",
+            ConfigError::PrefixWithoutBoundary => "a SAN prefix does not end in /",
             ConfigError::TrustEmpty => "a trust has neither keys nor a keyless part",
             ConfigError::NoIdentities => "a keyless trust has no identity",
             ConfigError::PredicateTypeNotAscii => {

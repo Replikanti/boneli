@@ -18,7 +18,8 @@
 //! read and checked like the others, then left out: that is how a Rekor
 //! v2 log names itself (by its signed-note key ID; `log2025-1` in the
 //! public-good root, measured), and a v2 log issues no SET, so it can
-//! vouch for nothing here (Rekor v2 is out of scope, S2). Entries are
+//! vouch for nothing here (Rekor v2 is out of scope, S2); its key still
+//! counts as a duplicate of any other log with the same key. Entries are
 //! looked up by the SHA-256 of the key either way, never by the file's
 //! `keyId`.
 //!
@@ -107,10 +108,14 @@ impl TrustedRoot {
         }
         // A Rekor v2 log names itself by its signed-note key ID, not by
         // the SHA-256 of its key (`log2025-1` in the public-good root), and
-        // never issues a SET: it is read like the others and left out.
+        // never issues a SET: it is read like the others and left out. Its
+        // key still counts for the duplicate check below, so the same key
+        // once kept and once left out is refused like any duplicate.
+        let mut ids = Vec::new();
         let mut tlogs = Vec::new();
         for value in list(&root, "tlogs")? {
             let (key, window, v1) = log(value)?;
+            ids.push(key.key_id());
             if v1 {
                 tlogs.push(Tlog { key, window });
             }
@@ -133,11 +138,7 @@ impl TrustedRoot {
             .iter()
             .map(authority)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut ids: Vec<[u8; 32]> = tlogs
-            .iter()
-            .map(|l| l.key.key_id())
-            .chain(ctlogs.iter().map(|l| l.key.key_id()))
-            .collect();
+        ids.extend(ctlogs.iter().map(|l| l.key.key_id()));
         ids.sort_unstable();
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(ConfigError::RootDuplicateLogId);

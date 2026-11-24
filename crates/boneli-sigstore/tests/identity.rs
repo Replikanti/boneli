@@ -12,6 +12,9 @@ fn prefix_without_boundary_refused() {
         "https://github.com/acme",
         "https://github.com/acme/app/.github/workflows/release.yaml",
         "https://github.com/acme/app/.github/workflows/release.yaml@refs",
+        // `@` is no boundary: it would trust every ref of the workflow.
+        "https://github.com/acme/app/.github/workflows/release.yaml@",
+        "https://github.com/acme/app/x.yaml@",
         "https://github.com/acme/app.",
     ] {
         assert_eq!(
@@ -22,7 +25,8 @@ fn prefix_without_boundary_refused() {
     }
     for prefix in [
         "https://github.com/acme/",
-        "https://github.com/acme/app/x.yaml@",
+        "https://github.com/acme/app/.github/workflows/release.yaml@refs/tags/",
+        "https://github.com/acme/app/.github/workflows/release.yaml@refs/heads/",
     ] {
         assert!(Identity::new(pki::ISSUER, SanRule::UriPrefix(prefix.to_owned())).is_ok());
     }
@@ -79,7 +83,7 @@ fn identity_look_alikes_do_not_match() {
     for rule in [
         SanRule::Uri(exact.to_owned()),
         SanRule::UriPrefix(
-            "https://github.com/acme/app/.github/workflows/release.yaml@".to_owned(),
+            "https://github.com/acme/app/.github/workflows/release.yaml@refs/tags/".to_owned(),
         ),
         SanRule::UriPrefix("https://github.com/acme/".to_owned()),
     ] {
@@ -128,13 +132,18 @@ fn identity_look_alikes_do_not_match() {
         Err(Refusal::IdentityMismatch)
     );
     assert!(verify_leaf(&pki, &email_leaf, &as_email).is_ok());
-    // A prefix rule never matches an email SAN.
+    // A prefix rule never matches an email SAN, even one whose text starts
+    // with the prefix (`/` is allowed in an email's local part).
+    let slash_email = LeafSpec {
+        san: Some(san(&[(RFC822_NAME, b"team/signer@boneli.test")])),
+        ..LeafSpec::email()
+    };
     let prefix = pki::keyless_trust(
         &pki,
-        vec![uri_identity(SanRule::UriPrefix("signer@".to_owned()))],
+        vec![uri_identity(SanRule::UriPrefix("team/".to_owned()))],
     );
     assert_eq!(
-        verify_leaf(&pki, &email_leaf, &prefix),
+        verify_leaf(&pki, &slash_email, &prefix),
         Err(Refusal::IdentityMismatch)
     );
 }
@@ -173,19 +182,70 @@ fn prefix_boundary_not_crossed() {
         verify_leaf(&pki, &evil, &trust),
         Err(Refusal::IdentityMismatch)
     );
-    let trust = pki::keyless_trust(
-        &pki,
-        vec![uri_identity(SanRule::UriPrefix(
-            "https://github.com/acme/app/.github/workflows/release.yaml@".to_owned(),
-        ))],
-    );
-    let evil = LeafSpec::uri(
-        "https://github.com/acme/app/.github/workflows/release.yaml-evil@refs/tags/v1",
-    );
+}
+
+const WORKFLOW: &str = "https://github.com/acme/app/.github/workflows/release.yaml";
+
+fn prefix_trust(pki: &Pki, prefix: &str) -> boneli_sigstore::Trust {
+    pki::keyless_trust(
+        pki,
+        vec![uri_identity(SanRule::UriPrefix(format!(
+            "{WORKFLOW}{prefix}"
+        )))],
+    )
+}
+
+fn san_result(pki: &Pki, trust: &boneli_sigstore::Trust, suffix: &str) -> Result<(), Refusal> {
+    verify_leaf(pki, &LeafSpec::uri(&format!("{WORKFLOW}{suffix}")), trust).map(|_| ())
+}
+
+#[test]
+fn tag_prefix_trusts_tags_only() {
+    let pki = Pki::new();
+    let tags = prefix_trust(&pki, "@refs/tags/");
+    assert_eq!(san_result(&pki, &tags, "@refs/tags/v1.2.3"), Ok(()));
+    // A branch, a commit SHA and a pull request's merge ref are other
+    // refs of the same workflow, which an `@` prefix would have let in.
+    for suffix in [
+        "@refs/heads/x",
+        "@refs/heads/main",
+        "@0123456789abcdef0123456789abcdef01234567",
+        "@refs/pull/7/merge",
+        "@refs/tagsx/v1",
+        "-evil@refs/tags/v1",
+    ] {
+        assert_eq!(
+            san_result(&pki, &tags, suffix),
+            Err(Refusal::IdentityMismatch),
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
+fn branch_prefix_and_exact_san() {
+    let pki = Pki::new();
+    let heads = prefix_trust(&pki, "@refs/heads/");
+    assert_eq!(san_result(&pki, &heads, "@refs/heads/main"), Ok(()));
     assert_eq!(
-        verify_leaf(&pki, &evil, &trust),
+        san_result(&pki, &heads, "@refs/tags/v1"),
         Err(Refusal::IdentityMismatch)
     );
+    // An exact SAN matches only itself: the protected branch.
+    let exact = pki::keyless_trust(
+        &pki,
+        vec![uri_identity(SanRule::Uri(format!(
+            "{WORKFLOW}@refs/heads/main"
+        )))],
+    );
+    assert_eq!(san_result(&pki, &exact, "@refs/heads/main"), Ok(()));
+    for suffix in ["@refs/heads/main2", "@refs/heads/x", "@refs/heads/mai"] {
+        assert_eq!(
+            san_result(&pki, &exact, suffix),
+            Err(Refusal::IdentityMismatch),
+            "{suffix}"
+        );
+    }
 }
 
 #[test]
