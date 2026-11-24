@@ -1517,16 +1517,16 @@
    "title": "boneli-sigstore: match Fulcio certificate source repository and ref extensions under Required",
    "epic": null,
    "order": 58,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "1806fc84",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
-   "note": "",
-   "updated_at": "2026-11-24T16:14:22+00:00",
+   "pr": 121,
+   "note": "PR #121 open",
+   "updated_at": "2026-11-24T17:11:08+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1590,14 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T00:40:52+00:00",
-   "issue": 57,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "b6fae515",
-   "note": null
-  },
   {
    "at": "2026-11-24T00:52:02+00:00",
    "issue": 109,
@@ -1989,6 +1981,14 @@
    "to": "pr-review",
    "by": "7ee136eb",
    "note": null
+  },
+  {
+   "at": "2026-11-24T17:11:08+00:00",
+   "issue": 113,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #121 open"
   }
  ],
  "open": [
@@ -2023,7 +2023,7 @@
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T16:57:00+00:00",
+ "updated_at": "2026-11-24T17:11:08+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
