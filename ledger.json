@@ -980,11 +980,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "b6fae515",
-   "pr": 108,
-   "note": "PR 1 #107, PR 2 #108 merged; PR 3 boneli-oci",
-   "updated_at": "2026-11-24T01:41:11+00:00",
+   "pr": 111,
+   "note": "PR 1 #107, PR 2 #108 merged; PR 3 #111 in QA + review",
+   "updated_at": "2026-11-24T03:03:52+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1489,14 +1489,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-20T22:10:44+00:00",
-   "issue": 81,
-   "from": "pr-review",
-   "to": "done",
-   "by": "f7d29cb8",
-   "note": null
-  },
-  {
    "at": "2026-11-20T22:10:46+00:00",
    "issue": 93,
    "from": "blocked",
@@ -1887,6 +1879,14 @@
    "to": "implementing",
    "by": "9f12be0c",
    "note": "PR 1 #110 merged b0fda3e; PR 2 (file-lock rule) in progress"
+  },
+  {
+   "at": "2026-11-24T03:03:52+00:00",
+   "issue": 57,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "b6fae515",
+   "note": "PR 1 #107, PR 2 #108 merged; PR 3 #111 in QA + review"
   }
  ],
  "open": [
@@ -1921,7 +1921,7 @@
   109
  ],
  "xopen": [],
- "updated_at": "2026-11-24T02:47:24+00:00",
+ "updated_at": "2026-11-24T03:03:52+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
