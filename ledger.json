@@ -1567,16 +1567,16 @@
    "title": "boneli-sigstore: verify Rekor intoto 0.0.1 entries for cosign .att attestations",
    "epic": null,
    "order": 60,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "2768f14b",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T20:26:49+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T20:26:56+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [
@@ -1590,14 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T03:03:52+00:00",
-   "issue": 57,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "b6fae515",
-   "note": "PR 1 #107, PR 2 #108 merged; PR 3 #111 in QA + review"
-  },
   {
    "at": "2026-11-24T03:42:06+00:00",
    "issue": 109,
@@ -1989,6 +1981,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-24T20:26:56+00:00",
+   "issue": 118,
+   "from": "ready",
+   "to": "claimed",
+   "by": "2768f14b",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2021,7 +2021,7 @@
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T20:26:49+00:00",
+ "updated_at": "2026-11-24T20:26:56+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
