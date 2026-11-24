@@ -643,8 +643,9 @@ fn trim_locked(
     report.after = saturated(total);
 
     // Pointer files (ADR-029, S6) that name no complete evidence any more:
-    // malformed, or a blob of theirs is gone (evicted above or by an
-    // earlier trim). Such a pointer reads as absent, so it only costs a
+    // malformed, or a blob of every line is gone (evicted above or by an
+    // earlier trim; a line with a blob gone is dropped when the file is
+    // next written). Such a pointer reads as absent, so it only costs a
     // file; removing it keeps `signatures/` from growing with every image
     // ever checked. A pull that rewrites one meanwhile loses at most its
     // pointer, and the next pull discovers the evidence again. The
@@ -654,11 +655,13 @@ fn trim_locked(
             for name in pointers.iter().filter(|n| is_hex64(n)) {
                 let path = dirs.signatures.join(name);
                 let complete = read_capped(&path, crate::signatures::MAX_POINTER_BYTES)
-                    .and_then(|bytes| crate::signatures::Pointer::parse(&bytes))
-                    .is_some_and(|p| {
-                        p.blobs().iter().all(|d| {
-                            fs::symlink_metadata(dirs.blobs.join(d.hex()))
-                                .is_ok_and(|m| m.file_type().is_file())
+                    .and_then(|bytes| crate::signatures::Pointer::parse_file(&bytes))
+                    .is_some_and(|lines| {
+                        lines.iter().any(|p| {
+                            p.blobs().iter().all(|d| {
+                                fs::symlink_metadata(dirs.blobs.join(d.hex()))
+                                    .is_ok_and(|m| m.file_type().is_file())
+                            })
                         })
                     });
                 if !complete && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {

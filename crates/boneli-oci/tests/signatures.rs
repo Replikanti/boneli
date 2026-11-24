@@ -1901,3 +1901,380 @@ fn trim_removes_dangling_pointers() {
         .expect("discovered again");
     assert!(pointer.is_file());
 }
+
+/// Two `Required` rules with different trusts over one digest keep each
+/// other's evidence: after a pull under the second rule, a warm pull under
+/// the first still makes no request (S6, review of PR 3), and so does one
+/// under the second; the pointer file holds both lines.
+#[test]
+fn kept_evidence_survives_another_rule() {
+    let (mut hub, pushed) = app_hub();
+    sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+    sign(&mut hub, "bundle", &other(), &pushed.index, &pushed.index);
+    let docs = hub.manifests[REPO].clone();
+    hub.manifests.insert("library/app2".to_owned(), docs);
+    let tags = hub.tags[REPO].clone();
+    hub.tags.insert("library/app2".to_owned(), tags);
+    let refs = hub.referrers[REPO].clone();
+    hub.referrers.insert("library/app2".to_owned(), refs);
+    let fake = hub_fake(hub);
+    let policy = rules(vec![
+        rule(
+            RepoScope::Exact(repo(REPO)),
+            Requirement::Required(keyed(&[SIGNER_PUB])),
+        ),
+        rule(
+            RepoScope::Exact(repo("library/app2")),
+            Requirement::Required(keyed(&[OTHER_PUB])),
+        ),
+    ]);
+    let tmp = TempDir::new("two-rules");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, policy);
+    store
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("first rule, cold");
+    store
+        .pull(&image_ref("library/app2", &pushed.index))
+        .expect("second rule, cold");
+    let before = fake.seen().len();
+    for name in [REPO, "library/app2", REPO] {
+        store.pull(&image_ref(name, &pushed.index)).expect("warm");
+    }
+    assert_eq!(
+        fake.seen().len(),
+        before,
+        "{:?}",
+        targets(&fake.seen()[before..])
+    );
+    let pointer = std::fs::read_to_string(
+        root.join("signatures/sha256")
+            .join(pushed.index.trim_start_matches("sha256:")),
+    )
+    .expect("pointer");
+    let kinds: Vec<&str> = pointer.lines().map(|l| &l[..6]).collect();
+    assert_eq!(kinds, ["legacy", "bundle"], "{pointer}");
+}
+
+/// A `.sig` answer that is another image's document served with another
+/// `Content-Type` never spoils that image: whether the image was pulled
+/// before (its kept copy is not replaced) or after (the copy the
+/// signature lookup left is fetched again from the image's own
+/// repository), its pulls under `Off` work, and so do the ones after.
+#[test]
+fn sig_answer_never_spoils_a_document() {
+    for victim_first in [false, true] {
+        let (mut hub, victim) = app_hub();
+        let evil = push(&mut hub, "evil/x", &[Layer::file("etc/evil", b"e\n")], "");
+        let victim_index = hub.manifests[REPO][&victim.index].1.clone();
+        hub.tag(
+            "evil/x",
+            &format!("{}.sig", tag_of(&evil.index)),
+            media::MANIFEST,
+            &victim_index,
+        );
+        let fake = hub_fake(hub);
+        let policy = rules(vec![rule(
+            RepoScope::Exact(repo("evil/x")),
+            Requirement::Required(keyed(&[SIGNER_PUB])),
+        )]);
+        let tmp = TempDir::new("spoil");
+        let root = tmp.path().join("store");
+        let store = open_with(&root, &fake, policy);
+        if victim_first {
+            store
+                .pull(&image_ref(REPO, &victim.index))
+                .expect("victim first");
+        }
+        assert!(store.pull(&image_ref("evil/x", &evil.index)).is_err());
+        let victim_blob = root
+            .join("blobs/sha256")
+            .join(victim.index.trim_start_matches("sha256:"));
+        let before = fake.seen().len();
+        if victim_first {
+            // The kept copy was not touched: the victim's pull is offline.
+            store.pull(&image_ref(REPO, &victim.index)).expect("victim");
+            assert_eq!(fake.seen().len(), before, "the victim's copy was replaced");
+        } else {
+            // A `.sig` answer that is no artifact is never kept.
+            assert!(!victim_blob.exists(), "an unparsed .sig answer was kept");
+        }
+        for round in 0..2 {
+            store
+                .pull(&image_ref(REPO, &victim.index))
+                .unwrap_or_else(|e| panic!("victim_first={victim_first} round {round}: {e:?}"));
+        }
+        let kept_type = std::fs::read_to_string(root.join("blobs/sha256").join(format!(
+            "{}.type",
+            victim.index.trim_start_matches("sha256:")
+        )))
+        .expect("type");
+        assert_eq!(kept_type, media::INDEX, "victim_first={victim_first}");
+        // Once healed, the victim's pull makes no request.
+        let before = fake.seen().len();
+        store.pull(&image_ref(REPO, &victim.index)).expect("warm");
+        assert_eq!(fake.seen().len(), before, "victim_first={victim_first}");
+    }
+}
+
+/// The same poisoning through an image pull (ADR-009 D8's path): an index
+/// in another repository that names the victim's index as its platform
+/// manifest, served with the manifest type, fails its own pull and leaves
+/// nothing kept that breaks the victim's.
+#[test]
+fn foreign_index_never_spoils_a_document() {
+    let (mut hub, victim) = app_hub();
+    let victim_index = hub.manifests[REPO][&victim.index].1.clone();
+    let evil_index = index(&[entry(
+        media::MANIFEST,
+        &victim.index,
+        victim_index.len(),
+        Some(("linux", "amd64", None)),
+    )]);
+    let evil = hub.document("evil/x", media::INDEX, &evil_index);
+    hub.manifests.get_mut("evil/x").expect("evil").insert(
+        victim.index.clone(),
+        (media::MANIFEST.to_owned(), victim_index),
+    );
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("foreign-index");
+    let store = open_with(&tmp.path().join("store"), &fake, SignaturePolicy::off());
+    assert!(store.pull(&image_ref("evil/x", &evil)).is_err());
+    store
+        .pull(&image_ref(REPO, &victim.index))
+        .expect("the victim pulls");
+}
+
+/// A line whose evidence is gone is dropped when the file is next
+/// written, and a trim keeps a file with one complete line among dangling
+/// ones.
+#[test]
+fn dangling_lines_dropped_and_trimmed() {
+    let (mut hub, pushed) = app_hub();
+    sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+    sign(&mut hub, "bundle", &other(), &pushed.index, &pushed.index);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("dangling-lines");
+    let root = tmp.path().join("store");
+    let pointer = root
+        .join("signatures/sha256")
+        .join(pushed.index.trim_start_matches("sha256:"));
+    let blobs = root.join("blobs/sha256");
+    let pull = |trust: &[u8]| {
+        open_with(&root, &fake, required(keyed(&[trust])))
+            .pull(&image_ref(REPO, &pushed.index))
+            .expect("pull");
+    };
+    pull(SIGNER_PUB);
+    pull(OTHER_PUB);
+    let lines = std::fs::read_to_string(&pointer).expect("pointer");
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    // The legacy payload goes: a trim keeps the file for the bundle line.
+    let payload = lines
+        .lines()
+        .next()
+        .expect("legacy")
+        .rsplit(' ')
+        .next()
+        .expect("payload");
+    std::fs::remove_file(blobs.join(payload.trim_start_matches("sha256:"))).expect("evict");
+    open_with(&root, &fake, trusted()).trim().expect("trim");
+    assert_eq!(std::fs::read_to_string(&pointer).expect("kept"), lines);
+    // The next write drops the dangling line.
+    std::fs::remove_file(&pointer).expect("reset");
+    std::fs::write(&pointer, &lines).expect("restore");
+    pull(SIGNER_PUB);
+    let after = std::fs::read_to_string(&pointer).expect("pointer");
+    let kinds: Vec<&str> = after.lines().map(|l| &l[..6]).collect();
+    assert_eq!(kinds, ["bundle", "legacy"], "{after}");
+}
+
+/// Discovery takes the artifacts it already kept from the store: with the
+/// pointer gone, a pull fetches the listings again but neither the
+/// referrer manifest nor the bundle.
+#[test]
+fn discovery_reuses_kept_artifacts() {
+    let (mut hub, pushed) = app_hub();
+    sign(&mut hub, "bundle", &signer(), &pushed.index, &pushed.index);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("reuse");
+    let root = tmp.path().join("store");
+    open_with(&root, &fake, trusted())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("cold");
+    let pointer = root
+        .join("signatures/sha256")
+        .join(pushed.index.trim_start_matches("sha256:"));
+    let line = std::fs::read_to_string(&pointer).expect("pointer");
+    std::fs::remove_file(&pointer).expect("forget");
+    let before = fake.seen().len();
+    open_with(&root, &fake, trusted())
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("again");
+    let again = targets(&fake.seen()[before..]);
+    assert!(again.iter().any(|t| t.contains("/referrers/")), "{again:?}");
+    for kept in line.trim_end().split(' ').skip(1) {
+        assert!(
+            !again.iter().any(|t| t.ends_with(kept)),
+            "{kept}: {again:?}"
+        );
+    }
+}
+
+/// A manifest without a `mediaType` field takes its type from the
+/// response, so two repositories may serve its bytes as Docker and as OCI.
+/// Each pull takes the kept copy only when it is what its index says, and
+/// otherwise fetches it again from its own repository: both images pull,
+/// in turn, every time.
+#[test]
+fn kept_document_of_another_type_refetched() {
+    let mut hub = Hub::default();
+    let layer = Layer::file("etc/a", b"a\n");
+    let diff = layer.diff_id.clone();
+    let config = format!(
+        r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{diff}"]}}}}"#
+    );
+    let mut repos = Vec::new();
+    for (repo, media_type) in [
+        ("library/docker", media::DOCKER_MANIFEST),
+        ("library/oci", media::MANIFEST),
+    ] {
+        let blob = hub.blob(repo, &layer.blob);
+        let config_digest = hub.blob(repo, config.as_bytes());
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"config":{},"layers":[{}]}}"#,
+            descriptor(
+                "application/vnd.oci.image.config.v1+json",
+                &config_digest,
+                config.len()
+            ),
+            descriptor(layer.media_type, &blob, layer.blob.len()),
+        );
+        let digest = hub.document(repo, media_type, manifest.as_bytes());
+        let index_bytes = index(&[entry(
+            media_type,
+            &digest,
+            manifest.len(),
+            Some(("linux", "amd64", None)),
+        )]);
+        repos.push((repo, hub.document(repo, media::INDEX, &index_bytes)));
+    }
+    // A third repository whose index says Docker but which serves the
+    // manifest as OCI: its pull fails, and keeps nothing it cannot use.
+    let docker_index = repos[0].1.clone();
+    let docker_manifest = nth_digest(&hub.manifests["library/docker"][&docker_index].1, 0);
+    let manifest_bytes = hub.manifests["library/docker"][&docker_manifest].1.clone();
+    let liar_index = index(&[entry(
+        media::DOCKER_MANIFEST,
+        &docker_manifest,
+        manifest_bytes.len(),
+        Some(("linux", "amd64", None)),
+    )]);
+    let liar = hub.document("library/liar", media::INDEX, &liar_index);
+    hub.document("library/liar", media::MANIFEST, &manifest_bytes);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("two-types");
+    let store = open_with(&tmp.path().join("store"), &fake, SignaturePolicy::off());
+    for round in 0..2 {
+        for (repo, index_digest) in &repos {
+            store
+                .pull(&image_ref(repo, index_digest))
+                .unwrap_or_else(|e| panic!("{repo} round {round}: {e:?}"));
+        }
+    }
+    // On a fresh store the liar's pull keeps nothing it could not use.
+    let tmp = TempDir::new("liar");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, SignaturePolicy::off());
+    assert!(store.pull(&image_ref("library/liar", &liar)).is_err());
+    assert!(
+        !root
+            .join("blobs/sha256")
+            .join(docker_manifest.trim_start_matches("sha256:"))
+            .exists(),
+        "an unusable manifest was kept"
+    );
+}
+
+/// A kept document whose `.type` makes it unreadable (left by a build
+/// that kept what it could not parse) is fetched again and replaced, and
+/// the pull after that is offline.
+#[test]
+fn unreadable_kept_document_fetched_again() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("unreadable");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, SignaturePolicy::off());
+    store.pull(&image_ref(REPO, &pushed.index)).expect("cold");
+    let type_path = root.join("blobs/sha256").join(format!(
+        "{}.type",
+        pushed.index.trim_start_matches("sha256:")
+    ));
+    std::fs::write(&type_path, media::MANIFEST).expect("spoil");
+    store.pull(&image_ref(REPO, &pushed.index)).expect("healed");
+    assert_eq!(
+        std::fs::read_to_string(&type_path).expect("type"),
+        media::INDEX
+    );
+    let before = fake.seen().len();
+    store.pull(&image_ref(REPO, &pushed.index)).expect("warm");
+    assert_eq!(fake.seen().len(), before);
+}
+
+/// A `.sig` answer that parses as an artifact but is a manifest another
+/// image keeps under another type (one without a `mediaType` field, kept
+/// as Docker as its index says, served as OCI by the lookup) leaves the
+/// kept copy as it is: the other image's pull stays offline.
+#[test]
+fn sig_answer_never_replaces_a_kept_manifest() {
+    let mut hub = Hub::default();
+    let layer = Layer::file("etc/a", b"a\n");
+    let diff = layer.diff_id.clone();
+    let config = format!(
+        r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{diff}"]}}}}"#
+    );
+    let repo = "library/docker";
+    let blob = hub.blob(repo, &layer.blob);
+    let config_digest = hub.blob(repo, config.as_bytes());
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"config":{},"layers":[{}]}}"#,
+        descriptor(
+            "application/vnd.oci.image.config.v1+json",
+            &config_digest,
+            config.len()
+        ),
+        descriptor(layer.media_type, &blob, layer.blob.len()),
+    );
+    let manifest_digest = hub.document(repo, media::DOCKER_MANIFEST, manifest.as_bytes());
+    let index_bytes = index(&[entry(
+        media::DOCKER_MANIFEST,
+        &manifest_digest,
+        manifest.len(),
+        Some(("linux", "amd64", None)),
+    )]);
+    let digest = hub.document(repo, media::INDEX, &index_bytes);
+    let evil = push(&mut hub, "evil/x", &[Layer::file("etc/evil", b"e\n")], "");
+    hub.tag(
+        "evil/x",
+        &format!("{}.sig", tag_of(&evil.index)),
+        media::MANIFEST,
+        manifest.as_bytes(),
+    );
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("sig-replace");
+    let policy = rules(vec![rule(
+        RepoScope::Exact(self::repo("evil/x")),
+        Requirement::Required(keyed(&[SIGNER_PUB])),
+    )]);
+    let store = open_with(&tmp.path().join("store"), &fake, policy);
+    store.pull(&image_ref(repo, &digest)).expect("docker image");
+    let detail = match store.pull(&image_ref("evil/x", &evil.index)) {
+        Err(ImageError::Failed { detail }) => detail,
+        other => panic!("{other:?}"),
+    };
+    assert!(detail.contains("not a simple-signing layer"), "{detail}");
+    let before = fake.seen().len();
+    store.pull(&image_ref(repo, &digest)).expect("docker again");
+    assert_eq!(fake.seen().len(), before, "the kept manifest was replaced");
+}

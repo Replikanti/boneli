@@ -360,13 +360,42 @@ after the acceptance run.
      listed and at most one fixed reason per candidate (a `Refusal`, a
      parser's fixed text, or the fetch error's detail of hosts, digests
      and statuses); every character outside printable ASCII is escaped.
-   - **Kept evidence** (S6): every artifact fetched (the `.sig` manifest,
-     payloads, referrer manifests, bundles) is kept in `blobs/sha256/`
-     with its `.type`, re-hashed on every read; the pointer
-     `signatures/sha256/<subject hex>` is one line, `legacy <manifest>
-     <payload>` or `bundle <manifest> <bundle>`, parsed exactly and
-     written by the store's `write_durably` under an owned temporary
-     name. The sweep of ADR-009 D8 and ADR-025 D1 covers the directory
+   - **Kept evidence** (S6): every artifact fetched that parsed (the
+     `.sig` manifest, payloads, referrer manifests, bundles) is kept in
+     `blobs/sha256/` with its `.type`, re-hashed on every read, and only
+     when the store does not hold that digest yet; the pointer file
+     `signatures/sha256/<subject hex>` holds up to `MAX_KEPT` = 32 lines,
+     each `legacy <manifest> <payload>` or `bundle <manifest> <bundle>`,
+     none twice, parsed exactly and written by the store's
+     `write_durably` under an owned temporary name. The warm check tries
+     every line under the current trust; a pass adds its line last,
+     drops lines whose blobs are gone, and past 32 the oldest.
+     **Changed at review of PR 3:** one line per subject, replaced on
+     every pass, let two `Required` rules with different trusts over one
+     digest overwrite each other's evidence, so a warm pull under the
+     first went back to the network (and failed in a registry outage)
+     after a pull under the second. 32 is every candidate the two
+     carriers can list for one subject at once (2 × `MAX_SIGNATURES`),
+     so while the listings stay as they are no rule's evidence is pushed
+     out, at 4,800 bytes per file at most. Two stores that add a line at
+     once may lose one; its rule then discovers again.
+   - **Kept documents and their type** (review of PR 3). A kept
+     document's bytes are its digest's, but its `.type` is what the
+     response that brought it said, and a registry chooses it: a `.sig`
+     answer, or an index in another repository, can serve another
+     image's bytes under another type. So a signature lookup never
+     replaces a kept document and keeps only what parsed, and the
+     resolution of ADR-009 D9 takes a kept index or manifest only when
+     it parses and is what the index names (its media type); otherwise
+     it fetches the document again from the image's own repository and
+     replaces the copy, and it keeps a fetched document only when the
+     pull can use it. This extends D8's "a mismatch removes it and it is
+     fetched again" from the bytes to the type, and closes the same
+     spoiling through an image pull, which ADR-009 had too. Cost: a
+     manifest without a `mediaType` field that two repositories serve as
+     Docker and as OCI is fetched again by whichever pull finds the
+     other's type kept (`kept_document_of_another_type_refetched`); the
+     verdict never changes. The sweep of ADR-009 D8 and ADR-025 D1 covers the directory
      (dead owners judged by their lock files, ADR-028), it is created
      with `boneli-private-dir`'s rules (ADR-021), and the trim, which
      evicts kept artifacts like any unpinned document (they serve no
@@ -400,6 +429,13 @@ the digest binds the bytes and mirrors are legitimate.
   (`check_validity` in rustls-webpki 0.103.17). Verification reads no wall
   clock, so the same inputs give the same verdict forever and replay
   stays deterministic.
+- **`MAX_KEPT` = 32 lines per pointer file (PR 3, review).** 2 ×
+  `MAX_SIGNATURES`: every candidate both carriers can list for one
+  subject at once, so rules with different trusts never push out each
+  other's evidence while the listings stay; at most 150 bytes a line,
+  4,800 bytes a file (`MAX_POINTER_BYTES` = 8,192 read). Lower lets
+  enough rules over one digest send each other's warm pulls to the
+  network; higher only keeps lines no listing can produce.
 - **`MAX_SIGNATURES` = 16 per carrier listing per subject (PR 3).**
   Measured: 1 to 2 signatures per digest (Kubernetes 1, Chainguard 1,
   cosign 2.4.1 2, 3.0.2 2, `latest` 2 referrers); each `cosign sign` run
@@ -475,7 +511,9 @@ the digest binds the bytes and mirrors are legitimate.
   were three checks no input could reach, a payload cap repeated before
   the fetch's own, a duplicate-annotation check behind `boneli-json`'s
   duplicate-key refusal and a pointer re-render behind strict parts, and
-  each was removed); the real Kubernetes
+  each was removed; at review 17 more over the fixes (pointer lines,
+  kept-document types), all killed once tests were added for the five
+  survivors of their first run); the real Kubernetes
   and Chainguard leaves are known answers against the public-good chain
   and CT log (PR 1), and the whole Kubernetes and Chainguard keyless
   signatures and cosign's keyed bundle pass `verify` against the

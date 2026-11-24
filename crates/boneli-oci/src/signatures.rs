@@ -67,9 +67,18 @@ pub(crate) const PREDICATE_ANNOTATION: &str = "dev.sigstore.bundle.predicateType
 /// The `Accept` field of a `.sig` request: the two manifest kinds.
 const SIG_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
-/// The longest pointer file read: `bundle`, two digests, two spaces and a
-/// newline are 150 bytes.
-pub(crate) const MAX_POINTER_BYTES: u64 = 256;
+/// The most evidence one subject's pointer file names: one line per
+/// evidence that passed under some rule, so rules with different trusts
+/// over one digest each keep theirs (review of PR 3). 32 is every
+/// candidate both carriers can list for one subject at once (2 ×
+/// [`MAX_SIGNATURES`]), so no rule's evidence is pushed out while the
+/// registry's listings stay as they are; past it the oldest line goes
+/// first.
+pub(crate) const MAX_KEPT: usize = 2 * MAX_SIGNATURES;
+
+/// The longest pointer file read: [`MAX_KEPT`] lines of at most 150 bytes
+/// (`bundle`, two digests, two spaces and a newline) are 4,800 bytes.
+pub(crate) const MAX_POINTER_BYTES: u64 = 8_192;
 
 /// The evidence a pull verified for one subject, as its pointer file names
 /// it (module doc, step 1).
@@ -116,6 +125,47 @@ impl Pointer {
             }),
             _ => None,
         }
+    }
+
+    /// The lines of a pointer file: up to [`MAX_KEPT`] rendered pointers,
+    /// none twice. Anything else is absent; an empty file names nothing.
+    pub(crate) fn parse_file(bytes: &[u8]) -> Option<Vec<Pointer>> {
+        let mut out: Vec<Pointer> = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let end = rest.iter().position(|b| *b == b'\n')? + 1;
+            let (line, tail) = rest.split_at(end);
+            let pointer = Pointer::parse(line)?;
+            if out.contains(&pointer) || out.len() == MAX_KEPT {
+                return None;
+            }
+            out.push(pointer);
+            rest = tail;
+        }
+        Some(out)
+    }
+
+    /// The lines of a pointer file after `new` passed: the `old` lines
+    /// other than `new` whose blobs all still `exist`, then `new`, and past
+    /// [`MAX_KEPT`] the oldest go.
+    pub(crate) fn merged(
+        old: Vec<Pointer>,
+        new: Pointer,
+        exist: impl Fn(&Digest) -> bool,
+    ) -> Vec<Pointer> {
+        let mut lines: Vec<Pointer> = old
+            .into_iter()
+            .filter(|p| *p != new && p.blobs().iter().all(&exist))
+            .collect();
+        lines.push(new);
+        let excess = lines.len().saturating_sub(MAX_KEPT);
+        lines.drain(..excess);
+        lines
+    }
+
+    /// The file holding `pointers`.
+    pub(crate) fn render_file(pointers: &[Pointer]) -> String {
+        pointers.iter().map(Pointer::render).collect()
     }
 
     /// The two kept blobs it names.
@@ -350,13 +400,7 @@ impl Check<'_, '_> {
                 found = self.referrers(subject, &mut notes)?;
             }
             if let Some(pointer) = found {
-                let dir = pointers_dir(self.root);
-                crate::store::write_durably(
-                    &dir,
-                    &pointer_path(self.root, subject),
-                    pointer.render().as_bytes(),
-                )
-                .map_err(|e| failed(e.to_string()))?;
+                self.keep(subject, pointer)?;
                 return Ok(());
             }
         }
@@ -369,17 +413,53 @@ impl Check<'_, '_> {
         ))))
     }
 
-    /// The kept evidence of `subject` (module doc, step 1).
+    /// Adds `pointer` to the pointer file of `subject`: the lines whose
+    /// blobs are all still in the store stay, the new one comes last, and
+    /// past [`MAX_KEPT`] the oldest go. Two stores that add at once may
+    /// lose one line; its rule then discovers the evidence again.
+    fn keep(&mut self, subject: &Digest, pointer: Pointer) -> Result<(), PullError> {
+        let path = pointer_path(self.root, subject);
+        let blobs = self.root.join("blobs").join("sha256");
+        let old = crate::store::read_capped(&path, MAX_POINTER_BYTES)
+            .ok()
+            .flatten()
+            .and_then(|bytes| Pointer::parse_file(&bytes))
+            .unwrap_or_default();
+        let lines = Pointer::merged(old, pointer, |d| blobs.join(d.hex()).is_file());
+        crate::store::write_durably(
+            &pointers_dir(self.root),
+            &path,
+            Pointer::render_file(&lines).as_bytes(),
+        )
+        .map_err(|e| failed(e.to_string()))
+    }
+
+    /// The kept evidence of `subject` (module doc, step 1): each line of
+    /// its pointer file, verified again under the current trust; the
+    /// first that passes is enough.
     fn kept(&mut self, subject: &Digest) -> Result<KeptOutcome, PullError> {
         let path = pointer_path(self.root, subject);
-        let pointer = match crate::store::read_capped(&path, MAX_POINTER_BYTES) {
-            Ok(Some(bytes)) => match Pointer::parse(&bytes) {
-                Some(pointer) => pointer,
+        let pointers = match crate::store::read_capped(&path, MAX_POINTER_BYTES) {
+            Ok(Some(bytes)) => match Pointer::parse_file(&bytes) {
+                Some(pointers) => pointers,
                 None => return Ok(KeptOutcome::Absent),
             },
             Ok(None) => return Ok(KeptOutcome::Absent),
             Err(e) => return Err(failed(format!("{}: {e}", path.display()))),
         };
+        let mut refused = None;
+        for pointer in pointers {
+            match self.kept_one(subject, pointer)? {
+                KeptOutcome::Pass => return Ok(KeptOutcome::Pass),
+                KeptOutcome::Absent => {}
+                KeptOutcome::Refused(why) => refused = Some(why),
+            }
+        }
+        Ok(refused.map_or(KeptOutcome::Absent, KeptOutcome::Refused))
+    }
+
+    /// One line of a pointer file (see [`Check::kept`]).
+    fn kept_one(&mut self, subject: &Digest, pointer: Pointer) -> Result<KeptOutcome, PullError> {
         let Some(manifest) = self.documents.get(&pointer.blobs()[0])? else {
             return Ok(KeptOutcome::Absent);
         };
@@ -446,10 +526,22 @@ impl Check<'_, '_> {
             .client
             .get_small_blob(self.repo, descriptor, max as u64)
             .map_err(Fault::Registry)?;
-        self.documents
-            .put(&descriptor.digest, &fetched)
+        self.keep_absent(&descriptor.digest, &fetched)
             .map_err(Fault::Store)?;
         Ok(fetched)
+    }
+
+    /// Keeps a signature artifact under `digest` unless the store already
+    /// holds that digest (review of PR 3): a registry chooses the
+    /// `Content-Type` a tag or referrer is served with, so a signature
+    /// lookup never replaces a kept document, another image's included,
+    /// and writes only what parsed. A copy kept here that an image pull
+    /// cannot read is fetched again by that pull (`kept_document`).
+    fn keep_absent(&mut self, digest: &Digest, fetched: &Fetched) -> Result<(), PullError> {
+        if self.documents.get(digest)?.is_none() {
+            self.documents.put(digest, fetched)?;
+        }
+        Ok(())
     }
 
     /// The `.sig` carrier of `subject` (module doc, step 2).
@@ -471,7 +563,6 @@ impl Check<'_, '_> {
             }
         };
         let manifest = Digest::of(&fetched.bytes);
-        self.documents.put(&manifest, &fetched)?;
         let artifact = match parse_artifact(&fetched, self.limits) {
             Ok(artifact) => artifact,
             Err(why) => {
@@ -479,6 +570,7 @@ impl Check<'_, '_> {
                 return Ok(None);
             }
         };
+        self.keep_absent(&manifest, &fetched)?;
         let listed = artifact.layers.len();
         if listed > MAX_SIGNATURES {
             notes.push(format!(
@@ -597,21 +689,25 @@ impl Check<'_, '_> {
     /// One referrer candidate: its manifest, its bundle and the verdict. A
     /// refusal comes back as `Fault::Registry` with a fixed reason.
     fn referrer(&mut self, subject: &Digest, entry: &Descriptor) -> Result<Pointer, Fault> {
-        let fetched = match self.documents.get(&entry.digest).map_err(Fault::Store)? {
-            Some(kept) => kept,
+        let refused = |why: &str| Fault::Registry(failed(why.to_owned()));
+        let kept = self
+            .documents
+            .get(&entry.digest)
+            .map_err(Fault::Store)?
+            .and_then(|kept| parse_artifact(&kept, self.limits).ok());
+        let artifact = match kept {
+            Some(artifact) => artifact,
             None => {
                 let fetched = self
                     .client
                     .get_manifest(self.repo, &entry.digest, Some(entry.size))
                     .map_err(|e| Fault::Registry(failed(e.detail().to_owned())))?;
-                self.documents
-                    .put(&entry.digest, &fetched)
+                let artifact = parse_artifact(&fetched, self.limits).map_err(refused)?;
+                self.keep_absent(&entry.digest, &fetched)
                     .map_err(Fault::Store)?;
-                fetched
+                artifact
             }
         };
-        let refused = |why: &str| Fault::Registry(failed(why.to_owned()));
-        let artifact = parse_artifact(&fetched, self.limits).map_err(refused)?;
         let layer = bundle_layer(&artifact, subject).map_err(refused)?;
         let bundle = self.blob(layer, MAX_BUNDLE_BYTES)?;
         match Evidence::from_bundle(&bundle.bytes)
@@ -852,6 +948,70 @@ mod tests {
         ] {
             assert!(parse_listing(bad.as_bytes(), &limits()).is_err(), "{bad}");
         }
+    }
+
+    /// A pointer file is up to `MAX_KEPT` distinct rendered lines; a
+    /// duplicate line, one line too many, a line without
+    /// its newline or any malformed line make it absent.
+    #[test]
+    fn pointer_file_lines_exact_and_capped() {
+        use super::MAX_KEPT;
+        let lines: Vec<Pointer> = (0..MAX_KEPT as u8 + 1)
+            .map(|n| Pointer::Bundle {
+                manifest: digest(n),
+                bundle: digest(200),
+            })
+            .collect();
+        let full = Pointer::render_file(&lines[..MAX_KEPT]);
+        assert_eq!(
+            Pointer::parse_file(full.as_bytes()),
+            Some(lines[..MAX_KEPT].to_vec())
+        );
+        assert!(full.len() as u64 <= super::MAX_POINTER_BYTES);
+        let one = Pointer::render_file(&lines[..1]);
+        assert_eq!(
+            Pointer::parse_file(one.as_bytes()),
+            Some(lines[..1].to_vec())
+        );
+        assert_eq!(Pointer::parse_file(b""), Some(Vec::new()));
+        for bad in [
+            Pointer::render_file(&lines),
+            format!("{one}{one}"),
+            one.trim_end().to_owned(),
+            format!("{one}\n"),
+            format!("{one}junk\n"),
+            format!("{}{one}", one.trim_end()),
+        ] {
+            assert_eq!(Pointer::parse_file(bad.as_bytes()), None, "{bad:?}");
+        }
+    }
+
+    /// A pass keeps the other lines whose evidence is there, drops its
+    /// own old copy and dangling lines, comes last, and past `MAX_KEPT`
+    /// pushes out the oldest.
+    #[test]
+    fn merged_keeps_others_and_caps() {
+        use super::MAX_KEPT;
+        let line = |n: u8| Pointer::Legacy {
+            manifest: digest(n),
+            payload: digest(n),
+        };
+        let all = |_: &Digest| true;
+        assert_eq!(Pointer::merged(vec![], line(1), all), vec![line(1)]);
+        assert_eq!(
+            Pointer::merged(vec![line(1), line(2)], line(1), all),
+            vec![line(2), line(1)]
+        );
+        assert_eq!(
+            Pointer::merged(vec![line(1), line(2), line(3)], line(4), |d| *d
+                != digest(2)),
+            vec![line(1), line(3), line(4)]
+        );
+        let full: Vec<Pointer> = (0..MAX_KEPT as u8).map(line).collect();
+        let merged = Pointer::merged(full.clone(), line(99), all);
+        assert_eq!(merged.len(), MAX_KEPT);
+        assert_eq!(merged[..MAX_KEPT - 1], full[1..]);
+        assert_eq!(merged[MAX_KEPT - 1], line(99));
     }
 
     #[test]

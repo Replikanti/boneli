@@ -428,14 +428,14 @@ impl<'a> Client<'a> {
         let repo = reference.repository();
         let digest = reference.digest();
         let platform = reference.platform();
-        let top = self.kept_manifest(documents, repo, digest, None)?;
-        let (index, manifest_digest, manifest) = match self.document(&top, digest)? {
+        let top = self.kept_document(documents, repo, digest, None, &|_| true)?;
+        let (index, manifest_digest, manifest) = match top {
             Document::Manifest(m) => (None, *digest, m),
             Document::Index(index) => {
                 let entry = manifest::select(&index, platform)?;
                 let d = entry.descriptor.clone();
-                let fetched = self.kept_manifest(documents, repo, &d.digest, Some(d.size))?;
-                match self.document(&fetched, &d.digest)? {
+                let usable = |doc: &Document| matches!(doc, Document::Manifest(m) if m.media_type == d.media_type);
+                match self.kept_document(documents, repo, &d.digest, Some(d.size), &usable)? {
                     Document::Manifest(m) if m.media_type == d.media_type => {
                         (Some(*digest), d.digest, m)
                     }
@@ -492,20 +492,35 @@ impl<'a> Client<'a> {
         })
     }
 
-    /// The manifest `digest` from `documents`, or fetched and kept there.
-    fn kept_manifest(
+    /// The index or manifest `digest`, parsed: from `documents` when the
+    /// kept copy parses and is `usable` here, otherwise fetched, and kept
+    /// only when it parses and is `usable`. The bytes of a kept copy are
+    /// its digest's (re-hashed on read), but its `.type` is what the
+    /// response it was fetched with said, and another repository or a
+    /// signature lookup may have served the same bytes with another type
+    /// (review of #57 PR 3): such a copy is fetched again from this
+    /// repository and replaced, never trusted, and a document this pull
+    /// cannot use is never kept, so it cannot spoil another image's pull.
+    fn kept_document(
         &mut self,
         documents: &mut dyn Documents,
         repo: &Repository,
         digest: &Digest,
         size: Option<u64>,
-    ) -> Result<Fetched, PullError> {
-        if let Some(kept) = documents.get(digest)? {
-            return Ok(kept);
+        usable: &dyn Fn(&Document) -> bool,
+    ) -> Result<Document, PullError> {
+        if let Some(kept) = documents.get(digest)?
+            && let Ok(doc) = self.document(&kept, digest)
+            && usable(&doc)
+        {
+            return Ok(doc);
         }
         let fetched = self.get_manifest(repo, digest, size)?;
-        documents.put(digest, &fetched)?;
-        Ok(fetched)
+        let doc = self.document(&fetched, digest)?;
+        if usable(&doc) {
+            documents.put(digest, &fetched)?;
+        }
+        Ok(doc)
     }
 
     fn document(&self, fetched: &Fetched, digest: &Digest) -> Result<Document, PullError> {

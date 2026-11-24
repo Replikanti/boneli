@@ -769,8 +769,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   verifies lets the pull go on, and every refusal is `Failed` before any
   layer blob is requested, with a detail of digests, counts and fixed
   reasons in printable ASCII. The evidence that verified is kept under
-  `blobs/sha256/` with one pointer file per subject in the new
-  `signatures/sha256/` and verified again, offline, on every later pull;
+  `blobs/sha256/` with a pointer file per subject in the new
+  `signatures/sha256/` (up to 32 lines, so rules with different trusts
+  keep each other's evidence) and verified again, offline, on every later
+  pull; a signature lookup never replaces a kept document, and a kept
+  index or manifest whose stored type makes it unusable is fetched again
+  from the image's repository instead of failing the pull;
   the sweep covers that directory and the trim removes pointers whose
   evidence is gone. `open` refuses a rule for a registry the store does
   not pull from (`Error::InvalidPolicy`). Live tests on Docker Hub, GHCR,
