@@ -1315,16 +1315,16 @@
    "title": "boneli-oci: check whether the image cache locks stay held through a child between fork and exec",
    "epic": null,
    "order": 50,
-   "state": "pr-review",
-   "owner": "785e81ac",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 106,
    "note": "",
-   "updated_at": "2026-11-23T22:56:19+00:00",
+   "updated_at": "2026-11-24T00:53:44+00:00",
    "priority": "P2",
    "size": "small",
    "deps": [],
@@ -1488,14 +1488,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T22:04:16+00:00",
-   "issue": 69,
-   "from": "ready",
-   "to": "claimed",
-   "by": "62531680",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T22:04:26+00:00",
    "issue": 55,
@@ -1887,6 +1879,14 @@
    "to": "claimed",
    "by": "9f12be0c",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T00:53:44+00:00",
+   "issue": 98,
+   "from": "pr-review",
+   "to": "done",
+   "by": "785e81ac",
+   "note": null
   }
  ],
  "open": [
@@ -1914,7 +1914,6 @@
   55,
   57,
   69,
-  98,
   102,
   103,
   104,
@@ -1922,7 +1921,7 @@
   109
  ],
  "xopen": [],
- "updated_at": "2026-11-24T00:52:36+00:00",
+ "updated_at": "2026-11-24T00:53:47+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
