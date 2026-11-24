@@ -205,6 +205,13 @@ impl CertificateClaims {
         })
     }
 
+    /// Whether a workflow-path rule is set with neither a repository rule
+    /// (1.12) nor a repository ID (1.15): the path would then bind no
+    /// repository (`Trust::with_certificate_claims` refuses it).
+    pub(crate) fn path_binds_no_repository(&self) -> bool {
+        self.workflow_path.is_some() && self.repository.is_none() && self.repository_id.is_none()
+    }
+
     /// These claims with the statement agreement (module doc). Needs the
     /// trust's provenance claims (`Trust::with_claims` first).
     pub fn with_statement_agreement(self) -> CertificateClaims {

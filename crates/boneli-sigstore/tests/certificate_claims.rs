@@ -1524,3 +1524,61 @@ fn workflow_path_configuration() {
         "a workflow path is not a plain relative path of printable ASCII without @"
     );
 }
+
+/// A workflow-path rule needs a source repository rule (1.12) or a
+/// repository ID (1.15): with neither, the path binds no repository, and
+/// a shared generator's SAN plus the path would admit any repository's
+/// workflow of that name on any ref (review of the PR). Refused at
+/// configuration; with a 1.12 rule or a 1.15 ID it passes, and another
+/// repository is refused.
+#[test]
+fn workflow_path_needs_a_repository() {
+    let pki = Pki::new();
+    let trust = || gh_trust(&pki, &[COSIGN_SIGN_PREDICATE]);
+    for cc in [
+        CertificateClaims::new(None, None, triggers(&[GH_TRIGGER])).expect("cc"),
+        CertificateClaims::new(None, prefix("refs/tags/"), triggers(&[GH_TRIGGER])).expect("cc"),
+    ] {
+        assert_eq!(
+            trust()
+                .with_certificate_claims(workflow_path(cc, CALLER_PATH))
+                .err(),
+            Some(ConfigError::WorkflowPathWithoutRepository)
+        );
+    }
+    // The reviewer's leaf: another repository on another ref, its 1.18
+    // naming its own workflow file of the same path.
+    let mallory = "https://github.com/mallory/anything";
+    let evil = LeafSpec::github(GH_WORKFLOW)
+        .fulcio(12, Some(utf8(mallory.as_bytes())))
+        .fulcio(14, Some(utf8(b"refs/heads/evil")))
+        .fulcio(15, Some(utf8(b"666")))
+        .fulcio(
+            18,
+            Some(utf8(
+                format!("{mallory}/{CALLER_PATH}@refs/heads/evil").as_bytes(),
+            )),
+        );
+    let by_repository = workflow_path(
+        CertificateClaims::new(exact(GH_REPOSITORY), None, triggers(&[GH_TRIGGER])).expect("cc"),
+        CALLER_PATH,
+    );
+    let by_id = workflow_path(
+        only_triggers(&[GH_TRIGGER])
+            .with_repository_id(GH_ID)
+            .expect("id"),
+        CALLER_PATH,
+    );
+    for (cc, other) in [
+        (by_repository, Extension::SourceRepositoryUri),
+        (by_id, Extension::SourceRepositoryIdentifier),
+    ] {
+        let trust = with_cc(trust(), cc);
+        assert_eq!(verify_leaf(&pki, &release_leaf("v2.4.0"), &trust), PASS);
+        assert_eq!(verify_leaf(&pki, &evil, &trust), mismatch(other));
+    }
+    assert_eq!(
+        ConfigError::WorkflowPathWithoutRepository.to_string(),
+        "a workflow path needs a source repository rule or a repository ID"
+    );
+}

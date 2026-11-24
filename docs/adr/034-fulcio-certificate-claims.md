@@ -137,12 +137,28 @@ list in every set of certificate claims (D2); an optional repository ID
      With the path as the rule, the URI is still compared whole, its
      repository and ref are the ones 1.12 and 1.14 already bind (with
      their own rules, if set), and every release of the same caller
-     passes. The path is checked when the rule is built: printable ASCII
-     without spaces, relative (no leading `/`), no `@` (it would end the
-     path inside 1.18), and every `/`-segment non-empty and neither `.`
-     nor `..`, so a rule cannot name a file outside the repository's own
-     tree or a form GitHub never writes (`WorkflowPathNotPlain`). Its use
-     for cosign `.att` provenance, whose SAN is the generator's, is #114.
+     passes. The path is checked when the rule is built
+     (`WorkflowPathNotPlain`): printable ASCII without spaces, relative
+     (no leading `/`), no `@`, and every `/`-segment non-empty and
+     neither `.` nor `..`. These keep the expected URI one unambiguous
+     form: a leading `/`, an empty segment or a `.`/`..` segment would
+     write a URI that a path reader resolves to another file than the
+     text says, and an `@` would put a second ref separator into
+     `<path>@<1.14>`. The check does not decide whether GitHub could run
+     the file: a path outside `.github/workflows/` (`release.yml`), a
+     backslash or a `%` is accepted, and such a rule passes only a leaf
+     whose 1.18 holds exactly that text (no measured leaf does), so the
+     operator's mistake fails closed.
+
+     A workflow-path rule needs a source repository rule (1.12) or a
+     repository ID (1.15) in the same claims, or
+     `Trust::with_certificate_claims` refuses it
+     (`WorkflowPathWithoutRepository`). The expected URI is built from the
+     leaf's own 1.12, so without one of them the path binds no
+     repository: under a shared generator's SAN, a rule with only a path
+     would admit any repository's workflow file of that name on any ref
+     (review of the PR). Its use for cosign `.att` provenance, whose SAN
+     is the generator's, is #114.
    - **Statement agreement** (opt-in,
      `CertificateClaims::with_statement_agreement`): `builder.id` = 1.9,
      `workflow.repository` = 1.12, `workflow.ref` = 1.14, and at least
@@ -331,8 +347,8 @@ ref, ref prefix, trigger, repository ID, workflow path) refuses naming
 it; the three leaves also meet a workflow-path rule naming their own
 file, and two tags of one caller pass under one rule. The hand-applied
 mutation pass over `fulcio.rs`, the agreement step, the order in
-`verify` and the configuration checks kills 60 of 61
-mutants (15 of 15 on the workflow-path rule).
+`verify` and the configuration checks kills 63 of 64
+mutants (18 of 18 on the workflow-path rule).
 The one left is equivalent: certificate claims on an accepted signature
 without a certificate (the `NoCertificate` arm) cannot be reached,
 because configuration refuses a trust with keys. Live on x86_64 (local

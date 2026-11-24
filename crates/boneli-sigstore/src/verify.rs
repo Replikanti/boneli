@@ -219,7 +219,9 @@ impl Trust {
     /// trust with keys (a keyed signature has no certificate), unless
     /// every identity's issuer is exactly [`GITHUB_ACTIONS_ISSUER`] (other
     /// issuers give these extensions other meanings), and for the
-    /// statement agreement without provenance claims (set them first).
+    /// statement agreement without provenance claims (set them first), and
+    /// for a workflow-path rule with neither a repository rule nor a
+    /// repository ID, which would bind no repository.
     pub fn with_certificate_claims(self, claims: CertificateClaims) -> Result<Trust, ConfigError> {
         if !self.keys.is_empty() {
             return Err(ConfigError::CertificateClaimsWithKeys);
@@ -233,6 +235,9 @@ impl Trust {
         }
         if claims.agreement && self.claims.is_none() {
             return Err(ConfigError::AgreementWithoutClaims);
+        }
+        if claims.path_binds_no_repository() {
+            return Err(ConfigError::WorkflowPathWithoutRepository);
         }
         Ok(Trust {
             certificate_claims: Some(claims),

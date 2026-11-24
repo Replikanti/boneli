@@ -241,6 +241,9 @@ pub enum ConfigError {
     /// A workflow path is empty, not printable ASCII, absolute, holds an
     /// `@`, or has an empty, `.` or `..` segment.
     WorkflowPathNotPlain,
+    /// A workflow-path rule is set with neither a source repository rule
+    /// (1.12) nor a repository ID (1.15).
+    WorkflowPathWithoutRepository,
 }
 
 impl fmt::Display for ConfigError {
@@ -288,6 +291,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::WorkflowPathNotPlain => {
                 "a workflow path is not a plain relative path of printable ASCII without @"
+            }
+            ConfigError::WorkflowPathWithoutRepository => {
+                "a workflow path needs a source repository rule or a repository ID"
             }
         })
     }
