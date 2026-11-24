@@ -62,7 +62,9 @@ round is 327 requests and a run 981 per architecture.
 | Run | Time (UTC) | x86_64 | arm64 |
 |-----|------------|--------|-------|
 | 45440408062 | 2026-11-24 16:44-17:06 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
-RUN2-ROW
+| 45448071309 | 2026-11-24 17:24-17:46 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
+| 45448490888 | 2026-11-24 17:26-17:48 | 981 to CloudFront, 0 to S3 | 981 to CloudFront, 0 to S3 |
+RUN-LATE-ROW
 
 Every first-hop answer was `307`. The first CloudFront hit of each job
 answered `Range: bytes=0-0` with `206` and no further redirect.
@@ -143,11 +145,14 @@ connects, and that matters on its own:
 - **Sample size.** 2 failures in 16 x86_64 attempts, about 16 blob
   requests each, is about 0.9 % of requests if they are independent
   (`1 - 0.875^(1/16)`). 500 requests see at least one S3 redirect with
-  probability `1 - 0.991^500` = 99 %. A run of 3 rounds of about 570
-  requests is about 1,700 requests per architecture, about 3,400 over the
-  two runs, which still sees a rate 3 times lower with 99 %. Fewer would
-  risk a clean sample that proves nothing; more costs only runner time,
-  which is free for a public repository.
+  probability `1 - 0.991^500` = 99 %, so the measurement was sized for at least 500
+  per architecture and run. A run made 981 (3 rounds of 327): at 0.9 % it
+  sees one with probability 99.99 %, and two runs (1,962 requests) still
+  see a rate 3 times lower (0.3 %) with 99.7 %. Fewer would risk a clean
+  sample that proves nothing; more costs only runner time, which is free
+  for a public repository. The clean runs refute the independence
+  assumption itself (Context, Reading), which is the finding: the rate is
+  not steady.
 - **Docker Hub's anonymous limit.** 100 manifest requests per hour per
   address (ADR-029). The measurement makes at most 66 per job (22 indexes,
   44 manifests); blob requests do not count. Each job runs on its own

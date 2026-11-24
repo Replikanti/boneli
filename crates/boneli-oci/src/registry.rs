@@ -104,10 +104,12 @@ impl Registry {
 
     /// Docker Hub, as measured on 2026-11-16: images under `docker.io`,
     /// the API at `registry-1.docker.io`, tokens from `auth.docker.io`,
-    /// blobs redirected to `production.cloudfront.docker.com`. And, from
-    /// GitHub-hosted runners only, some blobs redirected to the S3 host
+    /// blobs redirected to `production.cloudfront.docker.com`. And, seen
+    /// only in two `oci-acceptance` runs on GitHub-hosted x86_64 runners
+    /// (2026-11-23 and 2026-11-24, #117) and in none of the measurement
+    /// runs of 2026-11-24, blobs redirected to the S3 host
     /// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, admitted
-    /// as an exact host (ADR-035: MEASUREMENT-TBD).
+    /// as an exact host (ADR-035).
     pub fn docker_hub() -> Registry {
         Registry {
             name: "docker.io".to_owned(),
