@@ -1363,7 +1363,7 @@
    "title": "boneli-oci: force Required for image references an agent chose",
    "epic": null,
    "order": 52,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "8009a7a8",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1372,7 +1372,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-24T04:37:05+00:00",
+   "updated_at": "2026-11-24T08:27:22+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1540,14 +1540,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T20:35:36+00:00",
-   "issue": 97,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "36e4fbcc",
-   "note": null
-  },
   {
    "at": "2026-11-23T20:37:21+00:00",
    "issue": 98,
@@ -1939,6 +1931,14 @@
    "to": "blocked",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-24T08:27:22+00:00",
+   "issue": 105,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "8009a7a8",
+   "note": null
   }
  ],
  "open": [
@@ -1973,7 +1973,7 @@
   114
  ],
  "xopen": [],
- "updated_at": "2026-11-24T08:26:31+00:00",
+ "updated_at": "2026-11-24T08:27:22+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
