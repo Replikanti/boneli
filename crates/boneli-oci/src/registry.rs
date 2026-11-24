@@ -350,6 +350,29 @@ enum Step<T> {
 enum Kind {
     Manifest,
     Blob,
+    /// A signature tag, a referrers listing or a signature blob (ADR-029):
+    /// a second `401` is `Failed`, never `NotFound`.
+    Signature,
+}
+
+/// A tag a signature lookup reads, built only from a digest (ADR-029):
+/// cosign's `sha256-<hex>.sig` or the referrers tag schema's
+/// `sha256-<hex>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureTag {
+    /// `sha256-<hex>.sig`.
+    Sig(Digest),
+    /// `sha256-<hex>`, the fallback when the referrers API answers `404`.
+    Referrers(Digest),
+}
+
+impl SignatureTag {
+    fn text(self) -> String {
+        match self {
+            SignatureTag::Sig(d) => format!("sha256-{}.sig", d.hex()),
+            SignatureTag::Referrers(d) => format!("sha256-{}", d.hex()),
+        }
+    }
 }
 
 /// A client for one pull from one registry: it holds the token, which is
@@ -570,6 +593,109 @@ impl<'a> Client<'a> {
                 }
             }
         }
+    }
+
+    /// Fetches the document a signature tag names (ADR-029): `200` gives
+    /// its bytes, at most the document limit, which the caller hashes;
+    /// `404` gives `None`; every other status, and a redirect, fails.
+    pub(crate) fn get_tag_document(
+        &mut self,
+        repo: &Repository,
+        tag: SignatureTag,
+        accept: &str,
+    ) -> Result<Option<Fetched>, PullError> {
+        let url = self
+            .registry
+            .api_url(format!("/v2/{repo}/manifests/{}", tag.text()));
+        let what = format!("tag {}", tag.text());
+        self.get_optional_document(repo, &url, accept, &what)
+    }
+
+    /// The referrers of `digest` (OCI 1.1): `200` gives the listing, at
+    /// most the document limit; `404` gives `None`, a registry without the
+    /// API, whose caller falls back to the tag schema; every other status,
+    /// and a redirect, fails.
+    pub(crate) fn get_referrers(
+        &mut self,
+        repo: &Repository,
+        digest: &Digest,
+    ) -> Result<Option<Fetched>, PullError> {
+        let url = self
+            .registry
+            .api_url(format!("/v2/{repo}/referrers/{digest}"));
+        let what = format!("the referrers of {digest}");
+        self.get_optional_document(repo, &url, manifest::OCI_INDEX, &what)
+    }
+
+    /// One document from the API host that may be absent: `200` (at most
+    /// the document limit), `404` as `None`, the token flow of D9 with a
+    /// second `401` `Failed` (D11), nothing else.
+    fn get_optional_document(
+        &mut self,
+        repo: &Repository,
+        url: &Url,
+        accept: &str,
+        what: &str,
+    ) -> Result<Option<Fetched>, PullError> {
+        let max = self.limits.document.max_bytes() as u64;
+        let deadline = self.timeouts.deadline(max)?;
+        let mut fresh = false;
+        loop {
+            let step = self.send(url, Some(accept), deadline, |head, body| {
+                match head.status {
+                    200 => {
+                        let bytes = read_document(body, None, max, what)?;
+                        let content_type = head
+                            .headers
+                            .get("content-type")
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .map(str::to_owned);
+                        Ok(Step::Done(Some(Fetched {
+                            bytes,
+                            content_type,
+                        })))
+                    }
+                    404 => Ok(Step::Done(None)),
+                    401 => Ok(Step::Unauthorized(challenge(head))),
+                    status => Err(status_error(url, status, what)),
+                }
+            })?;
+            match step {
+                Step::Done(fetched) => {
+                    self.authorized = true;
+                    return Ok(fetched);
+                }
+                Step::Unauthorized(c) => {
+                    self.reauthenticate(c, repo, deadline, &mut fresh, Kind::Signature, what)?
+                }
+                Step::Redirect(_) => {
+                    return Err(failed(format!("{what}: an unexpected redirect")));
+                }
+            }
+        }
+    }
+
+    /// Fetches the blob `descriptor` into memory (ADR-029): a size above
+    /// `max` is refused before any request; the body must be exactly the
+    /// descriptor's size and digest. Redirects as for every blob (D10).
+    pub(crate) fn get_small_blob(
+        &mut self,
+        repo: &Repository,
+        descriptor: &Descriptor,
+        max: u64,
+    ) -> Result<Fetched, PullError> {
+        if descriptor.size > max {
+            return Err(failed(format!(
+                "blob {} has {} bytes, more than the limit of {max}",
+                descriptor.digest, descriptor.size
+            )));
+        }
+        let mut bytes = Vec::new();
+        self.fetch_blob(repo, descriptor, &mut bytes)?;
+        Ok(Fetched {
+            bytes,
+            content_type: None,
+        })
     }
 
     /// Fetches the blob `descriptor` into a temporary file next to `dest`

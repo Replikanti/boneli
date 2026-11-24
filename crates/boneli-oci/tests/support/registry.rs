@@ -217,6 +217,20 @@ pub struct Hub {
     pub blobs: BTreeMap<String, Vec<u8>>,
     /// Redirect blob requests to the CDN.
     pub cdn: bool,
+    /// Repository → (tag → (content type, bytes)): the signature tags.
+    pub tags: BTreeMap<String, BTreeMap<String, (String, Vec<u8>)>>,
+    /// Repository → (digest → answer) of the referrers API; a digest
+    /// without one is answered `404`, a registry without the API.
+    pub referrers: BTreeMap<String, BTreeMap<String, Referrers>>,
+}
+
+/// How the hub's referrers API answers for one digest.
+#[derive(Clone, Debug)]
+pub enum Referrers {
+    /// `200` with this listing.
+    Listing(Vec<u8>),
+    /// This status with no body.
+    Status(u16),
 }
 
 impl Hub {
@@ -236,6 +250,24 @@ impl Hub {
         let digest = digest_of(bytes);
         self.blobs.insert(digest.clone(), bytes.to_vec());
         digest
+    }
+
+    /// Tags `bytes` as `tag` in `repo`, served as a manifest with
+    /// `content_type`; returns their digest.
+    pub fn tag(&mut self, repo: &str, tag: &str, content_type: &str, bytes: &[u8]) -> String {
+        self.tags
+            .entry(repo.to_owned())
+            .or_default()
+            .insert(tag.to_owned(), (content_type.to_owned(), bytes.to_vec()));
+        digest_of(bytes)
+    }
+
+    /// Sets the referrers API's answer for `digest` in `repo`.
+    pub fn referrers(&mut self, repo: &str, digest: &str, reply: Referrers) {
+        self.referrers
+            .entry(repo.to_owned())
+            .or_default()
+            .insert(digest.to_owned(), reply);
     }
 
     /// The hub's answer to `seen`.
@@ -263,7 +295,9 @@ impl Hub {
         let Some(rest) = seen.target.strip_prefix("/v2/") else {
             return Reply::status(404);
         };
-        let (repo, kind, digest) = if let Some((repo, digest)) = rest.rsplit_once("/manifests/") {
+        let (repo, kind, digest) = if let Some((repo, digest)) = rest.rsplit_once("/referrers/") {
+            (repo, "referrers", digest)
+        } else if let Some((repo, digest)) = rest.rsplit_once("/manifests/") {
             (repo, "manifests", digest)
         } else if let Some((repo, digest)) = rest.rsplit_once("/blobs/") {
             (repo, "blobs", digest)
@@ -275,8 +309,20 @@ impl Hub {
         let Some(documents) = self.manifests.get(repo).filter(|_| authorized) else {
             return Reply::http(401, &[("WWW-Authenticate", &challenge)], b"{}");
         };
+        if kind == "referrers" {
+            return match self.referrers.get(repo).and_then(|r| r.get(digest)) {
+                Some(Referrers::Listing(bytes)) => Reply::http(
+                    200,
+                    &[("Content-Type", "application/vnd.oci.image.index.v1+json")],
+                    bytes,
+                ),
+                Some(Referrers::Status(status)) => Reply::status(*status),
+                None => Reply::status(404),
+            };
+        }
         if kind == "manifests" {
-            return match documents.get(digest) {
+            let tagged = self.tags.get(repo).and_then(|t| t.get(digest));
+            return match documents.get(digest).or(tagged) {
                 Some((ct, bytes)) => Reply::http(200, &[("Content-Type", ct)], bytes),
                 None => Reply::status(404),
             };

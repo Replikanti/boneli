@@ -1,0 +1,21 @@
+# cdn=false by_manifest=false
+registry-1.docker.io:443 /v2/library/app/manifests/sha256:5a79d9e2f7bdeae2bc58c392c62137e0c7c5317293782a6dcb84eca75d0d9c58 | Host: registry-1.docker.io | Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json
+auth.docker.io:443 /token?service=registry.docker.io&scope=repository%3Alibrary%2Fapp%3Apull | Host: auth.docker.io
+registry-1.docker.io:443 /v2/library/app/manifests/sha256:5a79d9e2f7bdeae2bc58c392c62137e0c7c5317293782a6dcb84eca75d0d9c58 | Host: registry-1.docker.io | Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/manifests/sha256:64eed2da2e2b9c5939f51f8c9325f287f39d8f040a7343ee3ea1c3b464f4cc01 | Host: registry-1.docker.io | Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:bb443d25250b135d2f663e029f09ce5e4905d622ec45d58d05b061c12fc7b717 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:33b3a053416b40d6b22269ab043434da46ca1d19224eb86b4c9272bd77fb9c89 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:10d840c01729fdb5a100c1b6e39b529f82610bf996472bd63d6a73504da4dad9 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:b09daa05d95c74cf8ff7178d617fd1c3f475246c3ec36c61d42aeaf9da4822f2 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+# cdn=true by_manifest=true
+registry-1.docker.io:443 /v2/library/app/manifests/sha256:64eed2da2e2b9c5939f51f8c9325f287f39d8f040a7343ee3ea1c3b464f4cc01 | Host: registry-1.docker.io | Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json
+auth.docker.io:443 /token?service=registry.docker.io&scope=repository%3Alibrary%2Fapp%3Apull | Host: auth.docker.io
+registry-1.docker.io:443 /v2/library/app/manifests/sha256:64eed2da2e2b9c5939f51f8c9325f287f39d8f040a7343ee3ea1c3b464f4cc01 | Host: registry-1.docker.io | Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json | Authorization: Bearer tok-1
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:bb443d25250b135d2f663e029f09ce5e4905d622ec45d58d05b061c12fc7b717 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+production.cloudfront.docker.com:443 /blobs/sha256:bb443d25250b135d2f663e029f09ce5e4905d622ec45d58d05b061c12fc7b717 | Host: production.cloudfront.docker.com
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:33b3a053416b40d6b22269ab043434da46ca1d19224eb86b4c9272bd77fb9c89 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+production.cloudfront.docker.com:443 /blobs/sha256:33b3a053416b40d6b22269ab043434da46ca1d19224eb86b4c9272bd77fb9c89 | Host: production.cloudfront.docker.com
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:10d840c01729fdb5a100c1b6e39b529f82610bf996472bd63d6a73504da4dad9 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+production.cloudfront.docker.com:443 /blobs/sha256:10d840c01729fdb5a100c1b6e39b529f82610bf996472bd63d6a73504da4dad9 | Host: production.cloudfront.docker.com
+registry-1.docker.io:443 /v2/library/app/blobs/sha256:b09daa05d95c74cf8ff7178d617fd1c3f475246c3ec36c61d42aeaf9da4822f2 | Host: registry-1.docker.io | Authorization: Bearer tok-1
+production.cloudfront.docker.com:443 /blobs/sha256:b09daa05d95c74cf8ff7178d617fd1c3f475246c3ec36c61d42aeaf9da4822f2 | Host: production.cloudfront.docker.com

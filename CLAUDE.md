@@ -150,8 +150,12 @@ a ramfs root through `unshare -Urm`, a store opened in a PID
 namespace without its own `/proc` through `unshare -Urpfm`, and that a
 second store's trim with a budget of 1 keeps the layers of a running
 sandbox (`mounted_layers_survive_trim`, ADR-025). `network::` pulls
-`node:22` and `postgres:17` from Docker Hub and runs them; CI runs it in
-the weekly `oci-acceptance` workflow, not on every PR.
+`node:22` and `postgres:17` from Docker Hub and runs them, and checks
+image signatures (ADR-029): `signatures_on_docker_hub` pulls the signed
+`chainguard/node` under a `Required` rule and refuses the unsigned
+`node:22` with no layer request, and `signatures_elsewhere` pulls signed
+images from GHCR, `cgr.dev` and Artifact Registry; CI runs it in the
+weekly `oci-acceptance` workflow, not on every PR.
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
