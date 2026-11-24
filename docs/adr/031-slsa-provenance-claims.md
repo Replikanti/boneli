@@ -116,8 +116,13 @@ against the statement as filed (Fulcio's certificate extensions follow in
      `externalParameters.workflow.repository`, the repository whose
      workflow run produced the build (the caller of a reusable workflow).
    - **Source ref**, exact or a prefix ending in `/`:
-     `externalParameters.workflow.ref`, the ref the run was triggered at
-     (a branch, a tag or `refs/pull/N/merge`). A prefix is allowed because
+     `externalParameters.workflow.ref`, the run's `GITHUB_REF` as the OIDC
+     token carries it (a branch, a tag or `refs/pull/N/merge`). It names
+     the code the run built only for `push`, tag and `pull_request` runs:
+     a run triggered by `pull_request_target`, `workflow_run` or
+     `issue_comment` gets the base or default branch as its ref and that
+     branch's commit as `gitCommit`, whatever code its steps check out
+     (see Known limits). A prefix is allowed because
      3 of the 5 measured producers have a ref that moves with every
      release, the reason S2 allows a URI prefix.
    - **Materials**, by URI and one digest: an entry of
@@ -254,6 +259,16 @@ against the statement as filed (Fulcio's certificate extensions follow in
   of `slsa-github-generator` lives, are not read, so claims cannot be
   checked where they would mean the most (1 of the 20 measured
   repositories). Closure: #114.
+- The ref and the source commit do not say which code a run built when
+  the run was triggered by `pull_request_target`, `workflow_run` or
+  `issue_comment`: such a run carries the base or default branch as its
+  ref and that branch's commit as `gitCommit`, so a rule with ref
+  `refs/heads/main` and that commit as a material accepts an image such
+  a workflow built from a fork's code. Only the trigger tells these runs
+  apart. The identity rule bounds it: the SAN names the signing workflow
+  file, so the gap is open only when that workflow lists one of these
+  triggers. Closure: #113 adds Fulcio's Build Trigger extension (1.20),
+  which Fulcio writes from the token's `event_name`.
 
 ## Alternatives considered
 
@@ -282,8 +297,10 @@ against the statement as filed (Fulcio's certificate extensions follow in
   every normalization adds a form an attacker can choose; the producer's
   form is fixed by its build type.
 - **Checking `event_name`** (`internalParameters.github`). Rejected: out
-  of the claim set as filed, and the ref claim already separates
-  `refs/pull/N/merge` from branches and tags.
+  of the claim set as filed. The ref claim separates `refs/pull/N/merge`
+  from branches and tags only for `pull_request` runs; the other
+  triggers are a known limit, closed by #113 through the certificate's
+  Build Trigger extension, which Fulcio writes rather than the job.
 
 ## Accept when
 
