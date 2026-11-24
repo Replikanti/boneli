@@ -73,6 +73,70 @@ pub enum Error {
         /// The role.
         role: &'static str,
     },
+    /// A version is below the one trusted before (5.4.3): the timestamp's
+    /// own, or the snapshot version a timestamp names.
+    Rollback {
+        /// The role whose version went back.
+        role: &'static str,
+        /// The version trusted before.
+        trusted: i64,
+        /// The version found.
+        found: i64,
+    },
+    /// A document's version is not the one the referring metadata names
+    /// (5.5.4, 5.6.4).
+    VersionMismatch {
+        /// The role.
+        role: &'static str,
+        /// The version named.
+        expected: i64,
+        /// The version found.
+        found: i64,
+    },
+    /// A file's length is not the one listed for it.
+    LengthMismatch {
+        /// `snapshot`, `targets` or `target`.
+        role: &'static str,
+        /// The listed length.
+        expected: u64,
+        /// The length found.
+        found: u64,
+    },
+    /// A file's SHA-256 is not the one listed for it.
+    HashMismatch {
+        /// `snapshot`, `targets` or `target`.
+        role: &'static str,
+    },
+    /// A hash map holds no `sha256`, the one algorithm read.
+    NoSha256,
+    /// The new snapshot no longer lists a file the stored one listed
+    /// (5.5.5).
+    EntryDropped,
+    /// The new snapshot lists a file with a lower version than the stored
+    /// one did (5.5.5).
+    EntryRollback {
+        /// The version in the stored snapshot.
+        trusted: i64,
+        /// The version in the new one.
+        found: i64,
+    },
+    /// The trusted targets do not list the target in top-level `targets`.
+    /// Delegations are never followed.
+    NotListed,
+    /// The target's listed length is above the cap of the file it
+    /// becomes, so it is never fetched.
+    TargetTooLarge {
+        /// The cap in bytes, `boneli_sigstore::MAX_TRUSTED_ROOT_BYTES`.
+        cap: usize,
+    },
+    /// The call does not follow the update order: the root chain, the
+    /// stored timestamp, the timestamp, the stored snapshot, the snapshot,
+    /// targets, then the target, each at most once except the timestamp.
+    OutOfOrder,
+    /// A root of this update changed the timestamp or snapshot keys or
+    /// thresholds, so stored timestamp and snapshot metadata are not used
+    /// (5.3.11, fast-forward recovery).
+    OnlineKeysChanged,
 }
 
 impl fmt::Display for Error {
@@ -109,6 +173,43 @@ impl fmt::Display for Error {
             }
             Error::NoNextVersion => f.write_str("the trusted root's version has no successor"),
             Error::Expired { role } => write!(f, "the {role} metadata has expired"),
+            Error::Rollback {
+                role,
+                trusted,
+                found,
+            } => write!(
+                f,
+                "the {role} version {found} is below the trusted version {trusted}"
+            ),
+            Error::VersionMismatch {
+                role,
+                expected,
+                found,
+            } => write!(f, "the {role} version is {found}, not {expected}"),
+            Error::LengthMismatch {
+                role,
+                expected,
+                found,
+            } => write!(f, "the {role} file is {found} bytes, not {expected}"),
+            Error::HashMismatch { role } => {
+                write!(f, "the {role} file's SHA-256 is not the listed one")
+            }
+            Error::NoSha256 => f.write_str("the hashes hold no sha256"),
+            Error::EntryDropped => {
+                f.write_str("the snapshot no longer lists a file the stored snapshot lists")
+            }
+            Error::EntryRollback { trusted, found } => write!(
+                f,
+                "the snapshot lists a file at version {found}, below the stored {trusted}"
+            ),
+            Error::NotListed => f.write_str("the target is not listed in the top-level targets"),
+            Error::TargetTooLarge { cap } => {
+                write!(f, "the target is listed as larger than {cap} bytes")
+            }
+            Error::OutOfOrder => f.write_str("the metadata was offered out of the update order"),
+            Error::OnlineKeysChanged => f.write_str(
+                "the root changed the timestamp or snapshot keys, so stored metadata is not used",
+            ),
         }
     }
 }

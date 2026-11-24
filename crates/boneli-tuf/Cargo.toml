@@ -23,7 +23,8 @@ boneli-https.workspace = true
 # support crate, no new external edge.
 boneli-json.workspace = true
 # The RFC 3339 reader for `expires` (`boneli_sigstore::time::parse`), so
-# the workspace has one; later the last check before `trusted_root.json`
-# is installed (`TrustedRoot::from_json`, ADR-033 item 6). A support
-# crate, no new external edge.
+# the workspace has one, and the cap on the `trusted_root.json` target
+# (`MAX_TRUSTED_ROOT_BYTES`); later the last check before the file is
+# installed (`TrustedRoot::from_json`, ADR-033 item 6). A support crate,
+# no new external edge.
 boneli-sigstore.workspace = true

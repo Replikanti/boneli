@@ -251,3 +251,226 @@ impl RootBuilder {
         self.signed_by(&signers)
     }
 }
+
+/// The online key of the default root: timestamp and snapshot.
+pub const ONLINE: usize = 6;
+/// The targets signers the online builders use by default: 3 of the
+/// default root's targets keys 1 to 5.
+pub const TARGETS_SIGNERS: [usize; 3] = [1, 2, 3];
+/// The fixture target's name and content.
+pub const TARGET_NAME: &str = "trusted_root.json";
+pub const TARGET: &[u8] = b"{\"fixture\":\"a trusted root of no use\"}\n";
+
+/// A `meta` entry of a timestamp or snapshot: a version, and a length and
+/// a SHA-256 (lower-case hex) when set.
+#[derive(Clone, Debug)]
+pub struct MetaSpec {
+    pub version: i64,
+    pub length: Option<i64>,
+    pub sha256: Option<String>,
+}
+
+impl MetaSpec {
+    /// An entry by version only, as Sigstore writes them.
+    pub fn version(version: i64) -> MetaSpec {
+        MetaSpec {
+            version,
+            length: None,
+            sha256: None,
+        }
+    }
+
+    /// An entry with the length and SHA-256 of `bytes`.
+    pub fn of(version: i64, bytes: &[u8]) -> MetaSpec {
+        MetaSpec {
+            version,
+            length: Some(bytes.len() as i64),
+            sha256: Some(hex(&Sha256::digest(bytes))),
+        }
+    }
+
+    pub fn value(&self) -> Value {
+        let mut o = Object::new();
+        o.insert("version", self.version);
+        if let Some(length) = self.length {
+            o.insert("length", length);
+        }
+        if let Some(sha256) = &self.sha256 {
+            o.insert("hashes", obj([("sha256", s(sha256))]));
+        }
+        Value::Object(o)
+    }
+}
+
+/// A target entry with the length and SHA-256 of `bytes`.
+pub fn target_entry(bytes: &[u8]) -> Value {
+    obj([
+        ("length", Value::from(bytes.len() as i64)),
+        ("hashes", obj([("sha256", s(&hex(&Sha256::digest(bytes))))])),
+    ])
+}
+
+/// The header every role shares.
+fn header(type_: &str, version: i64, expires: &str) -> Object {
+    let mut o = Object::new();
+    o.insert("_type", type_);
+    o.insert("spec_version", "1.0");
+    o.insert("version", version);
+    o.insert("expires", expires);
+    o
+}
+
+/// A timestamp under construction; signed by the online key.
+#[derive(Clone, Debug)]
+pub struct TimestampBuilder {
+    pub version: i64,
+    pub expires: String,
+    pub type_: String,
+    pub snapshot: MetaSpec,
+}
+
+impl TimestampBuilder {
+    pub fn new(version: i64, snapshot: MetaSpec) -> TimestampBuilder {
+        TimestampBuilder {
+            version,
+            expires: FAR.to_string(),
+            type_: "timestamp".to_string(),
+            snapshot,
+        }
+    }
+
+    pub fn signed(&self) -> Value {
+        let mut o = header(&self.type_, self.version, &self.expires);
+        o.insert("meta", obj([("snapshot.json", self.snapshot.value())]));
+        Value::Object(o)
+    }
+
+    pub fn signed_by(&self, signers: &[usize]) -> Vec<u8> {
+        signed_by(&self.signed(), signers)
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.signed_by(&[ONLINE])
+    }
+}
+
+/// A snapshot under construction; signed by the online key. `meta` holds
+/// `targets.json` first.
+#[derive(Clone, Debug)]
+pub struct SnapshotBuilder {
+    pub version: i64,
+    pub expires: String,
+    pub type_: String,
+    pub meta: Vec<(String, MetaSpec)>,
+}
+
+impl SnapshotBuilder {
+    pub fn new(version: i64, targets: MetaSpec) -> SnapshotBuilder {
+        SnapshotBuilder {
+            version,
+            expires: FAR.to_string(),
+            type_: "snapshot".to_string(),
+            meta: vec![("targets.json".to_string(), targets)],
+        }
+    }
+
+    pub fn signed(&self) -> Value {
+        let mut o = header(&self.type_, self.version, &self.expires);
+        let mut meta = Object::new();
+        for (name, spec) in &self.meta {
+            meta.insert(name.as_str(), spec.value());
+        }
+        o.insert("meta", Value::Object(meta));
+        Value::Object(o)
+    }
+
+    pub fn signed_by(&self, signers: &[usize]) -> Vec<u8> {
+        signed_by(&self.signed(), signers)
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.signed_by(&[ONLINE])
+    }
+}
+
+/// A targets document under construction; signed by `TARGETS_SIGNERS`.
+/// By default it lists the fixture target only.
+#[derive(Clone, Debug)]
+pub struct TargetsBuilder {
+    pub version: i64,
+    pub expires: String,
+    pub type_: String,
+    pub targets: Vec<(String, Value)>,
+    pub delegations: Option<Value>,
+}
+
+impl TargetsBuilder {
+    pub fn new(version: i64) -> TargetsBuilder {
+        TargetsBuilder {
+            version,
+            expires: FAR.to_string(),
+            type_: "targets".to_string(),
+            targets: vec![(TARGET_NAME.to_string(), target_entry(TARGET))],
+            delegations: None,
+        }
+    }
+
+    pub fn signed(&self) -> Value {
+        let mut o = header(&self.type_, self.version, &self.expires);
+        let mut targets = Object::new();
+        for (name, entry) in &self.targets {
+            targets.insert(name.as_str(), entry.clone());
+        }
+        o.insert("targets", Value::Object(targets));
+        if let Some(delegations) = &self.delegations {
+            o.insert("delegations", delegations.clone());
+        }
+        Value::Object(o)
+    }
+
+    pub fn signed_by(&self, signers: &[usize]) -> Vec<u8> {
+        signed_by(&self.signed(), signers)
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.signed_by(&TARGETS_SIGNERS)
+    }
+}
+
+/// The signed files of one consistent fixture repository.
+pub struct Files {
+    pub root: Vec<u8>,
+    pub timestamp: Vec<u8>,
+    pub snapshot: Vec<u8>,
+    pub targets: Vec<u8>,
+}
+
+/// A consistent fixture repository: the default root v1, targets `v`
+/// listing the fixture target, snapshot `v` naming targets by version,
+/// length and hash, and timestamp `v` naming snapshot the same way.
+/// Signatures are randomized, so each call signs anew.
+pub fn files(v: i64) -> Files {
+    let targets = TargetsBuilder::new(v).bytes();
+    let snapshot = SnapshotBuilder::new(v, MetaSpec::of(v, &targets)).bytes();
+    let timestamp = TimestampBuilder::new(v, MetaSpec::of(v, &snapshot)).bytes();
+    Files {
+        root: RootBuilder::new(1).bytes(),
+        timestamp,
+        snapshot,
+        targets,
+    }
+}
+
+/// A set trusting `files`' root at `START`.
+pub fn trusted_set(files: &Files) -> boneli_tuf::TrustedSet {
+    boneli_tuf::TrustedSet::new(&files.root, START).expect("fixture root")
+}
+
+/// A set that has verified `files` up to and including targets.
+pub fn through_targets(files: &Files) -> boneli_tuf::TrustedSet {
+    let mut set = trusted_set(files);
+    set.update_timestamp(&files.timestamp).expect("timestamp");
+    set.update_snapshot(&files.snapshot).expect("snapshot");
+    set.update_targets(&files.targets).expect("targets");
+    set
+}
