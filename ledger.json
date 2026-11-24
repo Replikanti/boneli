@@ -1467,16 +1467,16 @@
    "title": "one file-lock type for boneli-oci and boneli-store-fs, enforced by the architecture checker",
    "epic": null,
    "order": 56,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "9f12be0c",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 110,
    "note": "",
-   "updated_at": "2026-11-24T01:33:43+00:00",
+   "updated_at": "2026-11-24T02:25:22+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1488,14 +1488,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T22:06:00+00:00",
-   "issue": 80,
-   "from": "ready",
-   "to": "claimed",
-   "by": "f11746bb",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-20T22:08:20+00:00",
    "issue": 94,
@@ -1887,6 +1879,14 @@
    "to": "implementing",
    "by": "b6fae515",
    "note": "PR 1 #107, PR 2 #108 merged; PR 3 boneli-oci"
+  },
+  {
+   "at": "2026-11-24T02:25:22+00:00",
+   "issue": 109,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "9f12be0c",
+   "note": null
   }
  ],
  "open": [
@@ -1921,7 +1921,7 @@
   109
  ],
  "xopen": [],
- "updated_at": "2026-11-24T01:41:11+00:00",
+ "updated_at": "2026-11-24T02:25:22+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
