@@ -544,6 +544,8 @@ the digest binds the bytes and mirrors are legitimate.
   - Rotation depends on the operator replacing `trusted_root.json`; a
     stale file refuses signatures from new logs or CAs, which fails
     closed. A TUF client is a follow-up issue (filed at STOP 1).
+    ADR-033 closes it: `boneli_tuf::refresh_trusted_root` keeps the file
+    current from Sigstore's TUF repository.
   - A `trusted_root.json` that holds a key of a kind `PublicKey` does
     not support, or any other defect, refuses the whole file (PR 2); the
     one entry left out instead is a Rekor log whose `keyId` is not its

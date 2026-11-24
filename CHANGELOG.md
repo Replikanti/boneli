@@ -859,6 +859,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Sigstore's timestamp v842, snapshot v166 and targets v14 verify under
   root v16, and the `trusted_root.json` target is `boneli-sigstore`'s
   fixture.
+- `boneli-tuf` (part 3 of #103, ADR-033 accepted): the refresh.
+  `refresh_trusted_root` keeps `trusted_root.json` current in a private
+  trust directory (ADR-021 rules, the whole run under an exclusive
+  `FileLock` on `tuf/lock`): it bootstraps from the operator's pinned
+  `InitialRoot` once and records the pin (a changed pin fails until
+  `tuf/` is removed), walks the root chain, at most 32 new roots per run,
+  each stored before the next fetch (a root that rotates the timestamp or
+  snapshot keys deletes their stored copies first), verifies timestamp,
+  snapshot and targets against the stored copies, and installs the target
+  by rename only after its length, SHA-256 and `TrustedRoot::from_json`
+  passed; a current file is left alone (`Outcome::Unchanged`). Fetches go
+  through `boneli_https::Dial` with one `GET` per file, `200` only (a
+  `404` ends only the root chain), no redirect, no content coding, caps
+  per role checked against `Content-Length` before the body, and a
+  deadline of `setup + size / min_rate` (`Timeouts`, defaults 30 s, 30 s,
+  1 MiB/s). `Repository::parse` takes `https://<host>[:port][/<prefix>]`
+  in canonical form only. Errors are `RefreshError { step, detail }`.
+  The live test against `tuf-repo-cdn.sigstore.dev` runs weekly in the
+  `oci-acceptance` workflow on both architectures. Operator page:
+  `docs/sigstore-trust.md`.
 - `boneli_https::EcdsaP256Key` (ADR-033, S4): ECDSA P-256 signing through
   ring's key provider, PKCS#8 only, input wiped, so `boneli-tuf`'s tests
   sign fixtures with the one scheme production accepts.

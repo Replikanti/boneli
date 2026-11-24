@@ -25,7 +25,14 @@ name: oci-acceptance
 # (#105): node:22 and postgres:17 pull as references the agent chose under
 # the documented exemption docker.io + library/, and the agent's node:22
 # with no exemption is refused with no connection, so the Docker Hub
-# request count below is unchanged. Weekly, because
+# request count below is unchanged. And of ADR-033 (#103): refresh
+# trusted_root.json from tuf-repo-cdn.sigstore.dev through TUF, from the
+# pinned Sigstore root v16, into an empty trust directory and once more
+# (`sigstore_refresh_live`, 9 requests per architecture per run: 5 for
+# the first refresh, 4 for the second, which finds the file current); weekly
+# because the timestamp expires 7 days after it is signed and upstream
+# drift (a new key type, the target moved into a delegation) must show up
+# within that week. Weekly, because
 # registry changes (a garbage-collected digest, a CDN host move, the token
 # flow, a signature replaced) show up within 7 days at 13 Docker Hub
 # manifest, tag and referrers requests per architecture per run (4 before
@@ -95,3 +102,9 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self \
             cargo test -p boneli-oci --test boneli_oci_tests -- --ignored network:: --nocapture
+      # ADR-033: the TUF refresh of Sigstore's trusted root, also when a
+      # pull above failed; versions, run time and the target's SHA-256 are
+      # printed. It needs no host preparation.
+      - name: Refresh Sigstore's trusted root through TUF
+        if: ${{ !cancelled() }}
+        run: cargo test -p boneli-tuf --test network -- --ignored --nocapture
