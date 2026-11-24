@@ -35,7 +35,8 @@ fn every_clause_is_killed() {
 
 /// Every clause has a mutant, and a clause with sub-checks has one per
 /// sub-check: `silent-failure-detail` per operation of its port,
-/// `tampered-refused` per pull, `workspace-metadata-inert`,
+/// `tampered-refused` and `exemption-reported` per pull,
+/// `workspace-metadata-inert`,
 /// `uncitable-paths-carried` and `patch-uncitable-paths` per sub-check.
 #[test]
 fn mutant_table_covers_every_clause() {
@@ -76,7 +77,10 @@ fn mutant_table_covers_every_clause() {
         (
             "ImageStore",
             contract::image::CLAUSES,
-            &[("tampered-refused", contract::image::TAMPERED_PULLS)],
+            &[
+                ("tampered-refused", contract::image::TAMPERED_PULLS),
+                ("exemption-reported", contract::image::EXEMPTION_PULLS),
+            ],
         ),
         ("DataSnapshot", contract::data::CLAUSES, &[]),
     ];

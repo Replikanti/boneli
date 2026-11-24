@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
-use boneli_app::RootfsRef;
+use boneli_app::{ImageExemption, RootfsRef};
 use boneli_private_dir::lock::HandOff;
 
 use crate::error::Error;
@@ -31,6 +31,8 @@ pub struct Lease {
     /// The image's documents on disk (index, manifest, config), stamped
     /// with the layers when the lease is dropped.
     documents: Vec<PathBuf>,
+    /// The agent exemption that admitted the pull (ADR-032).
+    exemption: Option<ImageExemption>,
 }
 
 impl Lease {
@@ -41,6 +43,7 @@ impl Lease {
         config: ImageConfig,
         pins: Vec<LayerPin>,
         documents: Vec<PathBuf>,
+        exemption: Option<ImageExemption>,
     ) -> Lease {
         Lease {
             rootfs,
@@ -48,7 +51,16 @@ impl Lease {
             config,
             pins,
             documents,
+            exemption,
         }
+    }
+
+    /// The agent exemption that admitted the pull this lease comes from
+    /// (ADR-032): `None` for a reference the operator chose, for one
+    /// checked under a `Required` rule, and for a lease from
+    /// [`crate::OciImageStore::lease`], which is not a pull.
+    pub fn exemption(&self) -> Option<&ImageExemption> {
+        self.exemption.as_ref()
     }
 
     /// The handle the store issued for the root filesystem.

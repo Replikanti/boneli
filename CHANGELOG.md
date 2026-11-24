@@ -792,8 +792,31 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused under claims, and `boneli-oci` does not ask for the `.sig` tag of
   a rule with claims. A trust without claims behaves as before. Live test
   `provenance_claims_on_ghcr` (jq 1.8.2 on GHCR) in `oci-acceptance`.
+- Image references an agent chose (#105, ADR-032, accepted):
+  `boneli_app::ImageOrigin` (`Operator` or `Agent`, no default),
+  `ImageExemption` and `Pulled`. In `boneli-oci`, an agent's reference is
+  checked under the `Required` rule that covers it, passes under an
+  operator agent exemption (`SignaturePolicy::with_agent_exemptions`; one
+  repository or a prefix ending in `/`, never a whole registry; `Off`
+  rules neither admit an agent reference nor shadow a `Required` rule for
+  it), or is `Failed` before any request. The document an agent
+  reference names is fetched from its named repository on every agent
+  pull, so a warm cache never serves it another repository's digest (one
+  manifest request on a warm pull).
+  `AgentExemption::docker_official_images()` (`docker.io` + `library/`)
+  is the documented first-stack configuration. The pull reports the
+  exemption that admitted it (`Pulled::exemption`, `Lease::exemption`);
+  writing it to the run log is #14's. New contract clauses
+  `agent-origin-refused` and `exemption-reported`, each case with its
+  mutant; `MemoryImageStore::with_agent_exemptions`.
 
 ### Changed
+
+- **Breaking:** `ImageRef` has a required field `origin`, and
+  `ImageStore::pull` returns `Result<Pulled, ImageError>` instead of
+  `Result<RootfsRef, ImageError>` (#105, ADR-032). An operator reference
+  pulls as before; with no agent exemption configured, every agent
+  reference outside a `Required` rule is refused.
 
 - `GitCli::open` (#85, ADR-024) creates its root through
   `boneli_private_dir::create_new_root`, before git runs: a root with a

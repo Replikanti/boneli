@@ -57,6 +57,14 @@
 //! verified is kept and verified again, offline, on every later pull. The
 //! default, [`SignaturePolicy::off`], checks nothing and sends exactly the
 //! requests of ADR-009.
+//!
+//! Origin (ADR-032): a reference an agent chose
+//! (`boneli_app::ImageOrigin::Agent`) passes only under a `Required` rule
+//! or an operator [`AgentExemption`] for its repository or a prefix of it
+//! ([`AgentExemption::docker_official_images`] is the documented
+//! first-stack one), and is `Failed` before any request otherwise. The
+//! pull reports the exemption that admitted it ([`Lease::exemption`],
+//! `boneli_app::Pulled::exemption`).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
@@ -89,7 +97,9 @@ pub use layers::{LayerCache, LayerPin};
 pub use lease::Lease;
 pub use limits::{Budget, Limits};
 pub use manifest::{Descriptor, Document, Entry, ImageConfig, Index, Layer, Manifest};
-pub use policy::{PolicyRule, RepoScope, Requirement, SignaturePolicy};
+pub use policy::{
+    AgentExemption, Decision, ExemptScope, PolicyRule, RepoScope, Requirement, SignaturePolicy,
+};
 pub use reference::{Digest, Platform, Reference, RegistryHost, Repository};
 pub use registry::{
     Client, FetchLimits, Fetched, MAX_REDIRECTS, Registry, Resolved, Timeouts, select,

@@ -40,7 +40,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
+use boneli_app::{
+    ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, Pulled, RootfsRef,
+};
 use boneli_https::{ConnectOptions, Dial, Roots, Sha256, TlsConfig, TlsDial};
 
 use crate::error::{Error, PullError, failed, root_err};
@@ -50,7 +52,7 @@ use crate::lease::Lease;
 use crate::limits::{Budget, Limits};
 use crate::lock;
 use crate::manifest::{self, Descriptor, Document, ImageConfig};
-use crate::policy::{Requirement, SignaturePolicy};
+use crate::policy::{Decision, SignaturePolicy};
 use crate::reference::{Digest, Reference};
 use crate::registry::{Client, Documents, FetchLimits, Fetched, Registry, Timeouts, select};
 use crate::signatures::{self, Check};
@@ -117,6 +119,11 @@ pub const CACHE_BUDGET_BYTES: u64 = MAX_IMAGE_BYTES
     + BLOCK_ALLOWANCE * (MAX_IMAGE_ENTRIES + MAX_LAYERS as u64)
     + 3 * (MAX_DOCUMENT_BYTES as u64 + MAX_TYPE_BYTES + 2 * BLOCK_ALLOWANCE);
 
+/// What `pull_pinned` hands to the lease: the handle, the image config,
+/// the image's documents on disk and the agent exemption that admitted
+/// the pull (ADR-032).
+type PulledImage = (RootfsRef, ImageConfig, Vec<PathBuf>, Option<ImageExemption>);
+
 /// What a store pulls from and how: the registries, the limits and where
 /// connections go.
 pub struct StoreConfig {
@@ -140,9 +147,13 @@ pub struct StoreConfig {
     pub cache_budget: u64,
     /// Which images must carry a trusted signature before any layer is
     /// fetched (ADR-029); [`SignaturePolicy::off`] by default, under which
-    /// a pull sends exactly the requests of ADR-009. `open` refuses a rule
-    /// for a registry that is not among `registries` or
-    /// `default_registry`.
+    /// a pull sends exactly the requests of ADR-009 for a reference the
+    /// operator chose, and refuses every reference an agent chose before
+    /// any request (ADR-032). Its agent exemptions are the only way an
+    /// agent's image passes unchecked, and only the operator sets them,
+    /// here, before `open`: no port operation adds or widens one. `open`
+    /// refuses a rule or an exemption for a registry that is not among
+    /// `registries` or `default_registry`.
     pub signatures: SignaturePolicy,
 }
 
@@ -316,9 +327,9 @@ impl OciImageStore {
     ///   here rather than in a pull;
     /// - then the store is trimmed to `config.cache_budget`, so a lowered
     ///   budget applies at once (ADR-025, D6). A budget of 0, and a
-    ///   signature rule for a registry the store does not pull from
-    ///   (`Error::InvalidPolicy`, ADR-029), are refused first, before
-    ///   anything is created.
+    ///   signature rule or an agent exemption for a registry the store
+    ///   does not pull from (`Error::InvalidPolicy`, ADR-029, ADR-032),
+    ///   are refused first, before anything is created.
     pub fn open(root: &Path, config: StoreConfig) -> Result<OciImageStore, Error> {
         if config.cache_budget == 0 {
             return Err(Error::InvalidLimits("cache budget"));
@@ -328,7 +339,8 @@ impl OciImageStore {
                 && !config.registries.iter().any(|r| r.name() == *name)
         }) {
             return Err(Error::InvalidPolicy(format!(
-                "a signature rule names the registry {unknown:?}, which the store does not pull from"
+                "a signature rule or agent exemption names the registry {unknown:?}, which the \
+                 store does not pull from"
             )));
         }
         let resolved =
@@ -471,13 +483,14 @@ impl OciImageStore {
                 gone.display()
             )));
         }
-        Ok(self.leased(rootfs.clone(), config, pins, documents))
+        Ok(self.leased(rootfs.clone(), config, pins, documents, None))
     }
 
     /// Pulls `image` like [`ImageStore::pull`] and hands the pins the pull
     /// took to a [`Lease`], so no other store can remove a layer between
     /// the pull and the sandbox (ADR-025, D2). The lease is built from the
-    /// manifest and config the pull holds in memory.
+    /// manifest and config the pull holds in memory, and carries the agent
+    /// exemption that admitted the image, if any (ADR-032).
     pub fn pull_leased(&self, image: &ImageRef) -> Result<Lease, ImageError> {
         let (result, doomed) = {
             let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -504,13 +517,15 @@ impl OciImageStore {
 
     /// The lease of `rootfs` with `config` over `pins`, which hold every
     /// layer of `config`; `documents` are the image's documents on disk,
-    /// which the lease stamps when it is dropped.
+    /// which the lease stamps when it is dropped; `exemption` is the one
+    /// that admitted the pull, `None` for a lease that is not a pull.
     fn leased(
         &self,
         rootfs: RootfsRef,
         config: ImageConfig,
         pins: BTreeMap<Digest, LayerPin>,
         documents: Vec<PathBuf>,
+        exemption: Option<ImageExemption>,
     ) -> Lease {
         let mut seen = BTreeSet::new();
         let mut layers: Vec<PathBuf> = config
@@ -527,6 +542,7 @@ impl OciImageStore {
             config,
             pins.into_values().collect(),
             documents,
+            exemption,
         )
     }
 
@@ -586,9 +602,9 @@ impl OciImageStore {
         let mut pins = BTreeMap::new();
         let pulled = self.pull_pinned(image, &mut pins);
         let (doomed, trimmed) = self.trim_deferred();
-        let result = pulled.and_then(|(rootfs, config, documents)| {
+        let result = pulled.and_then(|(rootfs, config, documents, exemption)| {
             quietly(trimmed).map_err(pull_err)?;
-            Ok(self.leased(rootfs, config, pins, documents))
+            Ok(self.leased(rootfs, config, pins, documents, exemption))
         });
         (result, doomed)
     }
@@ -598,29 +614,62 @@ impl OciImageStore {
         &self,
         image: &ImageRef,
         pins: &mut BTreeMap<Digest, LayerPin>,
-    ) -> Result<(RootfsRef, ImageConfig, Vec<PathBuf>), PullError> {
+    ) -> Result<PulledImage, PullError> {
         let reference = Reference::parse(&image.name, &image.digest, &image.platform)?;
         let registry = select(
             &self.config.registries,
             &self.config.default_registry,
             &reference,
         )?;
+        // Who chose the reference decides before any request (ADR-032): a
+        // refused agent reference tells the registry nothing, and the
+        // cache, which knows images by digest only, is never asked.
+        let decision =
+            self.config
+                .signatures
+                .decide(registry.name(), reference.repository(), image.origin);
+        let exemption = match decision {
+            Decision::Refused => {
+                return Err(failed(format!(
+                    "signature policy: {}/{} was chosen by the agent, and no Required rule or \
+                     agent exemption covers it",
+                    registry.name(),
+                    reference.repository()
+                )));
+            }
+            Decision::Exempted(e) => Some(ImageExemption {
+                registry: e.registry.clone(),
+                scope: e.scope.as_str().to_owned(),
+            }),
+            Decision::Unchecked | Decision::Required(_) => None,
+        };
         let mut client = Client::new(
             registry,
             &*self.config.dial,
             &self.config.fetch,
             &self.config.timeouts,
         );
-        let resolved = client.resolve_with(&reference, &mut Kept { store: self })?;
+        // An agent's reference is served only a digest its named
+        // repository holds (ADR-032, S6): documents are kept by digest, not
+        // by repository, so the one the reference names is fetched from
+        // that repository on every agent pull, warm or cold. What it names
+        // in turn (platform manifest, config) is bound by its digest and may
+        // come from the store.
+        let resolved = match image.origin {
+            ImageOrigin::Agent => client.resolve_with(
+                &reference,
+                &mut FromRepository {
+                    kept: Kept { store: self },
+                    named: *reference.digest(),
+                },
+            )?,
+            ImageOrigin::Operator => client.resolve_with(&reference, &mut Kept { store: self })?,
+        };
         // The signature check, under a `Required` rule only: after the
         // documents are resolved and before any layer is pinned or its blob
         // requested (ADR-029). The subjects are the digest the reference
         // names and, for an index, the selected platform manifest.
-        if let Requirement::Required(trust) = self
-            .config
-            .signatures
-            .requirement(registry.name(), reference.repository())
-        {
+        if let Decision::Required(trust) = decision {
             let mut subjects = vec![*reference.digest()];
             if resolved.index.is_some() {
                 subjects.push(resolved.manifest_digest);
@@ -675,7 +724,7 @@ impl OciImageStore {
             )?;
         }
         let rootfs = RootfsRef::new(format!("sha256:{}", resolved.manifest_digest.hex()));
-        Ok((rootfs, resolved.config, documents))
+        Ok((rootfs, resolved.config, documents, exemption))
     }
 
     /// Makes sure the layer `pin` pins is committed and charges it to
@@ -759,6 +808,28 @@ fn hash_file(file: &mut File, size: u64) -> io::Result<Option<Digest>> {
         }
     }
     Ok((total == size).then(|| Digest::from_bytes(hash.finish())))
+}
+
+/// [`Kept`] that never serves `named`, the document the reference names,
+/// so the registry must serve it from the reference's own repository; a
+/// registry answers a digest only in a repository that holds it (ADR-032,
+/// S6). The fetched copy is kept as usual.
+struct FromRepository<'s> {
+    kept: Kept<'s>,
+    named: Digest,
+}
+
+impl Documents for FromRepository<'_> {
+    fn get(&mut self, digest: &Digest) -> Result<Option<Fetched>, PullError> {
+        if *digest == self.named {
+            return Ok(None);
+        }
+        self.kept.get(digest)
+    }
+
+    fn put(&mut self, digest: &Digest, fetched: &Fetched) -> Result<(), PullError> {
+        self.kept.put(digest, fetched)
+    }
 }
 
 /// The documents a pull reads, kept under `blobs/sha256/` (D8).
@@ -889,7 +960,14 @@ impl ImageStore for OciImageStore {
     /// The pins the pull took are released when it returns; a caller that
     /// starts a sandbox from the image takes [`OciImageStore::pull_leased`]
     /// or [`OciImageStore::lease`] instead (ADR-025, D2).
-    fn pull(&self, image: &ImageRef) -> Result<RootfsRef, ImageError> {
-        self.pull_leased(image).map(|lease| lease.rootfs().clone())
+    ///
+    /// A reference an agent chose is checked under the `Required` rule
+    /// that covers it, passes under an agent exemption, which the result
+    /// names, or is `Failed` before any request (ADR-032).
+    fn pull(&self, image: &ImageRef) -> Result<Pulled, ImageError> {
+        self.pull_leased(image).map(|lease| Pulled {
+            rootfs: lease.rootfs().clone(),
+            exemption: lease.exemption().cloned(),
+        })
     }
 }

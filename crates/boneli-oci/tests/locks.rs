@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
-use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
+use boneli_app::{ImageError, ImageOrigin, ImageRef, ImageStore, RootfsRef};
 use boneli_oci::{LayerCache, OciImageStore};
 
 use support::TempDir;
@@ -26,6 +26,7 @@ fn image_ref(name: &str, digest: &str) -> ImageRef {
         name: name.to_owned(),
         digest: digest.to_owned(),
         platform: "linux/amd64".to_owned(),
+        origin: ImageOrigin::Operator,
     }
 }
 
@@ -512,7 +513,8 @@ fn leasing_child_with(
     let root = tmp.path().join("store");
     let rootfs = open(&root, &fake)
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args(["--exact", test, "--test-threads=1", "--nocapture"])
         .env(LEASE_CHILD, &root)
@@ -663,6 +665,14 @@ fn pin_descriptors_hold_their_own_pins() {
         locks.iter().all(|p| is_held(p)),
         "the copies pin on their own"
     );
+    // A holder releases its pin by `LOCK_UN` before the close, as ADR-030
+    // D1 asks: a parallel test's `Command` forks this process, and its
+    // child holds a copy of every open descriptor until its exec, so a
+    // close alone would leave the lock held for that window (the flake
+    // noted on #98: 2 of 60 runs).
+    for copy in &copies {
+        copy.unlock().expect("a holder's LOCK_UN");
+    }
     drop(copies);
     assert!(locks.iter().all(|p| !is_held(p)));
 }
@@ -679,7 +689,8 @@ fn lease_of_missing_layer_fails() {
     let store = open(&root, &fake);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let middle = root.join("layers/sha256").join(hex(&layers[1].diff_id));
     support::make_writable(&middle);
     std::fs::remove_dir_all(&middle).expect("remove the layer");
@@ -746,7 +757,8 @@ fn lease_beyond_fd_limit_fails_cleanly() {
     let root = tmp.path().join("store");
     let rootfs = open(&root, &fake)
         .pull(&image_ref("library/many", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -786,7 +798,8 @@ fn lease_does_not_wait_for_a_pull() {
     let store = open(&tmp.path().join("store"), &fake);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     std::thread::scope(|s| {
         let pull = s.spawn(|| store.pull(&image_ref("library/other", &other.index)));
         rx.recv_timeout(Duration::from_secs(10))

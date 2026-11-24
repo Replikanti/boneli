@@ -34,7 +34,7 @@ mod host {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use boneli_app::{ImageRef, ImageStore};
+    use boneli_app::{ImageOrigin, ImageRef, ImageStore};
     use boneli_https::Sha256;
     use boneli_oci::{
         Budget, Compression, Error, LayerCache, Limits, OciImageStore, StoreConfig, unpack,
@@ -95,8 +95,10 @@ mod host {
                 name: "library/synthetic".to_owned(),
                 digest: pushed.index.clone(),
                 platform: "linux/amd64".to_owned(),
+                origin: ImageOrigin::Operator,
             })
-            .expect("pull");
+            .expect("pull")
+            .rootfs;
 
         let base = tmp.path().join("base");
         let staging = tmp.path().join("staging");
@@ -175,6 +177,7 @@ mod host {
                 name: "library/mounted".to_owned(),
                 digest: pushed.index.clone(),
                 platform: "linux/amd64".to_owned(),
+                origin: ImageOrigin::Operator,
             })
             .expect("pull");
         let layer_dirs = lease.layers().to_vec();
@@ -503,6 +506,7 @@ mod host {
                 name: "library/app".to_owned(),
                 digest: pushed.index.clone(),
                 platform: "linux/amd64".to_owned(),
+                origin: ImageOrigin::Operator,
             })
             .expect("pull");
         drop(open(&root, &fake));
@@ -615,12 +619,13 @@ mod network {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use boneli_app::{ImageError, ImageRef, ImageStore};
+    use boneli_app::{ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore};
     use boneli_http::{IdleCheck, Transport};
     use boneli_https::{ConnectOptions, PublicKey, Roots, TlsConfig};
     use boneli_oci::{
-        CONNECT_TIMEOUT, Dial, HANDSHAKE_TIMEOUT, IO_TIMEOUT, OciImageStore, PolicyRule, Registry,
-        RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Stream, TlsDial,
+        AgentExemption, CONNECT_TIMEOUT, Dial, HANDSHAKE_TIMEOUT, IO_TIMEOUT, OciImageStore,
+        PolicyRule, Registry, RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig,
+        Stream, TlsDial,
     };
     use boneli_sigstore::{
         COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, Identity, Material,
@@ -782,7 +787,9 @@ mod network {
     /// `postgres --version` (as 999, the image's postgres user, ADR-007
     /// D1) in the sandbox, on the image's layers alone. Logs pull time,
     /// throughput, the longest gap between reads and the layer media types
-    /// (ADR-009, D5 and D12).
+    /// (ADR-009, D5 and D12). Both references are the agent's, pulled
+    /// under the documented first-stack exemption `docker.io` + `library/`
+    /// (ADR-032, S4), and each pull reports it.
     #[test]
     #[ignore = "network: pulls node:22 and postgres:17 from Docker Hub; host: user namespaces"]
     fn node_and_postgres_run_in_sandbox() {
@@ -793,7 +800,10 @@ mod network {
             inner: Arc::new(TlsDial::new(tls, options)),
             stats: Arc::default(),
         };
-        let config = StoreConfig::new(Box::new(measured.clone())).expect("config");
+        let mut config = StoreConfig::new(Box::new(measured.clone())).expect("config");
+        config.signatures = SignaturePolicy::off()
+            .with_agent_exemptions(vec![AgentExemption::docker_official_images()])
+            .expect("policy");
         let tmp = TempDir::new("network");
         let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
         let cases = [
@@ -825,14 +835,27 @@ mod network {
         {
             *measured.stats.lock().expect("stats") = Stats::default();
             let started = Instant::now();
-            let rootfs = store
+            let pulled = store
                 .pull(&ImageRef {
                     name: name.to_owned(),
                     digest: digest.to_owned(),
                     platform: platform().to_owned(),
+                    origin: ImageOrigin::Agent,
                 })
                 .unwrap_or_else(|e| panic!("pull {name}: {e}"));
             let took = started.elapsed();
+            println!(
+                "oci-acceptance {name}: chosen by the agent, admitted by {:?}",
+                pulled.exemption
+            );
+            assert_eq!(
+                pulled.exemption,
+                Some(ImageExemption {
+                    registry: "docker.io".to_owned(),
+                    scope: "library/".to_owned(),
+                })
+            );
+            let rootfs = pulled.rootfs;
             let manifest = std::fs::read_to_string(
                 store
                     .root()
@@ -983,8 +1006,10 @@ mod network {
                 name: name.to_owned(),
                 digest: digest.to_owned(),
                 platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
             })
-            .unwrap_or_else(|e| panic!("pull {name}: {e}"));
+            .unwrap_or_else(|e| panic!("pull {name}: {e}"))
+            .rootfs;
         let lease = store.lease(&rootfs).expect("lease");
         assert!(!lease.layers().is_empty());
         for layer in lease.layers() {
@@ -1010,7 +1035,9 @@ mod network {
     /// committed, and again from the kept evidence with no signature
     /// request; under one for `library/`, the unsigned `library/node`
     /// index of the weekly acceptance is refused with no layer request
-    /// (the only CDN connection is the config's).
+    /// (the only CDN connection is the config's). Chosen by the agent, with
+    /// no rule and no exemption, it is refused with no connection at all
+    /// (ADR-032).
     #[test]
     #[ignore = "network: pulls chainguard/node and resolves node:22 on Docker Hub"]
     fn signatures_on_docker_hub() {
@@ -1043,6 +1070,7 @@ mod network {
                 name: "chainguard/node".to_owned(),
                 digest: CHAINGUARD_NODE.to_owned(),
                 platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
             })
             .expect("warm pull");
         assert!(
@@ -1055,6 +1083,7 @@ mod network {
             name: "library/node".to_owned(),
             digest: NODE.to_owned(),
             platform: platform().to_owned(),
+            origin: ImageOrigin::Operator,
         });
         let hosts = dial.hosts.lock().expect("hosts").clone();
         println!("oci-acceptance signatures library/node: {refused:?}, hosts {hosts:?}");
@@ -1068,6 +1097,26 @@ mod network {
         let cdn = hosts.iter().filter(|h| h.ends_with(".docker.com")).count();
         assert_eq!(cdn, 1, "only the config comes from the CDN: {hosts:?}");
         assert_eq!(layer_entries(&root), committed, "node:22 committed a layer");
+
+        let dial = recording();
+        let config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+        let tmp = TempDir::new("network-agent");
+        let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+        let refused = store.pull(&ImageRef {
+            name: "library/node".to_owned(),
+            digest: NODE.to_owned(),
+            platform: platform().to_owned(),
+            origin: ImageOrigin::Agent,
+        });
+        let hosts = dial.hosts.lock().expect("hosts").clone();
+        println!("oci-acceptance agent library/node, no exemption: {refused:?}, hosts {hosts:?}");
+        match refused {
+            Err(ImageError::Failed { detail }) => {
+                assert!(detail.contains("was chosen by the agent"), "{detail}")
+            }
+            other => panic!("the agent's node:22 must be refused: {other:?}"),
+        }
+        assert!(hosts.is_empty(), "the refusal made a connection: {hosts:?}");
     }
 
     /// Real signatures on the other registries ADR-029 measured: cosign's
@@ -1170,6 +1219,7 @@ mod network {
                     name: name.to_owned(),
                     digest: digest.to_owned(),
                     platform: platform().to_owned(),
+                    origin: ImageOrigin::Operator,
                 });
                 println!("oci-acceptance signatures {name} under another identity: {refused:?}");
                 match refused {
@@ -1267,6 +1317,7 @@ mod network {
                 name: "ghcr.io/jqlang/jq".to_owned(),
                 digest: JQ.to_owned(),
                 platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
             });
             println!(
                 "oci-acceptance provenance ghcr.io/jqlang/jq under another repository: {refused:?}"

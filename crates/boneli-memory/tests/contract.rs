@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
-    BranchName, Command, DatabaseCopy, ExecResult, ExitStatus, ImageRef, Limits, Phase,
-    RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId, SandboxSpec, SnapshotSource,
-    TreePath, TriageReport, Written,
+    BranchName, Command, DatabaseCopy, ExecResult, ExitStatus, ImageExemption, ImageOrigin,
+    ImageRef, Limits, Phase, RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId,
+    SandboxSpec, SnapshotSource, TreePath, TriageReport, Written,
 };
 use boneli_domain::{CitationStatus, CommitSha, FixChecks, TriageVerdict};
 use boneli_memory::{
@@ -779,23 +779,42 @@ fn image(name: &str, digest: &str, platform: &str) -> ImageRef {
         name: String::from(name),
         digest: String::from(digest),
         platform: String::from(platform),
+        origin: ImageOrigin::Operator,
     }
 }
 
-/// A store with one image, and refs that differ from it in one field.
+fn agent(image: ImageRef) -> ImageRef {
+    ImageRef {
+        origin: ImageOrigin::Agent,
+        ..image
+    }
+}
+
+/// A store with one image, refs that differ from it in one field, and
+/// two images for the agent, one of them exempted by name.
 pub fn images() -> contract::image::Images<MemoryImageStore> {
     let present = image("library/postgres", "sha256:aa", "linux/amd64");
+    let agent_refused = agent(image("acme/app", "sha256:dd", "linux/amd64"));
+    let agent_exempted = agent(image("library/mailhog", "sha256:ee", "linux/amd64"));
+    let exemption = ImageExemption {
+        registry: String::from("docker.io"),
+        scope: String::from("library/"),
+    };
     contract::image::Images {
-        adapter: MemoryImageStore::new(vec![present.clone()]).with_tampered(vec![image(
-            "library/redis",
-            "sha256:cc",
-            "linux/amd64",
-        )]),
+        adapter: MemoryImageStore::new(vec![
+            present.clone(),
+            agent_refused.clone(),
+            agent_exempted.clone(),
+        ])
+        .with_tampered(vec![image("library/redis", "sha256:cc", "linux/amd64")])
+        .with_agent_exemptions(vec![(agent_exempted.name.clone(), exemption)]),
         present,
         missing: image("library/node", "sha256:aa", "linux/amd64"),
         other_digest: image("library/postgres", "sha256:bb", "linux/amd64"),
         other_platform: image("library/postgres", "sha256:aa", "linux/arm64"),
         tampered: image("library/redis", "sha256:cc", "linux/amd64"),
+        agent_refused,
+        agent_exempted,
     }
 }
 
@@ -903,6 +922,84 @@ fn vacuous_fixtures_are_violations() {
         }
     };
     assert_eq!(clause(contract::image::run(other_name)), "platform-pinned");
+    // The agent clauses check their fixture too: an agent image that says
+    // `Operator`, and one the operator cannot pull either, are fixture
+    // violations, not passes (ADR-032).
+    let fixture = |result: Result<(), contract::Violation>, name: &str| {
+        let violation = result.expect_err("a vacuous fixture must not pass");
+        assert_eq!(violation.clause, name);
+        assert!(violation.detail.starts_with("fixture:"), "{violation:?}");
+    };
+    let operator_refused = || {
+        let i = images();
+        contract::image::Images {
+            agent_refused: ImageRef {
+                origin: ImageOrigin::Operator,
+                ..i.agent_refused.clone()
+            },
+            ..i
+        }
+    };
+    fixture(
+        contract::image::run(operator_refused),
+        "agent-origin-refused",
+    );
+    let unknown_refused = || {
+        let i = images();
+        contract::image::Images {
+            agent_refused: agent(image("acme/none", "sha256:dd", "linux/amd64")),
+            ..i
+        }
+    };
+    fixture(
+        contract::image::run(unknown_refused),
+        "agent-origin-refused",
+    );
+    let operator_exempted = || {
+        let i = images();
+        contract::image::Images {
+            agent_exempted: ImageRef {
+                origin: ImageOrigin::Operator,
+                ..i.agent_exempted.clone()
+            },
+            ..i
+        }
+    };
+    fixture(
+        contract::image::run(operator_exempted),
+        "exemption-reported",
+    );
+}
+
+/// The origin never changes the root filesystem: an agent's exempted pull
+/// and the operator's pull of the same image get the same handle, and
+/// only the agent's reports the exemption (ADR-032).
+#[test]
+fn memory_image_origin_keeps_the_rootfs() {
+    use boneli_app::ImageStore;
+    let i = images();
+    let by_agent = i.adapter.pull(&i.agent_exempted).expect("agent pull");
+    let by_operator = i
+        .adapter
+        .pull(&ImageRef {
+            origin: ImageOrigin::Operator,
+            ..i.agent_exempted.clone()
+        })
+        .expect("operator pull");
+    assert_eq!(by_agent.rootfs, by_operator.rootfs);
+    assert!(by_agent.exemption.is_some());
+    assert_eq!(by_operator.exemption, None);
+    // Refused first: an agent's image outside the set is Failed, not
+    // NotFound.
+    match i
+        .adapter
+        .pull(&agent(image("acme/none", "sha256:dd", "linux/amd64")))
+    {
+        Err(boneli_app::ImageError::Failed { detail }) => {
+            assert!(detail.contains("not exempted"), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The four infra ports stay object-safe: roots hold them as `&dyn`

@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
+use boneli_app::{ImageError, ImageOrigin, ImageRef, ImageStore, RootfsRef};
 use boneli_oci::{Error, Limits, OciImageStore};
 
 use support::TempDir;
@@ -22,6 +22,7 @@ fn image_ref(name: &str, digest: &str) -> ImageRef {
         name: name.to_owned(),
         digest: digest.to_owned(),
         platform: "linux/amd64".to_owned(),
+        origin: ImageOrigin::Operator,
     }
 }
 
@@ -372,7 +373,8 @@ fn unremovable_leftover_skipped() {
     );
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     assert_eq!(store.lease(&rootfs).expect("lease").layers().len(), 3);
     drop(store);
     drop(open(&root, &fake));
@@ -388,7 +390,7 @@ fn pull_idempotent_across_reopen() {
     let root = tmp.path().join("store");
     let image = image_ref("library/app", &pushed.index);
     let first = open(&root, &fake).pull(&image).expect("first pull");
-    assert_eq!(first.as_str(), pushed.manifest);
+    assert_eq!(first.rootfs.as_str(), pushed.manifest);
     let requests = fake.seen().len();
     let again = open(&root, &fake).pull(&image).expect("second pull");
     assert_eq!(again, first);
@@ -454,8 +456,11 @@ fn concurrent_pulls_two_stores() {
         });
         let ra = ra.expect("store a");
         assert_eq!(Ok(ra.clone()), rb);
-        let layers = a.lease(&ra).expect("lease").layers().to_vec();
-        assert_eq!(b.lease(&ra).expect("lease").layers().to_vec(), layers);
+        let layers = a.lease(&ra.rootfs).expect("lease").layers().to_vec();
+        assert_eq!(
+            b.lease(&ra.rootfs).expect("lease").layers().to_vec(),
+            layers
+        );
         for (layer, want) in layers.iter().zip(["etc/base", "usr/bin/tool", "etc/top"]) {
             assert!(
                 layer.join(want).is_file(),
@@ -655,7 +660,8 @@ fn rootfs_ref_round_trip() {
     let store = open(&root, &fake);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let layers = store.lease(&rootfs).expect("lease").layers().to_vec();
     let config = store.config(&rootfs).expect("config");
     assert_eq!(layers.len(), 3);
@@ -805,7 +811,8 @@ fn layers_live_under_the_root() {
     let store = open(&tmp.path().join("store"), &fake);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let base: PathBuf = store.root().join("layers/sha256");
     for layer in store.lease(&rootfs).expect("lease").layers().to_vec() {
         assert_eq!(layer.parent(), Some(base.as_path()));
