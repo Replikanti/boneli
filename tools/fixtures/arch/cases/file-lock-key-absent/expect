@@ -1,0 +1,2 @@
+# without check.file-lock no file is exempt, not even the shared lock type
+file-lock

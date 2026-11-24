@@ -51,6 +51,8 @@ pub(crate) struct Dependency {
     pub(crate) target: Option<String>,
     pub(crate) path: Option<PathBuf>,
     pub(crate) source: Option<String>,
+    /// The name the dependent uses for it, when the manifest renames it.
+    pub(crate) rename: Option<String>,
 }
 
 /// A node of the resolved graph.
@@ -159,6 +161,7 @@ pub(crate) fn parse(stdout: &[u8]) -> Result<Metadata, ToolError> {
                 target: optional(d, "target", "packages.dependencies.target")?,
                 path: optional(d, "path", "packages.dependencies.path")?.map(PathBuf::from),
                 source: optional(d, "source", "packages.dependencies.source")?,
+                rename: optional(d, "rename", "packages.dependencies.rename")?,
             });
         }
         let features = field(p, "features", "packages.features")?

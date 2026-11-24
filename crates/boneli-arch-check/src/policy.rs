@@ -29,6 +29,10 @@ pub(crate) struct Policy {
     pub(crate) edges: BTreeSet<(String, String)>,
     /// External crates whose build script an accepted ADR approves.
     pub(crate) build_scripts: BTreeMap<String, String>,
+    /// The one file exempt from rule file-lock (`check.file-lock`,
+    /// ADR-030 D5); `None` when the key is absent or malformed, and then no
+    /// file is exempt.
+    pub(crate) file_lock: Option<String>,
 }
 
 /// A TOML value as TOML syntax, for messages: a string as itself, other
@@ -110,6 +114,34 @@ fn lint_name(s: &str) -> Option<(String, String)> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     ok.then(|| (tool.to_owned(), name.to_owned()))
+}
+
+/// Why `check.file-lock` is not a path `crates/<crate>/src/<path>.rs`
+/// into a support crate: printable ASCII, relative, `/`-separated, no
+/// empty, `.` or `..` component and no backslash, so that it can only
+/// name one file, and that file is a support crate's source (ADR-030, D5).
+pub(crate) fn file_lock_problem(path: &str, support: &[String]) -> Option<&'static str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        Some("is not printable ASCII")
+    } else if path.contains('\\') {
+        Some("contains a backslash")
+    } else if path.starts_with('/') {
+        Some("is absolute")
+    } else if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        Some("has an empty, `.` or `..` component")
+    } else if !path.ends_with(".rs") {
+        Some("is not a .rs file")
+    } else if parts.len() < 4 || parts[0] != "crates" || parts[2] != "src" {
+        Some("is not crates/<crate>/src/<path>.rs")
+    } else if !support.iter().any(|s| s == parts[1]) {
+        Some("names a crate outside roles.support")
+    } else {
+        None
+    }
 }
 
 /// The ADR files `docs/adr/<number>-*.md` (symlinks to files count),
@@ -338,7 +370,10 @@ impl Checker<'_> {
             }
             Some(check) => {
                 for key in check.keys() {
-                    if !matches!(key, "platforms" | "no-std-target" | "\x75nsafe-lints") {
+                    if !matches!(
+                        key,
+                        "platforms" | "no-std-target" | "\x75nsafe-lints" | "file-lock"
+                    ) {
                         self.bad(format!("unknown key check.{}", show(key)));
                     }
                 }
@@ -393,6 +428,16 @@ impl Checker<'_> {
                             pol.unsafe_lints = Some(list);
                         }
                     }
+                }
+                // Optional: absent, nothing is exempt from rule file-lock, so
+                // deleting the line fails closed (ADR-030, D5).
+                match check.get("file-lock") {
+                    None => {}
+                    Some(Value::String(path)) => match file_lock_problem(path, &pol.support) {
+                        None => pol.file_lock = Some(path.clone()),
+                        Some(why) => self.bad(format!("check.file-lock {} {why}", show(path))),
+                    },
+                    Some(_) => self.bad("check.file-lock must be a string".to_owned()),
                 }
             }
         }
@@ -617,8 +662,8 @@ impl Checker<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Policy, adr_accepted, adr_files, check_policy, names_build_script, strip_html_comments,
-        toml_text,
+        Policy, adr_accepted, adr_files, check_policy, file_lock_problem, names_build_script,
+        strip_html_comments, toml_text,
     };
     use crate::py_vectors;
     use crate::rules::Report;
@@ -822,5 +867,58 @@ mod tests {
                 "check.\x75nsafe-lints names a lint twice",
             ]
         );
+    }
+
+    /// `check.file-lock` names one source file of a support crate; any
+    /// other form is policy-format and exempts nothing (ADR-030, D5).
+    #[test]
+    fn file_lock_key_forms() {
+        let support = ["boneli-private-dir".to_owned()];
+        assert_eq!(
+            file_lock_problem("crates/boneli-private-dir/src/lock.rs", &support),
+            None
+        );
+        assert_eq!(
+            file_lock_problem("crates/boneli-private-dir/src/a/lock.rs", &support),
+            None
+        );
+        for bad in [
+            "crates/boneli-private-dir/src/../src/lock.rs",
+            "crates/boneli-private-dir/src/./lock.rs",
+            "crates/boneli-private-dir/src//lock.rs",
+            "crates/boneli-private-dir\\src\\lock.rs",
+            "/crates/boneli-private-dir/src/lock.rs",
+            "crates/boneli-private-dir/src/lock",
+            "crates/boneli-private-dir/lock.rs",
+            "crates/boneli-private-dir/tests/lock.rs",
+            "lib/boneli-private-dir/src/lock.rs",
+            "crates/boneli-oci/src/lock.rs",
+            "crates/boneli-private-dir/src/l ock.rs",
+            "crates/boneli-private-dir/src/l\u{f6}ck.rs",
+            "",
+        ] {
+            assert!(file_lock_problem(bad, &support).is_some(), "{bad:?}");
+        }
+        let key = |value: &str| format!("file-lock = {value}\n");
+        let (pol, items) = checked(&key("\"crates/boneli-domain/src/lock.rs\""), &[]);
+        assert_eq!(pol.expect("usable").file_lock, None);
+        assert_eq!(
+            items,
+            [(
+                "policy-format".to_owned(),
+                "tools/architecture.toml".to_owned(),
+                "check.file-lock crates/boneli-domain/src/lock.rs names a crate outside roles.support"
+                    .to_owned()
+            )]
+        );
+        for value in ["[\"crates/a/src/lock.rs\"]", "1", "{ a = \"b\" }"] {
+            let (pol, items) = checked(&key(value), &[]);
+            assert_eq!(pol.expect("usable").file_lock, None, "{value}");
+            let messages: Vec<&str> = items.iter().map(|i| i.2.as_str()).collect();
+            assert_eq!(messages, ["check.file-lock must be a string"], "{value}");
+        }
+        let (pol, items) = checked("", &[]);
+        assert!(items.is_empty(), "{items:?}");
+        assert_eq!(pol.expect("usable").file_lock, None);
     }
 }

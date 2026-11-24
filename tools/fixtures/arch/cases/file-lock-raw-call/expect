@@ -1,0 +1,2 @@
+# a raw call of File::lock and File::unlock in an adapter, outside boneli_private_dir::lock
+file-lock

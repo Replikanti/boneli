@@ -1,6 +1,6 @@
 # ADR-030: One file-lock type for the workspace
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -166,36 +166,125 @@ lock that does not unlock.
 
 ### D5. The `file-lock` rule
 
-A rule `file-lock` in `crates/boneli-arch-check` fails any file-lock
-call outside the file named by `[check] file-lock` in
-`tools/architecture.toml` (`crates/boneli-private-dir/src/lock.rs`);
-with the key absent nothing is exempt. It lands in PR 2 of #109.
+A rule `file-lock` in `crates/boneli-arch-check` (the 33rd, listed last
+by `--list-rules`) fails any file-lock call outside the one file named
+by `[check] file-lock` in `tools/architecture.toml`,
+`crates/boneli-private-dir/src/lock.rs`. The key is optional, and
+without it no file is exempt, so deleting the line fails closed. It is
+`policy-format` unless it is a string of printable ASCII of the form
+`crates/<crate>/src/<path>.rs`, relative, without an empty, `.` or `..`
+component or a backslash, with `<crate>` in `roles.support`: it can
+name exactly one file, and only a support crate's source.
 
-- Raw names are flagged wherever they stand: `flock`, `lockf`,
-  `SYS_flock`, `LOCK_SH`, `LOCK_EX`, `LOCK_NB`, `LOCK_UN` and the `fcntl`
-  record and open-file-description lock commands.
-- The lock names `lock`, `try_lock`, `lock_shared`, `try_lock_shared` and
-  `unlock` are flagged in method position and in path position, and
-  anywhere inside a macro group, because a macro can rearrange its input.
-- `lock` and `try_lock` pass only in forms the compiler proves are not
-  `File`'s: `io::stdout|stderr|stdin().lock()`, a Mutex lock followed by
-  `.unwrap_or_else(PoisonError::into_inner)` or by `.as_deref()`, and a
-  `Mutex::` prefix. Shadowing the names these proofs trust (`Mutex`,
-  `PoisonError`, `io`, a `fn as_deref`) is flagged too.
-- `#[cfg(test)] mod` bodies and integration tests under `tests/` are not
-  scanned.
+The rule reads the token stream of the lenient lexer (comments dropped,
+literals one token each, so a name inside a string, a character or a
+comment is no hit) and reports. The lexer drops a first-line shebang as
+rustc does: `#!` at the start of the file (after a byte order mark)
+whose next token, past whitespace and comments that are no doc comments,
+is not `[`, up to the end of its line. Read as code, a shebang
+`#!/usr/bin/env cargo /*` would open a block comment that rustc never
+sees and hide the file from every token rule.
+
+- **Raw names, wherever they stand**: `flock`, `lockf`, `SYS_flock`,
+  `LOCK_SH`, `LOCK_EX`, `LOCK_NB`, `LOCK_UN` and the `fcntl` record and
+  open file description lock commands `F_SETLK`, `F_SETLKW`, `F_GETLK`,
+  `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`, and what an `fcntl` lock
+  is described by, `flock64` and the lock types `F_RDLCK`, `F_WRLCK`,
+  `F_UNLCK`. None of them occurs in the workspace outside the exempt
+  file.
+- **The lock names** `lock`, `try_lock`, `lock_shared`,
+  `try_lock_shared` and `unlock`, std's `File` methods:
+  - inside a macro group (`name!(..)`, `name![..]`, `name!{..}` and the
+    body of `macro_rules! name { .. }`), wherever they stand, because a
+    macro can rearrange its input: `m!(File :: lock :: f)` or a
+    transcriber `$r.$m()` invoked as `g!(f, lock)` builds a call that no
+    token pattern sees. Identifiers cannot be built from pieces on
+    stable Rust without proc macros, which ADR-001 bans, so the name is
+    always there as a token. A keyword written without `r#` names no
+    macro, so `if !(..)` opens no group;
+  - outside one, in method position (`.name(` or `.name::`) and in path
+    position (`::name` outside a `use` item and a `pub(in path)`
+    visibility, whose `crate::lock` names a module, and not followed by
+    `::` and
+    a further segment, so `File::lock::<>(&f)` is a call and
+    `crate::lock::Held` is not). A `use` item is `use` up to its `;` with
+    only path tokens between, so `impl Sized + use<> { .. }` is no
+    `use` item and stays scanned.
+- **Proven forms pass**, for `lock` and `try_lock` only, because the
+  checker has no types and these are the forms whose types the compiler
+  pins:
+  - P1 `io::stdout().lock()` (and `stderr`, `stdin`), with `io` the first
+    path segment or right after a first-segment `std::`: `Stdout::lock`
+    is inherent, and inherent methods win over trait methods;
+  - P2 `.lock()` or `.try_lock()` followed by
+    `.unwrap_or_else(PoisonError::into_inner)`, also with `sync::` or
+    `std::sync::` in front: `File::lock` returns `io::Result<()>` and
+    `File::try_lock` `Result<(), fs::TryLockError>`, and neither error is
+    a `PoisonError`, so the call does not compile on a `File`;
+  - P3 `.lock()` or `.try_lock()` followed by `.as_deref()`:
+    `Result::as_deref` needs `T: Deref`, and `()` is not;
+  - P4 a `Mutex::` prefix, `Mutex::lock(&m)` and `Mutex::try_lock(&m)`.
+
+  A closure `|p| p.into_inner()` is no proof: a user trait can give
+  `fs::TryLockError` an `into_inner` that returns `()`, and `fn
+  into_inner` exists in `boneli-oci` and `boneli-json`.
+- **Redefinitions of the names the proofs trust**, wherever they stand,
+  inside macros too: `Mutex`, `PoisonError` or `io` after `struct`,
+  `enum`, `union`, `type`, `trait` or `mod`, after `as` where `;`, `,` or
+  `}` follows, the end of a `use` tree or an `extern crate` item (so `use
+  std::fs::File as Mutex`, `use a::{File as Mutex, b}`, `mod io`, `extern
+  crate core as io`; `<W as io::Write>::flush(w)` and `fd as io::RawFd`
+  name a trait and a type and pass), declared as a generic
+  parameter (`fn f<io>()`, `impl<Mutex: T>`), and `Mutex` or
+  `PoisonError` followed by a single `:` (a bound, as in `where
+  PoisonError: T`); and `fn as_deref`. In a manifest, a dependency
+  renamed to one of the three names and a lib target named after one:
+  either makes `io::stdout()` a function of a workspace crate in its
+  dependents. `fn io(..)`, a field or parameter named `io` and a value of
+  any of the names are in the value namespace and pass.
+- **Not scanned**: `#[cfg(test)]` followed by further outer attributes,
+  an optional visibility and `mod name { .. }` outside a macro group, and
+  the files under a member's `tests/` when every target whose source lies
+  there has kind `test`. `#[cfg(test)] fn`, `#[cfg(test)] mod t;` (its
+  file is scanned), `#[cfg(any(test))]`, `#[cfg(not(test))]`,
+  `#![cfg(test)]` and a `[lib]` under `tests/` are scanned. Benches and
+  examples are scanned.
 
 `lock()` and `try_lock()` also name Mutex methods, and a name match alone
-cannot tell them apart; the checker has no types. The forms above are
-the ones a name scan can prove. Clippy's `disallowed_methods` sees types
-but needs a `clippy.toml`, which ADR-001 bans.
+cannot tell them apart. Clippy's `disallowed_methods` sees types but
+needs a `clippy.toml`, which ADR-001 bans because a clippy config can
+relax lints. So every Mutex lock outside test code takes one of the four
+forms, and the FAIL message names them. On the head of #109's PR 2 the
+rule found 53 lines in four crates, all Mutex locks, rewritten to the
+proven forms with the same behaviour: 40 `X.lock().expect("not
+poisoned")` in `boneli-replay-check` became `Mutex::lock(&X)`, the
+keeper's `Shared::lock` in `boneli-sys` became `Shared::guard` (6
+flagged callers, 7 with one in a test module), the five `|p|
+p.into_inner()` closures of `boneli-sys` became `PoisonError::into_inner`,
+and one `Mutex::lock` each went into `boneli-git-cli` and `boneli-https`:
+54 edits, the renamed definition included. It found no raw name, no lock name
+inside a macro group and no redefinition.
 
-Blind spots: test code (production builds never compile it, unless built
-with `--cfg test`); a lock taken by another program (`flock(1)`); a raw
-syscall by number, which needs `unsafe` and so lives only in
-`boneli-sys`, on the review list; an external crate's own locks, whose
-edge needs an ADR anyway; and a macro that assembles a shadowing item
-from reordered tokens.
+Blind spots:
+
+- **Test code**: `tests/` and `#[cfg(test)]` modules. Production builds
+  never compile them, unless someone builds with `--cfg test` through
+  `RUSTFLAGS`.
+- **A lock taken by another program** (`Command::new("flock")`).
+- **A libc lock call by number or under another link name**: a raw
+  syscall (`syscall(73, ..)`), `fcntl(fd, 6, ..)` with the command as a
+  number (6 is `F_SETLK` on x86_64 and aarch64), or an `extern` function
+  declared `#[link_name = "flock"]`, whose name is a string. Each needs
+  `unsafe` and `libc`, so it can live only in `boneli-sys`, which is on
+  the review list.
+- **An external crate's own locks and items**: its locks, and a module
+  `io` or a type `Mutex` it exports. A new external edge needs an ADR.
+- **A macro that assembles a redefinition** (`type Mutex = File`, `mod
+  io`, `fn as_deref`) from reordered tokens: the redefinition check
+  matches neighbouring tokens, and a tt muncher can emit `type` and
+  `Mutex` from different places of its input. No `macro_rules!` is
+  defined in the workspace today; the name appears only in strings and
+  comments.
 
 ### D6. Tests
 
@@ -265,6 +354,57 @@ moved table kills it.
 | `Owner::current` never reads the namespace | store-fs: `unlock_on_drop_releases_while_a_child_holds_a_copy`, `failed_open_leaves_the_root_openable`, `reopen_survives_concurrent_spawns`; oci: the six child-copy and spawn tests above, `foreign_drop_keeps_the_lock`; shared: `owner_reads_the_pid_namespace`, `foreign_copy_keeps_the_lock`, `drop_on_another_thread_unlocks`, `hand_off_dropped_early_releases_with_a_child_copy` |
 
 
+The rule (D5) has unit tests in `crates/boneli-arch-check/src/scan.rs`
+(`file_lock_calls_flagged`, `file_lock_raw_names_flagged`,
+`file_lock_proofs_pass`, `file_lock_unproven_forms_flagged`,
+`file_lock_non_calls_pass`, `file_lock_macro_tokens_strict`,
+`file_lock_shadowing_flagged`,
+`file_lock_test_modules_skipped_only_when_real`,
+`file_lock_unicode_whitespace_and_raw_identifiers`,
+`file_lock_shebang_line_is_skipped_as_rustc_does`) and in `policy.rs`
+(`file_lock_key_forms`), and 14 fixture cases: `file-lock-raw-call`,
+`file-lock-outside-module`, `file-lock-lib-in-tests-dir`,
+`file-lock-cfg-test-in-macro`, `file-lock-key-absent`,
+`file-lock-dependency-renamed-io`, `file-lock-lib-named-io` and
+`file-lock-shebang` fail with
+`file-lock`; `ok-file-lock-mutex` (with the form of
+`crates/boneli-forge-github/src/tokens.rs`,
+`&match self.cache.try_lock().as_deref() {`), `ok-file-lock-module`,
+`ok-file-lock-tests-dir` and `ok-file-lock-cfg-test-mod` pass;
+`policy-file-lock-not-support` and `policy-file-lock-malformed` fail with
+`policy-format`. Its mutation check ran by hand on a copy of the PR head,
+the unit mutants with `cargo test -p boneli-arch-check --lib` and the
+others with `tools/check-architecture.sh --fixtures`. Every mutant is
+killed:
+
+| Mutant (rule `file-lock`) | Killed by |
+| --- | --- |
+| rule not run (`file_lock_hits` never called) | fixtures `file-lock-raw-call`, `-outside-module`, `-lib-in-tests-dir`, `-cfg-test-in-macro`, `-key-absent` |
+| raw names not reported | `file_lock_raw_names_flagged` |
+| every `.lock()`/`.try_lock()` counts as proven | `file_lock_calls_flagged`, `_unproven_forms_flagged`, `_macro_tokens_strict`, `_test_modules_skipped_only_when_real`, `_unicode_whitespace_and_raw_identifiers` |
+| P2 accepts any `.unwrap_or_else(..)` | `file_lock_unproven_forms_flagged` |
+| P1 accepts any path before `io` | `file_lock_unproven_forms_flagged` |
+| P1 accepts any first segment, not only `io` (`x::stdout().lock()`) | `file_lock_unproven_forms_flagged` |
+| P2 accepts any `X::into_inner`, not only `PoisonError` (`Tr::into_inner`) | `file_lock_unproven_forms_flagged` |
+| no strict mode in macro groups | `file_lock_macro_tokens_strict` |
+| test-module skip applied inside macros | `file_lock_macro_tokens_strict` |
+| any `#[cfg(<word>)] mod` skipped | `file_lock_test_modules_skipped_only_when_real` |
+| `r#` ignored (`r#if!` no macro, `cfg(r#test)` skipped) | `file_lock_macro_tokens_strict`, `_test_modules_skipped_only_when_real` |
+| `::name::<` read as a path continuation | `file_lock_calls_flagged` |
+| a `use` item runs to any `;` | `file_lock_calls_flagged` |
+| redefinitions not reported | `file_lock_shadowing_flagged` |
+| generic parameters not read as redefinitions | `file_lock_shadowing_flagged` |
+| `tests/` exempt without the target check | fixture `file-lock-lib-in-tests-dir` |
+| the whole `src/` of the key's crate exempt | fixture `file-lock-outside-module` |
+| an absent key exempts the shared module | fixture `file-lock-key-absent` |
+| key form unchecked | `file_lock_key_forms`; fixtures `policy-file-lock-not-support`, `-malformed` |
+| dependency renames not checked | fixture `file-lock-dependency-renamed-io` |
+| lib target names not checked | fixture `file-lock-lib-named-io` |
+| a shebang line read as code | `file_lock_shebang_line_is_skipped_as_rustc_does`; fixture `file-lock-shebang` |
+| every `as NAME` read as a rename | `file_lock_shadowing_flagged` |
+| `as NAME` never read as a rename | `file_lock_shadowing_flagged` |
+| `::lock` in a `pub(in ..)` visibility read as a call | `file_lock_non_calls_pass` |
+
 ## Consequences
 
 - A fix to the owner check or the release is made once and reaches both
@@ -275,11 +415,11 @@ moved table kills it.
   (`getpid`, `stat`, `flock`), the same pauses and deadlines, the same
   errors to callers. `HandOff::try_take` reserves room for one more file
   before each lock.
-- Once D5 lands, every Mutex lock outside test code has to take one of
-  the proven forms; the rule's message names them.
+- Every Mutex lock outside test code takes one of the proven forms of
+  D5, workspace-wide; the rule's message names them. A Mutex lock in
+  another form fails the check even where no file is near.
 - ADR-025 D3 keeps its protocol, `LOCK_ATTEMPTS` and `LOCK_WAIT`; its
-  release sentence, ADR-026 and ADR-028 are superseded by this ADR once
-  it is accepted.
+  release sentence, ADR-026 and ADR-028 are superseded by this ADR.
 
 ## Alternatives considered
 
@@ -304,11 +444,11 @@ moved table kills it.
 
 The checker stays in Rust (ADR-015), so there is no language choice.
 
-## Accept when
+## Acceptance
 
-PR 2 of #109 is green on main: the `file-lock` rule (D5) with its
-fixtures in `tools/check-architecture.sh --fixtures`, no file-lock call
-left in `boneli-store-fs` or `boneli-oci` outside this module, and the
-Mutex call sites rewritten to the proven forms. That PR flips this ADR to
-accepted, sets ADR-026 and ADR-028 to superseded by ADR-030 and adds the
-pointer sentence to ADR-025 D3.
+Accepted with PR 2 of #109: the `file-lock` rule (D5) with its fixtures
+in `tools/check-architecture.sh --fixtures`, no file-lock call left in
+`boneli-store-fs` or `boneli-oci` outside this module, and the 53 Mutex
+lines rewritten to the proven forms. The same PR sets ADR-026 and
+ADR-028 to superseded by ADR-030 and adds the pointer sentence to
+ADR-025 D3.

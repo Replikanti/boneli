@@ -41,10 +41,11 @@ pub(crate) enum Rule {
     DepBuildScript,
     PolicyFormat,
     PolicyStrict,
+    FileLock,
 }
 
 /// Every rule, in the order of `--list-rules`.
-pub(crate) const RULES: [Rule; 32] = [
+pub(crate) const RULES: [Rule; 33] = [
     Rule::ToolError,
     Rule::MemberName,
     Rule::CoreMissing,
@@ -77,10 +78,11 @@ pub(crate) const RULES: [Rule; 32] = [
     Rule::DepBuildScript,
     Rule::PolicyFormat,
     Rule::PolicyStrict,
+    Rule::FileLock,
 ];
 
 /// The ids, indexed by `Rule as usize`.
-const IDS: [&str; 32] = [
+const IDS: [&str; 33] = [
     "tool-error",
     "member-name",
     "core-missing",
@@ -113,6 +115,7 @@ const IDS: [&str; 32] = [
     "dep-build-script",
     "policy-format",
     "policy-strict",
+    "file-lock",
 ];
 
 impl Rule {
@@ -259,19 +262,20 @@ fn single(out: &mut dyn Write, line: &str) -> io::Result<()> {
 mod tests {
     use super::{Outcome, RULES, Report, Rule, ToolError, emit, fail_line};
 
-    /// The ids and their order as the reference checker listed them.
+    /// The ids and their order as the reference checker listed them, then
+    /// the rules added since: `file-lock` (ADR-030).
     const PYTHON_ORDER: &str = "tool-error member-name core-missing graph-domain graph-app \
         graph-support graph-adapter graph-root-leaf lints-inherit lints-\x75nsafe sys-lints \
         cargo-config clippy-config toolchain-file doctest-\x75nsafe \x75nsafe-token \
         sys-macro-export proc-macro build-script source-redirect symlink core-no-std-attr \
         core-no-std-build core-targets core-features core-token manifest-redirect dep-source \
-        dep-edge dep-build-script policy-format policy-strict";
+        dep-edge dep-build-script policy-format policy-strict file-lock";
 
     #[test]
     fn rules_in_python_order() {
         let ids: Vec<&str> = RULES.iter().map(|r| r.id()).collect();
         assert_eq!(ids, PYTHON_ORDER.split(' ').collect::<Vec<_>>());
-        assert_eq!(RULES.len(), 32);
+        assert_eq!(RULES.len(), 33);
         for r in RULES {
             assert_eq!(Rule::from_id(r.id()), Some(r));
         }

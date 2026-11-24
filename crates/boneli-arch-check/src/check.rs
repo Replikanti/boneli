@@ -22,9 +22,10 @@ use crate::metadata::{self, Package};
 use crate::policy::{check_policy, text_or_nothing, toml_text};
 use crate::rules::{Report, Rule, ToolError};
 use crate::scan::{
-    CORE_TOKENS, EXTERN_CRATE, Kind, MACRO_EXPORT, UNSAFE, blank_comment_lines, extern_alloc_at,
-    first_format_spec, fmt_imports, format_specs, include_path_problem, leading_attributes,
-    source_redirects, task_paths, tokenize, unescape, with_lines,
+    CORE_TOKENS, EXTERN_CRATE, Kind, MACRO_EXPORT, TRUSTED_NAMES, UNSAFE, blank_comment_lines,
+    extern_alloc_at, file_lock_hits, first_format_spec, fmt_imports, format_specs,
+    include_path_problem, leading_attributes, source_redirects, task_paths, tokenize, unescape,
+    with_lines, without_test_modules,
 };
 use crate::text::{show, show_bytes, strip};
 
@@ -399,6 +400,15 @@ pub(crate) fn check(root: &Path) -> Result<Report, ToolError> {
     }
     let ws_lints = dig(&manifest, &["workspace", "lints"]);
 
+    // Every target of every member, resolved, for the tests/ exemption of
+    // rule file-lock: a member's tests/ directory is test code only when
+    // no target that is not a test reads a file under it.
+    let targets: Vec<(PathBuf, &[String])> = members
+        .iter()
+        .flat_map(|p| p.targets.iter())
+        .map(|t| (resolve(&t.src_path), t.kind.as_slice()))
+        .collect();
+
     // Per-member rules.
     let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
     for pkg in &members {
@@ -434,6 +444,45 @@ pub(crate) fn check(root: &Path) -> Result<Report, ToolError> {
                 );
             }
         }
+
+        // The names the proven lock forms trust, given to a crate: a
+        // dependency renamed to `io` makes `io::stdout()` that crate's
+        // function (ADR-030, D5).
+        for dep in &pkg.dependencies {
+            if let Some(alias) = dep.rename.as_deref()
+                && TRUSTED_NAMES.contains(&alias)
+            {
+                rep.fail(
+                    Rule::FileLock,
+                    mpath(pkg),
+                    format!(
+                        "{name}: dependency {} renamed to `{alias}`, a name the proven Mutex and stdio lock forms trust (ADR-030, D5)",
+                        show(&dep.name)
+                    ),
+                    None,
+                );
+            }
+        }
+        for t in &pkg.targets {
+            if t.kind.iter().any(|k| LIB_KINDS.contains(&k.as_str()))
+                && TRUSTED_NAMES.contains(&t.name.as_str())
+            {
+                rep.fail(
+                    Rule::FileLock,
+                    mpath(pkg),
+                    format!(
+                        "{name}: lib target named `{}`, a name the proven Mutex and stdio lock forms trust (ADR-030, D5)",
+                        t.name
+                    ),
+                    None,
+                );
+            }
+        }
+        let tests_dir = resolve(pkg_dir).join("tests");
+        let tests_only = targets
+            .iter()
+            .filter(|(src, _)| src.starts_with(&tests_dir))
+            .all(|(_, kind)| *kind == ["test"]);
 
         let (mut files, others, links) = walk_package(pkg_dir, root)?;
         for link in &links {
@@ -586,6 +635,18 @@ pub(crate) fn check(root: &Path) -> Result<Report, ToolError> {
             }
             for (line, message) in source_redirects(&toks) {
                 rep.fail(Rule::SourceRedirect, fpath.clone(), message, Some(line));
+            }
+            // File locks only through the one module (ADR-030, D5); test
+            // modules and integration tests are not scanned.
+            let exempt = pol
+                .file_lock
+                .as_deref()
+                .is_some_and(|p| fpath.as_bytes() == p.as_bytes())
+                || (tests_only && resolve(f).starts_with(&tests_dir));
+            if !exempt {
+                for (line, message) in file_lock_hits(&without_test_modules(&toks)) {
+                    rep.fail(Rule::FileLock, fpath.clone(), message, Some(line));
+                }
             }
             if !is_core {
                 continue;

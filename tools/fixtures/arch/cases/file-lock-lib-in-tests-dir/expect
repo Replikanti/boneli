@@ -1,0 +1,2 @@
+# a lib target under tests/ is production code, so tests/ is scanned
+file-lock

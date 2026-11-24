@@ -1,0 +1,1 @@
+# file-lock calls in an integration test under tests/ pass: no production build compiles it

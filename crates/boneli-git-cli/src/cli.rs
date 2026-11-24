@@ -576,9 +576,7 @@ impl GitCli {
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, GitError> {
-        self.state
-            .lock()
-            .map_err(|_| failed("the adapter's checkout table is poisoned"))
+        Mutex::lock(&self.state).map_err(|_| failed("the adapter's checkout table is poisoned"))
     }
 
     fn checkout(&self, id: &CheckoutId) -> Result<Checkout, GitError> {

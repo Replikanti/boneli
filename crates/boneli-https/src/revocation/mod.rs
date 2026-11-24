@@ -973,7 +973,7 @@ impl Clear for OcspCache {
 /// A cache's lock. A poisoned one is recovered and the cache cleared:
 /// the cache only saves fetches.
 fn lock<T: Clear>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
-    match cache.lock() {
+    match Mutex::lock(cache) {
         Ok(guard) => guard,
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();

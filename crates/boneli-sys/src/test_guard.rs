@@ -66,7 +66,8 @@ static HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Takes the host test lock; a test that failed while holding it does not
 /// fail the others.
 pub fn host_lock() -> std::sync::MutexGuard<'static, ()> {
-    HOST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    HOST.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The pids of this process's children, from every thread's list.

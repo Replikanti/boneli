@@ -1,0 +1,2 @@
+# a lib target named io would make io::stdout() a function of that crate in its dependents
+file-lock

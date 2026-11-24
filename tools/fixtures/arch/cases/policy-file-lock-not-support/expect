@@ -1,0 +1,2 @@
+# check.file-lock names a file of an adapter, not of a support crate
+policy-format

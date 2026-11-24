@@ -1,0 +1,14 @@
+# A minimal policy for the file-lock fixtures: the base workspace has no
+# external dependencies, so roles and check suffice.
+[roles]
+core = ["boneli-domain", "boneli-app"]
+support = ["boneli-private-dir"]
+roots = []
+unsafe = ["boneli-sys"]
+build-script = []
+
+[check]
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+no-std-target = "x86_64-unknown-none"
+unsafe-lints = ["rust.unsafe_op_in_unsafe_fn", "clippy.undocumented_unsafe_blocks", "clippy.multiple_unsafe_ops_per_block", "clippy.unwrap_used"]
+file-lock = "crates/boneli-oci/src/lock.rs"

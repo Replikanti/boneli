@@ -1,0 +1,2 @@
+# a shebang line, which rustc drops, opens a block comment that would hide a lock call from the lexer
+file-lock

@@ -46,14 +46,15 @@ const UNUSABLE: &str = "FAIL [policy-format] tools/architecture.toml: missing [r
     FAIL [policy-format] tools/architecture.toml: missing [check]\n2 violation(s)\n";
 
 #[test]
-fn list_rules_prints_32_ids() {
+fn list_rules_prints_33_ids() {
     let out = run(&[OsStr::new("--list-rules")], Path::new("/"));
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8(out.stdout).expect("ASCII");
     let ids: Vec<&str> = text.lines().collect();
-    assert_eq!(ids.len(), 32);
+    assert_eq!(ids.len(), 33);
     assert_eq!(ids[0], "tool-error");
     assert_eq!(ids[31], "policy-strict");
+    assert_eq!(ids[32], "file-lock");
 }
 
 #[test]

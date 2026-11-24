@@ -1,0 +1,2 @@
+# a cfg(test) module inside a macro group: the macro decides what it becomes, so it is scanned
+file-lock
