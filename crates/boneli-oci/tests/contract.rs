@@ -1,15 +1,16 @@
 //! The `ImageStore` contract (ADR-004) on the real adapter over the fake
 //! registry: `pull-idempotent`, `missing-image`, `digest-pinned`,
-//! `platform-pinned` and `tampered-refused` (#7, ADR-009).
+//! `platform-pinned` and `tampered-refused` (#7, ADR-009), and
+//! `agent-origin-refused` and `exemption-reported` (ADR-032).
 
 mod support;
 
 use boneli_app::contract::image::{Images, run};
-use boneli_app::{ImageError, ImageRef, ImageStore, RootfsRef};
-use boneli_oci::OciImageStore;
+use boneli_app::{ImageError, ImageOrigin, ImageRef, ImageStore, Pulled};
+use boneli_oci::{AgentExemption, ExemptScope, OciImageStore, SignaturePolicy};
 
 use support::TempDir;
-use support::images::{Layer, open, push};
+use support::images::{Layer, config, push};
 use support::registry::{Fake, Hub, digest_of};
 
 /// A store on its own root; the root goes with it.
@@ -19,7 +20,7 @@ struct Store {
 }
 
 impl ImageStore for Store {
-    fn pull(&self, image: &ImageRef) -> Result<RootfsRef, ImageError> {
+    fn pull(&self, image: &ImageRef) -> Result<Pulled, ImageError> {
         self.store.pull(image)
     }
 }
@@ -29,12 +30,22 @@ fn image_ref(name: &str, digest: &str, platform: &str) -> ImageRef {
         name: name.to_owned(),
         digest: digest.to_owned(),
         platform: platform.to_owned(),
+        origin: ImageOrigin::Operator,
     }
 }
 
-/// The hub: `library/app` for `linux/amd64` under an index, and
-/// `library/tampered`, whose layer blob is served with one byte flipped.
-/// An unknown repository gets `401` even with a token, as on Docker Hub.
+fn agent(image: ImageRef) -> ImageRef {
+    ImageRef {
+        origin: ImageOrigin::Agent,
+        ..image
+    }
+}
+
+/// The hub: `library/app` for `linux/amd64` under an index,
+/// `library/tampered`, whose layer blob is served with one byte flipped,
+/// and `library/exempt`, which the store's one agent exemption names
+/// exactly; the unsigned `library/app` is the agent's refused image. An
+/// unknown repository gets `401` even with a token, as on Docker Hub.
 fn images() -> Images<Store> {
     let mut hub = Hub::default();
     let app = push(
@@ -49,6 +60,12 @@ fn images() -> Images<Store> {
         &[Layer::file("etc/evil", b"evil\n")],
         "",
     );
+    let exempt = push(
+        &mut hub,
+        "library/exempt",
+        &[Layer::file("etc/exempt", b"exempt\n")],
+        "",
+    );
     let blob = tampered.blobs[0].clone();
     if let Some(bytes) = hub.blobs.get_mut(&blob)
         && let Some(b) = bytes.last_mut()
@@ -57,7 +74,14 @@ fn images() -> Images<Store> {
     }
     let fake = Fake::new(move |s| hub.handle(s));
     let root = TempDir::new("contract");
-    let store = open(&root.path().join("store"), &fake);
+    let mut config = config(&fake);
+    config.signatures = SignaturePolicy::off()
+        .with_agent_exemptions(vec![AgentExemption {
+            registry: "docker.io".to_owned(),
+            scope: ExemptScope::parse("library/exempt").expect("scope"),
+        }])
+        .expect("policy");
+    let store = OciImageStore::open(&root.path().join("store"), config).expect("open");
     Images {
         adapter: Store { store, _root: root },
         present: image_ref("library/app", &app.index, "linux/amd64"),
@@ -65,6 +89,8 @@ fn images() -> Images<Store> {
         other_digest: image_ref("library/app", &digest_of(b"no such index"), "linux/amd64"),
         other_platform: image_ref("library/app", &app.index, "linux/arm64"),
         tampered: image_ref("library/tampered", &tampered.index, "linux/amd64"),
+        agent_refused: agent(image_ref("library/app", &app.index, "linux/amd64")),
+        agent_exempted: agent(image_ref("library/exempt", &exempt.index, "linux/amd64")),
     }
 }
 

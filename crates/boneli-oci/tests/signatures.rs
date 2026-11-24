@@ -13,11 +13,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boneli_app::{ImageError, ImageRef, ImageStore};
+use boneli_app::{ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, Pulled};
 use boneli_https::{PublicKey, RsaSha256Key};
 use boneli_oci::{
-    Error, MAX_SIGNATURES, OciImageStore, PolicyRule, Registry, RepoScope, Repository, Requirement,
-    SignaturePolicy, StoreConfig, Timeouts,
+    AgentExemption, Decision, Error, ExemptScope, MAX_SIGNATURES, OciImageStore, PolicyRule,
+    Registry, RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Timeouts,
 };
 use boneli_sigstore::{
     BUNDLE_V03_MEDIA_TYPE, COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, IN_TOTO_PAYLOAD_TYPE,
@@ -342,6 +342,7 @@ fn image_ref(name: &str, digest: &str) -> ImageRef {
         name: name.to_owned(),
         digest: digest.to_owned(),
         platform: "linux/amd64".to_owned(),
+        origin: ImageOrigin::Operator,
     }
 }
 
@@ -385,7 +386,7 @@ fn pull_once(
     let store = open_with(&tmp.path().join("store"), fake, policy);
     let result = store
         .pull(&image_ref(REPO, digest))
-        .map(|r| r.as_str().to_owned());
+        .map(|r| r.rootfs.as_str().to_owned());
     (tmp, result)
 }
 
@@ -687,6 +688,11 @@ fn keyed_real_bundle_through_fallback_tag() {
 /// a cold pull by index and a warm one, then a cold pull by manifest
 /// through the CDN, each into a fresh store, under `config`.
 fn logged_pulls(config: impl Fn(&Fake) -> StoreConfig) -> String {
+    logged_pulls_as(ImageOrigin::Operator, config)
+}
+
+/// [`logged_pulls`] with references chosen by `origin` (ADR-032).
+fn logged_pulls_as(origin: ImageOrigin, config: impl Fn(&Fake) -> StoreConfig) -> String {
     let mut log = String::new();
     for (cdn, by_manifest) in [(false, false), (true, true)] {
         let (mut hub, pushed) = app_hub();
@@ -699,7 +705,10 @@ fn logged_pulls(config: impl Fn(&Fake) -> StoreConfig) -> String {
         } else {
             &pushed.index
         };
-        let image = image_ref(REPO, digest);
+        let image = ImageRef {
+            origin,
+            ..image_ref(REPO, digest)
+        };
         store.pull(&image).expect("cold pull");
         store.pull(&image).expect("warm pull");
         log.push_str(&format!("# cdn={cdn} by_manifest={by_manifest}\n"));
@@ -1639,7 +1648,7 @@ fn discovery_errors_fail_closed() {
             let (fake, tmp, store) = broken_store(alone, broken.clone(), breaker);
             let result = store
                 .pull(&image_ref(REPO, &pushed.index))
-                .map(|r| r.as_str().to_owned());
+                .map(|r| r.rootfs.as_str().to_owned());
             let detail = refused_before_layers(&fake, &pushed, &tmp, result);
             assert!(!detail.is_empty(), "{name}");
             // With the other carrier intact: it passes.
@@ -1648,6 +1657,7 @@ fn discovery_errors_fail_closed() {
             assert_eq!(
                 pulled
                     .unwrap_or_else(|e| panic!("{name} on {broken}: {e:?}"))
+                    .rootfs
                     .as_str(),
                 pushed.manifest
             );
@@ -1752,6 +1762,7 @@ fn warm_pull_offline() {
                 store
                     .pull(&image_ref(REPO, &pushed.index))
                     .expect("warm")
+                    .rootfs
                     .as_str(),
                 pushed.manifest
             );
@@ -2552,6 +2563,7 @@ fn warm_pull_rechecks_claims() {
         store
             .pull(&image_ref(REPO, &pushed.index))
             .expect("warm under A")
+            .rootfs
             .as_str(),
         pushed.manifest
     );
@@ -2560,5 +2572,857 @@ fn warm_pull_rechecks_claims() {
         before,
         "{:?}",
         targets(&fake.seen()[before..])
+    );
+}
+
+// ---------------------------------------------------------------------
+// Origin (ADR-032)
+// ---------------------------------------------------------------------
+
+/// The detail of an agent reference refused before any request.
+fn agent_refusal(registry: &str, repository: &str) -> String {
+    format!(
+        "signature policy: {registry}/{repository} was chosen by the agent, and no Required \
+         rule or agent exemption covers it"
+    )
+}
+
+fn agent_ref(name: &str, digest: &str) -> ImageRef {
+    ImageRef {
+        origin: ImageOrigin::Agent,
+        ..image_ref(name, digest)
+    }
+}
+
+fn exemption(registry: &str, scope: &str) -> AgentExemption {
+    AgentExemption {
+        registry: registry.to_owned(),
+        scope: ExemptScope::parse(scope).expect("scope"),
+    }
+}
+
+fn exempting(policy: SignaturePolicy, exemptions: Vec<AgentExemption>) -> SignaturePolicy {
+    policy
+        .with_agent_exemptions(exemptions)
+        .expect("exemptions")
+}
+
+/// `Off` with the documented first-stack exemption, `docker.io` +
+/// `library/`.
+fn official() -> SignaturePolicy {
+    exempting(
+        SignaturePolicy::off(),
+        vec![AgentExemption::docker_official_images()],
+    )
+}
+
+fn recorded(registry: &str, scope: &str) -> Option<ImageExemption> {
+    Some(ImageExemption {
+        registry: registry.to_owned(),
+        scope: scope.to_owned(),
+    })
+}
+
+/// The store has nothing under `blobs/` and `layers/`.
+fn store_empty(tmp: &TempDir) {
+    let blobs: Vec<_> = std::fs::read_dir(tmp.path().join("store/blobs/sha256"))
+        .expect("blobs")
+        .collect();
+    assert!(blobs.is_empty(), "{blobs:?}");
+    assert!(layer_entries(tmp).is_empty(), "{:?}", layer_entries(tmp));
+}
+
+/// `image` is `Failed` with exactly `detail` and the fake saw no request
+/// and no dial.
+fn refused_unseen(fake: &Fake, got: Result<Pulled, ImageError>, detail: &str) {
+    assert_eq!(
+        got,
+        Err(ImageError::Failed {
+            detail: detail.to_owned()
+        })
+    );
+    assert!(fake.seen().is_empty(), "{:?}", targets(&fake.seen()));
+    assert!(fake.dials().is_empty(), "{:?}", fake.dials());
+}
+
+/// Requests for signature evidence that carried a token.
+fn signature_requests(fake: &Fake) -> Vec<String> {
+    targets(&fake.seen())
+        .into_iter()
+        .filter(|t| t.contains(".sig") || t.contains("/referrers/") || t.contains("sha256-"))
+        .collect()
+}
+
+/// The hub of `app_hub` answering the referrers API with `[]` for both
+/// subjects, as Docker Hub does (ADR-029).
+fn docker_hub_like() -> (Hub, Pushed) {
+    let (mut hub, pushed) = app_hub();
+    for subject in [&pushed.index, &pushed.manifest] {
+        list(&mut hub, subject, &[]);
+    }
+    (hub, pushed)
+}
+
+/// Under the default policy, with no exemption or an empty list, the
+/// agent's unsigned `library/app` is refused with the exact detail before
+/// any request, so no layer either, and the store keeps nothing.
+#[test]
+fn agent_unsigned_refused_without_any_request() {
+    for policy in [
+        SignaturePolicy::off(),
+        exempting(SignaturePolicy::off(), Vec::new()),
+    ] {
+        let (hub, pushed) = app_hub();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-refused");
+        let store = open_with(&tmp.path().join("store"), &fake, policy);
+        let got = store.pull(&agent_ref(REPO, &pushed.index));
+        refused_unseen(&fake, got, &agent_refusal("docker.io", REPO));
+        store_empty(&tmp);
+    }
+}
+
+/// An agent's reference under a `Required` rule is checked with that
+/// rule's trust exactly as the operator's: signed, it passes, requests
+/// its layers and reports no exemption; unsigned, it is refused after the
+/// 4 signature requests of Docker Hub (`.sig` 404 and referrers `[]` for
+/// the index and its platform manifest) and no layer request, and the
+/// operator's pull sends the same requests.
+#[test]
+fn agent_ref_under_required_rule_checked() {
+    let (mut hub, pushed) = app_hub();
+    sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-required");
+    let store = open_with(&tmp.path().join("store"), &fake, trusted());
+    let got = store
+        .pull(&agent_ref(REPO, &pushed.index))
+        .expect("a signed agent image");
+    assert_eq!(got.rootfs.as_str(), pushed.manifest);
+    assert_eq!(got.exemption, None);
+    assert!(layer_requested(&fake, &pushed));
+
+    let mut logs = Vec::new();
+    for origin in [ImageOrigin::Agent, ImageOrigin::Operator] {
+        let (hub, pushed) = docker_hub_like();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-required-unsigned");
+        let store = open_with(&tmp.path().join("store"), &fake, trusted());
+        let result = store
+            .pull(&ImageRef {
+                origin,
+                ..image_ref(REPO, &pushed.index)
+            })
+            .map(|p| p.rootfs.as_str().to_owned());
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        assert!(detail.contains(".sig: none"), "{detail}");
+        assert_eq!(signature_requests(&fake).len(), 4, "{origin:?}");
+        logs.push(request_log(&fake.seen()));
+    }
+    assert_eq!(
+        logs[0], logs[1],
+        "the agent's check differs from the operator's"
+    );
+}
+
+/// An exempted agent pull passes and reports `docker.io` + `library/`,
+/// through the port and through the lease; the operator's pull of the
+/// same image right after reports none, and neither does a lease of the
+/// handle: the exemption belongs to the pull.
+#[test]
+fn exempted_agent_pull_reports_exemption() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-exempted");
+    let store = open_with(&tmp.path().join("store"), &fake, official());
+    let agent = agent_ref(REPO, &pushed.index);
+    let got = store.pull(&agent).expect("an exempted agent image");
+    assert_eq!(got.rootfs.as_str(), pushed.manifest);
+    assert_eq!(got.exemption, recorded("docker.io", "library/"));
+    let lease = store.pull_leased(&agent).expect("leased");
+    assert_eq!(
+        lease.exemption().cloned(),
+        recorded("docker.io", "library/")
+    );
+    drop(lease);
+    let by_operator = store
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("operator");
+    assert_eq!(by_operator.rootfs, got.rootfs);
+    assert_eq!(by_operator.exemption, None);
+    assert_eq!(
+        store.lease(&got.rootfs).expect("lease").exemption(),
+        None,
+        "a lease is not a pull"
+    );
+}
+
+/// Operator pulls with exemptions configured send exactly the requests of
+/// #7, byte for byte. An exempted agent pull sends them too on a cold
+/// store; a warm one fetches again only the document the reference names,
+/// from the named repository (ADR-032, S6): the first three requests of
+/// the cold pull (the manifest's `401`, the token, the manifest), and no
+/// other.
+#[test]
+fn exempted_agent_requests_unchanged() {
+    let with_exemptions = |fake: &Fake| {
+        config_with(
+            fake,
+            exempting(
+                SignaturePolicy::off(),
+                vec![
+                    AgentExemption::docker_official_images(),
+                    exemption("docker.io", REPO),
+                ],
+            ),
+        )
+    };
+    assert_eq!(logged_pulls(with_exemptions), POLICY_OFF_REQUESTS);
+    let mut expected = String::new();
+    for section in POLICY_OFF_REQUESTS.split_inclusive('\n').fold(
+        Vec::<Vec<&str>>::new(),
+        |mut sections, line| {
+            if line.starts_with("# ") {
+                sections.push(vec![line]);
+            } else if let Some(last) = sections.last_mut() {
+                last.push(line);
+            }
+            sections
+        },
+    ) {
+        assert!(section[1].contains("/manifests/"), "{section:?}");
+        assert!(
+            section[2].starts_with("auth.docker.io:443 /token"),
+            "{section:?}"
+        );
+        assert!(section[3].contains("/manifests/"), "{section:?}");
+        expected.extend(section.iter().copied());
+        expected.extend(section[1..4].iter().copied());
+    }
+    assert_eq!(
+        logged_pulls_as(ImageOrigin::Agent, with_exemptions),
+        expected
+    );
+}
+
+/// An exemption never lifts a `Required` rule: under a registry-wide
+/// rule, and under a `Required` default, the agent's unsigned image is
+/// refused by the signature check of ADR-029, before any layer request.
+#[test]
+fn exemption_never_lifts_required_rule() {
+    let trust = keyed(&[SIGNER_PUB]);
+    let registry_wide = exempting(
+        trusted(),
+        vec![
+            AgentExemption::docker_official_images(),
+            exemption("docker.io", REPO),
+        ],
+    );
+    let by_default = exempting(
+        SignaturePolicy::new(Requirement::Required(trust), Vec::new()).expect("policy"),
+        vec![AgentExemption::docker_official_images()],
+    );
+    for policy in [registry_wide, by_default] {
+        let (hub, pushed) = docker_hub_like();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("exemption-required");
+        let store = open_with(&tmp.path().join("store"), &fake, policy);
+        let result = store
+            .pull(&agent_ref(REPO, &pushed.index))
+            .map(|p| p.rootfs.as_str().to_owned());
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        assert!(detail.contains(".sig: none"), "{detail}");
+    }
+}
+
+/// An operator `Off` rule opens a repository to the operator's
+/// references only. Under a registry-wide `Required` rule the operator's
+/// pull passes unchecked, while the agent's is still checked under that
+/// rule and refused by the signature check; with the `Off` rule alone, the
+/// agent's is refused before any request.
+#[test]
+fn operator_off_rule_is_not_an_agent_exemption() {
+    let policy = || {
+        rules(vec![
+            rule(
+                RepoScope::Registry,
+                Requirement::Required(keyed(&[SIGNER_PUB])),
+            ),
+            rule(RepoScope::Exact(repo(REPO)), Requirement::Off),
+        ])
+    };
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(&fake, policy(), &pushed.index);
+    passed(result, &pushed);
+    assert!(signature_requests(&fake).is_empty());
+
+    let (hub, pushed) = docker_hub_like();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("off-not-exemption");
+    let store = open_with(&tmp.path().join("store"), &fake, policy());
+    let result = store
+        .pull(&agent_ref(REPO, &pushed.index))
+        .map(|p| p.rootfs.as_str().to_owned());
+    let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+    assert!(detail.contains(".sig: none"), "{detail}");
+    assert_eq!(signature_requests(&fake).len(), 4);
+
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("off-alone");
+    let off_alone = rules(vec![rule(RepoScope::Exact(repo(REPO)), Requirement::Off)]);
+    let store = open_with(&tmp.path().join("store"), &fake, off_alone);
+    let got = store.pull(&agent_ref(REPO, &pushed.index));
+    refused_unseen(&fake, got, &agent_refusal("docker.io", REPO));
+}
+
+/// Review of PR #116: an operator `Off` rule never shadows a `Required`
+/// rule for the agent, so it cannot turn on a broader exemption. With a
+/// `Required` prefix `library/`, an exact `Off` rule for `library/app` and
+/// the preset, the agent's unsigned `library/app` is checked under the
+/// prefix's trust and refused after the 4 signature requests, not pulled
+/// unchecked under `library/`; the operator's pull passes unchecked. Under
+/// a `Required` default with an `Off` rule and no exemption, the agent's
+/// reference is checked under the default.
+#[test]
+fn operator_off_rule_never_shadows_required_for_agent() {
+    let trust = keyed(&[SIGNER_PUB]);
+    let prefix_and_off = || {
+        exempting(
+            rules(vec![
+                rule(
+                    RepoScope::Prefix("library/".to_owned()),
+                    Requirement::Required(Arc::clone(&trust)),
+                ),
+                rule(RepoScope::Exact(repo(REPO)), Requirement::Off),
+            ]),
+            vec![AgentExemption::docker_official_images()],
+        )
+    };
+    let policy = prefix_and_off();
+    for r in [REPO, "library/other"] {
+        assert!(
+            matches!(
+                policy.decide("docker.io", &repo(r), ImageOrigin::Agent),
+                Decision::Required(_)
+            ),
+            "{r}"
+        );
+    }
+    assert!(matches!(
+        policy.decide("docker.io", &repo(REPO), ImageOrigin::Operator),
+        Decision::Unchecked
+    ));
+    let default_and_off = SignaturePolicy::new(
+        Requirement::Required(Arc::clone(&trust)),
+        vec![rule(RepoScope::Exact(repo(REPO)), Requirement::Off)],
+    )
+    .expect("policy");
+    assert!(matches!(
+        default_and_off.decide("docker.io", &repo(REPO), ImageOrigin::Agent),
+        Decision::Required(_)
+    ));
+
+    for policy in [prefix_and_off(), default_and_off] {
+        let (hub, pushed) = docker_hub_like();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("off-shadow");
+        let store = open_with(&tmp.path().join("store"), &fake, policy);
+        let result = store
+            .pull(&agent_ref(REPO, &pushed.index))
+            .map(|p| p.rootfs.as_str().to_owned());
+        let detail = refused_before_layers(&fake, &pushed, &tmp, result);
+        assert!(detail.contains(".sig: none"), "{detail}");
+        assert_eq!(signature_requests(&fake).len(), 4);
+    }
+    let (hub, pushed) = docker_hub_like();
+    let fake = hub_fake(hub);
+    let (_tmp, result) = pull_once(&fake, prefix_and_off(), &pushed.index);
+    passed(result, &pushed);
+    assert!(signature_requests(&fake).is_empty());
+}
+
+/// Review of PR #116: documents are kept by digest, so an agent's
+/// reference must not be served a digest its named repository does not
+/// hold. After the operator pulls `evil/miner@D`, the agent's
+/// `library/node@D` is `NotFound`, as on a cold store, under the preset
+/// and under a `Required` rule alike, and reports no exemption; the only
+/// new requests are for the named document in `library/node`. An agent
+/// pull of an image the named repository holds is served the kept layers
+/// after that one document.
+#[test]
+fn agent_ref_never_served_another_repositorys_digest() {
+    let required_library = || {
+        rules(vec![rule(
+            RepoScope::Prefix("library/".to_owned()),
+            Requirement::Required(keyed(&[SIGNER_PUB])),
+        )])
+    };
+    for policy in [official(), required_library()] {
+        let mut hub = Hub::default();
+        let evil = push(
+            &mut hub,
+            "evil/miner",
+            &[Layer::file("etc/evil", b"evil\n")],
+            "",
+        );
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-cross-repo");
+        let store = open_with(&tmp.path().join("store"), &fake, policy);
+        store
+            .pull(&image_ref("evil/miner", &evil.index))
+            .expect("operator");
+        let before = fake.seen().len();
+        let got = store.pull(&agent_ref("library/node", &evil.index));
+        assert_eq!(got, Err(ImageError::NotFound));
+        let new: Vec<String> = fake.seen()[before..]
+            .iter()
+            .map(|s| s.target.clone())
+            .collect();
+        assert!(!new.is_empty(), "the warm agent pull asked nothing");
+        for target in &new {
+            assert!(
+                target.starts_with("/v2/library/node/manifests/") || target.starts_with("/token?"),
+                "{target}"
+            );
+        }
+    }
+
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-warm-own");
+    let store = open_with(&tmp.path().join("store"), &fake, official());
+    store
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("operator");
+    let before = fake.seen().len();
+    let got = store
+        .pull(&agent_ref(REPO, &pushed.index))
+        .expect("the named repository holds it");
+    assert_eq!(got.rootfs.as_str(), pushed.manifest);
+    assert_eq!(got.exemption, recorded("docker.io", "library/"));
+    let authorized = targets(&fake.seen()[before..]);
+    assert_eq!(
+        authorized,
+        [format!("/v2/{REPO}/manifests/{}", pushed.index)],
+        "one manifest request for the named document"
+    );
+}
+
+fn exempted_scope(decision: Decision<'_>) -> Option<String> {
+    match decision {
+        Decision::Exempted(e) => Some(format!("{} {}", e.registry, e.scope.as_str())),
+        _ => None,
+    }
+}
+
+/// The most specific exemption is the one recorded: an exact one over a
+/// prefix, a longer prefix over a shorter one, in either order; a pull
+/// records the exact one.
+#[test]
+fn most_specific_exemption_recorded() {
+    let forward = vec![
+        exemption("docker.io", "library/"),
+        exemption("docker.io", REPO),
+        exemption("docker.io", "a/"),
+        exemption("docker.io", "a/b/"),
+    ];
+    let mut backward = forward.clone();
+    backward.reverse();
+    for list in [forward, backward] {
+        let policy = exempting(SignaturePolicy::off(), list);
+        let at = |r: &str| exempted_scope(policy.decide("docker.io", &repo(r), ImageOrigin::Agent));
+        assert_eq!(at(REPO).as_deref(), Some("docker.io library/app"));
+        assert_eq!(at("library/other").as_deref(), Some("docker.io library/"));
+        assert_eq!(at("a/b/c").as_deref(), Some("docker.io a/b/"));
+        assert_eq!(at("a/c").as_deref(), Some("docker.io a/"));
+    }
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("exemption-specific");
+    let policy = exempting(
+        SignaturePolicy::off(),
+        vec![
+            AgentExemption::docker_official_images(),
+            exemption("docker.io", REPO),
+        ],
+    );
+    let store = open_with(&tmp.path().join("store"), &fake, policy);
+    let got = store.pull(&agent_ref(REPO, &pushed.index)).expect("exempt");
+    assert_eq!(got.exemption, recorded("docker.io", REPO));
+}
+
+/// A prefix ends on a component boundary: `library/` covers neither the
+/// repository `library` nor `libraryx/app`, which are refused before any
+/// request.
+#[test]
+fn exemption_prefix_on_component_boundary() {
+    let policy = official();
+    for r in ["library", "libraryx/app"] {
+        assert!(
+            matches!(
+                policy.decide("docker.io", &repo(r), ImageOrigin::Agent),
+                Decision::Refused
+            ),
+            "{r}"
+        );
+        let fake = hub_fake(Hub::default());
+        let tmp = TempDir::new("exemption-boundary");
+        let store = open_with(&tmp.path().join("store"), &fake, official());
+        let got = store.pull(&agent_ref(r, &digest_of(b"anything")));
+        refused_unseen(&fake, got, &agent_refusal("docker.io", r));
+    }
+}
+
+/// An exemption is keyed by registry: `ghcr.io` + `library/` does not
+/// cover `docker.io/library/app`.
+#[test]
+fn exemption_keyed_by_registry() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("exemption-registry");
+    let mut config = config_with(
+        &fake,
+        exempting(
+            SignaturePolicy::off(),
+            vec![exemption("ghcr.io", "library/")],
+        ),
+    );
+    config.registries.push(
+        Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("registry"),
+    );
+    let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+    for name in [REPO, "docker.io/library/app"] {
+        let got = store.pull(&agent_ref(name, &pushed.index));
+        refused_unseen(&fake, got, &agent_refusal("docker.io", REPO));
+    }
+}
+
+/// A name through Docker Hub's API host, with or without its port, is the
+/// registry `docker.io`: exempt under the `docker.io` exemption and
+/// recorded as `docker.io`, refused before any request without it.
+#[test]
+fn agent_ref_through_api_host_matches_registry_name() {
+    let names = [
+        "registry-1.docker.io/library/app",
+        "registry-1.docker.io:443/library/app",
+        "docker.io/library/app",
+    ];
+    for name in names {
+        let (hub, pushed) = app_hub();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-api-host");
+        let store = open_with(&tmp.path().join("store"), &fake, official());
+        let got = store.pull(&agent_ref(name, &pushed.index)).expect(name);
+        assert_eq!(got.exemption, recorded("docker.io", "library/"), "{name}");
+
+        let (hub, pushed) = app_hub();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-api-host-refused");
+        let store = open_with(&tmp.path().join("store"), &fake, SignaturePolicy::off());
+        let got = store.pull(&agent_ref(name, &pushed.index));
+        refused_unseen(&fake, got, &agent_refusal("docker.io", REPO));
+    }
+}
+
+/// A bare name is read as written (D9): `app` is not `library/app`, so
+/// `library/` does not cover it.
+#[test]
+fn exempted_prefix_does_not_cover_bare_name() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-bare");
+    let store = open_with(&tmp.path().join("store"), &fake, official());
+    let got = store.pull(&agent_ref("app", &pushed.index));
+    refused_unseen(&fake, got, &agent_refusal("docker.io", "app"));
+}
+
+/// Scope text that breaks the repository grammar of D9 is refused, by
+/// `ExemptScope::parse` and, for a prefix built by hand, by
+/// `with_agent_exemptions`; the longest valid prefix (255 bytes before the
+/// `/`) is accepted and one byte more is not.
+#[test]
+fn exemption_grammar_checked() {
+    let long_ok = format!("{}/", "a".repeat(255));
+    let long_bad = format!("{}/", "a".repeat(256));
+    let bad_prefixes = [
+        "/",
+        "//",
+        "Library/",
+        "l\u{456}brary/",
+        "library\u{200b}/",
+        "library /",
+        " library/",
+        "library/\t/",
+        long_bad.as_str(),
+    ];
+    for text in bad_prefixes {
+        match ExemptScope::parse(text) {
+            Err(Error::InvalidPolicy(_)) => {}
+            other => panic!("{text:?}: {other:?}"),
+        }
+        let by_hand = AgentExemption {
+            registry: "docker.io".to_owned(),
+            scope: ExemptScope::Prefix(text.to_owned()),
+        };
+        match SignaturePolicy::off().with_agent_exemptions(vec![by_hand]) {
+            Err(Error::InvalidPolicy(_)) => {}
+            other => panic!("{text:?}: {other:?}"),
+        }
+    }
+    for text in [
+        "",
+        "library//app",
+        "Library/app",
+        "library/\t",
+        "library/app ",
+    ] {
+        match ExemptScope::parse(text) {
+            Err(Error::InvalidPolicy(_)) => {}
+            other => panic!("{text:?}: {other:?}"),
+        }
+    }
+    // A prefix built by hand without its `/` is refused, though parse
+    // would have read the text as one repository.
+    let no_slash = AgentExemption {
+        registry: "docker.io".to_owned(),
+        scope: ExemptScope::Prefix("library".to_owned()),
+    };
+    match SignaturePolicy::off().with_agent_exemptions(vec![no_slash]) {
+        Err(Error::InvalidPolicy(detail)) => assert!(detail.contains("does not end in /")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(long_ok.len(), 256);
+    assert_eq!(
+        ExemptScope::parse(&long_ok).expect("255 bytes and the /"),
+        ExemptScope::Prefix(long_ok.clone())
+    );
+    SignaturePolicy::off()
+        .with_agent_exemptions(vec![exemption("docker.io", &long_ok)])
+        .expect("the longest prefix");
+}
+
+/// The same registry and scope twice is refused; the same scope under two
+/// registries, and a repository next to the prefix of the same text, are
+/// fine.
+#[test]
+fn duplicate_exemption_refused() {
+    for scope in [REPO, "library/"] {
+        match SignaturePolicy::off().with_agent_exemptions(vec![
+            exemption("docker.io", scope),
+            exemption("docker.io", scope),
+        ]) {
+            Err(Error::InvalidPolicy(_)) => {}
+            other => panic!("{scope}: {other:?}"),
+        }
+        SignaturePolicy::off()
+            .with_agent_exemptions(vec![
+                exemption("docker.io", scope),
+                exemption("ghcr.io", scope),
+            ])
+            .expect("two registries");
+    }
+    SignaturePolicy::off()
+        .with_agent_exemptions(vec![
+            exemption("docker.io", "library"),
+            exemption("docker.io", "library/"),
+        ])
+        .expect("a repository and a prefix of the same text");
+}
+
+/// An exemption for a registry the store does not pull from fails `open`
+/// before the root exists.
+#[test]
+fn exemption_for_unknown_registry_refused() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("exemption-unknown-registry");
+    let root = tmp.path().join("store");
+    let policy = exempting(
+        SignaturePolicy::off(),
+        vec![exemption("ghcr.io", "library/")],
+    );
+    match OciImageStore::open(&root, config_with(&fake, policy)) {
+        Err(Error::InvalidPolicy(detail)) => assert!(detail.contains("ghcr.io"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(!root.exists(), "open created the root");
+}
+
+/// A cached image is no exemption: after the operator's pull, the agent's
+/// pull of the same image is refused with no new request; and a store
+/// reopened on the same root without the exemption that admitted an
+/// earlier agent pull refuses the agent's warm pull with no request.
+#[test]
+fn cached_image_refused_for_unexempted_agent() {
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-cached");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, SignaturePolicy::off());
+    store
+        .pull(&image_ref(REPO, &pushed.index))
+        .expect("operator");
+    let before = fake.seen().len();
+    let got = store.pull(&agent_ref(REPO, &pushed.index));
+    assert_eq!(
+        got,
+        Err(ImageError::Failed {
+            detail: agent_refusal("docker.io", REPO)
+        })
+    );
+    assert_eq!(fake.seen().len(), before);
+    drop(store);
+
+    let (hub, pushed) = app_hub();
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-cached-reopen");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, official());
+    store
+        .pull(&agent_ref(REPO, &pushed.index))
+        .expect("exempted");
+    drop(store);
+    let cold = hub_fake(Hub::default());
+    let store = open_with(&root, &cold, SignaturePolicy::off());
+    let got = store.pull(&agent_ref(REPO, &pushed.index));
+    refused_unseen(&cold, got, &agent_refusal("docker.io", REPO));
+}
+
+/// The refusal comes before the registry is asked, so an agent's
+/// reference to a repository the registry does not have is `Failed`, not
+/// `NotFound`; the operator's is `NotFound`.
+#[test]
+fn agent_refusal_is_failed_even_for_missing_image() {
+    let fake = hub_fake(Hub::default());
+    let tmp = TempDir::new("agent-missing");
+    let store = open_with(&tmp.path().join("store"), &fake, SignaturePolicy::off());
+    let digest = digest_of(b"no such index");
+    let got = store.pull(&agent_ref("library/missing", &digest));
+    refused_unseen(&fake, got, &agent_refusal("docker.io", "library/missing"));
+    assert_eq!(
+        store.pull(&image_ref("library/missing", &digest)),
+        Err(ImageError::NotFound)
+    );
+}
+
+/// A look-alike name (Cyrillic, zero-width, upper case) is refused by the
+/// reference grammar before any request, even under the exemption it
+/// imitates.
+#[test]
+fn agent_lookalike_name_refused_before_any_request() {
+    for name in ["l\u{456}brary/app", "library\u{200b}/app", "Library/app"] {
+        let (hub, pushed) = app_hub();
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-lookalike");
+        let store = open_with(&tmp.path().join("store"), &fake, official());
+        match store.pull(&agent_ref(name, &pushed.index)) {
+            Err(ImageError::Failed { detail }) => assert!(!detail.is_empty()),
+            other => panic!("{name:?}: {other:?}"),
+        }
+        assert!(fake.seen().is_empty(), "{name:?}");
+        assert!(fake.dials().is_empty(), "{name:?}");
+    }
+}
+
+/// A scope renders as it was parsed, and the text says which kind it is:
+/// a repository never ends in `/`, a prefix always does.
+#[test]
+fn exemption_scope_round_trips() {
+    for text in [REPO, "library", "library/", "a/b/", "a/b/c"] {
+        let scope = ExemptScope::parse(text).expect(text);
+        assert_eq!(scope.as_str(), text);
+        assert_eq!(ExemptScope::parse(scope.as_str()).expect(text), scope);
+        assert_eq!(
+            matches!(scope, ExemptScope::Prefix(_)),
+            text.ends_with('/'),
+            "{text}"
+        );
+    }
+}
+
+/// The preset is `docker.io` + `library/`, and the agent's `library/node`
+/// and `library/postgres` pull under it and record it (ADR-032 S4,
+/// offline; the network test pulls the real ones).
+#[test]
+fn docker_official_images_preset() {
+    assert_eq!(
+        AgentExemption::docker_official_images(),
+        AgentExemption {
+            registry: "docker.io".to_owned(),
+            scope: ExemptScope::Prefix("library/".to_owned()),
+        }
+    );
+    let mut hub = Hub::default();
+    let node = push(
+        &mut hub,
+        "library/node",
+        &[Layer::file("usr/local/bin/node", b"node\n")],
+        "",
+    );
+    let postgres = push(
+        &mut hub,
+        "library/postgres",
+        &[Layer::file("usr/bin/postgres", b"postgres\n")],
+        "",
+    );
+    let fake = hub_fake(hub);
+    let tmp = TempDir::new("agent-preset");
+    let store = open_with(&tmp.path().join("store"), &fake, official());
+    for (name, pushed) in [("library/node", &node), ("library/postgres", &postgres)] {
+        let got = store.pull(&agent_ref(name, &pushed.index)).expect(name);
+        assert_eq!(got.rootfs.as_str(), pushed.manifest);
+        assert_eq!(got.exemption, recorded("docker.io", "library/"), "{name}");
+    }
+}
+
+/// For the agent, the `Required` rule that applies is the most specific
+/// one of the reference's registry: an exact rule with the signer's key
+/// wins over a prefix with another key, in either order, so the signed
+/// image passes; a `Required` rule of another registry never applies, so
+/// the preset still admits the agent's `docker.io` reference.
+#[test]
+fn agent_required_rule_most_specific_of_its_registry() {
+    let exact = || {
+        rule(
+            RepoScope::Exact(repo(REPO)),
+            Requirement::Required(keyed(&[SIGNER_PUB])),
+        )
+    };
+    let prefix = || {
+        rule(
+            RepoScope::Prefix("library/".to_owned()),
+            Requirement::Required(keyed(&[OTHER_PUB])),
+        )
+    };
+    for list in [vec![exact(), prefix()], vec![prefix(), exact()]] {
+        let (mut hub, pushed) = app_hub();
+        sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+        let fake = hub_fake(hub);
+        let tmp = TempDir::new("agent-required-specific");
+        let store = open_with(&tmp.path().join("store"), &fake, rules(list));
+        let got = store
+            .pull(&agent_ref(REPO, &pushed.index))
+            .expect("checked under the exact rule");
+        assert_eq!(got.exemption, None);
+    }
+    let mut ghcr = rule(
+        RepoScope::Prefix("library/".to_owned()),
+        Requirement::Required(keyed(&[SIGNER_PUB])),
+    );
+    ghcr.registry = "ghcr.io".to_owned();
+    let policy = exempting(
+        rules(vec![ghcr]),
+        vec![AgentExemption::docker_official_images()],
+    );
+    assert_eq!(
+        exempted_scope(policy.decide("docker.io", &repo(REPO), ImageOrigin::Agent)).as_deref(),
+        Some("docker.io library/")
     );
 }

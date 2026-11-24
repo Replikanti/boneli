@@ -17,7 +17,8 @@
 //! environments and the agent's workspace build on. Paths
 //! that ports take are [`RelativePath`]s, the citation path rule of the
 //! domain; the paths a tree holds are [`TreePath`]s, which also carry
-//! names an agent cannot cite (ADR-018). [`contract`] holds the suites every adapter of a port must pass;
+//! names an agent cannot cite (ADR-018). An [`ImageRef`] carries who
+//! chose it ([`ImageOrigin`], ADR-032). [`contract`] holds the suites every adapter of a port must pass;
 //! the in-memory adapters live in the `boneli-memory` crate.
 #![no_std]
 #![doc(test(attr(forbid(unsafe_code))))]
@@ -53,7 +54,7 @@ pub use evidence::{Evidence, EvidenceError};
 pub use forge::{Attached, Forge, ForgeRef, PullRequest};
 pub use git::{BranchName, CheckoutId, CommitInfo, Git, GitError, RepoUrl};
 pub use ids::Ids;
-pub use image::{ImageError, ImageRef, ImageStore, RootfsRef};
+pub use image::{ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, Pulled, RootfsRef};
 pub use job::{JobFailure, MAX_DETAIL_BYTES, cap_detail};
 pub use path::{RelativePath, TreePath, TreePathProblem, Uncitable};
 pub use sandbox::{

@@ -528,7 +528,8 @@ the digest binds the bytes and mirrors are legitimate.
   - Protection exists only where the operator writes a `Required` rule,
     and an `Off` rule under a `Required` prefix is an exemption by
     design. Forcing `Required` for references an agent chose is a
-    follow-up issue (filed at STOP 1).
+    follow-up issue (filed at STOP 1). ADR-032 closes it for references
+    an agent chose.
   - A URI prefix trusts everyone who can run the workflow at a matching
     ref. `…@refs/tags/` trusts whoever may push tags to the signer's
     repository, `…@refs/heads/` whoever may push branches, and an org or

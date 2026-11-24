@@ -18,11 +18,11 @@ use boneli_app::contract::{self, SilentFailure, Violation};
 use boneli_app::{
     Agent, BranchName, CheckoutId, Clock, Command as SandboxCommand, CommitInfo, DataError,
     DataSnapshot, DatabaseCopy, EventStore, Evidence, EvidenceError, ExecResult, ExitStatus,
-    FixRequest, Forge, ForgeRef, Git, GitError, Ids, ImageError, ImageRef, ImageStore, JobFailure,
-    Limits, Phase, PullRequest, RelativePath, RepoUrl, ReproductionRequest, RootCauseReport,
-    RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox, SandboxError, SandboxId, SandboxSpec,
-    SnapshotId, SnapshotSource, StoreError, TreePath, TriageReport, TriageRequest, Verifier,
-    Written,
+    FixRequest, Forge, ForgeRef, Git, GitError, Ids, ImageError, ImageExemption, ImageOrigin,
+    ImageRef, ImageStore, JobFailure, Limits, Phase, PullRequest, Pulled, RelativePath, RepoUrl,
+    ReproductionRequest, RootCauseReport, RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox,
+    SandboxError, SandboxId, SandboxSpec, SnapshotId, SnapshotSource, StoreError, TreePath,
+    TriageReport, TriageRequest, Verifier, Written,
 };
 use boneli_domain::{
     Budget, Change, Citation, CitationStatus, CommitSha, Entry, EntryKind, EvidenceRef, FixChecks,
@@ -1468,6 +1468,13 @@ enum ImageBug {
     /// The first pull of a tampered image fails, but what it fetched is
     /// kept and handed out by the second.
     CachesTampered,
+    /// Every reference is pulled as the operator's: the origin is
+    /// dropped (ADR-032).
+    IgnoresOrigin,
+    /// The exemption that admitted an agent's image is not reported.
+    DropsExemption,
+    /// A pull of a reference the operator chose reports an exemption.
+    ExemptsOperator,
 }
 
 struct ImageMutant {
@@ -1479,33 +1486,59 @@ struct ImageMutant {
 }
 
 impl ImageStore for ImageMutant {
-    fn pull(&self, image: &ImageRef) -> Result<RootfsRef, ImageError> {
+    fn pull(&self, image: &ImageRef) -> Result<Pulled, ImageError> {
         let resolved = self.known.iter().find(|k| match self.bug {
             ImageBug::ByName => k.name == image.name,
             ImageBug::IgnoresPlatform => k.name == image.name && k.digest == image.digest,
             _ => *k == image,
         });
         let image = resolved.unwrap_or(image);
-        match (self.bug, self.inner.pull(image)) {
-            (ImageBug::AcceptsTampered, Err(ImageError::Failed { .. })) => {
-                Ok(RootfsRef::new(String::from("rootfs-tampered")))
-            }
+        let as_operator = ImageRef {
+            origin: ImageOrigin::Operator,
+            ..image.clone()
+        };
+        let pulled = match self.bug {
+            ImageBug::IgnoresOrigin => self.inner.pull(&as_operator),
+            _ => self.inner.pull(image),
+        };
+        let tampered = || {
+            Ok(Pulled {
+                rootfs: RootfsRef::new(String::from("rootfs-tampered")),
+                exemption: None,
+            })
+        };
+        match (self.bug, pulled) {
+            (ImageBug::AcceptsTampered, Err(ImageError::Failed { .. })) => tampered(),
             (ImageBug::CachesTampered, Err(ImageError::Failed { detail })) => {
                 let mut pulls = Mutex::lock(&self.pulls).expect("not poisoned");
                 *pulls += 1;
                 if *pulls == 1 {
                     Err(ImageError::Failed { detail })
                 } else {
-                    Ok(RootfsRef::new(String::from("rootfs-tampered")))
+                    tampered()
                 }
             }
-            (ImageBug::NewRootfsPerPull, Ok(rootfs)) => {
+            (ImageBug::NewRootfsPerPull, Ok(p)) => {
                 let mut pulls = Mutex::lock(&self.pulls).expect("not poisoned");
                 *pulls += 1;
-                Ok(RootfsRef::new(format!("{}-{pulls}", rootfs.as_str())))
+                Ok(Pulled {
+                    rootfs: RootfsRef::new(format!("{}-{pulls}", p.rootfs.as_str())),
+                    ..p
+                })
             }
-            (ImageBug::MissingIsEmpty, Err(ImageError::NotFound)) => {
-                Ok(RootfsRef::new(String::from("rootfs-empty")))
+            (ImageBug::MissingIsEmpty, Err(ImageError::NotFound)) => Ok(Pulled {
+                rootfs: RootfsRef::new(String::from("rootfs-empty")),
+                exemption: None,
+            }),
+            (ImageBug::DropsExemption, Ok(p)) => Ok(Pulled {
+                exemption: None,
+                ..p
+            }),
+            (ImageBug::ExemptsOperator, Ok(p)) if image.origin == ImageOrigin::Operator => {
+                Ok(Pulled {
+                    exemption: Some(exemption()),
+                    ..p
+                })
             }
             (_, got) => got,
         }
@@ -1517,25 +1550,50 @@ fn image_ref(name: &str, digest: &str, platform: &str) -> ImageRef {
         name: String::from(name),
         digest: String::from(digest),
         platform: String::from(platform),
+        origin: ImageOrigin::Operator,
+    }
+}
+
+fn agent_ref(name: &str) -> ImageRef {
+    ImageRef {
+        origin: ImageOrigin::Agent,
+        ..image_ref(name, "sha256:dd", "linux/amd64")
+    }
+}
+
+fn exemption() -> ImageExemption {
+    ImageExemption {
+        registry: String::from("docker.io"),
+        scope: String::from("library/"),
     }
 }
 
 fn images(bug: ImageBug) -> contract::image::Images<ImageMutant> {
     let present = image_ref("library/postgres", "sha256:aa", "linux/amd64");
     let tampered = image_ref("library/redis", "sha256:cc", "linux/amd64");
+    let agent_refused = agent_ref("acme/app");
+    let agent_exempted = agent_ref("library/mailcatcher");
+    let stocked = vec![
+        present.clone(),
+        agent_refused.clone(),
+        agent_exempted.clone(),
+    ];
     contract::image::Images {
         adapter: ImageMutant {
             bug,
-            inner: MemoryImageStore::new(vec![present.clone()])
-                .with_tampered(vec![tampered.clone()]),
+            inner: MemoryImageStore::new(stocked.clone())
+                .with_tampered(vec![tampered.clone()])
+                .with_agent_exemptions(vec![(agent_exempted.name.clone(), exemption())]),
             pulls: Mutex::new(0),
-            known: vec![present.clone()],
+            known: stocked,
         },
         present,
         missing: image_ref("library/node", "sha256:aa", "linux/amd64"),
         other_digest: image_ref("library/postgres", "sha256:bb", "linux/amd64"),
         other_platform: image_ref("library/postgres", "sha256:aa", "linux/arm64"),
         tampered,
+        agent_refused,
+        agent_exempted,
     }
 }
 
@@ -1837,6 +1895,13 @@ pub fn mutants() -> Vec<Mutant> {
         }),
         sub_mutant("ImageStore", "tampered-refused", "second-pull", || {
             contract::image::run(|| images(ImageBug::CachesTampered))
+        }),
+        image("agent-origin-refused", ImageBug::IgnoresOrigin),
+        sub_mutant("ImageStore", "exemption-reported", "agent-pull", || {
+            contract::image::run(|| images(ImageBug::DropsExemption))
+        }),
+        sub_mutant("ImageStore", "exemption-reported", "operator-pull", || {
+            contract::image::run(|| images(ImageBug::ExemptsOperator))
         }),
         data("distinct-copies", DataBug::SameCopy),
         data("copies-independent", DataBug::SharedData),

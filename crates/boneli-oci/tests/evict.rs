@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
-use boneli_app::{ImageError, ImageRef, ImageStore};
+use boneli_app::{ImageError, ImageOrigin, ImageRef, ImageStore};
 use boneli_https::Sha256;
 use boneli_oci::{
     BLOCK_ALLOWANCE, Budget, CACHE_BUDGET_BYTES, Compression, Error, LayerCache, Limits,
@@ -30,6 +30,7 @@ fn image_ref(name: &str, digest: &str) -> ImageRef {
         name: name.to_owned(),
         digest: digest.to_owned(),
         platform: "linux/amd64".to_owned(),
+        origin: ImageOrigin::Operator,
     }
 }
 
@@ -210,7 +211,8 @@ fn in_use_over_budget_is_soft() {
     let store = open_with(&root, &fake, 1);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull over the budget");
+        .expect("pull over the budget")
+        .rootfs;
     let lease = store
         .lease(&rootfs)
         .expect("lease after a pull over the budget");
@@ -386,7 +388,7 @@ fn use_refreshes_stamp() {
     let root = tmp.path().join("store");
     let store = open(&root, &fake);
     let image = image_ref("library/app", &pushed.index);
-    let rootfs = store.pull(&image).expect("pull");
+    let rootfs = store.pull(&image).expect("pull").rootfs;
     let sidecars: Vec<PathBuf> = layers
         .iter()
         .map(|l| sidecar_of(&root.join("layers/sha256").join(hex(&l.diff_id))))
@@ -1040,7 +1042,8 @@ fn locks_released_under_concurrent_spawns() {
     let store = open(&root, &fake);
     let rootfs = store
         .pull(&image_ref("library/app", &pushed.index))
-        .expect("pull");
+        .expect("pull")
+        .rootfs;
     let locks: Vec<PathBuf> = layers
         .iter()
         .map(|l| root.join("locks/sha256").join(hex(&l.diff_id)))
@@ -1116,7 +1119,7 @@ fn documents_evicted_before_the_pins_are_kept_again() {
         drop(open_with(&root, &no_requests(), 1));
         let evicted = !blobs.join(hex(&pushed.manifest)).exists();
         gate.release();
-        let rootfs = pull.join().expect("thread").expect("pull");
+        let rootfs = pull.join().expect("thread").expect("pull").rootfs;
         assert!(
             kept && evicted,
             "the window was not hit: kept {kept}, evicted {evicted}"

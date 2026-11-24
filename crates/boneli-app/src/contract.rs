@@ -2703,7 +2703,7 @@ pub mod git {
 /// The `ImageStore` suite.
 pub mod image {
     use super::*;
-    use crate::image::{ImageError, ImageRef, ImageStore};
+    use crate::image::{ImageError, ImageOrigin, ImageRef, ImageStore};
 
     const PORT: &str = "ImageStore";
 
@@ -2714,6 +2714,8 @@ pub mod image {
         "digest-pinned",
         "platform-pinned",
         "tampered-refused",
+        "agent-origin-refused",
+        "exemption-reported",
     ];
 
     /// The two pulls `tampered-refused` checks, each its own sub-check
@@ -2721,6 +2723,12 @@ pub mod image {
     /// bytes at once fails the first, one that keeps them after a refused
     /// pull fails the second.
     pub const TAMPERED_PULLS: &[&str] = &["first-pull", "second-pull"];
+
+    /// The two pulls `exemption-reported` checks, each its own sub-check
+    /// with its own mutant (ADR-032): a store that drops the exemption
+    /// fails the first, one that reports an exemption for a reference the
+    /// operator chose fails the second.
+    pub const EXEMPTION_PULLS: &[&str] = &["agent-pull", "operator-pull"];
 
     /// An adapter and the images its own test knows.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2738,6 +2746,13 @@ pub mod image {
         /// An image the registry serves with bytes that do not match their
         /// digest (#7, ADR-009).
         pub tampered: ImageRef,
+        /// An image the registry has, chosen by the agent, that the
+        /// adapter's policy does not admit for the agent; the same
+        /// reference chosen by the operator pulls (ADR-032).
+        pub agent_refused: ImageRef,
+        /// An image the registry has, chosen by the agent, that an
+        /// operator exemption admits (ADR-032).
+        pub agent_exempted: ImageRef,
     }
 
     /// Checks every clause; each clause gets a fresh adapter from `make`.
@@ -2746,7 +2761,89 @@ pub mod image {
         missing_image(&make())?;
         digest_pinned(&make())?;
         platform_pinned(&make())?;
-        tampered_refused(&make())
+        tampered_refused(&make())?;
+        agent_origin_refused(&make())?;
+        exemption_reported(&make())
+    }
+
+    /// `image` as the operator's reference, every other field kept.
+    fn by_operator(image: &ImageRef) -> ImageRef {
+        ImageRef {
+            origin: ImageOrigin::Operator,
+            ..image.clone()
+        }
+    }
+
+    /// The fixture's agent reference must say `Agent`, or the clause
+    /// would check an operator pull.
+    fn agent_fixture(clause: &'static str, field: &str, image: &ImageRef) -> Result<(), Violation> {
+        ensure(image.origin == ImageOrigin::Agent, PORT, clause, || {
+            format!("fixture: {field} {image:?} must have the origin Agent")
+        })
+    }
+
+    /// The origin is a port promise (ADR-032): an image the policy does
+    /// not admit for the agent is `Failed`, with a detail, even though
+    /// the same reference chosen by the operator pulls. The operator pull
+    /// runs first, so an adapter that keyed its cache by name alone would
+    /// hand the agent what the operator pulled.
+    fn agent_origin_refused<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let clause = "agent-origin-refused";
+        agent_fixture(clause, "agent_refused", &i.agent_refused)?;
+        let operator = by_operator(&i.agent_refused);
+        i.adapter.pull(&operator).map_err(|error| {
+            violation(
+                PORT,
+                clause,
+                format!("fixture: the operator's pull of {operator:?} failed: {error:?}"),
+            )
+        })?;
+        let got = i.adapter.pull(&i.agent_refused);
+        let refused = matches!(&got, Err(ImageError::Failed { detail }) if !is_blank(detail));
+        ensure(refused, PORT, clause, || {
+            format!(
+                "pull of {:?}, which the agent chose and no exemption admits, gave {got:?}, \
+                 expected Failed with a detail",
+                i.agent_refused
+            )
+        })
+    }
+
+    /// The exemption that admitted an agent's image comes back with the
+    /// pull, both fields filled, so the caller can log it; the operator's
+    /// pull of the same image right after reports none, because the
+    /// exemption belongs to the pull, not to the image.
+    fn exemption_reported<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
+        let clause = "exemption-reported";
+        agent_fixture(clause, "agent_exempted", &i.agent_exempted)?;
+        let [agent_pull, operator_pull] = EXEMPTION_PULLS else {
+            return Err(violation(PORT, clause, String::from("two pulls")));
+        };
+        let got = i.adapter.pull(&i.agent_exempted);
+        let reported = matches!(
+            &got,
+            Ok(p) if p.exemption.as_ref().is_some_and(|e| !is_blank(&e.registry) && !is_blank(&e.scope))
+        );
+        ensure(reported, PORT, clause, || {
+            format!(
+                "{agent_pull}: pull of {:?}, which an exemption admits, gave {got:?}, expected \
+                 Ok with the exemption",
+                i.agent_exempted
+            )
+        })?;
+        let operator = by_operator(&i.agent_exempted);
+        let got = i.adapter.pull(&operator);
+        ensure(
+            matches!(&got, Ok(p) if p.exemption.is_none()),
+            PORT,
+            clause,
+            || {
+                format!(
+                    "{operator_pull}: pull of {operator:?}, which the operator chose, gave {got:?}, \
+                 expected Ok with no exemption"
+                )
+            },
+        )
     }
 
     /// Digest verification is the port's main security property: an image
@@ -2809,14 +2906,20 @@ pub mod image {
     fn digest_pinned<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
         let p = &i.present;
         let o = &i.other_digest;
-        let same_but = o.name == p.name && o.platform == p.platform && o.digest != p.digest;
+        let same_but = o.name == p.name
+            && o.platform == p.platform
+            && o.origin == p.origin
+            && o.digest != p.digest;
         pinned(i, "digest-pinned", o, same_but, "digest")
     }
 
     fn platform_pinned<I: ImageStore>(i: &Images<I>) -> Result<(), Violation> {
         let p = &i.present;
         let o = &i.other_platform;
-        let same_but = o.name == p.name && o.digest == p.digest && o.platform != p.platform;
+        let same_but = o.name == p.name
+            && o.digest == p.digest
+            && o.origin == p.origin
+            && o.platform != p.platform;
         pinned(i, "platform-pinned", o, same_but, "platform")
     }
 
