@@ -1537,25 +1537,33 @@
     "sandbox"
    ],
    "manual": false
+  },
+  {
+   "issue": 117,
+   "title": "boneli-oci: Docker Hub blob redirects to an S3 host outside the redirect allowlist",
+   "epic": null,
+   "order": 59,
+   "state": "claimed",
+   "owner": "ecf725cc",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
+   "parked": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-24T16:09:59+00:00",
+   "priority": "P2",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T22:50:36+00:00",
-   "issue": 105,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
-  {
-   "at": "2026-11-23T22:50:36+00:00",
-   "issue": 104,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-23T22:50:36+00:00",
    "issue": 103,
@@ -1939,6 +1947,22 @@
    "to": "implementing",
    "by": "7ee136eb",
    "note": null
+  },
+  {
+   "at": "2026-11-24T16:09:59+00:00",
+   "issue": 117,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-24T16:09:59+00:00",
+   "issue": 117,
+   "from": "ready",
+   "to": "claimed",
+   "by": "ecf725cc",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1969,10 +1993,11 @@
   103,
   105,
   113,
-  114
+  114,
+  117
  ],
  "xopen": [],
- "updated_at": "2026-11-24T16:09:49+00:00",
+ "updated_at": "2026-11-24T16:09:59+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
