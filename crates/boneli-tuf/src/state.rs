@@ -152,9 +152,14 @@ impl TrustDir {
     /// `tuf/` or the lock file is missing or another inode than the one
     /// locked: an operator removed `tuf/` or the whole directory during
     /// the refresh, and perhaps another refresh set up a new one, whose
-    /// state this one must not write into. The window between this check
-    /// and the write it guards stays open (std has no `openat`); it is the
-    /// time of one rename.
+    /// state this one must not write into. std has no `openat`, so a window
+    /// stays open from this check through the whole write it guards (the
+    /// temporary file is created by path, written, synced and renamed). It
+    /// is reachable only when the whole trust directory is removed and a
+    /// new refresh recreates it inside that span, not by removing `tuf/`
+    /// (the lock stays held), and only by the runner's own uid, which owns
+    /// the `0700` directory and can already write `trusted_root.json`
+    /// (ADR-033, item 6).
     pub(crate) fn check_held(&self) -> Result<(), StateError> {
         let paths = [&self.root, &self.tuf, &self.lock_path];
         for (path, held) in paths.into_iter().zip(self.held) {
@@ -268,8 +273,9 @@ fn read_capped(path: &Path, max: u64) -> io::Result<Option<Option<Vec<u8>>>> {
 }
 
 /// Writes `bytes` to `.tmp-<name>` in `dir` (created anew, mode 0600),
-/// syncs it, renames it to `name` and syncs `dir`. On failure the
-/// temporary file is removed and `name` is as it was.
+/// syncs it, renames it to `name` and syncs `dir`. On a failure before
+/// the rename the temporary file is removed and `name` is as it was; after
+/// it only the sync of `dir` can fail, and `name` holds the new bytes.
 fn write_durably(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let temp = dir.join(format!("{TEMP_PREFIX}{name}"));
     let result = OpenOptions::new()

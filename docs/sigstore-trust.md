@@ -1,4 +1,4 @@
-or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory, or wait for the other refresh and run again. |# Sigstore trusted root: operator guide
+# Sigstore trusted root: operator guide
 
 Keyless image signatures are verified against the operator's
 `trusted_root.json` (ADR-029): the Fulcio CAs, Rekor logs and CT logs that
@@ -71,8 +71,13 @@ is never ignored silently.
 
 `trusted_root.json` is replaced only after every TUF step passed, the
 file's length and SHA-256 matched the signed target, and the verifier's
-own reader (`TrustedRoot::from_json`) read it. On every failure it stays
-as it was. Do not edit it by hand: the next refresh replaces it.
+own reader (`TrustedRoot::from_json`) read it. On every failure before
+the file is renamed into place it stays as it was. After the rename only
+the sync of the directory can fail: the refresh then reports `Write` with
+the new, fully verified file already in place, and the next run finds it
+current (`Unchanged`) while the repository still lists it, or installs
+it again if a crash lost the rename. Do not edit it by hand: the next
+refresh replaces it.
 
 ## When to refresh
 
@@ -97,7 +102,7 @@ the file, status, size or path, never text from the metadata.
 
 | Step | Meaning | What to do |
 | --- | --- | --- |
-| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others), or another refresh holds `tuf/lock` ("busy"). | Fix the directory, or wait for the other refresh. |
+| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others), or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory, or wait for the other refresh and run again. |
 | `InitialRoot` | The pin does not match the initial root, the root does not verify, the directory was set up from another pin, or `tuf/root.json` has no `tuf/pin`. | Check the pin. To change the initial root on purpose, remove `tuf/`. |
 | `Root(Some(N))` | `N.root.json` was refused: a status other than `200` or `404`, a signature or version check, more than 32 new roots in one run, the newest root expired, or a repository without consistent snapshots. | Retry. More than 32 roots: run again, the next run goes on. An expired newest root or a bad signature means the repository is stale or not Sigstore's: do not remove anything. |
 | `Root(None)` | The stored `tuf/root.json` does not parse or verify. | Remove `tuf/`; the next refresh bootstraps from the pin. |
@@ -105,7 +110,7 @@ the file, status, size or path, never text from the metadata.
 | `Snapshot(N)`, `Targets(N)` | `N.snapshot.json` or `N.targets.json` was refused: hash, length, version, signature, expiry, or a role the stored snapshot listed is gone or lower. | As for `Timestamp`. |
 | `Target` | `trusted_root.json` is not a top-level target (for example, moved into a delegation), is listed above 1 MiB, or the fetched file does not match its length and SHA-256. | Retry; a lasting "not listed" needs a Boneli update (ADR-033, known limits). |
 | `TrustedRoot` | The signed file passed TUF but the verifier cannot read it. | Keep the old file and report it: Sigstore changed the file's format. |
-| `Write` | The trust directory could not be read or written. | Check disk space and permissions. |
+| `Write` | The trust directory could not be read or written. When only the sync after the rename of `trusted_root.json` failed, the new, verified file is already in place. | Check disk space and permissions, then run again. |
 
 After a rollback or freeze refusal, the stored metadata keep protecting
 the next run: a repository that serves older versions keeps failing.
@@ -114,7 +119,9 @@ protection to whatever the repository serves next. Remove only `tuf/`,
 never `lock`. A refresh that is running holds `lock`, so one started
 after the removal fails as "busy" until it ends, and the running one
 stops at `Lock` instead of writing into the new `tuf/`: run the refresh
-again once it has ended.
+again once it has ended. Do not remove the whole trust directory while a
+refresh may run: a refresh that recreates it at that moment can race the
+running one's last write (ADR-033, item 6).
 
 ## Live test
 

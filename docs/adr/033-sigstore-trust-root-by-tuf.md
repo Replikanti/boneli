@@ -225,8 +225,16 @@ directory, the live run, and the acceptance of this ADR.
      locked, and fails at `Lock` otherwise. That covers removing the whole
      trust directory during a run: a refresh started after it creates a
      new directory and a new lock, and the old one then writes nothing
-     into it. std has no `openat`, so the window between the check and
-     the rename it guards stays open; it is one rename long.
+     into it. std has no `openat`, so a window stays open: from the check
+     through the whole write it guards (the temporary file is created by
+     path, written, synced and renamed). It is no trust gap. Only `tuf/`
+     removed (the documented remedy) cannot reach it: the lock stays
+     held, so no other refresh recreates `tuf/`, and a write into the
+     removed one fails. It is reachable only when the whole trust
+     directory is removed and a new refresh recreates it inside that
+     span. The directory is `0700` and the runner's, under ancestors no one
+     else can rename (ADR-021), so only the runner's own uid can do that,
+     and that uid can already write `trusted_root.json` directly.
    - Writes go to a temporary name in the same directory with
      `create_new` and mode 0600, then `sync_all`, rename, and a sync of
      the directory. The temporary name is `.tmp-<name>`, one per file,
@@ -251,9 +259,13 @@ directory, the live run, and the acceptance of this ADR.
      read it. When the file on disk is a regular file with the target's
      length and SHA-256, nothing is fetched or written
      (`Outcome::Unchanged`); a symlink there is never followed, and the
-     rename replaces it. TUF
-     state advances as the specification persists it, and the output file
-     stays untouched on every failure.
+     rename replaces it. TUF state advances as the specification persists
+     it. On every failure before the rename the old file stays as it was.
+     After the rename only the sync of the directory can fail: the
+     refresh then reports `Write` with the new, fully verified file in
+     place, and the next run finds it current (`Outcome::Unchanged`)
+     while the repository still lists it, or installs the target again if
+     a crash lost the rename.
 7. **Fetches** go through `boneli_https::Dial` (`TlsDial` in
    production, so revocation by ADR-017, ADR-020 and ADR-027 and name
    resolution by ADR-022 apply under each request's deadline), as the

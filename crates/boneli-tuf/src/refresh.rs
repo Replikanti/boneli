@@ -72,7 +72,9 @@ impl fmt::Display for Step {
 
 /// Why a refresh failed: the step, and a fixed reason that echoes file
 /// names, versions, statuses, sizes, hosts and paths, never metadata text
-/// (ADR-033, item 9). `trusted_root.json` is as it was.
+/// (ADR-033, item 9). `trusted_root.json` is as it was, except after a
+/// `Write` failure in the sync that follows its rename: the new, verified
+/// file is then in place, and the next run finds it current.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshError {
     /// Where it failed.
@@ -223,8 +225,12 @@ impl Outcome {
 ///    target is fetched, checked against its length and SHA-256, read by
 ///    `TrustedRoot::from_json`, and installed by rename.
 ///
-/// On any error `trusted_root.json` is as it was; the TUF state keeps
-/// what verified before the error.
+/// On an error before the rename `trusted_root.json` is as it was. After
+/// the rename only the directory sync can fail: the result is `Write` with
+/// the new, fully verified file in place, and the next run returns
+/// [`Outcome::Unchanged`] while the repository still lists it, or installs
+/// the target again if a crash lost the rename. The TUF state keeps what
+/// verified before the error.
 pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshError> {
     let dir = TrustDir::open(refresh.dir).map_err(|e| match e {
         OpenError::Dir(detail) => RefreshError::new(Step::Lock, detail),
