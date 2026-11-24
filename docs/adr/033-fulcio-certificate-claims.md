@@ -1,6 +1,6 @@
 # ADR-033: Fulcio certificate claims
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -274,4 +274,8 @@ run): `certificate_claims_on_ghcr` pulls jq with both layers in 5.9 s
 over 15 connections and refuses it under `[release]` with `referrers tag:
 1 listed, 1 candidates (entry 0: the certificate's Fulcio Build Trigger
 (1.3.6.1.4.1.57264.1.20) does not meet the rule)`, and no layer
-committed.
+committed. The `oci-acceptance` run on the PR (run 45444216792) passes
+`certificate_claims_on_ghcr` on x86_64 and arm64 (jq pulled in 5.8 to
+6.3 s over 15 connections on both), next to `provenance_claims_on_ghcr`,
+`signatures_on_docker_hub`, `signatures_elsewhere` and
+`node_and_postgres_run_in_sandbox`.
