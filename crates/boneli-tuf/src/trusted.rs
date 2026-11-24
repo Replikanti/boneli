@@ -217,10 +217,15 @@ impl TrustedSet {
     /// Loads the snapshot an earlier update stored, for the rollback
     /// checks of [`update_snapshot`](Self::update_snapshot) only:
     /// signatures under the trusted root and `_type`, no expiry and no
-    /// version check. Refused when a snapshot is already held, and with
-    /// [`Error::OnlineKeysChanged`] after a root of this update rotated
-    /// the online keys. The caller ignores a failure.
+    /// version check. Needs a timestamp verified in this update, so the
+    /// copy is read under the final root of the chain; refused when a
+    /// snapshot is already held, and with [`Error::OnlineKeysChanged`]
+    /// after a root of this update rotated the online keys. The caller
+    /// ignores a failure.
     pub fn load_local_snapshot(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.timestamp.as_ref().and_then(Held::verified).is_none() {
+            return Err(Error::OutOfOrder);
+        }
         if self.snapshot.is_some() || self.targets.is_some() {
             return Err(Error::OutOfOrder);
         }

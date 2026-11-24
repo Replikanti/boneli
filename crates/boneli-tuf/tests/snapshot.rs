@@ -302,11 +302,51 @@ fn rotated_snapshot_key_drops_stored_snapshot() {
     let mut v2 = RootBuilder::new(2);
     v2.timestamp.keys = vec![7];
     set.update_root(&v2.bytes()).expect("v2");
+    set.update_timestamp(&TimestampBuilder::new(1, MetaSpec::version(1)).signed_by(&[7]))
+        .expect("timestamp");
     assert_eq!(
         set.load_local_snapshot(&snapshot(50, 50, &[])),
         Err(Error::OnlineKeysChanged)
     );
-    set.update_timestamp(&TimestampBuilder::new(1, MetaSpec::version(1)).signed_by(&[7]))
-        .expect("timestamp");
     set.update_snapshot(&snapshot(1, 1, &[])).expect("v1");
+}
+
+/// The stored snapshot loads only after a timestamp verified in this
+/// update, so never before the root chain: a copy loaded under the old
+/// root would outlive a rotation of the snapshot key and block the
+/// timestamp step.
+#[test]
+fn local_snapshot_before_root_chain_refused() {
+    let mut set = TrustedSet::new(&RootBuilder::new(1).bytes(), START).expect("root");
+    assert_eq!(
+        set.load_local_snapshot(&snapshot(1, 1, &[])),
+        Err(Error::OutOfOrder)
+    );
+    assert_eq!(set.snapshot_version(), None);
+    // The chain then rotates the snapshot key, and the update completes.
+    let mut v2 = RootBuilder::new(2);
+    v2.snapshot.keys = vec![7];
+    set.update_root(&v2.bytes()).expect("v2");
+    set.update_timestamp(&TimestampBuilder::new(1, MetaSpec::version(1)).bytes())
+        .expect("timestamp");
+    let fresh = SnapshotBuilder::new(1, MetaSpec::version(1)).signed_by(&[7]);
+    set.update_snapshot(&fresh)
+        .expect("snapshot under the new key");
+}
+
+/// Nor before the timestamp step: a stored timestamp alone is not
+/// enough.
+#[test]
+fn local_snapshot_before_stored_timestamp_refused() {
+    let ts = TimestampBuilder::new(1, MetaSpec::version(1)).bytes();
+    let mut set = TrustedSet::new(&RootBuilder::new(1).bytes(), START).expect("root");
+    set.load_local_timestamp(&ts).expect("stored timestamp");
+    assert_eq!(
+        set.load_local_snapshot(&snapshot(1, 1, &[])),
+        Err(Error::OutOfOrder)
+    );
+    set.update_timestamp(&ts).expect("timestamp");
+    set.load_local_snapshot(&snapshot(1, 1, &[]))
+        .expect("after the timestamp step");
+    assert_eq!(set.snapshot_version(), Some(1));
 }

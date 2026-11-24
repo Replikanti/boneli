@@ -109,9 +109,11 @@ directory, the live run, and the acceptance of this ADR. Items marked
    - **Order.** The core takes the steps in one order and refuses a
      call out of it (`OutOfOrder`): roots, the stored timestamp, the
      timestamp, the stored snapshot, the snapshot, targets, the target.
-     No root is accepted once a timestamp is held, the snapshot needs a
-     timestamp verified in this update (a stored copy is not enough), and
-     targets need a verified snapshot. Each step runs once, except that
+     No root is accepted once a timestamp is held; the stored snapshot
+     and the snapshot both need a timestamp verified in this update (a
+     stored copy is not enough), so a stored snapshot is never read under
+     a root the chain later replaces; and targets need a verified
+     snapshot. Each step runs once, except that
      a timestamp may be updated again before the snapshot, against the
      one it replaces. A step that fails leaves the set as it was.
    - **Timestamp** (5.4). No timestamp is trusted while the trusted
