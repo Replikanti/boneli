@@ -178,12 +178,20 @@ name exactly one file, and only a support crate's source.
 
 The rule reads the token stream of the lenient lexer (comments dropped,
 literals one token each, so a name inside a string, a character or a
-comment is no hit) and reports:
+comment is no hit) and reports. The lexer drops a first-line shebang as
+rustc does: `#!` at the start of the file (after a byte order mark)
+whose next token, past whitespace and comments that are no doc comments,
+is not `[`, up to the end of its line. Read as code, a shebang
+`#!/usr/bin/env cargo /*` would open a block comment that rustc never
+sees and hide the file from every token rule.
 
 - **Raw names, wherever they stand**: `flock`, `lockf`, `SYS_flock`,
   `LOCK_SH`, `LOCK_EX`, `LOCK_NB`, `LOCK_UN` and the `fcntl` record and
   open file description lock commands `F_SETLK`, `F_SETLKW`, `F_GETLK`,
-  `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`.
+  `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`, and what an `fcntl` lock
+  is described by, `flock64` and the lock types `F_RDLCK`, `F_WRLCK`,
+  `F_UNLCK`. None of them occurs in the workspace outside the exempt
+  file.
 - **The lock names** `lock`, `try_lock`, `lock_shared`,
   `try_lock_shared` and `unlock`, std's `File` methods:
   - inside a macro group (`name!(..)`, `name![..]`, `name!{..}` and the
@@ -195,7 +203,9 @@ comment is no hit) and reports:
     always there as a token. A keyword written without `r#` names no
     macro, so `if !(..)` opens no group;
   - outside one, in method position (`.name(` or `.name::`) and in path
-    position (`::name` outside a `use` item and not followed by `::` and
+    position (`::name` outside a `use` item and a `pub(in path)`
+    visibility, whose `crate::lock` names a module, and not followed by
+    `::` and
     a further segment, so `File::lock::<>(&f)` is a call and
     `crate::lock::Held` is not). A `use` item is `use` up to its `;` with
     only path tokens between, so `impl Sized + use<> { .. }` is no
@@ -220,8 +230,11 @@ comment is no hit) and reports:
   into_inner` exists in `boneli-oci` and `boneli-json`.
 - **Redefinitions of the names the proofs trust**, wherever they stand,
   inside macros too: `Mutex`, `PoisonError` or `io` after `struct`,
-  `enum`, `union`, `type`, `trait`, `mod` or `as` (so `use std::fs::File
-  as Mutex`, `mod io`, `extern crate core as io`), declared as a generic
+  `enum`, `union`, `type`, `trait` or `mod`, after `as` where `;`, `,` or
+  `}` follows, the end of a `use` tree or an `extern crate` item (so `use
+  std::fs::File as Mutex`, `use a::{File as Mutex, b}`, `mod io`, `extern
+  crate core as io`; `<W as io::Write>::flush(w)` and `fd as io::RawFd`
+  name a trait and a type and pass), declared as a generic
   parameter (`fn f<io>()`, `impl<Mutex: T>`), and `Mutex` or
   `PoisonError` followed by a single `:` (a bound, as in `where
   PoisonError: T`); and `fn as_deref`. In a manifest, a dependency
@@ -258,9 +271,12 @@ Blind spots:
   never compile them, unless someone builds with `--cfg test` through
   `RUSTFLAGS`.
 - **A lock taken by another program** (`Command::new("flock")`).
-- **A raw syscall by number** (`syscall(73, ..)`): it needs `unsafe` and
-  `libc`, so it can live only in `boneli-sys`, which is on the review
-  list.
+- **A libc lock call by number or under another link name**: a raw
+  syscall (`syscall(73, ..)`), `fcntl(fd, 6, ..)` with the command as a
+  number (6 is `F_SETLK` on x86_64 and aarch64), or an `extern` function
+  declared `#[link_name = "flock"]`, whose name is a string. Each needs
+  `unsafe` and `libc`, so it can live only in `boneli-sys`, which is on
+  the review list.
 - **An external crate's own locks and items**: its locks, and a module
   `io` or a type `Mutex` it exports. A new external edge needs an ADR.
 - **A macro that assembles a redefinition** (`type Mutex = File`, `mod
@@ -344,11 +360,13 @@ The rule (D5) has unit tests in `crates/boneli-arch-check/src/scan.rs`
 `file_lock_non_calls_pass`, `file_lock_macro_tokens_strict`,
 `file_lock_shadowing_flagged`,
 `file_lock_test_modules_skipped_only_when_real`,
-`file_lock_unicode_whitespace_and_raw_identifiers`) and in `policy.rs`
-(`file_lock_key_forms`), and 13 fixture cases: `file-lock-raw-call`,
+`file_lock_unicode_whitespace_and_raw_identifiers`,
+`file_lock_shebang_line_is_skipped_as_rustc_does`) and in `policy.rs`
+(`file_lock_key_forms`), and 14 fixture cases: `file-lock-raw-call`,
 `file-lock-outside-module`, `file-lock-lib-in-tests-dir`,
 `file-lock-cfg-test-in-macro`, `file-lock-key-absent`,
-`file-lock-dependency-renamed-io` and `file-lock-lib-named-io` fail with
+`file-lock-dependency-renamed-io`, `file-lock-lib-named-io` and
+`file-lock-shebang` fail with
 `file-lock`; `ok-file-lock-mutex` (with the form of
 `crates/boneli-forge-github/src/tokens.rs`,
 `&match self.cache.try_lock().as_deref() {`), `ok-file-lock-module`,
@@ -366,6 +384,8 @@ killed:
 | every `.lock()`/`.try_lock()` counts as proven | `file_lock_calls_flagged`, `_unproven_forms_flagged`, `_macro_tokens_strict`, `_test_modules_skipped_only_when_real`, `_unicode_whitespace_and_raw_identifiers` |
 | P2 accepts any `.unwrap_or_else(..)` | `file_lock_unproven_forms_flagged` |
 | P1 accepts any path before `io` | `file_lock_unproven_forms_flagged` |
+| P1 accepts any first segment, not only `io` (`x::stdout().lock()`) | `file_lock_unproven_forms_flagged` |
+| P2 accepts any `X::into_inner`, not only `PoisonError` (`Tr::into_inner`) | `file_lock_unproven_forms_flagged` |
 | no strict mode in macro groups | `file_lock_macro_tokens_strict` |
 | test-module skip applied inside macros | `file_lock_macro_tokens_strict` |
 | any `#[cfg(<word>)] mod` skipped | `file_lock_test_modules_skipped_only_when_real` |
@@ -380,6 +400,10 @@ killed:
 | key form unchecked | `file_lock_key_forms`; fixtures `policy-file-lock-not-support`, `-malformed` |
 | dependency renames not checked | fixture `file-lock-dependency-renamed-io` |
 | lib target names not checked | fixture `file-lock-lib-named-io` |
+| a shebang line read as code | `file_lock_shebang_line_is_skipped_as_rustc_does`; fixture `file-lock-shebang` |
+| every `as NAME` read as a rename | `file_lock_shadowing_flagged` |
+| `as NAME` never read as a rename | `file_lock_shadowing_flagged` |
+| `::lock` in a `pub(in ..)` visibility read as a call | `file_lock_non_calls_pass` |
 
 ## Consequences
 

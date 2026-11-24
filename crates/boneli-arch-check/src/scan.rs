@@ -243,6 +243,61 @@ fn raw_string_start(chars: &[char], i: usize) -> Option<(usize, usize)> {
     (chars.get(j) == Some(&'"')).then_some((j + 1, hashes))
 }
 
+/// The end of a shebang line that rustc drops before it lexes (its
+/// `strip_shebang`): after an optional byte order mark, `#!` at the start
+/// of the file whose next token, past whitespace and comments that are no
+/// doc comments, is not `[`; the line ends before its `\n`. A file that
+/// starts with `#!/usr/bin/env cargo /*` is code from line 2 for rustc,
+/// so the lexer must not read that `/*` as a comment (ADR-030, D5).
+fn shebang_end(chars: &[char]) -> Option<usize> {
+    let start = usize::from(chars.first() == Some(&'\u{feff}'));
+    if !starts(chars, start, "#!") {
+        return None;
+    }
+    let n = chars.len();
+    let mut i = start + 2;
+    loop {
+        while i < n && is_pws(chars[i]) {
+            i += 1;
+        }
+        let doc_line = starts(chars, i, "///") && !starts(chars, i, "////");
+        let doc_block =
+            (starts(chars, i, "/**") && !starts(chars, i, "/**/") && !starts(chars, i, "/***"))
+                || starts(chars, i, "/*!");
+        if starts(chars, i, "//") && !doc_line && !starts(chars, i, "//!") {
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if starts(chars, i, "/*") && !doc_block {
+            // An unterminated comment runs to the end, as in rustc.
+            let mut depth = 1usize;
+            i += 2;
+            while i < n && depth > 0 {
+                if starts(chars, i, "/*") {
+                    depth += 1;
+                    i += 2;
+                } else if starts(chars, i, "*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    if chars.get(i) == Some(&'[') {
+        return None;
+    }
+    Some(
+        chars[start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(n, |j| start + j),
+    )
+}
+
 /// A lenient Rust lexer for the source-redirect and core rules: comments
 /// are dropped and literals become one token, so a name inside a string or
 /// a comment cannot hide or fake an attribute. An unterminated literal or
@@ -270,7 +325,8 @@ pub(crate) fn rust_tokens(text: &str) -> Result<Vec<Token>, String> {
             line,
         });
     };
-    let mut i = 0;
+    // A shebang line is no code for rustc, so it is skipped too.
+    let mut i = shebang_end(&chars).unwrap_or(0);
     while i < n {
         let c = chars[i];
         if is_pws(c) {
@@ -600,10 +656,12 @@ pub(crate) fn source_redirects(toks: &[Token]) -> Vec<(usize, &'static str)> {
 // --------------------------------------------------------------- file-lock
 
 /// The names a file lock is taken by in libc: `flock`, `lockf`, the
-/// `flock` syscall and operations, and the `fcntl` record and open file
-/// description lock commands (ADR-030, D5).
-const RAW_LOCK_NAMES: [&str; 13] = [
+/// `flock` syscall and operations, the `fcntl` record and open file
+/// description lock commands, and the `struct flock64` and lock types an
+/// `fcntl` lock is described by (ADR-030, D5).
+const RAW_LOCK_NAMES: [&str; 17] = [
     "flock",
+    "flock64",
     "lockf",
     "SYS_flock",
     "LOCK_SH",
@@ -616,6 +674,9 @@ const RAW_LOCK_NAMES: [&str; 13] = [
     "F_OFD_SETLK",
     "F_OFD_SETLKW",
     "F_OFD_GETLK",
+    "F_RDLCK",
+    "F_WRLCK",
+    "F_UNLCK",
 ];
 
 /// The file-lock methods of std's `File`.
@@ -678,9 +739,9 @@ const KEYWORDS: [&str; 38] = [
     "while",
 ];
 
-/// The items that declare a name in the type namespace, and `as`, which
-/// renames one.
-const DECLARERS: [&str; 7] = ["struct", "enum", "union", "type", "trait", "mod", "as"];
+/// The items that declare a name in the type namespace (`as`, which
+/// renames one, is read apart in `shadows`).
+const DECLARERS: [&str; 6] = ["struct", "enum", "union", "type", "trait", "mod"];
 
 fn punct_at(toks: &[Token], k: usize, c: char) -> bool {
     toks.get(k).is_some_and(|t| t.is_punct(c))
@@ -845,6 +906,33 @@ fn use_mask(toks: &[Token], macros: &[bool]) -> Vec<bool> {
     mask
 }
 
+/// For every token, whether it lies in a restricted visibility `pub(in
+/// path)` outside a macro, with only path tokens between: its `::lock`
+/// names a module, not a call.
+fn visibility_mask(toks: &[Token], macros: &[bool]) -> Vec<bool> {
+    let mut mask = vec![false; toks.len()];
+    for k in 0..toks.len() {
+        if macros[k]
+            || !keyword_at(toks, k, &["pub"])
+            || !punct_at(toks, k + 1, '(')
+            || !keyword_at(toks, k + 2, &["in"])
+        {
+            continue;
+        }
+        let mut j = k + 3;
+        while toks
+            .get(j)
+            .is_some_and(|t| t.kind == Kind::Ident || t.is_punct(':'))
+        {
+            j += 1;
+        }
+        if j > k + 3 && punct_at(toks, j, ')') {
+            mask[k..=j].fill(true);
+        }
+    }
+    mask
+}
+
 /// The indices of the names declared in a generic parameter list: the
 /// first token after the `<` of `impl<`, `fn name<`, `struct name<` (and
 /// `enum`, `union`, `trait`, `type`), and after each `,` at its top level.
@@ -902,7 +990,13 @@ fn shadows(toks: &[Token], k: usize, generics: &[usize]) -> bool {
     if !TRUSTED_NAMES.contains(&name) {
         return false;
     }
-    let declared = k >= 1 && keyword_at(toks, k - 1, &DECLARERS);
+    // `as` renames only in a `use` tree or after `extern crate`, where the
+    // name ends the item or a group member; `<W as io::Write>` and
+    // `fd as io::RawFd` name the trait or type, they do not rename it.
+    let renamed = k >= 1
+        && keyword_at(toks, k - 1, &["as"])
+        && (punct_at(toks, k + 1, ';') || punct_at(toks, k + 1, ',') || punct_at(toks, k + 1, '}'));
+    let declared = (k >= 1 && keyword_at(toks, k - 1, &DECLARERS)) || renamed;
     let bound = name != "io" && punct_at(toks, k + 1, ':') && !punct_at(toks, k + 2, ':');
     declared || bound || generics.binary_search(&k).is_ok()
 }
@@ -991,12 +1085,14 @@ fn proven(toks: &[Token], k: usize) -> bool {
 /// - the file-lock method names inside a macro group, wherever they
 ///   stand, because a macro can rearrange its input;
 /// - outside one, in method position (`.name(` or `.name::`) and in path
-///   position (`::name` outside a `use` item, not followed by `::` and a
+///   position (`::name` outside a `use` item and a `pub(in ..)`
+///   visibility, not followed by `::` and a
 ///   further segment), unless `lock`/`try_lock` takes a proven form;
 /// - a redefinition of a name the proven forms trust, and `fn as_deref`.
 pub(crate) fn file_lock_hits(toks: &[Token]) -> Vec<(usize, String)> {
     let macros = macro_mask(toks);
     let uses = use_mask(toks, &macros);
+    let visibility = visibility_mask(toks, &macros);
     let generics = generic_params(toks);
     let mut hits = Vec::new();
     for (k, t) in toks.iter().enumerate() {
@@ -1039,7 +1135,7 @@ pub(crate) fn file_lock_hits(toks: &[Token]) -> Vec<(usize, String)> {
             && punct_at(toks, k - 1, '.')
             && (punct_at(toks, k + 1, '(') || path_sep_at(toks, k + 1));
         let continued = path_sep_at(toks, k + 1) && !punct_at(toks, k + 3, '<');
-        let path = k >= 2 && path_sep_at(toks, k - 2) && !uses[k] && !continued;
+        let path = k >= 2 && path_sep_at(toks, k - 2) && !uses[k] && !visibility[k] && !continued;
         if (method || path) && !proven(toks, k) {
             hits.push((
                 t.line,
@@ -1558,6 +1654,10 @@ mod tests {
             "F_OFD_SETLK",
             "F_OFD_SETLKW",
             "F_OFD_GETLK",
+            "flock64",
+            "F_RDLCK",
+            "F_WRLCK",
+            "F_UNLCK",
         ] {
             assert_eq!(
                 lock_lines(&format!("fn f() {{ libc::{name}; }}")),
@@ -1575,6 +1675,7 @@ mod tests {
             "fn f() { libc::syscall(libc::SYS_flock, fd, 2); }",
             "fn f() { libc::fcntl(fd, libc::F_OFD_SETLKW, &l); }",
             "fn f() { r#flock(fd, 2); }",
+            "fn f() { libc::fcntl(fd, 6, &libc::flock64 { l_type: libc::F_WRLCK as i16, ..z }); }",
         ]);
     }
 
@@ -1629,6 +1730,8 @@ mod tests {
             "fn f() { io::stdout().try_lock(); }",
             "fn f() { io::stdout(x).lock(); }",
             "fn f() { io::other().lock(); }",
+            "fn f() { x::stdout().lock(); }",
+            "fn f(m: &Mutex<u8>) { m.lock().unwrap_or_else(Tr::into_inner); }",
             "fn f() { if !(m.lock().is_ok()) {} }",
         ]);
     }
@@ -1659,7 +1762,14 @@ mod tests {
             "/// x.lock()\n//! LOCK_UN\nfn f() {}",
             "/* a /* x.lock() */ File::lock(&f) */ fn f() {}",
             "fn f() { io::stdout().lock(); } fn io() {}",
+            "pub(in crate::lock) fn helper() {}",
+            "pub(in crate::a::lock) struct S;",
         ]);
+        // Only the visibility is a path; a call after it is still one.
+        assert_eq!(
+            lock_lines("pub(in crate::lock) fn f(f: &File) {\n    File::lock(&f);\n}"),
+            [2]
+        );
     }
 
     /// Inside a macro group every lock name is flagged wherever it stands,
@@ -1705,6 +1815,7 @@ mod tests {
             "type Mutex = File;",
             "use std::fs::File as Mutex;",
             "use std::fs::{File as PoisonError};",
+            "use std::fs::{File as Mutex, read};",
             "enum PoisonError {}",
             "union Mutex { a: u8 }",
             "trait Mutex {}",
@@ -1735,6 +1846,9 @@ mod tests {
             "fn f() { x.as_deref(); }",
             "use std::sync::{Mutex, PoisonError};",
             "use std::io;",
+            "fn f<W: io::Write>(w: &mut W) -> io::Result<()> { <W as io::Write>::flush(w) }",
+            "fn f(fd: i32) { let x = fd as io::RawFd; }",
+            "fn f(r: &mut R) { let x = r as &mut dyn io::Read; }",
         ]);
     }
 
@@ -1782,5 +1896,36 @@ mod tests {
             "fn f() { File::r#unlock(&f); }",
         ]);
         assert_passes(&["fn f() { f.l\u{43e}ck(); }"]);
+    }
+
+    /// A shebang line is dropped as rustc drops it, so a `/*` on it hides
+    /// nothing: `#!` at the start (after a byte order mark) whose next
+    /// token, past whitespace and plain comments, is not `[`.
+    #[test]
+    fn file_lock_shebang_line_is_skipped_as_rustc_does() {
+        let hidden = "#!/usr/bin/env cargo /*\nfn f(f: &File) -> R { f.lock() }\n// */";
+        assert_eq!(lock_lines(hidden), [2]);
+        assert_eq!(lock_lines(&format!("\u{feff}{hidden}")), [2]);
+        let values = |src: &str| -> Vec<String> {
+            rust_tokens(src)
+                .expect("lexes")
+                .into_iter()
+                .map(|t| t.value)
+                .collect()
+        };
+        // A doc comment ends the search: rustc reads `#! /// d` as a
+        // shebang line.
+        assert_eq!(
+            values("#! /// d\nfn f() {}"),
+            ["fn", "f", "(", ")", "{", "}"]
+        );
+        assert_eq!(values("#!x\ny"), ["y"]);
+        assert!(values("#!").is_empty());
+        // `#![` is an inner attribute, also past whitespace and plain
+        // comments, and `#!` later in the file is no shebang.
+        assert_eq!(values("#! /* c */ // d\n [a]"), ["#", "!", "[", "a", "]"]);
+        assert_eq!(values("#![a]"), ["#", "!", "[", "a", "]"]);
+        assert_eq!(values(" #!x"), ["#", "!", "x"]);
+        assert_eq!(lock_lines("#![a] /*\n*/ fn f() { f.lock(); }"), [2]);
     }
 }
