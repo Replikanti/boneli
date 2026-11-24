@@ -18,6 +18,16 @@
 //! only after their signature verified; without claims the predicate is
 //! never read.
 //!
+//! A trust of GitHub Actions identities may also carry Fulcio certificate
+//! claims ([`CertificateClaims`], ADR-034): the Source Repository URI and
+//! Ref Fulcio wrote into the leaf from the OIDC token (exact, or a prefix
+//! ending in `/`), the repository's numeric ID, the calling workflow file
+//! (the path in the Build Config URI), and a required list of build
+//! triggers. They apply to every keyless carrier, `.sig` layers
+//! included, and are read only from a leaf webpki verified. An opt-in
+//! statement agreement also makes an SLSA statement's builder, source
+//! repository, ref and source commit equal what the certificate says.
+//!
 //! Finding the evidence is the caller's job (`boneli-oci` reads the
 //! registry); everything here is pure, reads no clock, no file and no
 //! network, and gives the same verdict for the same bytes forever. The
@@ -30,8 +40,8 @@
 //! Out of scope (ADR-029): Rekor v2 entries, RFC 3161 timestamps as the
 //! time source, inclusion proofs and checkpoints, `messageSignature`
 //! bundles and bundles before v0.3, Notation, cosign `.att` and SLSA v0.2,
-//! claims from Fulcio's certificate extensions, and keeping
-//! `trusted_root.json` current (TUF).
+//! certificate claims under issuers other than GitHub Actions (ADR-034),
+//! and keeping `trusted_root.json` current (TUF).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 pub mod base64;
@@ -39,6 +49,7 @@ mod bundle;
 mod cosign;
 mod dsse;
 mod error;
+mod fulcio;
 mod hex;
 mod identity;
 mod json;
@@ -56,6 +67,7 @@ pub use cosign::{
 };
 pub use dsse::{IN_TOTO_PAYLOAD_TYPE, STATEMENT_V1, pae};
 pub use error::{ConfigError, Refusal};
+pub use fulcio::{CertificateClaims, CertificateRefusal, Extension, GITHUB_ACTIONS_ISSUER};
 pub use identity::{Identity, SanRule};
 pub use provenance::{ClaimMatch, ClaimRefusal, Claims, GITHUB_WORKFLOW_BUILD_TYPE, Material};
 pub use root::{TRUSTED_ROOT_MEDIA_TYPE, TrustedRoot};

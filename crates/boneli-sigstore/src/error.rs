@@ -7,6 +7,7 @@ use std::fmt;
 
 use boneli_https::{CertError, SctError};
 
+use crate::fulcio::CertificateRefusal;
 use crate::provenance::ClaimRefusal;
 
 /// Why one piece of evidence does not let an image pass.
@@ -104,6 +105,9 @@ pub enum Refusal {
     UnknownBuildType,
     /// A claim of the rule is not met.
     Claim(ClaimRefusal),
+    /// A Fulcio certificate claim of the rule is not met, or the
+    /// statement disagrees with the certificate (ADR-034).
+    CertificateClaim(CertificateRefusal),
 }
 
 impl fmt::Display for Refusal {
@@ -161,6 +165,7 @@ impl fmt::Display for Refusal {
                 "the provenance's build type is not one whose source the rule can read"
             }
             Refusal::Claim(claim) => return claim.fmt(f),
+            Refusal::CertificateClaim(claim) => return claim.fmt(f),
         };
         f.write_str(text)?;
         match self {
@@ -173,8 +178,8 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Why a trusted root, an identity, a trust or a claim list was refused
-/// at configuration.
+/// Why a trusted root, an identity, a trust, a claim list or certificate
+/// claims were refused at configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     /// The trusted root is longer than
@@ -221,6 +226,24 @@ pub enum ConfigError {
     /// A trust with claims does not list exactly the SLSA provenance v1
     /// predicate type.
     ClaimsPredicateTypes,
+    /// Certificate claims list no build trigger (ADR-034).
+    TriggersEmpty,
+    /// A repository ID is not ASCII digits without a leading zero.
+    RepositoryIdNotDecimal,
+    /// A trust with keys was given certificate claims.
+    CertificateClaimsWithKeys,
+    /// A trust with certificate claims has an identity whose issuer is not
+    /// GitHub Actions'.
+    CertificateClaimsIssuer,
+    /// The statement agreement was asked for on a trust without
+    /// provenance claims.
+    AgreementWithoutClaims,
+    /// A workflow path is empty, not printable ASCII, absolute, holds an
+    /// `@`, or has an empty, `.` or `..` segment.
+    WorkflowPathNotPlain,
+    /// A workflow-path rule is set with neither a source repository rule
+    /// (1.12) nor a repository ID (1.15).
+    WorkflowPathWithoutRepository,
 }
 
 impl fmt::Display for ConfigError {
@@ -252,6 +275,25 @@ impl fmt::Display for ConfigError {
             ConfigError::MaterialDigestNotHex => "a material digest is not lower-case hex",
             ConfigError::ClaimsPredicateTypes => {
                 "a trust with claims must list exactly the SLSA provenance v1 predicate type"
+            }
+            ConfigError::TriggersEmpty => "certificate claims list no trigger",
+            ConfigError::RepositoryIdNotDecimal => {
+                "a repository ID is not a decimal number without a leading zero"
+            }
+            ConfigError::CertificateClaimsWithKeys => {
+                "a trust with keys cannot have certificate claims"
+            }
+            ConfigError::CertificateClaimsIssuer => {
+                "certificate claims need every identity's issuer to be GitHub Actions'"
+            }
+            ConfigError::AgreementWithoutClaims => {
+                "the statement agreement needs provenance claims, set first"
+            }
+            ConfigError::WorkflowPathNotPlain => {
+                "a workflow path is not a plain relative path of printable ASCII without @"
+            }
+            ConfigError::WorkflowPathWithoutRepository => {
+                "a workflow path needs a source repository rule or a repository ID"
             }
         })
     }

@@ -47,6 +47,29 @@ const RSA_SHA256: &[u8] = &[
     0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B, 0x05, 0x00,
 ];
 
+/// GitHub Actions' OIDC issuer, and the claims of the leaf
+/// [`LeafSpec::github`] builds (ADR-034).
+pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+pub const GH_WORKFLOW: &str =
+    "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main";
+pub const GH_REPOSITORY: &str = "https://github.com/acme/app";
+pub const GH_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+pub const GH_REF: &str = "refs/heads/main";
+pub const GH_ID: &str = "4242";
+pub const GH_TRIGGER: &str = "push";
+pub const GH_MATERIAL: &str = "git+https://github.com/acme/app@refs/heads/main";
+
+/// The content octets of Fulcio's OID 1.3.6.1.4.1.57264.1.`nn`.
+pub fn fulcio_oid(nn: u8) -> Vec<u8> {
+    vec![0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x01, nn]
+}
+
+/// A non-critical Fulcio extension 1.`nn` whose `extnValue` holds
+/// `value`, a whole TLV (or raw bytes, for the deprecated 1.1 to 1.6).
+pub fn fulcio_ext(nn: u8, value: &[u8]) -> Vec<u8> {
+    ext(&fulcio_oid(nn), false, value)
+}
+
 pub const RFC822_NAME: u8 = 0x81;
 pub const URI_NAME: u8 = 0x86;
 
@@ -348,6 +371,14 @@ pub struct LeafSpec {
     pub eku: Option<Vec<&'static [u8]>>,
     pub ca: bool,
     pub scts: Vec<SctSpec>,
+    /// Whole extensions put before every other one.
+    pub first: Vec<Vec<u8>>,
+    /// Whole extensions put after the issuer extensions (Fulcio's
+    /// certificate claims, ADR-034).
+    pub extra: Vec<Vec<u8>>,
+    /// Whole extensions put after the SCT list. Every SCT is signed over
+    /// the TBS with all extensions but the list, in their final order.
+    pub after_sct: Vec<Vec<u8>>,
 }
 
 impl LeafSpec {
@@ -364,6 +395,9 @@ impl LeafSpec {
             eku: Some(vec![CODE_SIGNING]),
             ca: false,
             scts: vec![SctSpec::good()],
+            first: Vec::new(),
+            extra: Vec::new(),
+            after_sct: Vec::new(),
         }
     }
 
@@ -387,8 +421,45 @@ impl LeafSpec {
         }
     }
 
+    /// A GitHub Actions leaf (ADR-034): a URI SAN `san`, both issuer
+    /// extensions naming [`GITHUB_ISSUER`], and well-formed Build Signer
+    /// URI (1.9), Source Repository URI (1.12), Digest (1.13), Ref (1.14),
+    /// Identifier (1.15) and Build Trigger (1.20) of `acme/app`.
+    pub fn github(san: &str) -> LeafSpec {
+        LeafSpec {
+            issuer_v1: Some(GITHUB_ISSUER.as_bytes().to_vec()),
+            issuer_v2: Some(utf8(GITHUB_ISSUER.as_bytes())),
+            extra: vec![
+                fulcio_ext(9, &utf8(GH_WORKFLOW.as_bytes())),
+                fulcio_ext(12, &utf8(GH_REPOSITORY.as_bytes())),
+                fulcio_ext(13, &utf8(GH_COMMIT.as_bytes())),
+                fulcio_ext(14, &utf8(GH_REF.as_bytes())),
+                fulcio_ext(15, &utf8(GH_ID.as_bytes())),
+                fulcio_ext(20, &utf8(GH_TRIGGER.as_bytes())),
+            ],
+            ..LeafSpec::uri(san)
+        }
+    }
+
+    /// Sets Fulcio extension 1.3.6.1.4.1.57264.1.`nn` among `extra` to
+    /// `value` (a whole TLV), in place, or removes it when `None`.
+    pub fn fulcio(mut self, nn: u8, value: Option<Vec<u8>>) -> LeafSpec {
+        let oid = tlv(0x06, &fulcio_oid(nn));
+        let at = self.extra.iter().position(|e| content(e).starts_with(&oid));
+        match (at, value) {
+            (Some(i), Some(v)) => self.extra[i] = fulcio_ext(nn, &v),
+            (Some(i), None) => {
+                self.extra.remove(i);
+            }
+            (None, Some(v)) => self.extra.push(fulcio_ext(nn, &v)),
+            (None, None) => {}
+        }
+        self
+    }
+
     fn extensions(&self) -> Vec<Vec<u8>> {
-        let mut e = vec![key_usage(0x80)];
+        let mut e = self.first.clone();
+        e.push(key_usage(0x80));
         if let Some(purposes) = &self.eku {
             e.push(eku(purposes));
         }
@@ -402,6 +473,7 @@ impl LeafSpec {
         if let Some(v2) = &self.issuer_v2 {
             e.push(ext(ISSUER_V2, false, v2));
         }
+        e.extend(self.extra.iter().cloned());
         e
     }
 
@@ -412,10 +484,10 @@ impl LeafSpec {
         };
         let issuer_key_hash = Sha256::digest(&spki_of(ca_cert));
         let base = self.extensions();
-        let precert = self.spec(pki, self.serial, base.clone()).tbs();
-        let other = self
-            .spec(pki, self.serial.wrapping_add(1), base.clone())
-            .tbs();
+        let mut unlisted = base.clone();
+        unlisted.extend(self.after_sct.iter().cloned());
+        let precert = self.spec(pki, self.serial, unlisted.clone()).tbs();
+        let other = self.spec(pki, self.serial.wrapping_add(1), unlisted).tbs();
         let mut extensions = base;
         if !self.scts.is_empty() {
             let scts: Vec<Vec<u8>> = self
@@ -432,6 +504,7 @@ impl LeafSpec {
                 .collect();
             extensions.push(ext(SCT_LIST, false, &tlv(0x04, &tls_list(&scts))));
         }
+        extensions.extend(self.after_sct.iter().cloned());
         self.spec(pki, self.serial, extensions).sign(ca_key)
     }
 }

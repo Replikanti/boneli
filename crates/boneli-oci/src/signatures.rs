@@ -18,7 +18,8 @@
 //!      [`SIMPLE_SIGNING_MEDIA_TYPE`] of at most [`MAX_PAYLOAD_BYTES`] is
 //!      a candidate, its payload fetched by digest; a rule whose trust has
 //!      provenance claims skips it with no request, since only an SLSA
-//!      statement can meet them (ADR-031);
+//!      statement can meet them (ADR-031); certificate claims alone
+//!      (ADR-034) do not, a keyless layer's leaf can meet them;
 //!    - the referrers API, and on `404` (only) the tag `sha256-<hex>`:
 //!      each entry whose `artifactType` is [`BUNDLE_V03_MEDIA_TYPE`] and
 //!      whose predicate-type annotation is on the trust's list is a
@@ -399,7 +400,8 @@ impl Check<'_, '_> {
         for subject in subjects {
             // A rule with provenance claims admits SLSA statements only
             // (ADR-031): no `.sig` candidate could pass, so none is asked
-            // for.
+            // for. Certificate claims alone (ADR-034) keep the `.sig`
+            // carrier: a keyless layer's leaf can meet them.
             let mut found = if self.trust.claims().is_some() {
                 notes.push(format!(
                     "{subject}: .sig: not examined, the rule has provenance claims"

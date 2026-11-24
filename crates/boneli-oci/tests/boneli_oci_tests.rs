@@ -628,7 +628,7 @@ mod network {
         Stream, TlsDial,
     };
     use boneli_sigstore::{
-        COSIGN_SIGN_PREDICATE, ClaimMatch, Claims, Identity, Material,
+        COSIGN_SIGN_PREDICATE, CertificateClaims, ClaimMatch, Claims, Identity, Material,
         SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot,
     };
     use boneli_sys::ExitStatus;
@@ -1331,6 +1331,96 @@ mod network {
                         "{detail}"
                     );
                     assert!(detail.contains(".sig: not examined"), "{detail}");
+                }
+                other => panic!("jq must be refused: {other:?}"),
+            }
+            let committed = std::fs::read_dir(root.join("layers/sha256"))
+                .map(|dir| {
+                    dir.filter_map(Result::ok)
+                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(committed, 0, "a layer was committed");
+        }
+    }
+
+    /// jq's SLSA trust of `jq_provenance` with Fulcio certificate claims
+    /// (ADR-034): the source repository exactly, a tag ref, the repository
+    /// ID and the trigger list `triggers`, with the statement agreement.
+    fn jq_certificate(triggers: &str) -> Requirement {
+        let Requirement::Required(trust) = jq_provenance("https://github.com/jqlang/jq") else {
+            panic!("jq's provenance rule is Required");
+        };
+        let claims = CertificateClaims::new(
+            Some(ClaimMatch::Exact("https://github.com/jqlang/jq".to_owned())),
+            Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+            vec![triggers.to_owned()],
+        )
+        .expect("certificate claims")
+        .with_repository_id("5101141")
+        .expect("repository id")
+        .with_statement_agreement();
+        Requirement::Required(Arc::new(
+            Trust::clone(&trust)
+                .with_certificate_claims(claims)
+                .expect("with certificate claims"),
+        ))
+    }
+
+    /// The acceptance of ADR-034 on GHCR: under a `Required` rule whose
+    /// trust has SLSA provenance claims, Fulcio certificate claims and the
+    /// statement agreement, jq 1.8.2 pulls with every layer committed;
+    /// under the trigger list `[release]` it is refused before any layer is
+    /// committed, and the detail names the build trigger.
+    #[test]
+    #[ignore = "network: pulls jqlang/jq from ghcr.io"]
+    fn certificate_claims_on_ghcr() {
+        let ghcr = Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("ghcr");
+        for triggers in ["push", "release"] {
+            let dial = recording();
+            let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+            config.registries = vec![Registry::docker_hub(), ghcr.clone()];
+            config.signatures = SignaturePolicy::new(
+                Requirement::Off,
+                vec![rule(
+                    "ghcr.io",
+                    RepoScope::Exact(Repository::parse("jqlang/jq").expect("repository")),
+                    jq_certificate(triggers),
+                )],
+            )
+            .expect("policy");
+            let tmp = TempDir::new("network-certificate");
+            let root = tmp.path().join("store");
+            let store = OciImageStore::open(&root, config).expect("open");
+            if triggers == "push" {
+                pull_signed(&store, &dial, "ghcr.io/jqlang/jq", JQ);
+                continue;
+            }
+            let refused = store.pull(&ImageRef {
+                name: "ghcr.io/jqlang/jq".to_owned(),
+                digest: JQ.to_owned(),
+                platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
+            });
+            println!(
+                "oci-acceptance certificate claims ghcr.io/jqlang/jq under [release]: {refused:?}"
+            );
+            match refused {
+                Err(ImageError::Failed { detail }) => {
+                    assert!(detail.starts_with("signature policy: "), "{detail}");
+                    assert!(
+                        detail.contains(
+                            "the certificate's Fulcio Build Trigger (1.3.6.1.4.1.57264.1.20) does not meet the rule"
+                        ),
+                        "{detail}"
+                    );
                 }
                 other => panic!("jq must be refused: {other:?}"),
             }

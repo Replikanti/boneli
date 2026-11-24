@@ -21,10 +21,15 @@
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
 //!   and different is refused); and an identity matching issuer and SAN.
 //!
+//! - **Certificate claims (ADR-034):** under a trust with
+//!   [`CertificateClaims`], the keyless leaf that passed must also meet
+//!   them (`fulcio`), on every carrier, before any statement is read.
 //! - **Claims (ADR-031):** under a trust with [`Claims`], a cosign layer
 //!   is refused before any other check (it carries no provenance), and a
 //!   bundle whose signature passed must also meet the claims
-//!   (`provenance`). A trust without claims never reads the predicate.
+//!   (`provenance`), after agreeing with the certificate when the
+//!   certificate claims ask for it. A trust without claims never reads
+//!   the predicate.
 //!
 //! No step reads the wall clock: the only time is the log's, so the same
 //! inputs give the same verdict forever.
@@ -36,6 +41,7 @@ use boneli_https::{CertError, CodeSigningCert, PublicKey, verify_code_signing};
 
 use crate::dsse::Statement;
 use crate::error::{ConfigError, Refusal};
+use crate::fulcio::{self, CertificateClaims, Facts, GITHUB_ACTIONS_ISSUER, utf8_string};
 use crate::identity::{Identity, printable};
 use crate::provenance::{self, Claims};
 use crate::rekor::{self, Expected, TlogEntry};
@@ -122,16 +128,18 @@ impl Evidence {
 
 /// What a rule trusts: keys, a keyless part (a trusted root and the
 /// identities it may vouch for), the predicate types a bundle's statement
-/// may have, and optionally the SLSA provenance claims it must meet
-/// (ADR-031).
+/// may have, and optionally the SLSA provenance claims (ADR-031) and the
+/// Fulcio certificate claims (ADR-034) it must meet.
 ///
-/// `Debug` shows the counts only, and `claims: true` when claims are set.
+/// `Debug` shows the counts only, `claims: true` when claims are set and
+/// `certificate_claims: true` when certificate claims are.
 #[derive(Clone)]
 pub struct Trust {
     keys: Vec<PublicKey>,
     keyless: Option<(Arc<TrustedRoot>, Vec<Identity>)>,
     predicate_types: Vec<String>,
     claims: Option<Claims>,
+    certificate_claims: Option<CertificateClaims>,
 }
 
 impl fmt::Debug for Trust {
@@ -146,6 +154,9 @@ impl fmt::Debug for Trust {
         // Named only when set, so a trust without claims reads as in #57.
         if self.claims.is_some() {
             out.field("claims", &true);
+        }
+        if self.certificate_claims.is_some() {
+            out.field("certificate_claims", &true);
         }
         out.finish()
     }
@@ -174,6 +185,7 @@ impl Trust {
             keyless,
             predicate_types,
             claims: None,
+            certificate_claims: None,
         })
     }
 
@@ -200,6 +212,42 @@ impl Trust {
     /// The SLSA provenance claims, if any.
     pub fn claims(&self) -> Option<&Claims> {
         self.claims.as_ref()
+    }
+
+    /// This trust with Fulcio certificate `claims` (ADR-034): its keyless
+    /// signatures then pass only from leaves that meet them. Refused for a
+    /// trust with keys (a keyed signature has no certificate), unless
+    /// every identity's issuer is exactly [`GITHUB_ACTIONS_ISSUER`] (other
+    /// issuers give these extensions other meanings), and for the
+    /// statement agreement without provenance claims (set them first), and
+    /// for a workflow-path rule with neither a repository rule nor a
+    /// repository ID, which would bind no repository.
+    pub fn with_certificate_claims(self, claims: CertificateClaims) -> Result<Trust, ConfigError> {
+        if !self.keys.is_empty() {
+            return Err(ConfigError::CertificateClaimsWithKeys);
+        }
+        let github = self
+            .keyless
+            .as_ref()
+            .is_some_and(|(_, ids)| ids.iter().all(|id| id.issuer() == GITHUB_ACTIONS_ISSUER));
+        if !github {
+            return Err(ConfigError::CertificateClaimsIssuer);
+        }
+        if claims.agreement && self.claims.is_none() {
+            return Err(ConfigError::AgreementWithoutClaims);
+        }
+        if claims.path_binds_no_repository() {
+            return Err(ConfigError::WorkflowPathWithoutRepository);
+        }
+        Ok(Trust {
+            certificate_claims: Some(claims),
+            ..self
+        })
+    }
+
+    /// The Fulcio certificate claims, if any.
+    pub fn certificate_claims(&self) -> Option<&CertificateClaims> {
+        self.certificate_claims.as_ref()
     }
 }
 
@@ -243,17 +291,30 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
             }
         }
     }
-    let accepted = signature(evidence, trust)?;
+    let (accepted, cert) = signature(evidence, trust)?;
+    // Fulcio's facts first: no statement is read for a leaf that fails.
+    let facts = match (&trust.certificate_claims, &cert) {
+        (None, _) => None,
+        (Some(_), None) => return Err(Refusal::NoCertificate),
+        (Some(claims), Some(cert)) => Some((Facts::read(cert, claims)?, claims)),
+    };
+    let agreement = match &facts {
+        Some((facts, claims)) => fulcio::check(facts, claims)?,
+        None => None,
+    };
     // Only a statement a trusted signer signed is read for its claims.
     if let (Some(claims), Form::Bundle { payload, .. }) = (&trust.claims, &evidence.form) {
-        provenance::check(payload, claims)?;
+        provenance::check(payload, claims, agreement.as_ref())?;
     }
     Ok(accepted)
 }
 
 /// The signature checks of [`verify`], after the subject check: a trusted
-/// key, else the keyless path.
-fn signature(evidence: &Evidence, trust: &Trust) -> Result<Accepted, Refusal> {
+/// key, else the keyless path, which also gives the verified leaf.
+fn signature(
+    evidence: &Evidence,
+    trust: &Trust,
+) -> Result<(Accepted, Option<CodeSigningCert>), Refusal> {
     let message = evidence.message();
     let signature = evidence.signature();
     if let Some(key) = trust
@@ -261,7 +322,7 @@ fn signature(evidence: &Evidence, trust: &Trust) -> Result<Accepted, Refusal> {
         .iter()
         .position(|key| key.verify(message, signature).is_ok())
     {
-        return Ok(Accepted::Keyed { key });
+        return Ok((Accepted::Keyed { key }, None));
     }
     let (Some((root, identities)), true) = (&trust.keyless, evidence.is_keyless()) else {
         return Err(if trust.keys.is_empty() {
@@ -270,15 +331,17 @@ fn signature(evidence: &Evidence, trust: &Trust) -> Result<Accepted, Refusal> {
             Refusal::NoTrustedKey
         });
     };
-    keyless(evidence, root, identities)
+    let (accepted, cert) = keyless(evidence, root, identities)?;
+    Ok((accepted, Some(cert)))
 }
 
-/// The keyless path of [`verify`], after the subject check.
+/// The keyless path of [`verify`], after the subject check; gives the
+/// leaf webpki verified too.
 fn keyless(
     evidence: &Evidence,
     root: &TrustedRoot,
     identities: &[Identity],
-) -> Result<Accepted, Refusal> {
+) -> Result<(Accepted, CodeSigningCert), Refusal> {
     let (entry, expected, certificate) = match &evidence.form {
         Form::Cosign {
             payload,
@@ -336,11 +399,12 @@ fn keyless(
         .iter()
         .position(|id| id.matches(issuer, san))
         .ok_or(Refusal::IdentityMismatch)?;
-    Ok(Accepted::Keyless {
+    let accepted = Accepted::Keyless {
         integrated_time: at,
         log_index: entry.log_index,
         identity,
-    })
+    };
+    Ok((accepted, cert))
 }
 
 /// The certificate, verified through the first authority whose window
@@ -374,29 +438,4 @@ fn issuer(cert: &CodeSigningCert) -> Result<&[u8], Refusal> {
         (None, Some(b)) => Ok(b),
         (None, None) => Err(Refusal::NoIssuer),
     }
-}
-
-/// The content of a whole DER UTF8String with a minimal length.
-fn utf8_string(der: &[u8]) -> Option<&[u8]> {
-    let (&tag, rest) = der.split_first()?;
-    if tag != 0x0C {
-        return None;
-    }
-    let (&first, rest) = rest.split_first()?;
-    let (len, rest) = match first {
-        0..=0x7F => (usize::from(first), rest),
-        0x81 => {
-            let (&n, rest) = rest.split_first()?;
-            (n >= 0x80).then_some((usize::from(n), rest))?
-        }
-        0x82 => {
-            let [hi, lo, rest @ ..] = rest else {
-                return None;
-            };
-            let n = usize::from(*hi) << 8 | usize::from(*lo);
-            (n >= 0x100).then_some((n, rest))?
-        }
-        _ => return None,
-    };
-    (rest.len() == len).then_some(rest)
 }
