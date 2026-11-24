@@ -1491,16 +1491,16 @@
    "title": "boneli-oci: verify cosign .att SLSA v0.2 provenance for rules with claims",
    "epic": null,
    "order": 57,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "6cc0788e",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T09:24:47+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T09:24:58+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1517,16 +1517,16 @@
    "title": "boneli-sigstore: match Fulcio certificate source repository and ref extensions under Required",
    "epic": null,
    "order": 58,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "1806fc84",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-24T09:24:47+00:00",
+   "note": "",
+   "updated_at": "2026-11-24T09:24:58+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1540,22 +1540,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T21:40:46+00:00",
-   "issue": 97,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "36e4fbcc",
-   "note": null
-  },
-  {
-   "at": "2026-11-23T22:14:05+00:00",
-   "issue": 97,
-   "from": "pr-review",
-   "to": "done",
-   "by": "36e4fbcc",
-   "note": null
-  },
   {
    "at": "2026-11-23T22:38:06+00:00",
    "issue": 56,
@@ -1939,6 +1923,22 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-24T09:24:58+00:00",
+   "issue": 114,
+   "from": "ready",
+   "to": "claimed",
+   "by": "6cc0788e",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T09:24:58+00:00",
+   "issue": 113,
+   "from": "ready",
+   "to": "claimed",
+   "by": "1806fc84",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -1972,7 +1972,7 @@
   114
  ],
  "xopen": [],
- "updated_at": "2026-11-24T09:24:47+00:00",
+ "updated_at": "2026-11-24T09:24:58+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
