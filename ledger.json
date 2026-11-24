@@ -1389,7 +1389,7 @@
    "title": "boneli-sigstore: check SLSA provenance predicate claims (builder, source, materials) under Required",
    "epic": null,
    "order": 53,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "88ef9d69",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1398,7 +1398,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-24T04:20:35+00:00",
+   "updated_at": "2026-11-24T04:43:53+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1488,14 +1488,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T23:32:02+00:00",
-   "issue": 98,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-20T23:32:02+00:00",
    "issue": 97,
@@ -1887,6 +1879,14 @@
    "to": "plan-review",
    "by": "7ee136eb",
    "note": null
+  },
+  {
+   "at": "2026-11-24T04:43:53+00:00",
+   "issue": 104,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "88ef9d69",
+   "note": null
   }
  ],
  "open": [
@@ -1919,7 +1919,7 @@
   105
  ],
  "xopen": [],
- "updated_at": "2026-11-24T04:43:01+00:00",
+ "updated_at": "2026-11-24T04:43:53+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
