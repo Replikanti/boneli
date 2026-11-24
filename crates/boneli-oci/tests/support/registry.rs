@@ -208,7 +208,8 @@ pub fn challenge_for(repo: &str) -> String {
 /// A small Docker Hub: tokens from `auth.docker.io`, an API at
 /// `registry-1.docker.io` that wants `Bearer tok-1` and answers an unknown
 /// repository with `401` even then (measured), and blobs redirected to
-/// `production.cloudfront.docker.com` when `cdn` is set.
+/// the CDN host when `cdn` is set: `cdn_host`, or
+/// `production.cloudfront.docker.com` without one.
 #[derive(Clone, Default)]
 pub struct Hub {
     /// Repository → (digest → (content type, bytes)) of its documents.
@@ -217,6 +218,9 @@ pub struct Hub {
     pub blobs: BTreeMap<String, Vec<u8>>,
     /// Redirect blob requests to the CDN.
     pub cdn: bool,
+    /// The host blob requests are redirected to and that serves them;
+    /// `production.cloudfront.docker.com` when `None`.
+    pub cdn_host: Option<String>,
     /// Repository → (tag → (content type, bytes)): the signature tags.
     pub tags: BTreeMap<String, BTreeMap<String, (String, Vec<u8>)>>,
     /// Repository → (digest → answer) of the referrers API; a digest
@@ -270,6 +274,13 @@ impl Hub {
             .insert(digest.to_owned(), reply);
     }
 
+    /// The host blob requests are redirected to.
+    pub fn cdn_host(&self) -> &str {
+        self.cdn_host
+            .as_deref()
+            .unwrap_or("production.cloudfront.docker.com")
+    }
+
     /// The hub's answer to `seen`.
     pub fn handle(&self, seen: &Seen) -> Reply {
         match seen.host.as_str() {
@@ -280,7 +291,7 @@ impl Hub {
                     .as_bytes(),
             ),
             "registry-1.docker.io" => self.api(seen),
-            "production.cloudfront.docker.com" => {
+            host if host == self.cdn_host() => {
                 let digest = seen.target.trim_start_matches("/blobs/");
                 match self.blobs.get(digest) {
                     Some(bytes) => Reply::http(200, &[], bytes),
@@ -332,7 +343,7 @@ impl Hub {
                 307,
                 &[(
                     "Location",
-                    &format!("https://production.cloudfront.docker.com/blobs/{digest}"),
+                    &format!("https://{}/blobs/{digest}", self.cdn_host()),
                 )],
                 b"",
             ),

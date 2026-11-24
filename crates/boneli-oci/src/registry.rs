@@ -4,7 +4,8 @@
 //!
 //! - Every request goes to an allowlisted host: the registry's API host,
 //!   one of its token hosts, or (for blob redirects only) a host under one
-//!   of its redirect suffixes, matched on a dot boundary. `https` only,
+//!   of its redirect suffixes, matched on a dot boundary, or one of its
+//!   exact redirect hosts, compared whole (ADR-033). `https` only,
 //!   certificates verified by the `Dial` (D10).
 //! - `Authorization` goes to the API host and port only, never to a token
 //!   or redirect host.
@@ -16,6 +17,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,6 +44,7 @@ pub struct Registry {
     api: (String, u16),
     auth_hosts: Vec<(String, u16)>,
     redirect_suffixes: Vec<String>,
+    redirect_hosts: Vec<String>,
 }
 
 impl Registry {
@@ -53,7 +56,8 @@ impl Registry {
     /// - `auth_hosts`: the hosts a token realm may name;
     /// - `redirect_suffixes`: `.`-prefixed suffixes of the hosts a blob
     ///   request may be redirected to (`.docker.com`), matched on a dot
-    ///   boundary, port 443 only.
+    ///   boundary, port 443 only. Exact hosts come from
+    ///   [`Registry::with_redirect_hosts`]; this registry has none.
     ///
     /// Every host must pass the grammar of ADR-003.
     pub fn new(
@@ -94,19 +98,54 @@ impl Registry {
                 .map(|h| host(h))
                 .collect::<Result<_, _>>()?,
             redirect_suffixes: suffixes,
+            redirect_hosts: Vec::new(),
         })
     }
 
     /// Docker Hub, as measured on 2026-11-16: images under `docker.io`,
     /// the API at `registry-1.docker.io`, tokens from `auth.docker.io`,
-    /// blobs redirected to `production.cloudfront.docker.com`.
+    /// blobs redirected to `production.cloudfront.docker.com`. And, from
+    /// GitHub-hosted runners only, some blobs redirected to the S3 host
+    /// `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, admitted
+    /// as an exact host (ADR-033: MEASUREMENT-TBD).
     pub fn docker_hub() -> Registry {
         Registry {
             name: "docker.io".to_owned(),
             api: ("registry-1.docker.io".to_owned(), HTTPS_PORT),
             auth_hosts: vec![("auth.docker.io".to_owned(), HTTPS_PORT)],
             redirect_suffixes: vec![".docker.com".to_owned()],
+            redirect_hosts: vec![
+                "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com".to_owned(),
+            ],
         }
+    }
+
+    /// This registry with `hosts` as its exact redirect hosts, replacing
+    /// any before: a blob request may also be redirected to one of them,
+    /// compared whole, port 443 only (ADR-033). Each entry is a name in
+    /// the grammar of ADR-003 as the URL parser returns it: lowercase, no
+    /// port, no IP address, no leading `.` (that is a suffix, see
+    /// [`Registry::new`]). An empty list admits no host.
+    pub fn with_redirect_hosts(mut self, hosts: &[&str]) -> Result<Registry, Error> {
+        let mut exact = Vec::with_capacity(hosts.len());
+        for text in hosts {
+            let refuse =
+                |why: &str| Error::InvalidRegistry(format!("redirect host {text:?} must be {why}"));
+            if text.starts_with('.') {
+                return Err(refuse("an exact host, not a suffix"));
+            }
+            let (host, port) = url::host_port(text)
+                .map_err(|e| Error::InvalidRegistry(format!("{text:?}: {e}")))?;
+            if port.is_some() || host.contains(':') || host.parse::<Ipv4Addr>().is_ok() {
+                return Err(refuse("a name without a port"));
+            }
+            if host != *text {
+                return Err(refuse("lowercase"));
+            }
+            exact.push(host);
+        }
+        self.redirect_hosts = exact;
+        Ok(self)
     }
 
     /// The name images use for this registry.
@@ -127,17 +166,19 @@ impl Registry {
         url.host == self.api.0 && url.port == self.api.1
     }
 
-    /// Whether a blob request may go to `url`: the API host, or a host
-    /// strictly under a redirect suffix on port 443. A suffix starts with
-    /// `.` and a host never does (ADR-003 grammar), so `ends_with` alone
-    /// means strictly under, on a label boundary.
+    /// Whether a blob request may go to `url`: the API host, or on port
+    /// 443 a host strictly under a redirect suffix or equal to an exact
+    /// redirect host (ADR-033). A suffix starts with `.` and a host never
+    /// does (ADR-003 grammar), so `ends_with` alone means strictly under,
+    /// on a label boundary.
     fn redirect_allowed(&self, url: &Url) -> bool {
         self.is_api(url)
             || (url.port == HTTPS_PORT
-                && self
+                && (self
                     .redirect_suffixes
                     .iter()
-                    .any(|s| url.host.ends_with(s.as_str())))
+                    .any(|s| url.host.ends_with(s.as_str()))
+                    || self.redirect_hosts.contains(&url.host)))
     }
 
     fn api_url(&self, target: String) -> Url {

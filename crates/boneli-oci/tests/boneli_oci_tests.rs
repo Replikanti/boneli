@@ -915,6 +915,14 @@ mod network {
         }
     }
 
+    /// Whether Docker Hub serves blobs from `host` after a redirect: its
+    /// CDN under `.docker.com`, or the S3 host it sends some requests from
+    /// GitHub-hosted runners to (ADR-033).
+    fn is_hub_blob_host(host: &str) -> bool {
+        host.ends_with(".docker.com")
+            || host == "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com"
+    }
+
     /// A dial that records the host of every connection it makes.
     #[derive(Clone)]
     struct Recording {
@@ -1094,7 +1102,7 @@ mod network {
             }
             other => panic!("node:22 must be refused: {other:?}"),
         }
-        let cdn = hosts.iter().filter(|h| h.ends_with(".docker.com")).count();
+        let cdn = hosts.iter().filter(|h| is_hub_blob_host(h)).count();
         assert_eq!(cdn, 1, "only the config comes from the CDN: {hosts:?}");
         assert_eq!(layer_entries(&root), committed, "node:22 committed a layer");
 

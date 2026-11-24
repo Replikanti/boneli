@@ -37,9 +37,12 @@ name: oci-acceptance
 # flow, a signature replaced) show up within 7 days at 13 Docker Hub
 # manifest, tag and referrers requests per architecture per run (4 before
 # ADR-029, counted from the tests' code paths), far below the measured
-# anonymous limit of 100 per hour. Never on code paths and not a required
-# check, so a Docker Hub outage cannot block a code PR. `pull_request` is
-# limited to this file: GitHub dispatches `workflow_dispatch` only for
+# anonymous limit of 100 per hour. A blob redirect to a host outside the
+# allowlist fails the pull and names the host: this is where a new Docker
+# Hub redirect target shows up first (ADR-033, #117). Never on code paths
+# and not a required check, so a Docker Hub outage cannot block a code PR.
+# `pull_request` is limited to this file: GitHub dispatches
+# `workflow_dispatch` only for
 # workflows already on the default branch, so the PR that adds or edits
 # this file runs it before merge.
 on:

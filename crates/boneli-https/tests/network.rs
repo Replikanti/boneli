@@ -226,6 +226,7 @@ fn intermediates_checked_live() {
         "registry-1.docker.io",
         "auth.docker.io",
         "production.cloudflare.docker.com",
+        "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
         "pkg-containers.githubusercontent.com",
         "api.anthropic.com",
     ] {
