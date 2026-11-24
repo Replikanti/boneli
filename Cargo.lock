@@ -136,6 +136,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-sigstore"
+version = "0.0.0"
+dependencies = [
+ "boneli-https",
+ "boneli-json",
+]
+
+[[package]]
 name = "boneli-store-fs"
 version = "0.0.0"
 dependencies = [

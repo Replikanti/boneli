@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"registry.k8s.io/pause"},"image":{"docker-manifest-digest":"sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a"},"type":"cosign container image signature"},"optional":{"org.kubernetes.kpromo.version":"kpromo-v4.0.4-483-gf08f0f2"}}

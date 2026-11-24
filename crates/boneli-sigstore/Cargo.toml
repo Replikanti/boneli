@@ -1,0 +1,25 @@
+[package]
+name = "boneli-sigstore"
+description = "Boneli support crate: offline verification of Sigstore image signatures, cosign simple-signing layers and Sigstore bundles v0.3 (DSSE), against keys or a trusted root with Fulcio identities, SCTs and Rekor v1 promises (ADR-029)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No external crate (ADR-029, S3): sigstore-rs and the sigstore-verify
+# family pull crates that deny.toml bans.
+[dependencies]
+# Public keys, code-signing chains and embedded SCTs over ring and webpki
+# (`PublicKey`, `verify_code_signing`, ADR-029 item 7), and SHA-256
+# (`Sha256`, ADR-009 D6): the one crate that holds ring. A support crate,
+# no new external edge.
+boneli-https.workspace = true
+# Parses bundles, simple-signing payloads, Rekor entry bodies and
+# `trusted_root.json` under explicit limits (ADR-008). A support crate, no
+# new external edge.
+boneli-json.workspace = true
