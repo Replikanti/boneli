@@ -221,9 +221,11 @@ impl Trust {
     /// [`SLSA_PROVENANCE_V02_PREDICATE`] or both, each once, and nothing
     /// else: a claim list next to another predicate type could never be
     /// met by that type's statements, and a cosign layer would carry none.
-    /// A list with v0.2 also needs a repository or material claim
-    /// (`ClaimsWithoutSource`): the v0.2 producer's identity is a builder
-    /// workflow every project shares, so a builder or ref claim alone
+    /// A list with v0.2 also needs a claim that names an owner
+    /// (`ClaimsWithoutSource`): an exact repository, a repository prefix of
+    /// at least `<scheme>://<host>/<owner>/`, or a `git+` repository
+    /// material. The v0.2 producer's identity is a builder workflow every
+    /// project shares, so a builder or ref claim, or a host-wide prefix,
     /// would accept any project's image.
     pub fn with_claims(self, claims: Claims) -> Result<Trust, ConfigError> {
         let types = &self.predicate_types;

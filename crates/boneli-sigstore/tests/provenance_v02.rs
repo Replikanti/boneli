@@ -600,10 +600,10 @@ fn config_source_split() {
     let pki = Pki::new();
     let with_uri = |uri: &str| statement_with(|st| set(st, URI, s(uri)));
     let repo = |text: &str| Claims::new(None, exact(text), None, vec![]).expect("claims");
-    // A ref claim next to a repository prefix every URI here meets: a
-    // v0.2 trust needs a source claim (`ClaimsWithoutSource`).
+    // A ref claim next to an owner prefix every URI below meets: a v0.2
+    // trust needs a source claim that names an owner (`ClaimsWithoutSource`).
     let git_ref = |rule: Option<ClaimMatch>| {
-        Claims::new(None, prefix("https://github.com/"), rule, vec![]).expect("claims")
+        Claims::new(None, prefix("https://github.com/a/"), rule, vec![]).expect("claims")
     };
 
     // The first `@` ends the repository; the round trip rebuilds the URI.
@@ -615,7 +615,8 @@ fn config_source_split() {
         let uri = format!("git+{repository}@{r}");
         let st = with_uri(&uri);
         assert_eq!(check(&pki, &st, repo(repository)), KEYED, "{uri}");
-        assert_eq!(check(&pki, &st, git_ref(exact(r))), KEYED, "{uri}");
+        let both = Claims::new(None, exact(repository), exact(r), vec![]).expect("claims");
+        assert_eq!(check(&pki, &st, both), KEYED, "{uri}");
         assert_eq!(format!("git+{repository}@{r}"), uri);
     }
     // No `@`: no ref. A repository claim passes, a ref claim refuses.
@@ -874,7 +875,103 @@ fn claims_predicate_lists() {
             assert!(pki::keyed_trust(&pki, list).with_claims(claims).is_ok());
         }
     }
-    // A v1-only list keeps ADR-031's rule: any claim alone is enough.
+    // The source claim must name one owner at least (review of PR #122):
+    // a prefix that covers every owner of a host, or a material that is
+    // no `git+` repository URI, binds no project.
+    let repo_prefix = |p: &str| Claims::new(None, prefix(p), None, vec![]).expect("prefix");
+    let material_only = |uri: &str| {
+        Claims::new(None, None, None, vec![material(uri, real::FLUX_COMMIT)]).expect("material")
+    };
+    for list in [&[v02][..], &[v1, v02]] {
+        for p in [
+            "https://",
+            "https://github.com/",
+            "https:///fluxcd/",
+            "https://github.com//",
+            "https://github.com/fluxcd//",
+            "https://github.com/./",
+            "https://github.com/../",
+            "github.com/fluxcd/",
+            "://github.com/fluxcd/",
+        ] {
+            assert_eq!(
+                pki::keyed_trust(&pki, list)
+                    .with_claims(repo_prefix(p))
+                    .err(),
+                Some(ConfigError::ClaimsWithoutSource),
+                "{p:?}"
+            );
+        }
+        for uri in [
+            "https://github.com/fluxcd/flux2@refs/tags/v2.4.0",
+            "git+https://github.com/@refs/tags/v1",
+            "git+https://github.com@refs/tags/v1",
+            "git+https://@refs/tags/v1",
+            "git+@refs/tags/v1",
+            "pkg:docker/alpine",
+        ] {
+            assert_eq!(
+                pki::keyed_trust(&pki, list)
+                    .with_claims(material_only(uri))
+                    .err(),
+                Some(ConfigError::ClaimsWithoutSource),
+                "{uri:?}"
+            );
+        }
+        for p in [
+            "https://github.com/fluxcd/",
+            "https://github.com/fluxcd/flux2/",
+        ] {
+            assert!(
+                pki::keyed_trust(&pki, list)
+                    .with_claims(repo_prefix(p))
+                    .is_ok(),
+                "{p:?}"
+            );
+        }
+        for uri in [
+            real::FLUX_MATERIAL,
+            "git+https://github.com/fluxcd/flux2",
+            "git+https://github.com/fluxcd@refs/tags/v1",
+        ] {
+            assert!(
+                pki::keyed_trust(&pki, list)
+                    .with_claims(material_only(uri))
+                    .is_ok(),
+                "{uri:?}"
+            );
+        }
+        // An exact repository names one URI, whatever its text.
+        for e in ["https://github.com", "https://github.com/fluxcd/flux2"] {
+            assert!(
+                pki::keyed_trust(&pki, list)
+                    .with_claims(repository_claim(e))
+                    .is_ok(),
+                "{e:?}"
+            );
+        }
+        // One binding material is enough next to ones that bind nothing.
+        let mixed = Claims::new(
+            None,
+            None,
+            None,
+            vec![material("pkg:docker/alpine", "00"), flux_material()],
+        )
+        .expect("claims");
+        assert!(pki::keyed_trust(&pki, list).with_claims(mixed).is_ok());
+    }
+    // A host without its `/` is no prefix at all.
+    assert_eq!(
+        Claims::new(None, prefix("https://github.com"), None, vec![]).err(),
+        Some(ConfigError::ClaimPrefixWithoutBoundary)
+    );
+    // A v1-only list keeps ADR-031's rule: any claim alone is enough, a
+    // host-wide prefix included.
+    assert!(
+        pki::keyed_trust(&pki, &[v1])
+            .with_claims(repo_prefix("https://github.com/"))
+            .is_ok()
+    );
     for claims in [builder_only(), ref_only()] {
         assert!(pki::keyed_trust(&pki, &[v1]).with_claims(claims).is_ok());
     }
@@ -957,5 +1054,58 @@ fn dispatch_by_predicate_type() {
             &keyed(&pki, &[v1, v02], flux_claims())
         ),
         Err(Refusal::MalformedProvenance)
+    );
+}
+
+/// The review's repro (PR #122): another project's `.att` from the same
+/// generator, under the generator's shared identity. A host-wide
+/// repository prefix would accept it, so a v0.2 trust with one is
+/// refused at configuration; an owner prefix refuses the statement for
+/// its repository, and admits the owner's own.
+#[test]
+fn host_wide_prefix_refused_for_v02() {
+    let pki = Pki::new();
+    let project = |repository: &str| {
+        let uri = format!("git+{repository}@refs/tags/v1");
+        statement_with(|st| {
+            set(st, URI, s(&uri));
+            set(
+                st,
+                MATERIALS,
+                Value::Array(vec![sha1_entry(
+                    &uri,
+                    "0123456789abcdef0123456789abcdef01234567",
+                )]),
+            );
+        })
+    };
+    let attacker = project("https://github.com/attacker/evil");
+    for p in ["https://github.com/", "https://"] {
+        let claims =
+            Claims::new(Some(real::GENERATOR_V200), prefix(p), None, vec![]).expect("claims");
+        assert_eq!(
+            pki::keyed_trust(&pki, &[SLSA_PROVENANCE_V02_PREDICATE])
+                .with_claims(claims)
+                .err(),
+            Some(ConfigError::ClaimsWithoutSource),
+            "{p:?}"
+        );
+    }
+    let owner = || {
+        Claims::new(
+            Some(real::GENERATOR_V200),
+            prefix("https://github.com/fluxcd/"),
+            None,
+            vec![],
+        )
+        .expect("claims")
+    };
+    assert_eq!(
+        check(&pki, &attacker, owner()),
+        claim(ClaimRefusal::SourceRepository)
+    );
+    assert_eq!(
+        check(&pki, &project("https://github.com/fluxcd/flux2"), owner()),
+        KEYED
     );
 }

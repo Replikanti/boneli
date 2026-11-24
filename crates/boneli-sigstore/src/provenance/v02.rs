@@ -140,7 +140,7 @@ fn generator_source(invocation: &Value) -> Result<(&str, Option<&str>), Refusal>
 
 /// `git+<repository>[@<ref>]` split at the first `@`: the repository
 /// non-empty, and the ref non-empty when `@` is there.
-fn split_uri(uri: &str) -> Option<(&str, Option<&str>)> {
+pub(super) fn split_uri(uri: &str) -> Option<(&str, Option<&str>)> {
     let rest = uri.strip_prefix("git+")?;
     match rest.split_once('@') {
         None => (!rest.is_empty()).then_some((rest, None)),

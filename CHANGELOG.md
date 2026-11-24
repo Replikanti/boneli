@@ -799,7 +799,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (a DSSE envelope with cosign's certificate and Rekor annotations,
   Statement v0.1 or v1), verified as a bundle is. A trust with claims may
   list SLSA v1 and v0.2 (`SLSA_PROVENANCE_V02_PREDICATE`); with v0.2 it
-  needs a repository or material claim (`ConfigError::ClaimsWithoutSource`).
+  needs an exact repository claim, or a repository prefix or `git+`
+  material that names an owner (`ConfigError::ClaimsWithoutSource`).
   The v0.2 reader knows slsa-github-generator's container build type: the
   builder ID, `configSource.uri` split into repository and ref, and
   `materials`; non-empty workflow-dispatch inputs refuse

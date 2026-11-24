@@ -789,6 +789,6 @@ fn attestation_texts() {
     }
     assert_eq!(
         boneli_sigstore::ConfigError::ClaimsWithoutSource.to_string(),
-        "a trust that lists SLSA provenance v0.2 needs a source repository or material claim"
+        "a trust that lists SLSA provenance v0.2 needs an exact source repository, or a repository prefix or material that names an owner"
     );
 }

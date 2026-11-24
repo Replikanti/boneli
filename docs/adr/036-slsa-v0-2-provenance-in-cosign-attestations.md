@@ -133,12 +133,26 @@ follow-up, #118). The choices below the STOP decisions are the plan's.
    `[https://slsa.dev/provenance/v1]`. A trust with claims now admits a
    non-empty list of SLSA v1 and v0.2, each at most once, in any order
    (`ClaimsPredicateTypes` otherwise); v0.2 is opt-in through the list,
-   as ADR-029 S5 made v1 opt-in. A list with v0.2 also needs a source
-   repository claim or at least one material claim
-   (`ClaimsWithoutSource`): the v0.2 producer's identity is the
-   generator's workflow, the same SAN for flux, argocd and kyverno
-   (measured), so a rule with v0.2 and only a builder or ref claim would
-   accept any project's image built by the generator.
+   as ADR-029 S5 made v1 opt-in. A list with v0.2 also needs a claim
+   that names an owner (`ClaimsWithoutSource` otherwise): an exact source
+   repository, a repository prefix of at least
+   `<scheme>://<host>/<owner>/` (non-empty scheme, host and owner, no
+   empty, `.` or `..` segment), or a material whose URI is
+   `git+<repository>[@<ref>]` with such a repository. The v0.2 producer's
+   identity is the generator's workflow, the same SAN for flux, argocd
+   and kyverno (measured), so the source claim is all that ties a
+   statement to one project. A builder or ref claim, a host-wide prefix
+   (`https://` or `https://github.com/`) or a material that is no
+   repository URI (a dependency every project may list) would accept any
+   project's image built by the generator (review of PR #122). The owner
+   is the minimum because it is the smallest unit a forge hands to one
+   party: whoever controls `fluxcd` decides what lives under
+   `https://github.com/fluxcd/`, while every GitHub user can create a
+   repository under `https://github.com/`. A prefix shorter than an owner
+   therefore trusts every account on the host; an exact repository or an
+   exact material URI matches one URI only, whatever its text. A
+   v1-only list keeps ADR-031's rule, because a v1 SAN names the
+   project's own workflow.
 
 5. **The v0.2 reader and the claim mapping.** Read strictly, whichever
    claims are set, so a statement has one reading under every rule:
@@ -191,7 +205,8 @@ follow-up, #118). The choices below the STOP decisions are the plan's.
      of an accepted type"; `ClaimsPredicateTypes` "a trust with claims
      must list SLSA provenance v1 or v0.2, each at most once, and nothing
      else"; `ClaimsWithoutSource` "a trust that lists SLSA provenance v0.2
-     needs a source repository or material claim".
+     needs an exact source repository, or a repository prefix or material
+     that names an owner".
 
    The failure detail gains `{subject}: .att: none`, `.att: <fetch
    detail>`, `.att {manifest}: <parser reason>`, `.att {manifest}: {n}
@@ -345,7 +360,9 @@ claim named. The hand-applied mutation pass over every new check in
 rule, the `.att` carrier, the `attest` pointer and the tag kills 61 of 61
 mutants; one survived the first pass (`configSource` read from
 `invocation` when missing, refused either way but as another refusal)
-and is killed by a test added for it. Live on x86_64 (local run):
+and is killed by a test added for it. Review of PR #122 found that a
+host-wide repository prefix passed the item 4 guard; the owner rule now in
+item 4 closes it, and its 12 mutants are killed. Live on x86_64 (local run):
 `provenance_v02_on_ghcr` pulls flux-cli with its 4 layers in 26.1 s over
 19 connections and refuses it under another source repository with
 `.att sha256:467ee9c3…5b9f7ac5: 1 listed, 1 candidates (layer 0: the

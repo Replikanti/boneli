@@ -265,8 +265,10 @@ pub enum ConfigError {
     /// A workflow-path rule is set with neither a source repository rule
     /// (1.12) nor a repository ID (1.15).
     WorkflowPathWithoutRepository,
-    /// A trust with claims lists SLSA provenance v0.2 and has neither a
-    /// source repository nor a material claim (ADR-036).
+    /// A trust with claims lists SLSA provenance v0.2 and no claim names an
+    /// owner: neither an exact repository, nor a repository prefix of at
+    /// least `<scheme>://<host>/<owner>/`, nor a `git+` repository material
+    /// whose repository names one (ADR-036, item 4).
     ClaimsWithoutSource,
 }
 
@@ -301,7 +303,7 @@ impl fmt::Display for ConfigError {
                 "a trust with claims must list SLSA provenance v1 or v0.2, each at most once, and nothing else"
             }
             ConfigError::ClaimsWithoutSource => {
-                "a trust that lists SLSA provenance v0.2 needs a source repository or material claim"
+                "a trust that lists SLSA provenance v0.2 needs an exact source repository, or a repository prefix or material that names an owner"
             }
             ConfigError::TriggersEmpty => "certificate claims list no trigger",
             ConfigError::RepositoryIdNotDecimal => {

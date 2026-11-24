@@ -139,11 +139,25 @@ impl Claims {
         })
     }
 
-    /// Whether a source repository or a material claim is set: what binds
-    /// a statement to one project when the signer's identity does not
-    /// (ADR-036, `ClaimsWithoutSource`).
+    /// Whether a claim binds a statement to one owner's repositories at
+    /// least, which is what ties a v0.2 statement to one project when the
+    /// signer's identity is shared (ADR-036 item 4, `ClaimsWithoutSource`):
+    /// an exact repository (it names one URI), a repository prefix that
+    /// names an owner ([`names_owner`]), or a material whose URI is a
+    /// `git+` repository URI whose repository names one. A host-wide prefix
+    /// such as `https://github.com/` binds no more than a ref claim does,
+    /// and a material that is no repository URI may be a dependency every
+    /// project lists.
     pub(crate) fn names_source(&self) -> bool {
-        self.repository.is_some() || !self.materials.is_empty()
+        let repository = match &self.repository {
+            Some(ClaimMatch::Exact(_)) => true,
+            Some(ClaimMatch::Prefix(prefix)) => names_owner(prefix),
+            None => false,
+        };
+        repository
+            || self.materials.iter().any(|m| {
+                v02::split_uri(&m.uri).is_some_and(|(repository, _)| names_owner(repository))
+            })
     }
 }
 
@@ -160,6 +174,27 @@ pub(crate) fn check_match(rule: &ClaimMatch) -> Result<(), ConfigError> {
         }
         _ => Ok(()),
     }
+}
+
+/// Whether `text` is `<scheme>://<host>/<owner>`, optionally followed by
+/// more path and a final `/`: a non-empty scheme and host, and at least
+/// one path segment, none of them empty, `.` or `..`. The owner is the
+/// smallest unit a forge gives one party control of; anything shorter
+/// covers every party on the host.
+fn names_owner(text: &str) -> bool {
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return false;
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or_default();
+    let path: Vec<&str> = segments.collect();
+    !scheme.is_empty()
+        && !host.is_empty()
+        && !path.is_empty()
+        && path
+            .iter()
+            .all(|s| !s.is_empty() && *s != "." && *s != "..")
 }
 
 /// Which claim a statement failed.
