@@ -1543,16 +1543,16 @@
    "title": "boneli-oci: Docker Hub blob redirects to an S3 host outside the redirect allowlist",
    "epic": null,
    "order": 59,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "ecf725cc",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
-   "note": "",
-   "updated_at": "2026-11-24T16:41:02+00:00",
+   "pr": 119,
+   "note": "PR #119 open",
+   "updated_at": "2026-11-24T16:50:55+00:00",
    "priority": "P2",
    "size": "small",
    "deps": [],
@@ -1561,33 +1561,35 @@
     "sandbox"
    ],
    "manual": false
+  },
+  {
+   "issue": 118,
+   "title": "boneli-sigstore: verify Rekor intoto 0.0.1 entries for cosign .att attestations",
+   "epic": null,
+   "order": 60,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-24T16:50:55+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [
+    114
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T22:50:36+00:00",
-   "issue": 102,
-   "from": "ready",
-   "to": "blocked",
-   "by": "sync",
-   "note": null
-  },
-  {
-   "at": "2026-11-23T22:56:19+00:00",
-   "issue": 98,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "785e81ac",
-   "note": null
-  },
-  {
-   "at": "2026-11-23T23:27:32+00:00",
-   "issue": 57,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "b6fae515",
-   "note": null
-  },
   {
    "at": "2026-11-23T23:46:43+00:00",
    "issue": 57,
@@ -1963,6 +1965,30 @@
    "to": "implementing",
    "by": "6cc0788e",
    "note": null
+  },
+  {
+   "at": "2026-11-24T16:50:55+00:00",
+   "issue": 118,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-24T16:50:55+00:00",
+   "issue": 117,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #119 open"
+  },
+  {
+   "at": "2026-11-24T16:50:55+00:00",
+   "issue": 118,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -1993,10 +2019,11 @@
   103,
   113,
   114,
-  117
+  117,
+  118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T16:41:28+00:00",
+ "updated_at": "2026-11-24T16:50:55+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
