@@ -1,6 +1,6 @@
 # ADR-029: Image signatures and provenance
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-24
 
 ## Context
@@ -92,9 +92,9 @@ Measured on 2026-11-20 through the anonymous registry API (and on
 ## Decision
 
 The decisions of STOP 1 (S1 to S6), all as recommended, then what each
-of the three PRs of #57 builds. PR 1 builds item 7 and PR 2 item 8, each
-with the limits it names; item 9 follows in PR 3, and this ADR becomes
-`accepted` in PR 3 after the acceptance run.
+of the three PRs of #57 builds. PR 1 builds item 7, PR 2 item 8 and PR 3
+item 9, each with the limits it names; this ADR became `accepted` in PR 3
+after the acceptance run.
 
 1. **What counts as a signature (S1).** cosign's legacy `.sig` tag with
    simple-signing layers, and Sigstore bundles v0.3 found as OCI 1.1
@@ -311,12 +311,97 @@ with the limits it names; item 9 follows in PR 3, and this ADR becomes
      with issuer extensions and SCTs, test CT log and Rekor) is built at
      test time and signed with `RsaSha256Key`.
 
-9. **Discovery and policy (PR 3)**, in `boneli-oci`: the `.sig` tag, the
-   referrers API with the tag-schema fallback (only on 404), the strict
-   artifact-manifest parser, `SignaturePolicy` in `StoreConfig`,
-   verification after resolution and before the first layer request,
-   the kept evidence and pointer files of item 6, and the acceptance
-   tests.
+9. **Discovery and policy (PR 3)**, in `boneli-oci`.
+   - **Policy.** `StoreConfig::signatures`, `SignaturePolicy::off()` by
+     default. `SignaturePolicy::new(default, rules)` refuses two rules
+     with one registry and scope and a prefix that is not repository
+     components (ADR-009 D9) ending in `/` (`Error::InvalidPolicy`);
+     `OciImageStore::open` refuses a rule for a registry that is neither
+     the default nor listed, before it creates anything. The lookup ranks
+     an exact repository over any prefix, a longer prefix over a shorter
+     one, a prefix over the registry-wide rule and that over the default,
+     and reads the repository as written (`node` is not `library/node`).
+     A `Trust` is never empty (`Trust::new`), so `Required` needs no
+     check of its own.
+   - **Where it runs.** After the first `resolve_with` and before any
+     layer is pinned or its blob requested; with no `Required` rule
+     nothing of this item runs, and the request log of #7, recorded at
+     the merge base, is unchanged byte for byte (`policy_off_requests_unchanged`).
+   - **Order.** The kept evidence of every subject first, offline, then
+     discovery subject by subject (the named digest, then the platform
+     manifest), the `.sig` carrier before the referrers carrier, and the
+     first verified candidate ends the check. **Learned in PR 3:** the
+     plan's "per subject, the pointer first, then discovery" would make
+     the warm pull of an image signed only on its platform manifest
+     discover the index's signatures over the network on every pull;
+     checking every pointer before any request keeps S6's "no request".
+   - **Fetches** (`registry.rs`): a signature tag (`sha256-<hex>.sig`,
+     `sha256-<hex>`, built only from a digest) and the referrers listing
+     are read like a manifest of at most the document limit: `200` is the
+     document, `404` is absent, every other status and any redirect is
+     an error, and a second `401` is `Failed`, never `NotFound`. A
+     payload or bundle is a blob of at most `MAX_PAYLOAD_BYTES` or
+     `MAX_BUNDLE_BYTES`, size and digest exact, checked before the
+     request, redirects as for every blob (D10). Deadlines are D12's.
+   - **Parsers** (`signatures.rs`): an artifact manifest is an OCI or
+     Docker schema 2 manifest by the rule of `parse_document` (field, else
+     `Content-Type`), with a config of any media type, layers with string
+     annotations and optional `artifactType` and `subject`; a listing is
+     an OCI index (schema 2, `manifests` an array or `null`) whose entries
+     are descriptors with optional `artifactType` and string annotations,
+     `platform` not read. Media types, artifact types and the predicate
+     annotation `dev.sigstore.bundle.predicateType` compare byte for
+     byte. A referrer counts only when its manifest names the subject,
+     the bundle artifact type and exactly one layer of the bundle media
+     type. A tag-schema answer whose SHA-256 is the subject's lists
+     nothing.
+   - **Failure detail.** `signature policy: no trusted signature for
+     <subjects> in <repository>: …`, per subject and carrier the count
+     listed and at most one fixed reason per candidate (a `Refusal`, a
+     parser's fixed text, or the fetch error's detail of hosts, digests
+     and statuses); every character outside printable ASCII is escaped.
+   - **Kept evidence** (S6): every artifact fetched that parsed (the
+     `.sig` manifest, payloads, referrer manifests, bundles) is kept in
+     `blobs/sha256/` with its `.type`, re-hashed on every read, and only
+     when the store does not hold that digest yet; the pointer file
+     `signatures/sha256/<subject hex>` holds up to `MAX_KEPT` = 32 lines,
+     each `legacy <manifest> <payload>` or `bundle <manifest> <bundle>`,
+     none twice, parsed exactly and written by the store's
+     `write_durably` under an owned temporary name. The warm check tries
+     every line under the current trust; a pass adds its line last,
+     drops lines whose blobs are gone, and past 32 the oldest.
+     **Changed at review of PR 3:** one line per subject, replaced on
+     every pass, let two `Required` rules with different trusts over one
+     digest overwrite each other's evidence, so a warm pull under the
+     first went back to the network (and failed in a registry outage)
+     after a pull under the second. 32 is every candidate the two
+     carriers can list for one subject at once (2 × `MAX_SIGNATURES`),
+     so while the listings stay as they are no rule's evidence is pushed
+     out, at 4,832 bytes per file at most. Two stores that add a line at
+     once may lose one; its rule then discovers again.
+   - **Kept documents and their type** (review of PR 3). A kept
+     document's bytes are its digest's, but its `.type` is what the
+     response that brought it said, and a registry chooses it: a `.sig`
+     answer, or an index in another repository, can serve another
+     image's bytes under another type. So a signature lookup never
+     replaces a kept document and keeps only what parsed, and the
+     resolution of ADR-009 D9 takes a kept index or manifest only when
+     it parses and is what the index names (its media type); otherwise
+     it fetches the document again from the image's own repository and
+     replaces the copy, and it keeps a fetched document only when the
+     pull can use it. This extends D8's "a mismatch removes it and it is
+     fetched again" from the bytes to the type, and closes the same
+     spoiling through an image pull, which ADR-009 had too. Cost: a
+     manifest without a `mediaType` field that two repositories serve as
+     Docker and as OCI is fetched again by whichever pull finds the
+     other's type kept (`kept_document_of_another_type_refetched`); the
+     verdict never changes. The sweep of ADR-009 D8 and ADR-025 D1 covers the directory
+     (dead owners judged by their lock files, ADR-028), it is created
+     with `boneli-private-dir`'s rules (ADR-021), and the trim, which
+     evicts kept artifacts like any unpinned document (they serve no
+     layer, so no layer lock holds them, ADR-025 D7), removes a pointer
+     whose evidence is gone. **Added in PR 3:** that removal; without it
+     `signatures/` would keep one file for every subject ever checked.
 
 Decided in the plan and reviewable: the subjects are the digest the
 reference names and then, when it names an index, the selected platform
@@ -344,6 +429,13 @@ the digest binds the bytes and mirrors are legitimate.
   (`check_validity` in rustls-webpki 0.103.17). Verification reads no wall
   clock, so the same inputs give the same verdict forever and replay
   stays deterministic.
+- **`MAX_KEPT` = 32 lines per pointer file (PR 3, review).** 2 ×
+  `MAX_SIGNATURES`: every candidate both carriers can list for one
+  subject at once, so rules with different trusts never push out each
+  other's evidence while the listings stay; at most 151 bytes a line,
+  4,832 bytes a file (`MAX_POINTER_BYTES` = 8,192 read). Lower lets
+  enough rules over one digest send each other's warm pulls to the
+  network; higher only keeps lines no listing can produce.
 - **`MAX_SIGNATURES` = 16 per carrier listing per subject (PR 3).**
   Measured: 1 to 2 signatures per digest (Kubernetes 1, Chainguard 1,
   cosign 2.4.1 2, 3.0.2 2, `latest` 2 referrers); each `cosign sign` run
@@ -399,6 +491,11 @@ the digest binds the bytes and mirrors are legitimate.
   `KeyKind`, `PublicKeyError`, `SignatureError`, `MAX_PUBLIC_KEY_PEM_LEN`,
   `verify_code_signing`, `CodeSigningCert`, `San`, `CtLog`, `CertError`
   and `SctError`, all with fixed algorithms and no switch to skip a check.
+- PR 3 adds the edge `boneli-oci -> boneli-sigstore` (a support crate)
+  and no external one. `boneli-oci`'s API gains `SignaturePolicy`,
+  `PolicyRule`, `RepoScope`, `Requirement`, `MAX_SIGNATURES`,
+  `StoreConfig::signatures` and `Error::InvalidPolicy`; the store root
+  gains `signatures/sha256/`.
 - PR 2 adds the support crate `boneli-sigstore` (`roles.support` in
   `tools/architecture.toml`) with edges to `boneli-https` and
   `boneli-json` only, so the external graph is unchanged. It is pure: no
@@ -408,7 +505,15 @@ the digest binds the bytes and mirrors are legitimate.
   negative test and a mutant that a named test kills (PR 1: 23 mutants
   over `keys.rs` and `codesign.rs`, all killed; PR 2: 73 mutants over
   every check of `boneli-sigstore`, all killed, the one survivor of the
-  first run, PEM line length, by a test added for it); the real Kubernetes
+  first run, PEM line length, by a test added for it; PR 3: 43 mutants
+  over the policy, the discovery, the parsers, the fetches, the store
+  wiring and the pointer files, all killed; the first run's survivors
+  were three checks no input could reach, a payload cap repeated before
+  the fetch's own, a duplicate-annotation check behind `boneli-json`'s
+  duplicate-key refusal and a pointer re-render behind strict parts, and
+  each was removed; at review 17 more over the fixes (pointer lines,
+  kept-document types), all killed once tests were added for the five
+  survivors of their first run); the real Kubernetes
   and Chainguard leaves are known answers against the public-good chain
   and CT log (PR 1), and the whole Kubernetes and Chainguard keyless
   signatures and cosign's keyed bundle pass `verify` against the
@@ -517,3 +622,31 @@ the digest binds the bytes and mirrors are legitimate.
 PR 3's fake-registry acceptance passes (keyed on both carriers, and
 keyless with Chainguard's real `.sig`), and the `oci-acceptance` run on
 PR 3 passes `network::signatures_on_docker_hub` on x86_64 and arm64.
+
+**Result (PR 3, 2026-11-24).** The fake-registry acceptance passes: a
+trusted keyed signature pulls on both carriers, and an unsigned image,
+another key and a signature over another digest are refused before any
+layer request on both; Chainguard's real keyless `.sig` verifies against
+the public-good root with its exact workflow SAN and with the prefix
+`…@refs/heads/`, and the pull goes on to its first layer request;
+cosign's real keyed bundle passes through GHCR's tag schema exactly as
+GHCR serves it. Live on x86_64 (local run): `signatures_on_docker_hub`
+pulls `chainguard/node` with all 11 layers in 23.5 s over 31
+connections, pulls it again from the kept evidence with no connection,
+and refuses `library/node` `sha256:e13726ca…` after 4 signature requests
+(`.sig` 404 and referrers `[]` for the index and its amd64 manifest)
+with one CDN connection, the config's, and no layer committed;
+`signatures_elsewhere` pulls cosign v3.1.4 from GHCR (15 layers, 20.6 s,
+the second-listed bundle never needed), `chainguard/node` from `cgr.dev`
+(11 layers, 24.3 s) and `pause:3.10` through Artifact Registry (1
+layer, 1.8 s: no token, a blob redirect relative to the API host), and
+refuses each under another identity. Learned on the way: GHCR lists
+referrers with `"platform": null` and also answers the platform
+manifest's `sha256-<hex>` tag with a real listing (cosign signs both),
+and `cgr.dev` redirects blobs to `*.r2.cloudflarestorage.com`. The
+`oci-acceptance` run on PR 3 (run 45315915777) passes
+`signatures_on_docker_hub`, `signatures_elsewhere` and
+`node_and_postgres_run_in_sandbox` on x86_64 and arm64: `chainguard/node`
+from Docker Hub in 7.9 s (x86_64) and 16.9 s (arm64), cosign from GHCR in
+6.7 s and 14.1 s, `chainguard/node` from `cgr.dev` in 9.1 s and 17.0 s,
+`pause:3.10` in 4.7 s and 6.4 s, and `library/node` refused on both.

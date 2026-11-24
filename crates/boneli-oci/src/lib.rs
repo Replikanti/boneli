@@ -45,6 +45,18 @@
 //! store's accounted bytes are at or under [`StoreConfig::cache_budget`]
 //! ([`CACHE_BUDGET_BYTES`] by default), and reports it as a
 //! [`TrimReport`].
+//!
+//! Signatures (ADR-029): a [`SignaturePolicy`] in
+//! [`StoreConfig::signatures`] names the registries and repositories whose
+//! images must carry a signature that `boneli-sigstore` verifies under a
+//! `boneli_sigstore::Trust`: a cosign `.sig` layer or a Sigstore bundle
+//! v0.3 found through the referrers API or its tag schema, over the digest
+//! the reference names or the platform manifest it selects. Under a
+//! [`Requirement::Required`] rule the pull is `Failed` before any layer
+//! blob is requested unless one candidate verifies; the evidence that
+//! verified is kept and verified again, offline, on every later pull. The
+//! default, [`SignaturePolicy::off`], checks nothing and sends exactly the
+//! requests of ADR-009.
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod auth;
@@ -56,10 +68,12 @@ mod lease;
 mod limits;
 mod lock;
 mod manifest;
+mod policy;
 mod reference;
 mod registry;
 #[cfg(test)]
 mod scratch;
+mod signatures;
 mod store;
 mod tar;
 mod unpack;
@@ -75,10 +89,12 @@ pub use layers::{LayerCache, LayerPin};
 pub use lease::Lease;
 pub use limits::{Budget, Limits};
 pub use manifest::{Descriptor, Document, Entry, ImageConfig, Index, Layer, Manifest};
+pub use policy::{PolicyRule, RepoScope, Requirement, SignaturePolicy};
 pub use reference::{Digest, Platform, Reference, RegistryHost, Repository};
 pub use registry::{
     Client, FetchLimits, Fetched, MAX_REDIRECTS, Registry, Resolved, Timeouts, select,
 };
+pub use signatures::MAX_SIGNATURES;
 pub use store::{
     BLOCK_ALLOWANCE, CACHE_BUDGET_BYTES, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT,
     MAX_BLOB_BYTES, MAX_DEPTH, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_VALUES,

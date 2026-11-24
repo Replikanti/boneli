@@ -116,6 +116,7 @@ dependencies = [
  "boneli-https",
  "boneli-json",
  "boneli-private-dir",
+ "boneli-sigstore",
  "boneli-sys",
  "miniz_oxide",
  "ruzstd",

@@ -350,6 +350,29 @@ enum Step<T> {
 enum Kind {
     Manifest,
     Blob,
+    /// A signature tag, a referrers listing or a signature blob (ADR-029):
+    /// a second `401` is `Failed`, never `NotFound`.
+    Signature,
+}
+
+/// A tag a signature lookup reads, built only from a digest (ADR-029):
+/// cosign's `sha256-<hex>.sig` or the referrers tag schema's
+/// `sha256-<hex>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureTag {
+    /// `sha256-<hex>.sig`.
+    Sig(Digest),
+    /// `sha256-<hex>`, the fallback when the referrers API answers `404`.
+    Referrers(Digest),
+}
+
+impl SignatureTag {
+    fn text(self) -> String {
+        match self {
+            SignatureTag::Sig(d) => format!("sha256-{}.sig", d.hex()),
+            SignatureTag::Referrers(d) => format!("sha256-{}", d.hex()),
+        }
+    }
 }
 
 /// A client for one pull from one registry: it holds the token, which is
@@ -405,14 +428,14 @@ impl<'a> Client<'a> {
         let repo = reference.repository();
         let digest = reference.digest();
         let platform = reference.platform();
-        let top = self.kept_manifest(documents, repo, digest, None)?;
-        let (index, manifest_digest, manifest) = match self.document(&top, digest)? {
+        let top = self.kept_document(documents, repo, digest, None, &|_| true)?;
+        let (index, manifest_digest, manifest) = match top {
             Document::Manifest(m) => (None, *digest, m),
             Document::Index(index) => {
                 let entry = manifest::select(&index, platform)?;
                 let d = entry.descriptor.clone();
-                let fetched = self.kept_manifest(documents, repo, &d.digest, Some(d.size))?;
-                match self.document(&fetched, &d.digest)? {
+                let usable = |doc: &Document| matches!(doc, Document::Manifest(m) if m.media_type == d.media_type);
+                match self.kept_document(documents, repo, &d.digest, Some(d.size), &usable)? {
                     Document::Manifest(m) if m.media_type == d.media_type => {
                         (Some(*digest), d.digest, m)
                     }
@@ -469,20 +492,35 @@ impl<'a> Client<'a> {
         })
     }
 
-    /// The manifest `digest` from `documents`, or fetched and kept there.
-    fn kept_manifest(
+    /// The index or manifest `digest`, parsed: from `documents` when the
+    /// kept copy parses and is `usable` here, otherwise fetched, and kept
+    /// only when it parses and is `usable`. The bytes of a kept copy are
+    /// its digest's (re-hashed on read), but its `.type` is what the
+    /// response it was fetched with said, and another repository or a
+    /// signature lookup may have served the same bytes with another type
+    /// (review of #57 PR 3): such a copy is fetched again from this
+    /// repository and replaced, never trusted, and a document this pull
+    /// cannot use is never kept, so it cannot spoil another image's pull.
+    fn kept_document(
         &mut self,
         documents: &mut dyn Documents,
         repo: &Repository,
         digest: &Digest,
         size: Option<u64>,
-    ) -> Result<Fetched, PullError> {
-        if let Some(kept) = documents.get(digest)? {
-            return Ok(kept);
+        usable: &dyn Fn(&Document) -> bool,
+    ) -> Result<Document, PullError> {
+        if let Some(kept) = documents.get(digest)?
+            && let Ok(doc) = self.document(&kept, digest)
+            && usable(&doc)
+        {
+            return Ok(doc);
         }
         let fetched = self.get_manifest(repo, digest, size)?;
-        documents.put(digest, &fetched)?;
-        Ok(fetched)
+        let doc = self.document(&fetched, digest)?;
+        if usable(&doc) {
+            documents.put(digest, &fetched)?;
+        }
+        Ok(doc)
     }
 
     fn document(&self, fetched: &Fetched, digest: &Digest) -> Result<Document, PullError> {
@@ -570,6 +608,109 @@ impl<'a> Client<'a> {
                 }
             }
         }
+    }
+
+    /// Fetches the document a signature tag names (ADR-029): `200` gives
+    /// its bytes, at most the document limit, which the caller hashes;
+    /// `404` gives `None`; every other status, and a redirect, fails.
+    pub(crate) fn get_tag_document(
+        &mut self,
+        repo: &Repository,
+        tag: SignatureTag,
+        accept: &str,
+    ) -> Result<Option<Fetched>, PullError> {
+        let url = self
+            .registry
+            .api_url(format!("/v2/{repo}/manifests/{}", tag.text()));
+        let what = format!("tag {}", tag.text());
+        self.get_optional_document(repo, &url, accept, &what)
+    }
+
+    /// The referrers of `digest` (OCI 1.1): `200` gives the listing, at
+    /// most the document limit; `404` gives `None`, a registry without the
+    /// API, whose caller falls back to the tag schema; every other status,
+    /// and a redirect, fails.
+    pub(crate) fn get_referrers(
+        &mut self,
+        repo: &Repository,
+        digest: &Digest,
+    ) -> Result<Option<Fetched>, PullError> {
+        let url = self
+            .registry
+            .api_url(format!("/v2/{repo}/referrers/{digest}"));
+        let what = format!("the referrers of {digest}");
+        self.get_optional_document(repo, &url, manifest::OCI_INDEX, &what)
+    }
+
+    /// One document from the API host that may be absent: `200` (at most
+    /// the document limit), `404` as `None`, the token flow of D9 with a
+    /// second `401` `Failed` (D11), nothing else.
+    fn get_optional_document(
+        &mut self,
+        repo: &Repository,
+        url: &Url,
+        accept: &str,
+        what: &str,
+    ) -> Result<Option<Fetched>, PullError> {
+        let max = self.limits.document.max_bytes() as u64;
+        let deadline = self.timeouts.deadline(max)?;
+        let mut fresh = false;
+        loop {
+            let step = self.send(url, Some(accept), deadline, |head, body| {
+                match head.status {
+                    200 => {
+                        let bytes = read_document(body, None, max, what)?;
+                        let content_type = head
+                            .headers
+                            .get("content-type")
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .map(str::to_owned);
+                        Ok(Step::Done(Some(Fetched {
+                            bytes,
+                            content_type,
+                        })))
+                    }
+                    404 => Ok(Step::Done(None)),
+                    401 => Ok(Step::Unauthorized(challenge(head))),
+                    status => Err(status_error(url, status, what)),
+                }
+            })?;
+            match step {
+                Step::Done(fetched) => {
+                    self.authorized = true;
+                    return Ok(fetched);
+                }
+                Step::Unauthorized(c) => {
+                    self.reauthenticate(c, repo, deadline, &mut fresh, Kind::Signature, what)?
+                }
+                Step::Redirect(_) => {
+                    return Err(failed(format!("{what}: an unexpected redirect")));
+                }
+            }
+        }
+    }
+
+    /// Fetches the blob `descriptor` into memory (ADR-029): a size above
+    /// `max` is refused before any request; the body must be exactly the
+    /// descriptor's size and digest. Redirects as for every blob (D10).
+    pub(crate) fn get_small_blob(
+        &mut self,
+        repo: &Repository,
+        descriptor: &Descriptor,
+        max: u64,
+    ) -> Result<Fetched, PullError> {
+        if descriptor.size > max {
+            return Err(failed(format!(
+                "blob {} has {} bytes, more than the limit of {max}",
+                descriptor.digest, descriptor.size
+            )));
+        }
+        let mut bytes = Vec::new();
+        self.fetch_blob(repo, descriptor, &mut bytes)?;
+        Ok(Fetched {
+            bytes,
+            content_type: None,
+        })
     }
 
     /// Fetches the blob `descriptor` into a temporary file next to `dest`

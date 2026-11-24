@@ -12,6 +12,10 @@ pub enum Error {
     /// A `Registry` host is not a host the client could dial (ADR-009,
     /// D10).
     InvalidRegistry(String),
+    /// A signature policy is unusable: two rules with one scope, a prefix
+    /// that is not repository components ending in `/`, or a rule for a
+    /// registry the store does not pull from (ADR-029).
+    InvalidPolicy(String),
     /// Reading the layer stream failed.
     Read(io::Error),
     /// The gzip framing is invalid (ADR-009, D5).
@@ -100,6 +104,7 @@ impl fmt::Display for Error {
         match self {
             Error::InvalidLimits(what) => write!(f, "invalid limits: {what} must not be zero"),
             Error::InvalidRegistry(what) => write!(f, "invalid registry: {what}"),
+            Error::InvalidPolicy(what) => write!(f, "invalid signature policy: {what}"),
             Error::Read(e) => write!(f, "reading the layer failed: {e}"),
             Error::Gzip(what) => write!(f, "invalid gzip stream: {what}"),
             Error::Zstd(what) => write!(f, "invalid zstd stream: {what}"),

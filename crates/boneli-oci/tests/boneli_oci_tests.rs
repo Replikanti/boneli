@@ -11,7 +11,8 @@
 //!   in a scope started with `-p Delegate=yes` and
 //!   `BONELI_SYS_TEST_CGROUP=self`.
 //! - `network::` pulls `node:22` and `postgres:17` from Docker Hub and runs
-//!   them; the `oci-acceptance` workflow runs it weekly and on demand.
+//!   them, and checks image signatures on real registries (ADR-029); the
+//!   `oci-acceptance` workflow runs it weekly and on demand.
 //!
 //! The test `probe` is this binary's probe mode: a host test re-executes
 //! the binary inside the sandbox with `BONELI_OCI_PROBE=<action>`; without
@@ -614,13 +615,14 @@ mod network {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use boneli_app::{ImageRef, ImageStore};
+    use boneli_app::{ImageError, ImageRef, ImageStore};
     use boneli_http::{IdleCheck, Transport};
-    use boneli_https::{ConnectOptions, Roots, TlsConfig};
+    use boneli_https::{ConnectOptions, PublicKey, Roots, TlsConfig};
     use boneli_oci::{
-        CONNECT_TIMEOUT, Dial, HANDSHAKE_TIMEOUT, IO_TIMEOUT, OciImageStore, StoreConfig, Stream,
-        TlsDial,
+        CONNECT_TIMEOUT, Dial, HANDSHAKE_TIMEOUT, IO_TIMEOUT, OciImageStore, PolicyRule, Registry,
+        RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Stream, TlsDial,
     };
+    use boneli_sigstore::{COSIGN_SIGN_PREDICATE, Identity, SanRule, Trust, TrustedRoot};
     use boneli_sys::ExitStatus;
 
     use crate::support::TempDir;
@@ -884,6 +886,296 @@ mod network {
             );
             assert_eq!(out.status, ExitStatus::Exited(0), "{out:?}");
             assert!(out.stdout.starts_with(expect), "{out:?}");
+        }
+    }
+
+    /// A dial that records the host of every connection it makes.
+    #[derive(Clone)]
+    struct Recording {
+        inner: Arc<TlsDial>,
+        hosts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Dial for Recording {
+        fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>> {
+            self.hosts.lock().expect("hosts").push(host.to_owned());
+            self.inner.dial(host, port, deadline)
+        }
+    }
+
+    fn recording() -> Recording {
+        let tls = TlsConfig::new(Roots::mozilla()).expect("tls");
+        let options =
+            ConnectOptions::new(CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT).expect("options");
+        Recording {
+            inner: Arc::new(TlsDial::new(tls, options)),
+            hosts: Arc::default(),
+        }
+    }
+
+    /// The public-good `trusted_root.json` of 2026-11-20 (ADR-029).
+    const TRUSTED_ROOT: &[u8] = include_bytes!("data/sigstore-trusted-root.json");
+    /// cosign's release key, `release/release-cosign.pub` of
+    /// `sigstore/cosign`.
+    const COSIGN_RELEASE_KEY: &[u8] = include_bytes!("data/release-cosign.pub");
+    /// `chainguard/node`, the index measured on 2026-11-20 (ADR-029), on
+    /// Docker Hub and on `cgr.dev` with one digest.
+    const CHAINGUARD_NODE: &str =
+        "sha256:3fb5318a58807dec0f2ece547efbe8d62c67b7b2fd91a16795b98651d6385dbe";
+    /// `ghcr.io/sigstore/cosign/cosign:v3.1.4` (`latest` on 2026-11-24).
+    const COSIGN: &str = "sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d";
+    /// `registry.k8s.io/pause:3.10` through Artifact Registry.
+    const PAUSE: &str = "sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a";
+
+    fn keyless(issuer: &str, san: SanRule) -> Requirement {
+        let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+        let identity = Identity::new(issuer, san).expect("identity");
+        Requirement::Required(Arc::new(
+            Trust::new(
+                Vec::new(),
+                Some((root, vec![identity])),
+                vec![COSIGN_SIGN_PREDICATE.to_owned()],
+            )
+            .expect("trust"),
+        ))
+    }
+
+    fn chainguard() -> Requirement {
+        keyless(
+            "https://token.actions.githubusercontent.com",
+            SanRule::Uri(
+                "https://github.com/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The names in the store's layer directory, temporary ones aside.
+    fn layer_entries(root: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join("layers/sha256"))
+            .expect("layers")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn rule(registry: &str, scope: RepoScope, requirement: Requirement) -> PolicyRule {
+        PolicyRule {
+            registry: registry.to_owned(),
+            scope,
+            requirement,
+        }
+    }
+
+    /// Pulls `name@digest` for this host's platform and checks that every
+    /// layer of the image is committed; prints the hosts dialed.
+    fn pull_signed(store: &OciImageStore, dial: &Recording, name: &str, digest: &str) {
+        dial.hosts.lock().expect("hosts").clear();
+        let started = Instant::now();
+        let rootfs = store
+            .pull(&ImageRef {
+                name: name.to_owned(),
+                digest: digest.to_owned(),
+                platform: platform().to_owned(),
+            })
+            .unwrap_or_else(|e| panic!("pull {name}: {e}"));
+        let lease = store.lease(&rootfs).expect("lease");
+        assert!(!lease.layers().is_empty());
+        for layer in lease.layers() {
+            assert!(layer.is_dir(), "{}", layer.display());
+        }
+        let hosts = dial.hosts.lock().expect("hosts").clone();
+        println!(
+            "oci-acceptance signatures {name}@{digest} {}: pulled in {:.1} s, {} layers, {} connections",
+            platform(),
+            started.elapsed().as_secs_f64(),
+            lease.layers().len(),
+            hosts.len()
+        );
+        let pointers = std::fs::read_dir(store.root().join("signatures/sha256"))
+            .expect("pointers")
+            .count();
+        assert!(pointers >= 1, "no pointer kept");
+    }
+
+    /// The acceptance of ADR-029 on Docker Hub: under a `Required` rule for
+    /// `chainguard/` with Chainguard's workflow identity and the committed
+    /// public-good root, `chainguard/node` pulls with every layer
+    /// committed, and again from the kept evidence with no signature
+    /// request; under one for `library/`, the unsigned `library/node`
+    /// index of the weekly acceptance is refused with no layer request
+    /// (the only CDN connection is the config's).
+    #[test]
+    #[ignore = "network: pulls chainguard/node and resolves node:22 on Docker Hub"]
+    fn signatures_on_docker_hub() {
+        let dial = recording();
+        let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+        config.signatures = SignaturePolicy::new(
+            Requirement::Off,
+            vec![
+                rule(
+                    "docker.io",
+                    RepoScope::Prefix("chainguard/".to_owned()),
+                    chainguard(),
+                ),
+                rule(
+                    "docker.io",
+                    RepoScope::Prefix("library/".to_owned()),
+                    chainguard(),
+                ),
+            ],
+        )
+        .expect("policy");
+        let tmp = TempDir::new("network-signatures");
+        let root = tmp.path().join("store");
+        let store = OciImageStore::open(&root, config).expect("open");
+        pull_signed(&store, &dial, "chainguard/node", CHAINGUARD_NODE);
+        let committed = layer_entries(&root);
+        dial.hosts.lock().expect("hosts").clear();
+        store
+            .pull(&ImageRef {
+                name: "chainguard/node".to_owned(),
+                digest: CHAINGUARD_NODE.to_owned(),
+                platform: platform().to_owned(),
+            })
+            .expect("warm pull");
+        assert!(
+            dial.hosts.lock().expect("hosts").is_empty(),
+            "the warm pull made requests"
+        );
+
+        dial.hosts.lock().expect("hosts").clear();
+        let refused = store.pull(&ImageRef {
+            name: "library/node".to_owned(),
+            digest: NODE.to_owned(),
+            platform: platform().to_owned(),
+        });
+        let hosts = dial.hosts.lock().expect("hosts").clone();
+        println!("oci-acceptance signatures library/node: {refused:?}, hosts {hosts:?}");
+        match refused {
+            Err(ImageError::Failed { detail }) => {
+                assert!(detail.starts_with("signature policy: "), "{detail}");
+                assert!(detail.contains(".sig: none"), "{detail}");
+            }
+            other => panic!("node:22 must be refused: {other:?}"),
+        }
+        let cdn = hosts.iter().filter(|h| h.ends_with(".docker.com")).count();
+        assert_eq!(cdn, 1, "only the config comes from the CDN: {hosts:?}");
+        assert_eq!(layer_entries(&root), committed, "node:22 committed a layer");
+    }
+
+    /// Real signatures on the other registries ADR-029 measured: cosign's
+    /// keyed bundle on GHCR (no `.sig`, referrers API `404`, the tag
+    /// schema's listing), Chainguard's keyless `.sig` on `cgr.dev`, and the
+    /// Kubernetes release key's keyless `.sig` on `pause:3.10` through
+    /// Artifact Registry (referrers `null`). Each pulls under a `Required`
+    /// rule with its signer's identity, and is refused under another one.
+    #[test]
+    #[ignore = "network: pulls from ghcr.io, cgr.dev and europe-west3-docker.pkg.dev"]
+    fn signatures_elsewhere() {
+        let ghcr = Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("ghcr");
+        let cgr = Registry::new(
+            "cgr.dev",
+            "cgr.dev",
+            &["cgr.dev"],
+            &[".r2.cloudflarestorage.com"],
+        )
+        .expect("cgr");
+        let ar = Registry::new(
+            "europe-west3-docker.pkg.dev",
+            "europe-west3-docker.pkg.dev",
+            &[],
+            &[],
+        )
+        .expect("artifact registry");
+        let cosign_key = Requirement::Required(Arc::new(
+            Trust::new(
+                vec![PublicKey::from_pem(COSIGN_RELEASE_KEY).expect("key")],
+                None,
+                vec![COSIGN_SIGN_PREDICATE.to_owned()],
+            )
+            .expect("trust"),
+        ));
+        let kubernetes = keyless(
+            "https://accounts.google.com",
+            SanRule::Email("krel-trust@k8s-releng-prod.iam.gserviceaccount.com".to_owned()),
+        );
+        let wrong = keyless(
+            "https://accounts.google.com",
+            SanRule::Email("someone-else@example.com".to_owned()),
+        );
+        let cases = [
+            (
+                "ghcr.io/sigstore/cosign/cosign",
+                COSIGN,
+                "ghcr.io",
+                "sigstore/cosign/cosign",
+                cosign_key,
+            ),
+            (
+                "cgr.dev/chainguard/node",
+                CHAINGUARD_NODE,
+                "cgr.dev",
+                "chainguard/node",
+                chainguard(),
+            ),
+            (
+                "europe-west3-docker.pkg.dev/k8s-artifacts-prod/images/pause",
+                PAUSE,
+                "europe-west3-docker.pkg.dev",
+                "k8s-artifacts-prod/images/pause",
+                kubernetes,
+            ),
+        ];
+        for (name, digest, registry, repository, requirement) in cases {
+            for trusted in [false, true] {
+                let dial = recording();
+                let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+                config.registries = vec![
+                    Registry::docker_hub(),
+                    ghcr.clone(),
+                    cgr.clone(),
+                    ar.clone(),
+                ];
+                let exact = RepoScope::Exact(Repository::parse(repository).expect("repository"));
+                let requirement = if trusted {
+                    requirement.clone()
+                } else {
+                    wrong.clone()
+                };
+                config.signatures = SignaturePolicy::new(
+                    Requirement::Off,
+                    vec![rule(registry, exact, requirement)],
+                )
+                .expect("policy");
+                let tmp = TempDir::new("network-elsewhere");
+                let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+                if trusted {
+                    pull_signed(&store, &dial, name, digest);
+                    continue;
+                }
+                let refused = store.pull(&ImageRef {
+                    name: name.to_owned(),
+                    digest: digest.to_owned(),
+                    platform: platform().to_owned(),
+                });
+                println!("oci-acceptance signatures {name} under another identity: {refused:?}");
+                match refused {
+                    Err(ImageError::Failed { detail }) => {
+                        assert!(detail.starts_with("signature policy: "), "{detail}")
+                    }
+                    other => panic!("{name} must be refused: {other:?}"),
+                }
+            }
         }
     }
 }

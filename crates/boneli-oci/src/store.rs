@@ -16,8 +16,13 @@
 //!   by every pull and lease that uses the layer (ADR-025, D2).
 //! - `locks/trim`: held exclusively by the one trim running on the root
 //!   (ADR-025, D6).
+//! - `signatures/sha256/<hex>`: the pointer file of a subject (ADR-029,
+//!   S6), one line that names the kept evidence a former pull verified for
+//!   it under `blobs/sha256/` (`signatures.rs`). Written durably under an
+//!   owned temporary name like every file here; one whose evidence is gone
+//!   is removed by the trim.
 //!
-//! Temporary names in both directories carry their owner (boot id, PID
+//! Temporary names in `blobs/`, `layers/` and `signatures/` carry their owner (boot id, PID
 //! and time namespaces, pid, start time); `open` removes those whose owner
 //! is gone, by its owner lock or, without one, by `/proc`, and leaves the
 //! rest.
@@ -45,8 +50,10 @@ use crate::lease::Lease;
 use crate::limits::{Budget, Limits};
 use crate::lock;
 use crate::manifest::{self, Descriptor, Document, ImageConfig};
+use crate::policy::{Requirement, SignaturePolicy};
 use crate::reference::{Digest, Reference};
 use crate::registry::{Client, Documents, FetchLimits, Fetched, Registry, Timeouts, select};
+use crate::signatures::{self, Check};
 
 /// Uncompressed bytes of one layer: 4 GiB (D7).
 pub const MAX_LAYER_BYTES: u64 = 4_294_967_296;
@@ -131,6 +138,12 @@ pub struct StoreConfig {
     /// under, inclusive, apart from data in use (D5);
     /// [`CACHE_BUDGET_BYTES`] by default (D8). `open` refuses 0.
     pub cache_budget: u64,
+    /// Which images must carry a trusted signature before any layer is
+    /// fetched (ADR-029); [`SignaturePolicy::off`] by default, under which
+    /// a pull sends exactly the requests of ADR-009. `open` refuses a rule
+    /// for a registry that is not among `registries` or
+    /// `default_registry`.
+    pub signatures: SignaturePolicy,
 }
 
 impl StoreConfig {
@@ -162,6 +175,7 @@ impl StoreConfig {
             timeouts: Timeouts::new(IO_TIMEOUT, SETUP_TIMEOUT, MIN_RATE)?,
             dial,
             cache_budget: CACHE_BUDGET_BYTES,
+            signatures: SignaturePolicy::off(),
         })
     }
 
@@ -191,6 +205,7 @@ impl std::fmt::Debug for StoreConfig {
             .field("fetch", &self.fetch)
             .field("timeouts", &self.timeouts)
             .field("cache_budget", &self.cache_budget)
+            .field("signatures", &self.signatures)
             .finish_non_exhaustive()
     }
 }
@@ -300,11 +315,21 @@ impl OciImageStore {
     ///   format (0:0 whiteouts, `user.*` xattrs, D1), or `open` fails
     ///   here rather than in a pull;
     /// - then the store is trimmed to `config.cache_budget`, so a lowered
-    ///   budget applies at once (ADR-025, D6). A budget of 0 is refused
-    ///   first, before anything is created.
+    ///   budget applies at once (ADR-025, D6). A budget of 0, and a
+    ///   signature rule for a registry the store does not pull from
+    ///   (`Error::InvalidPolicy`, ADR-029), are refused first, before
+    ///   anything is created.
     pub fn open(root: &Path, config: StoreConfig) -> Result<OciImageStore, Error> {
         if config.cache_budget == 0 {
             return Err(Error::InvalidLimits("cache budget"));
+        }
+        if let Some(unknown) = config.signatures.registries().find(|name| {
+            *name != config.default_registry.name()
+                && !config.registries.iter().any(|r| r.name() == *name)
+        }) {
+            return Err(Error::InvalidPolicy(format!(
+                "a signature rule names the registry {unknown:?}, which the store does not pull from"
+            )));
         }
         let resolved =
             boneli_private_dir::prepare_root(root, &overlay_text_rule).map_err(root_err)?;
@@ -317,6 +342,7 @@ impl OciImageStore {
             &layer_dir,
             &owners,
             &layers::layer_locks_dir(&resolved),
+            &signatures::pointers_dir(&resolved),
         ] {
             boneli_private_dir::create(dir).map_err(root_err)?;
         }
@@ -586,6 +612,29 @@ impl OciImageStore {
             &self.config.timeouts,
         );
         let resolved = client.resolve_with(&reference, &mut Kept { store: self })?;
+        // The signature check, under a `Required` rule only: after the
+        // documents are resolved and before any layer is pinned or its blob
+        // requested (ADR-029). The subjects are the digest the reference
+        // names and, for an index, the selected platform manifest.
+        if let Requirement::Required(trust) = self
+            .config
+            .signatures
+            .requirement(registry.name(), reference.repository())
+        {
+            let mut subjects = vec![*reference.digest()];
+            if resolved.index.is_some() {
+                subjects.push(resolved.manifest_digest);
+            }
+            Check {
+                client: &mut client,
+                documents: &mut Kept { store: self },
+                root: &self.root,
+                repo: reference.repository(),
+                trust,
+                limits: self.config.fetch.document_limits(),
+            }
+            .run(&subjects)?;
+        }
         // Every layer is pinned before the cache is checked and before any
         // layer blob is requested, so no other store removes a layer this
         // pull is about to use (ADR-025, D2).
@@ -775,7 +824,7 @@ fn type_path(blob: &Path) -> PathBuf {
 }
 
 /// The bytes of `path`, `None` if it is missing or longer than `max`.
-fn read_capped(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_capped(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -788,7 +837,7 @@ fn read_capped(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
 
 /// Writes `bytes` to a temporary name in `dir`, syncs it, renames it to
 /// `dest` and syncs `dir`.
-fn write_durably(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn write_durably(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
     let temp = dir.join(layers::temporary_name()?);
     let result = OpenOptions::new()
         .write(true)

@@ -274,7 +274,7 @@ fn manifest(object: &Object, media_type: &str, max_layers: usize) -> Result<Mani
     })
 }
 
-fn descriptor(object: &Object) -> Result<Descriptor, String> {
+pub(crate) fn descriptor(object: &Object) -> Result<Descriptor, String> {
     let media_type = string(object, "mediaType")?.ok_or("a descriptor without mediaType")?;
     let digest = string(object, "digest")?.ok_or("a descriptor without digest")?;
     let digest = Digest::parse(&digest).map_err(|e| e.detail().to_owned())?;

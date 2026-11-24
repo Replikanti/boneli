@@ -299,6 +299,7 @@ struct Dirs {
     layers: PathBuf,
     blobs: PathBuf,
     locks: PathBuf,
+    signatures: PathBuf,
 }
 
 /// One evictable unit.
@@ -379,6 +380,7 @@ pub(crate) fn trim(
         layers: root.join("layers").join("sha256"),
         blobs: root.join("blobs").join("sha256"),
         locks: layers::layer_locks_dir(root),
+        signatures: crate::signatures::pointers_dir(root),
     };
     let trim_lock = match lock::exclusive(&root.join("locks").join("trim"), deadline) {
         Ok(held) => held,
@@ -640,6 +642,37 @@ fn trim_locked(
     }
     report.after = saturated(total);
 
+    // Pointer files (ADR-029, S6) that name no complete evidence any more:
+    // malformed, or a blob of every line is gone (evicted above or by an
+    // earlier trim; a line with a blob gone is dropped when the file is
+    // next written). Such a pointer reads as absent, so it only costs a
+    // file; removing it keeps `signatures/` from growing with every image
+    // ever checked. A pull that rewrites one meanwhile loses at most its
+    // pointer, and the next pull discovers the evidence again. The
+    // directory is missing only on a root `open` has not prepared.
+    match names(&dirs.signatures) {
+        Ok(pointers) => {
+            for name in pointers.iter().filter(|n| is_hex64(n)) {
+                let path = dirs.signatures.join(name);
+                let complete = read_capped(&path, crate::signatures::MAX_POINTER_BYTES)
+                    .and_then(|bytes| crate::signatures::Pointer::parse_file(&bytes))
+                    .is_some_and(|lines| {
+                        lines.iter().any(|p| {
+                            p.blobs().iter().all(|d| {
+                                fs::symlink_metadata(dirs.blobs.join(d.hex()))
+                                    .is_ok_and(|m| m.file_type().is_file())
+                            })
+                        })
+                    });
+                if !complete && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        Err(Error::Cache { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     // Lock files of layers that are not in the store, once nobody holds
     // them: a failed pull's, or one a crash left after step 5.
     for name in names(&dirs.locks)? {
@@ -655,7 +688,8 @@ fn trim_locked(
     Ok(())
 }
 
-/// Removes the names in `blobs/sha256/` and `layers/sha256/` that carry an
+/// Removes the names in `blobs/sha256/`, `layers/sha256/` and
+/// `signatures/sha256/` (ADR-029) that carry an
 /// owner (ADR-009, D8) whose owner is gone, then the owner lock files no
 /// name needs any more (ADR-025, D1). The names are grouped by owner, and
 /// each owner is judged once:
@@ -690,6 +724,7 @@ pub(crate) fn sweep(root: &Path, judge: &Judge) -> Result<(), Error> {
     let dirs = [
         root.join("blobs").join("sha256"),
         root.join("layers").join("sha256"),
+        crate::signatures::pointers_dir(root),
     ];
     let owners = layers::owners_dir(root);
     let mut by_owner: BTreeMap<String, (Owner, Vec<PathBuf>)> = BTreeMap::new();
@@ -1140,6 +1175,10 @@ pub(crate) mod tests {
             std::fs::create_dir_all(staged.join("d")).expect("staged");
             std::fs::write(staged.join("d/f"), b"x").expect("staged file");
             std::fs::write(blobs.join(format!(".tmp-{dead}.{:020}", 2)), b"x").expect("blob");
+            // And a pointer file it was writing (ADR-029).
+            let pointers = crate::signatures::pointers_dir(root);
+            boneli_private_dir::create(&pointers).expect("pointers");
+            std::fs::write(pointers.join(format!(".tmp-{dead}.{:020}", 3)), b"x").expect("pointer");
 
             let out = Command::new(std::env::current_exe().expect("test binary"))
                 .args([
@@ -1209,6 +1248,7 @@ pub(crate) mod tests {
                         "{step:?}: removed under the lock"
                     );
                     assert_eq!(temps(&blobs).len(), 1, "{step:?}");
+                    assert_eq!(temps(&pointers).len(), 1, "{step:?}");
                     let lock = root.join("locks/owners").join(&dead);
                     assert_eq!(
                         lock.exists(),
@@ -1222,7 +1262,7 @@ pub(crate) mod tests {
             // The next open.
             sweep(root, &Judge::current().expect("judge")).expect("sweep");
             trim_now(root, u64::MAX).expect("trim");
-            for dir in [&layers, &blobs] {
+            for dir in [&layers, &blobs, &pointers] {
                 let dots: Vec<String> = names(dir)
                     .into_iter()
                     .filter(|n| n.starts_with('.'))

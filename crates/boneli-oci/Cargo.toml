@@ -44,6 +44,10 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 # The store-root rules of ADR-009 D8, shared with boneli-store-fs
 # (ADR-021). A support crate, no external edge.
 boneli-private-dir.workspace = true
+# Verifies cosign signatures and Sigstore bundles against keys or a trusted
+# root under a `Required` signature rule (ADR-029, S3). A support crate, no
+# external edge.
+boneli-sigstore.workspace = true
 
 [dev-dependencies]
 # The same crate with its test seam, `lock::Foreign` and `FileLock::copy_as`,

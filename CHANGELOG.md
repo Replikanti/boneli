@@ -754,6 +754,31 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `latest`'s keyed bundle against Sigstore's public-good root and
   cosign's release key. Registered in `roles.support`; no new external
   edge.
+- `boneli-oci` (part 3 of #57, ADR-029, accepted): a signature policy
+  for the image store. `StoreConfig::signatures` (`SignaturePolicy::off`
+  by default, under which a pull sends exactly the requests of ADR-009)
+  holds rules by registry name and repository (the whole registry, one
+  repository as written, or a prefix ending in `/`; the most specific rule
+  wins) with `Requirement::Off` or `Requirement::Required(Trust)`. Under
+  `Required` a pull resolves the image, then looks for a signature over
+  the digest the reference names or the selected platform manifest: the
+  cosign `.sig` tag, and the referrers API with the `sha256-<hex>` tag
+  schema on `404` (GHCR answers that tag with the image itself where no
+  referrer exists, which counts as none). At most `MAX_SIGNATURES` (16)
+  entries per carrier listing; only a candidate that `boneli-sigstore`
+  verifies lets the pull go on, and every refusal is `Failed` before any
+  layer blob is requested, with a detail of digests, counts and fixed
+  reasons in printable ASCII. The evidence that verified is kept under
+  `blobs/sha256/` with a pointer file per subject in the new
+  `signatures/sha256/` (up to 32 lines, so rules with different trusts
+  keep each other's evidence) and verified again, offline, on every later
+  pull; a signature lookup never replaces a kept document, and a kept
+  index or manifest whose stored type makes it unusable is fetched again
+  from the image's repository instead of failing the pull;
+  the sweep covers that directory and the trim removes pointers whose
+  evidence is gone. `open` refuses a rule for a registry the store does
+  not pull from (`Error::InvalidPolicy`). Live tests on Docker Hub, GHCR,
+  `cgr.dev` and Artifact Registry in `oci-acceptance`.
 
 ### Changed
 

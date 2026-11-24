@@ -2,10 +2,15 @@ name: oci-acceptance
 
 # The acceptance of ADR-009 (#7): pull node:22 and postgres:17, pinned by
 # index digest, from Docker Hub on both architectures and run both in the
-# sandbox. Weekly, because Docker Hub changes (a garbage-collected digest, a
-# CDN host move, the token flow) show up within 7 days at 4 manifest
-# requests per architecture per run, far below the measured anonymous
-# limit of 100 per hour. Never on code paths and not a required check, so
+# sandbox. And of ADR-029 (#57): pull signed images under a `Required`
+# signature rule (chainguard/node on Docker Hub and cgr.dev, cosign on
+# GHCR, pause through Artifact Registry) and refuse the unsigned node:22
+# before any layer request. Weekly, because registry changes (a
+# garbage-collected digest, a CDN host move, the token flow, a signature
+# replaced) show up within 7 days at 13 Docker Hub manifest, tag and
+# referrers requests per architecture per run (4 before ADR-029, counted
+# from the tests' code paths), far below the measured anonymous limit of
+# 100 per hour. Never on code paths and not a required check, so
 # a Docker Hub outage cannot block a code PR. `pull_request` is limited to
 # this file: GitHub dispatches `workflow_dispatch` only for workflows
 # already on the default branch, so the PR that adds or edits this file
@@ -65,7 +70,7 @@ jobs:
           TARGET_DIR="$GITHUB_WORKSPACE/target" RUN_USER="$USER" ENABLE_LINGER=1 sh -eu "$RUNNER_TEMP/host-setup.sh"
       # Pull time, throughput, the longest gap between reads and the layer
       # media types are printed per image (ADR-009, D5 and D12).
-      - name: Pull and run node:22 and postgres:17
+      - name: Pull and run node:22 and postgres:17, check image signatures
         run: |
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self \

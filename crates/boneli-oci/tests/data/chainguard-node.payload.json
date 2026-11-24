@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"cgr.dev/chainguard/node"},"image":{"docker-manifest-digest":"sha256:3fb5318a58807dec0f2ece547efbe8d62c67b7b2fd91a16795b98651d6385dbe"},"type":"cosign container image signature"},"optional":null}
