@@ -980,11 +980,11 @@
    "title": "boneli-oci: verify image signatures and provenance",
    "epic": null,
    "order": 37,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "b6fae515",
    "pr": 108,
-   "note": "PR 1 #107 merged; PR 2 boneli-sigstore",
-   "updated_at": "2026-11-24T00:40:52+00:00",
+   "note": "PR 1 #107, PR 2 #108 merged; PR 3 boneli-oci",
+   "updated_at": "2026-11-24T01:41:11+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1489,14 +1489,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-20T22:05:50+00:00",
-   "issue": 69,
-   "from": "claimed",
-   "to": "stopped",
-   "by": "62531680",
-   "note": "scout NO-GO: start gate 'second stack once onboarding on TypeScript works' not met; #14 and #15 open"
-  },
-  {
    "at": "2026-11-20T22:06:00+00:00",
    "issue": 80,
    "from": "ready",
@@ -1887,6 +1879,14 @@
    "to": "implementing",
    "by": "9f12be0c",
    "note": null
+  },
+  {
+   "at": "2026-11-24T01:41:11+00:00",
+   "issue": 57,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "b6fae515",
+   "note": "PR 1 #107, PR 2 #108 merged; PR 3 boneli-oci"
   }
  ],
  "open": [
@@ -1921,7 +1921,7 @@
   109
  ],
  "xopen": [],
- "updated_at": "2026-11-24T01:33:43+00:00",
+ "updated_at": "2026-11-24T01:41:11+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
