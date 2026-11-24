@@ -832,9 +832,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CertificateClaims` (`Trust::with_certificate_claims`): the Source
   Repository URI (1.12) and Ref (1.14) Fulcio wrote into the leaf (exact,
   or a prefix ending in `/` followed by a plain path), an optional exact
-  repository ID (1.15), an optional exact Build Config URI (1.18, the
-  calling workflow file, which a reusable workflow's SAN does not name),
-  and a required list of build triggers (1.20). They
+  repository ID (1.15), an optional calling workflow path
+  (`with_workflow_path`: Build Config URI 1.18 must be
+  `<1.12>/<path>@<1.14>`, so every release of that file passes; a
+  reusable workflow's SAN does not name it), and a required list of build
+  triggers (1.20). They
   are read only from a leaf webpki verified, on every keyless carrier, so
   `boneli-oci` keeps examining `.sig` under them, and before any statement
   is parsed; every modeled extension present must be one minimal DER

@@ -51,8 +51,21 @@ Measured on 2026-11-24:
   and 1.18 its caller `…/release.yaml@refs/tags/v2.2.2`. At #114 STOP 1,
   on 4 cosign `.att` certificates of `slsa-github-generator` builds, the
   SAN (and so 1.9, written from the same `job_workflow_ref`) was the
-  generator's reusable workflow, shared by every caller, and 1.18 was `<repository>/<entryPoint>@<ref>`, for example
+  generator's reusable workflow, shared by every caller, and 1.18 was
+  `<repository>/<entryPoint>@<ref>`, for example
   `https://github.com/fluxcd/flux2/.github/workflows/release.yaml@refs/tags/v2.4.0`.
+- **1.18 is `<1.12>/<workflow path>@<1.14>`.** Checked on 19 leaves: the
+  3 committed ones, the 12 SLSA v1 bundles and the `.att` certificates of
+  flux-cli v2.4.0 and v2.7.3, argocd v3.2.0 and kyverno v1.16.0, fetched
+  again on 2026-11-24 (17 distinct leaves: the runner and jq bundles are
+  in both sets). In 19 of 19, 1.18 is exactly the leaf's own 1.12, `/`,
+  a workflow path and `@` with the leaf's own 1.14. The paths:
+  `.github/workflows/release.yaml` (Chainguard, coder ×2,
+  timestamp-server and all 4 `.att`), `.github/workflows/ci.yml` (jq),
+  `.github/workflows/docker-publish.yml` (runner) and
+  `.github/workflows/images-updater-core.yml` (dependabot ×6). So 1.18
+  carries the run's ref: flux-cli v2.4.0 and v2.7.3 have the same caller
+  file and two different 1.18 values.
 - **Why the statement and the certificate agree.** GitHub's producer
   (`actions/toolkit`, `packages/attest/src/provenance.ts`) fills
   `workflow.ref`, `workflow.repository`, the source dependency
@@ -104,18 +117,32 @@ list in every set of certificate claims (D2); an optional repository ID
      list of exact names. These are what the issue asks for, and what
      tells a run's code apart: the repository and ref, and the trigger
      for which they name the built code.
-   - **Build Config URI (1.18), exact and optional**
-     (`CertificateClaims::with_build_config`), added to #113 at #114 STOP
-     1 (D2). It is the only extension that names the calling workflow
-     file: where the signing job runs in a reusable workflow, the SAN and
-     1.9 name the reusable one, shared by every caller (all 4 measured
-     `.att` certificates, 1 of the 12 SLSA v1 bundles), and only 1.18
-     says which top-level workflow of the repository started the run.
-     Where a workflow signs for itself, 1.18 = 1.9 (3 of 3 committed
+   - **The calling workflow file, from Build Config URI (1.18)**,
+     optional (`CertificateClaims::with_workflow_path`), added to #113 at
+     #114 STOP 1 (D2). 1.18 is the only extension that names the calling
+     workflow file: where the signing job runs in a reusable workflow,
+     the SAN and 1.9 name the reusable one, shared by every caller (all 4
+     measured `.att` certificates, 1 of the 12 SLSA v1 bundles), and only
+     1.18 says which top-level workflow of the repository started the
+     run. Where a workflow signs for itself, 1.18 = 1.9 (3 of 3 committed
      leaves, 11 of 12 bundles), so the rule adds nothing there and costs
-     nothing. Exact, not a prefix: the value carries the ref, and a
-     release ref is covered by 1.14's prefix rule. Its use for cosign
-     `.att` provenance, whose SAN is the generator's, is #114.
+     nothing.
+
+     The rule holds a workflow path (`.github/workflows/release.yaml`),
+     and 1.18 must be byte for byte `<1.12>/<path>@<1.14>`, built from the
+     same leaf's 1.12 and 1.14 (19 of 19 measured leaves have this form).
+     A rule on the whole URI would pin one release, because 1.18 carries
+     the ref: a rule written for flux-cli v2.4.0 would refuse v2.4.1, and
+     1.14's prefix rule does not relax another field (review of the PR).
+     With the path as the rule, the URI is still compared whole, its
+     repository and ref are the ones 1.12 and 1.14 already bind (with
+     their own rules, if set), and every release of the same caller
+     passes. The path is checked when the rule is built: printable ASCII
+     without spaces, relative (no leading `/`), no `@` (it would end the
+     path inside 1.18), and every `/`-segment non-empty and neither `.`
+     nor `..`, so a rule cannot name a file outside the repository's own
+     tree or a form GitHub never writes (`WorkflowPathNotPlain`). Its use
+     for cosign `.att` provenance, whose SAN is the generator's, is #114.
    - **Statement agreement** (opt-in,
      `CertificateClaims::with_statement_agreement`): `builder.id` = 1.9,
      `workflow.repository` = 1.12, `workflow.ref` = 1.14, and at least
@@ -201,7 +228,7 @@ list in every set of certificate claims (D2); an optional repository ID
 9. **Order and texts.** The checks run:
    1. what is signed, then the signature and identity (ADR-029);
    2. the facts read from the leaf (item 6);
-   3. the rules: repository, ref, ID, build config, trigger, then the
+   3. the rules: repository, ref, ID, workflow path, trigger, then the
       presence of what
       the agreement needs;
    4. the statement's shape (ADR-031 items 5 and 6);
@@ -300,11 +327,12 @@ the `oci-acceptance` run on the PR for #113 passes
 attestations and Chainguard's `.sig` meet their certificate claims with
 the same `Accepted` as without them, the two attestations also with
 ADR-031's claims and the agreement, and one field off on each (repository,
-ref, ref prefix, trigger, repository ID, build config) refuses naming
-it; the three leaves also meet an exact 1.18 rule naming their own
-workflow file. The hand-applied mutation pass over `fulcio.rs`, the
-agreement step, the order in `verify` and the configuration checks kills
-53 of 54 mutants (8 of them on the 1.18 rule).
+ref, ref prefix, trigger, repository ID, workflow path) refuses naming
+it; the three leaves also meet a workflow-path rule naming their own
+file, and two tags of one caller pass under one rule. The hand-applied
+mutation pass over `fulcio.rs`, the agreement step, the order in
+`verify` and the configuration checks kills 60 of 61
+mutants (15 of 15 on the workflow-path rule).
 The one left is equivalent: certificate claims on an accepted signature
 without a certificate (the `NoCertificate` arm) cannot be reached,
 because configuration refuses a trust with keys. Live on x86_64 (local

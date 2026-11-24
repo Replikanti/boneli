@@ -1317,45 +1317,51 @@ fn truncated_extensions_refused() {
 }
 
 // ---------------------------------------------------------------------
-// Build Config URI (1.18)
+// The calling workflow file: Build Config URI (1.18)
 // ---------------------------------------------------------------------
 
-/// jq's Build Config URI, as Fulcio wrote it (equal to its 1.9 and SAN).
-const JQ_BUILD_CONFIG: &str =
-    "https://github.com/jqlang/jq/.github/workflows/ci.yml@refs/tags/jq-1.8.2";
-
-fn build_config(cc: CertificateClaims, uri: &str) -> CertificateClaims {
-    cc.with_build_config(uri).expect("build config")
+fn workflow_path(cc: CertificateClaims, path: &str) -> CertificateClaims {
+    cc.with_workflow_path(path).expect("workflow path")
 }
 
-/// The three real leaves meet an exact 1.18 rule naming their own
-/// workflow file, with the same `Accepted` as without it, and one with
-/// another path, ref or repository refuses naming 1.18.
+/// The three real leaves meet a workflow-path rule naming their own
+/// workflow file, with the same `Accepted` as without it (each 1.18 is
+/// `<1.12>/<path>@<1.14>`), and another path refuses naming 1.18.
 #[test]
-fn real_build_config_known_answer() {
+fn real_workflow_path_known_answer() {
     let runner = runner_verify(runner_cc());
     assert!(runner.is_ok());
     assert_eq!(
-        runner_verify(build_config(runner_cc(), real::RUNNER_WORKFLOW)),
+        runner_verify(workflow_path(
+            runner_cc(),
+            ".github/workflows/docker-publish.yml"
+        )),
         runner
     );
     let jq = jq_verify(jq_cc());
     assert!(jq.is_ok());
-    assert_eq!(jq_verify(build_config(jq_cc(), JQ_BUILD_CONFIG)), jq);
+    assert_eq!(
+        jq_verify(workflow_path(jq_cc(), ".github/workflows/ci.yml")),
+        jq
+    );
     let chainguard = chainguard_verify(chainguard_cc());
     assert!(chainguard.is_ok());
     assert_eq!(
-        chainguard_verify(build_config(chainguard_cc(), real::CHAINGUARD_WORKFLOW)),
+        chainguard_verify(workflow_path(
+            chainguard_cc(),
+            ".github/workflows/release.yaml"
+        )),
         chainguard
     );
     for other in [
-        real::RUNNER_WORKFLOW.replace("docker-publish.yml", "release.yml"),
-        real::RUNNER_WORKFLOW.replace("@refs/heads/main", "@refs/heads/dev"),
-        real::RUNNER_WORKFLOW.replace("actions/runner", "actions/other"),
-        format!("{}/", real::RUNNER_WORKFLOW),
+        ".github/workflows/release.yml",
+        ".github/workflows/docker-publish.yaml",
+        ".github/workflows/docker-publish.yml/x",
+        "github/workflows/docker-publish.yml",
+        "docker-publish.yml",
     ] {
         assert_eq!(
-            runner_verify(build_config(runner_cc(), &other)),
+            runner_verify(workflow_path(runner_cc(), other)),
             mismatch(Extension::BuildConfigUri),
             "{other}"
         );
@@ -1368,83 +1374,153 @@ fn real_build_config_known_answer() {
     )
     .expect("cc");
     assert_eq!(
-        runner_verify(build_config(cc, JQ_BUILD_CONFIG)),
+        runner_verify(workflow_path(cc, ".github/workflows/ci.yml")),
         mismatch(Extension::BuildConfigUri)
     );
 }
 
-/// A reusable workflow: 1.9 (and the SAN) name the called workflow, 1.18
-/// the caller. A 1.18 rule on the caller passes; one on the called
-/// workflow refuses, so only 1.18 binds the calling workflow file.
-#[test]
-fn build_config_names_the_caller() {
-    let pki = Pki::new();
-    let caller = "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main";
+const CALLER: &str = "https://github.com/acme/app/.github/workflows/release.yml";
+const CALLER_PATH: &str = ".github/workflows/release.yml";
+
+/// A leaf of a tag release of `acme/app` signed in a reusable workflow:
+/// 1.9 names the called generator, 1.18 the caller at `tag`; 1.14 is the
+/// tag.
+fn release_leaf(tag: &str) -> LeafSpec {
+    let git_ref = format!("refs/tags/{tag}");
     let called = "https://github.com/acme/generator/.github/workflows/build.yml@refs/tags/v1";
-    let leaf = LeafSpec::github(GH_WORKFLOW)
+    LeafSpec::github(GH_WORKFLOW)
         .fulcio(9, Some(utf8(called.as_bytes())))
-        .fulcio(18, Some(utf8(caller.as_bytes())));
-    assert_eq!(layer(&pki, &leaf, build_config(gh_claims(), caller)), PASS);
-    assert_eq!(
-        layer(&pki, &leaf, build_config(gh_claims(), called)),
-        mismatch(Extension::BuildConfigUri)
-    );
-    for value in [
-        "https://github.com/acme/app/.github/workflows/release.yaml@refs/heads/main",
-        "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main ",
-        "https://github.com/Acme/app/.github/workflows/release.yml@refs/heads/main",
-    ] {
-        let leaf = gh_leaf().fulcio(18, Some(utf8(value.as_bytes())));
+        .fulcio(14, Some(utf8(git_ref.as_bytes())))
+        .fulcio(18, Some(utf8(format!("{CALLER}@{git_ref}").as_bytes())))
+}
+
+/// Certificate claims for `acme/app`'s tag releases with `path`.
+fn release_claims(path: &str) -> CertificateClaims {
+    let cc = CertificateClaims::new(
+        exact(GH_REPOSITORY),
+        prefix("refs/tags/"),
+        triggers(&[GH_TRIGGER]),
+    )
+    .expect("cc");
+    workflow_path(cc, path)
+}
+
+/// Under a reusable workflow, the caller's path passes and the called
+/// generator's refuses: only 1.18 binds the calling workflow file. Two
+/// tags of the same caller both pass under one rule.
+#[test]
+fn workflow_path_names_the_caller() {
+    let pki = Pki::new();
+    for tag in ["v2.4.0", "v2.4.1"] {
+        let leaf = release_leaf(tag);
         assert_eq!(
-            layer(&pki, &leaf, build_config(gh_claims(), caller)),
+            layer(&pki, &leaf, release_claims(CALLER_PATH)),
+            PASS,
+            "{tag}"
+        );
+        assert_eq!(
+            layer(&pki, &leaf, release_claims(".github/workflows/build.yml")),
             mismatch(Extension::BuildConfigUri),
-            "{value:?}"
+            "{tag}"
         );
     }
-    // Missing under the rule.
+}
+
+/// 1.18 is compared whole against the leaf's own 1.12 and 1.14: a 1.18
+/// that names another ref, repository or path, or differs in a byte,
+/// refuses; a missing or malformed 1.18 refuses naming it.
+#[test]
+fn workflow_path_mismatch() {
+    let pki = Pki::new();
+    let tagged = |uri: &str| release_leaf("v2.4.0").fulcio(18, Some(utf8(uri.as_bytes())));
+    for uri in [
+        format!("{CALLER}@refs/tags/v2.3.0"),
+        format!("{CALLER}@refs/heads/main"),
+        "https://github.com/acme/other/.github/workflows/release.yml@refs/tags/v2.4.0".to_owned(),
+        "https://github.com/acme/app/.github/workflows/release.yaml@refs/tags/v2.4.0".to_owned(),
+        format!("{CALLER}@refs/tags/v2.4.0 "),
+        format!("{CALLER}/@refs/tags/v2.4.0"),
+        "https://github.com/acme/app//.github/workflows/release.yml@refs/tags/v2.4.0".to_owned(),
+        "https://github.com/Acme/app/.github/workflows/release.yml@refs/tags/v2.4.0".to_owned(),
+    ] {
+        assert_eq!(
+            layer(&pki, &tagged(&uri), release_claims(CALLER_PATH)),
+            mismatch(Extension::BuildConfigUri),
+            "{uri:?}"
+        );
+    }
     assert_eq!(
-        layer(&pki, &gh_leaf(), build_config(gh_claims(), caller)),
+        layer(
+            &pki,
+            &release_leaf("v2.4.0").fulcio(18, None),
+            release_claims(CALLER_PATH)
+        ),
         missing(Extension::BuildConfigUri)
     );
 }
 
-/// A malformed 1.18 refuses under the 1.18 rule, named before a malformed
-/// 1.20 (OID order); without the rule it is not read and the leaf passes.
+/// A malformed 1.18 refuses under the workflow-path rule, named before a
+/// malformed 1.20 (OID order); without the rule it is not read and the
+/// leaf passes.
 #[test]
-fn build_config_malformed() {
+fn workflow_path_malformed() {
     let pki = Pki::new();
-    let caller = GH_WORKFLOW;
     for value in [
         b"https://github.com/acme/app".to_vec(),
         vec![0x0C, 0x00],
         vec![0x0C, 0x02, 0xC0, 0xAF],
         vec![0x16, 0x01, b'a'],
     ] {
-        let leaf = gh_leaf().fulcio(18, Some(value.clone()));
+        let leaf = release_leaf("v2.4.0").fulcio(18, Some(value.clone()));
         assert_eq!(
-            layer(&pki, &leaf, build_config(gh_claims(), caller)),
+            layer(&pki, &leaf, release_claims(CALLER_PATH)),
             malformed(Extension::BuildConfigUri),
             "{value:?}"
         );
-        assert_eq!(layer(&pki, &leaf, gh_claims()), PASS, "{value:?}");
+        let without = CertificateClaims::new(None, None, triggers(&[GH_TRIGGER])).expect("cc");
+        assert_eq!(layer(&pki, &leaf, without), PASS, "{value:?}");
     }
-    let leaf = gh_leaf()
+    let leaf = release_leaf("v2.4.0")
         .fulcio(18, Some(b"raw".to_vec()))
         .fulcio(20, Some(b"raw".to_vec()));
     assert_eq!(
-        layer(&pki, &leaf, build_config(gh_claims(), caller)),
+        layer(&pki, &leaf, release_claims(CALLER_PATH)),
         malformed(Extension::BuildConfigUri)
     );
-    // Configuration: the URI is printable ASCII without spaces.
-    for uri in [
+}
+
+#[test]
+fn workflow_path_configuration() {
+    for path in [
         "",
-        "https://github.com/acme/app/x y.yml@refs/heads/main",
-        "\u{430}",
+        "/.github/workflows/release.yml",
+        ".github/workflows/release.yml@refs/tags/v1",
+        "@",
+        ".github/../release.yml",
+        "./release.yml",
+        ".github/workflows/.",
+        ".github//workflows/release.yml",
+        ".github/workflows/",
+        ".github/workflows/re lease.yml",
+        ".github/workflows/r\u{e9}lease.yml",
+        ".github/workflows/release.yml\n",
     ] {
         assert_eq!(
-            gh_claims().with_build_config(uri).err(),
-            Some(ConfigError::ClaimNotAscii),
-            "{uri:?}"
+            gh_claims().with_workflow_path(path).err(),
+            Some(ConfigError::WorkflowPathNotPlain),
+            "{path:?}"
         );
     }
+    for path in [
+        "release.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/..x.yml",
+        ".github/workflows/x..yml",
+    ] {
+        assert!(gh_claims().with_workflow_path(path).is_ok(), "{path:?}");
+    }
+    assert_eq!(
+        ConfigError::WorkflowPathNotPlain.to_string(),
+        "a workflow path is not a plain relative path of printable ASCII without @"
+    );
 }

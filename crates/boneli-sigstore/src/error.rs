@@ -238,6 +238,9 @@ pub enum ConfigError {
     /// The statement agreement was asked for on a trust without
     /// provenance claims.
     AgreementWithoutClaims,
+    /// A workflow path is empty, not printable ASCII, absolute, holds an
+    /// `@`, or has an empty, `.` or `..` segment.
+    WorkflowPathNotPlain,
 }
 
 impl fmt::Display for ConfigError {
@@ -282,6 +285,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::AgreementWithoutClaims => {
                 "the statement agreement needs provenance claims, set first"
+            }
+            ConfigError::WorkflowPathNotPlain => {
+                "a workflow path is not a plain relative path of printable ASCII without @"
             }
         })
     }

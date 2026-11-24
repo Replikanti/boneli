@@ -19,8 +19,10 @@
 //! - **The rules,** in this order: Source Repository URI (1.12, exact or
 //!   a prefix ending in `/`), Source Repository Ref (1.14, the same),
 //!   Source Repository Identifier (1.15, exact), Build Config URI (1.18,
-//!   exact) and Build Trigger (1.20, one of a list of exact names, which
-//!   every set of claims has). The first that fails is
+//!   exactly `<1.12>/<workflow path>@<1.14>` of the leaf's own 1.12 and
+//!   1.14, so every ref of one calling workflow file passes) and Build
+//!   Trigger (1.20, one of a list of exact names, which every set of
+//!   claims has). The first that fails is
 //!   [`CertificateRefusal::Mismatch`].
 //! - **The statement agreement** (opt-in): the SLSA statement's
 //!   `builder.id`, `workflow.repository`, `workflow.ref` and source
@@ -130,7 +132,7 @@ pub struct CertificateClaims {
     repository: Option<ClaimMatch>,
     git_ref: Option<ClaimMatch>,
     repository_id: Option<String>,
-    build_config: Option<String>,
+    workflow_path: Option<String>,
     triggers: Vec<String>,
     pub(crate) agreement: bool,
 }
@@ -159,7 +161,7 @@ impl CertificateClaims {
             repository,
             git_ref,
             repository_id: None,
-            build_config: None,
+            workflow_path: None,
             triggers,
             agreement: false,
         })
@@ -179,16 +181,26 @@ impl CertificateClaims {
         })
     }
 
-    /// These claims with an exact Build Config URI (1.18),
-    /// `<repository>/<workflow path>@<ref>`: the workflow file the run
-    /// started, which a reusable workflow's SAN and 1.9 do not name.
-    /// Non-empty printable ASCII without spaces.
-    pub fn with_build_config(self, uri: &str) -> Result<CertificateClaims, ConfigError> {
-        if !printable(uri) {
-            return Err(ConfigError::ClaimNotAscii);
+    /// These claims with the calling workflow file `path` (for example
+    /// `.github/workflows/release.yaml`): the leaf's Build Config URI
+    /// (1.18) must be exactly `<1.12>/<path>@<1.14>`, built from the same
+    /// leaf's Source Repository URI and Ref. 1.18 names the workflow the
+    /// run started, which a reusable workflow's SAN and 1.9 do not; it
+    /// also carries the ref, so a rule on the path rather than on the
+    /// whole URI admits every release of that file. The path must be
+    /// printable ASCII without spaces, relative (no leading `/`), without
+    /// `@`, and every `/`-segment non-empty and neither `.` nor `..`.
+    pub fn with_workflow_path(self, path: &str) -> Result<CertificateClaims, ConfigError> {
+        let plain = printable(path)
+            && !path.contains('@')
+            && path
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+        if !plain {
+            return Err(ConfigError::WorkflowPathNotPlain);
         }
         Ok(CertificateClaims {
-            build_config: Some(uri.to_owned()),
+            workflow_path: Some(path.to_owned()),
             ..self
         })
     }
@@ -257,7 +269,7 @@ impl<'a> Facts<'a> {
     ) -> Result<Facts<'a>, Refusal> {
         let mut values = [None; 7];
         for (slot, ext) in values.iter_mut().zip(Extension::ALL) {
-            if ext == Extension::BuildConfigUri && claims.build_config.is_none() {
+            if ext == Extension::BuildConfigUri && claims.workflow_path.is_none() {
                 continue;
             }
             if let Some(der) = cert.extension(&ext.oid()) {
@@ -304,10 +316,13 @@ pub(crate) fn check<'a>(
     {
         return Err(mismatch(Extension::SourceRepositoryIdentifier));
     }
-    if let Some(uri) = &claims.build_config
-        && facts.need(Extension::BuildConfigUri)? != uri
-    {
-        return Err(mismatch(Extension::BuildConfigUri));
+    if let Some(path) = &claims.workflow_path {
+        let uri = facts.need(Extension::BuildConfigUri)?;
+        let repository = facts.need(Extension::SourceRepositoryUri)?;
+        let git_ref = facts.need(Extension::SourceRepositoryRef)?;
+        if uri != format!("{repository}/{path}@{git_ref}") {
+            return Err(mismatch(Extension::BuildConfigUri));
+        }
     }
     let trigger = facts.need(Extension::BuildTrigger)?;
     if !claims.triggers.iter().any(|t| t == trigger) {
