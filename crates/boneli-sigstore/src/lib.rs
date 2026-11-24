@@ -21,8 +21,8 @@
 //! A trust of GitHub Actions identities may also carry Fulcio certificate
 //! claims ([`CertificateClaims`], ADR-033): the Source Repository URI and
 //! Ref Fulcio wrote into the leaf from the OIDC token (exact, or a prefix
-//! ending in `/`), the repository's numeric ID, and a required list of
-//! build triggers. They apply to every keyless carrier, `.sig` layers
+//! ending in `/`), the repository's numeric ID, the Build Config URI (the
+//! calling workflow file), and a required list of build triggers. They apply to every keyless carrier, `.sig` layers
 //! included, and are read only from a leaf webpki verified. An opt-in
 //! statement agreement also makes an SLSA statement's builder, source
 //! repository, ref and source commit equal what the certificate says.

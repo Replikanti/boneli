@@ -12,13 +12,16 @@
 //! - **One reading.** Every modeled extension that is present must be one
 //!   whole DER UTF8String with a minimal length, non-empty and valid
 //!   UTF-8, whichever rules are set; the first that is not, in OID order,
-//!   is [`CertificateRefusal::Malformed`]. A missing extension refuses
-//!   only where a rule needs it ([`CertificateRefusal::Missing`]).
+//!   is [`CertificateRefusal::Malformed`]. Build Config URI (1.18) is read
+//!   the same way, but only under its rule, so rules without it read what
+//!   they read before it was added. A missing extension refuses only
+//!   where a rule needs it ([`CertificateRefusal::Missing`]).
 //! - **The rules,** in this order: Source Repository URI (1.12, exact or
 //!   a prefix ending in `/`), Source Repository Ref (1.14, the same),
-//!   Source Repository Identifier (1.15, exact) and Build Trigger (1.20,
-//!   one of a list of exact names, which every set of claims has). The
-//!   first that fails is [`CertificateRefusal::Mismatch`].
+//!   Source Repository Identifier (1.15, exact), Build Config URI (1.18,
+//!   exact) and Build Trigger (1.20, one of a list of exact names, which
+//!   every set of claims has). The first that fails is
+//!   [`CertificateRefusal::Mismatch`].
 //! - **The statement agreement** (opt-in): the SLSA statement's
 //!   `builder.id`, `workflow.repository`, `workflow.ref` and source
 //!   commit must equal 1.9, 1.12, 1.14 and 1.13 (`provenance`); the four
@@ -54,17 +57,21 @@ pub enum Extension {
     SourceRepositoryRef,
     /// 1.3.6.1.4.1.57264.1.15: the repository's numeric ID.
     SourceRepositoryIdentifier,
+    /// 1.3.6.1.4.1.57264.1.18: the top-level workflow the run started,
+    /// `<repo>/<path>@<ref>`: the caller where 1.9 is a reusable one.
+    BuildConfigUri,
     /// 1.3.6.1.4.1.57264.1.20: the event that started the run.
     BuildTrigger,
 }
 
 impl Extension {
-    const ALL: [Extension; 6] = [
+    const ALL: [Extension; 7] = [
         Extension::BuildSignerUri,
         Extension::SourceRepositoryUri,
         Extension::SourceRepositoryDigest,
         Extension::SourceRepositoryRef,
         Extension::SourceRepositoryIdentifier,
+        Extension::BuildConfigUri,
         Extension::BuildTrigger,
     ];
 
@@ -76,6 +83,7 @@ impl Extension {
             Extension::SourceRepositoryDigest => 13,
             Extension::SourceRepositoryRef => 14,
             Extension::SourceRepositoryIdentifier => 15,
+            Extension::BuildConfigUri => 18,
             Extension::BuildTrigger => 20,
         }
     }
@@ -104,6 +112,7 @@ impl Extension {
             Extension::SourceRepositoryDigest => "Source Repository Digest",
             Extension::SourceRepositoryRef => "Source Repository Ref",
             Extension::SourceRepositoryIdentifier => "Source Repository Identifier",
+            Extension::BuildConfigUri => "Build Config URI",
             Extension::BuildTrigger => "Build Trigger",
         }
     }
@@ -121,6 +130,7 @@ pub struct CertificateClaims {
     repository: Option<ClaimMatch>,
     git_ref: Option<ClaimMatch>,
     repository_id: Option<String>,
+    build_config: Option<String>,
     triggers: Vec<String>,
     pub(crate) agreement: bool,
 }
@@ -149,6 +159,7 @@ impl CertificateClaims {
             repository,
             git_ref,
             repository_id: None,
+            build_config: None,
             triggers,
             agreement: false,
         })
@@ -164,6 +175,20 @@ impl CertificateClaims {
         }
         Ok(CertificateClaims {
             repository_id: Some(id.to_owned()),
+            ..self
+        })
+    }
+
+    /// These claims with an exact Build Config URI (1.18),
+    /// `<repository>/<workflow path>@<ref>`: the workflow file the run
+    /// started, which a reusable workflow's SAN and 1.9 do not name.
+    /// Non-empty printable ASCII without spaces.
+    pub fn with_build_config(self, uri: &str) -> Result<CertificateClaims, ConfigError> {
+        if !printable(uri) {
+            return Err(ConfigError::ClaimNotAscii);
+        }
+        Ok(CertificateClaims {
+            build_config: Some(uri.to_owned()),
             ..self
         })
     }
@@ -211,7 +236,7 @@ impl fmt::Display for CertificateRefusal {
 
 /// The modeled extensions of a verified leaf, each read once.
 pub(crate) struct Facts<'a> {
-    values: [Option<&'a str>; 6],
+    values: [Option<&'a str>; 7],
 }
 
 /// What the statement agreement compares (module doc): 1.9, 1.12, 1.14
@@ -224,10 +249,17 @@ pub(crate) struct Agreement<'a> {
 }
 
 impl<'a> Facts<'a> {
-    /// Reads every modeled extension of `cert` (module doc, one reading).
-    pub(crate) fn read(cert: &'a CodeSigningCert) -> Result<Facts<'a>, Refusal> {
-        let mut values = [None; 6];
+    /// Reads every modeled extension of `cert`, 1.18 only under its rule
+    /// in `claims` (module doc, one reading).
+    pub(crate) fn read(
+        cert: &'a CodeSigningCert,
+        claims: &CertificateClaims,
+    ) -> Result<Facts<'a>, Refusal> {
+        let mut values = [None; 7];
         for (slot, ext) in values.iter_mut().zip(Extension::ALL) {
+            if ext == Extension::BuildConfigUri && claims.build_config.is_none() {
+                continue;
+            }
             if let Some(der) = cert.extension(&ext.oid()) {
                 *slot = Some(utf8_text(der).ok_or(Refusal::CertificateClaim(
                     CertificateRefusal::Malformed(ext),
@@ -271,6 +303,11 @@ pub(crate) fn check<'a>(
         && facts.need(Extension::SourceRepositoryIdentifier)? != id
     {
         return Err(mismatch(Extension::SourceRepositoryIdentifier));
+    }
+    if let Some(uri) = &claims.build_config
+        && facts.need(Extension::BuildConfigUri)? != uri
+    {
+        return Err(mismatch(Extension::BuildConfigUri));
     }
     let trigger = facts.need(Extension::BuildTrigger)?;
     if !claims.triggers.iter().any(|t| t == trigger) {
@@ -356,7 +393,7 @@ mod tests {
     #[test]
     fn oids_in_order() {
         let arcs: Vec<u8> = Extension::ALL.iter().map(|e| e.oid()[9]).collect();
-        assert_eq!(arcs, [9, 12, 13, 14, 15, 20]);
+        assert_eq!(arcs, [9, 12, 13, 14, 15, 18, 20]);
         assert!(Extension::ALL.windows(2).all(|w| w[0] < w[1]));
     }
 }

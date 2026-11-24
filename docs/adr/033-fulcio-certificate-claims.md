@@ -36,6 +36,23 @@ Measured on 2026-11-24:
     `refs/heads/main` / `push` / `563510952`
 
   1.9 equals the SAN in all three, and the deprecated 1.2 equals 1.20.
+- **Build Config URI (1.18) against Build Signer URI (1.9).** Fulcio
+  writes 1.9 from the token's `job_workflow_ref`, the workflow file whose
+  job asked for the certificate, and 1.18 from `workflow_ref`, the
+  top-level workflow the run started. They differ exactly when the
+  signing job runs in a reusable workflow. In the three committed leaves
+  1.18 = 1.9 (each signs from its own workflow: runner
+  `…/actions/runner/.github/workflows/docker-publish.yml@refs/heads/main`,
+  jq `…/jqlang/jq/.github/workflows/ci.yml@refs/tags/jq-1.8.2`, Chainguard
+  `…/chainguard-images/images/.github/workflows/release.yaml@refs/heads/main`).
+  In the 12 bundles below, 11 have 1.18 = 1.9; in timestamp-server's,
+  1.9 is the reusable
+  `…/sigstore/timestamp-authority/.github/workflows/build_container.yml@refs/tags/v2.2.2`
+  and 1.18 its caller `…/release.yaml@refs/tags/v2.2.2`. At #114 STOP 1,
+  on 4 cosign `.att` certificates of `slsa-github-generator` builds, the
+  SAN (and so 1.9, written from the same `job_workflow_ref`) was the
+  generator's reusable workflow, shared by every caller, and 1.18 was `<repository>/<entryPoint>@<ref>`, for example
+  `https://github.com/fluxcd/flux2/.github/workflows/release.yaml@refs/tags/v2.4.0`.
 - **Why the statement and the certificate agree.** GitHub's producer
   (`actions/toolkit`, `packages/attest/src/provenance.ts`) fills
   `workflow.ref`, `workflow.repository`, the source dependency
@@ -87,6 +104,18 @@ list in every set of certificate claims (D2); an optional repository ID
      list of exact names. These are what the issue asks for, and what
      tells a run's code apart: the repository and ref, and the trigger
      for which they name the built code.
+   - **Build Config URI (1.18), exact and optional**
+     (`CertificateClaims::with_build_config`), added to #113 at #114 STOP
+     1 (D2). It is the only extension that names the calling workflow
+     file: where the signing job runs in a reusable workflow, the SAN and
+     1.9 name the reusable one, shared by every caller (all 4 measured
+     `.att` certificates, 1 of the 12 SLSA v1 bundles), and only 1.18
+     says which top-level workflow of the repository started the run.
+     Where a workflow signs for itself, 1.18 = 1.9 (3 of 3 committed
+     leaves, 11 of 12 bundles), so the rule adds nothing there and costs
+     nothing. Exact, not a prefix: the value carries the ref, and a
+     release ref is covered by 1.14's prefix rule. Its use for cosign
+     `.att` provenance, whose SAN is the generator's, is #114.
    - **Statement agreement** (opt-in,
      `CertificateClaims::with_statement_agreement`): `builder.id` = 1.9,
      `workflow.repository` = 1.12, `workflow.ref` = 1.14, and at least
@@ -97,7 +126,7 @@ list in every set of certificate claims (D2); an optional repository ID
      material claim, the source commit, which ADR-031's first known limit
      leaves written by the signer. 12 of 12 measured bundles agree in all
      four.
-   - **Never read:** 1.10, 1.11, 1.16 to 1.19, 1.21 to 1.24 and the
+   - **Never read:** 1.10, 1.11, 1.16, 1.17, 1.19, 1.21 to 1.24 and the
      deprecated raw 1.2 to 1.6. A 1.9 rule would repeat ADR-029 S2 (1.9
      equals the SAN in 3 of 3 leaves).
 
@@ -141,12 +170,15 @@ list in every set of certificate claims (D2); an optional repository ID
    DER UTF8String with a minimal length, non-empty and valid UTF-8;
    otherwise the refusal is `Malformed(ext)`, naming the first in OID
    order, whichever rules are set, so a leaf has one reading under every
-   rule. A missing extension refuses only where a rule needs it
-   (`Missing(ext)`): 1.12, 1.14 or 1.15 under their rules, 1.20 always,
-   1.9, 1.12, 1.13 and 1.14 under the agreement. An extension twice is
-   refused by `boneli-https`'s certificate reader before any of this
-   (`Certificate(Malformed)`), and so is a critical Fulcio extension, by
-   webpki. Without certificate claims nothing beyond the issuer is read,
+   rule. 1.18 is read the same way, but only under its rule: it was
+   added after the rest of this ADR was reviewed, and reading it under
+   every rule would let a leaf with a malformed 1.18 fail rules that
+   never ask for it. A missing extension refuses only where a rule needs
+   it (`Missing(ext)`): 1.12, 1.14, 1.15 or 1.18 under their rules, 1.20
+   always, 1.9, 1.12, 1.13 and 1.14 under the agreement. An extension
+   twice is refused by `boneli-https`'s certificate reader before any of
+   this (`Certificate(Malformed)`), and so is a critical Fulcio
+   extension, by webpki. Without certificate claims nothing beyond the issuer is read,
    so ADR-029 and ADR-031 verdicts do not change: the issuer reader keeps
    its own path (`utf8_string`, moved into the new `fulcio` module byte
    for byte, with no UTF-8 check added there).
@@ -169,7 +201,8 @@ list in every set of certificate claims (D2); an optional repository ID
 9. **Order and texts.** The checks run:
    1. what is signed, then the signature and identity (ADR-029);
    2. the facts read from the leaf (item 6);
-   3. the rules: repository, ref, ID, trigger, then the presence of what
+   3. the rules: repository, ref, ID, build config, trigger, then the
+      presence of what
       the agreement needs;
    4. the statement's shape (ADR-031 items 5 and 6);
    5. the agreement: builder, repository, ref, commit;
@@ -228,9 +261,12 @@ list in every set of certificate claims (D2); an optional repository ID
 
 - **A 1.9 (Build Signer URI) rule.** Rejected: it equals the SAN in 3 of
   3 leaves, so ADR-029 S2's identity already is that rule.
-- **A 1.18 (Build Config URI) rule.** Rejected: within one repository and
-  ref, whoever can add a calling workflow can also edit the one it names,
-  and it equals 1.9 in 3 of 3 leaves.
+- **Leaving 1.18 out** (the plan before #114 STOP 1: it equals 1.9 in 3
+  of 3 committed leaves). Rejected: that holds only for workflows that
+  sign for themselves. Under a reusable workflow, and always under
+  `slsa-github-generator`, 1.9 and the SAN are the shared generator's,
+  and 1.18 is the only field that binds the calling workflow file
+  (Context; #114).
 - **A 1.11 (runner environment) rule.** Rejected: whether a build ran on
   a GitHub-hosted runner is a question of SLSA levels, out of scope.
 - **Reading the deprecated 1.2 to 1.6 as a fallback.** Rejected: raw
@@ -264,9 +300,11 @@ the `oci-acceptance` run on the PR for #113 passes
 attestations and Chainguard's `.sig` meet their certificate claims with
 the same `Accepted` as without them, the two attestations also with
 ADR-031's claims and the agreement, and one field off on each (repository,
-ref, ref prefix, trigger, repository ID) refuses naming it. The
-hand-applied mutation pass over `fulcio.rs`, the agreement step, the
-order in `verify` and the configuration checks kills 45 of 46 mutants.
+ref, ref prefix, trigger, repository ID, build config) refuses naming
+it; the three leaves also meet an exact 1.18 rule naming their own
+workflow file. The hand-applied mutation pass over `fulcio.rs`, the
+agreement step, the order in `verify` and the configuration checks kills
+53 of 54 mutants (8 of them on the 1.18 rule).
 The one left is equivalent: certificate claims on an accepted signature
 without a certificate (the `NoCertificate` arm) cannot be reached,
 because configuration refuses a trust with keys. Live on x86_64 (local

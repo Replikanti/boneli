@@ -1231,6 +1231,10 @@ fn certificate_refusal_texts() {
             "Source Repository Identifier (1.3.6.1.4.1.57264.1.15)",
         ),
         (
+            Extension::BuildConfigUri,
+            "Build Config URI (1.3.6.1.4.1.57264.1.18)",
+        ),
+        (
             Extension::BuildTrigger,
             "Build Trigger (1.3.6.1.4.1.57264.1.20)",
         ),
@@ -1308,6 +1312,139 @@ fn truncated_extensions_refused() {
             layer(&pki, &leaf, only_triggers(&[GH_TRIGGER])),
             malformed(Extension::SourceRepositoryUri),
             "{n}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Build Config URI (1.18)
+// ---------------------------------------------------------------------
+
+/// jq's Build Config URI, as Fulcio wrote it (equal to its 1.9 and SAN).
+const JQ_BUILD_CONFIG: &str =
+    "https://github.com/jqlang/jq/.github/workflows/ci.yml@refs/tags/jq-1.8.2";
+
+fn build_config(cc: CertificateClaims, uri: &str) -> CertificateClaims {
+    cc.with_build_config(uri).expect("build config")
+}
+
+/// The three real leaves meet an exact 1.18 rule naming their own
+/// workflow file, with the same `Accepted` as without it, and one with
+/// another path, ref or repository refuses naming 1.18.
+#[test]
+fn real_build_config_known_answer() {
+    let runner = runner_verify(runner_cc());
+    assert!(runner.is_ok());
+    assert_eq!(
+        runner_verify(build_config(runner_cc(), real::RUNNER_WORKFLOW)),
+        runner
+    );
+    let jq = jq_verify(jq_cc());
+    assert!(jq.is_ok());
+    assert_eq!(jq_verify(build_config(jq_cc(), JQ_BUILD_CONFIG)), jq);
+    let chainguard = chainguard_verify(chainguard_cc());
+    assert!(chainguard.is_ok());
+    assert_eq!(
+        chainguard_verify(build_config(chainguard_cc(), real::CHAINGUARD_WORKFLOW)),
+        chainguard
+    );
+    for other in [
+        real::RUNNER_WORKFLOW.replace("docker-publish.yml", "release.yml"),
+        real::RUNNER_WORKFLOW.replace("@refs/heads/main", "@refs/heads/dev"),
+        real::RUNNER_WORKFLOW.replace("actions/runner", "actions/other"),
+        format!("{}/", real::RUNNER_WORKFLOW),
+    ] {
+        assert_eq!(
+            runner_verify(build_config(runner_cc(), &other)),
+            mismatch(Extension::BuildConfigUri),
+            "{other}"
+        );
+    }
+    // The 1.18 rule comes after the ID and before the trigger.
+    let cc = CertificateClaims::new(
+        exact(real::RUNNER_REPOSITORY),
+        exact(real::RUNNER_REF),
+        triggers(&["push"]),
+    )
+    .expect("cc");
+    assert_eq!(
+        runner_verify(build_config(cc, JQ_BUILD_CONFIG)),
+        mismatch(Extension::BuildConfigUri)
+    );
+}
+
+/// A reusable workflow: 1.9 (and the SAN) name the called workflow, 1.18
+/// the caller. A 1.18 rule on the caller passes; one on the called
+/// workflow refuses, so only 1.18 binds the calling workflow file.
+#[test]
+fn build_config_names_the_caller() {
+    let pki = Pki::new();
+    let caller = "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main";
+    let called = "https://github.com/acme/generator/.github/workflows/build.yml@refs/tags/v1";
+    let leaf = LeafSpec::github(GH_WORKFLOW)
+        .fulcio(9, Some(utf8(called.as_bytes())))
+        .fulcio(18, Some(utf8(caller.as_bytes())));
+    assert_eq!(layer(&pki, &leaf, build_config(gh_claims(), caller)), PASS);
+    assert_eq!(
+        layer(&pki, &leaf, build_config(gh_claims(), called)),
+        mismatch(Extension::BuildConfigUri)
+    );
+    for value in [
+        "https://github.com/acme/app/.github/workflows/release.yaml@refs/heads/main",
+        "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main ",
+        "https://github.com/Acme/app/.github/workflows/release.yml@refs/heads/main",
+    ] {
+        let leaf = gh_leaf().fulcio(18, Some(utf8(value.as_bytes())));
+        assert_eq!(
+            layer(&pki, &leaf, build_config(gh_claims(), caller)),
+            mismatch(Extension::BuildConfigUri),
+            "{value:?}"
+        );
+    }
+    // Missing under the rule.
+    assert_eq!(
+        layer(&pki, &gh_leaf(), build_config(gh_claims(), caller)),
+        missing(Extension::BuildConfigUri)
+    );
+}
+
+/// A malformed 1.18 refuses under the 1.18 rule, named before a malformed
+/// 1.20 (OID order); without the rule it is not read and the leaf passes.
+#[test]
+fn build_config_malformed() {
+    let pki = Pki::new();
+    let caller = GH_WORKFLOW;
+    for value in [
+        b"https://github.com/acme/app".to_vec(),
+        vec![0x0C, 0x00],
+        vec![0x0C, 0x02, 0xC0, 0xAF],
+        vec![0x16, 0x01, b'a'],
+    ] {
+        let leaf = gh_leaf().fulcio(18, Some(value.clone()));
+        assert_eq!(
+            layer(&pki, &leaf, build_config(gh_claims(), caller)),
+            malformed(Extension::BuildConfigUri),
+            "{value:?}"
+        );
+        assert_eq!(layer(&pki, &leaf, gh_claims()), PASS, "{value:?}");
+    }
+    let leaf = gh_leaf()
+        .fulcio(18, Some(b"raw".to_vec()))
+        .fulcio(20, Some(b"raw".to_vec()));
+    assert_eq!(
+        layer(&pki, &leaf, build_config(gh_claims(), caller)),
+        malformed(Extension::BuildConfigUri)
+    );
+    // Configuration: the URI is printable ASCII without spaces.
+    for uri in [
+        "",
+        "https://github.com/acme/app/x y.yml@refs/heads/main",
+        "\u{430}",
+    ] {
+        assert_eq!(
+            gh_claims().with_build_config(uri).err(),
+            Some(ConfigError::ClaimNotAscii),
+            "{uri:?}"
         );
     }
 }

@@ -291,7 +291,7 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
     let facts = match (&trust.certificate_claims, &cert) {
         (None, _) => None,
         (Some(_), None) => return Err(Refusal::NoCertificate),
-        (Some(claims), Some(cert)) => Some((Facts::read(cert)?, claims)),
+        (Some(claims), Some(cert)) => Some((Facts::read(cert, claims)?, claims)),
     };
     let agreement = match &facts {
         Some((facts, claims)) => fulcio::check(facts, claims)?,
