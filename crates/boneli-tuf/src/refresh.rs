@@ -10,7 +10,7 @@ use boneli_sigstore::TrustedRoot;
 
 use crate::fetch::{self, Fetched, Size, Timeouts};
 use crate::repository::Repository;
-use crate::state::{self, OpenError, TrustDir};
+use crate::state::{self, OpenError, StateError, TrustDir};
 use crate::{
     Error, MAX_ROOT_BYTES, MAX_ROOT_ROTATIONS, MAX_SNAPSHOT_BYTES, MAX_TARGETS_BYTES,
     MAX_TIMESTAMP_BYTES, TrustedSet,
@@ -27,7 +27,8 @@ const REMEDY: &str = "remove the trust directory's tuf/ to bootstrap again from 
 pub enum Step {
     /// The trust directory broke a rule of ADR-021, its lock could not be
     /// taken ("busy" while another refresh holds it), or it could not be
-    /// opened.
+    /// opened; or, later in the run, the trust directory, its `tuf/` or its
+    /// lock was removed or replaced, so the refresh stopped writing there.
     Lock,
     /// The initial root does not hash to its pin, the pin is malformed,
     /// the root does not reach its own threshold, or the trust directory
@@ -201,8 +202,10 @@ impl Outcome {
 /// Refreshes `trusted_root.json` in the trust directory from the
 /// repository by the TUF workflow 5.1 to 5.7 (ADR-033). Spawns no thread.
 ///
-/// 1. The trust directory is checked and its lock taken for the whole
-///    refresh; a crashed run's temporary files are removed.
+/// 1. The trust directory is checked and its lock (`<dir>/lock`, outside
+///    `tuf/`) taken for the whole refresh; before every read and write
+///    the directory, `tuf/` and the lock must still be the ones locked.
+///    A crashed run's temporary files are removed.
 /// 2. The trusted root is the stored one, or, in an empty directory, the
 ///    initial root, whose pin is recorded. A recorded pin other than the
 ///    initial root's fails until `tuf/` is removed.
@@ -227,7 +230,7 @@ pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshErr
         OpenError::Dir(detail) => RefreshError::new(Step::Lock, detail),
         OpenError::Busy => RefreshError::new(
             Step::Lock,
-            "busy: another refresh holds the trust directory's tuf/lock",
+            "busy: another refresh holds the trust directory's lock",
         ),
     })?;
     let mut set = trusted_root(&dir, refresh)?;
@@ -317,7 +320,7 @@ pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshErr
     };
     let installed = dir
         .installed(target.length())
-        .map_err(|e| write_err(dir.root(), &e))?;
+        .map_err(|e| state_err(e, "reading trusted_root.json"))?;
     if installed.is_some_and(|bytes| target.verify(&bytes).is_ok()) {
         return Ok(Outcome::Unchanged(report));
     }
@@ -329,7 +332,7 @@ pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshErr
     // The one reader of the file decides last (ADR-033, item 6).
     TrustedRoot::from_json(&bytes).map_err(|e| RefreshError::new(Step::TrustedRoot, e))?;
     dir.install(&bytes)
-        .map_err(|e| write_err(&dir.root().join(state::TRUSTED_ROOT), &e))?;
+        .map_err(|e| state_err(e, "installing trusted_root.json"))?;
     Ok(Outcome::Updated(report))
 }
 
@@ -480,21 +483,26 @@ fn read_tuf(
     max: usize,
 ) -> Result<Option<Option<Vec<u8>>>, RefreshError> {
     dir.read_tuf(name, max)
-        .map_err(|e| RefreshError::new(Step::Write, format!("reading tuf/{name}: {e}")))
+        .map_err(|e| state_err(e, &format!("reading tuf/{name}")))
 }
 
 fn write_tuf(dir: &TrustDir, name: &str, bytes: &[u8]) -> Result<(), RefreshError> {
     dir.write_tuf(name, bytes)
-        .map_err(|e| RefreshError::new(Step::Write, format!("writing tuf/{name}: {e}")))
+        .map_err(|e| state_err(e, &format!("writing tuf/{name}")))
 }
 
 fn remove_tuf(dir: &TrustDir, name: &str) -> Result<(), RefreshError> {
     dir.remove_tuf(name)
-        .map_err(|e| RefreshError::new(Step::Write, format!("removing tuf/{name}: {e}")))
+        .map_err(|e| state_err(e, &format!("removing tuf/{name}")))
 }
 
-fn write_err(path: &Path, e: &std::io::Error) -> RefreshError {
-    RefreshError::new(Step::Write, format!("{}: {e}", path.display()))
+/// A trust directory replaced under the lock is `Lock`: this refresh no
+/// longer holds the directory it writes to. Any other failure is `Write`.
+fn state_err(e: StateError, what: &str) -> RefreshError {
+    match e {
+        StateError::Replaced(why) => RefreshError::new(Step::Lock, format!("{what}: {why}")),
+        StateError::Io(e) => RefreshError::new(Step::Write, format!("{what}: {e}")),
+    }
 }
 
 /// Lower-case hex.

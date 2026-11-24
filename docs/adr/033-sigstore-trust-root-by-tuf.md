@@ -211,10 +211,22 @@ directory, the live run, and the acceptance of this ADR.
    of ADR-021 (`boneli_private_dir::prepare_root`) holds
    `trusted_root.json`, which the verifier's configuration (#32) reads;
    `tuf/root.json`, `tuf/timestamp.json` and `tuf/snapshot.json`, the
-   fetched bytes unchanged; `tuf/pin`; and `tuf/lock`.
+   fetched bytes unchanged; `tuf/pin`; and `lock`.
    - The whole refresh holds `FileLock::try_take(Kind::Exclusive)` on
-     `tuf/lock` (ADR-030); a second refresh fails at `Lock` with "busy".
-     `tuf/` must be a directory, not a symlink.
+     `<dir>/lock` (ADR-030); a second refresh fails at `Lock` with
+     "busy". The lock is outside `tuf/` because the remedy below removes
+     `tuf/`: a lock inside it would go with it, and a refresh started
+     after the removal, with a new pin, would set up a new `tuf/` while
+     the old refresh still runs and later writes its root there, next to
+     the new pin (review of PR 3). `tuf/` must be a directory, not a
+     symlink.
+   - Before every read and write the refresh checks that the trust
+     directory, `tuf/` and `lock` still have the `st_dev` and `st_ino` it
+     locked, and fails at `Lock` otherwise. That covers removing the whole
+     trust directory during a run: a refresh started after it creates a
+     new directory and a new lock, and the old one then writes nothing
+     into it. std has no `openat`, so the window between the check and
+     the rename it guards stays open; it is one rename long.
    - Writes go to a temporary name in the same directory with
      `create_new` and mode 0600, then `sync_all`, rename, and a sync of
      the directory. The temporary name is `.tmp-<name>`, one per file,
@@ -379,5 +391,5 @@ Met on 2026-11-24 with PR 3:
   runs on a PR that edits it): the same versions and the same SHA-256 on
   both, the first run in 0.81 s (x86_64) and 0.72 s (arm64), the second
   `Outcome::Unchanged`.
-- **Mutants:** 38 in PR 1, 44 in PR 2 and 51 in PR 3, each run against
+- **Mutants:** 38 in PR 1, 44 in PR 2 and 55 in PR 3, each run against
   the crate's whole suite; all killed (the tables are in the PR bodies).

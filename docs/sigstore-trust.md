@@ -1,4 +1,4 @@
-# Sigstore trusted root: operator guide
+or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory, or wait for the other refresh and run again. |# Sigstore trusted root: operator guide
 
 Keyless image signatures are verified against the operator's
 `trusted_root.json` (ADR-029): the Fulcio CAs, Rekor logs and CT logs that
@@ -57,7 +57,7 @@ is resolved and checked where it points.
     timestamp.json    the last verified timestamp, as fetched
     snapshot.json     the last verified snapshot, as fetched
     pin               the initial root's SHA-256, written on the first run
-    lock              held by a refresh for its whole run
+  lock                held by a refresh for its whole run
 ```
 
 Files are written `0600`, to a temporary `.tmp-<name>` first, synced and
@@ -110,7 +110,11 @@ the file, status, size or path, never text from the metadata.
 After a rollback or freeze refusal, the stored metadata keep protecting
 the next run: a repository that serves older versions keeps failing.
 Remove `tuf/` only for `Root(None)` or to change the pin; it resets that
-protection to whatever the repository serves next.
+protection to whatever the repository serves next. Remove only `tuf/`,
+never `lock`. A refresh that is running holds `lock`, so one started
+after the removal fails as "busy" until it ends, and the running one
+stops at `Lock` instead of writing into the new `tuf/`: run the refresh
+again once it has ended.
 
 ## Live test
 

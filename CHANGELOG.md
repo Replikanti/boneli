@@ -862,7 +862,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `boneli-tuf` (part 3 of #103, ADR-033 accepted): the refresh.
   `refresh_trusted_root` keeps `trusted_root.json` current in a private
   trust directory (ADR-021 rules, the whole run under an exclusive
-  `FileLock` on `tuf/lock`): it bootstraps from the operator's pinned
+  `FileLock` on `<dir>/lock`, outside `tuf/`): it bootstraps from the operator's pinned
   `InitialRoot` once and records the pin (a changed pin fails until
   `tuf/` is removed), walks the root chain, at most 32 new roots per run,
   each stored before the next fetch (a root that rotates the timestamp or

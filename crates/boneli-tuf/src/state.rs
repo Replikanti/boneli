@@ -1,7 +1,13 @@
 //! The trust directory (ADR-033, item 6): a private directory under the
 //! root rules of ADR-021 that holds `trusted_root.json`, and under `tuf/`
-//! the stored root, timestamp and snapshot (the fetched bytes unchanged),
-//! the pin of the initial root and the lock that the whole refresh holds.
+//! the stored root, timestamp and snapshot (the fetched bytes unchanged)
+//! and the pin of the initial root; and `lock`, which the whole refresh
+//! holds. The lock is in the trust directory itself, not under `tuf/`, so
+//! removing `tuf/` (the documented remedy) never frees it: a second refresh
+//! stays "busy" while the first runs. Before every read and write the
+//! refresh checks that the trust directory, `tuf/` and the lock file are
+//! still the inodes it locked, so a refresh whose directory was removed or
+//! replaced under it writes nothing more there (ADR-033, item 6).
 //!
 //! Every write goes to a temporary name in the same directory, created
 //! anew with mode 0600, then `sync_all`, a rename over the final name and
@@ -11,7 +17,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use boneli_private_dir::lock::{FileLock, Kind, TakeError};
@@ -25,7 +31,7 @@ pub(crate) const ROOT: &str = "root.json";
 pub(crate) const TIMESTAMP: &str = "timestamp.json";
 pub(crate) const SNAPSHOT: &str = "snapshot.json";
 pub(crate) const PIN: &str = "pin";
-/// The lock file, under `tuf/`.
+/// The lock file, in the trust directory, never under `tuf/`.
 const LOCK: &str = "lock";
 /// The prefix of every temporary name. Under the lock no other refresh
 /// writes, so one fixed name per file suffices, and every name with this
@@ -43,34 +49,53 @@ pub(crate) enum OpenError {
     Busy,
 }
 
+/// Why a read or write of the trust directory failed.
+#[derive(Debug)]
+pub(crate) enum StateError {
+    /// The trust directory, `tuf/` or the lock file is no longer the inode
+    /// this refresh locked: removed, or replaced by another one.
+    Replaced(&'static str),
+    /// The filesystem failed.
+    Io(io::Error),
+}
+
+impl From<io::Error> for StateError {
+    fn from(e: io::Error) -> StateError {
+        StateError::Io(e)
+    }
+}
+
+/// A file's `(st_dev, st_ino)`.
+type Identity = (u64, u64);
+
+fn identity(meta: &fs::Metadata) -> Identity {
+    (meta.dev(), meta.ino())
+}
+
 /// The trust directory, opened under its lock. The lock is released when
 /// this drops.
 #[derive(Debug)]
 pub(crate) struct TrustDir {
     root: PathBuf,
     tuf: PathBuf,
+    lock_path: PathBuf,
+    /// What [`check_held`](Self::check_held) compares: the trust
+    /// directory, `tuf/` and the lock file as they were locked.
+    held: [Identity; 3],
     _lock: FileLock,
 }
 
 impl TrustDir {
     /// Checks `dir` by ADR-021 (`prepare_root`: absolute, no `.` or `..`
     /// component, `0o700` and the caller's, every ancestor not writable by
-    /// others unless sticky), creating it where it is missing; creates
-    /// `tuf/` in it; takes the exclusive lock on `tuf/lock` without
-    /// waiting; then removes what a crashed run left.
+    /// others unless sticky), creating it where it is missing; takes the
+    /// exclusive lock on `<dir>/lock` without waiting; creates `tuf/`;
+    /// records the identities of the three; then removes what a crashed
+    /// run left.
     pub(crate) fn open(dir: &Path) -> Result<TrustDir, OpenError> {
         let root = boneli_private_dir::prepare_root(dir, &|_| Ok(()))
             .map_err(|e| OpenError::Dir(e.to_string()))?;
-        let tuf = root.join(TUF);
-        boneli_private_dir::create(&tuf).map_err(|e| OpenError::Dir(e.to_string()))?;
-        let meta = fs::symlink_metadata(&tuf).map_err(|e| dir_err(&tuf, &e))?;
-        if !meta.is_dir() {
-            return Err(OpenError::Dir(format!(
-                "{}: must be a directory, not a symlink",
-                tuf.display()
-            )));
-        }
-        let lock_path = tuf.join(LOCK);
+        let lock_path = root.join(LOCK);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -91,38 +116,85 @@ impl TrustDir {
             Err(TakeError::Busy) => return Err(OpenError::Busy),
             Err(TakeError::Io(e)) => return Err(dir_err(&lock_path, &e)),
         };
-        sweep(&root).map_err(|e| dir_err(&root, &e))?;
-        sweep(&tuf).map_err(|e| dir_err(&tuf, &e))?;
-        Ok(TrustDir {
+        let tuf = root.join(TUF);
+        boneli_private_dir::create(&tuf).map_err(|e| OpenError::Dir(e.to_string()))?;
+        let tuf_meta = fs::symlink_metadata(&tuf).map_err(|e| dir_err(&tuf, &e))?;
+        if !tuf_meta.is_dir() {
+            return Err(OpenError::Dir(format!(
+                "{}: must be a directory, not a symlink",
+                tuf.display()
+            )));
+        }
+        let root_meta = fs::symlink_metadata(&root).map_err(|e| dir_err(&root, &e))?;
+        let held = [
+            identity(&root_meta),
+            identity(&tuf_meta),
+            identity(&lock_meta),
+        ];
+        let dir = TrustDir {
             root,
             tuf,
+            lock_path,
+            held,
             _lock: lock,
-        })
+        };
+        // A directory replaced between the lock and here is not swept.
+        dir.check_held().map_err(|e| match e {
+            StateError::Replaced(why) => OpenError::Dir(why.to_string()),
+            StateError::Io(e) => dir_err(&dir.root, &e),
+        })?;
+        sweep(&dir.root).map_err(|e| dir_err(&dir.root, &e))?;
+        sweep(&dir.tuf).map_err(|e| dir_err(&dir.tuf, &e))?;
+        Ok(dir)
     }
 
-    /// The resolved trust directory.
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
+    /// Fails with [`StateError::Replaced`] when the trust directory,
+    /// `tuf/` or the lock file is missing or another inode than the one
+    /// locked: an operator removed `tuf/` or the whole directory during
+    /// the refresh, and perhaps another refresh set up a new one, whose
+    /// state this one must not write into. The window between this check
+    /// and the write it guards stays open (std has no `openat`); it is the
+    /// time of one rename.
+    pub(crate) fn check_held(&self) -> Result<(), StateError> {
+        let paths = [&self.root, &self.tuf, &self.lock_path];
+        for (path, held) in paths.into_iter().zip(self.held) {
+            match fs::symlink_metadata(path) {
+                Ok(meta) if identity(&meta) == held => {}
+                Ok(_) => return Err(StateError::Replaced(REPLACED)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(StateError::Replaced(REPLACED));
+                }
+                Err(e) => return Err(StateError::Io(e)),
+            }
+        }
+        Ok(())
     }
 
     /// The bytes of `tuf/<name>`: `Ok(None)` when it is missing, and
     /// `Ok(Some(None))` when it is longer than `max`, which the caller
     /// treats as a copy that does not parse.
-    pub(crate) fn read_tuf(&self, name: &str, max: usize) -> io::Result<Option<Option<Vec<u8>>>> {
-        read_capped(&self.tuf.join(name), max as u64)
+    pub(crate) fn read_tuf(
+        &self,
+        name: &str,
+        max: usize,
+    ) -> Result<Option<Option<Vec<u8>>>, StateError> {
+        self.check_held()?;
+        Ok(read_capped(&self.tuf.join(name), max as u64)?)
     }
 
     /// Writes `tuf/<name>` durably.
-    pub(crate) fn write_tuf(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        write_durably(&self.tuf, name, bytes)
+    pub(crate) fn write_tuf(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+        self.check_held()?;
+        Ok(write_durably(&self.tuf, name, bytes)?)
     }
 
     /// Removes `tuf/<name>` durably; a missing file is no error.
-    pub(crate) fn remove_tuf(&self, name: &str) -> io::Result<()> {
+    pub(crate) fn remove_tuf(&self, name: &str) -> Result<(), StateError> {
+        self.check_held()?;
         match fs::remove_file(self.tuf.join(name)) {
-            Ok(()) => sync_dir(&self.tuf),
+            Ok(()) => Ok(sync_dir(&self.tuf)?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -130,23 +202,29 @@ impl TrustDir {
     /// file of at most `max` bytes; `None` otherwise (missing, a symlink,
     /// a directory, or longer), so it is not the current target. A
     /// symlink is never followed.
-    pub(crate) fn installed(&self, max: u64) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn installed(&self, max: u64) -> Result<Option<Vec<u8>>, StateError> {
+        self.check_held()?;
         let path = self.root.join(TRUSTED_ROOT);
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() => {}
             Ok(_) => return Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
         Ok(read_capped(&path, max)?.flatten())
     }
 
     /// Installs `trusted_root.json` durably: a rename over the old name,
     /// which replaces a symlink there and never follows it.
-    pub(crate) fn install(&self, bytes: &[u8]) -> io::Result<()> {
-        write_durably(&self.root, TRUSTED_ROOT, bytes)
+    pub(crate) fn install(&self, bytes: &[u8]) -> Result<(), StateError> {
+        self.check_held()?;
+        Ok(write_durably(&self.root, TRUSTED_ROOT, bytes)?)
     }
 }
+
+/// The reason of [`StateError::Replaced`].
+const REPLACED: &str = "the trust directory, its tuf/ or its lock was removed or replaced \
+     during the refresh, so this refresh writes nothing more there";
 
 fn dir_err(path: &Path, e: &io::Error) -> OpenError {
     OpenError::Dir(format!("{}: {e}", path.display()))

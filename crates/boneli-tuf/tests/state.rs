@@ -7,11 +7,15 @@ mod support;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use boneli_private_dir::lock::{FileLock, Kind};
 use boneli_tuf::{InitialRoot, Outcome, Step};
 use support::real;
-use support::repo::{MetaSpec, RootBuilder, SnapshotBuilder, TargetsBuilder, TimestampBuilder};
+use support::repo::{
+    MetaSpec, RoleSpec, RootBuilder, SnapshotBuilder, TargetsBuilder, TimestampBuilder,
+};
 use support::server::{
     Reply, Scratch, Server, fixture, pinned, publish, root_v1, run, sha256_hex, trusted_root_v2,
 };
@@ -80,6 +84,7 @@ fn trust_dir_created_private() {
         (scratch.at("tuf/timestamp.json"), 0o600),
         (scratch.at("tuf/snapshot.json"), 0o600),
         (scratch.at("tuf/pin"), 0o600),
+        (scratch.at("lock"), 0o600),
     ] {
         let meta = fs::symlink_metadata(&path).expect("exists");
         assert_eq!(meta.mode() & 0o777, mode, "{}", path.display());
@@ -94,7 +99,7 @@ fn concurrent_refresh_busy() {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(scratch.at("tuf/lock"))
+        .open(scratch.at("lock"))
         .expect("lock file");
     let held = FileLock::try_take(file, Kind::Exclusive).expect("lock");
     server.clear_log();
@@ -381,7 +386,7 @@ fn failure_leaves_file_unchanged() {
         let file = File::options()
             .read(true)
             .write(true)
-            .open(scratch.at("tuf/lock"))
+            .open(scratch.at("lock"))
             .expect("lock file");
         held = Some(FileLock::try_take(file, Kind::Exclusive).expect("lock"));
         None
@@ -440,4 +445,116 @@ fn tuf_symlink_refused() {
     let err = run(&server, &scratch.trust(), &initial).expect_err("tuf/ is a link");
     assert_eq!(err.step, Step::Lock);
     assert_eq!(fs::read_dir(&elsewhere).expect("list").count(), 0);
+}
+
+/// A server whose `2.root.json` (the default root v2) arrives over about
+/// 1.8 s, so a refresh against it is still in its root chain while the
+/// test works on the trust directory; and that v2.
+fn slow_chain() -> (Server, Vec<u8>) {
+    let server = Server::new();
+    publish(&server, 1, real::TRUSTED_ROOT);
+    let v2 = RootBuilder::new(2).bytes();
+    let chunks = v2.chunks(v2.len() / 5 + 1).map(<[u8]>::to_vec).collect();
+    server.answer(
+        "2.root.json",
+        Reply::Trickle {
+            head: format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", v2.len()).into_bytes(),
+            chunks,
+            delay: Duration::from_millis(300),
+        },
+    );
+    (server, v2)
+}
+
+/// An initial root of another chain (root key 7 only), so another pin.
+fn other_root() -> Vec<u8> {
+    let mut b = RootBuilder::new(1);
+    b.root = RoleSpec {
+        keys: vec![7],
+        threshold: 1,
+    };
+    b.bytes()
+}
+
+#[test]
+fn remove_tuf_during_refresh_mixes_no_chains() {
+    // Review of PR 3: the remedy "remove tuf/" while a refresh runs. The
+    // lock is outside tuf/, so a refresh under the new pin is busy until
+    // the old one ends, and the old one writes nothing into a new tuf/.
+    let scratch = Scratch::new("race-tuf");
+    let (server_a, a_v2) = slow_chain();
+    let initial_a = pinned(&root_v1());
+    let b_v1 = other_root();
+    let initial_b = pinned(&b_v1);
+    let server_b = Server::new();
+    publish(&server_b, 1, real::TRUSTED_ROOT);
+
+    let trust = scratch.trust();
+    let a = {
+        let (trust, server_a) = (trust.clone(), server_a.clone());
+        thread::spawn(move || run(&server_a, &trust, &initial_a))
+    };
+    thread::sleep(Duration::from_millis(400));
+    fs::remove_dir_all(trust.join("tuf")).expect("remove tuf/");
+    let b = run(&server_b, &trust, &initial_b).expect_err("A still holds the lock");
+    assert_eq!(b.step, Step::Lock);
+    assert!(b.detail.contains("busy"), "{b}");
+    let a = a
+        .join()
+        .expect("join")
+        .expect_err("tuf/ was removed under A");
+    assert_eq!(a.step, Step::Lock, "{a}");
+
+    // Now the new pin bootstraps, and its chain is the only one stored.
+    let outcome = run(&server_b, &trust, &initial_b).expect("the new pin");
+    assert_eq!(outcome.report().root_version, 1);
+    assert_eq!(fs::read(trust.join("tuf/root.json")).expect("root"), b_v1);
+    assert_ne!(fs::read(trust.join("tuf/root.json")).expect("root"), a_v2);
+    assert_eq!(
+        fs::read_to_string(trust.join("tuf/pin")).expect("pin"),
+        format!("{}\n", initial_b.sha256_hex())
+    );
+}
+
+#[test]
+fn replaced_trust_dir_during_refresh_written_no_more() {
+    // The whole trust directory removed while a refresh runs: a refresh
+    // under the new pin creates a new one with a new lock and finishes;
+    // the old refresh then finds its directory replaced and writes nothing
+    // into the new one.
+    let scratch = Scratch::new("race-dir");
+    let (server_a, _) = slow_chain();
+    let initial_a = pinned(&root_v1());
+    let b_v1 = other_root();
+    let initial_b = pinned(&b_v1);
+    let server_b = Server::new();
+    publish(&server_b, 1, &trusted_root_v2());
+
+    let trust = scratch.trust();
+    let a = {
+        let (trust, server_a) = (trust.clone(), server_a.clone());
+        thread::spawn(move || run(&server_a, &trust, &initial_a))
+    };
+    thread::sleep(Duration::from_millis(400));
+    fs::remove_dir_all(&trust).expect("remove the trust directory");
+    run(&server_b, &trust, &initial_b).expect("the new directory");
+    let before = (
+        fs::read(trust.join("tuf/root.json")).expect("root"),
+        fs::read(trust.join("tuf/timestamp.json")).expect("timestamp"),
+        identity(&trust.join("trusted_root.json")),
+    );
+    let a = a
+        .join()
+        .expect("join")
+        .expect_err("A's directory was replaced");
+    assert_eq!(a.step, Step::Lock, "{a}");
+    let after = (
+        fs::read(trust.join("tuf/root.json")).expect("root"),
+        fs::read(trust.join("tuf/timestamp.json")).expect("timestamp"),
+        identity(&trust.join("trusted_root.json")),
+    );
+    assert_eq!(before, after);
+    assert_eq!(before.0, b_v1);
+    let next = run(&server_b, &trust, &initial_b).expect("the new pin goes on");
+    assert_eq!(next.report().root_version, 1);
 }
