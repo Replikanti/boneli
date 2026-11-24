@@ -1517,16 +1517,16 @@
    "title": "boneli-sigstore: match Fulcio certificate source repository and ref extensions under Required",
    "epic": null,
    "order": 58,
-   "state": "pr-review",
-   "owner": "1806fc84",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 121,
    "note": "PR #121 open",
-   "updated_at": "2026-11-24T17:11:08+00:00",
+   "updated_at": "2026-11-24T19:42:44+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1590,14 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T01:33:43+00:00",
-   "issue": 109,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "9f12be0c",
-   "note": null
-  },
   {
    "at": "2026-11-24T01:41:11+00:00",
    "issue": 57,
@@ -1989,6 +1981,14 @@
    "to": "implementing",
    "by": "7ee136eb",
    "note": "PR 2/3 merged (#123); next PR 3 (I/O refresh, live test, ADR accept)"
+  },
+  {
+   "at": "2026-11-24T19:42:44+00:00",
+   "issue": 113,
+   "from": "pr-review",
+   "to": "done",
+   "by": "1806fc84",
+   "note": null
   }
  ],
  "open": [
@@ -2017,13 +2017,12 @@
   69,
   102,
   103,
-  113,
   114,
   117,
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T19:09:46+00:00",
+ "updated_at": "2026-11-24T19:42:46+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
