@@ -1363,16 +1363,16 @@
    "title": "boneli-oci: force Required for image references an agent chose",
    "epic": null,
    "order": 52,
-   "state": "pr-review",
-   "owner": "8009a7a8",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 116,
-   "note": "PR #116 open",
-   "updated_at": "2026-11-24T09:06:56+00:00",
+   "note": "closed on GitHub",
+   "updated_at": "2026-11-24T16:10:14+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1564,14 +1564,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-23T22:50:36+00:00",
-   "issue": 103,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-23T22:50:36+00:00",
    "issue": 102,
@@ -1963,6 +1955,14 @@
    "to": "claimed",
    "by": "ecf725cc",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T16:10:14+00:00",
+   "issue": 105,
+   "from": "pr-review",
+   "to": "done",
+   "by": "sync",
+   "note": "closed on GitHub"
   }
  ],
  "open": [
@@ -1991,13 +1991,12 @@
   69,
   102,
   103,
-  105,
   113,
   114,
   117
  ],
  "xopen": [],
- "updated_at": "2026-11-24T16:09:59+00:00",
+ "updated_at": "2026-11-24T16:10:14+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
