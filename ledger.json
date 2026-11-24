@@ -1567,7 +1567,7 @@
    "title": "boneli-sigstore: verify Rekor intoto 0.0.1 entries for cosign .att attestations",
    "epic": null,
    "order": 60,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "2768f14b",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1576,7 +1576,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-24T20:26:56+00:00",
+   "updated_at": "2026-11-24T20:43:13+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1590,14 +1590,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T03:42:06+00:00",
-   "issue": 109,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "9f12be0c",
-   "note": null
-  },
   {
    "at": "2026-11-24T04:20:19+00:00",
    "issue": 57,
@@ -1989,6 +1981,14 @@
    "to": "claimed",
    "by": "2768f14b",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T20:43:13+00:00",
+   "issue": 118,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "2768f14b",
+   "note": null
   }
  ],
  "open": [
@@ -2021,7 +2021,7 @@
   118
  ],
  "xopen": [],
- "updated_at": "2026-11-24T20:43:09+00:00",
+ "updated_at": "2026-11-24T20:43:13+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
