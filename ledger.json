@@ -1467,16 +1467,16 @@
    "title": "one file-lock type for boneli-oci and boneli-store-fs, enforced by the architecture checker",
    "epic": null,
    "order": 56,
-   "state": "pr-review",
-   "owner": "9f12be0c",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 112,
    "note": "PR 1 #110 merged b0fda3e; PR 2 (file-lock rule) in progress",
-   "updated_at": "2026-11-24T03:42:06+00:00",
+   "updated_at": "2026-11-24T04:26:45+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [],
@@ -1488,14 +1488,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-20T22:49:27+00:00",
-   "issue": 56,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "03af0ec4",
-   "note": "PR 1 #92 merged (c422aa7); PR 2 eviction + budget in progress"
-  },
   {
    "at": "2026-11-20T22:49:52+00:00",
    "issue": 94,
@@ -1887,6 +1879,14 @@
    "to": "claimed",
    "by": "7ee136eb",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-24T04:26:45+00:00",
+   "issue": 109,
+   "from": "pr-review",
+   "to": "done",
+   "by": "9f12be0c",
+   "note": null
   }
  ],
  "open": [
@@ -1916,11 +1916,10 @@
   102,
   103,
   104,
-  105,
-  109
+  105
  ],
  "xopen": [],
- "updated_at": "2026-11-24T04:21:22+00:00",
+ "updated_at": "2026-11-24T04:26:47+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
