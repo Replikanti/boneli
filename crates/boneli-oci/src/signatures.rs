@@ -16,7 +16,9 @@
 //! 2. **Discovery,** subject by subject, two carriers in order:
 //!    - cosign's tag `sha256-<hex>.sig`: each layer of media type
 //!      [`SIMPLE_SIGNING_MEDIA_TYPE`] of at most [`MAX_PAYLOAD_BYTES`] is
-//!      a candidate, its payload fetched by digest;
+//!      a candidate, its payload fetched by digest; a rule whose trust has
+//!      provenance claims skips it with no request, since only an SLSA
+//!      statement can meet them (ADR-031);
 //!    - the referrers API, and on `404` (only) the tag `sha256-<hex>`:
 //!      each entry whose `artifactType` is [`BUNDLE_V03_MEDIA_TYPE`] and
 //!      whose predicate-type annotation is on the trust's list is a
@@ -395,7 +397,17 @@ impl Check<'_, '_> {
             }
         }
         for subject in subjects {
-            let mut found = self.legacy(subject, &mut notes)?;
+            // A rule with provenance claims admits SLSA statements only
+            // (ADR-031): no `.sig` candidate could pass, so none is asked
+            // for.
+            let mut found = if self.trust.claims().is_some() {
+                notes.push(format!(
+                    "{subject}: .sig: not examined, the rule has provenance claims"
+                ));
+                None
+            } else {
+                self.legacy(subject, &mut notes)?
+            };
             if found.is_none() {
                 found = self.referrers(subject, &mut notes)?;
             }

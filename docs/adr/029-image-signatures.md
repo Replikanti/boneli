@@ -567,7 +567,8 @@ the digest binds the bytes and mirrors are legitimate.
     registry.
   - "Provenance" means "signed by the trusted identity", not "built from
     source X by builder Y". SLSA claim checks are a follow-up issue
-    (filed at STOP 1).
+    (filed at STOP 1). ADR-031 (#104) checks the builder, source and
+    materials of SLSA v1 provenance under a rule with claims.
   - An intermediate without the Code Signing EKU refuses the chain
     (webpki's rule, item 7). Go's verifier treats such an intermediate as
     unrestricted; Sigstore's public-good intermediate carries the EKU, so

@@ -11,6 +11,13 @@
 //! embedded SCT, the Rekor v1 inclusion promise (SET) and its entry
 //! body, and the OIDC issuer and SAN (S2).
 //!
+//! A trust may also carry SLSA provenance claims ([`Claims`], ADR-031):
+//! an exact builder ID, a source repository and ref (exact, or a prefix
+//! ending in `/`), and resolved dependencies by URI and digest. Such a
+//! trust admits only SLSA v1 statements that meet them, read strictly and
+//! only after their signature verified; without claims the predicate is
+//! never read.
+//!
 //! Finding the evidence is the caller's job (`boneli-oci` reads the
 //! registry); everything here is pure, reads no clock, no file and no
 //! network, and gives the same verdict for the same bytes forever. The
@@ -22,8 +29,9 @@
 //!
 //! Out of scope (ADR-029): Rekor v2 entries, RFC 3161 timestamps as the
 //! time source, inclusion proofs and checkpoints, `messageSignature`
-//! bundles and bundles before v0.3, Notation, cosign `.att`, SLSA claim
-//! checks, and keeping `trusted_root.json` current (TUF).
+//! bundles and bundles before v0.3, Notation, cosign `.att` and SLSA v0.2,
+//! claims from Fulcio's certificate extensions, and keeping
+//! `trusted_root.json` current (TUF).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 pub mod base64;
@@ -35,6 +43,7 @@ mod hex;
 mod identity;
 mod json;
 mod pem;
+mod provenance;
 mod rekor;
 mod root;
 pub mod time;
@@ -48,6 +57,7 @@ pub use cosign::{
 pub use dsse::{IN_TOTO_PAYLOAD_TYPE, STATEMENT_V1, pae};
 pub use error::{ConfigError, Refusal};
 pub use identity::{Identity, SanRule};
+pub use provenance::{ClaimMatch, ClaimRefusal, Claims, GITHUB_WORKFLOW_BUILD_TYPE, Material};
 pub use root::{TRUSTED_ROOT_MEDIA_TYPE, TrustedRoot};
 pub use verify::{
     Accepted, COSIGN_SIGN_PREDICATE, Evidence, SLSA_PROVENANCE_V1_PREDICATE, Trust, verify,

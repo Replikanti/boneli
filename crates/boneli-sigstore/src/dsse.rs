@@ -8,8 +8,8 @@
 //! byte). What it signs is its `subject` list: a subject matches by
 //! `digest.sha256`, 64 lower-case hex digits compared byte for byte, and
 //! other algorithms or forms never match. Its `predicateType` must be on
-//! the trust's list; the predicate itself is not evaluated (SLSA claim
-//! checks are a follow-up).
+//! the trust's list; the predicate itself is evaluated only under a trust
+//! with claims (`provenance`, ADR-031).
 
 use boneli_json::Value;
 

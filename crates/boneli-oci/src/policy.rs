@@ -25,7 +25,9 @@ pub enum Requirement {
     /// No signature check: the request sequence of ADR-009.
     Off,
     /// Only an image a candidate signature verifies for under this trust
-    /// is unpacked; errors, absences and caps never let it pass.
+    /// is unpacked; errors, absences and caps never let it pass. A trust
+    /// with provenance claims (`Trust::with_claims`) admits only SLSA v1
+    /// statements that meet them (ADR-031).
     Required(Arc<Trust>),
 }
 

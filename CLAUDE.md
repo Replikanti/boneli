@@ -163,8 +163,11 @@ sandbox (`mounted_layers_survive_trim`, ADR-025). `network::` pulls
 image signatures (ADR-029): `signatures_on_docker_hub` pulls the signed
 `chainguard/node` under a `Required` rule and refuses the unsigned
 `node:22` with no layer request, and `signatures_elsewhere` pulls signed
-images from GHCR, `cgr.dev` and Artifact Registry; CI runs it in the
-weekly `oci-acceptance` workflow, not on every PR.
+images from GHCR, `cgr.dev` and Artifact Registry;
+`provenance_claims_on_ghcr` pulls jq from GHCR under a rule with SLSA
+provenance claims and refuses it under another source repository
+(ADR-031); CI runs them in the weekly `oci-acceptance` workflow, not on
+every PR.
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \

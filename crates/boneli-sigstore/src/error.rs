@@ -7,6 +7,8 @@ use std::fmt;
 
 use boneli_https::{CertError, SctError};
 
+use crate::provenance::ClaimRefusal;
+
 /// Why one piece of evidence does not let an image pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -88,6 +90,20 @@ pub enum Refusal {
     IssuerDisagree,
     /// No configured identity matches the issuer and the SAN.
     IdentityMismatch,
+    /// The rule has provenance claims and the evidence is a cosign
+    /// simple-signing layer, which carries none (ADR-031).
+    NotProvenance,
+    /// The SLSA v1 predicate lacks a field the reader models, or one has
+    /// the wrong type.
+    MalformedProvenance,
+    /// The statement names GitHub's build type with an external
+    /// parameter that type does not define.
+    UnknownParameters,
+    /// The rule has a repository or ref claim and the statement's build
+    /// type is not one whose source the reader knows.
+    UnknownBuildType,
+    /// A claim of the rule is not met.
+    Claim(ClaimRefusal),
 }
 
 impl fmt::Display for Refusal {
@@ -134,6 +150,17 @@ impl fmt::Display for Refusal {
             Refusal::MalformedIssuer => "the certificate's OIDC issuer is malformed",
             Refusal::IssuerDisagree => "the certificate names two different OIDC issuers",
             Refusal::IdentityMismatch => "the signer is not a trusted identity",
+            Refusal::NotProvenance => {
+                "the rule requires SLSA provenance claims, which a simple-signing signature does not carry"
+            }
+            Refusal::MalformedProvenance => "the SLSA provenance predicate is malformed",
+            Refusal::UnknownParameters => {
+                "the provenance has external parameters its build type does not define"
+            }
+            Refusal::UnknownBuildType => {
+                "the provenance's build type is not one whose source the rule can read"
+            }
+            Refusal::Claim(claim) => return claim.fmt(f),
         };
         f.write_str(text)?;
         match self {
@@ -146,8 +173,8 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Why a trusted root, an identity or a trust was refused at
-/// configuration.
+/// Why a trusted root, an identity, a trust or a claim list was refused
+/// at configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     /// The trusted root is longer than
@@ -183,6 +210,17 @@ pub enum ConfigError {
     NoIdentities,
     /// A predicate type is empty or not printable ASCII.
     PredicateTypeNotAscii,
+    /// A claim list names no claim (ADR-031).
+    ClaimsEmpty,
+    /// A claim's text is empty or not printable ASCII.
+    ClaimNotAscii,
+    /// A repository or ref prefix does not end in `/`.
+    ClaimPrefixWithoutBoundary,
+    /// A material digest is empty or not lower-case hex.
+    MaterialDigestNotHex,
+    /// A trust with claims does not list exactly the SLSA provenance v1
+    /// predicate type.
+    ClaimsPredicateTypes,
 }
 
 impl fmt::Display for ConfigError {
@@ -207,6 +245,13 @@ impl fmt::Display for ConfigError {
             ConfigError::NoIdentities => "a keyless trust has no identity",
             ConfigError::PredicateTypeNotAscii => {
                 "a predicate type is empty or not printable ASCII"
+            }
+            ConfigError::ClaimsEmpty => "a claim list names no claim",
+            ConfigError::ClaimNotAscii => "a claim's text is empty or not printable ASCII",
+            ConfigError::ClaimPrefixWithoutBoundary => "a claim prefix does not end in /",
+            ConfigError::MaterialDigestNotHex => "a material digest is not lower-case hex",
+            ConfigError::ClaimsPredicateTypes => {
+                "a trust with claims must list exactly the SLSA provenance v1 predicate type"
             }
         })
     }
