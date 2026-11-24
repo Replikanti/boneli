@@ -33,6 +33,32 @@ done
 sha256sum sigstore-*.root.json
 ```
 
+## Sigstore's online metadata (known answers)
+
+Captured on 2026-11-24 from the same repository, with the roots above:
+`timestamp.json` (v842, which named snapshot v166) and the files it led
+to, `166.snapshot.json` and `14.targets.json`. They are signed by root
+v16's keys. The tests check that they verify under v16 at the capture
+date, that the timestamp expires at 2026-11-30T01:20:52Z, and that the
+`trusted_root.json` target has the length and SHA-256 of
+`crates/boneli-sigstore/tests/data/sigstore-trusted-root.json`. The
+repository has signed newer timestamps since; the tests do not depend on
+which one is current.
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `sigstore-timestamp.json` | 447 | `d886518ebf54f8dd0aa9a29b3ce5f22b32bd9f6275092f582dc5fb5e96c8ab5f` |
+| `sigstore-166.snapshot.json` | 1760 | `6d61405faa993ba3d07556b79d1e319627cdc06ff879a7b5700967dc25d1d224` |
+| `sigstore-14.targets.json` | 4942 | `6a697f7f8908c8ab26c11786ecb490b54acec97fa8c802e399f065f8a0cc1acd` |
+
+```sh
+base=https://tuf-repo-cdn.sigstore.dev
+curl -sSf -o sigstore-timestamp.json "$base/timestamp.json"
+curl -sSf -o sigstore-166.snapshot.json "$base/166.snapshot.json"
+curl -sSf -o sigstore-14.targets.json "$base/14.targets.json"
+sha256sum sigstore-timestamp.json sigstore-166.snapshot.json sigstore-14.targets.json
+```
+
 ## Test-only signing keys
 
 `test-only-p256-1.key` to `test-only-p256-7.key` are ECDSA P-256 keys in

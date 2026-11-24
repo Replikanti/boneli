@@ -79,7 +79,7 @@ The client is built in three PRs under #103: PR 1 the canonical form,
 signatures, thresholds and the root chain; PR 2 timestamp, snapshot,
 targets and the target; PR 3 the refresh with its fetches and trust
 directory, the live run, and the acceptance of this ADR. Items marked
-"(PR 2)" or "(PR 3)" are decided here and built there.
+"(PR 3)" are decided here and built there.
 
 1. **Own code**, in the support crate `boneli-tuf`, on `boneli-https`
    (`PublicKey`, `Sha256`, and later `Dial`), `boneli-json` and
@@ -101,23 +101,53 @@ directory, the live run, and the acceptance of this ADR. Items marked
      the threshold of timestamp or snapshot against its predecessor, the
      stored timestamp and snapshot are dropped (5.3.11, fast-forward
      recovery); the signal is sticky over one update. Sigstore changed
-     the timestamp key 5 times.
-   - **Timestamp** (5.4, PR 2). Its version must not be below the stored
+     the timestamp key 5 times. The pure core enforces the drop as well:
+     after such a root it refuses to load a stored timestamp or snapshot
+     (`OnlineKeysChanged`), so a copy that still verifies (only the
+     snapshot key moved, or a threshold changed) cannot hold back the
+     recovered repository's versions.
+   - **Order.** The core takes the steps in one order and refuses a
+     call out of it (`OutOfOrder`): roots, the stored timestamp, the
+     timestamp, the stored snapshot, the snapshot, targets, the target.
+     No root is accepted once a timestamp is held; the stored snapshot
+     and the snapshot both need a timestamp verified in this update (a
+     stored copy is not enough), so a stored snapshot is never read under
+     a root the chain later replaces; and targets need a verified
+     snapshot. Each step runs once, except that
+     a timestamp may be updated again before the snapshot, against the
+     one it replaces. A step that fails leaves the set as it was.
+   - **Timestamp** (5.4). No timestamp is trusted while the trusted
+     root has expired (5.3.10 again, so the core does not depend on the
+     caller's order of checks). Its version must not be below the stored
      one, and its snapshot version must not be below the stored
      timestamp's. An equal version is allowed and passes every check
      again. Threshold, `_type`, and expired when `start >= expires`.
-   - **Snapshot** (5.5, PR 2), fetched as `V.snapshot.json`. Version
-     equal to the timestamp's entry; length and SHA-256 checked when the
-     timestamp lists them. Threshold, `_type`, expiry. Every entry of the
-     stored snapshot must still be there with a version at least as high.
-   - **Targets** (5.6, PR 2), fetched as `V.targets.json`. Version equal
-     to the snapshot's entry, length and SHA-256 when listed, threshold,
-     `_type`, expiry.
-   - **Target** (5.7, PR 2). `trusted_root.json` is looked up byte-exact
+     `meta` must hold `snapshot.json`; other entries are not read.
+   - **Snapshot** (5.5), fetched as `V.snapshot.json`. Length and SHA-256
+     are checked when the timestamp lists them, on the bytes before they
+     are parsed. Threshold, `_type`, version equal to the timestamp's
+     entry, expiry. Every entry of the stored snapshot must still be
+     there with a version at least as high; the errors name no entry,
+     because entry names are metadata text. Every entry of `meta` must be
+     an object with a version of at least 1, and `meta` must hold
+     `targets.json`; lengths and hashes are read only for `targets.json`,
+     the one file fetched from it, so a stale entry with another hash
+     algorithm refuses nothing.
+   - **Targets** (5.6), fetched as `V.targets.json`. Length and SHA-256
+     when listed, before parsing; threshold, `_type`, version equal to
+     the snapshot's entry, expiry. `targets` must be an object; only the
+     looked-up entry is read.
+   - **Target** (5.7). `trusted_root.json` is looked up byte-exact
      in top-level `targets` and fetched as
      `targets/<sha256>.trusted_root.json`. Its length is exact and its
-     SHA-256 must match. A hash map must hold `sha256`; other algorithms
-     are not read.
+     SHA-256 must match. The entry's `length` is a non-negative integer
+     and its `hashes` is required.
+   - **The hash rule** (snapshot and targets entries, and the target): a
+     hash map is an object holding `sha256` as 64 lower-case hex
+     characters, the form Sigstore and securesystemslib write; other
+     algorithms are not read. A map without `sha256` is refused
+     (`NoSha256`), not skipped: the repository asked for a check this
+     client cannot make. A listed length is a non-negative integer.
    - **Refused outright:** delegations are never followed (a target
      found only in a delegation is "not listed"), and a repository
      without consistent snapshots is refused.
@@ -236,7 +266,7 @@ test.
 | `MAX_TIMESTAMP_BYTES` | 16,384 | Measured 447 bytes, 36.7 times that. One entry of at most 304 bytes (two hashes) plus 234 bytes per signature: about 68 signatures. |
 | `MAX_SNAPSHOT_BYTES` | 1,048,576 | Measured 1,760 bytes (595 times). At 304 bytes per entry about 3,449 roles; entries grow with delegated roles (Sigstore: 1 live, 4 stale). |
 | `MAX_TARGETS_BYTES` | 1,048,576 | Measured 4,942 bytes (212 times). At 287 bytes per target about 3,650 targets. |
-| Target length (PR 2) | at most `boneli_sigstore::MAX_TRUSTED_ROOT_BYTES` (1,048,576) | ADR-029's own cap on the file this target becomes; checked against the targets entry before the request, so a larger file is never fetched. |
+| Target length | at most `boneli_sigstore::MAX_TRUSTED_ROOT_BYTES` (1,048,576) | ADR-029's own cap on the file this target becomes; checked against the targets entry before the request, so a larger file is never fetched. |
 | `MAX_JSON_DEPTH` / `MAX_JSON_VALUES` | 16 / 65,536 | ADR-009 D12's document limits, also ADR-029's: the same parser over documents of the same scale. Measured at most 7 / 124, so 2.3 and 528 times that. A depth below 7 refuses today's targets. Under the root and timestamp caps the value limit is never reached (two bytes per value at least); it bounds snapshot and targets. |
 | Response head (PR 3) | 16,384 bytes / 64 fields | D12. Measured 735 bytes / 20, so 22 and 3.2 times that. |
 | `MAX_ROOT_ROTATIONS` (PR 3) | 32 per run | 15 rotations measured in about 5.3 years (inferred about 2.8 a year), so 32 is about 11 years of lag. A run verifies and persists at most 32 new roots; a 33rd `200` stops it with an error (the 32 roots stay) and the next run continues. The cap bounds one run (at most 33 root requests), not how far behind a directory may be. |
@@ -254,8 +284,10 @@ fixed sentence of `KeyError::TooLarge` stays true for both key types.
 - A second security-critical verifier is ours to keep correct. Every
   check has a negative test and a killed mutant (the mutation table of
   each PR); thresholds count distinct keys; the canonical form is pinned
-  by known answers on 12 real roots (11 rotations) and, in PR 2, on 3
-  online files; the reviewer reads every PR of the crate.
+  by known answers on 12 real roots (11 rotations) and on 3 online files
+  (timestamp v842, snapshot v166, targets v14), whose `trusted_root.json`
+  target is byte for byte ADR-029's fixture; the reviewer reads every PR
+  of the crate.
 - A canonical-form or format mismatch can only refuse: the known answers
   prove that today's repository passes, and the weekly live run (PR 3)
   catches upstream drift within a week, for example a new key type in a
