@@ -3,11 +3,11 @@
 //! token) as a known answer, then the rules over the synthetic instance of
 //! `support::pki` with its test TSA.
 //!
-//! A bundle entry without an inclusion promise is still refused with
-//! `TlogEntries` once a time is found (Rekor v2 entries are PR 2 of
-//! #102), so the cases without a SET tell the time sources apart by that
-//! refusal: `TlogEntries` means a token counted, `NoTimeSource` or a
-//! token refusal means none did.
+//! A bundle entry of the Rekor v1 log without its inclusion promise is
+//! refused with `TlogEntries` once a time is found (a v1 entry needs its
+//! SET; Rekor v2 entries are `tests/rekor_v2.rs`), so the cases without a
+//! SET tell the time sources apart by that refusal: `TlogEntries` means a
+//! token counted, `NoTimeSource` or a token refusal means none did.
 
 mod support;
 
@@ -19,8 +19,8 @@ use boneli_sigstore::{
 };
 use support::pki::{
     self, BundleSpec, EPOCH_2020, IMAGE, INTEGRATED, LIFETIME, LOG_INDEX, LeafSpec, Pki, T, Tsa,
-    email_identity, keyless_trust_in, obj, remove, rfc3339_ms, root_value, s, set, to_bytes,
-    with_tokens, with_tsas,
+    email_identity, keyless_trust_in, obj, placeholder_proof, remove, rfc3339_ms, root_value, s,
+    set, to_bytes, with_tokens, with_tsas,
 };
 use support::real;
 
@@ -40,6 +40,11 @@ fn bundle(pki: &Pki, spec: &BundleSpec, tokens: &[Vec<u8>], promise: bool) -> Ev
     if !promise {
         let mut entry = spec.entry.bundle_entry(pki, "dsse");
         remove(&mut entry, &["inclusionPromise"]);
+        set(
+            &mut entry,
+            &["inclusionProof"],
+            placeholder_proof(LOG_INDEX),
+        );
         set(
             &mut value,
             &["verificationMaterial", "tlogEntries"],
@@ -95,18 +100,6 @@ fn real_set_and_timestamp_verify() {
             identity: 0,
         })
     );
-}
-
-/// The Rekor v2 bundles carry no integrated time; their entries are read
-/// by PR 2 of #102, so until then they are refused at the entry.
-#[test]
-fn real_rekor_v2_bundles_still_refused() {
-    for bytes in [real::BEX_BUNDLE, real::AICR_RECIPE_BUNDLE] {
-        assert_eq!(
-            Evidence::from_bundle(bytes).err(),
-            Some(Refusal::MalformedTlogEntry)
-        );
-    }
 }
 
 #[test]
@@ -174,6 +167,20 @@ fn time_source_threshold() {
     assert_eq!(
         check(&[b"not a token".to_vec()], false),
         Err(Refusal::Timestamp(TimestampError::Malformed))
+    );
+    // The real Rekor v2 bundle without its token has no time at all
+    // (ADR-038 AC 4, conformance `rekor2-no-timestamp_fail`); with it, it
+    // passes (`tests/rekor_v2.rs`).
+    let mut bex = real::json(real::BEX_BUNDLE);
+    remove(
+        &mut bex,
+        &["verificationMaterial", "timestampVerificationData"],
+    );
+    let evidence = Evidence::from_bundle(&to_bytes(&bex)).expect("bundle");
+    let trust = real::keyless(vec![real::bex_identity()]);
+    assert_eq!(
+        verify(&evidence, &real::BEX_DIGEST, &trust),
+        Err(Refusal::NoTimeSource)
     );
 }
 
@@ -443,6 +450,11 @@ fn tsa_not_in_root() {
         .expect("entries");
     let mut entry = entries[0].clone();
     remove(&mut entry, &["inclusionPromise"]);
+    set(
+        &mut entry,
+        &["inclusionProof"],
+        placeholder_proof(real::TRILLIAN_LOG_INDEX),
+    );
     set(
         &mut value,
         &["verificationMaterial", "tlogEntries"],

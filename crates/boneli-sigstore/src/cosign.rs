@@ -106,9 +106,10 @@ pub(crate) fn legacy_entry(text: &[u8]) -> Option<TlogEntry> {
     let payload = json::object(&value, "Payload")?;
     Some(TlogEntry {
         body: json::base64(payload, "body")?,
-        integrated_time: json::integer(payload, "integratedTime")?,
+        integrated_time: Some(json::integer(payload, "integratedTime")?),
         log_index: json::integer(payload, "logIndex")?,
         log_id: hex::decode_32(json::string(payload, "logID")?)?,
         set: Some(set),
+        proof: None,
     })
 }

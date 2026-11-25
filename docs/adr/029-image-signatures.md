@@ -559,7 +559,7 @@ the digest binds the bytes and mirrors are legitimate.
     would make the integrated time ambiguous, so it is refused rather
     than tried entry by entry.
   - A signer that moves to Rekor v2 or to TSA time is refused until the
-    follow-up issue (filed at STOP 1) lands.
+    follow-up issue (filed at STOP 1) lands. ADR-038 closes it (#102).
   - A SET is Rekor's signed promise, and boneli has no witness for it;
     without a witness, an inclusion proof would also rest on Rekor's key,
     so it is not checked. Inclusion proofs, checkpoints and witnesses stay

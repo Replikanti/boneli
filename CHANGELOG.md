@@ -919,7 +919,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also run through the offline fake registry of `boneli-oci`. No new
   refusal, limit or dependency.
 - RFC 3161 timestamps as a time source of keyless bundles (#102, part 1,
-  ADR-038, proposed): `boneli_https::TimestampToken` reads a
+  ADR-038, accepted): `boneli_https::TimestampToken` reads a
   `TimeStampResp` strictly (one signer, SHA-256, `ecdsa-with-SHA256`,
   contentType, messageDigest and signingCertificateV2 once each, a whole-
   second genTime, embedded certificates never parsed) and verifies it over
@@ -935,7 +935,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with no time is refused with `NoTimeSource` or the first token's
   `Timestamp` refusal (`NoTsaAtTime`). Seven real tokens of Sigstore's
   public-good TSA and the trillian_log_server bundle are known answers.
-  Rekor v2 entries are still refused. No new crate or dependency edge.
+  No new crate or dependency edge.
+- Rekor v2 entries (#102, part 2, ADR-038, accepted): a keyless bundle's
+  log entry may be Rekor v2 `hashedrekord` 0.0.2. `TrustedRoot` keeps a
+  Rekor log with an Ed25519 key whose `keyId` is its signed-note key ID
+  (`note_log_count`; `log2025-1` in the public-good root). An entry
+  without a promise needs its `inclusionProof`; its body is rebuilt from
+  the bundle and the verified P-256 leaf and must equal
+  `canonicalizedBody` byte for byte (`BodyMismatch`, other leaf kinds
+  `EntryKeyKind`), its RFC 9162 path must reach the root of a checkpoint
+  signed once by the log's key under the origin its key ID binds
+  (`InclusionProof`, `Checkpoint`), and the log's window must hold every
+  verified time. Its time comes from RFC 3161 tokens only, so a v2 bundle
+  without one is `NoTimeSource`. bex-cnb-run and aicr v1.3.0's recipe
+  catalog are known answers; live test `signatures_on_rekor_v2` in
+  `oci-acceptance`. `boneli_https::Ed25519Key` signs test checkpoints.
+  No new crate or dependency edge.
 
 ### Changed
 
@@ -943,6 +958,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `integrated_time: Option<u64>` and `signed_timestamps` (ADR-038), and a
   bundle entry without a promise and without a timestamp is now refused
   with `NoTimeSource` instead of `TlogEntries`.
+- **Breaking:** `boneli_https::KeyError` has a variant `NotEd25519`, and
+  `boneli_sigstore::Refusal` the variants `EntryKeyKind`,
+  `InclusionProof` and `Checkpoint` (ADR-038). A bundle entry without a
+  promise now needs an `inclusionProof` (else `MalformedTlogEntry`), and
+  the texts of `TlogEntries` and `LogOutsideWindow` name Rekor v2 too.
 - The trust anchor of a Fulcio code-signing chain must be valid at the
   verified time too (`CertError::OutsideValidity`); webpki never checks
   an anchor's validity (ADR-038, D3).

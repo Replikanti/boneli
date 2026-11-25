@@ -379,6 +379,8 @@ pub struct LeafSpec {
     /// Whole extensions put after the SCT list. Every SCT is signed over
     /// the TBS with all extensions but the list, in their final order.
     pub after_sct: Vec<Vec<u8>>,
+    /// The leaf's key; `None` is `test-only-leaf`'s (RSA).
+    pub spki: Option<Vec<u8>>,
 }
 
 impl LeafSpec {
@@ -398,6 +400,7 @@ impl LeafSpec {
             first: Vec::new(),
             extra: Vec::new(),
             after_sct: Vec::new(),
+            spki: None,
         }
     }
 
@@ -416,7 +419,7 @@ impl LeafSpec {
             subject: seq(&[]),
             not_before: self.not_before,
             not_after: self.not_after,
-            spki: pki.leaf_key.spki(),
+            spki: self.spki.clone().unwrap_or_else(|| pki.leaf_key.spki()),
             extensions,
         }
     }
@@ -1469,4 +1472,394 @@ pub fn with_tokens(mut bundle: Value, tokens: &[Vec<u8>]) -> Value {
         obj(vec![("rfc3161Timestamps", Value::Array(list))]),
     );
     bundle
+}
+
+// ---- Rekor v2 (ADR-038, D6 and D7) ------------------------------------
+
+/// The origin of the synthetic Rekor v2 log.
+pub const V2_ORIGIN: &str = "rekor-v2.boneli.test";
+/// The log index of the synthetic v2 entry, and the tree size it sits in.
+pub const V2_INDEX: u64 = 4;
+pub const V2_SIZE: u64 = 7;
+
+/// The seed of the synthetic Rekor v2 log's Ed25519 key: fixed bytes, so
+/// the key is made at test time and no key file is needed.
+const V2_LOG_SEED: [u8; 32] = [0x5B; 32];
+
+/// The synthetic Rekor v2 log: an Ed25519 key made from [`V2_LOG_SEED`]
+/// signs its checkpoints (`boneli_https::Ed25519Key`).
+pub struct NoteLog {
+    pub key: boneli_https::Ed25519Key,
+}
+
+impl NoteLog {
+    pub fn new() -> NoteLog {
+        // PKCS#8 v1 (RFC 8410): version 0, id-Ed25519, the seed as an
+        // OCTET STRING inside the private key OCTET STRING.
+        let mut der = vec![
+            0x30, 0x2E, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&V2_LOG_SEED);
+        let label = "PRIVATE KEY";
+        let mut pem = format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            base64::encode(&der)
+        )
+        .into_bytes();
+        NoteLog {
+            key: boneli_https::Ed25519Key::from_pem(&mut pem).expect("test Rekor v2 key"),
+        }
+    }
+
+    /// The raw 32-byte Ed25519 key: the end of its SubjectPublicKeyInfo.
+    pub fn raw_key(&self) -> [u8; 32] {
+        let spki = self.key.public_key().spki_der();
+        spki[spki.len() - 32..].try_into().expect("32 bytes")
+    }
+
+    /// The signed-note key ID of this key under `origin`:
+    /// SHA-256(origin ‖ `\n` ‖ 0x01 ‖ raw key).
+    pub fn key_id_for(&self, origin: &str) -> [u8; 32] {
+        let mut bytes = origin.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0x0A, 0x01]);
+        bytes.extend_from_slice(&self.raw_key());
+        Sha256::digest(&bytes)
+    }
+
+    pub fn key_id(&self) -> [u8; 32] {
+        self.key_id_for(V2_ORIGIN)
+    }
+
+    /// The `tlogs` entry of this log, as the public-good root lists
+    /// `log2025-1`: an Ed25519 key, `logId.keyId` the note key ID.
+    pub fn instance(&self, start: &str, end: Option<&str>) -> Value {
+        obj(vec![
+            ("baseUrl", s("https://rekor-v2.boneli.test")),
+            ("hashAlgorithm", s("SHA2_256")),
+            (
+                "publicKey",
+                obj(vec![
+                    (
+                        "rawBytes",
+                        s(&base64::encode(self.key.public_key().spki_der())),
+                    ),
+                    ("keyDetails", s("PKIX_ED25519")),
+                    ("validFor", valid_for(start, end)),
+                ]),
+            ),
+            (
+                "logId",
+                obj(vec![("keyId", s(&base64::encode(&self.key_id())))]),
+            ),
+        ])
+    }
+
+    /// A signature line over `body` by this key, named `name`, with the
+    /// key hint of `key_id`: `— <name> <base64(hint ‖ signature)>\n`.
+    pub fn line(&self, name: &str, key_id: &[u8; 32], body: &str) -> String {
+        let mut bytes = key_id[..4].to_vec();
+        bytes.extend(self.key.sign(body.as_bytes()).expect("sign"));
+        format!("\u{2014} {name} {}\n", base64::encode(&bytes))
+    }
+
+    /// A checkpoint over `size` and `root`, signed by this log under
+    /// [`V2_ORIGIN`], with one witness line after the log's.
+    pub fn checkpoint(&self, size: u64, root: &[u8; 32]) -> String {
+        let body = note_body(V2_ORIGIN, size, root);
+        format!(
+            "{body}\n{}{}",
+            self.line(V2_ORIGIN, &self.key_id(), &body),
+            witness_line("witness.boneli.test")
+        )
+    }
+}
+
+/// The text a checkpoint signs: origin, size and root hash, each ending in
+/// `\n`.
+pub fn note_body(origin: &str, size: u64, root: &[u8; 32]) -> String {
+    format!("{origin}\n{size}\n{}\n", base64::encode(root))
+}
+
+/// A well-formed witness cosignature line no root knows: a 4-byte hint,
+/// an 8-byte time and 64 bytes.
+pub fn witness_line(name: &str) -> String {
+    let mut bytes = vec![0x5A; 4];
+    bytes.extend_from_slice(&1_790_000_000u64.to_be_bytes());
+    bytes.extend_from_slice(&[0x33; 64]);
+    format!("\u{2014} {name} {}\n", base64::encode(&bytes))
+}
+
+/// RFC 6962's leaf hash, SHA-256(0x00 ‖ data).
+pub fn leaf_hash(data: &[u8]) -> [u8; 32] {
+    let mut bytes = vec![0x00];
+    bytes.extend_from_slice(data);
+    Sha256::digest(&bytes)
+}
+
+/// RFC 6962's interior node, SHA-256(0x01 ‖ left ‖ right).
+pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut bytes = vec![0x01];
+    bytes.extend_from_slice(left);
+    bytes.extend_from_slice(right);
+    Sha256::digest(&bytes)
+}
+
+/// The largest power of two below `n` (n > 1).
+fn split(n: usize) -> usize {
+    let mut k = 1;
+    while k * 2 < n {
+        k *= 2;
+    }
+    k
+}
+
+/// RFC 6962's Merkle tree hash over leaf hashes (section 2.1).
+pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    match leaves.len() {
+        0 => Sha256::digest(b""),
+        1 => leaves[0],
+        n => {
+            let k = split(n);
+            node_hash(&merkle_root(&leaves[..k]), &merkle_root(&leaves[k..]))
+        }
+    }
+}
+
+/// RFC 6962's audit path of leaf `m` (section 2.1.1), the RFC 9162
+/// inclusion proof.
+pub fn inclusion_path(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let n = leaves.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    let k = split(n);
+    if m < k {
+        let mut path = inclusion_path(m, &leaves[..k]);
+        path.push(merkle_root(&leaves[k..]));
+        path
+    } else {
+        let mut path = inclusion_path(m - k, &leaves[k..]);
+        path.push(merkle_root(&leaves[..k]));
+        path
+    }
+}
+
+/// A Rekor v2 `hashedrekord` 0.0.2 body as Rekor writes it (sorted keys,
+/// compact): the SHA-256 of `message` (the PAE), the signature and the
+/// leaf, with `key_details`.
+pub fn hashedrekord_v2(
+    message: &[u8],
+    signature: &[u8],
+    certificate: &[u8],
+    key_details: &str,
+) -> Vec<u8> {
+    format!(
+        "{{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{{\"hashedRekordV002\":{{\
+         \"data\":{{\"algorithm\":\"SHA2_256\",\"digest\":\"{}\"}},\
+         \"signature\":{{\"content\":\"{}\",\"verifier\":{{\"keyDetails\":\"{key_details}\",\
+         \"x509Certificate\":{{\"rawBytes\":\"{}\"}}}}}}}}}}}}",
+        base64::encode(&Sha256::digest(message)),
+        base64::encode(signature),
+        base64::encode(certificate),
+    )
+    .into_bytes()
+}
+
+/// A keyless DSSE bundle logged in the synthetic Rekor v2 log: a P-256
+/// leaf (`p256_leaf_key`) signs the PAE of the statement, the
+/// entry is `hashedrekord` 0.0.2 at `index` of a tree of `size` whose
+/// other leaves are fixed, and the checkpoint is the log's. Every field
+/// may be replaced before [`V2Spec::value`] renders the bundle; `seal`
+/// rebuilds the tree, the proof and the checkpoint over the current body.
+/// The leaf's ECDSA signature is randomized, so two specs differ: clone
+/// one to change a single field.
+#[derive(Clone)]
+pub struct V2Spec {
+    pub statement: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub certificate: Vec<u8>,
+    pub body: Vec<u8>,
+    pub kind: String,
+    pub version: String,
+    pub index: u64,
+    pub proof_index: u64,
+    pub size: u64,
+    pub log_id: [u8; 32],
+    pub hashes: Vec<[u8; 32]>,
+    pub root: [u8; 32],
+    pub checkpoint: String,
+}
+
+/// The P-256 key of the v2 leaves: the test TSA's key (`Tsa`), reused so
+/// that no other key file is needed. It changes no verdict here: a token
+/// names its signer by the hash of the TSA's certificate, never by key.
+pub fn p256_leaf_key() -> boneli_https::EcdsaP256Key {
+    boneli_https::EcdsaP256Key::from_pem(&mut include_bytes!("../data/test-only-tsa.key").to_vec())
+        .expect("test P-256 key")
+}
+
+/// `leaf` with the P-256 key of the v2 leaves.
+pub fn p256(leaf: &LeafSpec) -> LeafSpec {
+    LeafSpec {
+        spki: Some(p256_leaf_key().public_key().spki_der().to_vec()),
+        ..leaf.clone()
+    }
+}
+
+impl V2Spec {
+    /// An email leaf over `digest`, at [`V2_INDEX`] of [`V2_SIZE`].
+    pub fn new(pki: &Pki, log: &NoteLog, digest: &[u8; 32]) -> V2Spec {
+        V2Spec::with_leaf(pki, log, &p256(&LeafSpec::email()), digest)
+    }
+
+    pub fn with_leaf(pki: &Pki, log: &NoteLog, leaf: &LeafSpec, digest: &[u8; 32]) -> V2Spec {
+        let statement = statement(&[&hex(digest)], COSIGN_SIGN_PREDICATE);
+        let message = pae(IN_TOTO_PAYLOAD_TYPE.as_bytes(), &statement);
+        let signature = p256_leaf_key().sign(&message).expect("sign");
+        let certificate = leaf.build(pki);
+        let body = hashedrekord_v2(
+            &message,
+            &signature,
+            &certificate,
+            "PKIX_ECDSA_P256_SHA_256",
+        );
+        let mut spec = V2Spec {
+            statement,
+            signature,
+            certificate,
+            body,
+            kind: "hashedrekord".to_owned(),
+            version: "0.0.2".to_owned(),
+            index: V2_INDEX,
+            proof_index: V2_INDEX,
+            size: V2_SIZE,
+            log_id: log.key_id(),
+            hashes: Vec::new(),
+            root: [0; 32],
+            checkpoint: String::new(),
+        };
+        spec.seal(log);
+        spec
+    }
+
+    /// The PAE the leaf signed.
+    pub fn message(&self) -> Vec<u8> {
+        pae(IN_TOTO_PAYLOAD_TYPE.as_bytes(), &self.statement)
+    }
+
+    /// The tree's leaf hashes: the body's at `index`, fixed ones elsewhere.
+    pub fn leaves(&self) -> Vec<[u8; 32]> {
+        (0..self.size)
+            .map(|i| {
+                if i == self.index {
+                    leaf_hash(&self.body)
+                } else {
+                    leaf_hash(format!("other entry {i}").as_bytes())
+                }
+            })
+            .collect()
+    }
+
+    /// Rebuilds the proof, the root and the log's checkpoint over the
+    /// current body, index and size.
+    pub fn seal(&mut self, log: &NoteLog) {
+        let leaves = self.leaves();
+        self.hashes = inclusion_path(self.index as usize, &leaves);
+        self.root = merkle_root(&leaves);
+        self.checkpoint = log.checkpoint(self.size, &self.root);
+    }
+
+    /// The bundle's `TransparencyLogEntry`: no integrated time, no
+    /// promise, an inclusion proof with its checkpoint.
+    pub fn entry(&self) -> Value {
+        let hashes = self.hashes.iter().map(|h| s(&base64::encode(h))).collect();
+        obj(vec![
+            ("logIndex", s(&self.index.to_string())),
+            (
+                "logId",
+                obj(vec![("keyId", s(&base64::encode(&self.log_id)))]),
+            ),
+            (
+                "kindVersion",
+                obj(vec![("kind", s(&self.kind)), ("version", s(&self.version))]),
+            ),
+            (
+                "inclusionProof",
+                obj(vec![
+                    ("logIndex", s(&self.proof_index.to_string())),
+                    ("rootHash", s(&base64::encode(&self.root))),
+                    ("treeSize", s(&self.size.to_string())),
+                    ("hashes", Value::Array(hashes)),
+                    ("checkpoint", obj(vec![("envelope", s(&self.checkpoint))])),
+                ]),
+            ),
+            ("canonicalizedBody", s(&base64::encode(&self.body))),
+        ])
+    }
+
+    /// The bundle, carrying `tokens`.
+    pub fn value(&self, tokens: &[Vec<u8>]) -> Value {
+        let bundle = obj(vec![
+            ("mediaType", s(BUNDLE_V03_MEDIA_TYPE)),
+            (
+                "verificationMaterial",
+                obj(vec![
+                    (
+                        "certificate",
+                        obj(vec![("rawBytes", s(&base64::encode(&self.certificate)))]),
+                    ),
+                    ("tlogEntries", Value::Array(vec![self.entry()])),
+                ]),
+            ),
+            (
+                "dsseEnvelope",
+                obj(vec![
+                    ("payload", s(&base64::encode(&self.statement))),
+                    ("payloadType", s(IN_TOTO_PAYLOAD_TYPE)),
+                    (
+                        "signatures",
+                        Value::Array(vec![obj(vec![
+                            ("sig", s(&base64::encode(&self.signature))),
+                            ("keyid", s("")),
+                        ])]),
+                    ),
+                ]),
+            ),
+        ]);
+        with_tokens(bundle, tokens)
+    }
+
+    pub fn evidence(
+        &self,
+        tokens: &[Vec<u8>],
+    ) -> Result<boneli_sigstore::Evidence, boneli_sigstore::Refusal> {
+        boneli_sigstore::Evidence::from_bundle(&to_bytes(&self.value(tokens)))
+    }
+}
+
+/// The test root with the synthetic v2 log and `tsa`, each valid from
+/// 2020 on.
+pub fn v2_root(pki: &Pki, log: &NoteLog, tsa: &Tsa) -> Value {
+    let mut root = with_tsas(root_value(pki), vec![tsa.authority(EPOCH_2020, None)]);
+    let mut tlogs = match root.get("tlogs") {
+        Some(Value::Array(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    tlogs.push(log.instance(EPOCH_2020, None));
+    set(&mut root, &["tlogs"], Value::Array(tlogs));
+    root
+}
+
+/// A well-formed inclusion proof for a bundle entry that has lost its
+/// promise but is no v2 entry: the reader takes it, and the verdict comes
+/// from the log the entry names.
+pub fn placeholder_proof(log_index: u64) -> Value {
+    obj(vec![
+        ("logIndex", s(&log_index.to_string())),
+        ("rootHash", s(&base64::encode(&[0u8; 32]))),
+        ("treeSize", s(&(log_index + 1).to_string())),
+        ("hashes", Value::Array(vec![])),
+        ("checkpoint", obj(vec![("envelope", s("placeholder"))])),
+    ])
 }

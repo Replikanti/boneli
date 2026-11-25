@@ -6,8 +6,8 @@ mod support;
 use boneli_json::{Number, Value};
 use boneli_sigstore::{COSIGN_SIGN_PREDICATE, Evidence, MAX_BUNDLE_BYTES, Refusal, base64, verify};
 use support::pki::{
-    self, BundleSpec, IMAGE, LeafSpec, Pki, hex, keyed_bundle, keyed_trust, obj, remove, s, set,
-    statement, to_bytes,
+    self, BundleSpec, IMAGE, LOG_INDEX, LeafSpec, Pki, hex, keyed_bundle, keyed_trust, obj,
+    placeholder_proof, remove, s, set, statement, to_bytes,
 };
 use support::real;
 
@@ -231,8 +231,16 @@ fn tlog_entries_shape() {
         let evidence = parse(&b).expect("parses");
         assert_eq!(verify(&evidence, &IMAGE, &trust), Err(Refusal::TlogEntries));
     }
+    // Without a promise an entry needs an inclusion proof (Rekor v2's
+    // shape, ADR-038), and its integrated time is not read.
     let mut e = entry.clone();
     remove(&mut e, &["inclusionPromise"]);
+    assert_eq!(
+        with_entry(e.clone()).err(),
+        Some(Refusal::MalformedTlogEntry)
+    );
+    set(&mut e, &["inclusionProof"], placeholder_proof(LOG_INDEX));
+    set(&mut e, &["integratedTime"], s("-1"));
     let evidence = with_entry(e).expect("parses");
     assert_eq!(
         verify(&evidence, &IMAGE, &trust),

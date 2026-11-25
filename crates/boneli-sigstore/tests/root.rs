@@ -15,8 +15,8 @@ fn read(value: &Value) -> Result<TrustedRoot, ConfigError> {
 #[test]
 fn public_good_root_reads() {
     let root = TrustedRoot::from_json(real::TRUSTED_ROOT).expect("public-good root");
-    // Rekor v1 only (log2025-1 is v2 and left out), both Fulcio CAs,
-    // both CT logs.
+    // One Rekor v1 log (log2025-1 is v2 and counted apart), both Fulcio
+    // CAs, both CT logs.
     assert_eq!(
         (
             root.tlog_count(),
@@ -229,12 +229,14 @@ fn log_ids_are_recomputed() {
     set(&mut log, &["logId", "keyId"], s(&other));
     set(&mut v, &["ctlogs"], Value::Array(vec![log]));
     assert_eq!(read(&v).err(), Some(ConfigError::RootLogId));
-    // A Rekor log with such a keyId (a v2 log) is left out.
+    // A Rekor log with such a keyId is no v1 log, and with an RSA key no
+    // v2 log either (a v2 log's key is Ed25519, ADR-038): left out.
     let mut v = root_value(&pki);
     let mut log = log_instance(&pki.rekor_key, EPOCH_2020, None);
     set(&mut log, &["logId", "keyId"], s(&other));
     set(&mut v, &["tlogs"], Value::Array(vec![log]));
-    assert_eq!(read(&v).expect("root").tlog_count(), 0);
+    let root = read(&v).expect("root");
+    assert_eq!((root.tlog_count(), root.note_log_count()), (0, 0));
     // A keyId that is not 32 bytes refuses the file either way.
     for list in ["tlogs", "ctlogs"] {
         let mut v = root_value(&pki);
@@ -333,9 +335,12 @@ fn config_error_texts() {
 fn root_tsa_and_note_logs() {
     let root = TrustedRoot::from_json(real::TRUSTED_ROOT).expect("public-good root");
     assert_eq!(root.tsa_count(), 1);
+    // log2025-1, the Rekor v2 log (ADR-038, D6); more in
+    // `tests/rekor_v2.rs` (`root_note_logs`).
+    assert_eq!(root.note_log_count(), 1);
     assert_eq!(
         format!("{root:?}"),
-        "TrustedRoot { tlogs: 1, authorities: 2, ctlogs: 2, tsas: 1 }"
+        "TrustedRoot { tlogs: 1, note_logs: 1, authorities: 2, ctlogs: 2, tsas: 1 }"
     );
     let pki = Pki::new();
     let tsa = pki::Tsa::new(&pki);

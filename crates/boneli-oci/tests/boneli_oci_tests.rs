@@ -1566,4 +1566,108 @@ mod network {
             assert_eq!(committed, 0, "a layer was committed");
         }
     }
+
+    /// `ghcr.io/bex-co/bex-cnb-run`, the one public image found signed
+    /// through Rekor v2 (ADR-038): its index, its keyless `cosign sign`
+    /// workflow, the referrer and the bundle the offline tests hold.
+    const BEX: &str = "sha256:b02a639bada113f1b64024c23d5dce1ecb12b67ef4c75b1650999f2bf1732df9";
+    const BEX_WORKFLOW: &str =
+        "https://github.com/bex-co/bex/.github/workflows/native-base-image.yml@refs/heads/main";
+    const BEX_REFERRER: &str =
+        "sha256:9d24c9ab1fcf359ef560e2d33ea06b64182961756b52617398e47b35561343c4";
+    const BEX_BUNDLE: &str =
+        "sha256:04b2bd8bc7235b99a2635f087761904808db5426eb5e23bf5e027150da2ba8c7";
+
+    /// The acceptance of ADR-038 on GHCR: under a `Required` rule with
+    /// bex's workflow identity and the committed public-good root,
+    /// bex-cnb-run pulls with every layer committed, its signature a
+    /// Rekor v2 `hashedrekord` 0.0.2 entry with its time from an RFC 3161
+    /// token; the pointer names its bundle; a warm pull makes no request;
+    /// and under another SAN a fresh store refuses it before any layer is
+    /// committed. If the image or its referrer is gone, the failure names
+    /// it, and the test is repointed at another Rekor v2 signature.
+    #[test]
+    #[ignore = "network: pulls bex-co/bex-cnb-run (about 603 MB) from ghcr.io"]
+    fn signatures_on_rekor_v2() {
+        let ghcr = Registry::new(
+            "ghcr.io",
+            "ghcr.io",
+            &["ghcr.io"],
+            &[".githubusercontent.com"],
+        )
+        .expect("ghcr");
+        let name = "ghcr.io/bex-co/bex-cnb-run";
+        let image = || ImageRef {
+            name: name.to_owned(),
+            digest: BEX.to_owned(),
+            platform: platform().to_owned(),
+            origin: ImageOrigin::Operator,
+        };
+        for trusted in [true, false] {
+            let san = if trusted {
+                BEX_WORKFLOW.to_owned()
+            } else {
+                BEX_WORKFLOW.replace("refs/heads/main", "refs/heads/other")
+            };
+            let dial = recording();
+            let mut config = StoreConfig::new(Box::new(dial.clone())).expect("config");
+            config.registries = vec![Registry::docker_hub(), ghcr.clone()];
+            config.signatures = SignaturePolicy::new(
+                Requirement::Off,
+                vec![rule(
+                    "ghcr.io",
+                    RepoScope::Exact(Repository::parse("bex-co/bex-cnb-run").expect("repository")),
+                    keyless(
+                        "https://token.actions.githubusercontent.com",
+                        SanRule::Uri(san),
+                    ),
+                )],
+            )
+            .expect("policy");
+            let tmp = TempDir::new("network-rekor-v2");
+            let root = tmp.path().join("store");
+            let store = OciImageStore::open(&root, config).expect("open");
+            if !trusted {
+                let refused = store.pull(&image());
+                println!("oci-acceptance signatures {name} under another SAN: {refused:?}");
+                match refused {
+                    Err(ImageError::Failed { detail }) => {
+                        assert!(detail.starts_with("signature policy: "), "{detail}");
+                        assert!(
+                            detail.contains("the signer is not a trusted identity"),
+                            "{detail}"
+                        );
+                    }
+                    other => panic!("{name} must be refused: {other:?}"),
+                }
+                assert!(
+                    std::fs::read_dir(root.join("layers/sha256"))
+                        .map(|d| d
+                            .filter_map(Result::ok)
+                            .all(|e| e.file_name().to_string_lossy().starts_with('.')))
+                        .unwrap_or(true),
+                    "a layer was committed"
+                );
+                continue;
+            }
+            pull_signed(&store, &dial, name, BEX);
+            let pointer = std::fs::read_to_string(
+                root.join("signatures/sha256")
+                    .join(BEX.trim_start_matches("sha256:")),
+            )
+            .unwrap_or_else(|e| panic!("{name}: no pointer for the index: {e}"));
+            assert!(
+                pointer
+                    .lines()
+                    .any(|l| l == format!("bundle {BEX_REFERRER} {BEX_BUNDLE}")),
+                "{name}: the pointer does not name the Rekor v2 bundle: {pointer}"
+            );
+            dial.hosts.lock().expect("hosts").clear();
+            store.pull(&image()).expect("warm pull");
+            assert!(
+                dial.hosts.lock().expect("hosts").is_empty(),
+                "the warm pull made requests"
+            );
+        }
+    }
 }
