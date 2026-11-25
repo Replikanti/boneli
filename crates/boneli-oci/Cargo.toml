@@ -54,6 +54,11 @@ boneli-sigstore.workspace = true
 # which the tests of the lock owner check drop copies through (ADR-030, D4).
 # Dev-only, so normal builds never see the feature (resolver 3).
 boneli-private-dir = { workspace = true, features = ["test-seam"] }
+# The TLS server of the proxy pull test (`tests/proxy.rs`), the local
+# registry a pull reaches through a `CONNECT` tunnel with the certificate
+# checked end to end (ADR-039, D10). Dev-only, with boneli-https's
+# features: no new crate, one more edge into it.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 
 # Its own `main`: the process whose main thread has exited comes from
 # `boneli_sys::exit_main_thread`, which only a main thread can call, and

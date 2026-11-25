@@ -177,7 +177,11 @@ in a cosign `.att` (ADR-036), and `signatures_on_rekor_v2` pulls
 bex-cnb-run from GHCR, signed through a Rekor v2 entry with its time from
 an RFC 3161 timestamp, and refuses it under another SAN (ADR-038); CI
 runs them in the weekly
-`oci-acceptance` workflow, not on every PR.
+`oci-acceptance` workflow, not on every PR. `proxy::node_pulls_through_the_proxy`
+pulls `node:22` through the HTTP proxy named by `BONELI_OCI_TEST_PROXY`
+(`host:port`, ADR-039) and fails, naming the variable, when it is unset;
+`oci-acceptance` runs it through Squid with direct outbound 80 and 443
+rejected for the runner user.
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \

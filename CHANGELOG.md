@@ -973,6 +973,36 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still refuses them). The `CONNECT` answer is held to
   `PROXY_MAX_HEAD_BYTES` 16,384 and `PROXY_MAX_HEADERS` 64. No new crate
   or dependency edge.
+- Registry credentials and pulls through an HTTP proxy (#55, part 2,
+  ADR-039, accepted): `boneli_oci::Registry::with_credentials(BasicCredentials)`
+  sends a registry's credentials to its API host only after that host's
+  own `Basic` challenge, or on the token request to an allowlisted token
+  host after the API host's `Bearer` challenge named it (`Bearer` wins
+  when both are offered); never to a redirect host, another registry or
+  a proxy, and a `401` from a redirect host is a status, not a
+  challenge. A second `401` after `Basic`, and a `401` or `403` from the
+  token host to a request with credentials, are `Failed` ("refused the
+  configured credentials"); a `Basic` challenge without credentials
+  fails naming the registry. Every fetch, the signature lookups
+  included, goes through one request path that writes `Authorization`.
+  `StoreConfig::production` over a proxied `TlsConfig` uses
+  `PROXIED_SETUP_TIMEOUT` 40 s. Failure details no longer quote a
+  redirect's `Location`, a response's `Content-Type` or an
+  auth-parameter name, an image name with `@` is refused with its
+  userinfo shown as `[userinfo]`, and every detail of the registry
+  client and the store is passed through `BasicCredentials::redact` and
+  the new `boneli_https::redact` (`REDACT_WINDOW` 16 bytes, ASCII letters
+  compared case-insensitively, since hosts reach details lowercased)
+  over the credentials and every token received. `Registry`'s `Debug` is
+  redacted. `boneli-oci` re-exports `BasicCredentials` and `Proxy`.
+  Live test `proxy::node_pulls_through_the_proxy` (`BONELI_OCI_TEST_PROXY`)
+  through Squid in `oci-acceptance`, with direct outbound 80 and 443
+  rejected; only the Squid log lines the pull wrote are counted.
+  `rustls` becomes a dev-dependency of `boneli-oci` (the local TLS
+  registry of the proxy test); no new crate. The architecture checker
+  accepts `kinds = ["normal" | "dev" | "build"]` on an edge record and
+  then approves the edge for those dependency kinds only (rule
+  `dep-edge`); the `boneli-oci -> rustls` record is dev-only.
 
 ### Changed
 

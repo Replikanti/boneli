@@ -76,7 +76,7 @@ impl Reply {
     }
 }
 
-type Handler = dyn Fn(&Seen) -> Reply + Send + Sync;
+pub type Handler = dyn Fn(&Seen) -> Reply + Send + Sync;
 
 /// The fake: a handler and the log of what it saw.
 #[derive(Clone)]
@@ -117,19 +117,25 @@ impl Dial for Fake {
         let handler = Arc::clone(&self.handler);
         let log = Arc::clone(&self.log);
         let host = host.to_owned();
-        thread::spawn(move || serve(server, host, port, &*handler, &log));
+        thread::spawn(move || {
+            let mut server = server;
+            let _ = server.set_read_timeout(Some(Duration::from_secs(10)));
+            answer(&mut server, host, port, &*handler, &log);
+        });
         Ok(Box::new(client))
     }
 }
 
-fn serve(
-    mut stream: UnixStream,
+/// Reads one request head from `stream`, records it as sent to `host` and
+/// `port`, and writes `handler`'s answer: the fake's side of one connection,
+/// also for a fake registry behind TLS.
+pub fn answer<S: Read + Write>(
+    stream: &mut S,
     host: String,
     port: u16,
     handler: &Handler,
     log: &Mutex<Vec<Seen>>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     while !bytes.ends_with(b"\r\n\r\n") {
@@ -350,6 +356,145 @@ impl Hub {
             Some(bytes) => Reply::http(200, &[], bytes),
             None => Reply::status(404),
         }
+    }
+}
+
+/// How a [`Private`] registry asks for credentials (ADR-039, D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    /// `401` with `Basic realm="private"`; the API takes the credentials
+    /// as `Authorization: Basic …`.
+    Basic,
+    /// `401` with a Bearer challenge for the realm; the token request must
+    /// carry the credentials, the API takes the token only.
+    Token,
+    /// As `Token`, with a `Basic` challenge in a second
+    /// `WWW-Authenticate` field; the API still takes the token only.
+    Both,
+}
+
+/// A registry that wants credentials, at Docker Hub's API host
+/// `registry-1.docker.io`, in front of a [`Hub`] that serves the
+/// documents, tags, referrers and blobs. Its token realm is
+/// `https://auth.docker.io/token` unless `realm` says otherwise; its
+/// token endpoint wants `basic` and its API `basic` (flow `Basic`) or
+/// `Bearer <token>`. A blob is redirected through the hosts of `chain`
+/// in order, the last of which serves it.
+#[derive(Clone)]
+pub struct Private {
+    /// The content.
+    pub hub: Hub,
+    /// How the API asks for credentials.
+    pub flow: Flow,
+    /// The credentials the registry accepts, as the `Authorization` value
+    /// `Basic <base64>`.
+    pub basic: String,
+    /// The token it issues.
+    pub token: String,
+    /// The token realm, an `https` URL.
+    pub realm: String,
+    /// The hosts a blob request is redirected through; empty, the API
+    /// serves blobs itself.
+    pub chain: Vec<String>,
+}
+
+impl Private {
+    /// A private registry over `hub` with the realm on `auth.docker.io`
+    /// and no redirects.
+    pub fn new(hub: Hub, flow: Flow, basic: &str, token: &str) -> Private {
+        Private {
+            hub,
+            flow,
+            basic: basic.to_owned(),
+            token: token.to_owned(),
+            realm: "https://auth.docker.io/token".to_owned(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// The registry's answer to `seen`.
+    pub fn handle(&self, seen: &Seen) -> Reply {
+        let rest = self.realm.trim_start_matches("https://");
+        let (realm_host, realm_path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let to_realm = seen.host == realm_host
+            && seen
+                .target
+                .strip_prefix(realm_path)
+                .is_some_and(|t| t.is_empty() || t.starts_with('?'));
+        if to_realm {
+            if seen.header("authorization") != Some(self.basic.as_str()) {
+                return Reply::http(401, &[("WWW-Authenticate", r#"Basic realm="token""#)], b"");
+            }
+            return Reply::http(
+                200,
+                &[("Content-Type", "application/json")],
+                format!(r#"{{"token":"{}","expires_in":300}}"#, self.token).as_bytes(),
+            );
+        }
+        if seen.host == "registry-1.docker.io" {
+            return self.api(seen);
+        }
+        let Some(i) = self.chain.iter().position(|h| *h == seen.host) else {
+            return Reply::status(421);
+        };
+        let digest = seen.target.rsplit('/').next().unwrap_or_default();
+        match self.chain.get(i + 1) {
+            Some(next) => Reply::http(
+                307,
+                &[(
+                    "Location",
+                    &format!("https://{next}/hop/{}/{digest}", i + 1),
+                )],
+                b"",
+            ),
+            None => match self.hub.blobs.get(digest) {
+                Some(bytes) => Reply::http(200, &[], bytes),
+                None => Reply::status(404),
+            },
+        }
+    }
+
+    fn api(&self, seen: &Seen) -> Reply {
+        let wanted = match self.flow {
+            Flow::Basic => self.basic.clone(),
+            Flow::Token | Flow::Both => format!("Bearer {}", self.token),
+        };
+        if seen.header("authorization") != Some(wanted.as_str()) {
+            let path = seen.target.trim_start_matches("/v2/");
+            let repo = ["/manifests/", "/blobs/", "/referrers/"]
+                .iter()
+                .find_map(|k| path.rsplit_once(k).map(|(r, _)| r))
+                .unwrap_or_default();
+            let bearer = format!(
+                r#"Bearer realm="{}",service="private",scope="repository:{repo}:pull""#,
+                self.realm
+            );
+            let basic = r#"Basic realm="private""#;
+            let fields: Vec<(&str, &str)> = match self.flow {
+                Flow::Basic => vec![("WWW-Authenticate", basic)],
+                Flow::Token => vec![("WWW-Authenticate", &bearer)],
+                Flow::Both => vec![("WWW-Authenticate", basic), ("WWW-Authenticate", &bearer)],
+            };
+            return Reply::http(401, &fields, b"{}");
+        }
+        if let Some(first) = self.chain.first()
+            && let Some((_, digest)) = seen.target.rsplit_once("/blobs/")
+            && self.hub.blobs.contains_key(digest)
+        {
+            return Reply::http(
+                307,
+                &[("Location", &format!("https://{first}/hop/0/{digest}"))],
+                b"",
+            );
+        }
+        let mut inner = seen.clone();
+        inner
+            .headers
+            .retain(|(n, _)| !n.eq_ignore_ascii_case("authorization"));
+        inner
+            .headers
+            .push(("Authorization".to_owned(), format!("Bearer {TOKEN}")));
+        self.hub.handle(&inner)
     }
 }
 

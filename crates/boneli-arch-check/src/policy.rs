@@ -27,6 +27,10 @@ pub(crate) struct Policy {
     pub(crate) unsafe_lints: Option<Vec<(String, String)>>,
     /// Recorded edges (parent, crate).
     pub(crate) edges: BTreeSet<(String, String)>,
+    /// The dependency kinds (`normal`, `dev`, `build`) an edge record
+    /// limits its edge to with `kinds`; an edge without an entry may be of
+    /// any kind (ADR-039, D10).
+    pub(crate) edge_kinds: BTreeMap<(String, String), BTreeSet<String>>,
     /// External crates whose build script an accepted ADR approves.
     pub(crate) build_scripts: BTreeMap<String, String>,
     /// The one file exempt from rule file-lock (`check.file-lock`,
@@ -584,12 +588,36 @@ impl Checker<'_> {
                     continue;
                 };
                 for key in record.keys() {
-                    if !matches!(key, "reason" | "decision") {
+                    if !matches!(key, "reason" | "decision" | "kinds") {
                         self.bad(format!("{eat}: unknown key {}", show(key)));
                     }
                 }
                 self.reason(record.get("reason"), &eat);
                 self.decision(record.get("decision"), &eat)?;
+                if let Some(value) = record.get("kinds") {
+                    // A malformed list still limits the edge, to the valid
+                    // kinds in it or to none, so it fails closed in the
+                    // graph check as well as in policy-format.
+                    let mut allowed = BTreeSet::new();
+                    match self.names(Some(value), &format!("{eat} kinds")) {
+                        Some(list) if !list.is_empty() => {
+                            for kind in list {
+                                if matches!(kind.as_str(), "normal" | "dev" | "build") {
+                                    allowed.insert(kind);
+                                } else {
+                                    self.bad(format!(
+                                        "{eat}: kind {} is not normal, dev or build",
+                                        show(&kind)
+                                    ));
+                                }
+                            }
+                        }
+                        Some(_) => self.bad(format!("{eat}: kinds is empty")),
+                        None => {}
+                    }
+                    pol.edge_kinds
+                        .insert((parent.to_owned(), krate.to_owned()), allowed);
+                }
                 pol.edges.insert((parent.to_owned(), krate.to_owned()));
             }
         }

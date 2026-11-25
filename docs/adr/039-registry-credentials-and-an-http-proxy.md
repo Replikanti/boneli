@@ -1,15 +1,15 @@
 # ADR-039: Registry credentials and an HTTP proxy
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-25
 
-Issue #55, in two PRs. Part 1 (this ADR, proposed) adds the proxy route
-in `boneli-http` and `boneli-https`: `TlsConfig::with_proxy`, the tunnel
-in `TlsDial`, revocation fetches through the proxy, and
-`BasicCredentials`. Part 2 adds registry credentials to `boneli-oci`,
-wires the proxy into `StoreConfig`, runs the acceptance through Squid and
-accepts this ADR. The decisions for both parts are recorded here, so the
-reviewer of part 1 sees where part 2 goes.
+Issue #55, in two PRs. Part 1 (PR #135) added the proxy route in
+`boneli-http` and `boneli-https`: `TlsConfig::with_proxy`, the tunnel in
+`TlsDial`, revocation fetches through the proxy, and `BasicCredentials`.
+Part 2 adds registry credentials to `boneli-oci` (`Registry::with_credentials`),
+wires the proxy into `StoreConfig::production`, runs the acceptance
+through Squid and accepts this ADR. The decisions for both parts are
+recorded here.
 
 ## Context
 
@@ -83,6 +83,36 @@ password goes to the token host and never to the API host. Credentials
 belong to one `Registry` allowlist entry and follow it; registry A's
 never go to registry B or to the default registry.
 
+How part 2 holds the table, in `boneli-oci`'s registry client:
+
+- **Nothing before the host's own challenge.** A client starts without
+  an `Authorization` value. Only a `401` from the API host and port, on
+  the connection to it, makes it authenticate; a `401` from a redirect
+  host is that host's status and fails the fetch (`answered 401`), so a
+  CDN or a party behind it cannot draw credentials to anyone.
+- **`Basic` challenge:** with credentials, they are set for the API host
+  and the request is retried once; a second `401` is `Failed`, "refused
+  the configured credentials", never `NotFound` (the D11 rule of ADR-009
+  that turns Docker Hub's second `401` into `NotFound` is for tokens).
+  Without credentials it fails at once, naming the registry.
+- **`Bearer` challenge:** the realm must be one of the registry's
+  allowlisted token hosts and ports before anything is sent to it, as
+  ADR-009 D10 has it; then the token request carries the credentials
+  if and only if the registry has some. A `401` or `403` from the token
+  host to a request with credentials is `Failed`, "refused the configured
+  credentials", naming host, port and status. The token goes to the API
+  host only; it expires mid-pull as before, one new token request per
+  fetch, with the credentials again.
+- **One writer.** The client's `send` writes `Authorization` from the
+  value its caller passes and from nothing else; manifests, blobs,
+  configs and the signature lookups (the `.sig` and `.att` tags, the
+  referrers API and its tag fallback, signature blobs) pass the API
+  value only when the URL is the API host and port, the token request
+  passes the credentials, redirects pass nothing. So a fetch added later
+  inherits the rule. The TUF refresh of ADR-033 does not use the
+  registry client and carries no registry credentials; with a proxied
+  `TlsConfig` its `TlsDial` goes through the proxy like any other.
+
 ### D3. The credential source (STOP 1 decision 2)
 
 The API takes credential values. A composition root reads them from a
@@ -114,7 +144,37 @@ private image until #33 lands; no binary pulls any image today.
 - `Debug` of `BasicCredentials`, `Proxy`, `TlsConfig`, `TlsDial`, and in
   part 2 `Registry` and `StoreConfig`, is redacted; a test scans each.
 - An image name's userinfo (`user:pw@ghcr.io/x/y`) is refused as today,
-  and part 2 stops echoing it in the detail.
+  and part 2 stops echoing it in the detail: a name with `@` anywhere is
+  refused before it is parsed further, everything up to its last `@`
+  shown as `[userinfo]`. The same mask covers the hosts of
+  `Registry::new` and `with_redirect_hosts` in their errors.
+- Part 2 removes the places where a detail quoted the server's own text:
+  a redirect's `Location` (only the fact that it was refused, and why,
+  is named), a response's `Content-Type` (named, not quoted), and the
+  name of a duplicated auth-parameter in `WWW-Authenticate`. What is
+  left of server-chosen text are hosts: the realm host refused by the
+  allowlist, a redirect host refused by it, and the names in a TLS
+  error. A server that holds the credentials or a token can put them
+  there, lowercase, into a host label (63 bytes, enough for most
+  passwords and tokens).
+- So every detail the registry client returns passes a redaction as the
+  last step: `BasicCredentials::redact` replaces every run of
+  `REDACT_WINDOW` = 16 bytes of the username, the password, the pair and
+  its base64, and `boneli_https::redact` every such run of every token
+  the client received, each stretch by `[redacted]` (a secret shorter
+  than 16 bytes where it appears whole). Letters compare ASCII
+  case-insensitively, because the hosts a server chooses reach the
+  detail lowercased by the URL parser, so a mixed-case password or token
+  (every JWT or base64 token is one) put into a host label arrives
+  lowercase (#55 part 2 review). The store applies it once more to the
+  whole pull, the signature check included. Why 16: 16 bytes of base64
+  are 96 bits, about 80 with the case folded, so a run that long in a detail is the secret and
+  not a host, digest or word by chance; a shorter window starts to hit
+  ordinary text (a username like `AWS` already does, where it appears
+  whole), a longer one lets a 16-byte piece through. It is the window of
+  ADR-014's secret scans. A piece shorter than the window stays: a
+  hostile registry that splits its own credentials into 15-byte pieces
+  gets them into its detail, which leaks nothing it did not hold.
 - Credentials never enter the sandbox or the workspace: the store hands
   out layer directories and configs only (invariant 5).
 
@@ -285,10 +345,18 @@ documents for `with_resolver`.
   tunnel's first byte, and a proxy is a single hop whose success answer
   is a status line, so the limit only has to leave room for a refusal's
   fields (`Proxy-Authenticate`, an error page's metadata, policy and
-  tracing fields corporate proxies add). Not measured yet: part 2's CI
-  step prints Squid's head for an accepted and a refused `CONNECT`, and
-  the measurement goes here before this ADR is accepted. Lower risks
-  refusing a proxy's refusal (the operator then sees a limit error
+  tracing fields corporate proxies add). Measured in part 2's
+  `oci-acceptance` step (run 45683133090, 2026-11-25) with Ubuntu's Squid
+  in its default configuration, Squid 7.7 on ubuntu-26.04 x86_64 and 6.14
+  on ubuntu-24.04 arm64: the answer to an accepted `CONNECT
+  registry-1.docker.io:443` is the status line alone, 39 bytes with its
+  empty line and 0 fields, on both; the refusal of `CONNECT
+  registry-1.docker.io:25` (`403 Forbidden`, `deny CONNECT !SSL_ports`)
+  is 332 bytes and 11 fields on 7.7, 334 bytes and 11 fields on 6.14,
+  its error page in the body. The limits leave 49 times the refusal's
+  bytes and 5.8 times its fields for the policy and tracing fields a
+  corporate proxy adds (not measured: no corporate proxy is at hand).
+  Lower risks refusing a proxy's refusal (the operator then sees a limit error
   instead of the status); higher only lets a proxy make the runner buffer
   more per connection.
 - **Setup time through a proxy, `PROXIED_SETUP_TIMEOUT` 40 s** (part 2,
@@ -376,19 +444,68 @@ parser has its own cases (quoted commas, case, RFC 9110's example).
 The live revocation tests (`tests/network.rs`, `ocsp::live`) still run
 direct.
 
-Part 2: the registry tests of D2 (Basic and token flows, host scoping
-over a 3-hop redirect chain, classification), the secret scans of D4,
-a pull through a local proxy and a refusal of an untrusted registry
-behind it, and one live pull of `node:22` through Squid in
-`oci-acceptance`, with direct outbound 80 and 443 rejected for the runner
-user, and Squid's access log checked for the `CONNECT` and an
-absolute-form CRL `GET`.
+Part 2: `boneli-oci`'s `tests/credentials.rs` runs the store and the
+client against a fake private registry in front of the fake Docker Hub
+and checks every recorded request: the Basic flow (no credentials before
+the challenge, one retry, a second `401` `Failed`, none configured
+`Failed`), the token flow (credentials on the token request only, a
+refusing token host, the realm on the API host as on GHCR, `Bearer`
+over `Basic`, a token expiring on the last blob), host scoping over a
+3-hop redirect chain in every flow, a redirect suffix that covers the
+token host, a realm off the allowlist, registry A's credentials never at
+the default registry, the redirect limit, a `401` from a redirect host;
+the secret scans of D4 against a hostile registry that echoes the
+secrets into reason phrases, fields, bodies, `Location`,
+`WWW-Authenticate` and `Content-Type` in 46 hostile answers, through
+`OciImageStore::pull` in both flows and through the client, lowercase secrets in realm and
+redirect hosts, userinfo in image names, `Debug`; and the proxied setup
+time. `tests/signatures.rs` pulls under `Required` rules with and
+without claims in both flows and checks that every signature lookup
+carries the API value and nothing goes elsewhere. `tests/proxy.rs` runs
+the production `TlsDial` through a fake proxy to a local rustls registry
+(the `localhost` leaf of `boneli-https`'s test data): a pull with proxy
+and registry credentials each only where they belong, an untrusted
+registry refused behind the proxy with nothing committed, and the proxy
+refusing the CDN. That server is the one new dependency edge: `rustls`
+as a dev-dependency of `boneli-oci`
+(`[external.rustls.pulled-by.boneli-oci]`, approved here for
+dev-dependencies only: the record carries `kinds = ["dev"]`, a key the
+architecture checker gains with this ADR, so moving `rustls` into
+`boneli-oci`'s `[dependencies]` fails rule `dep-edge`, as fixtures
+`dep-dev-only-edge-normal`, `-build` and `-both` (declared as dev and
+normal at once) pin; without the key a record
+approves every kind, as before), with `boneli-https`'s features, so no
+new crate; it is the edge ADR-009 had
+for the `TlsDial` tests until ADR-014 D4 moved them to `boneli-https`
+(#72).
+And one live pull of `node:22` through Squid in `oci-acceptance`
+(`proxy::node_pulls_through_the_proxy`, `BONELI_OCI_TEST_PROXY`), with
+direct outbound 80 and 443 rejected for the runner user, and Squid's
+access log checked for the `CONNECT` and an absolute-form CRL `GET`
+among the lines written after the probes, which use `auth.docker.io` so
+that none of their lines counts for the pull.
+First runs on the part 2 branch: in run 45683133090 `curl` to Docker
+Hub without the proxy failed to connect and `node:22` pulled through
+Squid in 29.6 s on x86_64 and 45.3 s on arm64 (its log count of 14
+`CONNECT registry-1.docker.io:443` lines included two of the probes,
+which the review of part 2 found); in run 45690189984, counting only the
+pull's lines, Squid logged 27 lines per architecture, 12 of them
+`CONNECT registry-1.docker.io:443` and 5 absolute-form CRL `GET`s
+(Amazon's `rootca1` and `r2m01` lists, Let's Encrypt's `x2`, `ye` and a
+`ye1` shard), with `node:22` pulled in 31.0 s and 49.2 s.
 
 ## Consequences
 
 - A runner in a proxy-only network reaches registries, CRL, CA list and
   OCSP servers once a composition root passes a proxied `TlsConfig`
   (part 2 for the image store, #32/#33 for the binaries).
+- A failure detail may show `[redacted]` where a host it names held a
+  run of the credentials or of a token (D4), and a username shorter than
+  16 bytes is taken out wherever it appears whole, also inside an
+  unrelated word, so the operator sees less of the detail.
+- `boneli_https` gains `redact` and `REDACT_WINDOW`, and
+  `BasicCredentials::redact`, for any crate that builds text from what a
+  server holding its secrets sent.
 - A TLS-inspecting proxy works only once its CA is in the runner's
   `Roots`, and then it sees registry credentials and tokens: the end to
   end check is exactly what keeps an unconfigured inspecting proxy out.
@@ -434,6 +551,11 @@ absolute-form CRL `GET`.
 - **Reading credentials from a file now.** Rejected at STOP 1 (D3): it
   would duplicate the D6 file rules before a runner configuration
   exists.
+- **Redacting only the whole secrets, or nothing beyond the fixed
+  texts.** Rejected (D4): a server that holds the credentials chooses
+  how much of them it echoes, so an exact match misses a part; and the
+  hosts the detail must name for the operator (a refused realm or
+  redirect host, the names of a TLS error) stay server text.
 
 ## Accept when
 

@@ -282,6 +282,15 @@ impl Reference {
     /// and `Registry` matching decides whether it is allowed. Without a
     /// host the store's default registry applies.
     pub fn parse(name: &str, digest: &str, platform: &str) -> Result<Reference, PullError> {
+        // Neither a host nor a repository path holds `@`: a name with one
+        // carries userinfo, credentials perhaps, and the detail shows
+        // `[userinfo]` in its place (ADR-039, D4).
+        if name.contains('@') {
+            return Err(failed(format!(
+                "image name {:?} holds userinfo or `@`, which is refused",
+                url::mask_userinfo(name)
+            )));
+        }
         let (registry, path) = match name.split_once('/') {
             Some((first, rest))
                 if first.contains('.') || first.contains(':') || first == "localhost" =>

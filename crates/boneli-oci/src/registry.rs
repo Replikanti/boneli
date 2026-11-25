@@ -1,14 +1,25 @@
 //! The registry client (ADR-009, D9 to D12): manifests and blobs by
-//! digest over the OCI distribution API, the anonymous token flow, the
-//! host allowlist and redirects, error classification and limits.
+//! digest over the OCI distribution API, the token flow, registry
+//! credentials (ADR-039), the host allowlist and redirects, error
+//! classification and limits.
 //!
 //! - Every request goes to an allowlisted host: the registry's API host,
 //!   one of its token hosts, or (for blob redirects only) a host under one
 //!   of its redirect suffixes, matched on a dot boundary, or one of its
 //!   exact redirect hosts, compared whole (ADR-035). `https` only,
 //!   certificates verified by the `Dial` (D10).
-//! - `Authorization` goes to the API host and port only, never to a token
-//!   or redirect host.
+//! - `Authorization` goes to the API host and port only (the token, or
+//!   the credentials after the API host's own `Basic` challenge), and to
+//!   an allowlisted token host the credentials on the token request only,
+//!   after the API host's `Bearer` challenge named it; never to a
+//!   redirect host (ADR-039, D2). Only `Client::send` writes the field,
+//!   from the value its caller passes, so every fetch, the signature
+//!   lookups included, follows one rule.
+//! - No failure detail carries a secret: details name hosts, ports,
+//!   digests and statuses, never a field value or body the server sent,
+//!   and every detail a client returns is passed through
+//!   [`BasicCredentials::redact`] and [`boneli_https::redact`] over the
+//!   tokens it received (ADR-039, D4).
 //! - Every byte used is checked against its digest: a document before it
 //!   is parsed, a blob before it is renamed into place. A blob must be
 //!   exactly its descriptor's size.
@@ -23,9 +34,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use boneli_http::{Connection, Method, RequestBody, RequestHead, ResponseHead, Target};
-use boneli_https::{Dial, Sha256, Timed};
+use boneli_https::{BasicCredentials, Dial, Sha256, Timed};
 
-use crate::auth::{self, Challenge};
+use crate::auth::{self, Scheme};
 use crate::error::{Error, PullError, failed};
 use crate::manifest::{self, Descriptor, Document, ImageConfig, Manifest};
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
@@ -37,14 +48,39 @@ pub const MAX_REDIRECTS: usize = 10;
 /// The port of a registry, token or redirect host without one.
 const HTTPS_PORT: u16 = 443;
 
-/// An allowlisted registry (D10).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An allowlisted registry (D10), with its credentials if it has any
+/// (ADR-039). `Debug` shows whether credentials are set, never them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Registry {
     name: String,
     api: (String, u16),
     auth_hosts: Vec<(String, u16)>,
     redirect_suffixes: Vec<String>,
     redirect_hosts: Vec<String>,
+    credentials: Option<BasicCredentials>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("name", &self.name)
+            .field("api", &self.api)
+            .field("auth_hosts", &self.auth_hosts)
+            .field("redirect_suffixes", &self.redirect_suffixes)
+            .field("redirect_hosts", &self.redirect_hosts)
+            .field(
+                "credentials",
+                &format_args!(
+                    "{}",
+                    if self.credentials.is_some() {
+                        "[redacted]"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .finish()
+    }
 }
 
 impl Registry {
@@ -69,7 +105,7 @@ impl Registry {
         let host = |text: &str| {
             url::host_port(text)
                 .map(|(h, p)| (h, p.unwrap_or(HTTPS_PORT)))
-                .map_err(|e| Error::InvalidRegistry(format!("{text:?}: {e}")))
+                .map_err(|e| Error::InvalidRegistry(format!("{:?}: {e}", url::mask_userinfo(text))))
         };
         let (name, name_port) = host(name)?;
         if name_port != HTTPS_PORT || name.contains(':') {
@@ -80,12 +116,16 @@ impl Registry {
         let mut suffixes = Vec::with_capacity(redirect_suffixes.len());
         for suffix in redirect_suffixes {
             let rest = suffix.strip_prefix('.').ok_or_else(|| {
-                Error::InvalidRegistry(format!("redirect suffix {suffix:?} must start with ."))
+                Error::InvalidRegistry(format!(
+                    "redirect suffix {:?} must start with .",
+                    url::mask_userinfo(suffix)
+                ))
             })?;
             let (rest, port) = host(rest)?;
             if port != HTTPS_PORT || suffix.contains(':') {
                 return Err(Error::InvalidRegistry(format!(
-                    "redirect suffix {suffix:?} must be a host without a port"
+                    "redirect suffix {:?} must be a host without a port",
+                    url::mask_userinfo(suffix)
                 )));
             }
             suffixes.push(format!(".{rest}"));
@@ -99,6 +139,7 @@ impl Registry {
                 .collect::<Result<_, _>>()?,
             redirect_suffixes: suffixes,
             redirect_hosts: Vec::new(),
+            credentials: None,
         })
     }
 
@@ -119,6 +160,7 @@ impl Registry {
             redirect_hosts: vec![
                 "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com".to_owned(),
             ],
+            credentials: None,
         }
     }
 
@@ -131,13 +173,18 @@ impl Registry {
     pub fn with_redirect_hosts(mut self, hosts: &[&str]) -> Result<Registry, Error> {
         let mut exact = Vec::with_capacity(hosts.len());
         for text in hosts {
-            let refuse =
-                |why: &str| Error::InvalidRegistry(format!("redirect host {text:?} must be {why}"));
+            let refuse = |why: &str| {
+                Error::InvalidRegistry(format!(
+                    "redirect host {:?} must be {why}",
+                    url::mask_userinfo(text)
+                ))
+            };
             if text.starts_with('.') {
                 return Err(refuse("an exact host, not a suffix"));
             }
-            let (host, port) = url::host_port(text)
-                .map_err(|e| Error::InvalidRegistry(format!("{text:?}: {e}")))?;
+            let (host, port) = url::host_port(text).map_err(|e| {
+                Error::InvalidRegistry(format!("{:?}: {e}", url::mask_userinfo(text)))
+            })?;
             if port.is_some() {
                 return Err(refuse("a name without a port"));
             }
@@ -151,6 +198,19 @@ impl Registry {
         }
         self.redirect_hosts = exact;
         Ok(self)
+    }
+
+    /// This registry with `credentials`, replacing any before (ADR-039,
+    /// D2): sent to its API host after that host's own `Basic` challenge,
+    /// or to one of its token hosts on the token request after the API
+    /// host's `Bearer` challenge named it; never to a redirect host,
+    /// another registry or a proxy. Where they come from is the
+    /// composition root's business (ADR-039, D3): a file under ADR-014
+    /// D6's rules, never the environment, the command line or an image
+    /// name.
+    pub fn with_credentials(mut self, credentials: BasicCredentials) -> Registry {
+        self.credentials = Some(credentials);
+        self
     }
 
     /// The name images use for this registry.
@@ -387,7 +447,7 @@ impl Documents for NoDocuments {
 /// What one exchange ended in.
 enum Step<T> {
     Done(T),
-    Unauthorized(Result<Challenge, String>),
+    Unauthorized(Result<Scheme, String>),
     Redirect(Url),
 }
 
@@ -424,14 +484,19 @@ impl SignatureTag {
     }
 }
 
-/// A client for one pull from one registry: it holds the token, which is
-/// reused within the pull and fetched again once on a `401` (D9).
+/// A client for one pull from one registry: it holds the `Authorization`
+/// value for the API host, a token or the registry's credentials, which
+/// is reused within the pull and set again once per fetch on a `401` (D9;
+/// ADR-039, D2).
 pub struct Client<'a> {
     registry: &'a Registry,
     dial: &'a dyn Dial,
     limits: &'a FetchLimits,
     timeouts: &'a Timeouts,
-    token: Option<String>,
+    /// `Bearer <token>` or `Basic <credentials>`, for the API host only.
+    authorization: Option<String>,
+    /// Every token received, for [`Client::redact`].
+    tokens: Vec<String>,
     /// The API host answered a request with a document, a blob or a
     /// redirect to one: the repository exists.
     authorized: bool,
@@ -450,7 +515,8 @@ impl<'a> Client<'a> {
             dial,
             limits,
             timeouts,
-            token: None,
+            authorization: None,
+            tokens: Vec::new(),
             authorized: false,
         }
     }
@@ -464,7 +530,35 @@ impl<'a> Client<'a> {
     /// directly a mismatch is `NotFound`, for one selected from an index
     /// it is `Failed`, because the index said otherwise.
     pub fn resolve(&mut self, reference: &Reference) -> Result<Resolved, PullError> {
-        self.resolve_with(reference, &mut NoDocuments)
+        let result = self.resolve_with(reference, &mut NoDocuments);
+        result.map_err(|e| self.redact(e))
+    }
+
+    /// `e` with every run of the registry's credentials and of every
+    /// token this client received taken out of its detail (ADR-039, D4):
+    /// the backstop for text a server that holds them chose, such as a
+    /// host it redirected to or a signature it served.
+    pub(crate) fn redact(&self, e: PullError) -> PullError {
+        let clean = |detail: String| {
+            let detail = match &self.registry.credentials {
+                Some(credentials) => credentials.redact(&detail),
+                None => detail,
+            };
+            let tokens: Vec<&str> = self.tokens.iter().map(String::as_str).collect();
+            boneli_https::redact(&detail, &tokens)
+        };
+        match e {
+            PullError::NotFound(detail) => PullError::NotFound(clean(detail)),
+            PullError::Failed(detail) => PullError::Failed(clean(detail)),
+        }
+    }
+
+    /// The `Authorization` value for a request to `url`: the token or the
+    /// credentials, to the API host only (ADR-039, D2).
+    fn api_authorization(&self, url: &Url) -> Option<&str> {
+        self.authorization
+            .as_deref()
+            .filter(|_| self.registry.is_api(url))
     }
 
     /// [`Client::resolve`], taking each document from `documents` when it
@@ -564,7 +658,7 @@ impl<'a> Client<'a> {
         {
             return Ok(doc);
         }
-        let fetched = self.get_manifest(repo, digest, size)?;
+        let fetched = self.fetch_manifest(repo, digest, size)?;
         let doc = self.document(&fetched, digest)?;
         if usable(&doc) {
             documents.put(digest, &fetched)?;
@@ -595,6 +689,18 @@ impl<'a> Client<'a> {
         digest: &Digest,
         size: Option<u64>,
     ) -> Result<Fetched, PullError> {
+        let result = self.fetch_manifest(repo, digest, size);
+        result.map_err(|e| self.redact(e))
+    }
+
+    /// [`Client::get_manifest`] without the redaction, which the caller
+    /// of a whole pull applies once.
+    fn fetch_manifest(
+        &mut self,
+        repo: &Repository,
+        digest: &Digest,
+        size: Option<u64>,
+    ) -> Result<Fetched, PullError> {
         let max = self.limits.document.max_bytes() as u64;
         if let Some(size) = size
             && size > max
@@ -613,6 +719,7 @@ impl<'a> Client<'a> {
             let step = self.send(
                 &url,
                 Some(manifest::ACCEPT),
+                self.api_authorization(&url),
                 deadline,
                 |head, body| match head.status {
                     200 => {
@@ -705,25 +812,31 @@ impl<'a> Client<'a> {
         let deadline = self.timeouts.deadline(max)?;
         let mut fresh = false;
         loop {
-            let step = self.send(url, Some(accept), deadline, |head, body| {
-                match head.status {
-                    200 => {
-                        let bytes = read_document(body, None, max, what)?;
-                        let content_type = head
-                            .headers
-                            .get("content-type")
-                            .and_then(|v| std::str::from_utf8(v).ok())
-                            .map(str::to_owned);
-                        Ok(Step::Done(Some(Fetched {
-                            bytes,
-                            content_type,
-                        })))
-                    }
-                    404 => Ok(Step::Done(None)),
-                    401 => Ok(Step::Unauthorized(challenge(head))),
-                    status => Err(status_error(url, status, what)),
-                }
-            })?;
+            let authorization = self.api_authorization(url);
+            let step =
+                self.send(
+                    url,
+                    Some(accept),
+                    authorization,
+                    deadline,
+                    |head, body| match head.status {
+                        200 => {
+                            let bytes = read_document(body, None, max, what)?;
+                            let content_type = head
+                                .headers
+                                .get("content-type")
+                                .and_then(|v| std::str::from_utf8(v).ok())
+                                .map(str::to_owned);
+                            Ok(Step::Done(Some(Fetched {
+                                bytes,
+                                content_type,
+                            })))
+                        }
+                        404 => Ok(Step::Done(None)),
+                        401 => Ok(Step::Unauthorized(challenge(head))),
+                        status => Err(status_error(url, status, what)),
+                    },
+                )?;
             match step {
                 Step::Done(fetched) => {
                     self.authorized = true;
@@ -808,7 +921,7 @@ impl<'a> Client<'a> {
         if result.is_err() {
             let _ = fs::remove_file(&temp);
         }
-        result.map(|()| file)
+        result.map(|()| file).map_err(|e| self.redact(e))
     }
 
     fn check_blob_size(&self, descriptor: &Descriptor) -> Result<(), PullError> {
@@ -897,22 +1010,29 @@ impl<'a> Client<'a> {
         let mut fresh = false;
         loop {
             let to_api = self.registry.is_api(&url);
-            let step = self.send(&url, None, deadline, |head, body| match head.status {
-                200 => {
-                    copy_exact(body, sink, descriptor, &what)?;
-                    Ok(Step::Done(()))
+            // A redirect host gets nothing (ADR-039, D2), and its `401` is
+            // a status like any other: only the API host's own challenge
+            // makes the client authenticate.
+            let authorization = self.api_authorization(&url);
+            let step = self.send(&url, None, authorization, deadline, |head, body| {
+                match head.status {
+                    200 => {
+                        copy_exact(body, sink, descriptor, &what)?;
+                        Ok(Step::Done(()))
+                    }
+                    301 | 302 | 303 | 307 | 308 => {
+                        let location = single(head, "location").ok_or_else(|| {
+                            failed(format!("{what}: a redirect without one Location"))
+                        })?;
+                        // The Location is the server's text: never echoed.
+                        let next = url
+                            .join(location)
+                            .map_err(|e| failed(format!("{what}: a redirect refused: {e}")))?;
+                        Ok(Step::Redirect(next))
+                    }
+                    401 if to_api => Ok(Step::Unauthorized(challenge(head))),
+                    status => Err(status_error(&url, status, &what)),
                 }
-                301 | 302 | 303 | 307 | 308 => {
-                    let location = single(head, "location").ok_or_else(|| {
-                        failed(format!("{what}: a redirect without one Location"))
-                    })?;
-                    let next = url.join(location).map_err(|e| {
-                        failed(format!("{what}: redirect to {location:?} refused: {e}"))
-                    })?;
-                    Ok(Step::Redirect(next))
-                }
-                401 if to_api => Ok(Step::Unauthorized(challenge(head))),
-                status => Err(status_error(&url, status, &what)),
             })?;
             match step {
                 Step::Done(()) => {
@@ -947,24 +1067,36 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// After a `401`: fetches a token once per fetch (`fresh`). A second
-    /// `401` is `NotFound` for a manifest before anything was authorized
-    /// (Docker Hub's answer for an unknown repository, D11), `Failed`
-    /// otherwise.
+    /// After a `401` from the API host: authenticates once per fetch
+    /// (`fresh`). A `Bearer` challenge fetches a token, with the
+    /// registry's credentials on the token request when it has any; a
+    /// `Basic` one sets the credentials for the API host, and without
+    /// credentials fails (ADR-039, D2). A second `401` after credentials
+    /// went to the API host is `Failed`, the credentials refused; after a
+    /// token it is `NotFound` for a manifest before anything was
+    /// authorized (Docker Hub's answer for an unknown repository, D11),
+    /// `Failed` otherwise.
     fn reauthenticate(
         &mut self,
-        challenge: Result<Challenge, String>,
+        challenge: Result<Scheme, String>,
         repo: &Repository,
         deadline: Instant,
         fresh: &mut bool,
         kind: Kind,
         what: &str,
     ) -> Result<(), PullError> {
+        let api = self.registry.api.0.clone();
         if *fresh {
-            let detail = format!(
-                "{what}: {} refused a fresh token for {repo} (401)",
-                self.registry.api.0
-            );
+            if self
+                .authorization
+                .as_deref()
+                .is_some_and(|a| a.starts_with("Basic "))
+            {
+                return Err(failed(format!(
+                    "{what}: {api} refused the configured credentials for {repo} (401)"
+                )));
+            }
+            let detail = format!("{what}: {api} refused a fresh token for {repo} (401)");
             return Err(if kind == Kind::Manifest && !self.authorized {
                 PullError::NotFound(detail)
             } else {
@@ -972,13 +1104,25 @@ impl<'a> Client<'a> {
             });
         }
         *fresh = true;
-        self.token = None;
-        let challenge = challenge.map_err(|e| {
-            failed(format!(
-                "{what}: {} sent an unusable challenge: {e}",
-                self.registry.api.0
-            ))
-        })?;
+        self.authorization = None;
+        let scheme = challenge
+            .map_err(|e| failed(format!("{what}: {api} sent an unusable challenge: {e}")))?;
+        let challenge = match scheme {
+            Scheme::Bearer(challenge) => challenge,
+            Scheme::Basic => {
+                let Some(credentials) = &self.registry.credentials else {
+                    return Err(failed(format!(
+                        "{what}: {api} asks for credentials (Basic) and none are configured \
+                         for {}",
+                        self.registry.name
+                    )));
+                };
+                self.authorization = Some(credentials.header_value());
+                return Ok(());
+            }
+        };
+        // The realm must be an allowlisted token host before anything,
+        // credentials above all, is sent to it (ADR-039, D2).
         let realm = &challenge.realm;
         if !self
             .registry
@@ -994,18 +1138,34 @@ impl<'a> Client<'a> {
         let url = auth::token_url(&challenge, &format!("repository:{repo}:pull"));
         let max = self.limits.max_token_bytes;
         let limits = self.limits.token()?;
-        let token = self.send(&url, None, deadline, |head, body| match head.status {
-            200 => {
-                let bytes = read_document(body, None, max as u64, "the token response")?;
-                auth::token(&bytes, &limits)
-                    .map(Step::Done)
-                    .map_err(|e| failed(format!("the token response of {}: {e}", url.host)))
-            }
-            status => Err(status_error(&url, status, "the token")),
-        })?;
+        let basic = self
+            .registry
+            .credentials
+            .as_ref()
+            .map(BasicCredentials::header_value);
+        let token = self.send(
+            &url,
+            None,
+            basic.as_deref(),
+            deadline,
+            |head, body| match head.status {
+                200 => {
+                    let bytes = read_document(body, None, max as u64, "the token response")?;
+                    auth::token(&bytes, &limits)
+                        .map(Step::Done)
+                        .map_err(|e| failed(format!("the token response of {}: {e}", url.host)))
+                }
+                status @ (401 | 403) if basic.is_some() => Err(failed(format!(
+                    "{}:{} refused the configured credentials ({status})",
+                    url.host, url.port
+                ))),
+                status => Err(status_error(&url, status, "the token")),
+            },
+        )?;
         match token {
             Step::Done(token) => {
-                self.token = Some(token);
+                self.authorization = Some(format!("Bearer {token}"));
+                self.tokens.push(token);
                 Ok(())
             }
             _ => Err(failed("the token request ended without a token")),
@@ -1013,12 +1173,14 @@ impl<'a> Client<'a> {
     }
 
     /// One request on a new connection: `GET url`, with `Accept` if given
-    /// and the token if the URL is the API host. `read` sees the response
-    /// head and its body.
+    /// and `authorization` as `Authorization` if given. The caller decides
+    /// what goes where (ADR-039, D2); this is the only place the field is
+    /// written. `read` sees the response head and its body.
     fn send<T>(
         &self,
         url: &Url,
         accept: Option<&str>,
+        authorization: Option<&str>,
         deadline: Instant,
         read: impl FnOnce(&ResponseHead, &mut dyn Read) -> Result<Step<T>, PullError>,
     ) -> Result<Step<T>, PullError> {
@@ -1039,9 +1201,8 @@ impl<'a> Client<'a> {
         if let Some(accept) = accept {
             head.headers.append("Accept", accept);
         }
-        if let Some(token) = self.token.as_ref().filter(|_| self.registry.is_api(url)) {
-            head.headers
-                .append("Authorization", format!("Bearer {token}"));
+        if let Some(authorization) = authorization {
+            head.headers.append("Authorization", authorization);
         }
         let mut response = conn.request(&head, RequestBody::None).map_err(|e| at(&e))?;
         let head = response.head.clone();
@@ -1049,9 +1210,9 @@ impl<'a> Client<'a> {
     }
 }
 
-/// The challenge of a `401`.
-fn challenge(head: &ResponseHead) -> Result<Challenge, String> {
-    auth::bearer(head.headers.get_all("www-authenticate"))
+/// The challenge of a `401` from the API host: `Bearer` or `Basic`.
+fn challenge(head: &ResponseHead) -> Result<Scheme, String> {
+    auth::scheme(head.headers.get_all("www-authenticate"))
 }
 
 /// The value of a field that must appear exactly once, as visible ASCII.

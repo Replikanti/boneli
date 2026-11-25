@@ -94,6 +94,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// The fixed part of a fetch's deadline (D12).
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The fixed part of a fetch's deadline through an HTTP proxy (ADR-039,
+/// D9): [`SETUP_TIMEOUT`]'s 21 s of connect, handshake and a round trip
+/// plus the wait for the proxy's answer to `CONNECT`, which its own
+/// connect to the registry bounds at 10 s, and the same 9 s margin.
+pub const PROXIED_SETUP_TIMEOUT: Duration = Duration::from_secs(40);
 /// The slowest transfer a fetch's deadline admits, in bytes per second
 /// (D12).
 pub const MIN_RATE: u64 = 1_048_576;
@@ -191,11 +196,21 @@ impl StoreConfig {
     }
 
     /// [`StoreConfig::new`] over a [`TlsDial`] with `tls` and the connect
-    /// timeouts of D12.
+    /// timeouts of D12. When `tls` routes through a proxy
+    /// ([`TlsConfig::with_proxy`]), every registry connection and every
+    /// revocation fetch goes through it, and a fetch's setup time is
+    /// [`PROXIED_SETUP_TIMEOUT`] instead of [`SETUP_TIMEOUT`] (ADR-039, D9).
     pub fn production(tls: TlsConfig) -> Result<StoreConfig, Error> {
         let options = ConnectOptions::new(CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT)
             .map_err(|_| Error::InvalidLimits("connect options"))?;
-        StoreConfig::new(Box::new(TlsDial::new(tls, options)))
+        let setup = if tls.proxy().is_some() {
+            PROXIED_SETUP_TIMEOUT
+        } else {
+            SETUP_TIMEOUT
+        };
+        let mut config = StoreConfig::new(Box::new(TlsDial::new(tls, options)))?;
+        config.timeouts = Timeouts::new(IO_TIMEOUT, setup, MIN_RATE)?;
+        Ok(config)
     }
 
     /// [`StoreConfig::production`] with the Mozilla roots of
@@ -649,21 +664,37 @@ impl OciImageStore {
             &self.config.fetch,
             &self.config.timeouts,
         );
+        // Every detail from here on is passed through the client's
+        // redaction, signature lookups and checks included (ADR-039, D4).
+        let pulled = self.pull_with(&mut client, &reference, image.origin, decision, pins);
+        let (rootfs, config, documents) = pulled.map_err(|e| client.redact(e))?;
+        Ok((rootfs, config, documents, exemption))
+    }
+
+    /// The pull from the resolve on, over `client`.
+    fn pull_with(
+        &self,
+        client: &mut Client<'_>,
+        reference: &Reference,
+        origin: ImageOrigin,
+        decision: Decision<'_>,
+        pins: &mut BTreeMap<Digest, LayerPin>,
+    ) -> Result<(RootfsRef, ImageConfig, Vec<PathBuf>), PullError> {
         // An agent's reference is served only a digest its named
         // repository holds (ADR-032, S6): documents are kept by digest, not
         // by repository, so the one the reference names is fetched from
         // that repository on every agent pull, warm or cold. What it names
         // in turn (platform manifest, config) is bound by its digest and may
         // come from the store.
-        let resolved = match image.origin {
+        let resolved = match origin {
             ImageOrigin::Agent => client.resolve_with(
-                &reference,
+                reference,
                 &mut FromRepository {
                     kept: Kept { store: self },
                     named: *reference.digest(),
                 },
             )?,
-            ImageOrigin::Operator => client.resolve_with(&reference, &mut Kept { store: self })?,
+            ImageOrigin::Operator => client.resolve_with(reference, &mut Kept { store: self })?,
         };
         // The signature check, under a `Required` rule only: after the
         // documents are resolved and before any layer is pinned or its blob
@@ -675,7 +706,7 @@ impl OciImageStore {
                 subjects.push(resolved.manifest_digest);
             }
             Check {
-                client: &mut client,
+                client: &mut *client,
                 documents: &mut Kept { store: self },
                 root: &self.root,
                 repo: reference.repository(),
@@ -701,7 +732,7 @@ impl OciImageStore {
             .collect();
         documents.dedup();
         if documents.iter().any(|d| !d.is_file()) {
-            client.resolve_with(&reference, &mut Kept { store: self })?;
+            client.resolve_with(reference, &mut Kept { store: self })?;
         }
         let mut budget = Budget::new(self.config.limits.clone());
         let repo = reference.repository();
@@ -715,7 +746,7 @@ impl OciImageStore {
                 .get(diff_id)
                 .ok_or_else(|| failed(format!("layer {diff_id} is not pinned")))?;
             self.layer(
-                &mut client,
+                client,
                 repo,
                 &layer.descriptor,
                 layer.compression,
@@ -724,7 +755,7 @@ impl OciImageStore {
             )?;
         }
         let rootfs = RootfsRef::new(format!("sha256:{}", resolved.manifest_digest.hex()));
-        Ok((rootfs, resolved.config, documents, exemption))
+        Ok((rootfs, resolved.config, documents))
     }
 
     /// Makes sure the layer `pin` pins is committed and charges it to

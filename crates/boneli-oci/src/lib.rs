@@ -20,9 +20,11 @@
 //! - [`Reference`] parses an image's registry host, repository, digest and
 //!   platform before any request is made.
 //! - [`Client`] fetches manifests and blobs from an allowlisted
-//!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production), with the
-//!   anonymous token flow, checks every byte against its digest, and
-//!   classifies failures as a [`PullError`].
+//!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production, through
+//!   the customer's HTTP proxy when its `TlsConfig` has one), with the
+//!   token flow and the registry's credentials if it has any
+//!   ([`Registry::with_credentials`], ADR-039), checks every byte against
+//!   its digest, and classifies failures as a [`PullError`].
 //!
 //! Part 3 adds the store:
 //!
@@ -93,6 +95,9 @@ mod zstd;
 // The `Dial` seam lives in boneli-https since ADR-014 (D4); re-exported so
 // the registry client's callers keep their paths.
 pub use boneli_https::{Dial, Stream, TlsDial};
+// Registry credentials and the proxy route (ADR-039), re-exported so a
+// composition root configures a store from this crate alone.
+pub use boneli_https::{BasicCredentials, Proxy};
 pub use error::{Error, PullError};
 pub use evict::TrimReport;
 pub use layers::{LayerCache, LayerPin};
@@ -111,7 +116,7 @@ pub use store::{
     BLOCK_ALLOWANCE, CACHE_BUDGET_BYTES, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, IO_TIMEOUT,
     MAX_BLOB_BYTES, MAX_DEPTH, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_VALUES,
     MAX_HEAD_BYTES, MAX_HEADERS, MAX_IMAGE_BYTES, MAX_IMAGE_ENTRIES, MAX_LAYER_BYTES, MAX_LAYERS,
-    MAX_PULL_BYTES, MAX_SPECIAL_BYTES, MAX_TOKEN_BYTES, MIN_RATE, OciImageStore, SETUP_TIMEOUT,
-    StoreConfig,
+    MAX_PULL_BYTES, MAX_SPECIAL_BYTES, MAX_TOKEN_BYTES, MIN_RATE, OciImageStore,
+    PROXIED_SETUP_TIMEOUT, SETUP_TIMEOUT, StoreConfig,
 };
 pub use unpack::{Compression, LayerStats, unpack};

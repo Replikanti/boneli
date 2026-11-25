@@ -812,7 +812,13 @@ fn redirect_hosts_grammar() {
     ] {
         match plain().with_redirect_hosts(&[S3, host]) {
             Err(boneli_oci::Error::InvalidRegistry(detail)) => {
-                assert!(detail.contains(&format!("{host:?}")), "{host:?}: {detail}");
+                // Userinfo is never echoed (ADR-039, D4).
+                let shown = match host.rsplit_once('@') {
+                    Some((_, rest)) => format!("[userinfo]@{rest}"),
+                    None => host.to_owned(),
+                };
+                assert!(detail.contains(&format!("{shown:?}")), "{host:?}: {detail}");
+                assert!(!detail.contains("user@"), "{detail}");
                 assert!(detail.contains(reason), "{host:?}: {detail}");
             }
             other => panic!("{host:?}: expected InvalidRegistry, got {other:?}"),

@@ -17,6 +17,10 @@
 #     `build-script = "ADR-NNN"`, an accepted ADR that approves that script
 #     as `<crate>'s build script is approved` (ADR-005). The approval is
 #     per crate, not per version.
+#   - an edge record may carry `kinds = ["dev"]` (any of normal, dev,
+#     build): the edge is then approved for those dependency kinds only,
+#     so a test-only edge cannot become a build edge of its parent
+#     (ADR-039, D10).
 
 [roles]
 # Pure core: #![no_std] with alloc, no dependencies, token scan.
@@ -105,6 +109,12 @@ build-script = "ADR-005"
 [external.rustls.pulled-by.boneli-https]
 reason = "boneli-https is the only place for TLS"
 decision = "ARCHITECTURE"
+
+# Dev-only: the local TLS registry of boneli-oci's proxy pull test.
+[external.rustls.pulled-by.boneli-oci]
+reason = "the TLS server of the proxy pull test, a local registry behind a CONNECT tunnel (dev-dependency)"
+decision = "ADR-039"
+kinds = ["dev"]
 
 [external.webpki-roots]
 reason = "root certificates for rustls"
