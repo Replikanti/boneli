@@ -472,7 +472,8 @@ as a dev-dependency of `boneli-oci`
 dev-dependencies only: the record carries `kinds = ["dev"]`, a key the
 architecture checker gains with this ADR, so moving `rustls` into
 `boneli-oci`'s `[dependencies]` fails rule `dep-edge`, as fixtures
-`dep-dev-only-edge-normal` and `-build` pin; without the key a record
+`dep-dev-only-edge-normal`, `-build` and `-both` (declared as dev and
+normal at once) pin; without the key a record
 approves every kind, as before), with `boneli-https`'s features, so no
 new crate; it is the edge ADR-009 had
 for the `TlsDial` tests until ADR-014 D4 moved them to `boneli-https`
