@@ -907,6 +907,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Refusals name the extension in fixed text (`Refusal::CertificateClaim`).
   Live test `certificate_claims_on_ghcr` (jq 1.8.2 on GHCR) in
   `oci-acceptance`.
+- Rekor `intoto` entries for cosign attestations (#118, ADR-037,
+  accepted): the keyless log entry of a cosign `.att` layer may be Rekor
+  `intoto` 0.0.1, as slsa-github-generator before v2.0.0 logged it, besides
+  `dsse` 0.0.1. Its body must name the SHA-256 of the exact envelope bytes
+  (`content.hash`, the layer digest), the SHA-256 of the decoded payload
+  (`content.payloadHash`, required) and the leaf (`publicKey`); otherwise
+  `BodyMismatch`. Bundles and `.sig` layers still refuse an `intoto` entry
+  (`EntryKind`), and so does every other kind or version on an `.att`.
+  argocd v2.10.0 and kyverno v1.11.0 are known answers; kyverno's files
+  also run through the offline fake registry of `boneli-oci`. No new
+  refusal, limit or dependency.
 
 ### Changed
 

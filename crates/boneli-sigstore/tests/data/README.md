@@ -23,8 +23,10 @@ so these are the signatures whose leaves boneli-https holds.
 | `flux-cli-2.4.0.envelope.json` | `f12badd9…56be214b` | its DSSE envelope (12,624 bytes), Statement v0.1, statement 9,323 bytes |
 | `flux-cli-2.7.3.att.json` | `c3da9219…ec8bffb7` | the `.att` manifest of flux-cli v2.7.3 (index `sha256:334f7363…d418f14e`), 9,837 bytes: generator v2.1.0, a non-empty `invocation.parameters.vars`, Rekor `dsse` entry 649299369, integrated time 1761669969 |
 | `flux-cli-2.7.3.envelope.json` | `fa11fca2…b93f2d67` | its DSSE envelope (12,972 bytes) |
-| `argocd-2.10.0.att.json` | `954ee0e6…c776d1b9` | the `.att` manifest of `quay.io/argoproj/argocd` v2.10.0 (index `sha256:13cdc24e…87440baa`), 9,798 bytes: generator v1.9.0, logged as a Rekor `intoto` 0.0.1 entry, which ADR-036 refuses |
+| `argocd-2.10.0.att.json` | `954ee0e6…c776d1b9` | the `.att` manifest of `quay.io/argoproj/argocd` v2.10.0 (index `sha256:13cdc24e…87440baa`), 9,798 bytes: generator v1.9.0, logged as a Rekor `intoto` 0.0.1 entry 69491963, integrated time 1707230840, verified under ADR-037 |
 | `argocd-2.10.0.envelope.json` | `cd15fe3c…22478294` | its DSSE envelope (12,860 bytes) |
+| `kyverno-1.11.0.att.json` | `81c56313…9f9923a2` | the `.att` manifest of `ghcr.io/kyverno/kyverno` v1.11.0 (index `sha256:4c30afa8…8ab39e3a`, ADR-037), 9,734 bytes: generator v1.9.0, logged as a Rekor `intoto` 0.0.1 entry 48852930, integrated time 1699611421; `.sig`, the referrers API and the referrers tag answer 404, so this is the image's only evidence |
+| `kyverno-1.11.0.envelope.json` | `148c49dd…82837513` | its DSSE envelope (12,660 bytes) |
 
 From an empty directory, with `jq`:
 
@@ -75,6 +77,9 @@ att https://ghcr.io/v2/fluxcd/flux-cli "Authorization: Bearer $tok" \
   334f73637220fe587fcc8439f35a841c92c44d4695895fd04c77731bd418f14e flux-cli-2.7.3
 att https://quay.io/v2/argoproj/argocd '' \
   13cdc24e2218bb74fe6ec988c8045c7afc3043f24601e33b20ee78b787440baa argocd-2.10.0
+tok=$(curl -fsS 'https://ghcr.io/token?scope=repository:kyverno/kyverno:pull' | jq -r .token)
+att https://ghcr.io/v2/kyverno/kyverno "Authorization: Bearer $tok" \
+  4c30afa85d83f4a55ab14642b0630ba51fde573717ba712721edd1408ab39e3a kyverno-1.11.0
 ```
 
 Chainguard signs its images again from time to time and replaces the
@@ -82,7 +87,7 @@ Chainguard signs its images again from time to time and replaces the
 may differ, and these files then stay as they are. The two SLSA bundles
 attest fixed index digests, so a later capture gives the same bytes while
 GitHub keeps them; if it differs, the files and the hashes above stay. The
-same holds for the three `.att` captures, while GHCR and Quay keep them.
+same holds for the four `.att` captures, while GHCR and Quay keep them.
 
 ## Synthetic test instance
 

@@ -44,10 +44,11 @@
 //!
 //! Out of scope (ADR-029): Rekor v2 entries, RFC 3161 timestamps as the
 //! time source, inclusion proofs and checkpoints, `messageSignature`
-//! bundles and bundles before v0.3, Notation, cosign `.att` logged as
-//! Rekor `intoto` entries, SLSA v0.2 build types other than the container
-//! generator's, certificate claims under issuers other than GitHub Actions
-//! (ADR-034), and keeping `trusted_root.json` current (TUF).
+//! bundles and bundles before v0.3, Notation, Rekor `intoto` 0.0.2
+//! entries, and `intoto` entries for bundles or `.sig` layers (ADR-037),
+//! SLSA v0.2 build types other than the container generator's,
+//! certificate claims under issuers other than GitHub Actions (ADR-034),
+//! and keeping `trusted_root.json` current (TUF).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod attestation;
