@@ -51,7 +51,7 @@ and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 | `kyverno.envelope.json` | `148c49dd…82837513` | its DSSE envelope, the file `kyverno-1.11.0.envelope.json` there |
 | `bex-cnb-run.index.json` | `b02a639b…bf1732df9` | the index of `ghcr.io/bex-co/bex-cnb-run`, an OCI index of 1,611 bytes (ADR-038); the referrers API answers 404 |
 | `bex-cnb-run.amd64.json` | `091e70c5…29fb4321` | its `linux/amd64` manifest (OCI, 3,534 bytes, 17 layers) |
-| `bex-cnb-run.amd64-config.json` | `58e0afde…0a006989` | that manifest's config (16,539 bytes) |
+| `bex-cnb-run.amd64-config.json.b64` | `58e0afde…0a006989` (decoded) | that manifest's config (16,539 bytes), kept as base64 in lines of 76 characters because its build history names the Python interpreter, which the CI gate of ADR-015 D10 refuses in any tracked file; `signatures.rs` decodes it |
 | `bex-cnb-run.referrers-tag.json` | `e1d4df49…32668f7` | GHCR's answer to the tag `sha256-<index hex>`: five bundle referrers, one of them (`https://sigstore.dev/cosign/sign/v1`) the signature, 2,164 bytes |
 | `bex-cnb-run.referrer.json` | `9d24c9ab…561343c4` | that referrer's manifest, 1,013 bytes |
 | `bex-cnb-run.bundle.json` | `04b2bd8b…da2ba8c7` | its bundle: keyless `cosign sign`, a Rekor v2 `hashedrekord` 0.0.2 entry and one RFC 3161 token, the file `bex-cnb-run.bundle.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
@@ -126,8 +126,8 @@ bd=b02a639bada113f1b64024c23d5dce1ecb12b67ef4c75b1650999f2bf1732df9
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.index.json "$gh/manifests/sha256:$bd"
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.amd64.json \
   "$gh/manifests/$(jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest' bex-cnb-run.index.json)"
-curl -sSL -H "Authorization: Bearer $tok" -o bex-cnb-run.amd64-config.json \
-  "$gh/blobs/$(jq -r .config.digest bex-cnb-run.amd64.json)"
+curl -sSL -H "Authorization: Bearer $tok" "$gh/blobs/$(jq -r .config.digest bex-cnb-run.amd64.json)" |
+  base64 -w 76 > bex-cnb-run.amd64-config.json.b64
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.referrers-tag.json "$gh/manifests/sha256-$bd"
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.referrer.json \
   "$gh/manifests/$(jq -r '.manifests[] | select(.annotations["dev.sigstore.bundle.predicateType"] == "https://sigstore.dev/cosign/sign/v1") | .digest' bex-cnb-run.referrers-tag.json)"

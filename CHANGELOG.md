@@ -919,7 +919,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also run through the offline fake registry of `boneli-oci`. No new
   refusal, limit or dependency.
 - RFC 3161 timestamps as a time source of keyless bundles (#102, part 1,
-  ADR-038, proposed): `boneli_https::TimestampToken` reads a
+  ADR-038, accepted): `boneli_https::TimestampToken` reads a
   `TimeStampResp` strictly (one signer, SHA-256, `ecdsa-with-SHA256`,
   contentType, messageDigest and signingCertificateV2 once each, a whole-
   second genTime, embedded certificates never parsed) and verifies it over

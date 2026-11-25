@@ -1,6 +1,6 @@
 # ADR-038: Rekor v2 entries and RFC 3161 timestamps
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-25
 
 ## Context
@@ -439,3 +439,9 @@ only because their root differed. Both now have a case under a root the
 log signed (`inclusion_proof_rejections`), and both mutants are killed.
 The same test pins an entry index that differs from a valid proof's and
 index 1 of a tree of one leaf, which only the index checks refuse.
+
+**Accepted.** The `oci-acceptance` run of the second pull request,
+https://github.com/Replikanti/boneli/actions/runs/45641545933, passed
+`signatures_on_rekor_v2` on x86_64 (pull in 61.3 s) and arm64 (81.6 s):
+17 layers committed under the `Required` rule, the v2 bundle kept and
+verified again with no request, and the other SAN refused.

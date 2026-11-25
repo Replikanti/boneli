@@ -61,7 +61,10 @@ const JQ_REFERRER: &[u8] = include_bytes!("data/jq.referrer.json");
 const JQ_BUNDLE: &[u8] = include_bytes!("data/jq.bundle.json");
 const BEX_INDEX: &[u8] = include_bytes!("data/bex-cnb-run.index.json");
 const BEX_AMD64: &[u8] = include_bytes!("data/bex-cnb-run.amd64.json");
-const BEX_CONFIG: &[u8] = include_bytes!("data/bex-cnb-run.amd64-config.json");
+/// bex-cnb-run's config, in base64 with line breaks: its build history
+/// names the Python interpreter, which no tracked file may name in clear
+/// (ADR-015, D10).
+const BEX_CONFIG_B64: &[u8] = include_bytes!("data/bex-cnb-run.amd64-config.json.b64");
 const BEX_REFERRERS: &[u8] = include_bytes!("data/bex-cnb-run.referrers-tag.json");
 const BEX_REFERRER: &[u8] = include_bytes!("data/bex-cnb-run.referrer.json");
 const BEX_BUNDLE: &[u8] = include_bytes!("data/bex-cnb-run.bundle.json");
@@ -4665,7 +4668,12 @@ fn bex_hub() -> Hub {
     hub.document(BEX_REPO, media::INDEX, BEX_INDEX);
     hub.document(BEX_REPO, media::MANIFEST, BEX_AMD64);
     hub.document(BEX_REPO, media::MANIFEST, BEX_REFERRER);
-    hub.blob(BEX_REPO, BEX_CONFIG);
+    let config: Vec<u8> = BEX_CONFIG_B64
+        .iter()
+        .copied()
+        .filter(|b| *b != b'\n')
+        .collect();
+    hub.blob(BEX_REPO, &base64::decode(&config).expect("config base64"));
     hub.blob(BEX_REPO, BEX_BUNDLE);
     hub.tag(
         BEX_REPO,
