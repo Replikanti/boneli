@@ -73,11 +73,14 @@ all, 4,905 requests per architecture over 5 runs between 16:44 and 23:09
 UTC, 9,810 in total, and none went to an S3 host.
 
 **Reading.** If the S3 redirect were a steady per-request rate of about
-0.9 % (D4), a single run of 981 requests would have shown none with
-probability `0.991^981` = 0.00014. Five runs showed none on either
-architecture, so the redirect is not a steady rate: it comes in episodes
-(a time window, a CloudFront failover) or depends on something about the
-request that neither measurement reproduced. One such difference is
+0.83 % at the first hop (D4), a single run of 981 requests would have
+shown none with probability `0.9917^981` = 0.00028. Five runs showed none
+on either architecture, so the redirect is not a steady first-hop rate.
+It comes in episodes (a time window, a CloudFront failover), depends on
+something about the request that neither measurement reproduced, or comes
+at a later hop, after CloudFront: the measurement followed CloudFront only
+10 times, each with `Range: bytes=0-0`, and the logged failures do not
+say at which hop S3 appeared. One such difference is
 known: `curl` sends a `User-Agent` and the client sends none; the blob
 that failed in CI, requested from the residential connection without a
 `User-Agent`, still went to CloudFront 3 times of 3 (2026-11-24). Its
@@ -150,12 +153,12 @@ connects, and that matters on its own:
 ### D4. Numbers
 
 - **Sample size.** 2 failures in 16 x86_64 attempts, about 16 blob
-  requests each, is about 0.9 % of requests if they are independent
+  requests each, is about 0.83 % of requests if they are independent
   (`1 - 0.875^(1/16)`). 500 requests see at least one S3 redirect with
-  probability `1 - 0.991^500` = 99 %, so the measurement was sized for at
-  least 500 per architecture and run. A run made 981 (3 rounds of 327): at
-  0.9 % it sees one with probability 99.99 %, and two runs (1,962
-  requests) still see a rate 3 times lower (0.3 %) with 99.7 %; five runs
+  probability `1 - 0.9917^500` = 98.5 %, so the measurement was sized for
+  at least 500 per architecture and run. A run made 981 (3 rounds of 327):
+  at 0.83 % it sees one with probability 99.97 %, and two runs (1,962
+  requests) still see a rate 3 times lower (0.28 %) with 99.6 %; five runs
   made 4,905. Fewer would risk a clean
   sample that proves nothing; more costs only runner time, which is free
   for a public repository. The clean runs refute the independence

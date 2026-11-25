@@ -1102,8 +1102,20 @@ mod network {
             }
             other => panic!("node:22 must be refused: {other:?}"),
         }
-        let cdn = hosts.iter().filter(|h| is_hub_blob_host(h)).count();
-        assert_eq!(cdn, 1, "only the config comes from the CDN: {hosts:?}");
+        // One blob fetch, the config: straight to CloudFront or to S3, or
+        // CloudFront redirecting on to S3 (ADR-035), which is two hosts.
+        let blob_hosts: Vec<&str> = hosts
+            .iter()
+            .map(String::as_str)
+            .filter(|h| is_hub_blob_host(h))
+            .collect();
+        let s3 = |h: &str| !h.ends_with(".docker.com");
+        let one_fetch = match blob_hosts.as_slice() {
+            [_] => true,
+            [first, second] => !s3(first) && s3(second),
+            _ => false,
+        };
+        assert!(one_fetch, "only the config comes from the CDN: {hosts:?}");
         assert_eq!(layer_entries(&root), committed, "node:22 committed a layer");
 
         let dial = recording();
