@@ -1035,8 +1035,8 @@
    "state": "implementing",
    "owner": "ae67d3e8",
    "pr": null,
-   "note": "parked: one large task too many for its holder's profile; opens again when there is a place",
-   "updated_at": "2026-11-20T22:04:26+00:00",
+   "note": "PR 1 (proxy route) implementing",
+   "updated_at": "2026-11-25T17:03:39+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1049,7 +1049,7 @@
    "manual": false,
    "user": "ylohnitram",
    "machine": "df82df",
-   "session": false,
+   "session": true,
    "dispatched": true,
    "parked": null
   },
@@ -1689,14 +1689,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-24T16:14:22+00:00",
-   "issue": 113,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "1806fc84",
-   "note": null
-  },
-  {
    "at": "2026-11-24T16:21:39+00:00",
    "issue": 117,
    "from": "claimed",
@@ -2087,6 +2079,14 @@
    "to": "done",
    "by": "3613ba8e",
    "note": null
+  },
+  {
+   "at": "2026-11-25T17:03:39+00:00",
+   "issue": 55,
+   "from": "implementing",
+   "to": "implementing",
+   "by": "ae67d3e8",
+   "note": "PR 1 (proxy route) implementing"
   }
  ],
  "open": [
@@ -2117,7 +2117,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T17:03:14+00:00",
+ "updated_at": "2026-11-25T17:03:39+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
