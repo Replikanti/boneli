@@ -1667,16 +1667,16 @@
    "title": "boneli-https: investigate TimedOut in body_one_over_cap_is_too_large under CPU load",
    "epic": null,
    "order": 64,
-   "state": "pr-review",
-   "owner": "aac94746",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 133,
    "note": "PR #133 open",
-   "updated_at": "2026-11-25T15:00:23+00:00",
+   "updated_at": "2026-11-25T17:22:07+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T16:21:39+00:00",
-   "issue": 117,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "ecf725cc",
-   "note": null
-  },
   {
    "at": "2026-11-24T16:41:02+00:00",
    "issue": 117,
@@ -2087,6 +2079,14 @@
    "to": "implementing",
    "by": "ae67d3e8",
    "note": "PR 1 (proxy route) implementing"
+  },
+  {
+   "at": "2026-11-25T17:22:07+00:00",
+   "issue": 131,
+   "from": "pr-review",
+   "to": "done",
+   "by": "aac94746",
+   "note": null
   }
  ],
  "open": [
@@ -2113,11 +2113,10 @@
   49,
   55,
   69,
-  129,
-  131
+  129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T17:03:39+00:00",
+ "updated_at": "2026-11-25T17:22:09+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
