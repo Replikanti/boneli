@@ -1685,25 +1685,35 @@
     "core"
    ],
    "manual": false
+  },
+  {
+   "issue": 137,
+   "title": "boneli-tuf: refresh GitHub's Sigstore trusted root from tuf-repo.github.com",
+   "epic": null,
+   "order": 65,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-25T23:08:01+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    129
+   ],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T18:02:03+00:00",
-   "issue": 114,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #122 open"
-  },
-  {
-   "at": "2026-11-24T18:05:40+00:00",
-   "issue": 103,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "7ee136eb",
-   "note": null
-  },
   {
    "at": "2026-11-24T19:09:46+00:00",
    "issue": 103,
@@ -2087,6 +2097,22 @@
    "to": "implementing",
    "by": "9cc7896e",
    "note": null
+  },
+  {
+   "at": "2026-11-25T23:08:01+00:00",
+   "issue": 137,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-25T23:08:01+00:00",
+   "issue": 137,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2112,10 +2138,11 @@
   45,
   49,
   69,
-  129
+  129,
+  137
  ],
  "xopen": [],
- "updated_at": "2026-11-25T23:04:33+00:00",
+ "updated_at": "2026-11-25T23:08:01+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
