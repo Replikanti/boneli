@@ -1593,16 +1593,16 @@
    "title": "boneli-replay-check: make protected_walk_is_bounded independent of wall-clock load",
    "epic": null,
    "order": 61,
-   "state": "pr-review",
-   "owner": "48d4a169",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 126,
-   "note": "",
-   "updated_at": "2026-11-25T00:46:08+00:00",
+   "note": "closed on GitHub",
+   "updated_at": "2026-11-25T11:24:31+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1638,14 +1638,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T08:26:31+00:00",
-   "issue": 114,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
   {
    "at": "2026-11-24T08:26:31+00:00",
    "issue": 113,
@@ -2037,6 +2029,14 @@
    "to": "claimed",
    "by": "ea19b3dc",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-25T11:24:31+00:00",
+   "issue": 125,
+   "from": "pr-review",
+   "to": "done",
+   "by": "sync",
+   "note": "closed on GitHub"
   }
  ],
  "open": [
@@ -2064,11 +2064,10 @@
   55,
   69,
   102,
-  125,
   128
  ],
  "xopen": [],
- "updated_at": "2026-11-25T11:24:17+00:00",
+ "updated_at": "2026-11-25T11:24:31+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
