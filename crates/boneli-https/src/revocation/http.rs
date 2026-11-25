@@ -227,7 +227,7 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     use crate::Roots;
-    use crate::revocation::{CRL_CHECK_DEADLINE, MAX_CA_CRL_BYTES};
+    use crate::revocation::MAX_CA_CRL_BYTES;
 
     const GUARD: Duration = Duration::from_secs(10);
 
@@ -416,13 +416,22 @@ mod tests {
 
     #[test]
     fn body_at_cap_passes_size_check() {
-        let (addr, _server) = answer(ok_with(&vec![0u8; MAX_CRL_BYTES]));
-        // The only test that moves the full 32 MiB: it pins `fetch` at
-        // exactly `MAX_CRL_BYTES`, so it gets the code's own budget for
-        // that volume instead of `GUARD` (#131).
-        let deadline = Instant::now() + CRL_CHECK_DEADLINE;
-        let body = crl(&source(), &url(addr, "/ca.crl"), deadline).expect("fetch");
-        assert_eq!(body.len(), MAX_CRL_BYTES);
+        // A `Content-Length` of exactly `MAX_CRL_BYTES` passes the size
+        // check, so the client starts on the body; the server sends one
+        // byte and closes. `TooLarge` here would mean `fetch` caps below
+        // `MAX_CRL_BYTES`. No 32 MiB transfer, so no wall-clock margin to
+        // keep (#131); the full body at a cap is read in
+        // `chunked_body_at_cap_passes_size_check`.
+        let (addr, server) = answer(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {MAX_CRL_BYTES}\r\n\r\n\0").into_bytes(),
+        );
+        assert_eq!(
+            crl(&source(), &url(addr, "/ca.crl"), deadline()),
+            Err(CrlFetchError::Unreachable(
+                "the connection closed early".into()
+            ))
+        );
+        server.join().expect("server");
     }
 
     /// Chunk size of the chunked-body tests below; the cap is a multiple.
