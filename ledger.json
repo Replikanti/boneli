@@ -1667,7 +1667,7 @@
    "title": "boneli-https: investigate TimedOut in body_one_over_cap_is_too_large under CPU load",
    "epic": null,
    "order": 64,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "aac94746",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1676,7 +1676,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-25T13:08:26+00:00",
+   "updated_at": "2026-11-25T13:16:13+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:38:57+00:00",
-   "issue": 113,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "1806fc84",
-   "note": null
-  },
   {
    "at": "2026-11-24T09:47:27+00:00",
    "issue": 114,
@@ -2087,6 +2079,14 @@
    "to": "pr-review",
    "by": "3613ba8e",
    "note": null
+  },
+  {
+   "at": "2026-11-25T13:16:13+00:00",
+   "issue": 131,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "aac94746",
+   "note": null
   }
  ],
  "open": [
@@ -2118,7 +2118,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T13:13:54+00:00",
+ "updated_at": "2026-11-25T13:16:13+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
