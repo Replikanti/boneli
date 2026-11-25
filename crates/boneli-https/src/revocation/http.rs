@@ -11,6 +11,16 @@
 //! the same roots and without a revocation check of its own, which keeps
 //! the fetch from recursing: the list's or response's integrity comes from
 //! its signature, not from the transport.
+//!
+//! With a proxy in the configuration every fetch goes through it (ADR-039,
+//! D6): only the proxy's name is resolved; an `http` point or responder is
+//! an absolute-form `GET http://host/path` to the proxy, with
+//! `Proxy-Authorization` when credentials are set; an `https` one is a
+//! `CONNECT` tunnel and then TLS as above, and the request inside the
+//! tunnel carries `Host` only. A refused `CONNECT` is
+//! `CrlFetchError::Unreachable` naming the proxy, the target and the
+//! status; a non-200 answer to a proxied `GET`, from the proxy or the
+//! server behind it, is `CrlFetchError::Status`, as on a direct fetch.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -27,12 +37,13 @@ use super::{
     CRL_MAX_HEADERS, CrlFetchError, CrlSource, MAX_CRL_BYTES,
 };
 use crate::dial::{DeadlineSocket, time_left};
-use crate::{ConnectOptions, TlsConfig};
+use crate::{ConnectOptions, Nonblocking, Proxy, TlsConfig};
 
 /// Fetches CRLs and OCSP responses over HTTP and HTTPS.
 pub(crate) struct HttpSource {
-    /// The handshake's roots and groups, without a revocation check, and
-    /// the resolver of every fetch's host.
+    /// The handshake's roots and groups, without a revocation check, the
+    /// resolver of every fetch's host, and the proxy every fetch goes
+    /// through when one is set (ADR-039, D6).
     tls: TlsConfig,
     /// Each TCP connection attempt.
     pub(crate) connect_timeout: Duration,
@@ -63,15 +74,20 @@ impl HttpSource {
         deadline: Instant,
     ) -> Result<Vec<u8>, CrlFetchError> {
         time_left(deadline).map_err(io_error)?;
+        // With a proxy only the proxy's name is resolved (ADR-039, D6).
+        let (host, port, what) = match self.tls.proxy() {
+            Some(proxy) => (proxy.host(), proxy.port(), "the proxy"),
+            None => (url.host(), url.port(), "the host"),
+        };
         // The lookup counts inside the deadline (ADR-022); a lookup that
         // ran out of it is a timeout, like every later step.
         let addrs = self
             .tls
             .resolver
-            .lookup(url.host(), url.port(), deadline)
+            .lookup(host, port, deadline)
             .map_err(|e| match e.kind() {
                 io::ErrorKind::TimedOut => CrlFetchError::TimedOut,
-                _ => CrlFetchError::Unreachable(format!("cannot resolve the host: {e}")),
+                _ => CrlFetchError::Unreachable(format!("cannot resolve {what}: {e}")),
             })?;
         let mut last = None;
         for addr in addrs {
@@ -82,7 +98,7 @@ impl HttpSource {
             }
         }
         Err(last.map_or_else(
-            || CrlFetchError::Unreachable("the host has no address".into()),
+            || CrlFetchError::Unreachable(format!("{what} has no address")),
             io_error,
         ))
     }
@@ -100,29 +116,69 @@ impl HttpSource {
             .set_read_timeout(Some(self.io_timeout))
             .and_then(|()| socket.set_write_timeout(Some(self.io_timeout)))
             .map_err(io_error)?;
-        match url.scheme() {
-            CrlScheme::Http => request(socket, url, path, cap),
-            CrlScheme::Https => {
-                let options = ConnectOptions::new(
-                    self.connect_timeout,
-                    self.handshake_timeout,
-                    self.io_timeout,
-                )
-                .map_err(|e| CrlFetchError::Unreachable(e.to_string()))?;
-                let tls = crate::connect_over_until(
-                    socket,
-                    url.host(),
-                    &self.tls,
-                    &options,
-                    Some(deadline),
-                )
+        match (url.scheme(), self.tls.proxy()) {
+            (CrlScheme::Http, proxy) => request(socket, url, path, cap, proxy),
+            (CrlScheme::Https, None) => self.https(socket, url, path, cap, deadline),
+            (CrlScheme::Https, Some(proxy)) => {
+                let tunnel = proxy
+                    .tunnel(socket, url.host(), url.port())
+                    .map_err(|e| tunnel_error(proxy, url, e))?;
+                self.https(tunnel, url, path, cap, deadline)
+            }
+        }
+    }
+
+    /// TLS to `url`'s host over `stream`, then `GET path` inside it.
+    fn https<S: Transport + Nonblocking>(
+        &self,
+        stream: S,
+        url: &CrlUrl,
+        path: &str,
+        cap: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CrlFetchError> {
+        let options = ConnectOptions::new(
+            self.connect_timeout,
+            self.handshake_timeout,
+            self.io_timeout,
+        )
+        .map_err(|e| CrlFetchError::Unreachable(e.to_string()))?;
+        let tls =
+            crate::connect_over_until(stream, url.host(), &self.tls, &options, Some(deadline))
                 .map_err(|e| match e {
                     crate::Error::Io(e) => io_error(e),
                     other => CrlFetchError::Unreachable(format!("TLS: {other}")),
                 })?;
-                request(tls, url, path, cap)
-            }
+        // Inside the tunnel the request is the server's: no proxy field.
+        request(tls, url, path, cap, None)
+    }
+}
+
+/// A failed `CONNECT` to `url`'s host through `proxy`: a refusal is
+/// `Unreachable` with the text of `Error::Proxy` (the proxy, the target
+/// and the status); a timeout stays `TimedOut`; anything else names the
+/// proxy. No text holds a field value.
+fn tunnel_error(proxy: &Proxy, url: &CrlUrl, e: boneli_http::Error) -> CrlFetchError {
+    use boneli_http::Error;
+    match e {
+        Error::Status(status) => {
+            CrlFetchError::Unreachable(proxy.refused(url.host(), url.port(), status).to_string())
         }
+        Error::Timeout => CrlFetchError::TimedOut,
+        Error::Io(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            CrlFetchError::TimedOut
+        }
+        other => CrlFetchError::Unreachable(format!(
+            "CONNECT {}:{} through the proxy {}: {other}",
+            url.host(),
+            url.port(),
+            proxy.authority()
+        )),
     }
 }
 
@@ -156,20 +212,29 @@ impl OcspSource for HttpSource {
 }
 
 /// `GET <path>` with `Host` only; 200, no content coding, the whole body
-/// of at most `cap` bytes.
+/// of at most `cap` bytes. Through `proxy`, an `http` URL only: the
+/// absolute form, plus `Proxy-Authorization` when credentials are set.
 fn request<S: Read + Write + IdleCheck>(
     stream: S,
     url: &CrlUrl,
     path: &str,
     cap: usize,
+    proxy: Option<&Proxy>,
 ) -> Result<Vec<u8>, CrlFetchError> {
     let limits =
         Limits::new(CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, cap as u64).map_err(http_error)?;
-    let mut conn = Connection::new(stream, &url.authority(), limits).map_err(http_error)?;
-    let head = RequestHead::new(
+    let mut head = RequestHead::new(
         Method::new("GET").map_err(http_error)?,
         Target::Origin(path.to_owned()),
     );
+    let mut conn = match proxy {
+        None => Connection::new(stream, &url.authority(), limits),
+        Some(proxy) => {
+            head.headers = proxy.fields();
+            Connection::new_via_proxy(stream, &url.authority(), limits)
+        }
+    }
+    .map_err(http_error)?;
     let mut response = conn.request(&head, RequestBody::None).map_err(http_error)?;
     let status = response.head.status;
     if status != 200 {
@@ -685,6 +750,127 @@ mod tests {
         assert_eq!(crl(&source(), &url, deadline()), Ok(b"over tls".to_vec()));
         let head = server.join().expect("server");
         assert!(head.starts_with(b"GET /ca.crl HTTP/1.1\r\n"));
+    }
+
+    // ------------------------------------------------------------- proxy
+
+    /// A source whose fetches go through the proxy at `addr`, with
+    /// credentials `user:pass`.
+    fn proxied(addr: SocketAddr) -> HttpSource {
+        let proxy = Proxy::new("127.0.0.1", addr.port())
+            .expect("proxy")
+            .with_credentials(crate::BasicCredentials::new("user", "pass").expect("valid"));
+        let tls = TlsConfig::new(crl_roots())
+            .expect("config")
+            .with_proxy(proxy);
+        HttpSource::new(tls.without_revocation())
+    }
+
+    /// An `http` point through the proxy: one absolute-form `GET` with
+    /// `Host` and `Proxy-Authorization`, to the proxy, never to the point's
+    /// host (`crl.boneli.test` does not resolve).
+    #[test]
+    fn http_point_is_an_absolute_get_to_the_proxy() {
+        let (addr, server) = answer(ok_with(b"list"));
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        assert_eq!(
+            crl(&proxied(addr), &point, deadline()),
+            Ok(b"list".to_vec())
+        );
+        let head = String::from_utf8(server.join().expect("server")).expect("ASCII");
+        assert_eq!(
+            head,
+            "GET http://crl.boneli.test/ca.crl HTTP/1.1\r\nHost: crl.boneli.test\r\n\
+Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+        );
+        // A non-200 from the proxy is a status, as on a direct fetch.
+        let (addr, _server) =
+            answer(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec());
+        assert_eq!(
+            crl(&proxied(addr), &point, deadline()),
+            Err(CrlFetchError::Status(403))
+        );
+    }
+
+    /// An `https` point through the proxy: `CONNECT` with
+    /// `Proxy-Authorization`, then TLS to the point inside the tunnel with
+    /// a request that carries `Host` only. Here the proxy serves the
+    /// point's TLS itself.
+    #[test]
+    fn https_point_tunnels_through_the_proxy() {
+        let chain = CertificateDer::pem_slice_iter(include_bytes!("../../tests/data/crl-good.pem"))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cert");
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/data/crl-leaf.key"))
+            .expect("key");
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .expect("server cert"),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let proxy = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().expect("accept");
+            tcp.set_read_timeout(Some(GUARD)).expect("timeout");
+            let tunnel_head = read_head(&mut tcp);
+            tcp.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answer");
+            let conn = ServerConnection::new(config).expect("server");
+            let mut tls = StreamOwned::new(conn, tcp);
+            let inner = read_head(&mut tls);
+            let _ = tls.write_all(&ok_with(b"over tls"));
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            (tunnel_head, inner)
+        });
+        let point = CrlUrl::parse("https://localhost:8443/ca.crl").expect("URL");
+        assert_eq!(
+            crl(&proxied(addr), &point, deadline()),
+            Ok(b"over tls".to_vec())
+        );
+        let (tunnel_head, inner) = proxy.join().expect("proxy");
+        assert_eq!(
+            String::from_utf8_lossy(&tunnel_head),
+            "CONNECT localhost:8443 HTTP/1.1\r\nHost: localhost:8443\r\n\
+Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&inner),
+            "GET /ca.crl HTTP/1.1\r\nHost: localhost:8443\r\n\r\n"
+        );
+    }
+
+    /// A refused `CONNECT` for an `https` point is `Unreachable` naming the
+    /// proxy, the target and the status, without the credentials.
+    #[test]
+    fn https_point_refused_by_the_proxy_names_it() {
+        let (addr, _server) = answer(b"HTTP/1.1 403 Forbidden\r\n\r\n".to_vec());
+        let point = CrlUrl::parse("https://crl.boneli.test/ca.crl").expect("URL");
+        let err = crl(&proxied(addr), &point, deadline()).expect_err("refused");
+        assert_eq!(
+            err,
+            CrlFetchError::Unreachable(format!(
+                "the proxy 127.0.0.1:{} answered 403 to CONNECT crl.boneli.test:443",
+                addr.port()
+            ))
+        );
+        assert!(!err.to_string().contains("dXNlcjpwYXNz"));
+        // A deadline past the proxy dials nothing.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        assert_eq!(
+            crl(&proxied(addr), &point, Instant::now()),
+            Err(CrlFetchError::TimedOut)
+        );
+        assert_eq!(
+            listener.accept().map(|_| ()).map_err(|e| e.kind()),
+            Err(io::ErrorKind::WouldBlock)
+        );
     }
 
     // ------------------------------------------------------------- OCSP

@@ -951,6 +951,24 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   catalog are known answers; live test `signatures_on_rekor_v2` in
   `oci-acceptance`. `boneli_https::Ed25519Key` signs test checkpoints.
   No new crate or dependency edge.
+- An HTTP proxy route (#55, part 1, ADR-039, proposed):
+  `boneli_https::TlsConfig::with_proxy(Proxy)` sends every connection of
+  the configuration through the customer's HTTP proxy. `TlsDial` resolves
+  and connects to the proxy only, opens a `CONNECT` tunnel under the
+  request's deadline and runs TLS to the target over it, certificate and
+  revocation checked as on a direct connection; a non-2xx answer is
+  `Error::Proxy` (proxy, target, status, no field value). The CRL, CA list
+  and OCSP fetches go through the same proxy, `http` ones as absolute-form
+  `GET`s, `https` ones through a tunnel, and still fail closed.
+  `BasicCredentials` (RFC 7617, at most `MAX_BASIC_CREDENTIAL_BYTES`
+  6,120 B, redacted `Debug`) go to the proxy up front in
+  `Proxy-Authorization`. `connect` refuses a proxied configuration. No
+  proxy environment variable is read. `boneli-http` gains
+  `connect_tunnel_with` (extra fields after `Host`) and
+  `Connection::new_via_proxy` (absolute-form request lines; the server
+  still refuses them). The `CONNECT` answer is held to
+  `PROXY_MAX_HEAD_BYTES` 16,384 and `PROXY_MAX_HEADERS` 64. No new crate
+  or dependency edge.
 
 ### Changed
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use boneli_http::{
     Connection, Error, Exchange, Headers, IdleCheck, Method, RequestBody, RequestHead, Target,
-    connect_tunnel,
+    connect_tunnel, connect_tunnel_with,
 };
 use common::{MemStream, wide};
 
@@ -326,4 +326,73 @@ fn client_tunnel_refused() {
     .expect("served");
     assert_eq!(common::statuses(&output.borrow()), vec![500]);
     assert!(String::from_utf8_lossy(&output.borrow()).contains("Connection: close"));
+}
+
+/// `connect_tunnel_with` writes the caller's fields after `Host`, in
+/// order, and nothing else: the way `Proxy-Authorization` reaches a proxy
+/// (ADR-039, D8).
+#[test]
+fn connect_tunnel_with_writes_fields_after_host() {
+    let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\nEARLY", 5);
+    let mut fields = Headers::new();
+    fields.append("Proxy-Authorization", "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    fields.append("X-Second", "2");
+    let mut tunnel =
+        connect_tunnel_with(stream, "registry.example", 443, &fields, &wide()).expect("tunnel");
+    assert_eq!(
+        &written.borrow()[..],
+        b"CONNECT registry.example:443 HTTP/1.1\r\nHost: registry.example:443\r\n\
+Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nX-Second: 2\r\n\r\n"
+    );
+    let mut got = Vec::new();
+    tunnel.read_to_end(&mut got).expect("read");
+    assert_eq!(got, b"EARLY");
+
+    // No fields: byte for byte what `connect_tunnel` writes.
+    let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 64);
+    connect_tunnel_with(stream, "::1", 8443, &Headers::new(), &wide()).expect("tunnel");
+    assert_eq!(
+        &written.borrow()[..],
+        b"CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n"
+    );
+
+    // A refused CONNECT is still `Error::Status`.
+    let (stream, _) = MemStream::new(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", 64);
+    assert!(matches!(
+        connect_tunnel_with(stream, "registry.example", 443, &fields, &wide()),
+        Err(Error::Status(407))
+    ));
+}
+
+/// A field the client writes itself, a name that is not a token, or a
+/// control character in a value is refused with `InvalidInput` before any
+/// byte is written.
+#[test]
+fn connect_tunnel_with_refuses_owned_and_control_fields() {
+    let cases: [(&str, &[u8]); 10] = [
+        ("Host", b"other.example:443"),
+        ("host", b"other.example:443"),
+        ("Content-Length", b"0"),
+        ("Transfer-Encoding", b"chunked"),
+        ("CONNECTION", b"close"),
+        ("Proxy-Authorization", b"Basic a\r\nX-Injected: 1"),
+        ("Proxy-Authorization", b"Basic a\nb"),
+        ("Proxy-Authorization", b"Basic \0"),
+        ("Proxy-Authorization", b"Basic \x7f"),
+        ("Bad Name", b"v"),
+    ];
+    for (name, value) in cases {
+        let mut fields = Headers::new();
+        fields.append("X-Fine", "1");
+        fields.append(name, value.to_vec());
+        let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 64);
+        assert!(
+            matches!(
+                connect_tunnel_with(stream, "registry.example", 443, &fields, &wide()),
+                Err(Error::InvalidInput(_))
+            ),
+            "{name}: {value:?}"
+        );
+        assert!(written.borrow().is_empty(), "{name}: something was written");
+    }
 }

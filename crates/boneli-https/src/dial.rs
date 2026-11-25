@@ -15,6 +15,12 @@
 //! The deadline bounds the name lookup too: [`TlsDial`] resolves through
 //! its `TlsConfig`'s [`Resolver`](crate::Resolver), whose every wait ends
 //! by the deadline (ADR-022).
+//!
+//! With a proxy ([`TlsConfig::with_proxy`](crate::TlsConfig::with_proxy))
+//! the dial resolves and connects to the proxy only, opens a `CONNECT`
+//! tunnel to the target under the same deadline, and runs TLS to the
+//! target over it (ADR-039, D5): the target's certificate is verified end
+//! to end, and the target's name is never resolved here.
 
 use std::cell::Cell;
 use std::io::{self, Read, Write};
@@ -23,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use boneli_http::{IdleCheck, Target, Transport};
 
-use crate::{ConnectOptions, Nonblocking, TlsConfig};
+use crate::{ConnectOptions, Nonblocking, Proxy, TlsConfig};
 
 /// A stream the client can send a request over: timeouts and the idle
 /// check of ADR-003, item 12.
@@ -46,6 +52,13 @@ pub trait Dial {
 /// against the caller's `TlsConfig` (ADR-005), and the timeouts of the
 /// caller's `ConnectOptions`. The deadline bounds the lookup, and holds on
 /// the socket under TLS for the handshake and every later read and write.
+///
+/// With a proxy in the `TlsConfig`, the lookup and the TCP connection go
+/// to the proxy, then `CONNECT host:port` with `Proxy-Authorization` when
+/// credentials are set, each read and write bounded by `io_timeout` and
+/// the deadline; a non-2xx answer is [`Error::Proxy`](crate::Error::Proxy)
+/// inside the `io::Error`, and then the same handshake runs over the
+/// tunnel (ADR-039, D5).
 #[derive(Clone, Debug)]
 pub struct TlsDial {
     config: TlsConfig,
@@ -62,6 +75,9 @@ impl TlsDial {
 impl Dial for TlsDial {
     fn dial(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Box<dyn Stream>> {
         check_host(host, port)?;
+        if let Some(proxy) = self.config.proxy() {
+            return self.dial_via(proxy, host, port, deadline);
+        }
         let mut last = None;
         for addr in self.config.resolver.lookup(host, port, deadline)? {
             let left = time_left(deadline)?;
@@ -80,18 +96,92 @@ impl Dial for TlsDial {
                         Some(deadline),
                     )
                     .map(|tls| Box::new(tls) as Box<dyn Stream>)
-                    .map_err(|e| match e {
-                        crate::Error::Io(e) => e,
-                        // The error itself, so a caller can tell a revoked
-                        // certificate (ADR-017) from a network failure.
-                        other => io::Error::other(other),
-                    });
+                    .map_err(tls_error);
                 }
                 Err(e) => last = Some(e),
             }
         }
         Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))
     }
+}
+
+impl TlsDial {
+    /// `dial` through `proxy`: the proxy's addresses in turn, then the
+    /// tunnel, then TLS to `host` over it. A proxy that answers, whatever
+    /// it answers, ends the dial: the next address is tried only when TCP
+    /// fails.
+    fn dial_via(
+        &self,
+        proxy: &Proxy,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+    ) -> io::Result<Box<dyn Stream>> {
+        let mut last = None;
+        for addr in self
+            .config
+            .resolver
+            .lookup(proxy.host(), proxy.port(), deadline)?
+        {
+            let left = time_left(deadline)?;
+            match TcpStream::connect_timeout(&addr, left.min(self.options.connect_timeout())) {
+                Ok(tcp) => {
+                    let socket = DeadlineSocket::new(tcp, deadline);
+                    socket.set_read_timeout(Some(self.options.io_timeout()))?;
+                    socket.set_write_timeout(Some(self.options.io_timeout()))?;
+                    let tunnel = proxy
+                        .tunnel(socket, host, port)
+                        .map_err(|e| tunnel_error(proxy, host, port, e))?;
+                    return crate::connect_over_until(
+                        tunnel,
+                        host,
+                        &self.config,
+                        &self.options,
+                        Some(deadline),
+                    )
+                    .map(|tls| Box::new(tls) as Box<dyn Stream>)
+                    .map_err(tls_error);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))
+    }
+}
+
+/// A TLS client error as the `io::Error` a `Dial` returns.
+fn tls_error(e: crate::Error) -> io::Error {
+    match e {
+        crate::Error::Io(e) => e,
+        // The error itself, so a caller can tell a revoked certificate
+        // (ADR-017) from a network failure.
+        other => io::Error::other(other),
+    }
+}
+
+/// A failed `CONNECT` as an `io::Error`: a refusal carries
+/// [`Error::Proxy`](crate::Error::Proxy); anything else keeps its kind
+/// (`TimedOut` for the deadline) and names the proxy and the target. No
+/// text holds a field value: `boneli-http`'s errors are fixed strings.
+pub(crate) fn tunnel_error(
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+    e: boneli_http::Error,
+) -> io::Error {
+    if let boneli_http::Error::Status(status) = e {
+        return io::Error::other(proxy.refused(host, port, status));
+    }
+    let what = e.to_string();
+    let kind = io::Error::from(e).kind();
+    io::Error::new(
+        kind,
+        format!(
+            "CONNECT {} through the proxy {}: {what}",
+            crate::proxy::authority(host, port),
+            proxy.authority()
+        ),
+    )
 }
 
 /// Refuses, before anything is resolved or dialed, a host and port that

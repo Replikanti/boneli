@@ -39,6 +39,10 @@ impl Method {
 }
 
 /// A request target. The absolute and asterisk forms are not accepted.
+/// The client writes the absolute form only through
+/// `Connection::new_via_proxy`, built from an origin-form target; no
+/// `Target` holds it, and the server refuses it (ADR-003, item 3; ADR-039,
+/// D6).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     /// Origin form: a path starting with `/`, with an optional query;

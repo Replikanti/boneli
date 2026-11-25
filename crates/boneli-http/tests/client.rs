@@ -566,3 +566,90 @@ fn client_header_injection_rejected() {
     head.headers = headers;
     fetch(&mut conn, &head).expect("valid value");
 }
+
+/// A connection to a forward proxy writes the absolute form
+/// `http://<Host><path>` on its request line and keeps the origin's
+/// `Host`, with and without a port (RFC 9112, 3.2.2; ADR-039, D6).
+#[test]
+fn via_proxy_request_line_is_absolute_form() {
+    let ok: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlist";
+    for (host, line) in [
+        (
+            "crl.example",
+            &b"GET http://crl.example/ca.crl?x=1 HTTP/1.1\r\nHost: crl.example\r\n"[..],
+        ),
+        (
+            "crl.example:8080",
+            &b"GET http://crl.example:8080/ca.crl?x=1 HTTP/1.1\r\nHost: crl.example:8080\r\n"[..],
+        ),
+        (
+            "[::1]:8080",
+            &b"GET http://[::1]:8080/ca.crl?x=1 HTTP/1.1\r\nHost: [::1]:8080\r\n"[..],
+        ),
+    ] {
+        let (stream, written) = MemStream::new(ok, 7);
+        let mut conn = Connection::new_via_proxy(stream, host, wide()).expect("connection");
+        let mut head = get("/ca.crl?x=1");
+        head.headers.append("Proxy-Authorization", "Basic YTpi");
+        assert_eq!(
+            fetch(&mut conn, &head).expect("get"),
+            (200, b"list".to_vec())
+        );
+        let mut expected = line.to_vec();
+        expected.extend_from_slice(b"Proxy-Authorization: Basic YTpi\r\n\r\n");
+        assert_eq!(
+            String::from_utf8_lossy(&written.borrow()),
+            String::from_utf8_lossy(&expected),
+            "{host}"
+        );
+    }
+    // The host grammar of `Connection::new` holds.
+    for host in ["127.1", "a_b", "u@h", "a..b"] {
+        assert!(
+            matches!(
+                Connection::new_via_proxy(MemStream::new(b"", 1).0, host, wide()),
+                Err(Error::InvalidInput(_))
+            ),
+            "{host}"
+        );
+    }
+}
+
+/// Through a proxy `request()` still takes only origin-form targets and
+/// never CONNECT, and the owned fields stay refused; nothing is written.
+#[test]
+fn via_proxy_refuses_connect_and_non_origin_targets() {
+    let authority = Target::Authority {
+        host: "origin.example".into(),
+        port: 443,
+    };
+    let mut heads = vec![
+        RequestHead::new(Method::new("CONNECT").expect("method"), authority.clone()),
+        RequestHead::new(Method::new("GET").expect("method"), authority),
+        RequestHead::new(
+            Method::new("CONNECT").expect("method"),
+            Target::Origin("/".into()),
+        ),
+        get("http://origin.example/"),
+        get("*"),
+    ];
+    let mut owned = get("/");
+    owned.headers.append("Host", "other.example");
+    heads.push(owned);
+    for head in heads {
+        let (stream, written) = MemStream::new(b"HTTP/1.1 200 OK\r\n\r\n", 7);
+        let mut conn =
+            Connection::new_via_proxy(stream, "origin.example", wide()).expect("connection");
+        assert!(
+            matches!(
+                conn.request(&head, RequestBody::None),
+                Err(Error::InvalidInput(_))
+            ),
+            "{head:?}"
+        );
+        assert!(
+            written.borrow().is_empty(),
+            "{head:?}: something was written"
+        );
+    }
+}
