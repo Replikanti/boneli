@@ -1126,6 +1126,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `boneli-oci` (#117, ADR-035, accepted): a Docker Hub blob request that
+  Docker Hub redirects to its S3 host
+  `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com` is followed
+  instead of failing the pull with "not on the allowlist". The host is
+  admitted exactly, not by suffix, through the new
+  `Registry::with_redirect_hosts`: another bucket, region, endpoint form
+  or port is still refused, and the blob is still checked by digest.
 - `FsStore` (#94, ADR-026) releases its lock by an explicit unlock when it
   drops, and on every error of `open` after the lock is taken: a reopen
   no longer fails with `InUse` while a process spawned by another thread

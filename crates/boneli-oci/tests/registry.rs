@@ -540,6 +540,377 @@ fn authorization_only_to_registry_host() {
     assert!(seen.iter().any(|s| is_api(s) && authorized(s)));
 }
 
+// --- Exact redirect hosts (#117) -----------------------------------------
+
+/// The S3 host Docker Hub redirects some blob requests to (#117).
+const S3: &str = "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com";
+
+/// A hub that redirects blob requests to the S3 host and serves them there.
+fn s3_hub(
+    bytes: &[u8],
+    answer: impl Fn(&Seen) -> Option<Reply> + Send + Sync + 'static,
+) -> (Fake, Descriptor) {
+    let mut hub = Hub::default();
+    let digest = hub.blob("library/node", bytes);
+    hub.cdn = true;
+    hub.cdn_host = Some(S3.to_owned());
+    let fake = Fake::new(move |s| answer(s).unwrap_or_else(|| hub.handle(s)));
+    let descriptor = Descriptor {
+        media_type: media::TAR.to_owned(),
+        digest: Digest::parse(&digest).expect("digest"),
+        size: bytes.len() as u64,
+    };
+    (fake, descriptor)
+}
+
+/// `get_blob` through `registry` instead of Docker Hub.
+fn get_blob_from(
+    registry: &Registry,
+    fake: &Fake,
+    descriptor: &Descriptor,
+    dest: &Path,
+) -> Result<(), PullError> {
+    let limits = limits();
+    Client::new(registry, fake, &limits, &timeouts())
+        .get_blob(&repo("library/node"), descriptor, dest)
+        .map(|_| ())
+}
+
+/// Every dial went to the API or the token host.
+fn only_api_or_auth_dialed(fake: &Fake) -> bool {
+    fake.dials()
+        .iter()
+        .all(|(h, _)| h == "registry-1.docker.io" || h == "auth.docker.io")
+}
+
+#[test]
+fn redirect_to_the_s3_host_succeeds() {
+    let tmp = TempDir::new("redirect-s3");
+    let (fake, d) = s3_hub(b"s3 blob bytes", |_| None);
+    let dest = blobs(&tmp, &d);
+    get_blob(&fake, &d, &dest).expect("the admitted S3 host");
+    assert_eq!(std::fs::read(&dest).expect("blob"), b"s3 blob bytes");
+    assert!(
+        fake.dials().contains(&(S3.to_owned(), 443)),
+        "{:?}",
+        fake.dials()
+    );
+    let seen = fake.seen();
+    let at_s3: Vec<&Seen> = seen.iter().filter(|s| s.host == S3).collect();
+    assert_eq!(at_s3.len(), 1, "{seen:?}");
+    assert_eq!(
+        at_s3[0].header("authorization"),
+        None,
+        "Authorization to S3"
+    );
+    assert_eq!(
+        seen.iter().filter(|s| is_api(s) && authorized(s)).count(),
+        1,
+        "{seen:?}"
+    );
+
+    // An uppercase Location host is the same host: the URL is lowercased
+    // before the allowlist sees it.
+    let tmp = TempDir::new("redirect-s3-upper");
+    let upper = format!("https://{}/blobs/", S3.to_ascii_uppercase());
+    let (fake, d) = s3_hub(b"s3 blob bytes", move |s| {
+        (is_api(s) && authorized(s)).then(|| {
+            let digest = s.target.rsplit('/').next().unwrap_or_default();
+            Reply::http(307, &[("Location", &format!("{upper}{digest}"))], b"")
+        })
+    });
+    let dest = blobs(&tmp, &d);
+    get_blob(&fake, &d, &dest).expect("uppercase S3 host");
+    assert_eq!(std::fs::read(&dest).expect("blob"), b"s3 blob bytes");
+    assert!(
+        fake.dials().contains(&(S3.to_owned(), 443)),
+        "{:?}",
+        fake.dials()
+    );
+}
+
+#[test]
+fn redirect_exact_host_refusals() {
+    for location in [
+        // Another bucket in the same region and endpoint form.
+        "https://evil-bucket.s3.dualstack.us-east-1.amazonaws.com/blob",
+        // The same bucket in another region or endpoint form.
+        "https://docker-images-prod.s3.dualstack.us-west-2.amazonaws.com/blob",
+        "https://docker-images-prod.s3.amazonaws.com/blob",
+        "https://docker-images-prod.s3.us-east-1.amazonaws.com/blob",
+        // Path style: the bucket in the path, not the host.
+        "https://s3.dualstack.us-east-1.amazonaws.com/docker-images-prod/blob",
+        "https://s3.amazonaws.com/docker-images-prod/blob",
+        // Under, before and around the admitted host.
+        "https://x.docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/blob",
+        "https://evildocker-images-prod.s3.dualstack.us-east-1.amazonaws.com/blob",
+        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.evil.example/blob",
+        "https://amazonaws.com/blob",
+        // The admitted host with another port, a trailing dot, http,
+        // userinfo.
+        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:8443/blob",
+        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com./blob",
+        "http://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/blob",
+        "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com@evil.example/blob",
+        "https://user@docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/blob",
+        // Addresses and look-alikes.
+        "https://52.216.0.1/blob",
+        "https://[2600:1fa0::1]/blob",
+        "https://docker-images-pr\u{43e}d.s3.dualstack.us-east-1.amazonaws.com/blob",
+        "https://xn--docker-images-prd-7ob.s3.dualstack.us-east-1.amazonaws.com/blob",
+    ] {
+        let tmp = TempDir::new("redirect-exact-refused");
+        let target = location.to_owned();
+        let (fake, d) = s3_hub(b"blob bytes", move |s| {
+            (is_api(s) && authorized(s) && s.target.contains("/blobs/"))
+                .then(|| Reply::http(307, &[("Location", &target)], b""))
+        });
+        let dest = blobs(&tmp, &d);
+        let detail = assert_failed(get_blob(&fake, &d, &dest), location);
+        assert!(
+            detail.contains("not on the allowlist") || detail.contains("refused"),
+            "{location}: {detail}"
+        );
+        assert!(
+            only_api_or_auth_dialed(&fake),
+            "{location}: dialed {:?}",
+            fake.dials()
+        );
+        assert!(
+            entries(dest.parent().expect("dir")).is_empty(),
+            "{location}"
+        );
+    }
+}
+
+#[test]
+fn redirect_s3_host_only_for_docker_hub() {
+    // Docker Hub's hosts without its exact redirect list: the suffix
+    // `.docker.com` alone does not admit the S3 host.
+    let plain = Registry::new(
+        "docker.io",
+        "registry-1.docker.io",
+        &["auth.docker.io"],
+        &[".docker.com"],
+    )
+    .expect("registry");
+    let tmp = TempDir::new("redirect-s3-other-registry");
+    let (fake, d) = s3_hub(b"blob bytes", |_| None);
+    let dest = blobs(&tmp, &d);
+    let detail = assert_failed(get_blob_from(&plain, &fake, &d, &dest), "plain registry");
+    assert!(detail.contains("not on the allowlist"), "{detail}");
+    assert!(only_api_or_auth_dialed(&fake), "dialed {:?}", fake.dials());
+    assert!(entries(dest.parent().expect("dir")).is_empty());
+
+    // A registry on another host with the same suffix rule refuses it too.
+    let ghcr = Registry::new(
+        "ghcr.io",
+        "ghcr.io",
+        &["ghcr.io"],
+        &[".githubusercontent.com"],
+    )
+    .expect("ghcr");
+    let tmp = TempDir::new("redirect-s3-ghcr");
+    let fake = Fake::new(|s| {
+        if s.host == "ghcr.io" && s.target.contains("/blobs/") {
+            Reply::http(307, &[("Location", &format!("https://{S3}/blob"))], b"")
+        } else {
+            Reply::status(404)
+        }
+    });
+    let d = Descriptor {
+        media_type: media::TAR.to_owned(),
+        digest: Digest::parse(&digest_of(b"blob bytes")).expect("digest"),
+        size: 10,
+    };
+    let dest = blobs(&tmp, &d);
+    let detail = assert_failed(get_blob_from(&ghcr, &fake, &d, &dest), "ghcr");
+    assert!(detail.contains("not on the allowlist"), "{detail}");
+    assert!(
+        fake.dials().iter().all(|(h, _)| h == "ghcr.io"),
+        "dialed {:?}",
+        fake.dials()
+    );
+
+    // Docker Hub's exact list is exactly the measured set: the same
+    // registry built by hand with that list equals `docker_hub()`.
+    assert_ne!(plain, Registry::docker_hub());
+    assert_eq!(
+        plain.with_redirect_hosts(&[S3]).expect("exact host"),
+        Registry::docker_hub()
+    );
+}
+
+#[test]
+fn redirect_hosts_grammar() {
+    let plain = || {
+        Registry::new(
+            "docker.io",
+            "registry-1.docker.io",
+            &["auth.docker.io"],
+            &[".docker.com"],
+        )
+        .expect("registry")
+    };
+    assert!(plain().with_redirect_hosts(&[S3]).is_ok());
+    assert_eq!(
+        plain().with_redirect_hosts(&[]).expect("no hosts"),
+        plain(),
+        "an empty list admits nothing"
+    );
+    // Each refusal with the reason it names; "" where the URL grammar of
+    // ADR-003 refuses the entry before the exact-host checks.
+    for (host, reason) in [
+        (".s3.dualstack.us-east-1.amazonaws.com", "not a suffix"),
+        (".amazonaws.com", "not a suffix"),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:443",
+            "without a port",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com:8443",
+            "without a port",
+        ),
+        ("", ""),
+        (" ", ""),
+        (
+            "Docker-Images-Prod.s3.dualstack.us-east-1.amazonaws.com",
+            "lowercase",
+        ),
+        (
+            "DOCKER-IMAGES-PROD.S3.DUALSTACK.US-EAST-1.AMAZONAWS.COM",
+            "lowercase",
+        ),
+        ("52.216.0.1", "not an IP address"),
+        ("[2600:1fa0::1]", "not an IP address"),
+        ("2600:1fa0::1", ""),
+        (
+            "user@docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com.",
+            "",
+        ),
+        (
+            "docker_images_prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        ("*.s3.dualstack.us-east-1.amazonaws.com", ""),
+        (
+            "https://docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+        (
+            "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com/x",
+            "",
+        ),
+        (
+            "docker-images-pr\u{43e}d.s3.dualstack.us-east-1.amazonaws.com",
+            "",
+        ),
+    ] {
+        match plain().with_redirect_hosts(&[S3, host]) {
+            Err(boneli_oci::Error::InvalidRegistry(detail)) => {
+                assert!(detail.contains(&format!("{host:?}")), "{host:?}: {detail}");
+                assert!(detail.contains(reason), "{host:?}: {detail}");
+            }
+            other => panic!("{host:?}: expected InvalidRegistry, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn s3_tampered_blob_never_cached() {
+    // The S3 host serves other bytes of the right length.
+    const BYTES: &[u8] = b"the real layer";
+    let tmp = TempDir::new("s3-tampered");
+    let (fake, d) = s3_hub(BYTES, |s| {
+        (s.host == S3).then(|| Reply::http(200, &[], b"the fake layer"))
+    });
+    let dest = blobs(&tmp, &d);
+    let detail = assert_failed(get_blob(&fake, &d, &dest), "tampered at S3");
+    assert!(detail.contains("digest"), "{detail}");
+    assert!(entries(dest.parent().expect("dir")).is_empty());
+    assert!(!dest.exists());
+
+    // And one byte more is refused by length.
+    let tmp = TempDir::new("s3-longer");
+    let (fake, d) = s3_hub(BYTES, |s| {
+        (s.host == S3).then(|| Reply::http(200, &[], b"the real layer!"))
+    });
+    let dest = blobs(&tmp, &d);
+    let detail = assert_failed(get_blob(&fake, &d, &dest), "longer at S3");
+    assert!(detail.contains("longer than"), "{detail}");
+    assert!(entries(dest.parent().expect("dir")).is_empty());
+}
+
+/// A blob the API redirects to CloudFront, which chains `/hop/1` ..
+/// `/hop/<hops>` and then redirects to the S3 host, which serves it:
+/// `hops + 1` redirects in all.
+fn cloudfront_then_s3(hops: usize) -> (Fake, Descriptor) {
+    s3_hub(b"two hosts", move |s| {
+        if is_api(s) && authorized(s) && s.target.contains("/blobs/") {
+            return Some(Reply::http(
+                307,
+                &[("Location", "https://production.cloudfront.docker.com/hop/1")],
+                b"",
+            ));
+        }
+        if s.host != "production.cloudfront.docker.com" {
+            return None;
+        }
+        let n: usize = s.target.strip_prefix("/hop/")?.parse().ok()?;
+        Some(if n < hops {
+            Reply::http(302, &[("Location", &format!("/hop/{}", n + 1))], b"")
+        } else {
+            let digest = digest_of(b"two hosts");
+            Reply::http(
+                307,
+                &[("Location", &format!("https://{S3}/blobs/{digest}"))],
+                b"",
+            )
+        })
+    })
+}
+
+#[test]
+fn redirect_chain_cloudfront_then_s3() {
+    let tmp = TempDir::new("chain-cf-s3");
+    let (fake, d) = cloudfront_then_s3(1);
+    let dest = blobs(&tmp, &d);
+    get_blob(&fake, &d, &dest).expect("CloudFront, then S3");
+    assert_eq!(std::fs::read(&dest).expect("blob"), b"two hosts");
+    let hosts: Vec<String> = fake.seen().into_iter().map(|s| s.host).collect();
+    assert_eq!(
+        hosts.iter().rev().take(2).collect::<Vec<_>>(),
+        [S3, "production.cloudfront.docker.com"],
+        "{hosts:?}"
+    );
+    for s in fake.seen().iter().filter(|s| !is_api(s)) {
+        assert_eq!(
+            s.header("authorization"),
+            None,
+            "Authorization to {}",
+            s.host
+        );
+    }
+
+    // The limit counts every hop over both hosts: 10 redirects pass, 11
+    // are refused before the S3 host is dialed.
+    let tmp = TempDir::new("chain-cf-s3-10");
+    let (fake, d) = cloudfront_then_s3(9);
+    get_blob(&fake, &d, &blobs(&tmp, &d)).expect("10 redirects");
+
+    let tmp = TempDir::new("chain-cf-s3-11");
+    let (fake, d) = cloudfront_then_s3(10);
+    let dest = blobs(&tmp, &d);
+    let detail = assert_failed(get_blob(&fake, &d, &dest), "11 redirects");
+    assert!(detail.contains("redirects"), "{detail}");
+    assert!(!fake.dials().iter().any(|(h, _)| h == S3), "S3 was dialed");
+    assert!(entries(dest.parent().expect("dir")).is_empty());
+}
+
 /// A manifest request whose API answers `challenge` until it sees the
 /// hub's token; any host that gets a request for `/token` hands it out.
 fn with_challenge(challenge: &str) -> (Result<boneli_oci::Fetched, PullError>, Fake) {
