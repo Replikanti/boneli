@@ -158,7 +158,9 @@ enum OnConnect {
 /// A fake HTTP proxy on 127.0.0.1. Every connection counts and every
 /// request head is recorded; `CONNECT` goes as `on_connect` says, and an
 /// absolute-form `GET` gets the answer of the first entry of `gets` whose
-/// prefix its target starts with, or `502`.
+/// prefix its target starts with, or `502`. A proxy started with
+/// `requiring` answers `407` to any request without that
+/// `Proxy-Authorization` value, as an authenticating proxy does.
 struct FakeProxy {
     addr: SocketAddr,
     heads: Arc<Mutex<Vec<String>>>,
@@ -167,23 +169,34 @@ struct FakeProxy {
 
 impl FakeProxy {
     fn start(on_connect: OnConnect, gets: Vec<(String, Vec<u8>)>) -> FakeProxy {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        FakeProxy::on(listener, on_connect, gets)
+        FakeProxy::requiring(on_connect, gets, None)
     }
 
-    fn on(listener: TcpListener, on_connect: OnConnect, gets: Vec<(String, Vec<u8>)>) -> FakeProxy {
+    fn requiring(
+        on_connect: OnConnect,
+        gets: Vec<(String, Vec<u8>)>,
+        auth: Option<String>,
+    ) -> FakeProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let heads = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
         let (record, count) = (Arc::clone(&heads), Arc::clone(&connections));
         let gets = Arc::new(gets);
+        let auth = Arc::new(auth);
         thread::spawn(move || {
             for tcp in listener.incoming() {
                 let Ok(tcp) = tcp else { continue };
                 count.fetch_add(1, Ordering::SeqCst);
-                let (record, on_connect, gets) =
-                    (Arc::clone(&record), on_connect.clone(), Arc::clone(&gets));
-                thread::spawn(move || proxy_connection(tcp, &record, &on_connect, &gets));
+                let (record, on_connect, gets, auth) = (
+                    Arc::clone(&record),
+                    on_connect.clone(),
+                    Arc::clone(&gets),
+                    Arc::clone(&auth),
+                );
+                thread::spawn(move || {
+                    proxy_connection(tcp, &record, &on_connect, &gets, auth.as_deref())
+                });
             }
         });
         FakeProxy {
@@ -219,11 +232,21 @@ fn proxy_connection(
     record: &Mutex<Vec<String>>,
     on_connect: &OnConnect,
     gets: &[(String, Vec<u8>)],
+    auth: Option<&str>,
 ) {
     let _ = client.set_read_timeout(Some(GUARD));
     let _ = client.set_write_timeout(Some(GUARD));
     let head = String::from_utf8_lossy(&read_head(&mut client)).into_owned();
     record.lock().expect("record").push(head.clone());
+    if let Some(auth) = auth
+        && !head.contains(&format!("\r\nProxy-Authorization: {auth}\r\n"))
+    {
+        let _ = client.write_all(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+Proxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n",
+        );
+        return;
+    }
     if head.starts_with("CONNECT ") {
         match on_connect {
             OnConnect::Tunnel(origin) => {
@@ -697,13 +720,15 @@ fn proxy_silent_after_accept_fails_at_the_deadline() {
 // ------------------------------------------------------------- revocation
 
 /// The leaf's `http` CRL point is an absolute-form `GET` to the proxy,
-/// and the list it answers settles the leaf.
+/// and the list it answers settles the leaf. Against a proxy that asks for
+/// credentials, the `GET` carries them only on its retry after `407`.
 #[test]
 fn crl_fetch_goes_through_the_proxy() {
     let origin = Origin::start(server_config(&[CRL_GOOD], CRL_LEAF_KEY));
-    let proxy = FakeProxy::start(
+    let proxy = FakeProxy::requiring(
         OnConnect::Tunnel(origin.addr),
         vec![(CRL_URL.into(), ok_with(CRL_FRESH))],
+        Some(credentials().header_value()),
     );
     let config = TlsConfig::new(roots(CRL_CA))
         .expect("config")
@@ -712,20 +737,25 @@ fn crl_fetch_goes_through_the_proxy() {
         .dial("localhost", origin.addr.port(), Instant::now() + GUARD)
         .expect("dial");
     drop(stream);
-    let heads = proxy.heads();
-    let get = heads
-        .iter()
-        .find(|h| h.starts_with("GET "))
-        .expect("a GET through the proxy");
+    // The CONNECT carries the credentials up front; the GET goes without
+    // them first and again with them after the proxy's 407 (ADR-039, D8).
+    let port = origin.addr.port();
     assert_eq!(
-        get,
-        &format!(
-            "GET {CRL_URL} HTTP/1.1\r\nHost: crl.boneli.test\r\n\
+        proxy.heads(),
+        [
+            format!(
+                "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\
 Proxy-Authorization: Basic {}\r\n\r\n",
-            encoded()
-        )
+                encoded()
+            ),
+            format!("GET {CRL_URL} HTTP/1.1\r\nHost: crl.boneli.test\r\n\r\n"),
+            format!(
+                "GET {CRL_URL} HTTP/1.1\r\nHost: crl.boneli.test\r\n\
+Proxy-Authorization: Basic {}\r\n\r\n",
+                encoded()
+            ),
+        ]
     );
-    assert_eq!(heads.len(), 2, "{heads:?}");
 }
 
 /// The status a `TlsStream` reports, through the proxy.

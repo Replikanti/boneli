@@ -157,7 +157,8 @@ documents for `with_resolver`.
   42 leaf lists and 23 CA lists, and every OCSP responder measured for
   ADR-020 are `http`) go as an
   absolute-form `GET http://host/path HTTP/1.1` to the proxy, with `Host`
-  the point's and `Proxy-Authorization` when set (RFC 9112, 3.2.2).
+  the point's (RFC 9112, 3.2.2) and no `Proxy-Authorization` until the
+  proxy asks for it (D8).
   `boneli_http::Connection::new_via_proxy` is the only writer of the
   absolute form. This is a client-only exception to ADR-003 item 3: the
   server still refuses absolute and asterisk forms (its test
@@ -170,9 +171,12 @@ documents for `with_resolver`.
   (no revocation check of its own, ADR-017 item 6); the request inside
   the tunnel carries `Host` only.
 - A refused `CONNECT` is `CrlFetchError::Unreachable` whose text is
-  `Error::Proxy`'s: the proxy, the target and the status. A non-200
-  answer to a proxied `GET` is `CrlFetchError::Status`, as on a direct
-  fetch: the client cannot tell whether the proxy or the server behind it
+  `Error::Proxy`'s: the proxy, the target and the status. A `407` to a
+  proxied `GET` is `Unreachable` too, naming the proxy: without
+  credentials it says none are configured, and after the one retry with
+  them it says the proxy refused them (D8). Any other non-200 answer to a
+  proxied `GET` is `CrlFetchError::Status`, as on a direct fetch: the
+  client cannot tell whether the proxy or the server behind it
   answered. Either way the check fails closed with `RevocationUnknown`
   naming the URL, so the operator knows which host to allow.
 - A caching proxy is an on-path party, which ADR-017 already assumes for
@@ -203,13 +207,32 @@ documents for `with_resolver`.
   port not 0); an error does not echo the host, which may hold userinfo.
 - One proxy for every connection of a `TlsConfig`; no per-host routes.
 - An HTTP proxy, reached in plain HTTP, with optional `Basic`
-  credentials sent up front on every `CONNECT` and proxied `GET`
-  (`boneli_http::connect_tunnel_with` writes them after `Host`). Sending
-  them before a `407` saves a round trip per connection, and the runner
-  opens one connection per request (ADR-009 D10). Weak spots: a proxy
-  that requires NTLM or Kerberos is not supported, and a registry
-  reachable only directly next to one reachable only through the proxy
-  needs two stores until a `NO_PROXY` follow-up.
+  credentials.
+  - **`CONNECT`: sent up front** (`boneli_http::connect_tunnel_with`
+    writes them after `Host`). The proxy consumes a `CONNECT` head and
+    relays only the tunnel's bytes, so the field cannot reach the target,
+    and sending it before a `407` saves a round trip per connection; the
+    runner opens one connection per request (ADR-009 D10).
+  - **Proxied `GET` (the `http` revocation fetches, D6): sent only after
+    a `407`.** A forward proxy that did not authenticate the request
+    itself may forward `Proxy-Authorization` to the server with the rest
+    of the head: Apache httpd's `mod_proxy` unsets it only when it
+    authenticated the user (`proxy_util.c`), so behind an IP access rule
+    or as a parent proxy it passes the field on. The #55 part 1 review
+    reproduced this with Apache 2.4.69: the CRL server received the
+    runner's proxy credentials in cleartext. Squid drops the field toward
+    servers. So the first `GET` carries no credentials; on a `407` the
+    fetch retries once, on a new connection under the same deadline,
+    with `Proxy-Authorization`; a second `407` fails closed with
+    `Unreachable` ("refused the configured credentials"), and a `407`
+    without configured credentials is not retried. A proxy that asks for
+    credentials has consumed them, so the retry does not leak them on.
+    Cost: one more connection and round trip per revocation fetch through
+    an authenticating proxy, at most once per list or answer per cache
+    period (24 h, ADR-017 and ADR-020); D9 counts it in the setup time.
+  - Weak spots: a proxy that requires NTLM or Kerberos is not supported,
+    and a registry reachable only directly next to one reachable only
+    through the proxy needs two stores until a `NO_PROXY` follow-up.
 
 ### D9. Limits and deadlines
 
@@ -253,17 +276,50 @@ documents for `with_resolver`.
   Lower cuts a proxied connection off inside its own bounds; higher only
   lets a small fetch through a proxy hang longer. `StoreConfig::production`
   uses it when the `TlsConfig` has a proxy, 30 s otherwise.
-- **Revocation constants stay as they are.** An `http` point through a
-  proxy needs TCP to the proxy (10 s) + the proxy's upstream connect
-  (seen as one read, bounded by `CRL_IO_TIMEOUT` 10 s) + one round trip,
-  about 21 s, inside `CRL_SETUP_TIME` (30 s). An `https` point has three
-  phases, TCP to the proxy, the `CONNECT` answer and the handshake, about
-  31 s, over 30 s. Weak spot: an `https` point behind a slow proxy can be
-  cut off inside its own bounds. None of the measured points is `https`
-  (ADR-017: 65 of 65 CRL URLs, CA lists included, `http`; ADR-020:
-  every responder), so in practice this is a customer CA's
-  point; raising `CRL_SETUP_TIME` for it would lengthen every check's
-  deadline for a case not seen.
+- **Revocation constants stay as they are.** The bounds are ADR-017's:
+  `CRL_CONNECT_TIMEOUT` 10 s per TCP connect, `CRL_IO_TIMEOUT` 10 s per
+  read (the proxy's own connect to the server is seen as one read, so it
+  is bounded by it), `CRL_HANDSHAKE_TIMEOUT` 10 s, and a round trip with
+  the server's time, at most 0.211 s measured (rounded to 0.25 s here).
+  Through a proxy:
+  - `http` point, proxy without authentication: TCP to the proxy (10 s)
+    + the proxy's upstream connect (10 s) + one round trip, about 20.3 s,
+    inside `CRL_SETUP_TIME` (30 s).
+  - `http` point, authenticating proxy (D8): the first attempt is TCP to
+    the proxy (10 s) + the `407`, which the proxy answers itself (one
+    round trip, 0.25 s); the retry is TCP again (10 s) + the upstream
+    connect (10 s) + one round trip (0.25 s): about 30.5 s, 0.5 s over.
+  - `https` point: TCP to the proxy (10 s) + the `CONNECT` answer, which
+    waits for the upstream connect (10 s) + the handshake (10 s) + one
+    round trip, about 30.3 s, 0.3 s over; credentials go up front, so no
+    `407` round.
+  What "over" means: `CRL_SETUP_TIME` is not a timeout of its own but the
+  setup share of the check's deadline (`CRL_CHECK_DEADLINE` = 30 s +
+  `MAX_CRL_BYTES` at `CRL_MIN_RATE`, 62 s; `CA_CRL_CHECK_DEADLINE` 38 s).
+  A fetch that hits every bound leaves its body less than the 32 s
+  budgeted, at most 0.5 s less: a list at the 32 MiB cap at exactly
+  1 MiB/s would then miss the deadline, the largest measured list
+  (11,005,110 B, 10.5 s at that rate) would not, and a fetch that hits
+  none of the bounds is unaffected. Weak spot, accepted: raising
+  `CRL_SETUP_TIME` to 31 s would lengthen every check's deadline, proxied
+  or not, for a worst case that needs three 10 s bounds to be hit in one
+  fetch. None of the measured points is `https` (ADR-017: 65 of 65 CRL
+  URLs, CA lists included, `http`; ADR-020: every responder), so the
+  `https` case is a customer CA's point.
+- **OCSP through a proxy.** `OCSP_CHECK_DEADLINE` (31 s, ADR-020) is the
+  sum of the bounds of a direct fetch: connect (10 s), TLS for an `https`
+  responder (10 s), the response (10 s) and 1 s of body. A direct `http`
+  responder uses 21 s of it. Through a proxy the response read also
+  covers the proxy's upstream connect (one read, still bounded by 10 s):
+  an `http` responder needs about 21 s without proxy authentication and
+  about 31.3 s with it (TCP 10 s + the `407` 0.25 s + TCP 10 s + the
+  response 10 s + 1 s), 0.3 s over; an `https` responder needs TCP
+  (10 s) + the `CONNECT` answer (10 s) + TLS (10 s) + the response
+  (10 s) + 1 s, about 41 s, 10 s over. Weak spot, accepted for the same
+  reason: it takes every bound to be hit in one fetch, no measured
+  responder is `https`, and a longer deadline would delay every failing
+  OCSP check, proxied or not. A check cut short fails closed with
+  `RevocationUnknown`, it never passes a certificate.
 
 ### D10. Tests and the live check
 
@@ -276,13 +332,18 @@ and tunnels to local rustls servers that record what they receive: the
 trusted leaf passes, an untrusted one is refused behind a tunnel and
 behind a proxy that terminates TLS itself, an invalid target and a past
 deadline dial nothing, the target is never resolved, the proxy's
-addresses are tried in turn, credentials appear on `CONNECT` and proxied
-`GET` only, refusals are `Error::Proxy` without secrets, the head limits
+addresses are tried in turn, credentials appear on `CONNECT` and, only
+after a `407`, on a proxied `GET` (against a fake proxy that asks for
+them), refusals are `Error::Proxy` without secrets, the head limits
 hold at their edge, a silent proxy fails at the deadline, the leaf's CRL,
 an intermediate's CA list and an OCSP responder are fetched through the
 proxy and a refused fetch fails closed, and the configuration order and
 `connect`'s refusal hold. Unit tests cover the credential and host rules,
-the RFC 7617 vector, the `https` point through a tunnel and redaction.
+the RFC 7617 vector, the `https` point through a tunnel, redaction, and
+the `407` rule of D8: no credentials on the first `GET`, the retry
+carries them, a second `407` fails closed with no third try, a `407`
+without credentials is not retried, and a `CONNECT` carries them up front
+and is not retried.
 The live revocation tests (`tests/network.rs`, `ocsp::live`) still run
 direct.
 
@@ -327,9 +388,14 @@ absolute-form CRL `GET`.
   `HTTPS_PROXY` points at `boneli-egress`.
 - **`CONNECT` to port 80 for `http` points.** Rejected: Squid's default
   configuration refuses it (D6).
-- **Waiting for `407` before sending proxy credentials.** Rejected: one
-  more round trip per connection for no gain; the credentials go to the
-  proxy either way.
+- **Waiting for `407` before sending proxy credentials on `CONNECT`.**
+  Rejected: one more round trip per connection for no gain, because a
+  proxy consumes the `CONNECT` head and the field cannot reach the target.
+- **Sending proxy credentials up front on a proxied `GET` too.**
+  Rejected after review (D8): a proxy that does not authenticate the
+  request may pass the field on to the server in cleartext, as Apache
+  httpd's forward proxy does; the saved round trip is not worth the
+  credentials.
 - **NTLM, Negotiate, Digest, SOCKS, TLS to the proxy.** Out of scope:
   each needs a protocol implementation (NTLM and Negotiate need a GSSAPI
   or an NTLM crate, which ADR-001 would have to admit) and #55 asks for

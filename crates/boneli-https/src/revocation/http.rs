@@ -14,13 +14,18 @@
 //!
 //! With a proxy in the configuration every fetch goes through it (ADR-039,
 //! D6): only the proxy's name is resolved; an `http` point or responder is
-//! an absolute-form `GET http://host/path` to the proxy, with
-//! `Proxy-Authorization` when credentials are set; an `https` one is a
-//! `CONNECT` tunnel and then TLS as above, and the request inside the
-//! tunnel carries `Host` only. A refused `CONNECT` is
-//! `CrlFetchError::Unreachable` naming the proxy, the target and the
-//! status; a non-200 answer to a proxied `GET`, from the proxy or the
-//! server behind it, is `CrlFetchError::Status`, as on a direct fetch.
+//! an absolute-form `GET http://host/path` to the proxy, first without
+//! credentials: a proxy that does not authenticate a request itself may
+//! pass `Proxy-Authorization` on to the server (Apache httpd's forward
+//! proxy does), so the field goes out only on one retry, on a new
+//! connection, after the proxy answered `407`. An `https` one is a
+//! `CONNECT` tunnel with `Proxy-Authorization` up front (the proxy reads a
+//! `CONNECT` head and relays nothing of it) and then TLS as above, and the
+//! request inside the tunnel carries `Host` only. A refused `CONNECT` and
+//! a `407` to a `GET` are `CrlFetchError::Unreachable` naming the proxy and
+//! the status; any other non-200 answer to a proxied `GET`, from the proxy
+//! or the server behind it, is `CrlFetchError::Status`, as on a direct
+//! fetch.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -73,6 +78,42 @@ impl HttpSource {
         cap: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, CrlFetchError> {
+        let first = self.fetch_once(url, path, cap, deadline, false);
+        let Some(proxy) = self.tls.proxy() else {
+            return first;
+        };
+        // Only a proxied `GET` waits for `407` before it sends credentials
+        // (ADR-039, D8); a `CONNECT` carried them already.
+        if !matches!(url.scheme(), CrlScheme::Http) || first != Err(CrlFetchError::Status(407)) {
+            return first;
+        }
+        if !proxy.has_credentials() {
+            return Err(CrlFetchError::Unreachable(format!(
+                "the proxy {} answered 407 to GET {url}: it asks for credentials and none are configured",
+                proxy.authority()
+            )));
+        }
+        // One retry, on a new connection, under the same deadline.
+        match self.fetch_once(url, path, cap, deadline, true) {
+            Err(CrlFetchError::Status(407)) => Err(CrlFetchError::Unreachable(format!(
+                "the proxy {} answered 407 to GET {url} again: it refused the configured credentials; only Basic is sent",
+                proxy.authority()
+            ))),
+            other => other,
+        }
+    }
+
+    /// One fetch on one connection: to the point's host, or to the proxy,
+    /// whose `Proxy-Authorization` a proxied `GET` carries only when
+    /// `credentials` is set.
+    fn fetch_once(
+        &self,
+        url: &CrlUrl,
+        path: &str,
+        cap: usize,
+        deadline: Instant,
+        credentials: bool,
+    ) -> Result<Vec<u8>, CrlFetchError> {
         time_left(deadline).map_err(io_error)?;
         // With a proxy only the proxy's name is resolved (ADR-039, D6).
         let (host, port, what) = match self.tls.proxy() {
@@ -93,7 +134,7 @@ impl HttpSource {
         for addr in addrs {
             let left = time_left(deadline).map_err(io_error)?;
             match TcpStream::connect_timeout(&addr, left.min(self.connect_timeout)) {
-                Ok(tcp) => return self.get(tcp, url, path, cap, deadline),
+                Ok(tcp) => return self.get(tcp, url, path, cap, deadline, credentials),
                 Err(e) => last = Some(e),
             }
         }
@@ -110,6 +151,7 @@ impl HttpSource {
         path: &str,
         cap: usize,
         deadline: Instant,
+        credentials: bool,
     ) -> Result<Vec<u8>, CrlFetchError> {
         let socket = DeadlineSocket::new(tcp, deadline);
         socket
@@ -117,7 +159,10 @@ impl HttpSource {
             .and_then(|()| socket.set_write_timeout(Some(self.io_timeout)))
             .map_err(io_error)?;
         match (url.scheme(), self.tls.proxy()) {
-            (CrlScheme::Http, proxy) => request(socket, url, path, cap, proxy),
+            (CrlScheme::Http, None) => request(socket, url, path, cap, Route::Direct),
+            (CrlScheme::Http, Some(proxy)) => {
+                request(socket, url, path, cap, Route::Proxy { proxy, credentials })
+            }
             (CrlScheme::Https, None) => self.https(socket, url, path, cap, deadline),
             (CrlScheme::Https, Some(proxy)) => {
                 let tunnel = proxy
@@ -150,7 +195,7 @@ impl HttpSource {
                     other => CrlFetchError::Unreachable(format!("TLS: {other}")),
                 })?;
         // Inside the tunnel the request is the server's: no proxy field.
-        request(tls, url, path, cap, None)
+        request(tls, url, path, cap, Route::Direct)
     }
 }
 
@@ -211,15 +256,26 @@ impl OcspSource for HttpSource {
     }
 }
 
+/// Where a `GET` goes.
+#[derive(Clone, Copy)]
+enum Route<'a> {
+    /// To the point's host, or inside a tunnel.
+    Direct,
+    /// To `proxy` in the absolute form, with its `Proxy-Authorization`
+    /// only when `credentials` is set: on the retry after a `407`
+    /// (ADR-039, D8).
+    Proxy { proxy: &'a Proxy, credentials: bool },
+}
+
 /// `GET <path>` with `Host` only; 200, no content coding, the whole body
-/// of at most `cap` bytes. Through `proxy`, an `http` URL only: the
-/// absolute form, plus `Proxy-Authorization` when credentials are set.
+/// of at most `cap` bytes. Through a proxy, an `http` URL only: the
+/// absolute form, plus `Proxy-Authorization` on the retry after a `407`.
 fn request<S: Read + Write + IdleCheck>(
     stream: S,
     url: &CrlUrl,
     path: &str,
     cap: usize,
-    proxy: Option<&Proxy>,
+    route: Route<'_>,
 ) -> Result<Vec<u8>, CrlFetchError> {
     let limits =
         Limits::new(CRL_MAX_HEAD_BYTES, CRL_MAX_HEADERS, cap as u64).map_err(http_error)?;
@@ -227,10 +283,12 @@ fn request<S: Read + Write + IdleCheck>(
         Method::new("GET").map_err(http_error)?,
         Target::Origin(path.to_owned()),
     );
-    let mut conn = match proxy {
-        None => Connection::new(stream, &url.authority(), limits),
-        Some(proxy) => {
-            head.headers = proxy.fields();
+    let mut conn = match route {
+        Route::Direct => Connection::new(stream, &url.authority(), limits),
+        Route::Proxy { proxy, credentials } => {
+            if credentials {
+                head.headers = proxy.fields();
+            }
             Connection::new_via_proxy(stream, &url.authority(), limits)
         }
     }
@@ -767,8 +825,9 @@ mod tests {
     }
 
     /// An `http` point through the proxy: one absolute-form `GET` with
-    /// `Host` and `Proxy-Authorization`, to the proxy, never to the point's
-    /// host (`crl.boneli.test` does not resolve).
+    /// `Host` only, to the proxy, never to the point's host
+    /// (`crl.boneli.test` does not resolve). The credentials stay back
+    /// until the proxy asks for them (ADR-039, D8).
     #[test]
     fn http_point_is_an_absolute_get_to_the_proxy() {
         let (addr, server) = answer(ok_with(b"list"));
@@ -780,8 +839,7 @@ mod tests {
         let head = String::from_utf8(server.join().expect("server")).expect("ASCII");
         assert_eq!(
             head,
-            "GET http://crl.boneli.test/ca.crl HTTP/1.1\r\nHost: crl.boneli.test\r\n\
-Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+            "GET http://crl.boneli.test/ca.crl HTTP/1.1\r\nHost: crl.boneli.test\r\n\r\n"
         );
         // A non-200 from the proxy is a status, as on a direct fetch.
         let (addr, _server) =
@@ -790,6 +848,143 @@ Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
             crl(&proxied(addr), &point, deadline()),
             Err(CrlFetchError::Status(403))
         );
+    }
+
+    /// A proxy's `407` with a `Basic` challenge.
+    const PROXY_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+Proxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\n\r\n";
+
+    /// Accepts one connection per answer, in order, reads its request head
+    /// and writes the answer. Returns the heads and the listener, so a
+    /// test can check that no further connection came.
+    fn sequence(
+        answers: Vec<Vec<u8>>,
+    ) -> (SocketAddr, thread::JoinHandle<(Vec<String>, TcpListener)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = thread::spawn(move || {
+            let mut heads = Vec::new();
+            for answer in answers {
+                let (mut tcp, _) = listener.accept().expect("accept");
+                tcp.set_read_timeout(Some(GUARD)).expect("timeout");
+                heads.push(String::from_utf8(read_head(&mut tcp)).expect("ASCII"));
+                let _ = tcp.write_all(&answer);
+            }
+            (heads, listener)
+        });
+        (addr, handle)
+    }
+
+    /// Whether a connection is waiting on `listener`.
+    fn another_connection(listener: &TcpListener) -> bool {
+        listener.set_nonblocking(true).expect("nonblocking");
+        thread::sleep(Duration::from_millis(100));
+        listener.accept().is_ok()
+    }
+
+    /// The proxy answers the plain `GET` with `407`: one retry on a new
+    /// connection carries `Proxy-Authorization`, and its answer counts.
+    #[test]
+    fn proxied_get_sends_credentials_only_after_407() {
+        let (addr, server) = sequence(vec![PROXY_407.to_vec(), ok_with(b"list")]);
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        assert_eq!(
+            crl(&proxied(addr), &point, deadline()),
+            Ok(b"list".to_vec())
+        );
+        let (heads, listener) = server.join().expect("server");
+        assert_eq!(
+            heads,
+            [
+                "GET http://crl.boneli.test/ca.crl HTTP/1.1\r\nHost: crl.boneli.test\r\n\r\n",
+                "GET http://crl.boneli.test/ca.crl HTTP/1.1\r\nHost: crl.boneli.test\r\n\
+Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            ]
+        );
+        assert!(!another_connection(&listener), "a third request");
+        // The OCSP path goes through the same fetch.
+        let (addr, server) = sequence(vec![PROXY_407.to_vec(), ok_with(b"answer")]);
+        let responder = CrlUrl::parse("http://ocsp.boneli.test/").expect("URL");
+        assert_eq!(
+            ocsp(&proxied(addr), &responder, REQUEST, deadline()),
+            Ok(b"answer".to_vec())
+        );
+        let (heads, _) = server.join().expect("server");
+        assert!(!heads[0].contains("Proxy-Authorization"), "{heads:?}");
+        assert!(
+            heads[1].contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"),
+            "{heads:?}"
+        );
+    }
+
+    /// A second `407` fails closed with an error that names the proxy and
+    /// the refusal, never the credentials; there is no third try.
+    #[test]
+    fn second_407_fails_closed() {
+        let (addr, server) = sequence(vec![PROXY_407.to_vec(), PROXY_407.to_vec()]);
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        let err = crl(&proxied(addr), &point, deadline()).expect_err("refused");
+        assert_eq!(
+            err,
+            CrlFetchError::Unreachable(format!(
+                "the proxy 127.0.0.1:{} answered 407 to GET http://crl.boneli.test/ca.crl again: \
+it refused the configured credentials; only Basic is sent",
+                addr.port()
+            ))
+        );
+        let (heads, listener) = server.join().expect("server");
+        assert_eq!(heads.len(), 2);
+        assert!(!another_connection(&listener), "a third request");
+    }
+
+    /// Without credentials a `407` is not retried and says that none are
+    /// configured.
+    #[test]
+    fn proxied_407_without_credentials_is_not_retried() {
+        let (addr, server) = sequence(vec![PROXY_407.to_vec()]);
+        let proxy = Proxy::new("127.0.0.1", addr.port()).expect("proxy");
+        let tls = TlsConfig::new(crl_roots())
+            .expect("config")
+            .with_proxy(proxy);
+        let source = HttpSource::new(tls.without_revocation());
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        let err = crl(&source, &point, deadline()).expect_err("refused");
+        let CrlFetchError::Unreachable(text) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(text.contains("answered 407"), "{text}");
+        assert!(text.contains("none are configured"), "{text}");
+        let (_, listener) = server.join().expect("server");
+        assert!(
+            !another_connection(&listener),
+            "a retry without credentials"
+        );
+    }
+
+    /// `CONNECT` keeps its credentials up front, and its `407` is final:
+    /// no retry.
+    #[test]
+    fn connect_carries_credentials_up_front_and_407_is_final() {
+        let (addr, server) = sequence(vec![PROXY_407.to_vec()]);
+        let point = CrlUrl::parse("https://crl.boneli.test/ca.crl").expect("URL");
+        let err = crl(&proxied(addr), &point, deadline()).expect_err("refused");
+        assert_eq!(
+            err,
+            CrlFetchError::Unreachable(format!(
+                "the proxy 127.0.0.1:{} answered 407 to CONNECT crl.boneli.test:443: \
+it asks for credentials; only Basic is sent",
+                addr.port()
+            ))
+        );
+        let (heads, listener) = server.join().expect("server");
+        assert_eq!(
+            heads,
+            [
+                "CONNECT crl.boneli.test:443 HTTP/1.1\r\nHost: crl.boneli.test:443\r\n\
+Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+            ]
+        );
+        assert!(!another_connection(&listener), "CONNECT was retried");
     }
 
     /// An `https` point through the proxy: `CONNECT` with

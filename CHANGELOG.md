@@ -961,8 +961,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and OCSP fetches go through the same proxy, `http` ones as absolute-form
   `GET`s, `https` ones through a tunnel, and still fail closed.
   `BasicCredentials` (RFC 7617, at most `MAX_BASIC_CREDENTIAL_BYTES`
-  6,120 B, redacted `Debug`) go to the proxy up front in
-  `Proxy-Authorization`. `connect` refuses a proxied configuration. No
+  6,120 B, redacted `Debug`) go to the proxy in `Proxy-Authorization`, up
+  front on `CONNECT`, and on a proxied `GET` only in one retry after a
+  `407` (a proxy that did not ask may forward the field to the server); a
+  second `407` fails closed. `connect` refuses a proxied configuration. No
   proxy environment variable is read. `boneli-http` gains
   `connect_tunnel_with` (extra fields after `Host`) and
   `Connection::new_via_proxy` (absolute-form request lines; the server

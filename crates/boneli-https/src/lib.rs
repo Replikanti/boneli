@@ -63,8 +63,9 @@
 //! revocation checked as on a direct connection, and the CRL, CA list and
 //! OCSP fetches go through the same proxy, `http` ones as absolute-form
 //! `GET`s. Only the proxy's name is resolved. [`BasicCredentials`] go to
-//! the proxy up front in `Proxy-Authorization`; no proxy environment
-//! variable is read, and [`connect`] refuses a proxied configuration.
+//! the proxy in `Proxy-Authorization`, up front on `CONNECT` and only after
+//! a `407` on a `GET`; no proxy environment variable is read, and
+//! [`connect`] refuses a proxied configuration.
 //!
 //! `TlsStream` is a `boneli_http::Transport` when its stream is one, and an
 //! `IdleCheck` that counts what rustls already holds: plaintext it has

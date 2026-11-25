@@ -8,8 +8,11 @@
 //! Set only explicitly: no `HTTPS_PROXY`, `NO_PROXY` or `ALL_PROXY` is
 //! read, because in the sandbox `HTTPS_PROXY` names `boneli-egress`, and a
 //! runner that picked it up would route itself through the sandbox's
-//! broker (ADR-039, D8). Proxy credentials are `Basic` only, sent with
-//! every `CONNECT` and every proxied `GET` without waiting for a `407`.
+//! broker (ADR-039, D8). Proxy credentials are `Basic` only. They go with
+//! every `CONNECT` without waiting for a `407`, because the proxy consumes
+//! that head; a proxied `GET` carries them only on its retry after a
+//! `407`, because a proxy that did not ask for them may pass the field on
+//! to the server (ADR-039, D8).
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -90,7 +93,8 @@ impl fmt::Debug for BasicCredentials {
 }
 
 /// An HTTP forward proxy: its host and port in ADR-003's grammar, and
-/// optional [`BasicCredentials`] sent to it up front (ADR-039, D8). Plain
+/// optional [`BasicCredentials`] for it: up front on `CONNECT`, after a
+/// `407` on a proxied `GET` (ADR-039, D8). Plain
 /// HTTP to the proxy: TLS to the proxy, NTLM, Negotiate, Digest and SOCKS
 /// are not supported.
 #[derive(Clone, PartialEq, Eq)]
