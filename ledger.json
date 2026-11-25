@@ -1032,11 +1032,11 @@
    "title": "boneli-oci: private-registry credentials and an HTTP proxy for customer networks",
    "epic": null,
    "order": 39,
-   "state": "pr-review",
-   "owner": "ae67d3e8",
+   "state": "done",
+   "owner": null,
    "pr": 136,
    "note": "PR #136 open",
-   "updated_at": "2026-11-25T19:24:26+00:00",
+   "updated_at": "2026-11-25T20:31:34+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1047,10 +1047,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1641,7 +1641,7 @@
    "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
    "epic": null,
    "order": 63,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1650,7 +1650,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-25T12:04:53+00:00",
+   "updated_at": "2026-11-25T20:31:36+00:00",
    "priority": "P3",
    "size": "?",
    "deps": [
@@ -1688,22 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T16:50:55+00:00",
-   "issue": 117,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #119 open"
-  },
-  {
-   "at": "2026-11-24T16:50:55+00:00",
-   "issue": 118,
-   "from": "ready",
-   "to": "blocked",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-24T16:57:00+00:00",
    "issue": 103,
@@ -2087,6 +2071,22 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #136 open"
+  },
+  {
+   "at": "2026-11-25T20:31:34+00:00",
+   "issue": 55,
+   "from": "pr-review",
+   "to": "done",
+   "by": "ae67d3e8",
+   "note": null
+  },
+  {
+   "at": "2026-11-25T20:31:36+00:00",
+   "issue": 129,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2111,12 +2111,11 @@
   33,
   45,
   49,
-  55,
   69,
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T19:25:18+00:00",
+ "updated_at": "2026-11-25T20:31:36+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
