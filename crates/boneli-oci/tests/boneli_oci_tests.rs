@@ -13,6 +13,9 @@
 //! - `network::` pulls `node:22` and `postgres:17` from Docker Hub and runs
 //!   them, and checks image signatures on real registries (ADR-029); the
 //!   `oci-acceptance` workflow runs it weekly and on demand.
+//! - `proxy::` pulls `node:22` through the HTTP proxy named by
+//!   `BONELI_OCI_TEST_PROXY` (ADR-039); `oci-acceptance` runs it through
+//!   Squid with direct outbound 80 and 443 rejected.
 //!
 //! The test `probe` is this binary's probe mode: a host test re-executes
 //! the binary inside the sandbox with `BONELI_OCI_PROBE=<action>`; without
@@ -637,7 +640,8 @@ mod network {
     use crate::support::sandbox::{self, ids, image_mounts, root};
 
     /// `library/node:22`, the index measured on 2026-11-16 (ADR-009).
-    const NODE: &str = "sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb";
+    pub(crate) const NODE: &str =
+        "sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb";
     /// `library/postgres:17`, the index measured on 2026-11-16 (ADR-009).
     const POSTGRES: &str =
         "sha256:0d938e975177bef9f1f61f3f9dbcf2e0aa0a139568f66d3415ed8892eb97f6ac";
@@ -774,7 +778,7 @@ mod network {
         expect: &'static str,
     }
 
-    fn platform() -> &'static str {
+    pub(crate) fn platform() -> &'static str {
         match std::env::consts::ARCH {
             "x86_64" => "linux/amd64",
             "aarch64" => "linux/arm64",
@@ -1669,5 +1673,63 @@ mod network {
                 "the warm pull made requests"
             );
         }
+    }
+}
+
+mod proxy {
+    use std::time::Instant;
+
+    use boneli_app::{ImageOrigin, ImageRef, ImageStore};
+    use boneli_https::{Proxy, Roots, TlsConfig};
+    use boneli_oci::{OciImageStore, StoreConfig};
+
+    use crate::network::{NODE, platform};
+    use crate::support::TempDir;
+
+    /// The proxy the live test goes through, `host:port`.
+    const PROXY_VAR: &str = "BONELI_OCI_TEST_PROXY";
+
+    /// Pulls `node:22` from Docker Hub through the HTTP proxy at
+    /// `BONELI_OCI_TEST_PROXY` (ADR-039, D10): every registry connection
+    /// and every revocation fetch of the production dial goes through it.
+    /// In `oci-acceptance` the proxy is Squid and direct outbound 80 and
+    /// 443 are rejected for the test's user, so a connection that
+    /// bypassed the proxy would fail the pull. Fails, naming the variable,
+    /// when it is unset.
+    #[test]
+    #[ignore = "network: pulls node:22 from Docker Hub through the proxy in BONELI_OCI_TEST_PROXY"]
+    fn node_pulls_through_the_proxy() {
+        let value = std::env::var(PROXY_VAR)
+            .unwrap_or_else(|_| panic!("{PROXY_VAR} must name the proxy as host:port"));
+        let (host, port) = value
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("{PROXY_VAR} must be host:port"));
+        let port = port
+            .parse()
+            .unwrap_or_else(|_| panic!("{PROXY_VAR} has no port number"));
+        let proxy = Proxy::new(host, port).expect("the proxy in BONELI_OCI_TEST_PROXY");
+        let tls = TlsConfig::new(Roots::mozilla())
+            .expect("tls")
+            .with_proxy(proxy);
+        let config = StoreConfig::production(tls).expect("config");
+        let tmp = TempDir::new("proxy-live");
+        let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+        let started = Instant::now();
+        let pulled = store
+            .pull(&ImageRef {
+                name: "library/node".to_owned(),
+                digest: NODE.to_owned(),
+                platform: platform().to_owned(),
+                origin: ImageOrigin::Operator,
+            })
+            .unwrap_or_else(|e| panic!("pull node:22 through {value}: {e}"));
+        let lease = store.lease(&pulled.rootfs).expect("lease");
+        assert!(!lease.layers().is_empty());
+        println!(
+            "oci-acceptance proxy: node:22 {} through {value} in {:.1} s, {} layers",
+            platform(),
+            started.elapsed().as_secs_f64(),
+            lease.layers().len()
+        );
     }
 }

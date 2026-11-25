@@ -119,6 +119,7 @@ dependencies = [
  "boneli-sigstore",
  "boneli-sys",
  "miniz_oxide",
+ "rustls",
  "ruzstd",
 ]
 

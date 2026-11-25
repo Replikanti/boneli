@@ -127,6 +127,7 @@ pub use ed25519::Ed25519Key;
 pub use keys::{KeyKind, MAX_PUBLIC_KEY_PEM_LEN, PublicKey, PublicKeyError, SignatureError};
 pub use proxy::{
     BasicCredentials, MAX_BASIC_CREDENTIAL_BYTES, PROXY_MAX_HEAD_BYTES, PROXY_MAX_HEADERS, Proxy,
+    REDACT_WINDOW, redact,
 };
 pub use random::{RandomFailed, fill_random};
 pub use resolve::{

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boneli_app::{ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, Pulled};
-use boneli_https::{PublicKey, RsaSha256Key};
+use boneli_https::{BasicCredentials, PublicKey, RsaSha256Key};
 use boneli_oci::{
     AgentExemption, Decision, Error, ExemptScope, MAX_SIGNATURES, OciImageStore, PolicyRule,
     Registry, RepoScope, Repository, Requirement, SignaturePolicy, StoreConfig, Timeouts,
@@ -30,8 +30,8 @@ use boneli_sigstore::{
 use support::TempDir;
 use support::images::{Layer, Pushed, config, push};
 use support::registry::{
-    Fake, Hub, Referrers, Reply, Seen, challenge_for, descriptor, digest_of, entry, image, index,
-    media,
+    Fake, Flow, Hub, Private, Referrers, Reply, Seen, challenge_for, descriptor, digest_of, entry,
+    image, index, media,
 };
 use support::tarball::Tar;
 
@@ -4774,4 +4774,95 @@ fn kept_rekor_v2_evidence_offline() {
         "{detail}"
     );
     assert!(!reached(&fake.seen()), "{:?}", targets(&fake.seen()));
+}
+
+// ---------------------------------------------------------------------
+// Registry credentials (ADR-039)
+// ---------------------------------------------------------------------
+
+/// The signature lookups take the registry client's request path, so
+/// they inherit its credential handling (ADR-039, D2): with credentials,
+/// in the Basic and the token flow, the `.sig` tag, the referrers API, its
+/// tag fallback and the `.att` tag under claims reach the API host with
+/// the credentials (Basic) or the token, the token request alone carries
+/// the credentials, and nothing goes anywhere else; a signed image still
+/// passes and an unsigned one is still refused.
+#[test]
+fn signature_lookups_inherit_the_credentials() {
+    let credentials = BasicCredentials::new(
+        "sIg-u5Er9q8RzT3vW1xY7kLm",
+        "sIg-pA55w0rD9xK2mN7qR4tV6yZ8bC1dF3gH5jL7",
+    )
+    .expect("credentials");
+    let basic = credentials.header_value();
+    let token = "sIg-tOk-9fH2kL7mQ4rT8vX1zB5nC3dG6jP0sW2y";
+    let claims = || {
+        rules(vec![rule(
+            RepoScope::Registry,
+            Requirement::Required(slsa_keyed(Some("https://github.com/acme/app"))),
+        )])
+    };
+    for flow in [Flow::Basic, Flow::Token] {
+        for (case, signed) in [("keyed", true), ("keyed", false), ("claims", false)] {
+            let (mut hub, pushed) = app_hub();
+            if signed {
+                sign(&mut hub, "legacy", &signer(), &pushed.index, &pushed.index);
+            }
+            let private = Private::new(hub, flow, &basic, token);
+            let fake = Fake::new(move |s| private.handle(s));
+            let policy = if case == "claims" {
+                claims()
+            } else {
+                trusted()
+            };
+            let mut config = config_with(&fake, policy);
+            let registry = Registry::docker_hub().with_credentials(credentials.clone());
+            config.registries = vec![registry.clone()];
+            config.default_registry = registry;
+            let tmp = TempDir::new("sig-creds");
+            let store = OciImageStore::open(&tmp.path().join("store"), config).expect("open");
+            let result = store.pull(&image_ref(REPO, &pushed.index));
+            assert_eq!(result.is_ok(), signed, "{flow:?} {case}: {result:?}");
+            let seen = fake.seen();
+            let lookup = |s: &Seen| {
+                s.target.ends_with(".sig")
+                    || s.target.ends_with(".att")
+                    || s.target.contains("/referrers/")
+                    || s.target.contains("/manifests/sha256-")
+            };
+            let lookups: Vec<&Seen> = seen.iter().filter(|s| lookup(s)).collect();
+            if case == "keyed" {
+                assert!(lookups.iter().any(|s| s.target.ends_with(".sig")));
+            }
+            if !signed {
+                assert!(lookups.iter().any(|s| s.target.contains("/referrers/")));
+                assert!(lookups.iter().any(
+                    |s| s.target.contains("/manifests/sha256-") && !s.target.ends_with(".sig")
+                ));
+            }
+            if case == "claims" {
+                assert!(lookups.iter().any(|s| s.target.ends_with(".att")));
+            }
+            let allowed = match flow {
+                Flow::Basic => basic.clone(),
+                Flow::Token | Flow::Both => format!("Bearer {token}"),
+            };
+            for s in &lookups {
+                assert_eq!(s.header("authorization"), Some(allowed.as_str()), "{s:?}");
+            }
+            for s in &seen {
+                let carried = s.header("authorization");
+                match s.host.as_str() {
+                    "auth.docker.io" => assert_eq!(carried, Some(basic.as_str()), "{s:?}"),
+                    "registry-1.docker.io" => {
+                        assert!(
+                            carried.is_none() || carried == Some(allowed.as_str()),
+                            "{s:?}"
+                        )
+                    }
+                    other => panic!("{flow:?} {case}: a request to {other}"),
+                }
+            }
+        }
+    }
 }

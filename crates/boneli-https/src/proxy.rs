@@ -84,6 +84,74 @@ impl BasicCredentials {
     pub fn header_value(&self) -> String {
         format!("Basic {}", crate::base64::encode(self.pair.as_bytes()))
     }
+
+    /// `text` with every run of [`REDACT_WINDOW`] bytes of the username,
+    /// the password, `username:password` or its base64 replaced
+    /// ([`redact`]): for a detail built from text a server chose, which a
+    /// server that holds these credentials could have filled with them
+    /// (ADR-039, D4).
+    pub fn redact(&self, text: &str) -> String {
+        let (username, password) = self.pair.split_once(':').unwrap_or((&self.pair, ""));
+        let encoded = crate::base64::encode(self.pair.as_bytes());
+        redact(text, &[username, password, &self.pair, &encoded])
+    }
+}
+
+/// The length of the runs of a secret [`redact`] removes, in bytes
+/// (ADR-039, D4): 16 bytes of base64 carry 96 bits, so a run that long
+/// in a detail is the secret and not a host, a digest or a word by
+/// chance; a shorter run would start to match ordinary text, a longer
+/// one would let a piece of that length through.
+pub const REDACT_WINDOW: usize = 16;
+
+/// `text` with every byte that lies in a copy of a run of
+/// [`REDACT_WINDOW`] bytes of one of `secrets`, or of a whole secret that
+/// is shorter, replaced: each stretch of such bytes, widened to whole
+/// characters, becomes one `[redacted]`. Empty secrets are skipped. A
+/// piece of a secret shorter than the window stays.
+pub fn redact(text: &str, secrets: &[&str]) -> String {
+    let bytes = text.as_bytes();
+    let mut hit = vec![false; bytes.len()];
+    for secret in secrets.iter().map(|s| s.as_bytes()) {
+        if secret.is_empty() {
+            continue;
+        }
+        let width = secret.len().min(REDACT_WINDOW);
+        let runs: std::collections::BTreeSet<&[u8]> = secret.windows(width).collect();
+        for (at, window) in bytes.windows(width).enumerate() {
+            if runs.contains(window) {
+                hit[at..at + width].fill(true);
+            }
+        }
+    }
+    // A secret with multi-byte characters may match mid-character: the
+    // whole character goes.
+    for at in 0..bytes.len() {
+        if hit[at] && !text.is_char_boundary(at) {
+            let start = (0..at)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            hit[start..at].fill(true);
+        }
+        if at > 0 && hit[at - 1] && !text.is_char_boundary(at) {
+            hit[at] = true;
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_hit = false;
+    for (at, c) in text.char_indices() {
+        if hit[at] {
+            if !in_hit {
+                out.push_str("[redacted]");
+            }
+            in_hit = true;
+        } else {
+            out.push(c);
+            in_hit = false;
+        }
+    }
+    out
 }
 
 impl fmt::Debug for BasicCredentials {
@@ -349,6 +417,47 @@ mod tests {
                 .header_value()
         );
         assert!(line.len() <= 8_192, "{}", line.len());
+    }
+
+    /// Every 16-byte run of the username, the password, the pair and its
+    /// base64 goes, wherever it sits in the text; a 15-byte piece stays,
+    /// and so does everything else.
+    #[test]
+    fn redact_removes_every_window() {
+        let credentials = BasicCredentials::new(USER, PASS).expect("credentials");
+        let encoded = crate::base64::encode(format!("{USER}:{PASS}").as_bytes());
+        let text = format!(
+            "a {PASS} b {} c {} d {USER}e {USER}:{PASS}",
+            &encoded[3..19],
+            &PASS[..15]
+        );
+        let out = credentials.redact(&text);
+        assert_no_secret(&out);
+        assert_eq!(
+            out,
+            format!(
+                "a [redacted] b [redacted] c {} d [redacted]e [redacted]",
+                &PASS[..15]
+            )
+        );
+        assert_eq!(
+            credentials.redact("host:443 answered 401"),
+            "host:443 answered 401"
+        );
+    }
+
+    /// A secret shorter than the window goes where it appears whole; an
+    /// empty one is skipped; a run that starts or ends inside a character
+    /// takes the whole character, so the result stays UTF-8.
+    #[test]
+    fn redact_short_secrets_and_characters() {
+        assert_eq!(redact("x-AWS-y", &["AWS"]), "x-[redacted]-y");
+        assert_eq!(redact("abc", &[""]), "abc");
+        let secret = format!("a{}", "\u{e9}".repeat(8));
+        let text = format!("<a{}\u{e8}>", "\u{e9}".repeat(7));
+        assert_eq!(redact(&text, &[&secret]), "<[redacted]>");
+        let tail = format!("<{}>", &secret[1..]);
+        assert_eq!(redact(&tail, &[&secret]), "<[redacted]>");
     }
 
     /// RFC 7617, 2: `Aladdin:open sesame`, decoded back byte for byte.

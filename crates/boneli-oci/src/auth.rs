@@ -1,13 +1,16 @@
-//! The anonymous token flow of a registry (ADR-009, D9): the Bearer
-//! challenge of a `401`, the token request it names, and the token in the
-//! answer.
+//! The token flow of a registry (ADR-009, D9) and its `Basic` alternative
+//! (ADR-039, D2): the challenge of a `401`, the token request it names,
+//! and the token in the answer.
 //!
 //! `WWW-Authenticate` is read as RFC 9110, section 11.6.1, defines it:
 //! one or more challenges per field, each a scheme followed by
 //! comma-separated auth-params (token or quoted-string values, with
-//! backslash escapes) or one token68. Exactly one `Bearer` challenge must
+//! backslash escapes) or one token68. At most one `Bearer` challenge may
 //! be present; its parameters are unique and their names compare
-//! case-insensitively. Non-ASCII bytes are refused.
+//! case-insensitively. A `Bearer` challenge wins over `Basic` ones, so a
+//! password goes to the token host and never to the API host when both
+//! are offered. Non-ASCII bytes are refused. No error text echoes the
+//! server's bytes (ADR-039, D4).
 
 use crate::url::Url;
 
@@ -22,15 +25,32 @@ pub(crate) struct Challenge {
     pub(crate) scope: Option<String>,
 }
 
+/// How the API host asks for authorization (ADR-039, D2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Scheme {
+    /// A token from the realm of this challenge.
+    Bearer(Challenge),
+    /// `Basic` credentials, sent to the API host itself.
+    Basic,
+}
+
 /// One challenge: its scheme and its parameters (a token68 has the name
 /// `""`).
 type Raw = (String, Vec<(String, String)>);
 
-/// The Bearer challenge among every `WWW-Authenticate` value.
-pub(crate) fn bearer<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<Challenge, String> {
+/// The scheme among every `WWW-Authenticate` value: exactly one `Bearer`
+/// challenge gives `Bearer`, whatever `Basic` challenges come with it;
+/// two are an error; with none, one or more `Basic` challenges give
+/// `Basic`; neither is an error.
+pub(crate) fn scheme<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<Scheme, String> {
     let mut found = None;
+    let mut basic = false;
     for value in values {
         for (scheme, params) in challenges(value)? {
+            if scheme.eq_ignore_ascii_case("basic") {
+                basic = true;
+                continue;
+            }
             if !scheme.eq_ignore_ascii_case("bearer") {
                 continue;
             }
@@ -40,7 +60,15 @@ pub(crate) fn bearer<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<Chall
             found = Some(params);
         }
     }
-    let params = found.ok_or("no Bearer challenge")?;
+    match found {
+        Some(params) => bearer(params).map(Scheme::Bearer),
+        None if basic => Ok(Scheme::Basic),
+        None => Err("neither a Bearer nor a Basic challenge".into()),
+    }
+}
+
+/// The Bearer challenge with `params`.
+fn bearer(params: Vec<(String, String)>) -> Result<Challenge, String> {
     let mut realm = None;
     let mut service = None;
     let mut scope = None;
@@ -63,7 +91,7 @@ pub(crate) fn bearer<'a>(values: impl Iterator<Item = &'a [u8]>) -> Result<Chall
     })
 }
 
-/// The URL of the anonymous token request: the realm with `service` and
+/// The URL of the token request: the realm with `service` and
 /// `scope` appended to its query, percent-encoded.
 pub(crate) fn token_url(challenge: &Challenge, scope: &str) -> Url {
     let mut url = challenge.realm.clone();
@@ -254,7 +282,7 @@ fn params_of(c: &mut Cursor<'_>, params: &mut Vec<(String, String)>) -> Result<(
         }
         let name = name.to_ascii_lowercase();
         if params.iter().any(|(n, _)| *n == name) {
-            return Err(format!("the auth-param {name:?} appears twice"));
+            return Err("an auth-param appears twice".into());
         }
         params.push((name, value));
         c.skip_ows();
@@ -284,7 +312,7 @@ fn token68(c: &mut Cursor<'_>, params: &mut Vec<(String, String)>) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer, challenges, token};
+    use super::{Scheme, challenges, scheme, token};
 
     fn json() -> boneli_json::Limits {
         boneli_json::Limits::new(65_536, 16, 65_536).expect("limits")
@@ -321,14 +349,61 @@ mod tests {
     #[test]
     fn bearer_needs_one_challenge_with_a_realm() {
         let one = [&br#"Bearer realm="https://a.example/t""#[..]];
-        assert!(bearer(one.into_iter()).is_ok());
+        assert!(matches!(scheme(one.into_iter()), Ok(Scheme::Bearer(_))));
         let two = [
             &br#"Bearer realm="https://a.example/t""#[..],
             br#"Bearer realm="https://b.example/t""#,
         ];
-        assert!(bearer(two.into_iter()).is_err());
-        assert!(bearer([&b"Bearer service=x"[..]].into_iter()).is_err());
-        assert!(bearer([&b"Bearer abc="[..]].into_iter()).is_err());
+        assert!(scheme(two.into_iter()).is_err());
+        assert!(scheme([&b"Bearer service=x"[..]].into_iter()).is_err());
+        assert!(scheme([&b"Bearer abc="[..]].into_iter()).is_err());
+    }
+
+    /// One `Bearer` challenge wins over `Basic` ones, in one field or in
+    /// several; `Basic` alone (any case, with or without parameters) is
+    /// `Basic`; neither, or two `Bearer` next to a `Basic`, is an error.
+    #[test]
+    fn scheme_prefers_bearer_over_basic() {
+        let bearer = &br#"Bearer realm="https://a.example/t",service="s""#[..];
+        for values in [
+            vec![&br#"Basic realm="r", Bearer realm="https://a.example/t""#[..]],
+            vec![&br#"Basic realm="r""#[..], bearer],
+            vec![bearer, &b"basic"[..]],
+        ] {
+            match scheme(values.into_iter()) {
+                Ok(Scheme::Bearer(c)) => assert_eq!(c.realm.host, "a.example"),
+                other => panic!("{other:?}"),
+            }
+        }
+        for basic in [
+            &b"Basic"[..],
+            br#"basic realm="registry""#,
+            br#"BASIC realm="r", charset="UTF-8""#,
+            br#"Negotiate abc==, Basic realm="r""#,
+        ] {
+            assert_eq!(scheme([basic].into_iter()), Ok(Scheme::Basic));
+        }
+        for bad in [
+            vec![&b"Negotiate abc=="[..]],
+            vec![&br#"Digest realm="r", nonce="n""#[..]],
+            vec![
+                &br#"Basic realm="r""#[..],
+                bearer,
+                br#"Bearer realm="https://b.example/t""#,
+            ],
+        ] {
+            assert!(scheme(bad.into_iter()).is_err());
+        }
+    }
+
+    /// No error text echoes what the server sent: a duplicated parameter
+    /// is named by its rule, not its name.
+    #[test]
+    fn errors_do_not_echo_the_challenge() {
+        let secret = "secret-param-name-0123456789";
+        let value = format!(r#"Bearer realm="https://a.example/t",{secret}=1,{secret}=2"#);
+        let err = scheme([value.as_bytes()].into_iter()).expect_err("duplicate");
+        assert!(!err.contains(secret), "{err}");
     }
 
     #[test]

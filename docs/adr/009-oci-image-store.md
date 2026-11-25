@@ -772,7 +772,8 @@ the client and saves at most one request per expiry).
   with verified certificates, every host from the allowlist above, and
   the token to the API host only. Weak spot: a customer network that
   forces an HTTP proxy cannot pull yet; `boneli_http::connect_tunnel` plus
-  `boneli_https::connect_over` make that an additive `Dial` (#55).
+  `boneli_https::connect_over` make that an additive `Dial` (#55). Closed
+  by ADR-039 (Replikanti/boneli#55).
 - **The `Dial` seam.** Requests go through a crate-local trait, modeled on
   `boneli-egress`'s `Upstream` (ADR-006, D11): no use case drives it, so
   it is not a `boneli-app` port and needs no in-memory adapter. The tests
@@ -1059,7 +1060,8 @@ Hub, 2026-11-16):
 - Images that need a tag, a nested index, schema 1, a `sha512` digest,
   foreign or nondistributable layers, more than 128 layers, a download of
   more than 16 GiB plus 16 MiB or a registry login do not pull (#55 adds
-  credentials).
+  credentials). Closed by ADR-039 (Replikanti/boneli#55) for
+  registry logins.
 
 ## Alternatives considered
 

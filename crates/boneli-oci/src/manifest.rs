@@ -173,8 +173,10 @@ pub(crate) fn parse_document(
     });
     let media_type = match (field, header.as_deref()) {
         (Some(f), Some(h)) if f != h => {
+            // The header is the server's text, outside the digest: never
+            // echoed (ADR-039, D4).
             return Err(format!(
-                "mediaType {f:?} differs from the Content-Type {h:?}"
+                "mediaType {f:?} differs from the response's Content-Type"
             ));
         }
         (Some(f), _) => f,
@@ -193,7 +195,8 @@ pub(crate) fn parse_document(
             object, media_type, max_layers,
         )?)),
         t if SCHEMA1.contains(&t) => Err("schema 1 manifests are refused".into()),
-        t => Err(format!("unknown media type {t:?}")),
+        t if field.is_some() => Err(format!("unknown media type {t:?}")),
+        _ => Err("unknown media type in the response's Content-Type".into()),
     }
 }
 
@@ -399,5 +402,26 @@ pub(crate) fn select<'i>(index: &'i Index, platform: &Platform) -> Result<&'i En
         t => Err(failed(format!(
             "the entry for {platform} has the unknown media type {t:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OCI_MANIFEST, parse_document};
+
+    /// The `Content-Type` is the server's text, outside the digest: an
+    /// error about it names it and never quotes it (ADR-039, D4).
+    #[test]
+    fn content_type_never_echoed() {
+        let limits = boneli_json::Limits::new(4_194_304, 16, 65_536).expect("limits");
+        let secret = "application/secret-token-0123456789abcdef";
+        let with_field = format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}"}}"#);
+        let without = r#"{"schemaVersion":2}"#;
+        for doc in [with_field.as_str(), without] {
+            let err =
+                parse_document(doc.as_bytes(), Some(secret), &limits, 128).expect_err("refused");
+            assert!(!err.contains("secret-token"), "{err}");
+            assert!(err.contains("Content-Type"), "{err}");
+        }
     }
 }

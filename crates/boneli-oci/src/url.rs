@@ -101,6 +101,16 @@ fn scheme_end(text: &str) -> Option<usize> {
     .then_some(colon)
 }
 
+/// `text` with everything up to its last `@` shown as `[userinfo]`, so a
+/// detail about a host or an image name never echoes credentials someone
+/// wrote into it (ADR-039, D4); `text` itself when it has no `@`.
+pub(crate) fn mask_userinfo(text: &str) -> String {
+    match text.rsplit_once('@') {
+        Some((_, rest)) => format!("[userinfo]@{rest}"),
+        None => text.to_owned(),
+    }
+}
+
 /// `host[:port]` or `[ipv6][:port]` with the grammar of ADR-003: the
 /// host lowercase and the port if one was given. Userinfo is refused.
 pub(crate) fn host_port(authority: &str) -> Result<(String, Option<u16>), &'static str> {

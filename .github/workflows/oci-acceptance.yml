@@ -110,3 +110,58 @@ jobs:
       - name: Refresh Sigstore's trusted root through TUF
         if: ${{ !cancelled() }}
         run: cargo test -p boneli-tuf --test network -- --ignored --nocapture
+      # ADR-039 (#55): node:22 through Squid, with direct outbound 80 and
+      # 443 rejected for this user (Squid runs as `proxy`), so every
+      # registry connection and every CRL or OCSP fetch of the pull has to
+      # go through the proxy. Squid's answer heads to an accepted and a
+      # refused CONNECT are printed for ADR-039 D9 (bytes, fields), and its
+      # access log must show the CONNECT to Docker Hub and an absolute-form
+      # GET of a revocation fetch. Last, because the rules would block the
+      # steps after it; they are removed when the step ends either way.
+      - name: Pull node:22 through Squid with direct egress blocked
+        if: ${{ !cancelled() }}
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q squid
+          i=0
+          until (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; do
+            i=$((i + 1)); [ "$i" -le 30 ] || { echo "squid: not listening after 30 s"; exit 1; }; sleep 1
+          done
+          squid -v | sed -n 1p
+          # The answer head to one CONNECT: its bytes up to and including
+          # the empty line, and its field lines.
+          connect_head() {
+            exec 3<>/dev/tcp/127.0.0.1/3128
+            printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+            timeout 10 cat <&3 > "$RUNNER_TEMP/head-$2" || true
+            exec 3<&- 3>&-
+            LC_ALL=C awk -v what="$2" -v target="$1" '
+              BEGIN { RS = "\r\n" }
+              NR == 1 { status = $0; bytes = length($0) + 2; next }
+              $0 == "" { bytes += 2; done = 1; exit }
+              { bytes += length($0) + 2; fields++ }
+              END { printf "squid CONNECT head (%s, %s): %s; %d bytes, %d fields, complete=%d\n", what, target, status, bytes, fields, done }
+            ' "$RUNNER_TEMP/head-$2"
+          }
+          connect_head registry-1.docker.io:443 accepted
+          connect_head registry-1.docker.io:25 refused
+          me=$(id -u)
+          cleanup() {
+            for t in iptables ip6tables; do
+              sudo "$t" -D OUTPUT -p tcp -m owner --uid-owner "$me" -m multiport --dports 80,443 -j REJECT || true
+            done
+          }
+          trap cleanup EXIT
+          for t in iptables ip6tables; do
+            sudo "$t" -I OUTPUT -p tcp -m owner --uid-owner "$me" -m multiport --dports 80,443 -j REJECT
+          done
+          if curl -sS -o /dev/null --max-time 10 https://registry-1.docker.io/v2/; then
+            echo "direct HTTPS still works; the block is not in place"
+            exit 1
+          fi
+          curl -sS -o /dev/null --max-time 20 -x http://127.0.0.1:3128 https://registry-1.docker.io/v2/ \
+            -w 'through squid: %{http_code}\n'
+          BONELI_OCI_TEST_PROXY=127.0.0.1:3128 \
+            cargo test -p boneli-oci --test boneli_oci_tests -- --ignored proxy:: --nocapture
+          sudo grep -c 'CONNECT registry-1.docker.io:443' /var/log/squid/access.log
+          sudo grep ' GET http://' /var/log/squid/access.log

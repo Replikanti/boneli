@@ -366,7 +366,8 @@ Decided at #80 STOP 1 (2026-11-21), all three as the plan recommended:
   - Delta and indirect lists, `onlySomeReasons` partitions and names
     relative to the issuer are refused (`Malformed`), so a CA that uses
     them fails closed. None was measured.
-  - No fetch through a proxy, as ADR-017's known limit says.
+  - No fetch through a proxy, as ADR-017's known limit says. Closed by
+    ADR-039 (Replikanti/boneli#55).
 
 ## Alternatives considered
 

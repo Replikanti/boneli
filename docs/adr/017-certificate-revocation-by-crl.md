@@ -473,7 +473,8 @@ Decided at #38 STOP 1 (2026-11-20), each with its basis in the Decision:
   - No CRL fetch through a proxy. `boneli-https` has no proxy support
     for its own connections either, so a host that needs a proxy cannot
     use the client at all today; this ADR adds no new case. When proxy
-    support lands, the `CrlSource` seam takes a proxy source.
+    support lands, the `CrlSource` seam takes a proxy source. Closed by
+    ADR-039 (Replikanti/boneli#55).
   - Staleness: at most about 48 h after the CA records a revocation while
     refreshes get through, plus 1 h per failed refresh in a row, and up to
     the cached list's `nextUpdate` (238 h measured, 240 h by the BR) while
