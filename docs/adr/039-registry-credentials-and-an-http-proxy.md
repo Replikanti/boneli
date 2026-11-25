@@ -1,6 +1,6 @@
 # ADR-039: Registry credentials and an HTTP proxy
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-25
 
 Issue #55, in two PRs. Part 1 (PR #135) added the proxy route in
@@ -341,10 +341,18 @@ documents for `with_resolver`.
   tunnel's first byte, and a proxy is a single hop whose success answer
   is a status line, so the limit only has to leave room for a refusal's
   fields (`Proxy-Authenticate`, an error page's metadata, policy and
-  tracing fields corporate proxies add). Not measured yet: part 2's CI
-  step prints Squid's head for an accepted and a refused `CONNECT`, and
-  the measurement goes here before this ADR is accepted. Lower risks
-  refusing a proxy's refusal (the operator then sees a limit error
+  tracing fields corporate proxies add). Measured in part 2's
+  `oci-acceptance` step (run 45683133090, 2026-11-25) with Ubuntu's Squid
+  in its default configuration, Squid 7.7 on ubuntu-26.04 x86_64 and 6.14
+  on ubuntu-24.04 arm64: the answer to an accepted `CONNECT
+  registry-1.docker.io:443` is the status line alone, 39 bytes with its
+  empty line and 0 fields, on both; the refusal of `CONNECT
+  registry-1.docker.io:25` (`403 Forbidden`, `deny CONNECT !SSL_ports`)
+  is 332 bytes and 11 fields on 7.7, 334 bytes and 11 fields on 6.14,
+  its error page in the body. The limits leave 49 times the refusal's
+  bytes and 5.8 times its fields for the policy and tracing fields a
+  corporate proxy adds (not measured: no corporate proxy is at hand).
+  Lower risks refusing a proxy's refusal (the operator then sees a limit error
   instead of the status); higher only lets a proxy make the runner buffer
   more per connection.
 - **Setup time through a proxy, `PROXIED_SETUP_TIMEOUT` 40 s** (part 2,
@@ -464,6 +472,12 @@ And one live pull of `node:22` through Squid in `oci-acceptance`
 (`proxy::node_pulls_through_the_proxy`, `BONELI_OCI_TEST_PROXY`), with
 direct outbound 80 and 443 rejected for the runner user, and Squid's
 access log checked for the `CONNECT` and an absolute-form CRL `GET`.
+First run on the part 2 branch (run 45683133090): `curl` to Docker Hub
+without the proxy failed to connect, `node:22` pulled through Squid in
+29.6 s on x86_64 and 45.3 s on arm64, Squid's log held 14 `CONNECT
+registry-1.docker.io:443` lines and 5 absolute-form CRL `GET`s on each
+(Amazon's `rootca1` and `r2m01` lists, Let's Encrypt's `x2`, `ye` and a
+`ye1` shard).
 
 ## Consequences
 

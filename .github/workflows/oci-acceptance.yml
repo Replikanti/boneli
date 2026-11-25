@@ -34,9 +34,10 @@ name: oci-acceptance
 # drift (a new key type, the target moved into a delegation) must show up
 # within that week. Weekly, because
 # registry changes (a garbage-collected digest, a CDN host move, the token
-# flow, a signature replaced) show up within 7 days at 13 Docker Hub
+# flow, a signature replaced) show up within 7 days at 15 Docker Hub
 # manifest, tag and referrers requests per architecture per run (4 before
-# ADR-029, counted from the tests' code paths), far below the measured
+# ADR-029, 2 for the pull of node:22 through Squid of ADR-039, counted
+# from the tests' code paths), far below the measured
 # anonymous limit of 100 per hour. A blob redirect to a host outside the
 # allowlist fails the pull and names the host: this is where a new Docker
 # Hub redirect target shows up first (ADR-035, #117). Never on code paths
