@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use boneli_https::{CertError, SctError};
+use boneli_https::{CertError, SctError, TimestampError};
 
 use crate::fulcio::CertificateRefusal;
 use crate::provenance::ClaimRefusal;
@@ -79,9 +79,21 @@ pub enum Refusal {
     /// The entry body does not match the signature, payload or
     /// certificate.
     BodyMismatch,
-    /// No certificate authority of the trusted root is valid at the
-    /// integrated time.
+    /// No certificate authority of the trusted root is valid at a
+    /// verified time: the integrated time or a timestamp's (ADR-038).
     NoCaAtTime,
+    /// A keyless signature has neither a Rekor v1 inclusion promise nor
+    /// an RFC 3161 timestamp that verifies (ADR-038, D1).
+    NoTimeSource,
+    /// No timestamp authority of the trusted root is valid at a token's
+    /// genTime.
+    NoTsaAtTime,
+    /// The bundle carries more than
+    /// [`MAX_TIMESTAMPS`](crate::MAX_TIMESTAMPS) RFC 3161 timestamps.
+    TooManyTimestamps,
+    /// An RFC 3161 timestamp does not verify (the first one that failed,
+    /// when no time source verified).
+    Timestamp(TimestampError),
     /// The certificate chain does not verify.
     Certificate(CertError),
     /// No embedded SCT verifies.
@@ -159,8 +171,16 @@ impl fmt::Display for Refusal {
             Refusal::EntryKind => "the transparency log entry is of the wrong kind",
             Refusal::BodyMismatch => "the transparency log entry does not match the signature",
             Refusal::NoCaAtTime => {
-                "no trusted certificate authority is valid at the integrated time"
+                "no trusted certificate authority is valid at a verified signing time"
             }
+            Refusal::NoTimeSource => {
+                "a keyless signature needs an inclusion promise or a verified timestamp"
+            }
+            Refusal::NoTsaAtTime => {
+                "no trusted timestamp authority is valid at the timestamp's time"
+            }
+            Refusal::TooManyTimestamps => "the bundle carries too many timestamps",
+            Refusal::Timestamp(_) => "the timestamp does not verify",
             Refusal::Certificate(_) => "the certificate does not verify",
             Refusal::Sct(_) => "no embedded SCT verifies",
             Refusal::SignatureInvalid => "the certificate's key does not verify the signature",
@@ -192,6 +212,7 @@ impl fmt::Display for Refusal {
         match self {
             Refusal::Certificate(e) => write!(f, ": {e}"),
             Refusal::Sct(e) => write!(f, ": {e}"),
+            Refusal::Timestamp(e) => write!(f, ": {e}"),
             _ => Ok(()),
         }
     }

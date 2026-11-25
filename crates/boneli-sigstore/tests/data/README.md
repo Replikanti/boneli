@@ -89,6 +89,46 @@ attest fixed index digests, so a later capture gives the same bytes while
 GitHub keeps them; if it differs, the files and the hashes above stay. The
 same holds for the four `.att` captures, while GHCR and Quay keep them.
 
+## RFC 3161 timestamps and Rekor v2 (ADR-038)
+
+Captured on 2026-11-25 through the anonymous registry API and GitHub's
+release downloads. Every token in them verifies with OpenSSL against the
+TSA chain of `sigstore-trusted-root.json`
+(`openssl ts -verify -data <DSSE signature bytes>`); the tokens and the
+signed bytes are also in `crates/boneli-https/tests/data/` (`tsa-*`).
+
+| File | SHA-256 | What |
+| --- | --- | --- |
+| `trillian-log-server.bundle.json` | `2ce141d6…d858c2e7` | the one Sigstore bundle v0.3 referrer of `ghcr.io/sigstore/scaffolding/trillian_log_server` (index `sha256:ec7c9ee7…91504f1f`, v0.7.42), listed by the tag `sha256-<index hex>`: referrer manifest `sha256:40bb0550…a3c4e199`, bundle 10,699 bytes, keyless `cosign sign` (`release.yaml@refs/tags/v0.7.42`), predicate `https://sigstore.dev/cosign/sign/v1`, Rekor v1 `dsse` 0.0.1 entry 4047157521 with a SET, integrated time 1795367610, and one RFC 3161 token whose genTime and the leaf's notBefore are that same second |
+| `bex-cnb-run.bundle.json` | `04b2bd8b…da2ba8c7` | the Sigstore bundle referrer `sha256:9d24c9ab…561343c4` of `ghcr.io/bex-co/bex-cnb-run` (index `sha256:b02a639b…bf1732df9`), 9,747 bytes: keyless `cosign sign` (`native-base-image.yml@refs/heads/main`), Rekor v2 `hashedrekord` 0.0.2 entry 176091980 in `log2025-1` with an inclusion proof of 20 hashes and a checkpoint, no integrated time, one token (genTime 1793371569, notBefore + 1) |
+| `aicr-recipe-catalog-1.3.0.sigstore.json` | `1eb27e1b…7c0dfc4a` | the release asset `recipe-catalog.sigstore.json` of `NVIDIA/aicr` v1.3.0, 10,076 bytes: Rekor v2 `hashedrekord` 0.0.2 entry 202433287, one token (genTime 1794873195 = notBefore) |
+
+The two Rekor v2 bundles are read by the second step of ADR-038; until
+then `tests/timestamp.rs` pins that they are refused at their entry.
+
+```sh
+acc='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json'
+blob() { # repository, referrer manifest digest, output
+  tok=$(curl -fsS "https://ghcr.io/token?scope=repository:$1:pull" | jq -r .token)
+  curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o referrer.json \
+    "https://ghcr.io/v2/$1/manifests/$2"
+  curl -sSL -H "Authorization: Bearer $tok" -o "$3" \
+    "https://ghcr.io/v2/$1/blobs/$(jq -r '.layers[0].digest' referrer.json)"
+}
+blob sigstore/scaffolding/trillian_log_server \
+  sha256:40bb0550fa47d01f942b60edb005e81ceb213288967d4b442acb22a9e3c4e199 \
+  trillian-log-server.bundle.json
+blob bex-co/bex-cnb-run \
+  sha256:9d24c9ab1fcf359ef560e2d33ea06b64182961756b52617398e47b35561343c4 \
+  bex-cnb-run.bundle.json
+curl -sSL -o aicr-recipe-catalog-1.3.0.sigstore.json \
+  https://github.com/NVIDIA/aicr/releases/download/v1.3.0/recipe-catalog.sigstore.json
+```
+
+The trillian bundle names a fixed index digest; `latest` moves on, so a
+later capture through the tag finds another bundle, and the file above
+stays.
+
 ## Synthetic test instance
 
 `tests/support/pki.rs` builds a Sigstore instance at test time from the
@@ -116,3 +156,14 @@ S3).
 | `test-only-rekor` | the test Rekor: it signs the SETs |
 | `test-only-signer` | the trusted key of the keyed cases |
 | `test-only-other` | an untrusted key: SCTs, SETs and signatures from outside the trust |
+
+The test timestamp authority (`Tsa` in `tests/support/pki.rs`, ADR-038)
+signs its tokens with `test-only-tsa.key`, ECDSA P-256, PKCS#8, the same
+key as in `crates/boneli-https/tests/data/`, because a token's signature
+must be `ecdsa-with-SHA256` (`boneli_https::EcdsaP256Key` signs it); its
+leaf is issued at test time by the RSA test root, or by the attacker's
+self-signed CA with the root's name:
+
+```sh
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out test-only-tsa.key
+```

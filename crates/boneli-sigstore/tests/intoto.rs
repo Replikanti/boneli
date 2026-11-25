@@ -59,7 +59,8 @@ const ARGOCD: Real = Real {
     material: real::ARGOCD_MATERIAL,
     commit: real::ARGOCD_COMMIT,
     accepted: Accepted::Keyless {
-        integrated_time: 1_707_230_840,
+        integrated_time: Some(1_707_230_840),
+        signed_timestamps: 0,
         log_index: 69_491_963,
         identity: 0,
     },
@@ -74,7 +75,8 @@ const KYVERNO: Real = Real {
     material: real::KYVERNO_MATERIAL,
     commit: real::KYVERNO_COMMIT,
     accepted: Accepted::Keyless {
-        integrated_time: 1_699_611_421,
+        integrated_time: Some(1_699_611_421),
+        signed_timestamps: 0,
         log_index: 48_852_930,
         identity: 0,
     },
@@ -211,7 +213,8 @@ fn synthetic_verify(pki: &Pki, spec: &AttestationSpec) -> Result<Accepted, Refus
 }
 
 const SYNTHETIC: Result<Accepted, Refusal> = Ok(Accepted::Keyless {
-    integrated_time: pki::INTEGRATED,
+    integrated_time: Some(pki::INTEGRATED),
+    signed_timestamps: 0,
     log_index: pki::LOG_INDEX,
     identity: 0,
 });
@@ -291,7 +294,8 @@ fn real_intoto_attestations_verify() {
     assert_eq!(
         ARGOCD.accepted,
         Accepted::Keyless {
-            integrated_time: real::ARGOCD_INTEGRATED,
+            integrated_time: Some(real::ARGOCD_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::ARGOCD_LOG_INDEX,
             identity: 0
         }
@@ -299,7 +303,8 @@ fn real_intoto_attestations_verify() {
     assert_eq!(
         KYVERNO.accepted,
         Accepted::Keyless {
-            integrated_time: real::KYVERNO_INTEGRATED,
+            integrated_time: Some(real::KYVERNO_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::KYVERNO_LOG_INDEX,
             identity: 0
         }

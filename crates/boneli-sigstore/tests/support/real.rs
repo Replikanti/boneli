@@ -371,3 +371,33 @@ pub fn kyverno() -> Evidence {
 pub fn generator_v190_identity() -> Identity {
     Identity::new(GITHUB_ACTIONS, SanRule::Uri(GENERATOR_V190.to_owned())).expect("identity")
 }
+
+// ---- RFC 3161 timestamps (ADR-038) -------------------------------------
+
+/// The keyless `cosign sign` bundle of
+/// `ghcr.io/sigstore/scaffolding/trillian_log_server` v0.7.42: Rekor v1
+/// `dsse` 0.0.1 with a SET, and one RFC 3161 token of the public-good TSA.
+pub const TRILLIAN_BUNDLE: &[u8] = include_bytes!("../data/trillian-log-server.bundle.json");
+/// The Rekor v2 bundles (`hashedrekord` 0.0.2, no integrated time, one
+/// token each): read by PR 2 of #102; until then refused at the entry.
+pub const BEX_BUNDLE: &[u8] = include_bytes!("../data/bex-cnb-run.bundle.json");
+pub const AICR_RECIPE_BUNDLE: &[u8] =
+    include_bytes!("../data/aicr-recipe-catalog-1.3.0.sigstore.json");
+
+/// The image index the trillian bundle signs.
+pub const TRILLIAN_DIGEST: [u8; 32] =
+    hex32("ec7c9ee7a48ebdd4ca53ed68e493f1cb389fb7c899f60b9648ff72ab91504f1f");
+pub const TRILLIAN_WORKFLOW: &str =
+    "https://github.com/sigstore/scaffolding/.github/workflows/release.yaml@refs/tags/v0.7.42";
+/// Its integrated time, which equals its token's genTime and its leaf's
+/// notBefore (2026-11-22T17:13:30Z), and its log index.
+pub const TRILLIAN_INTEGRATED: u64 = 1_795_367_610;
+pub const TRILLIAN_LOG_INDEX: u64 = 4_047_157_521;
+
+pub fn trillian() -> Evidence {
+    Evidence::from_bundle(TRILLIAN_BUNDLE).expect("trillian bundle")
+}
+
+pub fn trillian_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(TRILLIAN_WORKFLOW.to_owned())).expect("identity")
+}

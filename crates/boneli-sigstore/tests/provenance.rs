@@ -156,7 +156,8 @@ fn real_provenance_meets_its_claims() {
     assert_eq!(
         runner_verify(runner_claims()),
         Ok(Accepted::Keyless {
-            integrated_time: real::RUNNER_INTEGRATED,
+            integrated_time: Some(real::RUNNER_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::RUNNER_LOG_INDEX,
             identity: 0
         })
@@ -172,7 +173,8 @@ fn real_provenance_meets_its_claims() {
     assert_eq!(
         verify(&real::jq(), &real::JQ_DIGEST, &trust),
         Ok(Accepted::Keyless {
-            integrated_time: real::JQ_INTEGRATED,
+            integrated_time: Some(real::JQ_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::JQ_LOG_INDEX,
             identity: 0
         })

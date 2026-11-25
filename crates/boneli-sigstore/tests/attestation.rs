@@ -57,7 +57,8 @@ fn flux_verify(trust: &Trust) -> Result<Accepted, Refusal> {
 }
 
 const FLUX_ACCEPTED: Result<Accepted, Refusal> = Ok(Accepted::Keyless {
-    integrated_time: real::FLUX_INTEGRATED,
+    integrated_time: Some(real::FLUX_INTEGRATED),
+    signed_timestamps: 0,
     log_index: real::FLUX_LOG_INDEX,
     identity: 0,
 });
@@ -223,7 +224,8 @@ fn real_attestation_with_vars() {
     assert_eq!(
         verify(&real::flux_273(), &real::FLUX_273_DIGEST, &trust),
         Ok(Accepted::Keyless {
-            integrated_time: real::FLUX_273_INTEGRATED,
+            integrated_time: Some(real::FLUX_273_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::FLUX_273_LOG_INDEX,
             identity: 0
         })

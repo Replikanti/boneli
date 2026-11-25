@@ -105,6 +105,7 @@ impl Evidence {
                     certificate,
                     statement,
                     tlogs: tlog.into_iter().collect(),
+                    timestamps: Vec::new(),
                 },
                 digest,
             ),

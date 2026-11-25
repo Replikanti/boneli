@@ -918,9 +918,34 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   argocd v2.10.0 and kyverno v1.11.0 are known answers; kyverno's files
   also run through the offline fake registry of `boneli-oci`. No new
   refusal, limit or dependency.
+- RFC 3161 timestamps as a time source of keyless bundles (#102, part 1,
+  ADR-038, proposed): `boneli_https::TimestampToken` reads a
+  `TimeStampResp` strictly (one signer, SHA-256, `ecdsa-with-SHA256`,
+  contentType, messageDigest and signingCertificateV2 once each, a whole-
+  second genTime, embedded certificates never parsed) and verifies it over
+  a message against a TSA chain the caller supplies, at genTime, with the
+  leaf's EKU critical and exactly timeStamping, and the anchor itself
+  valid at genTime. `TrustedRoot` reads `timestampAuthorities`
+  (`tsa_count`; an entry of one certificate is skipped, not refused), and
+  bundles carry up to
+  `MAX_TIMESTAMPS` (32) tokens (`TooManyTimestamps`). A keyless bundle's
+  verified times are the SET's integrated time and the genTime of every
+  token a TSA of the root verifies over the DSSE signature; tokens that
+  fail do not count, the leaf must be valid at every time, and a bundle
+  with no time is refused with `NoTimeSource` or the first token's
+  `Timestamp` refusal (`NoTsaAtTime`). Seven real tokens of Sigstore's
+  public-good TSA and the trillian_log_server bundle are known answers.
+  Rekor v2 entries are still refused. No new crate or dependency edge.
 
 ### Changed
 
+- **Breaking:** `boneli_sigstore::Accepted::Keyless` carries
+  `integrated_time: Option<u64>` and `signed_timestamps` (ADR-038), and a
+  bundle entry without a promise and without a timestamp is now refused
+  with `NoTimeSource` instead of `TlogEntries`.
+- The trust anchor of a Fulcio code-signing chain must be valid at the
+  verified time too (`CertError::OutsideValidity`); webpki never checks
+  an anchor's validity (ADR-038, D3).
 - **Breaking:** `ImageRef` has a required field `origin`, and
   `ImageStore::pull` returns `Result<Pulled, ImageError>` instead of
   `Result<RootfsRef, ImageError>` (#105, ADR-032). An operator reference

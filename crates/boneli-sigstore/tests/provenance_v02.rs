@@ -1004,7 +1004,8 @@ fn dispatch_by_predicate_type() {
     assert_eq!(
         verify(&real::runner(), &real::RUNNER_DIGEST, &trust),
         Ok(Accepted::Keyless {
-            integrated_time: real::RUNNER_INTEGRATED,
+            integrated_time: Some(real::RUNNER_INTEGRATED),
+            signed_timestamps: 0,
             log_index: real::RUNNER_LOG_INDEX,
             identity: 0
         })

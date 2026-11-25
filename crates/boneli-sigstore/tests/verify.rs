@@ -27,7 +27,8 @@ fn kubernetes_passes_with_its_email_identity() {
     assert_eq!(
         accepted,
         Accepted::Keyless {
-            integrated_time: real::KUBERNETES_INTEGRATED,
+            integrated_time: Some(real::KUBERNETES_INTEGRATED),
+            signed_timestamps: 0,
             log_index: 96_410_323,
             identity: 0
         }
@@ -49,7 +50,8 @@ fn chainguard_passes_with_its_uri_and_its_prefix() {
         assert!(matches!(
             accepted,
             Accepted::Keyless {
-                integrated_time: real::CHAINGUARD_INTEGRATED,
+                integrated_time: Some(real::CHAINGUARD_INTEGRATED),
+                signed_timestamps: 0,
                 ..
             }
         ));
@@ -715,7 +717,7 @@ fn refusal_texts() {
         ),
         (
             Refusal::NoCaAtTime,
-            "no trusted certificate authority is valid at the integrated time",
+            "no trusted certificate authority is valid at a verified signing time",
         ),
         (
             Refusal::Certificate(CertError::UnknownIssuer),

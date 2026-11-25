@@ -6,7 +6,9 @@
 //! by RFC 6962, section 3.2.
 //!
 //! webpki decides the chain: the signatures, the validity at `at_secs`
-//! (inclusive at both ends), the basic constraints (the leaf must not be
+//! (inclusive at both ends) of the leaf and the intermediates, while the
+//! trust anchor's own validity, which webpki never reads, is checked by
+//! `verify_chain` (ADR-038, D3), the basic constraints (the leaf must not be
 //! a CA), and the EKU, which `KeyUsage::required` demands of the leaf and
 //! of every intermediate on the path, as Sigstore's public-good
 //! intermediate carries it. Intermediates come only from the caller, so a
@@ -35,7 +37,7 @@ use crate::keys::{KeyKind, PublicKey};
 use crate::sha256::Sha256;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 /// id-kp-codeSigning, 1.3.6.1.5.5.7.3.3.
 const ID_KP_CODE_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
@@ -173,11 +175,83 @@ pub fn verify_code_signing(
     roots: &[&[u8]],
     at_secs: u64,
 ) -> Result<CodeSigningCert, CertError> {
+    let issuer_spki = verify_chain(leaf, intermediates, roots, at_secs, ID_KP_CODE_SIGNING)?;
+    let parsed = parse(leaf).map_err(|_| CertError::Malformed)?;
+    let sans = match find(&parsed.extensions, SUBJECT_ALT_NAME) {
+        Some(extension) => sans(extension.value)?,
+        None => Vec::new(),
+    };
+    let public_key =
+        PublicKey::from_spki_der(parsed.spki).map_err(|_| CertError::UnsupportedKey)?;
+    Ok(CodeSigningCert {
+        der: leaf.to_vec(),
+        issuer_spki,
+        sans,
+        extensions: parsed
+            .extensions
+            .iter()
+            .map(|e| (e.oid.to_vec(), e.value.to_vec()))
+            .collect(),
+        public_key,
+        not_before: parsed.not_before,
+        not_after: parsed.not_after,
+    })
+}
+
+/// Verifies `leaf` through `intermediates` to one of `roots` at `at_secs`
+/// for the extended key usage `eku`, which webpki demands of the leaf and
+/// of every intermediate on the path (module doc): the one webpki call of
+/// code-signing chains and of timestamp authorities (`timestamp`). Gives
+/// the SubjectPublicKeyInfo of the leaf's issuer on the verified path.
+///
+/// webpki checks the validity of the certificates on the path only, never
+/// of the trust anchor (a `TrustAnchor` carries none), so the root that
+/// ends a path must also be valid at `at_secs`, inclusive at both ends as
+/// webpki's own check (ADR-038, D3). The check runs as webpki's path
+/// callback, so a path to a root outside its validity is not taken and
+/// path building goes on to the other roots. A root the strict reader
+/// cannot read is refused as `BadRoot`, as one webpki cannot use.
+pub(crate) fn verify_chain(
+    leaf: &[u8],
+    intermediates: &[&[u8]],
+    roots: &[&[u8]],
+    at_secs: u64,
+    eku: &'static [u8],
+) -> Result<Vec<u8>, CertError> {
+    let validity = roots
+        .iter()
+        .map(|root| {
+            parse(root)
+                .map(|p| (p.not_before, p.not_after))
+                .map_err(|_| CertError::BadRoot)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let roots: Vec<CertificateDer<'_>> = roots.iter().map(|r| CertificateDer::from(*r)).collect();
     let anchors = roots
         .iter()
         .map(|root| webpki::anchor_from_trusted_cert(root).map_err(|_| CertError::BadRoot))
         .collect::<Result<Vec<_>, _>>()?;
+    let time = UnixTime::since_unix_epoch(Duration::from_secs(at_secs));
+    let anchor_valid = |path: &webpki::VerifiedPath<'_>| -> Result<(), webpki::Error> {
+        let index = anchors
+            .iter()
+            .position(|anchor| std::ptr::eq(anchor, path.anchor()))
+            .ok_or(webpki::Error::UnknownIssuer)?;
+        let (not_before, not_after) = validity[index];
+        if at_secs < not_before {
+            return Err(webpki::Error::CertNotValidYet {
+                time,
+                not_before: UnixTime::since_unix_epoch(Duration::from_secs(not_before)),
+            });
+        }
+        if at_secs > not_after {
+            return Err(webpki::Error::CertExpired {
+                time,
+                not_after: UnixTime::since_unix_epoch(Duration::from_secs(not_after)),
+            });
+        }
+        Ok(())
+    };
     let intermediates: Vec<CertificateDer<'_>> = intermediates
         .iter()
         .map(|c| CertificateDer::from(*c))
@@ -191,34 +265,13 @@ pub fn verify_code_signing(
                 .all,
             &anchors,
             &intermediates,
-            UnixTime::since_unix_epoch(Duration::from_secs(at_secs)),
-            webpki::KeyUsage::required(ID_KP_CODE_SIGNING),
+            time,
+            webpki::KeyUsage::required(eku),
             None,
-            None,
+            Some(&anchor_valid),
         )
         .map_err(chain_error)?;
-    let issuer_spki = path.issuer_spki().as_ref().to_vec();
-
-    let parsed = parse(leaf).map_err(|_| CertError::Malformed)?;
-    let sans = match find(&parsed.extensions, SUBJECT_ALT_NAME) {
-        Some(value) => sans(value)?,
-        None => Vec::new(),
-    };
-    let public_key =
-        PublicKey::from_spki_der(parsed.spki).map_err(|_| CertError::UnsupportedKey)?;
-    Ok(CodeSigningCert {
-        der: leaf.to_vec(),
-        issuer_spki,
-        sans,
-        extensions: parsed
-            .extensions
-            .iter()
-            .map(|(oid, value)| (oid.to_vec(), value.to_vec()))
-            .collect(),
-        public_key,
-        not_before: parsed.not_before,
-        not_after: parsed.not_after,
-    })
+    Ok(path.issuer_spki().as_ref().to_vec())
 }
 
 /// The fixed reason for a webpki chain error.
@@ -325,13 +378,23 @@ fn algorithm_matches(kind: KeyKind, hash: u8, signature: u8) -> bool {
 }
 
 /// What the strict reader takes from a certificate.
-struct Parsed<'a> {
+pub(crate) struct Parsed<'a> {
     /// The SubjectPublicKeyInfo, whole.
-    spki: &'a [u8],
-    not_before: u64,
-    not_after: u64,
-    /// `(OID, extnValue contents)`, in certificate order, no OID twice.
-    extensions: Vec<(&'a [u8], &'a [u8])>,
+    pub(crate) spki: &'a [u8],
+    pub(crate) not_before: u64,
+    pub(crate) not_after: u64,
+    /// In certificate order, no OID twice.
+    pub(crate) extensions: Vec<Extension<'a>>,
+}
+
+/// One extension of a certificate the strict reader read.
+pub(crate) struct Extension<'a> {
+    /// The content octets of its OBJECT IDENTIFIER.
+    pub(crate) oid: &'a [u8],
+    /// Whether it is marked critical (a BOOLEAN TRUE, `0xFF`).
+    pub(crate) critical: bool,
+    /// The contents of `extnValue`.
+    pub(crate) value: &'a [u8],
 }
 
 /// The TBSCertificate of a certificate, as content octets.
@@ -346,7 +409,7 @@ fn tbs_of(cert: &[u8]) -> Result<&[u8], DerError> {
     Ok(tbs)
 }
 
-fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
+pub(crate) fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
     let mut tbs = Reader::new(tbs_of(cert)?);
     tbs.optional(CONTEXT_0)?; // version
     tbs.expect(INTEGER)?; // serialNumber
@@ -370,13 +433,17 @@ fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
         while !list.is_empty() {
             let mut extension = Reader::new(list.expect(SEQUENCE)?);
             let oid = extension.expect(OID)?;
-            extension.optional(BOOLEAN)?; // critical
+            let critical = extension.optional(BOOLEAN)? == Some(&[0xFF]);
             let value = extension.expect(OCTET_STRING)?;
             extension.finish()?;
             if find(&extensions, oid).is_some() {
                 return Err(DerError("two extensions with one OID"));
             }
-            extensions.push((oid, value));
+            extensions.push(Extension {
+                oid,
+                critical,
+                value,
+            });
         }
     }
     tbs.finish()?;
@@ -388,11 +455,11 @@ fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
     })
 }
 
-fn find<'a>(extensions: &[(&[u8], &'a [u8])], oid: &[u8]) -> Option<&'a [u8]> {
-    extensions
-        .iter()
-        .find(|(id, _)| *id == oid)
-        .map(|(_, value)| *value)
+pub(crate) fn find<'e, 'a>(
+    extensions: &'e [Extension<'a>],
+    oid: &[u8],
+) -> Option<&'e Extension<'a>> {
+    extensions.iter().find(|e| e.oid == oid)
 }
 
 /// `GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName`, as [`San`]s.
@@ -674,6 +741,43 @@ mod tests {
             verify(&leaf, CA, T + LIFETIME + 1).expect_err("refused"),
             CertError::OutsideValidity
         );
+    }
+
+    /// The trust anchor itself must be valid at the time, inclusive at
+    /// both ends: webpki never checks an anchor's validity (ADR-038, D3).
+    /// The intermediate is the anchor here (2026-01-01 to 2126-01-01), and
+    /// the leaf is valid well around both of its bounds.
+    #[test]
+    fn anchor_validity_at_time() {
+        const ANCHOR_FROM: u64 = 1_767_225_600;
+        const ANCHOR_TO: u64 = 4_922_899_200;
+        let anchor = pem_der(CA);
+        let leaf = |at: u64| {
+            LeafSpec {
+                not_before: at - 86_400,
+                not_after: at + 86_400,
+                ..LeafSpec::email()
+            }
+            .build()
+        };
+        for (at, ok) in [
+            (1_751_328_000, false),
+            (ANCHOR_FROM - 1, false),
+            (ANCHOR_FROM, true),
+            (ANCHOR_TO, true),
+            (ANCHOR_TO + 1, false),
+        ] {
+            let result = verify_code_signing(&leaf(at), &[], &[&anchor], at);
+            if ok {
+                assert!(result.is_ok(), "{at}");
+            } else {
+                assert_eq!(
+                    result.expect_err("refused"),
+                    CertError::OutsideValidity,
+                    "{at}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2,12 +2,13 @@
 
 Fixtures for `tests/tls.rs`, `tests/dial.rs`, `tests/rsa.rs`, `tests/ecdsa.rs`,
 `tests/revocation.rs`, `tests/ocsp.rs`, `tests/intermediates.rs`,
-`tests/keys.rs`, `tests/codesign.rs` and the unit tests of
-`src/revocation/` and `src/codesign.rs`, read with `include_bytes!`. The
+`tests/keys.rs`, `tests/codesign.rs`, `tests/timestamp.rs` and the unit
+tests of `src/revocation/`, `src/codesign.rs` and `src/timestamp.rs`, read
+with `include_bytes!`. The
 keys protect nothing: they exist only so that a local test server can
 complete a TLS handshake, so that `RsaSha256Key` and `PublicKey` can be
 checked against OpenSSL, and so that tests can sign OCSP answers,
-code-signing leaves and SCTs. No system trusts these CAs (the real
+code-signing leaves, SCTs and timestamp tokens. No system trusts these CAs (the real
 captures at the end are public certificates of real hosts), and no
 GitHub App or other account has any of these keys. The signing keys say
 so in their names (`test-only-`).
@@ -804,3 +805,54 @@ jq -r '.layers[0].annotations["dev.sigstore.cosign/bundle"]' k8s-sig.json | jq .
 openssl verify -CAfile sigstore-fulcio-root.pem -untrusted sigstore-fulcio-intermediate.pem \
   -attime 1716500129 sigstore-leaf-kubernetes.pem
 ```
+
+## RFC 3161 timestamps (`tests/timestamp.rs`, `src/timestamp/`, ADR-038)
+
+Sigstore's public-good timestamp authority and seven of its tokens,
+captured on 2026-11-25 from the bundles named below; each `.tsr` is a
+bundle's `signedTimestamp` (a whole DER `TimeStampResp`) and each `.sig`
+the bytes it is over, the bundle's DSSE signature. Every token verifies
+with OpenSSL against the two certificates
+(`openssl ts -verify -in tsa-X.tsr -data tsa-X.sig -CAfile tsa-sigstore-root.pem -untrusted tsa-sigstore-leaf.pem`).
+
+| File | SHA-256 | What |
+| --- | --- | --- |
+| `tsa-sigstore-leaf.pem` | `366bf80f…194f2bdf` | "sigstore-tsa" (O=sigstore.dev), P-384, 2025-04-08 to 2035-04-06, keyUsage digitalSignature and EKU timeStamping, both critical: the first certificate of `timestampAuthorities[0]` of `trusted_root.json` |
+| `tsa-sigstore-root.pem` | `bf6960b2…22dbb03f` | "sigstore-tsa-selfsigned", P-384, the same validity, `CA:TRUE, pathlen:0`: the anchor, its second certificate |
+| `tsa-aicr-recipe-catalog-1.3.0.tsr`, `.sig` | `2abe744c…92d4075c` | release asset `recipe-catalog.sigstore.json` of `NVIDIA/aicr` v1.3.0 (Rekor v2), genTime 1794873195 |
+| `tsa-aicr-sbom-1.3.0.tsr`, `.sig` | `88eb548e…3ff69376` | release asset `aicr_1.3.0_linux_amd64.sbom.json.sigstore.json` (Rekor v2), genTime 1794873249 |
+| `tsa-aicr-openvex-858ab1e4.tsr`, `.sig` | `16262f2a…9386c5c4` | the OpenVEX bundle `sha256:054f435f…` of `ghcr.io/nvidia/aicr`'s amd64 manifest `sha256:858ab1e4…` (referrer manifest `sha256:461cdf6c…`; Rekor v1 with a SET), genTime 1793656382 |
+| `tsa-aicr-openvex-1.3.0.tsr`, `.sig` | `a5f6b43f…732976b7` | the OpenVEX bundle `sha256:6701dc50…` of aicr v1.3.0's amd64 manifest `sha256:21fb2bdb…` (referrer manifest `sha256:d20cc74d…`; Rekor v1 with a SET), genTime 1794873594 |
+| `tsa-bex-cnb-run.tsr`, `.sig` | `eeb8fe5e…0768238d` | `crates/boneli-sigstore/tests/data/bex-cnb-run.bundle.json` (Rekor v2), genTime 1793371569 |
+| `tsa-cosign-latest.tsr`, `.sig` | `376eb7ca…ab31c5b7` | `crates/boneli-sigstore/tests/data/cosign-latest.bundle.json` (keyed, Rekor v1), genTime 1792519726 |
+| `tsa-trillian-log-server.tsr`, `.sig` | `62edc199…6b0b8710` | `crates/boneli-sigstore/tests/data/trillian-log-server.bundle.json` (Rekor v1 with a SET), genTime 1795367610 |
+| `test-only-tsa.key`, `test-only-tsa.pub.pem` | | the test TSA's key, ECDSA P-256, PKCS#8, and its public key: `src/timestamp/testing.rs` signs tokens with it at test time (`EcdsaP256Key`), under leaves the code-signing test intermediate's key issues, with that intermediate as the anchor |
+
+The SHA-256 is the token's. With the bundles in the current directory
+(the three of `crates/boneli-sigstore/tests/data/` above, and the aicr
+ones fetched as in that README: the release assets by
+`https://github.com/NVIDIA/aicr/releases/download/v1.3.0/<name>`, the
+OpenVEX bundles as the blob of their referrer manifest), with `jq`:
+
+```sh
+tsa() { jq -r ".timestampAuthorities[0].certChain.certificates[$1].rawBytes" trusted_root.json |
+  base64 -d | openssl x509 -inform DER -out "$2"; }
+tsa 0 tsa-sigstore-leaf.pem; tsa 1 tsa-sigstore-root.pem
+token() { # bundle, name
+  jq -r '.verificationMaterial.timestampVerificationData.rfc3161Timestamps[0].signedTimestamp' "$1" |
+    base64 -d > "tsa-$2.tsr"
+  jq -r '.dsseEnvelope.signatures[0].sig' "$1" | base64 -d > "tsa-$2.sig"
+}
+token recipe-catalog.sigstore.json aicr-recipe-catalog-1.3.0
+token aicr_1.3.0_linux_amd64.sbom.json.sigstore.json aicr-sbom-1.3.0
+token openvex-858ab1e4.bundle.json aicr-openvex-858ab1e4
+token openvex-1.3.0.bundle.json aicr-openvex-1.3.0
+token bex-cnb-run.bundle.json bex-cnb-run
+token cosign-latest.bundle.json cosign-latest
+token trillian-log-server.bundle.json trillian-log-server
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out test-only-tsa.key
+openssl pkey -in test-only-tsa.key -pubout -out test-only-tsa.pub.pem
+```
+
+The test key is test-only and signs nothing outside these tests; the
+same key is in `crates/boneli-sigstore/tests/data/`.

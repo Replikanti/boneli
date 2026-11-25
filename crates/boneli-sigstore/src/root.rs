@@ -1,7 +1,8 @@
 //! `trusted_root.json`, the operator's statement of which Sigstore
 //! instance to trust (ADR-029, S2): the Rekor logs whose promises count,
 //! the Fulcio certificate authorities that issue signing certificates,
-//! and the CT logs whose SCTs count, each with a validity window.
+//! the CT logs whose SCTs count, and the timestamp authorities whose RFC
+//! 3161 tokens count as a time (ADR-038, D4), each with a validity window.
 //!
 //! It is read strictly, because a wrong reading would trust the wrong
 //! key: the media type byte for byte; every log ID recomputed from its key
@@ -10,8 +11,11 @@
 //! `boneli_https::PublicKey`); `hashAlgorithm` `SHA2_256`, the only hash
 //! RFC 6962 and Rekor v1 use; no log ID twice across the Rekor and CT
 //! logs; no window that ends before it starts. A field this crate does
-//! not use is not read: `baseUrl`, `uri`, `subject`, and the whole of
-//! `timestampAuthorities` (TSA time is out of scope, ADR-029 S2).
+//! not use is not read: `baseUrl`, `uri` and `subject`. A timestamp
+//! authority's chain is read with its leaf first and its anchor last; one
+//! of a single certificate can anchor no token and is skipped, and one
+//! whose first certificate is a CA stays listed but no token verifies
+//! through it (ADR-038, D4).
 //!
 //! A CT log whose `keyId` is not the SHA-256 of its key refuses the file
 //! (RFC 6962 defines the log ID so). A Rekor log whose `keyId` is not is
@@ -70,6 +74,17 @@ pub(crate) struct Authority {
     pub(crate) window: Window,
 }
 
+/// A timestamp authority (ADR-038, D4): its leaf, the certificates between
+/// the leaf and the anchor, the anchor, and the window of genTimes it
+/// vouches for.
+#[derive(Clone, Debug)]
+pub(crate) struct Tsa {
+    pub(crate) leaf: Vec<u8>,
+    pub(crate) intermediates: Vec<Vec<u8>>,
+    pub(crate) root: Vec<u8>,
+    pub(crate) window: Window,
+}
+
 /// A parsed `trusted_root.json`.
 ///
 /// `Debug` shows how many logs and authorities it holds.
@@ -78,6 +93,7 @@ pub struct TrustedRoot {
     pub(crate) tlogs: Vec<Tlog>,
     pub(crate) authorities: Vec<Authority>,
     pub(crate) ctlogs: Vec<CtLog>,
+    pub(crate) tsas: Vec<Tsa>,
 }
 
 impl fmt::Debug for TrustedRoot {
@@ -86,6 +102,7 @@ impl fmt::Debug for TrustedRoot {
             .field("tlogs", &self.tlogs.len())
             .field("authorities", &self.authorities.len())
             .field("ctlogs", &self.ctlogs.len())
+            .field("tsas", &self.tsas.len())
             .finish()
     }
 }
@@ -138,6 +155,13 @@ impl TrustedRoot {
             .iter()
             .map(authority)
             .collect::<Result<Vec<_>, _>>()?;
+        let tsas = list(&root, "timestampAuthorities")?
+            .iter()
+            .map(tsa)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         ids.extend(ctlogs.iter().map(|l| l.key.key_id()));
         ids.sort_unstable();
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -147,6 +171,7 @@ impl TrustedRoot {
             tlogs,
             authorities,
             ctlogs,
+            tsas,
         })
     }
 
@@ -163,6 +188,11 @@ impl TrustedRoot {
     /// How many CT logs the root holds.
     pub fn ctlog_count(&self) -> usize {
         self.ctlogs.len()
+    }
+
+    /// How many timestamp authorities the root holds (ADR-038).
+    pub fn tsa_count(&self) -> usize {
+        self.tsas.len()
     }
 }
 
@@ -217,19 +247,25 @@ fn details_match(details: &str, kind: KeyKind) -> bool {
 
 /// A `CertificateAuthority`: its chain and window.
 fn authority(value: &Value) -> Result<Authority, ConfigError> {
-    let chain = json::object(value, "certChain").ok_or(ConfigError::RootCertificate)?;
-    let certificates = json::array(chain, "certificates").ok_or(ConfigError::RootCertificate)?;
-    let mut ders = certificates
-        .iter()
-        .map(|c| json::base64(c, "rawBytes").filter(|d| !d.is_empty()))
-        .collect::<Option<Vec<_>>>()
-        .ok_or(ConfigError::RootCertificate)?;
+    let mut ders = chain(value)?;
     let root = ders.pop().ok_or(ConfigError::RootCertificate)?;
     Ok(Authority {
         intermediates: ders,
         root,
         window: window(value)?,
     })
+}
+
+/// The DER certificates of `certChain.certificates`, each non-empty
+/// canonical base64.
+fn chain(value: &Value) -> Result<Vec<Vec<u8>>, ConfigError> {
+    let chain = json::object(value, "certChain").ok_or(ConfigError::RootCertificate)?;
+    let certificates = json::array(chain, "certificates").ok_or(ConfigError::RootCertificate)?;
+    certificates
+        .iter()
+        .map(|c| json::base64(c, "rawBytes").filter(|d| !d.is_empty()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ConfigError::RootCertificate)
 }
 
 /// The `validFor` member of `value`: `start` required, `end` optional.
@@ -255,4 +291,29 @@ fn window(value: &Value) -> Result<Window, ConfigError> {
         start_ms: start,
         end_ms: end,
     })
+}
+
+/// A `timestampAuthorities` entry (ADR-038, D4): `certChain.certificates`
+/// with the TSA's leaf first and the anchor last, and `validFor` with
+/// `start` required. `subject` and `uri` are not read; an empty chain
+/// refuses the file. An entry whose chain is one certificate is read as
+/// strictly and then skipped (`None`): webpki cannot verify a certificate
+/// that is itself the anchor, so the entry anchors no token, and refusing
+/// the whole file would also refuse every Rekor v1 bundle under it. A
+/// chain whose first certificate is a CA is kept; no token verifies
+/// through it, since its "leaf" is refused as a CA or as not the signer.
+fn tsa(value: &Value) -> Result<Option<Tsa>, ConfigError> {
+    let mut ders = chain(value)?;
+    let window = window(value)?;
+    if ders.len() == 1 {
+        return Ok(None);
+    }
+    let root = ders.pop().ok_or(ConfigError::RootCertificate)?;
+    let leaf = ders.remove(0);
+    Ok(Some(Tsa {
+        leaf,
+        intermediates: ders,
+        root,
+        window,
+    }))
 }

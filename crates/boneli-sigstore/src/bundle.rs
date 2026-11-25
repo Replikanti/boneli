@@ -16,8 +16,13 @@
 //!   `integratedTime`, `canonicalizedBody` and, if present,
 //!   `inclusionPromise.signedEntryTimestamp`. A `kindVersion` that does
 //!   not name the body's kind and version is a malformed entry, as
-//!   sigstore-go treats it. `inclusionProof` and
-//!   `timestampVerificationData` are not read (out of scope, ADR-029).
+//!   sigstore-go treats it. `inclusionProof` is not read (out of scope,
+//!   ADR-029). An entry without `integratedTime`, as Rekor v2 writes
+//!   them, is malformed: Rekor v2 entries are not read yet (ADR-038).
+//! - `timestampVerificationData` (ADR-038): absent, `{}`, or
+//!   `rfc3161Timestamps`, at most [`MAX_TIMESTAMPS`] objects with a
+//!   non-empty `signedTimestamp`, kept as DER and parsed only by `verify`.
+//!   Any other shape is a malformed bundle.
 //!
 //! Integers are protobuf JSON's int64 strings; bytes are canonical
 //! base64.
@@ -28,7 +33,7 @@ use crate::dsse::{self, IN_TOTO_PAYLOAD_TYPE};
 use crate::error::Refusal;
 use crate::rekor::TlogEntry;
 use crate::verify::{Dsse, Evidence, Form};
-use crate::{MAX_BUNDLE_BYTES, json};
+use crate::{MAX_BUNDLE_BYTES, MAX_TIMESTAMPS, json};
 
 /// The one bundle media type accepted.
 pub const BUNDLE_V03_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
@@ -73,6 +78,7 @@ impl Evidence {
                 .map(|e| entry(e).ok_or(Refusal::MalformedTlogEntry))
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let timestamps = timestamps(material)?;
 
         let envelope = json::object(&bundle, "dsseEnvelope").ok_or(Refusal::MalformedBundle)?;
         let payload = json::base64(envelope, "payload").ok_or(Refusal::MalformedBundle)?;
@@ -93,9 +99,38 @@ impl Evidence {
                 certificate,
                 statement,
                 tlogs,
+                timestamps,
             }),
         })
     }
+}
+
+/// The tokens of `timestampVerificationData`: absent, `{}`, or
+/// `rfc3161Timestamps` as a list of objects whose `signedTimestamp` is
+/// non-empty canonical base64, at most [`MAX_TIMESTAMPS`] of them. Any
+/// other shape, other members included, is a malformed bundle.
+fn timestamps(material: &Value) -> Result<Vec<Vec<u8>>, Refusal> {
+    let Some(data) = material.get("timestampVerificationData") else {
+        return Ok(Vec::new());
+    };
+    let members = data.as_object().ok_or(Refusal::MalformedBundle)?;
+    if members.keys().any(|key| key != "rfc3161Timestamps") {
+        return Err(Refusal::MalformedBundle);
+    }
+    let Some(list) = data.get("rfc3161Timestamps") else {
+        return Ok(Vec::new());
+    };
+    let list = list.as_array().ok_or(Refusal::MalformedBundle)?;
+    if list.len() > MAX_TIMESTAMPS {
+        return Err(Refusal::TooManyTimestamps);
+    }
+    list.iter()
+        .map(|t| {
+            json::base64(t, "signedTimestamp")
+                .filter(|der| !der.is_empty())
+                .ok_or(Refusal::MalformedBundle)
+        })
+        .collect()
 }
 
 /// One `TransparencyLogEntry`.

@@ -17,7 +17,7 @@ pub(crate) const CA: &[u8] = include_bytes!("../../tests/data/codesign-intermedi
 pub(crate) const CA_NO_EKU: &[u8] =
     include_bytes!("../../tests/data/codesign-intermediate-no-eku.pem");
 /// The key of both intermediates.
-const CA_KEY: &[u8] = include_bytes!("../../tests/data/test-only-codesign-ca.key");
+pub(crate) const CA_KEY: &[u8] = include_bytes!("../../tests/data/test-only-codesign-ca.key");
 const CT_KEY: &[u8] = include_bytes!("../../tests/data/test-only-ct-log.key");
 pub(crate) const CT_PUBLIC: &[u8] = include_bytes!("../../tests/data/codesign-ct-log.pem");
 /// The public key every built leaf carries.
@@ -42,7 +42,7 @@ const EXT_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
 const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13];
 const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1D, 0x11];
 /// `ecdsa-with-SHA384`, whole.
-const ECDSA_SHA384: &[u8] = &[
+pub(crate) const ECDSA_SHA384: &[u8] = &[
     0x30, 0x0A, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03,
 ];
 
@@ -111,7 +111,7 @@ pub(crate) fn key_hash(pem: &[u8]) -> [u8; 32] {
     Sha256::digest(cert.subject_public_key_info().as_ref())
 }
 
-fn subject(pem: &[u8]) -> Vec<u8> {
+pub(crate) fn subject(pem: &[u8]) -> Vec<u8> {
     let der = CertificateDer::from(pem_der(pem));
     let cert = webpki::EndEntityCert::try_from(&der).expect("CA");
     der::encode(SEQUENCE, cert.subject())
@@ -119,7 +119,7 @@ fn subject(pem: &[u8]) -> Vec<u8> {
 
 /// A DER ECDSA signature of `message` with the PKCS#8 key `pem` under
 /// `scheme`.
-fn sign(pem: &[u8], scheme: SignatureScheme, message: &[u8]) -> Vec<u8> {
+pub(crate) fn sign(pem: &[u8], scheme: SignatureScheme, message: &[u8]) -> Vec<u8> {
     let key = PrivateKeyDer::from_pem_slice(pem).expect("key PEM");
     let key = rustls::crypto::ring::sign::any_ecdsa_type(&key).expect("ECDSA key");
     let signer = key.choose_scheme(&[scheme]).expect("scheme");
