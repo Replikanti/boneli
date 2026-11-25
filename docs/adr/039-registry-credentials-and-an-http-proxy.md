@@ -483,12 +483,15 @@ direct outbound 80 and 443 rejected for the runner user, and Squid's
 access log checked for the `CONNECT` and an absolute-form CRL `GET`
 among the lines written after the probes, which use `auth.docker.io` so
 that none of their lines counts for the pull.
-First run on the part 2 branch (run 45683133090): `curl` to Docker Hub
-without the proxy failed to connect, `node:22` pulled through Squid in
-29.6 s on x86_64 and 45.3 s on arm64, Squid's log held 14 `CONNECT
-registry-1.docker.io:443` lines and 5 absolute-form CRL `GET`s on each
+First runs on the part 2 branch: in run 45683133090 `curl` to Docker
+Hub without the proxy failed to connect and `node:22` pulled through
+Squid in 29.6 s on x86_64 and 45.3 s on arm64 (its log count of 14
+`CONNECT registry-1.docker.io:443` lines included two of the probes,
+which the review of part 2 found); in run 45690189984, counting only the
+pull's lines, Squid logged 27 lines per architecture, 12 of them
+`CONNECT registry-1.docker.io:443` and 5 absolute-form CRL `GET`s
 (Amazon's `rootca1` and `r2m01` lists, Let's Encrypt's `x2`, `ye` and a
-`ye1` shard).
+`ye1` shard), with `node:22` pulled in 31.0 s and 49.2 s.
 
 ## Consequences
 
