@@ -1617,16 +1617,16 @@
    "title": "boneli-replay-check: make line_cost_is_linear_in_bytes independent of wall-clock load",
    "epic": null,
    "order": 62,
-   "state": "pr-review",
-   "owner": "ea19b3dc",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 130,
    "note": "",
-   "updated_at": "2026-11-25T12:11:33+00:00",
+   "updated_at": "2026-11-25T13:08:14+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1661,25 +1661,33 @@
     "sandbox"
    ],
    "manual": false
+  },
+  {
+   "issue": 131,
+   "title": "boneli-https: investigate TimedOut in body_one_over_cap_is_too_large under CPU load",
+   "epic": null,
+   "order": 64,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-25T13:08:19+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "core"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:24:47+00:00",
-   "issue": 114,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
-  {
-   "at": "2026-11-24T09:24:47+00:00",
-   "issue": 113,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-24T09:24:58+00:00",
    "issue": 114,
@@ -2063,6 +2071,22 @@
    "to": "pr-review",
    "by": "ea19b3dc",
    "note": null
+  },
+  {
+   "at": "2026-11-25T13:08:14+00:00",
+   "issue": 128,
+   "from": "pr-review",
+   "to": "done",
+   "by": "ea19b3dc",
+   "note": null
+  },
+  {
+   "at": "2026-11-25T13:08:19+00:00",
+   "issue": 131,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
   }
  ],
  "open": [
@@ -2090,11 +2114,11 @@
   55,
   69,
   102,
-  128,
-  129
+  129,
+  131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T12:11:33+00:00",
+ "updated_at": "2026-11-25T13:08:19+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
