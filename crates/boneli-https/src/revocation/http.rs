@@ -18,8 +18,11 @@
 //! credentials: a proxy that does not authenticate a request itself may
 //! pass `Proxy-Authorization` on to the server (Apache httpd's forward
 //! proxy does), so the field goes out only on one retry, on a new
-//! connection, after the proxy answered `407`. An `https` one is a
-//! `CONNECT` tunnel with `Proxy-Authorization` up front (the proxy reads a
+//! connection, after the proxy answered `407` with a `Basic`
+//! `Proxy-Authenticate` challenge. Only the proxy's own `407` carries one:
+//! a proxy does not pass a server's challenge on, so a `407` without it
+//! came from behind the proxy and fails without a retry. An `https` one is
+//! a `CONNECT` tunnel with `Proxy-Authorization` up front (the proxy reads a
 //! `CONNECT` head and relays nothing of it) and then TLS as above, and the
 //! request inside the tunnel carries `Host` only. A refused `CONNECT` and
 //! a `407` to a `GET` are `CrlFetchError::Unreachable` naming the proxy and
@@ -42,6 +45,7 @@ use super::{
     CRL_MAX_HEADERS, CrlFetchError, CrlSource, MAX_CRL_BYTES,
 };
 use crate::dial::{DeadlineSocket, time_left};
+use crate::proxy::offers_basic;
 use crate::{ConnectOptions, Nonblocking, Proxy, TlsConfig};
 
 /// Fetches CRLs and OCSP responses over HTTP and HTTPS.
@@ -83,7 +87,9 @@ impl HttpSource {
             return first;
         };
         // Only a proxied `GET` waits for `407` before it sends credentials
-        // (ADR-039, D8); a `CONNECT` carried them already.
+        // (ADR-039, D8); a `CONNECT` carried them already. `request`
+        // returns `Status(407)` only for a 407 with a `Basic` challenge,
+        // the proxy's own.
         if !matches!(url.scheme(), CrlScheme::Http) || first != Err(CrlFetchError::Status(407)) {
             return first;
         }
@@ -295,6 +301,20 @@ fn request<S: Read + Write + IdleCheck>(
     .map_err(http_error)?;
     let mut response = conn.request(&head, RequestBody::None).map_err(http_error)?;
     let status = response.head.status;
+    if status == 407
+        && let Route::Proxy { proxy, .. } = route
+        && !offers_basic(response.head.headers.get_all("proxy-authenticate"))
+    {
+        // Not the proxy's own challenge: a 407 from the server, or from
+        // the plaintext leg behind the proxy, that a proxy which does not
+        // authenticate passed on. Credentials sent now could reach the
+        // server, so no retry (ADR-039, D8).
+        return Err(CrlFetchError::Unreachable(format!(
+            "the proxy {} returned 407 to GET {url} without a Basic Proxy-Authenticate \
+challenge, so it is not the proxy's own; not retried with credentials",
+            proxy.authority()
+        )));
+    }
     if status != 200 {
         return Err(CrlFetchError::Status(status));
     }
@@ -931,6 +951,82 @@ Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
 it refused the configured credentials; only Basic is sent",
                 addr.port()
             ))
+        );
+        let (heads, listener) = server.join().expect("server");
+        assert_eq!(heads.len(), 2);
+        assert!(!another_connection(&listener), "a third request");
+    }
+
+    /// A `407` with these `Proxy-Authenticate` fields.
+    fn status_407(challenges: &[&str]) -> Vec<u8> {
+        let mut head = String::from("HTTP/1.1 407 Proxy Authentication Required\r\n");
+        for challenge in challenges {
+            head.push_str(&format!("Proxy-Authenticate: {challenge}\r\n"));
+        }
+        head.push_str("Content-Length: 0\r\n\r\n");
+        head.into_bytes()
+    }
+
+    /// A `407` without a `Basic` challenge is not the proxy's own: a
+    /// server's, passed on by a proxy that did not authenticate (Apache
+    /// httpd with an IP rule strips the server's `Proxy-Authenticate`).
+    /// No retry, so no credential goes out, and the error says why.
+    #[test]
+    fn relayed_407_without_basic_challenge_is_not_retried() {
+        for challenges in [&[][..], &["Negotiate"], &["NTLM", "Negotiate abc=="]] {
+            let (addr, server) = sequence(vec![status_407(challenges)]);
+            let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+            let err = crl(&proxied(addr), &point, deadline()).expect_err("refused");
+            let CrlFetchError::Unreachable(text) = &err else {
+                panic!("{challenges:?}: {err:?}");
+            };
+            assert!(
+                text.contains("without a Basic Proxy-Authenticate challenge"),
+                "{text}"
+            );
+            assert!(!text.contains("dXNlcjpwYXNz"), "{text}");
+            let (heads, listener) = server.join().expect("server");
+            assert!(!heads[0].contains("Proxy-Authorization"), "{heads:?}");
+            assert!(!another_connection(&listener), "{challenges:?}: retried");
+        }
+    }
+
+    /// A `Basic` challenge among others, in one field or in several, in any
+    /// case, is the proxy's own: one retry with credentials, as before.
+    #[test]
+    fn basic_among_challenges_is_retried_once() {
+        for challenges in [
+            &["Negotiate", "basic realm=\"proxy\""][..],
+            &["Negotiate, BASIC realm=\"proxy\", NTLM"],
+        ] {
+            let (addr, server) = sequence(vec![status_407(challenges), ok_with(b"list")]);
+            let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+            assert_eq!(
+                crl(&proxied(addr), &point, deadline()),
+                Ok(b"list".to_vec()),
+                "{challenges:?}"
+            );
+            let (heads, listener) = server.join().expect("server");
+            assert!(!heads[0].contains("Proxy-Authorization"), "{heads:?}");
+            assert!(
+                heads[1].contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"),
+                "{heads:?}"
+            );
+            assert!(!another_connection(&listener), "a third request");
+        }
+    }
+
+    /// The proxy takes the credentials on the retry, and the server behind
+    /// it answers `407`, passed on without a challenge: the fetch fails
+    /// with that reason, with no third try.
+    #[test]
+    fn relayed_407_after_the_retry_is_final() {
+        let (addr, server) = sequence(vec![PROXY_407.to_vec(), status_407(&[])]);
+        let point = CrlUrl::parse("http://crl.boneli.test/ca.crl").expect("URL");
+        let err = crl(&proxied(addr), &point, deadline()).expect_err("refused");
+        assert!(
+            matches!(&err, CrlFetchError::Unreachable(t) if t.contains("without a Basic")),
+            "{err:?}"
         );
         let (heads, listener) = server.join().expect("server");
         assert_eq!(heads.len(), 2);

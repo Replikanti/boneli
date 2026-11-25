@@ -172,9 +172,10 @@ documents for `with_resolver`.
   the tunnel carries `Host` only.
 - A refused `CONNECT` is `CrlFetchError::Unreachable` whose text is
   `Error::Proxy`'s: the proxy, the target and the status. A `407` to a
-  proxied `GET` is `Unreachable` too, naming the proxy: without
-  credentials it says none are configured, and after the one retry with
-  them it says the proxy refused them (D8). Any other non-200 answer to a
+  proxied `GET` is `Unreachable` too, naming the proxy: without a `Basic`
+  challenge it says the `407` is not the proxy's own and was not retried,
+  without credentials it says none are configured, and after the one
+  retry with them it says the proxy refused them (D8). Any other non-200 answer to a
   proxied `GET` is `CrlFetchError::Status`, as on a direct fetch: the
   client cannot tell whether the proxy or the server behind it
   answered. Either way the check fails closed with `RevocationUnknown`
@@ -221,13 +222,37 @@ documents for `with_resolver`.
     or as a parent proxy it passes the field on. The #55 part 1 review
     reproduced this with Apache 2.4.69: the CRL server received the
     runner's proxy credentials in cleartext. Squid drops the field toward
-    servers. So the first `GET` carries no credentials; on a `407` the
-    fetch retries once, on a new connection under the same deadline,
-    with `Proxy-Authorization`; a second `407` fails closed with
-    `Unreachable` ("refused the configured credentials"), and a `407`
-    without configured credentials is not retried. A proxy that asks for
-    credentials has consumed them, so the retry does not leak them on.
-    Cost: one more connection and round trip per revocation fetch through
+    servers. So the first `GET` carries no credentials; on the proxy's
+    own `407` the fetch retries once, on a new connection under the same
+    deadline, with `Proxy-Authorization`; a second such `407` fails
+    closed with `Unreachable` ("refused the configured credentials"), and
+    a `407` without configured credentials is not retried.
+  - **Only the proxy's own `407` triggers the retry: one with a `Basic`
+    challenge in `Proxy-Authenticate`.** A proxy that does not
+    authenticate passes on whatever status the server answers, `407`
+    included, and anyone on the plaintext leg between the proxy and the
+    server can forge one. Retrying on such a `407` would send the
+    credentials through the same proxy that forwards the field, to the
+    server (the #55 part 1 review, run 2, reproduced it with Apache
+    2.4.69 behind an open proxy and behind an IP-or-user rule). A proxy
+    sends `Proxy-Authenticate` for its own challenge and does not pass a
+    server's on (RFC 9110, 11.7.1: the field applies to the next
+    inbound proxy only; Apache httpd strips it from a passed-on `407`,
+    verified in the same review). So the retry needs a `Basic` challenge:
+    the auth-scheme token compared case-insensitively, one of several
+    challenges in one field or in several fields counts, commas in quoted
+    strings do not split (`proxy::offers_basic`). A `407` without one
+    fails closed with `Unreachable` ("without a Basic Proxy-Authenticate
+    challenge … not retried with credentials"), so a server that answers
+    `407` behind the proxy makes the fetch fail and gets no credentials.
+    What "the proxy has consumed them" rests on is therefore the proxy's
+    own challenge, not the status. Known limit: a non-conforming proxy
+    that forwards a server's `Proxy-Authenticate` with its `407` and also
+    forwards `Proxy-Authorization` to the server would still let a server
+    or the plaintext leg behind it obtain the credentials; the client
+    cannot tell that `407` from the proxy's own. The cure is a proxy that
+    follows RFC 9110 or one that authenticates every request.
+  - Cost: one more connection and round trip per revocation fetch through
     an authenticating proxy, at most once per list or answer per cache
     period (24 h, ADR-017 and ADR-020); D9 counts it in the setup time.
   - Weak spots: a proxy that requires NTLM or Kerberos is not supported,
@@ -342,8 +367,12 @@ proxy and a refused fetch fails closed, and the configuration order and
 the RFC 7617 vector, the `https` point through a tunnel, redaction, and
 the `407` rule of D8: no credentials on the first `GET`, the retry
 carries them, a second `407` fails closed with no third try, a `407`
-without credentials is not retried, and a `CONNECT` carries them up front
-and is not retried.
+without credentials is not retried, a `407` with no challenge or only
+non-`Basic` ones (`Negotiate`, `NTLM`) is not retried and sends no
+credential, a `Basic` challenge among others in one or several fields is
+retried once, a challenge-less `407` passed on after the retry is final,
+and a `CONNECT` carries them up front and is not retried; the challenge
+parser has its own cases (quoted commas, case, RFC 9110's example).
 The live revocation tests (`tests/network.rs`, `ocsp::live`) still run
 direct.
 

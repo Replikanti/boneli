@@ -204,6 +204,67 @@ impl fmt::Debug for Proxy {
     }
 }
 
+/// Whether the `Proxy-Authenticate` field values `values` hold a `Basic`
+/// challenge (RFC 9110, 11.6.1 and 11.7.1; RFC 7617): one of the
+/// challenges, in one field or in several, whose auth-scheme is `Basic`,
+/// compared case-insensitively. A field value is a comma-separated list
+/// whose elements are challenges (`scheme`, `scheme token68`, `scheme
+/// param=value`) or further auth-params of the challenge before them
+/// (`param=value`, `param = "quoted, value"`); commas inside a quoted
+/// string do not separate elements. An element starts a challenge when it
+/// begins with a token that is not followed by `=`.
+///
+/// Only a proxy's own `407` carries this field: a proxy does not pass a
+/// server's `Proxy-Authenticate` on (RFC 9110, 11.7.1; Apache httpd strips
+/// it), so a `407` without a `Basic` challenge did not come from a proxy
+/// that will consume `Basic` credentials (ADR-039, D8).
+pub(crate) fn offers_basic<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> bool {
+    values.into_iter().any(|value| {
+        split_list(value).into_iter().any(|element| {
+            let element = element.trim_ascii();
+            let token_end = element
+                .iter()
+                .position(|&b| !is_tchar(b))
+                .unwrap_or(element.len());
+            if token_end == 0 {
+                return false;
+            }
+            let rest = element[token_end..].trim_ascii_start();
+            // `token =` is an auth-param, not a scheme.
+            if rest.first() == Some(&b'=') {
+                return false;
+            }
+            element[..token_end].eq_ignore_ascii_case(b"basic")
+        })
+    })
+}
+
+/// RFC 9110 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// `value` split at the commas outside quoted strings (RFC 9110, 5.6.1 and
+/// 5.6.4: a backslash escapes the next byte inside quotes).
+fn split_list(value: &[u8]) -> Vec<&[u8]> {
+    let mut elements = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, &b) in value.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            quoted = !quoted;
+        } else if b == b',' && !quoted {
+            elements.push(&value[start..i]);
+            start = i + 1;
+        }
+    }
+    elements.push(&value[start..]);
+    elements
+}
+
 /// `host:port`, an IPv6 host in brackets.
 pub(crate) fn authority(host: &str, port: u16) -> String {
     if host.contains(':') {
@@ -375,6 +436,40 @@ mod tests {
         let debug = format!("{proxy:?} {proxy:#?}");
         assert!(debug.contains("[redacted]"), "{debug}");
         assert_no_secret(&debug);
+    }
+
+    #[test]
+    fn basic_challenge_detection() {
+        let offers = |fields: &[&str]| offers_basic(fields.iter().map(|f| f.as_bytes()));
+        for yes in [
+            &["Basic realm=\"proxy\""][..],
+            &["basic realm=\"proxy\""],
+            &["BASIC"],
+            &["  Basic  "],
+            &["Negotiate, Basic realm=\"p\""],
+            &["Negotiate abc==, Basic realm=\"p\""],
+            &["Negotiate", "Basic realm=\"p\""],
+            &["Digest realm=\"a, Basic b\", nonce=\"1\", Basic realm=\"x\""],
+            // RFC 9110, 11.6.1's example.
+            &[
+                "Newauth realm=\"apps\", type=1, title=\"Login to \\\"apps\\\"\", Basic realm=\"simple\"",
+            ],
+        ] {
+            assert!(offers(yes), "{yes:?}");
+        }
+        for no in [
+            &[][..],
+            &[""],
+            &["Negotiate"],
+            &["NTLM", "Negotiate abc=="],
+            &["Digest realm=\"Basic\", nonce=\"Basic, Basic x\""],
+            &["Digest realm=\"a\", basic=1"],
+            &["Digest realm=\"a\", basic = \"x\""],
+            &["Basicx realm=\"p\""],
+            &["Bearer realm=\"Basic realm\""],
+        ] {
+            assert!(!offers(no), "{no:?}");
+        }
     }
 
     #[test]
