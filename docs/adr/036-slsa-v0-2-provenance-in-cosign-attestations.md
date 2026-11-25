@@ -294,6 +294,7 @@ superseded by item 4 here. The rest of ADR-031 stands.
 - `.att` attestations logged as Rekor `intoto` 0.0.1 entries (generator
   before v2.0.0, 2 of 13 measured) are refused with `EntryKind` (D3).
   Closure: #118, an `intoto` body check bound through `content.hash`.
+  Closed by ADR-037 (#118): both measured `intoto` entries verify.
 - The caller's workflow file is not bound (D2). For v0.2 the SAN is the
   generator's, so any workflow of the source repository at a matching
   ref that calls the generator passes; for v1 the SAN names the

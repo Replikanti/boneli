@@ -35,7 +35,10 @@
 //!   (`AttestationNeedsClaims`), so the verdict over kept evidence never
 //!   differs from a cold pull's, which does not ask for `.att` then. Past
 //!   that it is checked exactly as a bundle: predicate type, subject,
-//!   signature, certificate claims, then the claims.
+//!   signature, certificate claims, then the claims. Its log entry is
+//!   Rekor `dsse` 0.0.1, as a bundle's, or `intoto` 0.0.1 over the exact
+//!   envelope bytes (ADR-037); a bundle or a cosign layer never takes an
+//!   `intoto` entry.
 //!
 //! No step reads the wall clock: the only time is the log's, so the same
 //! inputs give the same verdict forever.
@@ -88,7 +91,9 @@ pub(crate) enum Form {
         tlog: Option<TlogEntry>,
     },
     Bundle(Dsse),
-    Attestation(Dsse),
+    /// A cosign `.att` layer: its envelope and the SHA-256 of the exact
+    /// envelope bytes, which a Rekor `intoto` 0.0.1 entry names (ADR-037).
+    Attestation(Dsse, [u8; 32]),
 }
 
 /// A DSSE envelope over an in-toto statement, with what verifies it: the
@@ -109,7 +114,7 @@ impl fmt::Debug for Evidence {
         let form = match &self.form {
             Form::Cosign { .. } => "cosign",
             Form::Bundle(_) => "bundle",
-            Form::Attestation(_) => "attestation",
+            Form::Attestation(..) => "attestation",
         };
         let keyless = self.is_keyless();
         f.debug_struct("Evidence")
@@ -125,7 +130,7 @@ impl Evidence {
         match &self.form {
             Form::Cosign { certificate, .. }
             | Form::Bundle(Dsse { certificate, .. })
-            | Form::Attestation(Dsse { certificate, .. }) => certificate.is_some(),
+            | Form::Attestation(Dsse { certificate, .. }, _) => certificate.is_some(),
         }
     }
 
@@ -133,7 +138,7 @@ impl Evidence {
     fn message(&self) -> &[u8] {
         match &self.form {
             Form::Cosign { payload, .. } => payload,
-            Form::Bundle(dsse) | Form::Attestation(dsse) => &dsse.message,
+            Form::Bundle(dsse) | Form::Attestation(dsse, _) => &dsse.message,
         }
     }
 
@@ -141,7 +146,7 @@ impl Evidence {
         match &self.form {
             Form::Cosign { signature, .. }
             | Form::Bundle(Dsse { signature, .. })
-            | Form::Attestation(Dsse { signature, .. }) => signature,
+            | Form::Attestation(Dsse { signature, .. }, _) => signature,
         }
     }
 }
@@ -311,7 +316,7 @@ pub enum Accepted {
 /// Whether `evidence` signs the image digest `subject` (SHA-256) under
 /// `trust` (module doc).
 pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<Accepted, Refusal> {
-    if matches!(evidence.form, Form::Attestation(_)) && trust.claims.is_none() {
+    if matches!(evidence.form, Form::Attestation(..)) && trust.claims.is_none() {
         return Err(Refusal::AttestationNeedsClaims);
     }
     match &evidence.form {
@@ -323,7 +328,7 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
                 return Err(Refusal::SubjectMismatch);
             }
         }
-        Form::Bundle(Dsse { statement, .. }) | Form::Attestation(Dsse { statement, .. }) => {
+        Form::Bundle(Dsse { statement, .. }) | Form::Attestation(Dsse { statement, .. }, _) => {
             if !trust.predicate_types.contains(&statement.predicate_type) {
                 return Err(Refusal::PredicateType);
             }
@@ -344,7 +349,7 @@ pub fn verify(evidence: &Evidence, subject: &[u8; 32], trust: &Trust) -> Result<
         None => None,
     };
     // Only a statement a trusted signer signed is read for its claims.
-    if let (Some(claims), Form::Bundle(dsse) | Form::Attestation(dsse)) =
+    if let (Some(claims), Form::Bundle(dsse) | Form::Attestation(dsse, _)) =
         (&trust.claims, &evidence.form)
     {
         provenance::check(
@@ -412,27 +417,34 @@ fn keyless(
             certificate: Some(certificate),
             tlogs,
             ..
-        })
-        | Form::Attestation(Dsse {
-            payload,
-            signature,
-            certificate: Some(certificate),
-            tlogs,
-            ..
-        }) => {
-            let [entry] = tlogs.as_slice() else {
-                return Err(Refusal::TlogEntries);
-            };
-            (
-                entry,
-                Expected::Dsse {
-                    payload,
-                    signature,
-                    certificate,
-                },
+        }) => (
+            one_entry(tlogs)?,
+            Expected::Dsse {
+                payload,
+                signature,
                 certificate,
-            )
-        }
+            },
+            certificate,
+        ),
+        Form::Attestation(
+            Dsse {
+                payload,
+                signature,
+                certificate: Some(certificate),
+                tlogs,
+                ..
+            },
+            envelope,
+        ) => (
+            one_entry(tlogs)?,
+            Expected::Attestation {
+                payload,
+                signature,
+                certificate,
+                envelope,
+            },
+            certificate,
+        ),
         _ => return Err(Refusal::NoCertificate),
     };
     // The readers refuse a negative time or one above `i64` (Rekor's type);
@@ -460,6 +472,14 @@ fn keyless(
         identity,
     };
     Ok((accepted, cert))
+}
+
+/// The one log entry a DSSE carrier must have.
+fn one_entry(tlogs: &[TlogEntry]) -> Result<&TlogEntry, Refusal> {
+    match tlogs {
+        [entry] => Ok(entry),
+        _ => Err(Refusal::TlogEntries),
+    }
 }
 
 /// The certificate, verified through the first authority whose window

@@ -326,3 +326,48 @@ pub fn generator_prefix_identity() -> Identity {
     )
     .expect("identity")
 }
+
+// ---- Rekor `intoto` 0.0.1 entries for cosign `.att` (ADR-037) ------------
+
+pub const KYVERNO_ATT: &[u8] = include_bytes!("../data/kyverno-1.11.0.att.json");
+pub const KYVERNO_ENVELOPE: &[u8] = include_bytes!("../data/kyverno-1.11.0.envelope.json");
+
+/// The SHA-256 of kyverno v1.11.0's `.att` manifest and envelope, as
+/// `tests/data/README.md` lists them.
+pub const KYVERNO_ATT_SHA256: [u8; 32] =
+    hex32("81c56313cb6c8b8906489344965a12d44bca389f482d99a0d406c9923f9923a2");
+pub const KYVERNO_ENVELOPE_SHA256: [u8; 32] =
+    hex32("148c49ddc6f3099c00a75e6ac186ae003aba2c81c37458b6aa6c0e6f82837513");
+
+/// `ghcr.io/kyverno/kyverno` v1.11.0's index digest, the statement's
+/// subject.
+pub const KYVERNO_DIGEST: [u8; 32] =
+    hex32("4c30afa85d83f4a55ab14642b0630ba51fde573717ba712721edd1408ab39e3a");
+
+/// slsa-github-generator's container workflow at v1.9.0: the SAN of the
+/// argocd and kyverno certificates and their statements' `builder.id`.
+pub const GENERATOR_V190: &str = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v1.9.0";
+
+pub const ARGOCD_REF: &str = "refs/tags/v2.10.0";
+pub const ARGOCD_MATERIAL: &str = "git+https://github.com/argoproj/argo-cd@refs/tags/v2.10.0";
+pub const ARGOCD_COMMIT: &str = "2175939ed6156ddd743e60f427f7f48118c971bf";
+pub const KYVERNO_REPOSITORY: &str = "https://github.com/kyverno/kyverno";
+pub const KYVERNO_REF: &str = "refs/tags/v1.11.0";
+pub const KYVERNO_MATERIAL: &str = "git+https://github.com/kyverno/kyverno@refs/tags/v1.11.0";
+pub const KYVERNO_COMMIT: &str = "a411fe6377afc165f31f251d119ab526f56fcfb6";
+
+/// Rekor's integrated time and log index of the two `intoto` entries.
+/// Each integrated time equals its leaf's notBefore to the second.
+pub const ARGOCD_INTEGRATED: u64 = 1_707_230_840;
+pub const ARGOCD_LOG_INDEX: u64 = 69_491_963;
+pub const KYVERNO_INTEGRATED: u64 = 1_699_611_421;
+pub const KYVERNO_LOG_INDEX: u64 = 48_852_930;
+
+pub fn kyverno() -> Evidence {
+    attestation(KYVERNO_ATT, KYVERNO_ENVELOPE).expect("kyverno v1.11.0 attestation")
+}
+
+/// The generator's exact SAN at v1.9.0.
+pub fn generator_v190_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(GENERATOR_V190.to_owned())).expect("identity")
+}

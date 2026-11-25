@@ -13,7 +13,8 @@ later pull without a `Required` rule to it, byte for byte.
 Captured on 2026-11-24 through the anonymous registry API. The digests
 are the ones ADR-029 measured on 2026-11-20, and jq's the one ADR-031
 measured on 2026-11-24, and flux-cli's the one ADR-036 measured on
-2026-11-24; `sigstore-trusted-root.json`
+2026-11-24, and kyverno's the one ADR-037 measured on 2026-11-24;
+`sigstore-trusted-root.json`
 and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 (same SHA-256), where their sources are listed.
 
@@ -43,6 +44,11 @@ and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 | `flux.amd64-config.json` | `9b0c4fef…e14e2bd8` | that manifest's config |
 | `flux.att.json` | `467ee9c3…5b9f7ac5` | the cosign `.att` manifest of the index (the tag `sha256-<index hex>.att`; the amd64 manifest's answers 404): one SLSA v0.2 layer, the file `flux-cli-2.4.0.att.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
 | `flux.envelope.json` | `f12badd9…56be214b` | its DSSE envelope, the file `flux-cli-2.4.0.envelope.json` there |
+| `kyverno.index.json` | `4c30afa8…8ab39e3a` | the index of `ghcr.io/kyverno/kyverno:v1.11.0`, an OCI index of 7 platforms, 2,027 bytes (ADR-037); `.sig`, the referrers API and the referrers tag answer 404 |
+| `kyverno.amd64.json` | `db534c96…bc066f42` | its `linux/amd64` manifest (OCI, 1,211 bytes) |
+| `kyverno.amd64-config.json` | `0bd890f3…0b6a5bcd` | that manifest's config (1,045 bytes) |
+| `kyverno.att.json` | `81c56313…9f9923a2` | the cosign `.att` manifest of the index: one SLSA v0.2 layer logged as a Rekor `intoto` 0.0.1 entry, the file `kyverno-1.11.0.att.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
+| `kyverno.envelope.json` | `148c49dd…82837513` | its DSSE envelope, the file `kyverno-1.11.0.envelope.json` there |
 
 From an empty directory, with `jq`:
 
@@ -97,6 +103,17 @@ curl -sSL -H "Authorization: Bearer $tok" -o flux.amd64-config.json \
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o flux.att.json "$gh/manifests/sha256-$fd.att"
 curl -sSL -H "Authorization: Bearer $tok" -o flux.envelope.json \
   "$gh/blobs/$(jq -r '.layers[0].digest' flux.att.json)"
+gh=https://ghcr.io/v2/kyverno/kyverno
+tok=$(curl -fsS 'https://ghcr.io/token?scope=repository:kyverno/kyverno:pull' | jq -r .token)
+kd=4c30afa85d83f4a55ab14642b0630ba51fde573717ba712721edd1408ab39e3a
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o kyverno.index.json "$gh/manifests/sha256:$kd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o kyverno.amd64.json \
+  "$gh/manifests/$(jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest' kyverno.index.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o kyverno.amd64-config.json \
+  "$gh/blobs/$(jq -r .config.digest kyverno.amd64.json)"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o kyverno.att.json "$gh/manifests/sha256-$kd.att"
+curl -sSL -H "Authorization: Bearer $tok" -o kyverno.envelope.json \
+  "$gh/blobs/$(jq -r '.layers[0].digest' kyverno.att.json)"
 ```
 
 ## Test keys

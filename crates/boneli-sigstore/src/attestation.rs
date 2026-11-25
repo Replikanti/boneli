@@ -21,10 +21,25 @@
 //! members are not read. The statement is in-toto Statement v0.1 or v1
 //! (every measured `.att` is v0.1). The result is checked as a bundle is
 //! (`verify`): PAE is the signed text, and a keyless one needs its one
-//! Rekor `dsse` 0.0.1 entry. The entry body's `envelopeHash` is not
-//! checked, as for a bundle (ADR-029 item 8): the signature over PAE, the
-//! payload hash and the verifier already bind everything the verdict
-//! reads.
+//! Rekor entry, of one of two kinds:
+//!
+//! - `dsse` 0.0.1 (ADR-036), as for a bundle. The body's `envelopeHash` is
+//!   not checked (ADR-029 item 8): the signature over PAE, the payload
+//!   hash and the verifier already bind everything the verdict reads.
+//! - `intoto` 0.0.1 (ADR-037), as slsa-github-generator before v2 logged
+//!   its attestations. Its body holds no signature, so the binding runs
+//!   through the envelope bytes: the SET covers the body, the body's
+//!   `content.hash` is the SHA-256 of the exact blob this reader took (the
+//!   layer digest `boneli-oci` checked on fetch), and with those bytes the
+//!   signature and payload are fixed; `content.payloadHash` names the
+//!   decoded payload and `publicKey` the leaf, which the chain then
+//!   verifies. The digest is taken over the input before any parse, never
+//!   over a re-serialization.
+//!
+//! Only `.att` takes an `intoto` entry: a bundle does not carry the bytes
+//! Rekor hashed, and a `.sig` layer is a `hashedrekord` (ADR-029 S2).
+
+use boneli_https::Sha256;
 
 use crate::cosign::{self, annotation};
 use crate::dsse::{self, IN_TOTO_PAYLOAD_TYPE, STATEMENT_V01, STATEMENT_V1};
@@ -50,6 +65,9 @@ impl Evidence {
         if envelope.len() > MAX_BUNDLE_BYTES {
             return Err(Refusal::EnvelopeTooLarge);
         }
+        // Over the input as received, before any parse: an `intoto` entry
+        // names these bytes, and a re-serialization would differ.
+        let digest = Sha256::digest(envelope);
         let certificate = match annotation(annotations, CERTIFICATE_ANNOTATION)? {
             None | Some("") => None,
             Some(text) => {
@@ -79,14 +97,17 @@ impl Evidence {
         let signature = json::base64(one, "sig").ok_or(Refusal::MalformedSignature)?;
         let statement = dsse::statement(&payload, &[STATEMENT_V01, STATEMENT_V1])?;
         Ok(Evidence {
-            form: Form::Attestation(Dsse {
-                message: dsse::pae(payload_type.as_bytes(), &payload),
-                payload,
-                signature,
-                certificate,
-                statement,
-                tlogs: tlog.into_iter().collect(),
-            }),
+            form: Form::Attestation(
+                Dsse {
+                    message: dsse::pae(payload_type.as_bytes(), &payload),
+                    payload,
+                    signature,
+                    certificate,
+                    statement,
+                    tlogs: tlog.into_iter().collect(),
+                },
+                digest,
+            ),
         })
     }
 }

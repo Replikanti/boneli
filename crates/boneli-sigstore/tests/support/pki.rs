@@ -802,6 +802,41 @@ pub fn dsse_body(payload: &[u8], signature: &[u8], certificate: &[u8]) -> Value 
     ])
 }
 
+/// An `intoto` 0.0.1 body as Rekor writes it for a cosign `.att` layer
+/// (ADR-037): the SHA-256 of the `envelope` bytes, the SHA-256 of the
+/// decoded `payload`, and the leaf as `publicKey`.
+pub fn intoto_body(envelope: &[u8], payload: &[u8], certificate: &[u8]) -> Value {
+    obj(vec![
+        ("apiVersion", s("0.0.1")),
+        ("kind", s("intoto")),
+        (
+            "spec",
+            obj(vec![
+                (
+                    "content",
+                    obj(vec![
+                        (
+                            "hash",
+                            obj(vec![
+                                ("algorithm", s("sha256")),
+                                ("value", s(&hex(&Sha256::digest(envelope)))),
+                            ]),
+                        ),
+                        (
+                            "payloadHash",
+                            obj(vec![
+                                ("algorithm", s("sha256")),
+                                ("value", s(&hex(&Sha256::digest(payload)))),
+                            ]),
+                        ),
+                    ]),
+                ),
+                ("publicKey", s(&base64::encode(pem(certificate).as_bytes()))),
+            ]),
+        ),
+    ])
+}
+
 /// The JCS bytes a SET signs.
 pub fn set_message(
     body: &[u8],
@@ -1163,4 +1198,96 @@ pub fn rfc3339_ms(ms: u64) -> String {
         rem % 60,
         ms % 1_000
     )
+}
+
+/// A keyless cosign `.att` layer (ADR-036, ADR-037): the leaf signs the PAE
+/// of `statement`, `envelope` is the layer blob (compact unless replaced),
+/// and the entry is the test Rekor's over an `intoto` 0.0.1 body of those
+/// exact bytes unless replaced.
+pub struct AttestationSpec {
+    pub statement: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub certificate: Vec<u8>,
+    pub envelope: Vec<u8>,
+    pub entry: EntrySpec,
+    pub predicate_type: String,
+}
+
+impl AttestationSpec {
+    pub fn keyless(pki: &Pki, leaf: &LeafSpec, statement: Vec<u8>) -> AttestationSpec {
+        let signature = pki
+            .leaf_key
+            .sign(&pae(IN_TOTO_PAYLOAD_TYPE.as_bytes(), &statement));
+        let certificate = leaf.build(pki);
+        let envelope = to_bytes(&envelope_value(&statement, &signature));
+        let body = intoto_body(&envelope, &statement, &certificate);
+        AttestationSpec {
+            entry: EntrySpec::new(pki, &body),
+            statement,
+            signature,
+            certificate,
+            envelope,
+            predicate_type: boneli_sigstore::SLSA_PROVENANCE_V02_PREDICATE.to_owned(),
+        }
+    }
+
+    /// The `intoto` 0.0.1 body of the current envelope, payload and leaf.
+    pub fn intoto_body(&self) -> Value {
+        intoto_body(&self.envelope, &self.statement, &self.certificate)
+    }
+
+    /// Logs `body` instead, signed by the test Rekor.
+    pub fn log(&mut self, pki: &Pki, body: &Value) {
+        self.entry = EntrySpec::new(pki, body);
+    }
+
+    /// Logs the current envelope again as `intoto` 0.0.1.
+    pub fn relog(&mut self, pki: &Pki) {
+        let body = self.intoto_body();
+        self.log(pki, &body);
+    }
+
+    /// cosign's annotations: an empty signature, the leaf in PEM, the
+    /// entry and the predicate type.
+    pub fn annotations(&self, pki: &Pki) -> Vec<(String, String)> {
+        vec![
+            (SIGNATURE_ANNOTATION.to_owned(), String::new()),
+            (CERTIFICATE_ANNOTATION.to_owned(), pem(&self.certificate)),
+            (
+                BUNDLE_ANNOTATION.to_owned(),
+                String::from_utf8(to_bytes(&self.entry.cosign_annotation(pki))).expect("UTF-8"),
+            ),
+            (
+                boneli_sigstore::PREDICATE_TYPE_ANNOTATION.to_owned(),
+                self.predicate_type.clone(),
+            ),
+        ]
+    }
+
+    pub fn evidence(
+        &self,
+        pki: &Pki,
+    ) -> Result<boneli_sigstore::Evidence, boneli_sigstore::Refusal> {
+        let owned = self.annotations(pki);
+        let pairs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        boneli_sigstore::Evidence::from_cosign_attestation(&pairs, &self.envelope)
+    }
+}
+
+/// A DSSE envelope as cosign's `.att` layer holds it, `keyid` empty.
+pub fn envelope_value(statement: &[u8], signature: &[u8]) -> Value {
+    obj(vec![
+        ("payloadType", s(IN_TOTO_PAYLOAD_TYPE)),
+        ("payload", s(&base64::encode(statement))),
+        (
+            "signatures",
+            Value::Array(vec![obj(vec![
+                ("keyid", s("")),
+                ("sig", s(&base64::encode(signature))),
+            ])]),
+        ),
+    ])
 }

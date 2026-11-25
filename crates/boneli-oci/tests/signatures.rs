@@ -3809,6 +3809,120 @@ fn real_attestation_through_att_tag() {
     }
 }
 
+// ---- Rekor `intoto` 0.0.1 entries for `.att` (ADR-037) -----------------
+
+const KYVERNO_REPO: &str = "kyverno/kyverno";
+const KYVERNO_INDEX: &[u8] = include_bytes!("data/kyverno.index.json");
+const KYVERNO_AMD64: &[u8] = include_bytes!("data/kyverno.amd64.json");
+const KYVERNO_CONFIG: &[u8] = include_bytes!("data/kyverno.amd64-config.json");
+const KYVERNO_ATT: &[u8] = include_bytes!("data/kyverno.att.json");
+const KYVERNO_ENVELOPE: &[u8] = include_bytes!("data/kyverno.envelope.json");
+const GENERATOR_V190: &str = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v1.9.0";
+const KYVERNO_SOURCE: &str = "https://github.com/kyverno/kyverno";
+const KYVERNO_MATERIAL: &str = "git+https://github.com/kyverno/kyverno@refs/tags/v1.11.0";
+const KYVERNO_COMMIT: &str = "a411fe6377afc165f31f251d119ab526f56fcfb6";
+
+/// kyverno v1.11.0's real index (an OCI index), amd64 manifest and
+/// config, and its `.att` manifest and envelope (captured 2026-11-24).
+/// GHCR answers `404` for its `.sig`, referrers and referrers tag, and so
+/// does this fake, as for every layer blob.
+fn kyverno_hub() -> Hub {
+    let mut hub = Hub::default();
+    hub.document(KYVERNO_REPO, media::INDEX, KYVERNO_INDEX);
+    hub.document(KYVERNO_REPO, media::MANIFEST, KYVERNO_AMD64);
+    hub.blob(KYVERNO_REPO, KYVERNO_CONFIG);
+    hub.blob(KYVERNO_REPO, KYVERNO_ENVELOPE);
+    hub.tag(
+        KYVERNO_REPO,
+        &format!("{}.att", tag_of(&digest_of(KYVERNO_INDEX))),
+        media::MANIFEST,
+        KYVERNO_ATT,
+    );
+    hub
+}
+
+/// The generator's keyless trust at v1.9.0, v0.2 only, with an exact
+/// builder, `repository` as the source-repository claim, the tag prefix
+/// and kyverno's material.
+fn kyverno_trust(repository: &str) -> Arc<Trust> {
+    let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+    let identity =
+        Identity::new(GITHUB_ACTIONS, SanRule::Uri(GENERATOR_V190.to_owned())).expect("id");
+    let claims = Claims::new(
+        Some(GENERATOR_V190),
+        Some(ClaimMatch::Exact(repository.to_owned())),
+        Some(ClaimMatch::Prefix("refs/tags/".to_owned())),
+        vec![Material::new(KYVERNO_MATERIAL, "sha1", KYVERNO_COMMIT).expect("material")],
+    )
+    .expect("claims");
+    Arc::new(
+        Trust::new(
+            Vec::new(),
+            Some((root, vec![identity])),
+            vec![SLSA_PROVENANCE_V02_PREDICATE.to_owned()],
+        )
+        .expect("trust")
+        .with_claims(claims)
+        .expect("with claims"),
+    )
+}
+
+/// kyverno's real `.att`, logged as a Rekor `intoto` 0.0.1 entry, through
+/// the fake registry: with its own claims the pull goes on to its first
+/// layer (answered `404`) and a second pull over the same store sends no
+/// signature request; with another source repository it is refused before
+/// any layer request, the detail names `.att` and the claim. Neither asks
+/// for a `.sig`.
+#[test]
+fn real_intoto_attestation_through_att_tag() {
+    let index = digest_of(KYVERNO_INDEX);
+    let first_layer = nth_digest(KYVERNO_AMD64, 1);
+    let att = digest_of(KYVERNO_ATT);
+    let envelope = digest_of(KYVERNO_ENVELOPE);
+    for (repository, passes) in [
+        (KYVERNO_SOURCE, true),
+        ("https://github.com/kyverno/other", false),
+    ] {
+        let fake = hub_fake(kyverno_hub());
+        let tmp = TempDir::new("kyverno");
+        let root = tmp.path().join("store");
+        let pull = || match open_with(&root, &fake, required(kyverno_trust(repository)))
+            .pull(&image_ref(KYVERNO_REPO, &index))
+        {
+            Err(ImageError::Failed { detail }) => detail,
+            other => panic!("{other:?}"),
+        };
+        let detail = pull();
+        let reached = targets(&fake.seen())
+            .iter()
+            .any(|t| t.ends_with(&format!("/blobs/{first_layer}")));
+        assert_eq!(reached, passes, "{detail}");
+        assert!(!sig_requested(&fake), "{:?}", targets(&fake.seen()));
+        assert!(att_requested(&fake));
+        if passes {
+            assert!(!detail.contains("signature policy"), "{detail}");
+            let before = fake.seen().len();
+            let warm = pull();
+            assert!(!warm.contains("signature policy"), "{warm}");
+            let later = targets(&fake.seen()[before..]);
+            assert!(
+                later.iter().all(|t| !t.contains("/referrers/")
+                    && !t.contains("sha256-")
+                    && !t.ends_with(&format!("/blobs/{envelope}"))),
+                "{later:?}"
+            );
+        } else {
+            assert!(detail.starts_with("signature policy: "), "{detail}");
+            assert!(
+                detail.contains(&format!(
+                    "{index}: .att {att}: 1 listed, 1 candidates (layer 0: the provenance's source repository does not meet the rule)"
+                )),
+                "{detail}"
+            );
+        }
+    }
+}
+
 /// An image whose only evidence is a keyed `.att` passes under a claims
 /// rule, after exactly the referrers request, the referrers tag, the
 /// `.att` tag and the envelope.

@@ -321,21 +321,6 @@ fn real_attestation_negative() {
     );
 }
 
-/// argocd v2.10.0's `.att` is logged as a Rekor `intoto` 0.0.1 entry,
-/// which this crate does not read (D3): refused with `EntryKind`.
-#[test]
-fn real_intoto_entry_refused() {
-    let claims = Claims::new(None, exact(real::ARGOCD_REPOSITORY), None, vec![]).expect("c");
-    let trust = slsa(
-        real::slsa_v02_keyless(real::generator_prefix_identity()),
-        claims,
-    );
-    assert_eq!(
-        verify(&real::argocd(), &real::ARGOCD_DIGEST, &trust),
-        Err(Refusal::EntryKind)
-    );
-}
-
 /// Under a trust without claims an attestation counts for nothing, keyed
 /// or keyless, whatever its predicate list: `AttestationNeedsClaims`
 /// before any other check, so a warm verdict equals the cold one.

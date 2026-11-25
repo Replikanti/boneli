@@ -20,6 +20,18 @@
 //! checked: Rekor hashed the envelope as cosign submitted it, and the
 //! bundle carries no copy of those bytes (cosign writes the envelope
 //! again), so no input could reproduce it.
+//!
+//! A cosign `.att` layer (ADR-037) may also be logged as `intoto` 0.0.1,
+//! as slsa-github-generator before v2 did. That body has no signature
+//! member: it names the SHA-256 of the envelope bytes (`content.hash`),
+//! the SHA-256 of the decoded payload (`content.payloadHash`) and the
+//! signing certificate (`publicKey`). Here the layer blob is the exact
+//! envelope Rekor hashed, so the content hash binds the signature and the
+//! payload, and the public key the leaf; that is the pair cosign's
+//! `VerifyBundle` compares. The payload hash is checked as well, and
+//! required: Rekor indexes attestations by it, so it ties the statement
+//! log monitors see to the one we read. sigstore-go reads no `intoto`
+//! 0.0.1 entry; bundles and `.sig` layers never take one here.
 
 use boneli_https::Sha256;
 use boneli_json::Value;
@@ -53,6 +65,15 @@ pub(crate) enum Expected<'a> {
         payload: &'a [u8],
         signature: &'a [u8],
         certificate: &'a [u8],
+    },
+    /// The entry of a cosign `.att` layer: a `dsse` 0.0.1 as [`Expected::Dsse`],
+    /// or an `intoto` 0.0.1 over the envelope whose SHA-256 is `envelope`
+    /// (ADR-037).
+    Attestation {
+        payload: &'a [u8],
+        signature: &'a [u8],
+        certificate: &'a [u8],
+        envelope: &'a [u8; 32],
     },
 }
 
@@ -114,7 +135,7 @@ fn body_matches(body: &Value, expected: &Expected<'_>) -> Result<(), Refusal> {
                 .ok_or(Refusal::BodyMismatch)?;
             let sig = json::object(spec, "signature").ok_or(Refusal::BodyMismatch)?;
             let key = json::object(sig, "publicKey").ok_or(Refusal::BodyMismatch)?;
-            let ok = hash_matches(hash, payload)
+            let ok = sha256_is(hash, &Sha256::digest(payload))
                 && json::base64(sig, "content").as_deref() == Some(*signature)
                 && pem_certificate(key, "content").as_deref() == Some(*certificate);
             ok.then_some(()).ok_or(Refusal::BodyMismatch)
@@ -127,24 +148,66 @@ fn body_matches(body: &Value, expected: &Expected<'_>) -> Result<(), Refusal> {
             if (kind, version) != (Some("dsse"), Some("0.0.1")) {
                 return Err(Refusal::EntryKind);
             }
-            let spec = spec.ok_or(Refusal::BodyMismatch)?;
-            let hash = json::object(spec, "payloadHash").ok_or(Refusal::BodyMismatch)?;
-            let [one] = json::array(spec, "signatures").ok_or(Refusal::BodyMismatch)? else {
-                return Err(Refusal::BodyMismatch);
-            };
-            let ok = hash_matches(hash, payload)
-                && json::base64(one, "signature").as_deref() == Some(*signature)
-                && pem_certificate(one, "verifier").as_deref() == Some(*certificate);
-            ok.then_some(()).ok_or(Refusal::BodyMismatch)
+            dsse_matches(spec, payload, signature, certificate)
         }
+        Expected::Attestation {
+            payload,
+            signature,
+            certificate,
+            envelope,
+        } => match (kind, version) {
+            (Some("dsse"), Some("0.0.1")) => dsse_matches(spec, payload, signature, certificate),
+            (Some("intoto"), Some("0.0.1")) => intoto_matches(spec, payload, certificate, envelope),
+            _ => Err(Refusal::EntryKind),
+        },
     }
 }
 
-/// Whether `{"algorithm":"sha256","value":<hex>}` is the SHA-256 of
-/// `data`.
-fn hash_matches(hash: &Value, data: &[u8]) -> bool {
+/// Whether a `dsse` 0.0.1 `spec` names the SHA-256 of `payload` and
+/// exactly one signature, `signature`, with `certificate` as verifier.
+fn dsse_matches(
+    spec: Option<&Value>,
+    payload: &[u8],
+    signature: &[u8],
+    certificate: &[u8],
+) -> Result<(), Refusal> {
+    let spec = spec.ok_or(Refusal::BodyMismatch)?;
+    let hash = json::object(spec, "payloadHash").ok_or(Refusal::BodyMismatch)?;
+    let [one] = json::array(spec, "signatures").ok_or(Refusal::BodyMismatch)? else {
+        return Err(Refusal::BodyMismatch);
+    };
+    let ok = sha256_is(hash, &Sha256::digest(payload))
+        && json::base64(one, "signature").as_deref() == Some(signature)
+        && pem_certificate(one, "verifier").as_deref() == Some(certificate);
+    ok.then_some(()).ok_or(Refusal::BodyMismatch)
+}
+
+/// Whether an `intoto` 0.0.1 `spec` names the envelope whose SHA-256 is
+/// `envelope` (`content.hash`), the SHA-256 of the decoded `payload`
+/// (`content.payloadHash`) and `certificate` (`publicKey`). All three are
+/// required (ADR-037, D2); `content.envelope` and other members are not
+/// read.
+fn intoto_matches(
+    spec: Option<&Value>,
+    payload: &[u8],
+    certificate: &[u8],
+    envelope: &[u8; 32],
+) -> Result<(), Refusal> {
+    let spec = spec.ok_or(Refusal::BodyMismatch)?;
+    let content = json::object(spec, "content").ok_or(Refusal::BodyMismatch)?;
+    let hash = json::object(content, "hash").ok_or(Refusal::BodyMismatch)?;
+    let payload_hash = json::object(content, "payloadHash").ok_or(Refusal::BodyMismatch)?;
+    let ok = sha256_is(hash, envelope)
+        && sha256_is(payload_hash, &Sha256::digest(payload))
+        && pem_certificate(spec, "publicKey").as_deref() == Some(certificate);
+    ok.then_some(()).ok_or(Refusal::BodyMismatch)
+}
+
+/// Whether `hash` is `{"algorithm":"sha256","value":<hex>}` with `digest`
+/// in lower-case hex.
+fn sha256_is(hash: &Value, digest: &[u8; 32]) -> bool {
     json::string(hash, "algorithm") == Some("sha256")
-        && json::string(hash, "value") == Some(hex::encode(&Sha256::digest(data)).as_str())
+        && json::string(hash, "value") == Some(hex::encode(digest).as_str())
 }
 
 /// The DER of the PEM certificate that the member `key` holds in base64.
