@@ -326,3 +326,55 @@ fn config_error_texts() {
         "a SAN prefix does not end in /"
     );
 }
+
+/// Timestamp authorities (ADR-038, D4): the public-good root lists one; a
+/// chain needs a leaf and an anchor; the window reads as every other.
+#[test]
+fn root_tsa_and_note_logs() {
+    let root = TrustedRoot::from_json(real::TRUSTED_ROOT).expect("public-good root");
+    assert_eq!(root.tsa_count(), 1);
+    assert_eq!(
+        format!("{root:?}"),
+        "TrustedRoot { tlogs: 1, authorities: 2, ctlogs: 2, tsas: 1 }"
+    );
+    let pki = Pki::new();
+    let tsa = pki::Tsa::new(&pki);
+    let with = |entry: Value| pki::with_tsas(root_value(&pki), vec![entry]);
+    assert_eq!(read(&root_value(&pki)).map(|r| r.tsa_count()), Ok(0));
+    assert_eq!(
+        read(&with(tsa.authority(EPOCH_2020, None))).map(|r| r.tsa_count()),
+        Ok(1)
+    );
+    // A three-certificate chain, as GitHub's TSAs have, reads too.
+    let three = pki::authority(&[&tsa.leaf, &pki.intermediate, &pki.root], EPOCH_2020, None);
+    assert_eq!(read(&with(three)).map(|r| r.tsa_count()), Ok(1));
+    // One certificate, none, an empty one.
+    for chain in [vec![&tsa.leaf[..]], vec![], vec![&[][..], &pki.root[..]]] {
+        let entry = pki::authority(&chain, EPOCH_2020, None);
+        assert_eq!(read(&with(entry)).err(), Some(ConfigError::RootCertificate));
+    }
+    let mut no_chain = tsa.authority(EPOCH_2020, None);
+    remove(&mut no_chain, &["certChain"]);
+    assert_eq!(
+        read(&with(no_chain)).err(),
+        Some(ConfigError::RootCertificate)
+    );
+    // The window.
+    assert_eq!(
+        read(&with(
+            tsa.authority("2026-01-01T00:00:00Z", Some(EPOCH_2020))
+        ))
+        .err(),
+        Some(ConfigError::RootReversedWindow)
+    );
+    let mut no_start = tsa.authority(EPOCH_2020, None);
+    remove(&mut no_start, &["validFor", "start"]);
+    assert_eq!(read(&with(no_start)).err(), Some(ConfigError::RootTime));
+    let mut no_window = tsa.authority(EPOCH_2020, None);
+    remove(&mut no_window, &["validFor"]);
+    assert_eq!(read(&with(no_window)).err(), Some(ConfigError::RootTime));
+    // Not a list.
+    let mut v = root_value(&pki);
+    set(&mut v, &["timestampAuthorities"], s("x"));
+    assert_eq!(read(&v).err(), Some(ConfigError::RootMalformed));
+}

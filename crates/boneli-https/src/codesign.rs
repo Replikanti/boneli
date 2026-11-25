@@ -35,7 +35,7 @@ use crate::keys::{KeyKind, PublicKey};
 use crate::sha256::Sha256;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 /// id-kp-codeSigning, 1.3.6.1.5.5.7.3.3.
 const ID_KP_CODE_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
@@ -173,6 +173,41 @@ pub fn verify_code_signing(
     roots: &[&[u8]],
     at_secs: u64,
 ) -> Result<CodeSigningCert, CertError> {
+    let issuer_spki = verify_chain(leaf, intermediates, roots, at_secs, ID_KP_CODE_SIGNING)?;
+    let parsed = parse(leaf).map_err(|_| CertError::Malformed)?;
+    let sans = match find(&parsed.extensions, SUBJECT_ALT_NAME) {
+        Some(extension) => sans(extension.value)?,
+        None => Vec::new(),
+    };
+    let public_key =
+        PublicKey::from_spki_der(parsed.spki).map_err(|_| CertError::UnsupportedKey)?;
+    Ok(CodeSigningCert {
+        der: leaf.to_vec(),
+        issuer_spki,
+        sans,
+        extensions: parsed
+            .extensions
+            .iter()
+            .map(|e| (e.oid.to_vec(), e.value.to_vec()))
+            .collect(),
+        public_key,
+        not_before: parsed.not_before,
+        not_after: parsed.not_after,
+    })
+}
+
+/// Verifies `leaf` through `intermediates` to one of `roots` at `at_secs`
+/// for the extended key usage `eku`, which webpki demands of the leaf and
+/// of every intermediate on the path (module doc): the one webpki call of
+/// code-signing chains and of timestamp authorities (`timestamp`). Gives
+/// the SubjectPublicKeyInfo of the leaf's issuer on the verified path.
+pub(crate) fn verify_chain(
+    leaf: &[u8],
+    intermediates: &[&[u8]],
+    roots: &[&[u8]],
+    at_secs: u64,
+    eku: &'static [u8],
+) -> Result<Vec<u8>, CertError> {
     let roots: Vec<CertificateDer<'_>> = roots.iter().map(|r| CertificateDer::from(*r)).collect();
     let anchors = roots
         .iter()
@@ -192,33 +227,12 @@ pub fn verify_code_signing(
             &anchors,
             &intermediates,
             UnixTime::since_unix_epoch(Duration::from_secs(at_secs)),
-            webpki::KeyUsage::required(ID_KP_CODE_SIGNING),
+            webpki::KeyUsage::required(eku),
             None,
             None,
         )
         .map_err(chain_error)?;
-    let issuer_spki = path.issuer_spki().as_ref().to_vec();
-
-    let parsed = parse(leaf).map_err(|_| CertError::Malformed)?;
-    let sans = match find(&parsed.extensions, SUBJECT_ALT_NAME) {
-        Some(value) => sans(value)?,
-        None => Vec::new(),
-    };
-    let public_key =
-        PublicKey::from_spki_der(parsed.spki).map_err(|_| CertError::UnsupportedKey)?;
-    Ok(CodeSigningCert {
-        der: leaf.to_vec(),
-        issuer_spki,
-        sans,
-        extensions: parsed
-            .extensions
-            .iter()
-            .map(|(oid, value)| (oid.to_vec(), value.to_vec()))
-            .collect(),
-        public_key,
-        not_before: parsed.not_before,
-        not_after: parsed.not_after,
-    })
+    Ok(path.issuer_spki().as_ref().to_vec())
 }
 
 /// The fixed reason for a webpki chain error.
@@ -325,13 +339,23 @@ fn algorithm_matches(kind: KeyKind, hash: u8, signature: u8) -> bool {
 }
 
 /// What the strict reader takes from a certificate.
-struct Parsed<'a> {
+pub(crate) struct Parsed<'a> {
     /// The SubjectPublicKeyInfo, whole.
-    spki: &'a [u8],
-    not_before: u64,
-    not_after: u64,
-    /// `(OID, extnValue contents)`, in certificate order, no OID twice.
-    extensions: Vec<(&'a [u8], &'a [u8])>,
+    pub(crate) spki: &'a [u8],
+    pub(crate) not_before: u64,
+    pub(crate) not_after: u64,
+    /// In certificate order, no OID twice.
+    pub(crate) extensions: Vec<Extension<'a>>,
+}
+
+/// One extension of a certificate the strict reader read.
+pub(crate) struct Extension<'a> {
+    /// The content octets of its OBJECT IDENTIFIER.
+    pub(crate) oid: &'a [u8],
+    /// Whether it is marked critical (a BOOLEAN TRUE, `0xFF`).
+    pub(crate) critical: bool,
+    /// The contents of `extnValue`.
+    pub(crate) value: &'a [u8],
 }
 
 /// The TBSCertificate of a certificate, as content octets.
@@ -346,7 +370,7 @@ fn tbs_of(cert: &[u8]) -> Result<&[u8], DerError> {
     Ok(tbs)
 }
 
-fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
+pub(crate) fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
     let mut tbs = Reader::new(tbs_of(cert)?);
     tbs.optional(CONTEXT_0)?; // version
     tbs.expect(INTEGER)?; // serialNumber
@@ -370,13 +394,17 @@ fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
         while !list.is_empty() {
             let mut extension = Reader::new(list.expect(SEQUENCE)?);
             let oid = extension.expect(OID)?;
-            extension.optional(BOOLEAN)?; // critical
+            let critical = extension.optional(BOOLEAN)? == Some(&[0xFF]);
             let value = extension.expect(OCTET_STRING)?;
             extension.finish()?;
             if find(&extensions, oid).is_some() {
                 return Err(DerError("two extensions with one OID"));
             }
-            extensions.push((oid, value));
+            extensions.push(Extension {
+                oid,
+                critical,
+                value,
+            });
         }
     }
     tbs.finish()?;
@@ -388,11 +416,11 @@ fn parse(cert: &[u8]) -> Result<Parsed<'_>, DerError> {
     })
 }
 
-fn find<'a>(extensions: &[(&[u8], &'a [u8])], oid: &[u8]) -> Option<&'a [u8]> {
-    extensions
-        .iter()
-        .find(|(id, _)| *id == oid)
-        .map(|(_, value)| *value)
+pub(crate) fn find<'e, 'a>(
+    extensions: &'e [Extension<'a>],
+    oid: &[u8],
+) -> Option<&'e Extension<'a>> {
+    extensions.iter().find(|e| e.oid == oid)
 }
 
 /// `GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName`, as [`San`]s.

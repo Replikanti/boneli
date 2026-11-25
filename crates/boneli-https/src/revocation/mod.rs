@@ -30,7 +30,7 @@ mod cache;
 mod chain;
 mod http;
 mod ocsp;
-mod signature;
+pub(crate) mod signature;
 mod url;
 
 pub use ocsp::{

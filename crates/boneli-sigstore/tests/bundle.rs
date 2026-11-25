@@ -218,7 +218,8 @@ fn tlog_entries_shape() {
     let mut b = good.clone();
     set(&mut b, &["verificationMaterial", "tlogEntries"], s("x"));
     assert_eq!(parse(&b).err(), Some(Refusal::MalformedTlogEntry));
-    // Zero, two, or one without a promise: refused for keyless.
+    // Zero or two: refused for keyless. One without a promise and without
+    // a timestamp has no time source at all (ADR-038, D1).
     let trust = keyless_trust(&pki);
     for entries in [vec![], vec![entry.clone(), entry.clone()]] {
         let mut b = good.clone();
@@ -233,7 +234,10 @@ fn tlog_entries_shape() {
     let mut e = entry.clone();
     remove(&mut e, &["inclusionPromise"]);
     let evidence = with_entry(e).expect("parses");
-    assert_eq!(verify(&evidence, &IMAGE, &trust), Err(Refusal::TlogEntries));
+    assert_eq!(
+        verify(&evidence, &IMAGE, &trust),
+        Err(Refusal::NoTimeSource)
+    );
 }
 
 #[test]

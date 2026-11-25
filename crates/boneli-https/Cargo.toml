@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, ring's SHA-256, RS256 signatures and random source, and signature verification and code-signing chains for image signatures."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, and name resolution under each request's deadline, for boneli-http, the Dial seam of HTTPS clients, ring's SHA-256, RS256 signatures and random source, signature verification and code-signing chains for image signatures, and RFC 3161 timestamp tokens (ADR-038)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -54,8 +54,10 @@ zeroize = { version = "1.9.1", default-features = false }
 # with `id-kp-OCSPSigning`); ADR-020. The same path gives the issuers of
 # the intermediates, whose CRLs ADR-027 checks. The code-signing chains of
 # image signatures (`verify_code_signing`, `id-kp-codeSigning`, ADR-029)
-# go through `verify_for_usage` too. Already in the graph through rustls;
-# a direct edge, no new crate. `alloc` for `VerifiedPath::issuer_spki`.
+# go through `verify_for_usage` too, and so do the chains of RFC 3161
+# timestamp authorities (`id-kp-timeStamping`, ADR-038). Already in the
+# graph through rustls; a direct edge, no new crate. `alloc` for
+# `VerifiedPath::issuer_spki`.
 rustls-webpki = { version = "0.103.17", default-features = false, features = ["alloc"] }
 # SHA-1 for OCSP CertIDs only (`digest::SHA1_FOR_LEGACY_USE_ONLY`): every
 # measured responder answers with a SHA-1 CertID (ADR-020). Already in the

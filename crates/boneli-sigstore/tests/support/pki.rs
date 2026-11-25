@@ -1291,3 +1291,182 @@ pub fn envelope_value(statement: &[u8], signature: &[u8]) -> Value {
         ),
     ])
 }
+
+// ---- RFC 3161 timestamp authorities (ADR-038) -------------------------
+
+/// id-kp-timeStamping, 1.3.6.1.5.5.7.3.8.
+pub const TIME_STAMPING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+const ID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
+const ID_CT_TST_INFO: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04,
+];
+const ATTR_CONTENT_TYPE: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03];
+const ATTR_SIGNING_TIME: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05];
+const ATTR_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+const ATTR_SIGNING_CERTIFICATE_V2: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+];
+const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+/// Sigstore's TSA policy, 1.3.6.1.4.1.57264.2.
+const TSA_POLICY: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x02];
+
+/// The validity of every built TSA leaf: a year on each side of `T`.
+pub const TSA_FROM: u64 = T - 365 * 86_400;
+pub const TSA_TO: u64 = T + 365 * 86_400;
+
+/// A test timestamp authority: the P-256 key `test-only-tsa.key`, a leaf
+/// with keyUsage digitalSignature and the EKU timeStamping, both critical
+/// (the public-good TSA's shape), and the CA certificate that issued it,
+/// which is the anchor of its chain.
+pub struct Tsa {
+    pub key: boneli_https::EcdsaP256Key,
+    pub leaf: Vec<u8>,
+    pub anchor: Vec<u8>,
+}
+
+impl Tsa {
+    /// The test instance's TSA: its leaf issued by the test root.
+    pub fn new(pki: &Pki) -> Tsa {
+        Tsa::issued(&pki.root, ROOT_NAME, &pki.root_key, TSA_FROM, TSA_TO)
+    }
+
+    /// An attacker's TSA: a self-signed CA with the test root's name and
+    /// the attacker's key issues the leaf.
+    pub fn attacker(pki: &Pki) -> Tsa {
+        let ca = CertSpec {
+            serial: 4,
+            issuer: name(ROOT_NAME),
+            subject: name(ROOT_NAME),
+            not_before: T - 365 * 86_400,
+            not_after: T + 10 * 365 * 86_400,
+            spki: pki.attacker_key.spki(),
+            extensions: vec![basic_constraints_ca(), key_usage(0x06)],
+        }
+        .sign(&pki.attacker_key);
+        Tsa::issued(&ca, ROOT_NAME, &pki.attacker_key, TSA_FROM, TSA_TO)
+    }
+
+    /// A TSA whose leaf, valid from `from` to `to`, `issuer_key` issues
+    /// under `issuer_name`; `anchor` is the issuer's certificate.
+    pub fn issued(anchor: &[u8], issuer_name: &str, issuer_key: &Key, from: u64, to: u64) -> Tsa {
+        let key = boneli_https::EcdsaP256Key::from_pem(
+            &mut include_bytes!("../data/test-only-tsa.key").to_vec(),
+        )
+        .expect("test TSA key");
+        let ku = ext(KEY_USAGE, true, &tlv(0x03, &[0x07, 0x80]));
+        let leaf_eku = ext(EXT_KEY_USAGE, true, &tlv(0x30, &tlv(0x06, TIME_STAMPING)));
+        let leaf = CertSpec {
+            serial: 11,
+            issuer: name(issuer_name),
+            subject: name("Boneli sigstore test TSA"),
+            not_before: from,
+            not_after: to,
+            spki: key.public_key().spki_der().to_vec(),
+            extensions: vec![ku, leaf_eku],
+        }
+        .sign(issuer_key);
+        Tsa {
+            key,
+            leaf,
+            anchor: anchor.to_vec(),
+        }
+    }
+
+    /// A `TimeStampResp` over `message` at `gen_time`, in the public-good
+    /// TSA's field order: status 0, an empty `certificates [0]`, one
+    /// SignerInfo by issuer and serial with digest SHA-256, the signed
+    /// attributes contentType, signingTime, messageDigest and
+    /// signingCertificateV2 (of this TSA's leaf, the hash algorithm left
+    /// out), signature `ecdsa-with-SHA256`; a TSTInfo of policy
+    /// 1.3.6.1.4.1.57264.2 with a SHA-256 imprint (NULL parameters) and an
+    /// accuracy of 1 s.
+    pub fn token(&self, message: &[u8], gen_time: u64) -> Vec<u8> {
+        self.token_with(message, gen_time, Some(Vec::new()))
+    }
+
+    /// [`Tsa::token`] with `certificates` as the content of
+    /// `certificates [0]`, or none.
+    pub fn token_with(
+        &self,
+        message: &[u8],
+        gen_time: u64,
+        certificates: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let sha256_null = seq(&[&tlv(0x06, SHA256_OID), &tlv(0x05, &[])]);
+        let sha256 = seq(&[&tlv(0x06, SHA256_OID)]);
+        let tst = seq(&[
+            &tlv(0x02, &[1]),
+            &tlv(0x06, TSA_POLICY),
+            &seq(&[&sha256_null, &tlv(0x04, &Sha256::digest(message))]),
+            &tlv(0x02, &[0x3A, 0x13]),
+            &generalized_time(gen_time),
+            &seq(&[&tlv(0x02, &[1])]),
+        ]);
+        let attribute = |oid: &[u8], value: &[u8]| seq(&[&tlv(0x06, oid), &tlv(0x31, value)]);
+        let ess = seq(&[&seq(&[&seq(&[&tlv(0x04, &Sha256::digest(&self.leaf))])])]);
+        let attributes = [
+            attribute(ATTR_CONTENT_TYPE, &tlv(0x06, ID_CT_TST_INFO)),
+            attribute(ATTR_SIGNING_TIME, &tlv(0x17, b"260921141320Z")),
+            attribute(ATTR_MESSAGE_DIGEST, &tlv(0x04, &Sha256::digest(&tst))),
+            attribute(ATTR_SIGNING_CERTIFICATE_V2, &ess),
+        ]
+        .concat();
+        let signature = self.key.sign(&tlv(0x31, &attributes)).expect("sign");
+        let signer = seq(&[
+            &tlv(0x02, &[1]),
+            &seq(&[&name(ROOT_NAME), &tlv(0x02, &[11])]),
+            &sha256,
+            &tlv(0xA0, &attributes),
+            &seq(&[&tlv(0x06, ECDSA_WITH_SHA256)]),
+            &tlv(0x04, &signature),
+        ]);
+        let mut signed_data = vec![
+            tlv(0x02, &[3]),
+            tlv(0x31, &sha256),
+            seq(&[&tlv(0x06, ID_CT_TST_INFO), &tlv(0xA0, &tlv(0x04, &tst))]),
+        ];
+        if let Some(certificates) = certificates {
+            signed_data.push(tlv(0xA0, &certificates));
+        }
+        signed_data.push(tlv(0x31, &signer));
+        let content_info = seq(&[
+            &tlv(0x06, ID_SIGNED_DATA),
+            &tlv(0xA0, &tlv(0x30, &signed_data.concat())),
+        ]);
+        seq(&[&seq(&[&tlv(0x02, &[0])]), &content_info])
+    }
+
+    /// A `timestampAuthorities` entry: the leaf and the anchor, valid
+    /// from `start` to `end`.
+    pub fn authority(&self, start: &str, end: Option<&str>) -> Value {
+        let mut entry = authority(&[&self.leaf, &self.anchor], start, end);
+        set(
+            &mut entry,
+            &["uri"],
+            s("https://timestamp.boneli.test/api/v1/timestamp"),
+        );
+        entry
+    }
+}
+
+/// `root` with `timestampAuthorities` set to `entries`.
+pub fn with_tsas(mut root: Value, entries: Vec<Value>) -> Value {
+    set(&mut root, &["timestampAuthorities"], Value::Array(entries));
+    root
+}
+
+/// `bundle` with `timestampVerificationData.rfc3161Timestamps` holding
+/// `tokens`.
+pub fn with_tokens(mut bundle: Value, tokens: &[Vec<u8>]) -> Value {
+    let list = tokens
+        .iter()
+        .map(|t| obj(vec![("signedTimestamp", s(&base64::encode(t)))]))
+        .collect();
+    set(
+        &mut bundle,
+        &["verificationMaterial", "timestampVerificationData"],
+        obj(vec![("rfc3161Timestamps", Value::Array(list))]),
+    );
+    bundle
+}

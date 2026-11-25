@@ -77,7 +77,8 @@ fn gh_leaf() -> LeafSpec {
 }
 
 const PASS: Result<Accepted, Refusal> = Ok(Accepted::Keyless {
-    integrated_time: pki::INTEGRATED,
+    integrated_time: Some(pki::INTEGRATED),
+    signed_timestamps: 0,
     log_index: pki::LOG_INDEX,
     identity: 0,
 });

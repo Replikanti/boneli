@@ -10,9 +10,11 @@
 //! [`verify`] decides whether one of them signs an image digest under a
 //! [`Trust`]: keys (ECDSA P-256 and P-384, Ed25519, RSA), or keyless,
 //! against the operator's [`TrustedRoot`] (`trusted_root.json`) and
-//! [`Identity`]s: the Fulcio chain at Rekor's integrated time, an
-//! embedded SCT, the Rekor v1 inclusion promise (SET) and its entry
-//! body, and the OIDC issuer and SAN (S2).
+//! [`Identity`]s: the Fulcio chain at every verified time, an embedded
+//! SCT, the Rekor v1 inclusion promise (SET) and its entry body, and the
+//! OIDC issuer and SAN (S2). The verified times are Rekor's integrated
+//! time and the genTime of every RFC 3161 timestamp of a bundle that a
+//! timestamp authority of the root verifies (ADR-038).
 //!
 //! A trust may also carry SLSA provenance claims ([`Claims`], ADR-031):
 //! an exact builder ID, a source repository and ref (exact, or a prefix
@@ -37,18 +39,19 @@
 //! registry); everything here is pure, reads no clock, no file and no
 //! network, and gives the same verdict for the same bytes forever. The
 //! cryptography is `boneli-https`'s (`PublicKey`, `verify_code_signing`,
-//! ring through webpki, ADR-029 item 7); this crate owns the formats
-//! around it and uses no external crate (S3). Every parser is strict
-//! where its output decides, and every refusal is a fixed reason
+//! `TimestampToken`, ring through webpki, ADR-029 item 7); this crate owns
+//! the formats around it and uses no external crate (S3). Every parser is
+//! strict where its output decides, and every refusal is a fixed reason
 //! ([`Refusal`]) that echoes none of the input.
 //!
-//! Out of scope (ADR-029): Rekor v2 entries, RFC 3161 timestamps as the
-//! time source, inclusion proofs and checkpoints, `messageSignature`
-//! bundles and bundles before v0.3, Notation, Rekor `intoto` 0.0.2
-//! entries, and `intoto` entries for bundles or `.sig` layers (ADR-037),
-//! SLSA v0.2 build types other than the container generator's,
-//! certificate claims under issuers other than GitHub Actions (ADR-034),
-//! and keeping `trusted_root.json` current (TUF).
+//! Out of scope (ADR-029, ADR-038): Rekor v2 entries (they follow, ADR-038
+//! D2), inclusion proofs and checkpoints, RFC 3161 timestamps on cosign
+//! layers and on keyed signatures, fractional genTimes, TSA revocation,
+//! `messageSignature` bundles and bundles before v0.3, Notation, Rekor
+//! `intoto` 0.0.2 entries, and `intoto` entries for bundles or `.sig`
+//! layers (ADR-037), SLSA v0.2 build types other than the container
+//! generator's, certificate claims under issuers other than GitHub
+//! Actions (ADR-034), and keeping `trusted_root.json` current (TUF).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod attestation;
@@ -66,6 +69,7 @@ mod provenance;
 mod rekor;
 mod root;
 pub mod time;
+mod timestamp;
 mod verify;
 
 pub use attestation::{DSSE_ENVELOPE_MEDIA_TYPE, PREDICATE_TYPE_ANNOTATION};
@@ -120,3 +124,13 @@ pub const MAX_JSON_DEPTH: usize = 16;
 /// The value count of every JSON document read here: 65,536, the
 /// document limit of ADR-009 D12. Measured: bundle 58, trusted root 85.
 pub const MAX_JSON_VALUES: usize = 65_536;
+
+/// The most RFC 3161 timestamps a bundle may carry: 32 (ADR-038, limits).
+/// Measured: 1 per bundle in 6 of 6. 32 is sigstore-go's
+/// `MaxAllowedTimestamps`, so no bundle cosign verifies is refused by
+/// count alone; a token costs one parse of about 718 bytes and, per TSA
+/// of the root whose window holds its time (1 in the public-good root),
+/// one webpki check and one ECDSA verification. Lower refuses bundles
+/// cosign accepts; higher only lets a hostile bundle force more checks
+/// (the 4 MiB bundle cap alone allows about 4,258 tokens).
+pub const MAX_TIMESTAMPS: usize = 32;

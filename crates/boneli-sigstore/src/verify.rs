@@ -10,12 +10,17 @@
 //!   signatures have no transparency and no revocation, and a key is
 //!   trusted by configuration alone.
 //! - **Keyless:** the evidence carries a certificate and the trust has a
-//!   trusted root and identities. Exactly one log entry with an inclusion
-//!   promise; its integrated time inside `i64` and comparable in
-//!   milliseconds; a Rekor log of the root that knows it, its SET and its
-//!   body (`rekor`); a Fulcio authority of the root whose window holds the
-//!   integrated time and whose chain webpki verifies the certificate
-//!   through for code signing at that time (only the root's
+//!   trusted root and identities. Exactly one log entry. The verified
+//!   times (ADR-038, D1): the entry's integrated time when it has an
+//!   inclusion promise (inside `i64`, comparable in milliseconds, a Rekor
+//!   log of the root that knows it, its SET and its body, `rekor`), and
+//!   the genTime of every RFC 3161 timestamp of a bundle that a timestamp
+//!   authority of the root verifies (`timestamp`; a token that does not
+//!   is skipped, D5); none is `NoTimeSource`, or the first token's
+//!   refusal. The entry must have its promise (Rekor v2 entries are not
+//!   read yet). Then, at every verified time, a Fulcio authority of the
+//!   root whose window holds it and whose chain webpki verifies the
+//!   certificate through for code signing (only the root's
 //!   intermediates); an embedded SCT from a CT log of the root; the
 //!   certificate's key verifying the signature; exactly one SAN; the OIDC
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
@@ -40,8 +45,9 @@
 //!   envelope bytes (ADR-037); a bundle or a cosign layer never takes an
 //!   `intoto` entry.
 //!
-//! No step reads the wall clock: the only time is the log's, so the same
-//! inputs give the same verdict forever.
+//! No step reads the wall clock: the only times are the log's and the
+//! timestamp authorities', so the same inputs give the same verdict
+//! forever.
 
 use std::fmt;
 use std::sync::Arc;
@@ -55,6 +61,7 @@ use crate::identity::{Identity, printable};
 use crate::provenance::{self, Claims};
 use crate::rekor::{self, Expected, TlogEntry};
 use crate::root::TrustedRoot;
+use crate::timestamp;
 
 /// The predicate type of `cosign sign` with a bundle, the default list.
 pub const COSIGN_SIGN_PREDICATE: &str = "https://sigstore.dev/cosign/sign/v1";
@@ -107,6 +114,9 @@ pub(crate) struct Dsse {
     pub(crate) certificate: Option<Vec<u8>>,
     pub(crate) statement: Statement,
     pub(crate) tlogs: Vec<TlogEntry>,
+    /// The RFC 3161 tokens of a bundle, DER `TimeStampResp`s, unparsed
+    /// (ADR-038); a cosign attestation carries none.
+    pub(crate) timestamps: Vec<Vec<u8>>,
 }
 
 impl fmt::Debug for Evidence {
@@ -304,8 +314,12 @@ pub enum Accepted {
     },
     /// A certificate of the trusted root, logged in Rekor.
     Keyless {
-        /// The integrated time, Unix seconds.
-        integrated_time: u64,
+        /// The integrated time of a Rekor v1 entry with its promise, Unix
+        /// seconds.
+        integrated_time: Option<u64>,
+        /// How many of the bundle's RFC 3161 timestamps verified
+        /// (ADR-038); 0 for a cosign layer or attestation.
+        signed_timestamps: usize,
         /// The entry's log index.
         log_index: u64,
         /// The index of the first identity that matched.
@@ -395,7 +409,7 @@ fn keyless(
     root: &TrustedRoot,
     identities: &[Identity],
 ) -> Result<(Accepted, CodeSigningCert), Refusal> {
-    let (entry, expected, certificate) = match &evidence.form {
+    let (entry, expected, certificate, tokens) = match &evidence.form {
         Form::Cosign {
             payload,
             signature,
@@ -410,12 +424,14 @@ fn keyless(
                 certificate,
             },
             certificate,
+            &[][..],
         ),
         Form::Bundle(Dsse {
             payload,
             signature,
             certificate: Some(certificate),
             tlogs,
+            timestamps,
             ..
         }) => (
             one_entry(tlogs)?,
@@ -425,6 +441,7 @@ fn keyless(
                 certificate,
             },
             certificate,
+            timestamps.as_slice(),
         ),
         Form::Attestation(
             Dsse {
@@ -444,15 +461,38 @@ fn keyless(
                 envelope,
             },
             certificate,
+            &[][..],
         ),
         _ => return Err(Refusal::NoCertificate),
     };
-    // The readers refuse a negative time or one above `i64` (Rekor's type);
-    // what is left must still fit milliseconds in a `u64`.
-    let at = entry.integrated_time;
-    let at_ms = at.checked_mul(1_000).ok_or(Refusal::IntegratedTimeRange)?;
-    rekor::check(entry, root, at_ms, &expected)?;
-    let cert = chain(certificate, root, at, at_ms)?;
+    // Time (ADR-038, D1): the SET's integrated time, and the genTime of
+    // every token a TSA of the root verifies over the signature bytes.
+    let mut times = Vec::new();
+    if entry.set.is_some() {
+        // The readers refuse a negative time or one above `i64` (Rekor's
+        // type); what is left must still fit milliseconds in a `u64`.
+        let at = entry.integrated_time;
+        let at_ms = at.checked_mul(1_000).ok_or(Refusal::IntegratedTimeRange)?;
+        rekor::check(entry, root, at_ms, &expected)?;
+        times.push(at);
+    }
+    let (verified, first_failure) = timestamp::verified_times(tokens, evidence.signature(), root);
+    let signed_timestamps = verified.len();
+    times.extend(verified);
+    let Some(&first) = times.first() else {
+        return Err(first_failure.unwrap_or(Refusal::NoTimeSource));
+    };
+    // Transparency (D2): a Rekor v1 entry needs its promise; Rekor v2
+    // entries are not read yet.
+    if entry.set.is_none() {
+        return Err(Refusal::TlogEntries);
+    }
+    // The leaf and its CA must be valid at every verified time, so times
+    // that contradict each other refuse; the first time gives the leaf.
+    let cert = chain(certificate, root, first, first.saturating_mul(1_000))?;
+    for &at in &times[1..] {
+        chain(certificate, root, at, at.saturating_mul(1_000))?;
+    }
     cert.verify_embedded_sct(&root.ctlogs)
         .map_err(Refusal::Sct)?;
     cert.public_key()
@@ -467,7 +507,8 @@ fn keyless(
         .position(|id| id.matches(issuer, san))
         .ok_or(Refusal::IdentityMismatch)?;
     let accepted = Accepted::Keyless {
-        integrated_time: at,
+        integrated_time: entry.set.is_some().then_some(entry.integrated_time),
+        signed_timestamps,
         log_index: entry.log_index,
         identity,
     };

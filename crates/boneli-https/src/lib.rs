@@ -80,7 +80,10 @@
 //! handshake; [`verify_code_signing`] verifies a Fulcio leaf for
 //! `id-kp-codeSigning` at a time the caller chooses and reads its SANs and
 //! extensions; [`CodeSigningCert::verify_embedded_sct`] verifies its
-//! embedded SCTs against the caller's CT logs (RFC 6962). The Sigstore
+//! embedded SCTs against the caller's CT logs (RFC 6962).
+//! [`TimestampToken`] reads an RFC 3161 timestamp token strictly and
+//! verifies it over a message against a timestamp authority's chain the
+//! caller supplies, at the token's own time (ADR-038, D3). The Sigstore
 //! formats around them (signatures, bundles, Rekor entries, the trusted
 //! root) are not this crate's (ADR-029, S3).
 //!
@@ -100,6 +103,7 @@ mod resolve;
 mod revocation;
 mod rsa;
 mod sha256;
+mod timestamp;
 
 pub use codesign::{CertError, CodeSigningCert, CtLog, San, SctError, verify_code_signing};
 pub use dial::{Dial, Stream, Timed, TlsDial};
@@ -123,6 +127,7 @@ pub use revocation::{
 };
 pub use rsa::{KeyError, RsaSha256Key};
 pub use sha256::Sha256;
+pub use timestamp::{TimestampError, TimestampToken};
 
 use std::fmt;
 use std::io::{self, Read, Write};

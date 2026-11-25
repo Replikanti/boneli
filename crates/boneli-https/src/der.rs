@@ -7,7 +7,9 @@
 //! `ca_list` parses CA lists with this reader, strictly, as `ocsp` does.
 //! Outside `revocation/` (ADR-029), `keys` reads SubjectPublicKeyInfos
 //! and RSA moduli with it, and `codesign` the SANs and extensions of a
-//! code-signing leaf and the TBS it rebuilds for embedded SCTs.
+//! code-signing leaf and the TBS it rebuilds for embedded SCTs, and
+//! `timestamp` RFC 3161 timestamp tokens (ADR-038), strictly: their
+//! parse decides, as the OCSP response's does.
 //!
 //! The certificate and CRL functions read only bytes webpki has accepted
 //! already: the leaf after the handshake verified it, the CRL after
@@ -288,6 +290,13 @@ impl KeyUsage {
     /// `cRLSign`, bit 6: the key may sign CRLs.
     pub(crate) fn crl_sign(self) -> bool {
         self.0 & (1 << 6) != 0
+    }
+
+    /// `digitalSignature`, bit 0, or `nonRepudiation` (`contentCommitment`),
+    /// bit 1: the key may sign data other than certificates and CRLs, as
+    /// a timestamp authority's must (RFC 3161, 2.3).
+    pub(crate) fn signs_content(self) -> bool {
+        self.0 & 0b11 != 0
     }
 }
 
