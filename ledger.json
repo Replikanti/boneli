@@ -1617,16 +1617,16 @@
    "title": "boneli-replay-check: make line_cost_is_linear_in_bytes independent of wall-clock load",
    "epic": null,
    "order": 62,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "ea19b3dc",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 130,
    "note": "",
-   "updated_at": "2026-11-25T11:31:30+00:00",
+   "updated_at": "2026-11-25T12:11:33+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1664,14 +1664,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:24:45+00:00",
-   "issue": 104,
-   "from": "pr-review",
-   "to": "done",
-   "by": "88ef9d69",
-   "note": null
-  },
   {
    "at": "2026-11-24T09:24:47+00:00",
    "issue": 114,
@@ -2063,6 +2055,14 @@
    "to": "blocked",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-25T12:11:33+00:00",
+   "issue": 128,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "ea19b3dc",
+   "note": null
   }
  ],
  "open": [
@@ -2094,7 +2094,7 @@
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T12:04:53+00:00",
+ "updated_at": "2026-11-25T12:11:33+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
