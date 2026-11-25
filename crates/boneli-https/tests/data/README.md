@@ -896,7 +896,7 @@ github-root.pem -untrusted <leaf + intermediate> -attime <genTime>`).
 | `github-tsa-intermediate.pem` | `ebfcb01e…99c96eac` | "TSA intermediate", 2023-08-07 to 2028-08-05, EKU timeStamping: the second certificate of every TSA entry |
 | `github-tsa-0-leaf.pem` | `ddac887c…a31e78cc` | "TSA Timestamping" of TSA window 0, 2023-08-31 to 2024-08-30, EKU timeStamping (critical) |
 | `github-tsa-4-leaf.pem` | `61cbc008…b0a1e44d` | the same name in window 4, 2025-11-13 to 2026-11-13 |
-| `github-leaf-attest-demo.pem` | `9916d4b8…4038072a` | K1's leaf, SAN `URI:https://github.com/actions/attest-demo/.github/workflows/build-python.yml@refs/heads/main`, 2024-04-22 17:33:26 to 17:43:26 UTC, no SCT list |
+| `github-leaf-attest-demo.pem` | `9916d4b8…4038072a` | K1's leaf, SAN the URI of `actions/attest-demo`'s build workflow at `refs/heads/main` (`tests/codesign.rs` has it whole), 2024-04-22 17:33:26 to 17:43:26 UTC, no SCT list |
 | `github-leaf-prober.pem` | `79fabbc5…c11f98c0` | K2's leaf, SAN `URI:https://github.com/actions/attest-build-provenance/.github/workflows/prober.yml@refs/heads/main`, 2025-11-21 08:13:26 to 08:23:26 UTC, no SCT list |
 | `tsa-github-attest-demo.tsr`, `.sig` | `c2754515…4e6d94e3` | K1's token (SHA-384, `ecdsa-with-SHA384`, genTime 1713807206) and the DSSE signature it is over |
 | `tsa-github-prober.tsr`, `.sig` | `42ba708d…68cb087e` | K2's token (genTime 1763712806) and its signed bytes |

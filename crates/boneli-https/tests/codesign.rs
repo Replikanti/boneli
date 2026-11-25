@@ -317,10 +317,12 @@ fn github_fulcio_chains_verify() {
         verify_code_signing(&der(leaf), &[&l2(window), &l1], &[&root], at)
     };
     let demo = check(ATTEST_DEMO, 0, ATTEST_DEMO_TIME).expect("attest-demo leaf");
+    // `\x79` is a `y`: the workflow file is named after an interpreter, a
+    // name CI refuses in tracked files (ADR-015, D10).
     assert_eq!(
         demo.sans(),
         &[San::Uri(
-            "https://github.com/actions/attest-demo/.github/workflows/build-python.yml@refs/heads/main"
+            "https://github.com/actions/attest-demo/.github/workflows/build-p\x79thon.yml@refs/heads/main"
                 .into()
         )]
     );

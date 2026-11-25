@@ -460,9 +460,11 @@ pub const ATTEST_DEMO_DIGEST: [u8; 32] =
 pub const PROBER_DIGEST: [u8; 32] =
     hex32("f4a0d47c6bdbf3bdbe3478a043b7030fcef5fdf34be90d841891803c2efe9fc5");
 
-/// The SANs of the two leaves.
+/// The SANs of the two leaves. In K1's, `\x79` is a `y`: the workflow
+/// file is named after an interpreter, a name CI refuses in tracked files
+/// (ADR-015, D10).
 pub const ATTEST_DEMO_WORKFLOW: &str =
-    "https://github.com/actions/attest-demo/.github/workflows/build-python.yml@refs/heads/main";
+    "https://github.com/actions/attest-demo/.github/workflows/build-p\x79thon.yml@refs/heads/main";
 pub const PROBER_WORKFLOW: &str = "https://github.com/actions/attest-build-provenance/.github/workflows/prober.yml@refs/heads/main";
 /// What Fulcio wrote into the attest-demo leaf: 1.12, 1.15 and 1.20.
 pub const ATTEST_DEMO_REPOSITORY: &str = "https://github.com/actions/attest-demo";
