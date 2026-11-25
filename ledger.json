@@ -1611,17 +1611,33 @@
     "debugger"
    ],
    "manual": false
+  },
+  {
+   "issue": 128,
+   "title": "boneli-replay-check: make line_cost_is_linear_in_bytes independent of wall-clock load",
+   "epic": null,
+   "order": 62,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-25T11:24:07+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "debugger"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T04:43:53+00:00",
-   "issue": 104,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "88ef9d69",
-   "note": null
-  },
   {
    "at": "2026-11-24T08:24:55+00:00",
    "issue": 104,
@@ -2013,6 +2029,14 @@
    "to": "done",
    "by": "2768f14b",
    "note": null
+  },
+  {
+   "at": "2026-11-25T11:24:07+00:00",
+   "issue": 128,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
   }
  ],
  "open": [
@@ -2040,10 +2064,11 @@
   55,
   69,
   102,
-  125
+  125,
+  128
  ],
  "xopen": [],
- "updated_at": "2026-11-25T01:35:11+00:00",
+ "updated_at": "2026-11-25T11:24:07+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2053,7 +2078,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795560305,
+  "at": 1795605847,
   "private": false
  },
  "schema": 2,
