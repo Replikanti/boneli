@@ -227,7 +227,7 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     use crate::Roots;
-    use crate::revocation::MAX_CA_CRL_BYTES;
+    use crate::revocation::{CRL_CHECK_DEADLINE, MAX_CA_CRL_BYTES};
 
     const GUARD: Duration = Duration::from_secs(10);
 
@@ -417,26 +417,75 @@ mod tests {
     #[test]
     fn body_at_cap_passes_size_check() {
         let (addr, _server) = answer(ok_with(&vec![0u8; MAX_CRL_BYTES]));
-        let body = crl(&source(), &url(addr, "/ca.crl"), deadline()).expect("fetch");
+        // The only test that moves the full 32 MiB: it pins `fetch` at
+        // exactly `MAX_CRL_BYTES`, so it gets the code's own budget for
+        // that volume instead of `GUARD` (#131).
+        let deadline = Instant::now() + CRL_CHECK_DEADLINE;
+        let body = crl(&source(), &url(addr, "/ca.crl"), deadline).expect("fetch");
         assert_eq!(body.len(), MAX_CRL_BYTES);
+    }
+
+    /// Chunk size of the chunked-body tests below; the cap is a multiple.
+    const CHUNK: usize = 65_536;
+    // Several whole chunks make up the cap, so no single chunk equals it.
+    const _: () = assert!(MAX_CA_CRL_BYTES.is_multiple_of(CHUNK) && MAX_CA_CRL_BYTES / CHUNK > 1);
+
+    /// A server that sends a chunked 200 head, `MAX_CA_CRL_BYTES` of body
+    /// in chunks of `CHUNK` bytes, then `tail`. The chunk logic does not
+    /// depend on the cap's value, so these tests use the 1 MiB CA cap
+    /// through `fetch_limited` rather than moving 32 MiB (#131).
+    fn chunked_at_cap(tail: &'static [u8]) -> (SocketAddr, thread::JoinHandle<Vec<u8>>) {
+        server(move |tcp| {
+            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let size = format!("{CHUNK:x}\r\n");
+            let chunk = vec![0u8; CHUNK];
+            for _ in 0..MAX_CA_CRL_BYTES / CHUNK {
+                let _ = tcp.write_all(size.as_bytes());
+                let _ = tcp.write_all(&chunk);
+                let _ = tcp.write_all(b"\r\n");
+            }
+            let _ = tcp.write_all(tail);
+        })
+    }
+
+    #[test]
+    fn chunked_body_at_cap_passes_size_check() {
+        let (addr, _server) = chunked_at_cap(b"0\r\n\r\n");
+        let body = source()
+            .fetch_limited(&url(addr, "/ca.crl"), MAX_CA_CRL_BYTES, deadline())
+            .expect("fetch");
+        assert_eq!(body.len(), MAX_CA_CRL_BYTES);
     }
 
     #[test]
     fn body_one_over_cap_is_too_large() {
-        let (addr, _server) = server(|tcp| {
-            let _ = tcp.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
-            let chunk = vec![0u8; 1_048_576];
-            for _ in 0..32 {
-                let _ = tcp.write_all(b"100000\r\n");
-                let _ = tcp.write_all(&chunk);
-                let _ = tcp.write_all(b"\r\n");
-            }
-            let _ = tcp.write_all(b"1\r\n\0\r\n0\r\n\r\n");
-        });
+        // The chunks sum to the cap; one more 1-byte chunk is over it.
+        let (addr, _server) = chunked_at_cap(b"1\r\n\0\r\n0\r\n\r\n");
         assert_eq!(
-            crl(&source(), &url(addr, "/ca.crl"), deadline()),
+            source().fetch_limited(&url(addr, "/ca.crl"), MAX_CA_CRL_BYTES, deadline()),
             Err(CrlFetchError::TooLarge)
         );
+    }
+
+    #[test]
+    fn chunk_header_over_cap_fails_before_data() {
+        let (addr, server) = server(|tcp| {
+            let _ = tcp.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    MAX_CA_CRL_BYTES + 1
+                )
+                .as_bytes(),
+            );
+            // No chunk data: a client that waited for it would end in
+            // `TimedOut`, so the verdict alone shows it did not.
+            let _ = read_head(tcp);
+        });
+        assert_eq!(
+            source().fetch_limited(&url(addr, "/ca.crl"), MAX_CA_CRL_BYTES, deadline()),
+            Err(CrlFetchError::TooLarge)
+        );
+        server.join().expect("server");
     }
 
     #[test]
