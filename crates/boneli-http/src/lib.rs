@@ -25,7 +25,7 @@ mod transport;
 mod wire;
 
 pub use body::{BodyReader, BodyWriter, pass_through};
-pub use client::{Connection, RequestBody, Response, connect_tunnel};
+pub use client::{Connection, RequestBody, Response, connect_tunnel, connect_tunnel_with};
 pub use error::{Error, Result};
 pub use head::{Headers, Method, RequestHead, ResponseHead, Target};
 pub use limits::{Limits, ServerLimits};

@@ -1087,7 +1087,7 @@ const SOCKET_ADDR_TURBOFISH: [&str; 9] =
 /// (`SOCKET_ADDR_TURBOFISH`), and the test servers' binds to
 /// `127.0.0.1:0`. A new call changes the count and fails.
 const SOCKET_ADDR_CALLS: [(&str, usize); 2] =
-    [("resolve/exchange.rs", 2), ("revocation/http.rs", 6)];
+    [("resolve/exchange.rs", 2), ("revocation/http.rs", 9)];
 
 /// One token of a Rust source file. Comments are dropped and each
 /// literal is one token, so a name or a `)` inside them is not seen.

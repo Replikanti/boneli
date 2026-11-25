@@ -57,6 +57,16 @@
 //! another NSS source knows (mDNS, LDAP, split DNS behind uplink servers)
 //! do not resolve. [`TlsConfig::with_resolver`] sets another resolver.
 //!
+//! [`TlsConfig::with_proxy`] sends every connection of a configuration
+//! through the customer's HTTP proxy (ADR-039): [`TlsDial`] opens a
+//! `CONNECT` tunnel and runs TLS end to end over it, certificate and
+//! revocation checked as on a direct connection, and the CRL, CA list and
+//! OCSP fetches go through the same proxy, `http` ones as absolute-form
+//! `GET`s. Only the proxy's name is resolved. [`BasicCredentials`] go to
+//! the proxy in `Proxy-Authorization`, up front on `CONNECT` and only after
+//! a `407` on a `GET`; no proxy environment variable is read, and
+//! [`connect`] refuses a proxied configuration.
+//!
 //! `TlsStream` is a `boneli_http::Transport` when its stream is one, and an
 //! `IdleCheck` that counts what rustls already holds: plaintext it has
 //! decrypted, records that have arrived, and the part of a record that has
@@ -94,6 +104,7 @@
 //! one (ADR-009, D10; moved here from `boneli-oci` by ADR-014, D4).
 #![doc(test(attr(forbid(unsafe_code))))]
 
+mod base64;
 mod codesign;
 mod der;
 mod dial;
@@ -101,6 +112,7 @@ mod ecdsa;
 mod ed25519;
 mod keys;
 mod pq;
+mod proxy;
 mod random;
 mod resolve;
 mod revocation;
@@ -113,6 +125,9 @@ pub use dial::{Dial, Stream, Timed, TlsDial};
 pub use ecdsa::EcdsaP256Key;
 pub use ed25519::Ed25519Key;
 pub use keys::{KeyKind, MAX_PUBLIC_KEY_PEM_LEN, PublicKey, PublicKeyError, SignatureError};
+pub use proxy::{
+    BasicCredentials, MAX_BASIC_CREDENTIAL_BYTES, PROXY_MAX_HEAD_BYTES, PROXY_MAX_HEADERS, Proxy,
+};
 pub use random::{RandomFailed, fill_random};
 pub use resolve::{
     DNS_DEFAULT_ATTEMPTS, DNS_DEFAULT_NDOTS, DNS_DEFAULT_TRY_TIMEOUT, DNS_MAX_ATTEMPTS,
@@ -183,6 +198,17 @@ pub enum Error {
     /// intermediate's details start with `intermediate k of n` (ADR-027).
     /// The check fails closed.
     RevocationUnknown(Vec<RevocationFailure>),
+    /// The proxy of [`TlsConfig::with_proxy`] answered `CONNECT` with a
+    /// status other than 2xx (ADR-039). The text names the proxy, the
+    /// target and the status, never a field value.
+    Proxy {
+        /// The proxy, `host:port`.
+        proxy: String,
+        /// The `CONNECT` target, `host:port`.
+        target: String,
+        /// The proxy's status.
+        status: u16,
+    },
 }
 
 impl fmt::Display for Error {
@@ -200,6 +226,17 @@ impl fmt::Display for Error {
                 for (i, failure) in failures.iter().enumerate() {
                     f.write_str(if i == 0 { ": " } else { "; " })?;
                     write!(f, "{failure}")?;
+                }
+                Ok(())
+            }
+            Error::Proxy {
+                proxy,
+                target,
+                status,
+            } => {
+                write!(f, "the proxy {proxy} answered {status} to CONNECT {target}")?;
+                if *status == 407 {
+                    f.write_str(": it asks for credentials; only Basic is sent")?;
                 }
                 Ok(())
             }
@@ -306,13 +343,16 @@ impl Roots {
 /// checked for revocation by CRL (ADR-017) or OCSP (ADR-020), and their
 /// intermediates by CRL (ADR-027), with no switch to turn it off. Cheap
 /// to clone; clones share the session store and the CRL, CA and OCSP
-/// caches, so share one per set of roots.
+/// caches, so share one per set of roots. With a [`Proxy`]
+/// ([`TlsConfig::with_proxy`]) every connection it makes goes through that
+/// proxy: [`TlsDial`]'s and the revocation fetches' (ADR-039, D5).
 #[derive(Clone, Debug)]
 pub struct TlsConfig {
     client: Arc<ClientConfig>,
     roots: Arc<RootCertStore>,
     revocation: Arc<Revocation>,
     resolver: Resolver,
+    proxy: Option<Arc<Proxy>>,
 }
 
 impl TlsConfig {
@@ -377,7 +417,7 @@ impl TlsConfig {
         // the same client without a revocation check (`fetch_config`).
         let resolver = Resolver::system();
         let source = Arc::new(HttpSource::new(TlsConfig::fetch_config(
-            &client, &roots, &resolver,
+            &client, &roots, &resolver, None,
         )));
         Ok(TlsConfig {
             revocation: Arc::new(Revocation::on(
@@ -389,38 +429,40 @@ impl TlsConfig {
             client,
             roots,
             resolver,
+            proxy: None,
         })
     }
 
     /// What an `https` CRL or OCSP fetch connects with: the same client and
     /// roots without a revocation check, which keeps the fetch from
-    /// recursing (ADR-017, item 6; ADR-020, item 8), and `resolver` for the
-    /// hosts of every fetch (ADR-022).
+    /// recursing (ADR-017, item 6; ADR-020, item 8), `resolver` for the
+    /// hosts of every fetch (ADR-022), and `proxy`, which every fetch goes
+    /// through when set (ADR-039, D6).
     fn fetch_config(
         client: &Arc<ClientConfig>,
         roots: &Arc<RootCertStore>,
         resolver: &Resolver,
+        proxy: Option<&Arc<Proxy>>,
     ) -> TlsConfig {
         TlsConfig {
             client: Arc::clone(client),
             roots: Arc::clone(roots),
             revocation: Arc::new(Revocation::off()),
             resolver: resolver.clone(),
+            proxy: proxy.map(Arc::clone),
         }
     }
 
-    /// The same configuration with names resolved by `resolver` (ADR-022,
-    /// D7): `TlsDial`'s target, `connect`'s host and the hosts of every CRL
-    /// and OCSP fetch. The default is [`Resolver::system`]. It installs
-    /// fetch sources over the new resolver for both CRLs and OCSP, so it
-    /// replaces a source set earlier by [`TlsConfig::with_crl_source`] or
-    /// [`TlsConfig::with_ocsp_source`]: call those after it. Both caches
-    /// start empty.
-    pub fn with_resolver(&self, resolver: Resolver) -> TlsConfig {
+    /// The same configuration with `resolver` and `proxy`, and fetch
+    /// sources over both for CRLs and OCSP, so that the order of
+    /// [`TlsConfig::with_resolver`] and [`TlsConfig::with_proxy`] does not
+    /// matter. Both caches start empty.
+    fn with_route(&self, resolver: Resolver, proxy: Option<Arc<Proxy>>) -> TlsConfig {
         let source = Arc::new(HttpSource::new(TlsConfig::fetch_config(
             &self.client,
             &self.roots,
             &resolver,
+            proxy.as_ref(),
         )));
         TlsConfig {
             client: Arc::clone(&self.client),
@@ -430,7 +472,43 @@ impl TlsConfig {
                 Some(source),
             )),
             resolver,
+            proxy,
         }
+    }
+
+    /// The same configuration with names resolved by `resolver` (ADR-022,
+    /// D7): `TlsDial`'s target, `connect`'s host and the hosts of every CRL
+    /// and OCSP fetch, or with a proxy only the proxy's name (ADR-039). The
+    /// default is [`Resolver::system`]. It installs
+    /// fetch sources over the new resolver for both CRLs and OCSP, so it
+    /// replaces a source set earlier by [`TlsConfig::with_crl_source`] or
+    /// [`TlsConfig::with_ocsp_source`]: call those after it. Both caches
+    /// start empty. A proxy set by [`TlsConfig::with_proxy`] stays, in
+    /// either order.
+    pub fn with_resolver(&self, resolver: Resolver) -> TlsConfig {
+        self.with_route(resolver, self.proxy.clone())
+    }
+
+    /// The same configuration with every connection through `proxy`
+    /// (ADR-039, D5): [`TlsDial`] opens a `CONNECT` tunnel to its target
+    /// and runs TLS to the target over it, the certificate and its
+    /// revocation checked as on a direct connection; the CRL and OCSP
+    /// fetches go through the proxy too, `http` ones as absolute-form
+    /// `GET`s, `https` ones through a tunnel (D6). Only the proxy's name is
+    /// resolved, by this configuration's resolver; a target's name never
+    /// is. [`connect`] refuses a configuration with a proxy. A second call
+    /// replaces the proxy. Like [`TlsConfig::with_resolver`], it installs
+    /// fetch sources for both CRLs and OCSP over the resolver and the
+    /// proxy, so it replaces a source set earlier by
+    /// [`TlsConfig::with_crl_source`] or [`TlsConfig::with_ocsp_source`]:
+    /// call those after it. Both caches start empty.
+    pub fn with_proxy(&self, proxy: Proxy) -> TlsConfig {
+        self.with_route(self.resolver.clone(), Some(Arc::new(proxy)))
+    }
+
+    /// The proxy every connection goes through, if one is set.
+    pub fn proxy(&self) -> Option<&Proxy> {
+        self.proxy.as_deref()
     }
 
     /// The same configuration with CRLs from `source`, the OCSP source of
@@ -445,6 +523,7 @@ impl TlsConfig {
             roots: Arc::clone(&self.roots),
             revocation: Arc::new(self.revocation.with_sources(Some(source), None)),
             resolver: self.resolver.clone(),
+            proxy: self.proxy.clone(),
         }
     }
 
@@ -461,6 +540,7 @@ impl TlsConfig {
             roots: Arc::clone(&self.roots),
             revocation: Arc::new(self.revocation.with_sources(None, Some(source))),
             resolver: self.resolver.clone(),
+            proxy: self.proxy.clone(),
         }
     }
 
@@ -468,7 +548,12 @@ impl TlsConfig {
     /// CRL or OCSP fetch connects with.
     #[cfg(test)]
     pub(crate) fn without_revocation(&self) -> TlsConfig {
-        TlsConfig::fetch_config(&self.client, &self.roots, &self.resolver)
+        TlsConfig::fetch_config(
+            &self.client,
+            &self.roots,
+            &self.resolver,
+            self.proxy.as_ref(),
+        )
     }
 }
 
@@ -549,12 +634,22 @@ fn server_name(name: &str) -> Result<ServerName<'static>> {
 /// and, ASCII-lowercased, in ADR-003's grammar, as for [`TlsDial`]: a name
 /// rustls accepts but the grammar does not (an underscore, a trailing dot)
 /// is `Error::Io` of kind `InvalidInput`, before any query is sent.
+///
+/// A configuration with a proxy ([`TlsConfig::with_proxy`]) is
+/// `Error::InvalidInput` before anything is resolved: connecting directly
+/// could break the network's egress policy, so it goes through
+/// [`TlsDial`] (ADR-039, D5).
 pub fn connect(
     host: &str,
     port: u16,
     config: &TlsConfig,
     options: &ConnectOptions,
 ) -> Result<TlsStream<TcpStream>> {
+    if config.proxy.is_some() {
+        return Err(Error::InvalidInput(
+            "connect does not use the proxy; dial through TlsDial",
+        ));
+    }
     let name = server_name(host)?;
     if port == 0 {
         return Err(Error::InvalidInput("port is zero"));

@@ -11,8 +11,8 @@ use std::io::{self, Read, Write};
 use crate::body::{BodyReader, BodyState, BodyWriter};
 use crate::error::{Error, Result};
 use crate::head::{
-    Framing, RequestHead, ResponseHead, Target, authority_host, host_field, parse_response,
-    response_framing,
+    Framing, Headers, RequestHead, ResponseHead, Target, authority_host, encode_fields, host_field,
+    parse_response, response_framing,
 };
 use crate::limits::Limits;
 use crate::transport::{IdleCheck, Tunnel};
@@ -50,6 +50,8 @@ pub struct Connection<S> {
     used: bool,
     host: String,
     limits: Limits,
+    /// The peer is a forward proxy: request lines carry the absolute form.
+    via_proxy: bool,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -57,6 +59,22 @@ impl<S: Read + Write> Connection<S> {
     /// host is a name, an IPv4 address or a bracketed IPv6 address, with
     /// an optional port.
     pub fn new(stream: S, host: &str, limits: Limits) -> Result<Connection<S>> {
+        Connection::open(stream, host, limits, false)
+    }
+
+    /// A connection to a forward proxy over `stream`, for `http` requests
+    /// to the origin `host` (the grammar of [`Connection::new`]). Each
+    /// request line carries the absolute form `http://<host><target>`
+    /// built from the head's origin-form target, and `Host` stays the
+    /// origin's (RFC 9112, 3.2.2). The only place the client writes the
+    /// absolute form; the server still refuses it (ADR-003, item 3;
+    /// ADR-039, D6). `https` goes through a CONNECT tunnel instead
+    /// ([`connect_tunnel_with`]).
+    pub fn new_via_proxy(stream: S, host: &str, limits: Limits) -> Result<Connection<S>> {
+        Connection::open(stream, host, limits, true)
+    }
+
+    fn open(stream: S, host: &str, limits: Limits, via_proxy: bool) -> Result<Connection<S>> {
         Ok(Connection {
             wire: Wire::new(stream, None),
             body: BodyState::Done,
@@ -64,6 +82,7 @@ impl<S: Read + Write> Connection<S> {
             used: false,
             host: host_field(host)?,
             limits,
+            via_proxy,
         })
     }
 
@@ -116,6 +135,13 @@ impl<S: Read + Write + IdleCheck> Connection<S> {
             .position(|w| w == b"\r\n")
             .map_or(0, |i| i + 2);
         let mut out = encoded[..line_end].to_vec();
+        if self.via_proxy {
+            // The method is a token, so its end is the line's first space;
+            // the origin-form target after it becomes `http://<Host><target>`.
+            let method_end = head.method.as_str().len() + 1;
+            let absolute = format!("http://{}", self.host);
+            out.splice(method_end..method_end, absolute.bytes());
+        }
         out.extend_from_slice(format!("Host: {}\r\n", self.host).as_bytes());
         let framing = match &body {
             RequestBody::None => Framing::None,
@@ -244,16 +270,38 @@ fn read_final_head<S: Read>(wire: &mut Wire<S>, limits: &Limits) -> Result<Respo
 /// final status is `Error::Status`. `host` is a name, an IPv4 address or
 /// an IPv6 address without brackets.
 pub fn connect_tunnel<S: Read + Write>(
+    stream: S,
+    host: &str,
+    port: u16,
+    limits: &Limits,
+) -> Result<Tunnel<S>> {
+    connect_tunnel_with(stream, host, port, &Headers::new(), limits)
+}
+
+/// [`connect_tunnel`] with `fields` written after `Host`, in order: how
+/// `Proxy-Authorization` reaches a proxy (ADR-039, D8). A field the client
+/// writes itself (`Host`, `Content-Length`, `Transfer-Encoding`,
+/// `Connection`), a name that is not a token or a control character in a
+/// value is `Error::InvalidInput`, and nothing is written.
+pub fn connect_tunnel_with<S: Read + Write>(
     mut stream: S,
     host: &str,
     port: u16,
+    fields: &Headers,
     limits: &Limits,
 ) -> Result<Tunnel<S>> {
     if port == 0 {
         return Err(Error::InvalidInput("port is zero"));
     }
+    if fields.has_any(&OWNED) {
+        return Err(Error::InvalidInput(
+            "the client writes Host and the framing fields",
+        ));
+    }
     let authority = format!("{}:{port}", authority_host(host)?);
-    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes();
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n").into_bytes();
+    encode_fields(&mut request, fields)?;
+    request.extend_from_slice(b"\r\n");
     stream.write_all(&request)?;
     stream.flush()?;
     let mut wire = Wire::new(stream, None);
