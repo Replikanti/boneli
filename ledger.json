@@ -1641,16 +1641,16 @@
    "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
    "epic": null,
    "order": 63,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "9cc7896e",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
-   "note": "",
-   "updated_at": "2026-11-25T23:04:33+00:00",
+   "pr": 138,
+   "note": "PR #138 open",
+   "updated_at": "2026-11-25T23:48:31+00:00",
    "priority": "P3",
    "size": "?",
    "deps": [
@@ -1714,14 +1714,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T19:09:46+00:00",
-   "issue": 103,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "7ee136eb",
-   "note": "PR 2/3 merged (#123); next PR 3 (I/O refresh, live test, ADR accept)"
-  },
   {
    "at": "2026-11-24T19:42:44+00:00",
    "issue": 113,
@@ -2113,6 +2105,14 @@
    "to": "blocked",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-25T23:48:31+00:00",
+   "issue": 129,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #138 open"
   }
  ],
  "open": [
@@ -2142,7 +2142,7 @@
   137
  ],
  "xopen": [],
- "updated_at": "2026-11-25T23:08:01+00:00",
+ "updated_at": "2026-11-25T23:48:31+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2152,7 +2152,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795627874,
+  "at": 1795650511,
   "private": false
  },
  "schema": 2,
