@@ -1441,7 +1441,7 @@
    "title": "boneli-sigstore: accept Rekor v2 entries and RFC 3161 timestamps as the time source",
    "epic": null,
    "order": 55,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "3613ba8e",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1449,8 +1449,8 @@
    "dispatched": true,
    "parked": null,
    "pr": 132,
-   "note": "",
-   "updated_at": "2026-11-25T13:13:54+00:00",
+   "note": "PR 1 #132 merged (RFC 3161); PR 2 Rekor v2 next",
+   "updated_at": "2026-11-25T13:47:35+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:47:27+00:00",
-   "issue": 114,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "6cc0788e",
-   "note": null
-  },
   {
    "at": "2026-11-24T16:09:49+00:00",
    "issue": 103,
@@ -2087,6 +2079,14 @@
    "to": "plan-review",
    "by": "aac94746",
    "note": null
+  },
+  {
+   "at": "2026-11-25T13:47:35+00:00",
+   "issue": 102,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "3613ba8e",
+   "note": "PR 1 #132 merged (RFC 3161); PR 2 Rekor v2 next"
   }
  ],
  "open": [
@@ -2118,7 +2118,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T13:16:13+00:00",
+ "updated_at": "2026-11-25T13:47:35+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
