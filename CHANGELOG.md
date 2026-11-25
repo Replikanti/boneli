@@ -924,8 +924,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   contentType, messageDigest and signingCertificateV2 once each, a whole-
   second genTime, embedded certificates never parsed) and verifies it over
   a message against a TSA chain the caller supplies, at genTime, with the
-  leaf's EKU critical and exactly timeStamping. `TrustedRoot` reads
-  `timestampAuthorities` (`tsa_count`), and bundles carry up to
+  leaf's EKU critical and exactly timeStamping, and the anchor itself
+  valid at genTime. `TrustedRoot` reads `timestampAuthorities`
+  (`tsa_count`; an entry of one certificate is skipped, not refused), and
+  bundles carry up to
   `MAX_TIMESTAMPS` (32) tokens (`TooManyTimestamps`). A keyless bundle's
   verified times are the SET's integrated time and the genTime of every
   token a TSA of the root verifies over the DSSE signature; tokens that
@@ -941,6 +943,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `integrated_time: Option<u64>` and `signed_timestamps` (ADR-038), and a
   bundle entry without a promise and without a timestamp is now refused
   with `NoTimeSource` instead of `TlogEntries`.
+- The trust anchor of a Fulcio code-signing chain must be valid at the
+  verified time too (`CertError::OutsideValidity`); webpki never checks
+  an anchor's validity (ADR-038, D3).
 - **Breaking:** `ImageRef` has a required field `origin`, and
   `ImageStore::pull` returns `Result<Pulled, ImageError>` instead of
   `Result<RootfsRef, ImageError>` (#105, ADR-032). An operator reference

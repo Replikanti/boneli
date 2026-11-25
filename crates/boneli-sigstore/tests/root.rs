@@ -348,11 +348,33 @@ fn root_tsa_and_note_logs() {
     // A three-certificate chain, as GitHub's TSAs have, reads too.
     let three = pki::authority(&[&tsa.leaf, &pki.intermediate, &pki.root], EPOCH_2020, None);
     assert_eq!(read(&with(three)).map(|r| r.tsa_count()), Ok(1));
-    // One certificate, none, an empty one.
-    for chain in [vec![&tsa.leaf[..]], vec![], vec![&[][..], &pki.root[..]]] {
+    // None, an empty one.
+    for chain in [vec![], vec![&[][..], &pki.root[..]]] {
         let entry = pki::authority(&chain, EPOCH_2020, None);
         assert_eq!(read(&with(entry)).err(), Some(ConfigError::RootCertificate));
     }
+    // One certificate (a leaf alone, a CA alone) anchors no token: the
+    // entry is skipped, not the file (review of PR #132, run 1). Its
+    // window is still read strictly.
+    for one in [&tsa.leaf, &pki.root] {
+        let entry = pki::authority(&[one], EPOCH_2020, None);
+        assert_eq!(read(&with(entry)).map(|r| r.tsa_count()), Ok(0));
+        let mut no_start = pki::authority(&[one], EPOCH_2020, None);
+        remove(&mut no_start, &["validFor", "start"]);
+        assert_eq!(read(&with(no_start)).err(), Some(ConfigError::RootTime));
+        let skipped_and_kept = pki::with_tsas(
+            root_value(&pki),
+            vec![
+                pki::authority(&[one], EPOCH_2020, None),
+                tsa.authority(EPOCH_2020, None),
+            ],
+        );
+        assert_eq!(read(&skipped_and_kept).map(|r| r.tsa_count()), Ok(1));
+    }
+    // CAs only (an intermediate and the root) stay listed; no token
+    // verifies through them (`tests/timestamp.rs`).
+    let cas_only = pki::authority(&[&pki.intermediate, &pki.root], EPOCH_2020, None);
+    assert_eq!(read(&with(cas_only)).map(|r| r.tsa_count()), Ok(1));
     let mut no_chain = tsa.authority(EPOCH_2020, None);
     remove(&mut no_chain, &["certChain"]);
     assert_eq!(

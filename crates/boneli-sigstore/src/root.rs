@@ -12,8 +12,10 @@
 //! RFC 6962 and Rekor v1 use; no log ID twice across the Rekor and CT
 //! logs; no window that ends before it starts. A field this crate does
 //! not use is not read: `baseUrl`, `uri` and `subject`. A timestamp
-//! authority's chain must hold at least two certificates, its leaf first
-//! and its anchor last.
+//! authority's chain is read with its leaf first and its anchor last; one
+//! of a single certificate can anchor no token and is skipped, and one
+//! whose first certificate is a CA stays listed but no token verifies
+//! through it (ADR-038, D4).
 //!
 //! A CT log whose `keyId` is not the SHA-256 of its key refuses the file
 //! (RFC 6962 defines the log ID so). A Rekor log whose `keyId` is not is
@@ -156,7 +158,10 @@ impl TrustedRoot {
         let tsas = list(&root, "timestampAuthorities")?
             .iter()
             .map(tsa)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         ids.extend(ctlogs.iter().map(|l| l.key.key_id()));
         ids.sort_unstable();
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -289,20 +294,26 @@ fn window(value: &Value) -> Result<Window, ConfigError> {
 }
 
 /// A `timestampAuthorities` entry (ADR-038, D4): `certChain.certificates`
-/// of at least two, the TSA's leaf first and the anchor last (webpki
-/// cannot verify a certificate that is itself the anchor), and `validFor`
-/// with `start` required. `subject` and `uri` are not read.
-fn tsa(value: &Value) -> Result<Tsa, ConfigError> {
+/// with the TSA's leaf first and the anchor last, and `validFor` with
+/// `start` required. `subject` and `uri` are not read; an empty chain
+/// refuses the file. An entry whose chain is one certificate is read as
+/// strictly and then skipped (`None`): webpki cannot verify a certificate
+/// that is itself the anchor, so the entry anchors no token, and refusing
+/// the whole file would also refuse every Rekor v1 bundle under it. A
+/// chain whose first certificate is a CA is kept; no token verifies
+/// through it, since its "leaf" is refused as a CA or as not the signer.
+fn tsa(value: &Value) -> Result<Option<Tsa>, ConfigError> {
     let mut ders = chain(value)?;
-    if ders.len() < 2 {
-        return Err(ConfigError::RootCertificate);
+    let window = window(value)?;
+    if ders.len() == 1 {
+        return Ok(None);
     }
     let root = ders.pop().ok_or(ConfigError::RootCertificate)?;
     let leaf = ders.remove(0);
-    Ok(Tsa {
+    Ok(Some(Tsa {
         leaf,
         intermediates: ders,
         root,
-        window: window(value)?,
-    })
+        window,
+    }))
 }

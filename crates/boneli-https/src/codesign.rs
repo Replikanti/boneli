@@ -6,7 +6,9 @@
 //! by RFC 6962, section 3.2.
 //!
 //! webpki decides the chain: the signatures, the validity at `at_secs`
-//! (inclusive at both ends), the basic constraints (the leaf must not be
+//! (inclusive at both ends) of the leaf and the intermediates, while the
+//! trust anchor's own validity, which webpki never reads, is checked by
+//! `verify_chain` (ADR-038, D3), the basic constraints (the leaf must not be
 //! a CA), and the EKU, which `KeyUsage::required` demands of the leaf and
 //! of every intermediate on the path, as Sigstore's public-good
 //! intermediate carries it. Intermediates come only from the caller, so a
@@ -201,6 +203,14 @@ pub fn verify_code_signing(
 /// of every intermediate on the path (module doc): the one webpki call of
 /// code-signing chains and of timestamp authorities (`timestamp`). Gives
 /// the SubjectPublicKeyInfo of the leaf's issuer on the verified path.
+///
+/// webpki checks the validity of the certificates on the path only, never
+/// of the trust anchor (a `TrustAnchor` carries none), so the root that
+/// ends a path must also be valid at `at_secs`, inclusive at both ends as
+/// webpki's own check (ADR-038, D3). The check runs as webpki's path
+/// callback, so a path to a root outside its validity is not taken and
+/// path building goes on to the other roots. A root the strict reader
+/// cannot read is refused as `BadRoot`, as one webpki cannot use.
 pub(crate) fn verify_chain(
     leaf: &[u8],
     intermediates: &[&[u8]],
@@ -208,11 +218,40 @@ pub(crate) fn verify_chain(
     at_secs: u64,
     eku: &'static [u8],
 ) -> Result<Vec<u8>, CertError> {
+    let validity = roots
+        .iter()
+        .map(|root| {
+            parse(root)
+                .map(|p| (p.not_before, p.not_after))
+                .map_err(|_| CertError::BadRoot)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let roots: Vec<CertificateDer<'_>> = roots.iter().map(|r| CertificateDer::from(*r)).collect();
     let anchors = roots
         .iter()
         .map(|root| webpki::anchor_from_trusted_cert(root).map_err(|_| CertError::BadRoot))
         .collect::<Result<Vec<_>, _>>()?;
+    let time = UnixTime::since_unix_epoch(Duration::from_secs(at_secs));
+    let anchor_valid = |path: &webpki::VerifiedPath<'_>| -> Result<(), webpki::Error> {
+        let index = anchors
+            .iter()
+            .position(|anchor| std::ptr::eq(anchor, path.anchor()))
+            .ok_or(webpki::Error::UnknownIssuer)?;
+        let (not_before, not_after) = validity[index];
+        if at_secs < not_before {
+            return Err(webpki::Error::CertNotValidYet {
+                time,
+                not_before: UnixTime::since_unix_epoch(Duration::from_secs(not_before)),
+            });
+        }
+        if at_secs > not_after {
+            return Err(webpki::Error::CertExpired {
+                time,
+                not_after: UnixTime::since_unix_epoch(Duration::from_secs(not_after)),
+            });
+        }
+        Ok(())
+    };
     let intermediates: Vec<CertificateDer<'_>> = intermediates
         .iter()
         .map(|c| CertificateDer::from(*c))
@@ -226,10 +265,10 @@ pub(crate) fn verify_chain(
                 .all,
             &anchors,
             &intermediates,
-            UnixTime::since_unix_epoch(Duration::from_secs(at_secs)),
+            time,
             webpki::KeyUsage::required(eku),
             None,
-            None,
+            Some(&anchor_valid),
         )
         .map_err(chain_error)?;
     Ok(path.issuer_spki().as_ref().to_vec())
@@ -702,6 +741,43 @@ mod tests {
             verify(&leaf, CA, T + LIFETIME + 1).expect_err("refused"),
             CertError::OutsideValidity
         );
+    }
+
+    /// The trust anchor itself must be valid at the time, inclusive at
+    /// both ends: webpki never checks an anchor's validity (ADR-038, D3).
+    /// The intermediate is the anchor here (2026-01-01 to 2126-01-01), and
+    /// the leaf is valid well around both of its bounds.
+    #[test]
+    fn anchor_validity_at_time() {
+        const ANCHOR_FROM: u64 = 1_767_225_600;
+        const ANCHOR_TO: u64 = 4_922_899_200;
+        let anchor = pem_der(CA);
+        let leaf = |at: u64| {
+            LeafSpec {
+                not_before: at - 86_400,
+                not_after: at + 86_400,
+                ..LeafSpec::email()
+            }
+            .build()
+        };
+        for (at, ok) in [
+            (1_751_328_000, false),
+            (ANCHOR_FROM - 1, false),
+            (ANCHOR_FROM, true),
+            (ANCHOR_TO, true),
+            (ANCHOR_TO + 1, false),
+        ] {
+            let result = verify_code_signing(&leaf(at), &[], &[&anchor], at);
+            if ok {
+                assert!(result.is_ok(), "{at}");
+            } else {
+                assert_eq!(
+                    result.expect_err("refused"),
+                    CertError::OutsideValidity,
+                    "{at}"
+                );
+            }
+        }
     }
 
     #[test]

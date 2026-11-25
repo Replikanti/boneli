@@ -20,8 +20,9 @@
 //! [`TimestampToken::verify`] checks, cheapest first: the imprint against
 //! the message, the ESSCertIDv2 hash against the leaf, the leaf's EKU
 //! (critical and exactly `id-kp-timeStamping`, RFC 3161 2.3) and keyUsage,
-//! the chain by webpki at genTime (`codesign::verify_chain`), the
-//! messageDigest against the TSTInfo bytes, and the leaf's signature over
+//! the chain by webpki at genTime with the anchor itself valid then
+//! (`codesign::verify_chain`), the messageDigest against the TSTInfo
+//! bytes, and the leaf's signature over
 //! the signed attributes. Every refusal is a fixed [`TimestampError`].
 
 use std::fmt;
@@ -1062,6 +1063,38 @@ mod tests {
                     "{at}"
                 );
             }
+        }
+    }
+
+    /// The TSA's anchor must hold at genTime too, not only the leaf: the
+    /// anchor (the test intermediate) is valid from 2026-01-01 to
+    /// 2126-01-01, and each leaf here is valid around genTime (review of
+    /// PR #132, run 1).
+    #[test]
+    fn anchor_validity_at_gen_time() {
+        for (at, leaf_from, leaf_to) in [
+            // genTime 2025-07-01 inside a leaf from 2025-06-01.
+            (1_751_328_000, 1_748_736_000, LEAF_TO),
+            // genTime one second after the anchor's notAfter.
+            (4_922_899_201, LEAF_FROM, 4_922_899_300),
+        ] {
+            let leaf = TsaLeafSpec {
+                not_before: leaf_from,
+                not_after: leaf_to,
+                ..TsaLeafSpec::good()
+            }
+            .build();
+            let spec = TokenSpec {
+                leaf: leaf.clone(),
+                ..TokenSpec::over(MESSAGE, at)
+            };
+            assert_eq!(
+                parse(&spec)
+                    .expect("parses")
+                    .verify(MESSAGE, &leaf, &[], &anchor()),
+                Err(TimestampError::Chain(CertError::OutsideValidity)),
+                "{at}"
+            );
         }
     }
 

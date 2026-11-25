@@ -116,16 +116,52 @@ assets and OpenSSL:
    and exactly `id-kp-timeStamping` (RFC 3161 2.3) and its keyUsage, if
    present, allowing digitalSignature or nonRepudiation; webpki's
    `verify_for_usage` for `id-kp-timeStamping` at genTime with the root's
-   intermediates and anchor only; messageDigest against SHA-256 of the
+   intermediates and anchor only, and the anchor itself valid at genTime
+   (inclusive at both ends, as webpki's check of the other certificates);
+   messageDigest against SHA-256 of the
    TSTInfo; and the leaf's signature over the signed attributes re-tagged
    as a SET, through the algorithms ECDSA P-256 and P-384 with SHA-256
    only. Every refusal is a fixed `TimestampError`.
+   The anchor check is in the shared `verify_chain` (D9), so it also
+   tightens the Fulcio chains of ADR-029: before, an anchor was never
+   checked against the time, because webpki's `TrustAnchor` carries no
+   validity and webpki checks only the certificates on the path. Why:
+   Go's `x509.Verify`, which sigstore-go and timestamp-authority use,
+   refuses an expired or not yet valid root, and without the check a
+   token whose genTime lies outside its anchor's lifetime but inside an
+   open-ended `validFor` (the public-good TSA has no `end`) would count
+   as a time (review of this pull request, run 1). It runs as webpki's
+   path callback, so a path to an anchor outside its validity is not
+   taken and path building goes on to the other roots. Cost: none
+   measured; in the public-good root the TSA anchor is valid from
+   2025-04-08 to 2035-04-06 and the two Fulcio anchors from 2021-03-07
+   to 2031-02-23 and from 2021-10-07 to 2031-10-05, which holds every
+   measured time, and every real known answer still verifies. The
+   current Fulcio anchor's `validFor` has no `end`, so from 2031-10-06 a
+   time is refused by the certificate, not by the window, as sigstore-go
+   refuses it.
 4. **D4, TSAs in the trusted root.** `timestampAuthorities` is read
-   (absent is empty): `certChain.certificates` of at least two, the leaf
-   first, the anchor last, the rest intermediates (`RootCertificate`
-   otherwise), and `validFor` with `start` required, as for CAs. `subject`
-   and `uri` are not read. A token counts only through a TSA whose window
-   holds its genTime, in milliseconds as every window here.
+   (absent is empty): `certChain.certificates` with the leaf first, the
+   anchor last, the rest intermediates, every certificate non-empty
+   (`RootCertificate` otherwise, also for an empty chain), and `validFor`
+   with `start` required, as for CAs. `subject` and `uri` are not read. A
+   token counts only through a TSA whose window holds its genTime, in
+   milliseconds as every window here. An entry that cannot serve as a TSA
+   chain does not refuse the file: one of a single certificate is read
+   as strictly and then skipped (it is not counted by `tsa_count`), and
+   one whose first certificate is a CA (CAs only, the leaf left to the
+   token's own `certificates`) stays listed, but no token verifies
+   through it, because its first certificate is not the token's signer
+   (`SigningCertificate`) or is a CA (`IsCa`). Fail closed at the token,
+   not at the root. Why: sigstore-go's `ParseTimestampingAuthority` loads
+   both shapes (it takes the leaf from the token when the first
+   certificate is a CA), and refusing the file would also refuse every
+   Rekor v1 bundle that verifies under it, a regression against the root
+   before this ADR, which did not read the member. No measured root has
+   either shape (public-good: 1 TSA of 2 certificates; GitHub: 6 TSAs of
+   3, all leaf first), so the skip costs nothing measured, and a TSA of
+   that shape gives no time until a successor ADR reads the leaf from the
+   token (review of this pull request, run 1).
 5. **D5, failing tokens do not count.** A token that does not parse or
    that no TSA verifies is skipped, and is no refusal by itself. Why:
    sigstore-go's `VerifySignedTimestamp` skips such tokens and counts
@@ -167,9 +203,10 @@ assets and OpenSSL:
   bundle force more checks: without a cap the 4,194,304-byte bundle limit
   allows 4,194,304 ÷ about 985 bytes per base64 token entry ≈ 4,258
   tokens.
-- **A TSA chain of at least 2 certificates.** webpki cannot verify a
-  certificate that is itself the anchor. Measured chains: 2 certificates
-  (public-good) and 3 (GitHub).
+- **A TSA chain of at least 2 certificates to count.** webpki cannot
+  verify a certificate that is itself the anchor, so a chain of one is
+  skipped (D4). Measured chains: 2 certificates (public-good) and 3
+  (GitHub).
 - **genTime in whole seconds only.** 7 of 7 tokens have no fraction. A
   fraction would need every validity window checked at both ends of the
   second (two webpki calls per time), for no measured token. A TSA that
@@ -200,6 +237,11 @@ assets and OpenSSL:
 - Kept evidence is re-verified under the same rules, so a warm pull
   gives the cold pull's verdict.
 - `NoCaAtTime` now names a verified time, not only the integrated time.
+- The anchor of a Fulcio chain must now be valid at every verified time
+  too (D3). No measured bundle changes its verdict: the public-good
+  Fulcio anchors are valid from 2021 to 2031, around every measured time.
+- A `trusted_root.json` whose TSA entry has a single certificate or CAs
+  only still reads (D4); that TSA gives no time.
 - `Accepted::Keyless` changed shape (`integrated_time: Option<u64>`,
   `signed_timestamps`), a breaking change of a public enum whose only
   users are this crate's tests.
@@ -209,6 +251,10 @@ assets and OpenSSL:
   per check, a reviewer on both pull requests.
 
 **Known limits, each with its closure:**
+
+- A TSA listed with CAs only, its leaf only in the token, gives no time
+  (D4). Closure: a measured root with that shape, and a successor ADR
+  that reads the leaf from the token's `certificates`.
 
 - Rekor v2 entries are still refused (`MalformedTlogEntry`: they have no
   `integratedTime`). Closure: the second pull request of #102.
@@ -261,17 +307,24 @@ one verified token, and with the token not counted against a root
 without TSAs (`real_set_and_timestamp_verify`). Every edge case of the
 first part refuses with its named refusal (`src/timestamp.rs` unit tests,
 `crates/boneli-sigstore/tests/timestamp.rs`, `root_tsa_and_note_logs`).
-47 hand-applied mutants, 47 killed: 30 in `boneli-https` (the status,
+54 hand-applied mutants, 54 killed: 35 in `boneli-https` (the status,
 content types, signer count, digest, signature and imprint algorithms,
 unknown algorithm parameters, the signed-attribute rules, the
 ESSCertIDv2 algorithm, genTime's tag, the TSTInfo version and critical
 extensions, the explicit FALSE, the skipped `certificates`, each of the
 six checks of `verify`, the time webpki is asked at, the re-tag of the
-signed attributes, and the criticality the strict leaf reader reports)
-and 17 in `boneli-sigstore` (the token cap at both ends, unknown members,
+signed attributes, the criticality the strict leaf reader reports, and
+after review the anchor's validity: the check not called, either bound
+dropped, either bound made exclusive)
+and 19 in `boneli-sigstore` (the token cap at both ends, unknown members,
 empty tokens, tokens not passed, the imprint over the PAE, the TSA window,
 the TSA check itself, which failure is kept, `NoTsaAtTime` over a token
 error, `NoTimeSource` over a token error, the transparency check, the
 chain at every time, the leaf from the first time, the reported
-`integrated_time` and `signed_timestamps`, and the two-certificate
-chain rule). The second part adds its own.
+`integrated_time` and `signed_timestamps`, and the one-certificate
+rule of D4 as changed after review: the entry refusing the file again,
+its window read only after the skip, and every TSA dropped).
+The anchor and skip rules are tested by `anchor_validity_at_gen_time`,
+`codesign::tests::anchor_validity_at_time`,
+`unusable_tsa_entry_anchors_no_token` and `root_tsa_and_note_logs`. The
+second part adds its own.

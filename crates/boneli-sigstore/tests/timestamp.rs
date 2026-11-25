@@ -475,6 +475,55 @@ fn tsa_not_in_root() {
     );
 }
 
+/// A TSA entry that cannot serve as a TSA chain (one certificate, or CAs
+/// only) leaves the root readable, so a Rekor v1 bundle still verifies by
+/// its SET, and a token that chains only to that entry does not count
+/// (ADR-038, D4; review of PR #132, run 1).
+#[test]
+fn unusable_tsa_entry_anchors_no_token() {
+    let pki = Pki::new();
+    let tsa = Tsa::new(&pki);
+    let spec = email_bundle(&pki);
+    let token = tsa.token(&spec.signature, T + 10);
+    for (chain, without_set) in [
+        // The TSA's issuing CA alone: skipped, so the root has no TSA.
+        (vec![&tsa.anchor[..]], Refusal::NoTsaAtTime),
+        // The TSA's leaf alone: skipped too.
+        (vec![&tsa.leaf[..]], Refusal::NoTsaAtTime),
+        // CAs only: listed, but its first certificate is not the signer.
+        (
+            vec![&pki.intermediate[..], &pki.root[..]],
+            Refusal::Timestamp(TimestampError::SigningCertificate),
+        ),
+    ] {
+        let root = with_tsas(
+            root_value(&pki),
+            vec![pki::authority(&chain, EPOCH_2020, None)],
+        );
+        let trust = trusting(&root);
+        assert_eq!(
+            verify(&bundle(&pki, &spec, &[], true), &IMAGE, &trust),
+            accepted(Some(INTEGRATED), 0)
+        );
+        assert_eq!(
+            verify(
+                &bundle(&pki, &spec, std::slice::from_ref(&token), true),
+                &IMAGE,
+                &trust
+            ),
+            accepted(Some(INTEGRATED), 0)
+        );
+        assert_eq!(
+            verify(
+                &bundle(&pki, &spec, std::slice::from_ref(&token), false),
+                &IMAGE,
+                &trust
+            ),
+            Err(without_set)
+        );
+    }
+}
+
 #[test]
 fn embedded_certificates_not_read() {
     let pki = Pki::new();
