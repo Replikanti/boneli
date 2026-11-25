@@ -1032,11 +1032,11 @@
    "title": "boneli-oci: private-registry credentials and an HTTP proxy for customer networks",
    "epic": null,
    "order": 39,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "ae67d3e8",
    "pr": 135,
-   "note": "PR 1 (proxy route) implementing",
-   "updated_at": "2026-11-25T17:31:14+00:00",
+   "note": "PR 1 merged (#135, 825d2aa); PR 2 (credentials in boneli-oci, Squid CI step, ADR-039 accepted) next",
+   "updated_at": "2026-11-25T18:33:18+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1689,14 +1689,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-24T16:41:28+00:00",
-   "issue": 114,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "6cc0788e",
-   "note": null
-  },
-  {
    "at": "2026-11-24T16:50:55+00:00",
    "issue": 118,
    "from": null,
@@ -2087,6 +2079,14 @@
    "to": "pr-review",
    "by": "ae67d3e8",
    "note": null
+  },
+  {
+   "at": "2026-11-25T18:33:18+00:00",
+   "issue": 55,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "ae67d3e8",
+   "note": "PR 1 merged (#135, 825d2aa); PR 2 (credentials in boneli-oci, Squid CI step, ADR-039 accepted) next"
   }
  ],
  "open": [
@@ -2116,7 +2116,7 @@
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T17:31:14+00:00",
+ "updated_at": "2026-11-25T18:33:18+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
