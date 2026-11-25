@@ -1593,16 +1593,16 @@
    "title": "boneli-replay-check: make protected_walk_is_bounded independent of wall-clock load",
    "epic": null,
    "order": 61,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "48d4a169",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 126,
    "note": "",
-   "updated_at": "2026-11-24T23:29:45+00:00",
+   "updated_at": "2026-11-25T00:46:08+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1614,14 +1614,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T04:20:35+00:00",
-   "issue": 103,
-   "from": "ready",
-   "to": "claimed",
-   "by": "7ee136eb",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-24T04:26:45+00:00",
    "issue": 109,
@@ -2013,6 +2005,14 @@
    "to": "claimed",
    "by": "3613ba8e",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-25T00:46:08+00:00",
+   "issue": 125,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "48d4a169",
+   "note": null
   }
  ],
  "open": [
@@ -2045,7 +2045,7 @@
   125
  ],
  "xopen": [],
- "updated_at": "2026-11-25T00:09:10+00:00",
+ "updated_at": "2026-11-25T00:46:08+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
