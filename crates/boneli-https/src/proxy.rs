@@ -98,7 +98,8 @@ impl BasicCredentials {
 }
 
 /// The length of the runs of a secret [`redact`] removes, in bytes
-/// (ADR-039, D4): 16 bytes of base64 carry 96 bits, so a run that long
+/// (ADR-039, D4): 16 bytes of base64 carry 96 bits (about 80 with the
+/// case folded), so a run that long
 /// in a detail is the secret and not a host, a digest or a word by
 /// chance; a shorter run would start to match ordinary text, a longer
 /// one would let a piece of that length through.
@@ -107,11 +108,18 @@ pub const REDACT_WINDOW: usize = 16;
 /// `text` with every byte that lies in a copy of a run of
 /// [`REDACT_WINDOW`] bytes of one of `secrets`, or of a whole secret that
 /// is shorter, replaced: each stretch of such bytes, widened to whole
-/// characters, becomes one `[redacted]`. Empty secrets are skipped. A
+/// characters, becomes one `[redacted]`. Letters compare ASCII
+/// case-insensitively: the hosts a server chooses reach a detail
+/// lowercased by the URL parser, so a mixed-case secret put into a host
+/// label arrives lowercase (ADR-039, D4). Empty secrets are skipped. A
 /// piece of a secret shorter than the window stays.
 pub fn redact(text: &str, secrets: &[&str]) -> String {
-    let bytes = text.as_bytes();
+    // ASCII lowercasing keeps every byte where it is, so a position in
+    // `folded` is the same position in `text`.
+    let folded = text.to_ascii_lowercase();
+    let bytes = folded.as_bytes();
     let mut hit = vec![false; bytes.len()];
+    let secrets: Vec<String> = secrets.iter().map(|s| s.to_ascii_lowercase()).collect();
     for secret in secrets.iter().map(|s| s.as_bytes()) {
         if secret.is_empty() {
             continue;
@@ -444,6 +452,26 @@ mod tests {
             credentials.redact("host:443 answered 401"),
             "host:443 answered 401"
         );
+    }
+
+    /// Letters compare ASCII case-insensitively: a mixed-case password or
+    /// token that reached the text lowercased, as a host does, goes too,
+    /// and so does an uppercased copy; the rest keeps its case.
+    #[test]
+    fn redact_ignores_ascii_case() {
+        let credentials = BasicCredentials::new(USER, PASS).expect("credentials");
+        let text = format!(
+            "realm {}.example and {}",
+            PASS.to_ascii_lowercase(),
+            USER.to_ascii_uppercase()
+        );
+        assert_eq!(
+            credentials.redact(&text),
+            "realm [redacted].example and [redacted]"
+        );
+        let token = "Tok-9fH2kL7mQ4rT8vX1zB5nC3dG6jP0sW2yA4eU";
+        let text = format!("Redirect to {}.Example", token.to_ascii_lowercase());
+        assert_eq!(redact(&text, &[token]), "Redirect to [redacted].Example");
     }
 
     /// A secret shorter than the window goes where it appears whole; an

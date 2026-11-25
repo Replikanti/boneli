@@ -968,11 +968,37 @@ pub(crate) fn check(root: &Path) -> Result<Report, ToolError> {
         let (Some(parent), Some(child)) = (packages.get(pid), packages.get(cid)) else {
             return Err(unexpected("resolve.nodes.deps.pkg"));
         };
-        if !pol
-            .edges
-            .contains(&(parent.name.clone(), child.name.clone()))
-        {
-            let kinds: BTreeSet<&str> = dep_kinds.iter().map(|k| k.unwrap_or("normal")).collect();
+        let key = (parent.name.clone(), child.name.clone());
+        let kinds: BTreeSet<&str> = dep_kinds.iter().map(|k| k.unwrap_or("normal")).collect();
+        if pol.edges.contains(&key) {
+            // A record with `kinds` approves the edge for those dependency
+            // kinds only (ADR-039, D10): a dev-only record does not let the
+            // crate into the build of the parent itself.
+            if let Some(allowed) = pol.edge_kinds.get(&key)
+                && kinds.iter().any(|k| !allowed.contains(*k))
+            {
+                let kinds: Vec<&str> = kinds.into_iter().collect();
+                let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                rep.fail(
+                    Rule::DepEdge,
+                    POLICY,
+                    format!(
+                        "{} -> {} ({}): [external.{}.pulled-by.{}] allows only kinds {}",
+                        parent.name,
+                        child.name,
+                        kinds.join(", "),
+                        child.name,
+                        parent.name,
+                        if allowed.is_empty() {
+                            "(none)".to_owned()
+                        } else {
+                            allowed.join(", ")
+                        }
+                    ),
+                    None,
+                );
+            }
+        } else {
             let kinds: Vec<&str> = kinds.into_iter().collect();
             rep.fail(
                 Rule::DepEdge,

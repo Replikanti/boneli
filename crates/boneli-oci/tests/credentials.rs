@@ -808,43 +808,55 @@ fn proxied_store_uses_the_proxied_setup() {
     );
 }
 
-/// Hosts the server chose reach a detail as they are, lowercase: a
-/// registry holding lowercase credentials or a lowercase token can put
-/// them into a realm or a redirect host. The client's redaction takes
-/// them out (ADR-039, D4).
+/// Hosts the server chose reach a detail lowercased by the URL parser: a
+/// registry holding the credentials or a token, lowercase or mixed case
+/// (every JWT or base64 token is), can put them into a realm or a
+/// redirect host. The client's redaction takes them out, compared ASCII
+/// case-insensitively (ADR-039, D4).
 #[test]
 fn hosts_holding_secrets_are_redacted() {
-    let user = "lowercase-user-0123456789abcdef";
-    let pass = "lowercase-pass-0123456789abcdef0123456789";
-    let token = "lowercase-token-0123456789abcdef01234567";
-    let credentials = BasicCredentials::new(user, pass).expect("credentials");
-    let basic = credentials.header_value();
-    let registry = Registry::docker_hub().with_credentials(credentials);
-    let cases: [(&str, String); 3] = [
-        ("realm", format!("https://{pass}.example/token")),
-        ("realm", format!("https://{user}.example/token")),
-        ("redirect", format!("{token}.example")),
+    let lowercase = [
+        "lowercase-user-0123456789abcdef",
+        "lowercase-pass-0123456789abcdef0123456789",
+        "lowercase-token-0123456789abcdef01234567",
     ];
-    for (kind, value) in cases {
-        let mut hub = Hub::default();
-        let pushed = app(&mut hub);
-        let mut private = Private::new(hub, Flow::Token, &basic, token);
-        if kind == "realm" {
-            private.realm = value.clone();
-        } else {
-            private.chain = vec![value.clone()];
-        }
-        let fake = fake_of(private);
-        let (_tmp, store) = store(&fake, registry.clone());
-        let detail = match pull(&store, &pushed.index) {
-            Err(ImageError::Failed { detail }) => detail,
-            other => panic!("{kind}: expected Failed, got {other:?}"),
-        };
-        assert!(detail.contains("[redacted]"), "{detail}");
-        for secret in [user, pass, token] {
-            for window in secret.as_bytes().windows(16) {
-                let window = std::str::from_utf8(window).expect("ASCII");
-                assert!(!detail.contains(window), "{window:?} in {detail:?}");
+    let mixed = [
+        "Review-User-0123456789ABCDEFghij",
+        "Review-Pass-0123456789ABCDEFghijKLMNopqr",
+        "Review-Token-0123456789ABCDEFghijKLMNop",
+    ];
+    for [user, pass, token] in [lowercase, mixed] {
+        let credentials = BasicCredentials::new(user, pass).expect("credentials");
+        let basic = credentials.header_value();
+        let registry = Registry::docker_hub().with_credentials(credentials);
+        let cases: [(&str, String); 3] = [
+            ("realm", format!("https://{pass}.example/token")),
+            ("realm", format!("https://{user}.example/token")),
+            ("redirect", format!("{token}.example")),
+        ];
+        for (kind, value) in cases {
+            let mut hub = Hub::default();
+            let pushed = app(&mut hub);
+            let mut private = Private::new(hub, Flow::Token, &basic, token);
+            if kind == "realm" {
+                private.realm = value.clone();
+            } else {
+                private.chain = vec![value.clone()];
+            }
+            let fake = fake_of(private);
+            let (_tmp, store) = store(&fake, registry.clone());
+            let detail = match pull(&store, &pushed.index) {
+                Err(ImageError::Failed { detail }) => detail,
+                other => panic!("{kind}: expected Failed, got {other:?}"),
+            };
+            assert!(detail.contains("[redacted]"), "{detail}");
+            let folded = detail.to_ascii_lowercase();
+            for secret in [user, pass, token] {
+                let secret = secret.to_ascii_lowercase();
+                for window in secret.as_bytes().windows(16) {
+                    let window = std::str::from_utf8(window).expect("ASCII");
+                    assert!(!folded.contains(window), "{window:?} in {detail:?}");
+                }
             }
         }
     }

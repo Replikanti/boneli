@@ -116,9 +116,12 @@ jobs:
       # registry connection and every CRL or OCSP fetch of the pull has to
       # go through the proxy. Squid's answer heads to an accepted and a
       # refused CONNECT are printed for ADR-039 D9 (bytes, fields), and its
-      # access log must show the CONNECT to Docker Hub and an absolute-form
-      # GET of a revocation fetch. Last, because the rules would block the
-      # steps after it; they are removed when the step ends either way.
+      # access log, counted only from the lines the pull wrote, must show a
+      # CONNECT to Docker Hub's API host and an absolute-form GET of a
+      # revocation fetch. The probes use auth.docker.io, so none of their
+      # lines can stand in for the pull's. Last, because the rules would
+      # block the steps after it; they are removed when the step ends
+      # either way.
       - name: Pull node:22 through Squid with direct egress blocked
         if: ${{ !cancelled() }}
         run: |
@@ -144,8 +147,8 @@ jobs:
               END { printf "squid CONNECT head (%s, %s): %s; %d bytes, %d fields, complete=%d\n", what, target, status, bytes, fields, done }
             ' "$RUNNER_TEMP/head-$2"
           }
-          connect_head registry-1.docker.io:443 accepted
-          connect_head registry-1.docker.io:25 refused
+          connect_head auth.docker.io:443 accepted
+          connect_head auth.docker.io:25 refused
           me=$(id -u)
           cleanup() {
             for t in iptables ip6tables; do
@@ -160,9 +163,13 @@ jobs:
             echo "direct HTTPS still works; the block is not in place"
             exit 1
           fi
-          curl -sS -o /dev/null --max-time 20 -x http://127.0.0.1:3128 https://registry-1.docker.io/v2/ \
+          curl -sS -o /dev/null --max-time 20 -x http://127.0.0.1:3128 https://auth.docker.io/token \
             -w 'through squid: %{http_code}\n'
+          # Only the lines written from here on belong to the pull.
+          before=$(sudo sh -c 'wc -l < /var/log/squid/access.log')
           BONELI_OCI_TEST_PROXY=127.0.0.1:3128 \
             cargo test -p boneli-oci --test boneli_oci_tests -- --ignored proxy:: --nocapture
-          sudo grep -c 'CONNECT registry-1.docker.io:443' /var/log/squid/access.log
-          sudo grep ' GET http://' /var/log/squid/access.log
+          sudo tail -n "+$((before + 1))" /var/log/squid/access.log > "$RUNNER_TEMP/pull.log"
+          echo "squid log lines of the pull: $(wc -l < "$RUNNER_TEMP/pull.log")"
+          grep -c ' CONNECT registry-1.docker.io:443 ' "$RUNNER_TEMP/pull.log"
+          grep ' GET http://' "$RUNNER_TEMP/pull.log"

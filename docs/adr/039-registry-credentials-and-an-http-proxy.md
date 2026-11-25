@@ -162,9 +162,13 @@ private image until #33 lands; no binary pulls any image today.
   `REDACT_WINDOW` = 16 bytes of the username, the password, the pair and
   its base64, and `boneli_https::redact` every such run of every token
   the client received, each stretch by `[redacted]` (a secret shorter
-  than 16 bytes where it appears whole). The store applies it once more
-  to the whole pull, the signature check included. Why 16: 16 bytes of
-  base64 are 96 bits, so a run that long in a detail is the secret and
+  than 16 bytes where it appears whole). Letters compare ASCII
+  case-insensitively, because the hosts a server chooses reach the
+  detail lowercased by the URL parser, so a mixed-case password or token
+  (every JWT or base64 token is one) put into a host label arrives
+  lowercase (#55 part 2 review). The store applies it once more to the
+  whole pull, the signature check included. Why 16: 16 bytes of base64
+  are 96 bits, about 80 with the case folded, so a run that long in a detail is the secret and
   not a host, digest or word by chance; a shorter window starts to hit
   ordinary text (a username like `AWS` already does, where it appears
   whole), a longer one lets a 16-byte piece through. It is the window of
@@ -464,14 +468,21 @@ and registry credentials each only where they belong, an untrusted
 registry refused behind the proxy with nothing committed, and the proxy
 refusing the CDN. That server is the one new dependency edge: `rustls`
 as a dev-dependency of `boneli-oci`
-(`[external.rustls.pulled-by.boneli-oci]`, approved here), with
-`boneli-https`'s features, so no new crate; it is the edge ADR-009 had
+(`[external.rustls.pulled-by.boneli-oci]`, approved here for
+dev-dependencies only: the record carries `kinds = ["dev"]`, a key the
+architecture checker gains with this ADR, so moving `rustls` into
+`boneli-oci`'s `[dependencies]` fails rule `dep-edge`, as fixtures
+`dep-dev-only-edge-normal` and `-build` pin; without the key a record
+approves every kind, as before), with `boneli-https`'s features, so no
+new crate; it is the edge ADR-009 had
 for the `TlsDial` tests until ADR-014 D4 moved them to `boneli-https`
 (#72).
 And one live pull of `node:22` through Squid in `oci-acceptance`
 (`proxy::node_pulls_through_the_proxy`, `BONELI_OCI_TEST_PROXY`), with
 direct outbound 80 and 443 rejected for the runner user, and Squid's
-access log checked for the `CONNECT` and an absolute-form CRL `GET`.
+access log checked for the `CONNECT` and an absolute-form CRL `GET`
+among the lines written after the probes, which use `auth.docker.io` so
+that none of their lines counts for the pull.
 First run on the part 2 branch (run 45683133090): `curl` to Docker Hub
 without the proxy failed to connect, `node:22` pulled through Squid in
 29.6 s on x86_64 and 45.3 s on arm64, Squid's log held 14 `CONNECT

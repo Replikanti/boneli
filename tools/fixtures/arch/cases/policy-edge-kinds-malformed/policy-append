@@ -1,0 +1,8 @@
+[external.leftpad]
+reason = "padding in tests"
+decision = "ARCHITECTURE"
+
+[external.leftpad.pulled-by.boneli-http]
+reason = "pads in tests only"
+decision = "ARCHITECTURE"
+kinds = ["dev", "test"]

@@ -991,13 +991,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   auth-parameter name, an image name with `@` is refused with its
   userinfo shown as `[userinfo]`, and every detail of the registry
   client and the store is passed through `BasicCredentials::redact` and
-  the new `boneli_https::redact` (`REDACT_WINDOW` 16 bytes) over the
-  credentials and every token received. `Registry`'s `Debug` is
+  the new `boneli_https::redact` (`REDACT_WINDOW` 16 bytes, ASCII letters
+  compared case-insensitively, since hosts reach details lowercased)
+  over the credentials and every token received. `Registry`'s `Debug` is
   redacted. `boneli-oci` re-exports `BasicCredentials` and `Proxy`.
   Live test `proxy::node_pulls_through_the_proxy` (`BONELI_OCI_TEST_PROXY`)
   through Squid in `oci-acceptance`, with direct outbound 80 and 443
-  rejected. `rustls` becomes a dev-dependency of `boneli-oci` (the
-  local TLS registry of the proxy test); no new crate.
+  rejected; only the Squid log lines the pull wrote are counted.
+  `rustls` becomes a dev-dependency of `boneli-oci` (the local TLS
+  registry of the proxy test); no new crate. The architecture checker
+  accepts `kinds = ["normal" | "dev" | "build"]` on an edge record and
+  then approves the edge for those dependency kinds only (rule
+  `dep-edge`); the `boneli-oci -> rustls` record is dev-only.
 
 ### Changed
 

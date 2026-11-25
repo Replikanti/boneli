@@ -20,9 +20,11 @@
 //! - [`Reference`] parses an image's registry host, repository, digest and
 //!   platform before any request is made.
 //! - [`Client`] fetches manifests and blobs from an allowlisted
-//!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production), with the
-//!   anonymous token flow, checks every byte against its digest, and
-//!   classifies failures as a [`PullError`].
+//!   [`Registry`] through a [`Dial`] ([`TlsDial`] in production, through
+//!   the customer's HTTP proxy when its `TlsConfig` has one), with the
+//!   token flow and the registry's credentials if it has any
+//!   ([`Registry::with_credentials`], ADR-039), checks every byte against
+//!   its digest, and classifies failures as a [`PullError`].
 //!
 //! Part 3 adds the store:
 //!
