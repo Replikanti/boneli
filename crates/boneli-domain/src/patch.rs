@@ -3028,4 +3028,63 @@ mod tests {
         assert!(reached.resolve(&tree, "p/package.json", b"../l0", 1));
         assert_eq!(MAX_STEPS - reached.steps, expected, "a hop went uncharged");
     }
+
+    /// Components that do nothing are charged too: the same chain with
+    /// `l{i} -> .//l{i+1}` charges `.`, the empty component and the name on
+    /// every hop. Skipping the charge for `""` and `.` leaves a target of
+    /// slashes free, and across guards nothing else bounds that walk.
+    #[test]
+    fn protected_walk_charges_empty_and_dot_components() {
+        let mut links = vec![base_link("p/package.json", "../l0")];
+        let mut expected = "p".len() + 1 + "..".len() + 1 + "l0".len() + 1;
+        for i in 0..MAX_HOPS {
+            let next = if i == MAX_HOPS - 1 {
+                String::from("end")
+            } else {
+                format!("l{}", i + 1)
+            };
+            expected += ".".len() + 1 + "".len() + 1 + next.len() + 1;
+            links.push(base_link(&format!("l{i}"), &format!(".//{next}")));
+        }
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(reached.resolve(&tree, "p/package.json", b"../l0", 1));
+        assert_eq!(
+            MAX_STEPS - reached.steps,
+            expected,
+            "a component went uncharged"
+        );
+    }
+
+    /// States are counted when they are made, not when they are taken off
+    /// the stack: 24 aliasing links, each `\u{E0}/../` repeated, fan every
+    /// component out 24 ways, so the cap is reached inside the first
+    /// followed target, long before that target is walked. Counting on pop
+    /// lets the stack grow past the cap and the charge run to the budget.
+    #[test]
+    fn protected_walk_counts_states_when_made() {
+        let target = "\u{E0}/../".repeat(20);
+        let mut links: Vec<BaseLink> = (0..24u32)
+            .map(|k| {
+                let name = char::from_u32(0xE0 + k).expect("a letter");
+                base_link(&String::from(name), &target)
+            })
+            .collect();
+        links.push(base_link(".npmrc", "\u{E0}"));
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(!reached.resolve(&tree, ".npmrc", "\u{E0}".as_bytes(), 1));
+        let charged = MAX_STEPS - reached.steps;
+        assert!(charged < 1_024, "states counted late: {charged} bytes");
+    }
 }
