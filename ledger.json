@@ -1635,25 +1635,35 @@
     "debugger"
    ],
    "manual": false
+  },
+  {
+   "issue": 129,
+   "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
+   "epic": null,
+   "order": 63,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-25T12:04:53+00:00",
+   "priority": "P3",
+   "size": "?",
+   "deps": [
+    55
+   ],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T08:56:50+00:00",
-   "issue": 104,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #115 open"
-  },
-  {
-   "at": "2026-11-24T09:06:56+00:00",
-   "issue": 105,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #116 open"
-  },
   {
    "at": "2026-11-24T09:24:45+00:00",
    "issue": 104,
@@ -2037,6 +2047,22 @@
    "to": "implementing",
    "by": "3613ba8e",
    "note": null
+  },
+  {
+   "at": "2026-11-25T12:04:53+00:00",
+   "issue": 129,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-25T12:04:53+00:00",
+   "issue": 129,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2064,10 +2090,11 @@
   55,
   69,
   102,
-  128
+  128,
+  129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T12:03:21+00:00",
+ "updated_at": "2026-11-25T12:04:53+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
