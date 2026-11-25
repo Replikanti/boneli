@@ -1641,16 +1641,16 @@
    "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
    "epic": null,
    "order": 63,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "9cc7896e",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-25T20:31:36+00:00",
+   "note": "",
+   "updated_at": "2026-11-25T20:31:42+00:00",
    "priority": "P3",
    "size": "?",
    "deps": [
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T16:57:00+00:00",
-   "issue": 103,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "7ee136eb",
-   "note": null
-  },
   {
    "at": "2026-11-24T17:11:08+00:00",
    "issue": 113,
@@ -2087,6 +2079,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-25T20:31:42+00:00",
+   "issue": 129,
+   "from": "ready",
+   "to": "claimed",
+   "by": "9cc7896e",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2115,7 +2115,7 @@
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T20:31:36+00:00",
+ "updated_at": "2026-11-25T20:31:42+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
