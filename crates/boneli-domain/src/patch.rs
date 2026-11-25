@@ -2869,4 +2869,222 @@ mod tests {
             one(deps(0))
         );
     }
+
+    // The work bound of review round 3 of PR #70 (item 2), counted instead
+    // of timed (#125). The counts are private fields of `Reached`: `steps`
+    // is the byte budget left of `MAX_STEPS`, `places` the arena. A
+    // refactor of either keeps a counter these tests can read.
+
+    /// Links whose walk branches: every name `a{i}` aliases the links
+    /// `a{i}` and `A{i}`, both to `a{i + 1}`, so each level doubles the
+    /// states, down to `end` at depth 13; and the guard
+    /// `p/package.json -> ../a0`.
+    fn branching_links() -> Patch {
+        let mut links = Vec::new();
+        for i in 0..12 {
+            let next = format!("a{}", i + 1);
+            links.push(base_link(&format!("a{i}"), &next));
+            links.push(base_link(&format!("A{i}"), &next));
+        }
+        links.push(base_link("a12", "end"));
+        links.push(base_link("A12", "end"));
+        links.push(base_link("p/package.json", "../a0"));
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        Patch {
+            changes: Vec::new(),
+            base_links: links,
+        }
+    }
+
+    /// A branching walk stops at `MAX_STATES` (ADR-013, D6), long before
+    /// the byte budget. Depth 13 stays under `MAX_HOPS` (40), so only the
+    /// state cap can stop the walk early; without it the walk ends on its
+    /// own with every path marked, and without both caps (the PR #70
+    /// regression) too.
+    #[test]
+    fn protected_walk_state_cap_stops_branching() {
+        let patch = branching_links();
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        let ok = reached.resolve(&tree, "p/package.json", b"../a0", 1);
+        let charged = MAX_STEPS - reached.steps;
+        let places = reached.places.len();
+        assert!(
+            !ok,
+            "the walk did not give up: {charged} bytes, {places} places"
+        );
+        assert!(
+            charged < 4_096,
+            "the byte budget stopped it: {charged} bytes"
+        );
+        assert!(places <= 64, "{places} places");
+    }
+
+    /// The two review shapes of PR #70 give up within the byte budget
+    /// (ADR-013, D6), as the clock-free test in `boneli-replay-check`
+    /// builds them: links `X` and `x` to `x/` repeated, and guards
+    /// `pNN/package.json -> ../x`. 20,000 components make a 40 KB target,
+    /// over `MAX_TARGET`, so the walk gives up before it reads any of it;
+    /// 23 guards over 2,047 components exhaust the budget on the first
+    /// guard, and the other 22 still give up.
+    #[test]
+    fn protected_walk_cost_is_bounded_on_the_review_shapes() {
+        // The review shapes end only through the caps: without one, or
+        // with a budget that followed links do not drain, the second
+        // shape runs for minutes. Both caps are checked on finite walks
+        // first, so such a change fails here by assertion.
+        let finite = branching_links();
+        let tree = LinkTree::after(&finite);
+        assert!(
+            !Reached::new().resolve(&tree, "p/package.json", b"../a0", 1),
+            "the state cap does not stop a branching walk"
+        );
+        let mut drained = Reached::new();
+        drained.steps = 8;
+        assert!(
+            !drained.resolve(&tree, "p/package.json", b"../end/a/b/c", 1),
+            "the byte budget does not stop a straight walk"
+        );
+        // Through a followed link: `p`, `..` and `q` (7 bytes) fit, the
+        // target `end/a/b/c` of `q` (10 bytes) does not.
+        let followed = Patch {
+            changes: Vec::new(),
+            base_links: vec![
+                base_link("p/package.json", "../q"),
+                base_link("q", "end/a/b/c"),
+            ],
+        };
+        let tree = LinkTree::after(&followed);
+        let mut drained = Reached::new();
+        drained.steps = 8;
+        assert!(
+            !drained.resolve(&tree, "p/package.json", b"../q", 1),
+            "the byte budget does not stop a walk through a followed link"
+        );
+        for (k, guards) in [(20_000, 1), (2_047, 1), (2_047, 23)] {
+            let target = "x/".repeat(k);
+            let mut changes = vec![add("X", link(&target)), add("x", link(&target))];
+            for g in 0..guards {
+                changes.push(add(&format!("p{g:02}/package.json"), link("../x")));
+            }
+            changes.sort_by(|a, b| a.path.cmp(&b.path));
+            let patch = Patch {
+                changes,
+                base_links: Vec::new(),
+            };
+            let ctx = Context::new(&patch);
+            let charged = MAX_STEPS - ctx.reached.steps;
+            let places = ctx.reached.places.len();
+            assert!(
+                ctx.everywhere & guard_bit(Guard::Class(ForbiddenClass::Dependencies)) != 0,
+                "{guards} guards over {k}: the walk did not give up"
+            );
+            // The first guard's walk through the followed links `X` and
+            // `x` drains the budget: less than one longest target is left,
+            // with that guard alone as with all 23.
+            if k == 2_047 {
+                assert!(
+                    charged > MAX_STEPS - MAX_TARGET - 1,
+                    "{guards} guards over {k}: the budget was not drained: \
+                     {charged} bytes, {places} places"
+                );
+            }
+            // The over-long target stops the walk where it is met, after
+            // `p00`, `..` and `x` (9 bytes), not after a walk of it.
+            if k == 20_000 {
+                assert!(
+                    charged < 4_096,
+                    "the 40 KB target was walked: {charged} bytes"
+                );
+            }
+        }
+    }
+
+    /// Every followed link is charged, up to the last hop `MAX_HOPS` allows,
+    /// not only the first few: a straight chain `p/package.json -> ../l0`,
+    /// `l{i} -> l{i+1}`, `l39 -> end` takes hops 1 to 40 (`MAX_HOPS`)
+    /// without branching, so the charge is exact. A budget that stops charging at some hop lets
+    /// the review shapes run on to the state cap and fails here at once.
+    #[test]
+    fn protected_walk_charges_every_hop() {
+        let mut links = vec![base_link("p/package.json", "../l0")];
+        let mut expected = "p".len() + 1 + "..".len() + 1 + "l0".len() + 1;
+        for i in 0..MAX_HOPS {
+            let next = if i == MAX_HOPS - 1 {
+                String::from("end")
+            } else {
+                format!("l{}", i + 1)
+            };
+            expected += next.len() + 1;
+            links.push(base_link(&format!("l{i}"), &next));
+        }
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(reached.resolve(&tree, "p/package.json", b"../l0", 1));
+        assert_eq!(MAX_STEPS - reached.steps, expected, "a hop went uncharged");
+    }
+
+    /// Components that do nothing are charged too: the same chain with
+    /// `l{i} -> .//l{i+1}` charges `.`, the empty component and the name on
+    /// every hop. Skipping the charge for `""` and `.` leaves a target of
+    /// slashes free, and across guards nothing else bounds that walk.
+    #[test]
+    fn protected_walk_charges_empty_and_dot_components() {
+        let mut links = vec![base_link("p/package.json", "../l0")];
+        let mut expected = "p".len() + 1 + "..".len() + 1 + "l0".len() + 1;
+        for i in 0..MAX_HOPS {
+            let next = if i == MAX_HOPS - 1 {
+                String::from("end")
+            } else {
+                format!("l{}", i + 1)
+            };
+            expected += ".".len() + 1 + "".len() + 1 + next.len() + 1;
+            links.push(base_link(&format!("l{i}"), &format!(".//{next}")));
+        }
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(reached.resolve(&tree, "p/package.json", b"../l0", 1));
+        assert_eq!(
+            MAX_STEPS - reached.steps,
+            expected,
+            "a component went uncharged"
+        );
+    }
+
+    /// States are counted when they are made, not when they are taken off
+    /// the stack: 24 aliasing links, each `\u{E0}/../` repeated, fan every
+    /// component out 24 ways, so the cap is reached inside the first
+    /// followed target, long before that target is walked. Counting on pop
+    /// lets the stack grow past the cap and the charge run to the budget.
+    #[test]
+    fn protected_walk_counts_states_when_made() {
+        let target = "\u{E0}/../".repeat(20);
+        let mut links: Vec<BaseLink> = (0..24u32)
+            .map(|k| {
+                let name = char::from_u32(0xE0 + k).expect("a letter");
+                base_link(&String::from(name), &target)
+            })
+            .collect();
+        links.push(base_link(".npmrc", "\u{E0}"));
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(!reached.resolve(&tree, ".npmrc", "\u{E0}".as_bytes(), 1));
+        let charged = MAX_STEPS - reached.steps;
+        assert!(charged < 1_024, "states counted late: {charged} bytes");
+    }
 }
