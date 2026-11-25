@@ -8,8 +8,8 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use boneli_domain::{
-    BaseLink, Change, ChangeProblem, Entry, EntryKind, Marker, Patch, PatchLimits, PatchVerdict,
-    PatchViolation, TestDisabling, patch_policy,
+    BaseLink, Change, ChangeProblem, Entry, EntryKind, ForbiddenClass, Marker, Patch, PatchLimits,
+    PatchVerdict, PatchViolation, TestDisabling, patch_policy,
 };
 
 /// A bound on hostile shapes in a debug build. A quadratic algorithm on
@@ -485,6 +485,14 @@ fn line_cost_is_linear_in_bytes() {
 /// protected-link walk branch and grow. Two links with 40 KB targets once
 /// aborted the process at 8 GB; 23 guard links over two legal 4,094-byte
 /// targets took 45 s and 1.35 GB in a release build.
+///
+/// No clock: the bounded work is pinned by counters in the domain's unit
+/// tests (`protected_walk_state_cap_stops_branching`,
+/// `protected_walk_cost_is_bounded_on_the_review_shapes` in
+/// `boneli-domain`'s `patch` module; #125). Here the verdict is pinned:
+/// the walk gives up and protects every path (ADR-013, D6), so every
+/// change, the unrelated link `X` included, is a forbidden dependency
+/// file.
 #[test]
 fn protected_walk_is_bounded() {
     for (k, guards) in [(20_000, 1), (2_047, 23)] {
@@ -505,9 +513,20 @@ fn protected_walk_is_bounded() {
             max_changed_bytes: NonZeroU32::MAX,
             ..PatchLimits::DEFAULT
         };
-        let (verdict, took) = judge_within(changes, Vec::new(), limits);
-        assert!(matches!(verdict, PatchVerdict::Reject(_)), "{verdict:?}");
-        eprintln!("{guards} guards over {k}-component targets: {took:?}");
-        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let count = changes.len();
+        let (verdict, _) = judge_within(changes, Vec::new(), limits);
+        let PatchVerdict::Reject(violations) = &verdict else {
+            panic!("{guards} guards over {k}: {verdict:?}");
+        };
+        for index in 0..count {
+            let deps = PatchViolation::Forbidden {
+                index,
+                class: ForbiddenClass::Dependencies,
+            };
+            assert!(
+                violations.contains(&deps),
+                "{guards} guards over {k}: change {index} not protected: {verdict:?}"
+            );
+        }
     }
 }

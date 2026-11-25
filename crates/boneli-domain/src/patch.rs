@@ -2869,4 +2869,115 @@ mod tests {
             one(deps(0))
         );
     }
+
+    // The work bound of review round 3 of PR #70 (item 2), counted instead
+    // of timed (#125). The counts are private fields of `Reached`: `steps`
+    // is the byte budget left of `MAX_STEPS`, `places` the arena. A
+    // refactor of either keeps a counter these tests can read.
+
+    /// Links whose walk branches: every name `a{i}` aliases the links
+    /// `a{i}` and `A{i}`, both to `a{i + 1}`, so each level doubles the
+    /// states, down to `end` at depth 13; and the guard
+    /// `p/package.json -> ../a0`.
+    fn branching_links() -> Patch {
+        let mut links = Vec::new();
+        for i in 0..12 {
+            let next = format!("a{}", i + 1);
+            links.push(base_link(&format!("a{i}"), &next));
+            links.push(base_link(&format!("A{i}"), &next));
+        }
+        links.push(base_link("a12", "end"));
+        links.push(base_link("A12", "end"));
+        links.push(base_link("p/package.json", "../a0"));
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        Patch {
+            changes: Vec::new(),
+            base_links: links,
+        }
+    }
+
+    /// A branching walk stops at `MAX_STATES` (ADR-013, D6), long before
+    /// the byte budget. Depth 13 stays under `MAX_HOPS` (40), so only the
+    /// state cap can stop the walk early; without it the walk ends on its
+    /// own with every path marked, and without both caps (the PR #70
+    /// regression) too.
+    #[test]
+    fn protected_walk_state_cap_stops_branching() {
+        let patch = branching_links();
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        let ok = reached.resolve(&tree, "p/package.json", b"../a0", 1);
+        let charged = MAX_STEPS - reached.steps;
+        let places = reached.places.len();
+        assert!(
+            !ok,
+            "the walk did not give up: {charged} bytes, {places} places"
+        );
+        assert!(
+            charged < 4_096,
+            "the byte budget stopped it: {charged} bytes"
+        );
+        assert!(places <= 64, "{places} places");
+    }
+
+    /// The two review shapes of PR #70 give up within the byte budget
+    /// (ADR-013, D6), as the clock-free test in `boneli-replay-check`
+    /// builds them: links `X` and `x` to `x/` repeated, and guards
+    /// `pNN/package.json -> ../x`. 20,000 components make a 40 KB target,
+    /// over `MAX_TARGET`, so the walk gives up before it reads any of it;
+    /// 23 guards over 2,047 components exhaust the budget on the first
+    /// guard, and the other 22 still give up.
+    #[test]
+    fn protected_walk_cost_is_bounded_on_the_review_shapes() {
+        // The review shapes end only through the caps: without one, the
+        // second shape runs for minutes. Both caps are checked on finite
+        // walks first, so such a change fails here by assertion.
+        let finite = branching_links();
+        let tree = LinkTree::after(&finite);
+        assert!(
+            !Reached::new().resolve(&tree, "p/package.json", b"../a0", 1),
+            "the state cap does not stop a branching walk"
+        );
+        let mut drained = Reached::new();
+        drained.steps = 8;
+        assert!(
+            !drained.resolve(&tree, "p/package.json", b"../end/a/b/c", 1),
+            "the byte budget does not stop a straight walk"
+        );
+        for (k, guards) in [(20_000, 1), (2_047, 23)] {
+            let target = "x/".repeat(k);
+            let mut changes = vec![add("X", link(&target)), add("x", link(&target))];
+            for g in 0..guards {
+                changes.push(add(&format!("p{g:02}/package.json"), link("../x")));
+            }
+            changes.sort_by(|a, b| a.path.cmp(&b.path));
+            let patch = Patch {
+                changes,
+                base_links: Vec::new(),
+            };
+            let ctx = Context::new(&patch);
+            let charged = MAX_STEPS - ctx.reached.steps;
+            let places = ctx.reached.places.len();
+            assert!(
+                ctx.everywhere & guard_bit(Guard::Class(ForbiddenClass::Dependencies)) != 0,
+                "{guards} guards over {k}: the walk did not give up"
+            );
+            assert!(
+                places <= MAX_STEPS,
+                "{guards} guards over {k}: {places} places"
+            );
+            assert!(
+                charged <= MAX_STEPS,
+                "{guards} guards over {k}: {charged} bytes"
+            );
+            // The over-long target stops the walk where it is met, after
+            // `p00`, `..` and `x` (9 bytes), not after a walk of it.
+            if k == 20_000 {
+                assert!(
+                    charged < 4_096,
+                    "the 40 KB target was walked: {charged} bytes"
+                );
+            }
+        }
+    }
 }
