@@ -18,10 +18,11 @@
 //! refuse. The trace holds one entry per diagonal and step, at most
 //! (D + 1)(D + 2) / 2 for a distance of D.
 //!
-//! The time is pinned by two measures of [`Work`], not by a clock: the
-//! bytes hashed (each line of the middles exactly once) and the probes of
-//! the search (calls of the line comparison, within Myers' O((N + M) D)
-//! bound for D up to the budget).
+//! The time is pinned by three measures of [`Work`], not by a clock: the
+//! bytes hashed (each line of the middles exactly once), the probes of the
+//! search (calls of the line comparison, within Myers' O((N + M) D) bound
+//! for D up to the budget) and the line bytes the comparison reads (none
+//! when traced or when the hashes differ, so a probe costs no bytes).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -67,11 +68,14 @@ fn line_start(s: &[u8], end: usize) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-/// Line `i` of `s`, by its start in `starts`.
-fn line_at<'s>(s: &'s [u8], starts: &[usize], i: usize) -> Option<&'s [u8]> {
-    starts
+/// Line `i` of `s`, by its start in `starts`. Adds the bytes of the line
+/// (the bytes `line_end` scans) to `read`.
+fn line_at<'s>(s: &'s [u8], starts: &[usize], i: usize, read: &Cell<usize>) -> Option<&'s [u8]> {
+    let line = starts
         .get(i)
-        .and_then(|from| s.get(*from..line_end(s, *from)))
+        .and_then(|from| s.get(*from..line_end(s, *from)));
+    read.set(read.get().saturating_add(line.map_or(0, <[u8]>::len)));
+    line
 }
 
 /// The lines of `s`, in order, without collecting them.
@@ -110,6 +114,8 @@ pub(crate) struct Work {
     pub(crate) hashed: Cell<usize>,
     /// The calls of the line comparison in the search.
     pub(crate) probes: usize,
+    /// The line bytes the comparison reads.
+    pub(crate) compared: Cell<usize>,
 }
 
 /// [`cost`], adding its work to `work`.
@@ -174,7 +180,7 @@ pub(crate) fn cost_counted(
         if traced {
             return true;
         }
-        line_at(a, &sa_, x) == line_at(b, &sb_, y)
+        line_at(a, &sa_, x, &work.compared) == line_at(b, &sb_, y, &work.compared)
     };
     let script = myers(
         ha.len(),
@@ -584,6 +590,7 @@ mod tests {
         assert_eq!(work.cells, 0);
         assert_eq!(work.hashed.get(), 0);
         assert_eq!(work.probes, 0);
+        assert_eq!(work.compared.get(), 0);
         // A length difference over the byte budget is cut off before any
         // line is hashed, too.
         let mut work = Work::default();
@@ -596,6 +603,7 @@ mod tests {
         assert_eq!(work.cells, 0);
         assert_eq!(work.hashed.get(), 0);
         assert_eq!(work.probes, 0);
+        assert_eq!(work.compared.get(), 0);
         // Spread edits: the cells follow the distance, not the size.
         let spread: Vec<u8> = (0..2_000_000u32)
             .flat_map(|k| {
@@ -665,6 +673,13 @@ mod tests {
                 a.len() + b.len(),
                 "{lines} lines of {len}: bytes hashed"
             );
+            // No two lines share a hash, so no probe reads a line's bytes,
+            // traced or not.
+            assert_eq!(
+                work.compared.get(),
+                0,
+                "{lines} lines of {len}: bytes compared"
+            );
             let limit = max_lines.min(2 * lines);
             assert!(
                 work.probes <= steps(limit),
@@ -695,6 +710,7 @@ mod tests {
         );
         assert_eq!(work.hashed.get(), left.len() + right.len());
         assert!(work.probes <= steps(6), "{} probes", work.probes);
+        assert_eq!(work.compared.get(), 0);
 
         let mut work = Work::default();
         assert_eq!(
@@ -742,26 +758,49 @@ mod tests {
                 lines.iter().map(String::as_str).collect::<String>()
             };
             let before = base.iter().map(String::as_str).collect::<String>();
-            for (edits, lines) in [(499, Some(998)), (501, None)] {
+            // Budget 1000 is traced; 5000 is above `MAX_TRACED` once the
+            // middles hold more lines (20,000 lines and up), where every
+            // equal hash is checked against the bytes on the spot.
+            for (max_lines, edits, lines) in [
+                (1000, 499, Some(998)),
+                (1000, 501, None),
+                (5000, 499, Some(998)),
+                (5000, 501, Some(1002)),
+            ] {
                 let after = edited(edits);
                 let mut work = Work::default();
                 let got = cost_counted(
                     before.as_bytes(),
                     after.as_bytes(),
-                    1000,
+                    max_lines,
                     usize::MAX,
                     &mut work,
                 );
-                assert_eq!(got.ok().map(|c| c.lines), lines, "{edits} edits on {size}");
+                let what = format!("{edits} edits on {size}, budget {max_lines}");
+                assert_eq!(got.ok().map(|c| c.lines), lines, "{what}");
                 if lines.is_none() {
-                    assert_eq!(got, Err(Over::Lines), "{edits} edits on {size}");
+                    assert_eq!(got, Err(Over::Lines), "{what}");
                 }
-                let bound = 1001 * (2 * size) + steps(1000);
+                let bound = (max_lines + 1) * (2 * size) + steps(max_lines);
                 assert!(
                     work.probes <= bound,
-                    "{edits} edits on {size}: {} probes over {bound}",
+                    "{what}: {} probes over {bound}",
                     work.probes
                 );
+                // Untraced, a probe reads the bytes of two lines only when
+                // their hashes match. Every line of `before` equals at most
+                // one line of `after`, and a pair is matched at most once
+                // (each diagonal's x only grows), so the bytes read stay
+                // within both sides, never once per step.
+                let compared = work.compared.get();
+                if max_lines <= MAX_TRACED {
+                    assert_eq!(compared, 0, "{what}: bytes compared");
+                } else {
+                    assert!(
+                        compared <= before.len() + after.len(),
+                        "{what}: {compared} bytes compared"
+                    );
+                }
             }
         }
     }

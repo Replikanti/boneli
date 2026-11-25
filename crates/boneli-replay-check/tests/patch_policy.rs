@@ -458,10 +458,11 @@ fn policy_never_panics() {
 /// 400 distinct lines of 25 KB per side (10 MB each), all different, take
 /// the full line budget of 800 steps.
 ///
-/// No clock: the bytes hashed and the search probes are pinned by
-/// counters in the domain's unit test `line_cost_hashes_each_line_once`
-/// (`line_diff` module; #128), whose top rung is this case. Here the
-/// verdicts are pinned.
+/// No clock: the bytes hashed, the search probes and the line bytes the
+/// comparison reads are pinned by counters in the domain's unit test
+/// `line_cost_hashes_each_line_once` (`line_diff` module; #128), whose top
+/// rung is this exact input. The counters are crate-private to the domain
+/// (no test hook in its public API), so here the verdicts are pinned.
 #[test]
 fn line_cost_is_linear_in_bytes() {
     let side = |tag: char| -> String {
