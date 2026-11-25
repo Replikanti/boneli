@@ -1641,7 +1641,7 @@
    "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
    "epic": null,
    "order": 63,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "9cc7896e",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1650,7 +1650,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-25T20:59:09+00:00",
+   "updated_at": "2026-11-25T23:04:33+00:00",
    "priority": "P3",
    "size": "?",
    "deps": [
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T17:30:45+00:00",
-   "issue": 103,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "7ee136eb",
-   "note": "PR 1/3 merged (#120); next PR 2 (timestamp/snapshot/targets)"
-  },
   {
    "at": "2026-11-24T18:02:03+00:00",
    "issue": 114,
@@ -2087,6 +2079,14 @@
    "to": "plan-review",
    "by": "9cc7896e",
    "note": null
+  },
+  {
+   "at": "2026-11-25T23:04:33+00:00",
+   "issue": 129,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "9cc7896e",
+   "note": null
   }
  ],
  "open": [
@@ -2115,7 +2115,7 @@
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T20:59:09+00:00",
+ "updated_at": "2026-11-25T23:04:33+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
