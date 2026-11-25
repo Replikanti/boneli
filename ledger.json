@@ -1032,11 +1032,11 @@
    "title": "boneli-oci: private-registry credentials and an HTTP proxy for customer networks",
    "epic": null,
    "order": 39,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "ae67d3e8",
-   "pr": null,
+   "pr": 135,
    "note": "PR 1 (proxy route) implementing",
-   "updated_at": "2026-11-25T17:03:39+00:00",
+   "updated_at": "2026-11-25T17:31:14+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1689,14 +1689,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-24T16:41:02+00:00",
-   "issue": 117,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "ecf725cc",
-   "note": null
-  },
-  {
    "at": "2026-11-24T16:41:28+00:00",
    "issue": 114,
    "from": "plan-review",
@@ -2087,6 +2079,14 @@
    "to": "done",
    "by": "aac94746",
    "note": null
+  },
+  {
+   "at": "2026-11-25T17:31:14+00:00",
+   "issue": 55,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "ae67d3e8",
+   "note": null
   }
  ],
  "open": [
@@ -2116,7 +2116,7 @@
   129
  ],
  "xopen": [],
- "updated_at": "2026-11-25T17:22:09+00:00",
+ "updated_at": "2026-11-25T17:31:14+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2126,7 +2126,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795605847,
+  "at": 1795627874,
   "private": false
  },
  "schema": 2,
