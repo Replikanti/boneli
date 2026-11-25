@@ -1667,7 +1667,7 @@
    "title": "boneli-https: investigate TimedOut in body_one_over_cap_is_too_large under CPU load",
    "epic": null,
    "order": 64,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "aac94746",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1676,7 +1676,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-25T13:16:13+00:00",
+   "updated_at": "2026-11-25T14:04:37+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T16:09:49+00:00",
-   "issue": 103,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "7ee136eb",
-   "note": null
-  },
   {
    "at": "2026-11-24T16:09:59+00:00",
    "issue": 117,
@@ -2087,6 +2079,14 @@
    "to": "implementing",
    "by": "3613ba8e",
    "note": "PR 1 #132 merged (RFC 3161); PR 2 Rekor v2 next"
+  },
+  {
+   "at": "2026-11-25T14:04:37+00:00",
+   "issue": 131,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "aac94746",
+   "note": null
   }
  ],
  "open": [
@@ -2118,7 +2118,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T13:47:35+00:00",
+ "updated_at": "2026-11-25T14:04:37+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
