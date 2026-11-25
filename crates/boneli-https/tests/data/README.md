@@ -114,6 +114,22 @@ ECDSA signatures are randomized, so there is no signature to pin; the
 test checks that `EcdsaP256Key::public_key` equals OpenSSL's public key
 and that every signature verifies under it.
 
+## Ed25519 signing key (`tests/ed25519.rs`, ADR-038)
+
+`Ed25519Key` signs with `test-only-ed25519.key` from the table above (the
+key `EcdsaP256Key` refuses); the other keys there are keys it must refuse.
+
+| File | What |
+| --- | --- |
+| `test-only-ed25519.pub.pem` | the public key of `test-only-ed25519.key` (`PUBLIC KEY`), derived by OpenSSL 3.5 |
+
+```sh
+openssl pkey -in test-only-ed25519.key -pubout -out test-only-ed25519.pub.pem
+```
+
+The test checks that `Ed25519Key::public_key` equals OpenSSL's public key
+and that every signature verifies under it.
+
 ## Hybrid key exchange values (`x25519mlkem768-kat.txt`, ADR-016)
 
 The known-answer values of the X25519MLKEM768 unit tests in `src/pq.rs`,

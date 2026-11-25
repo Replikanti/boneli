@@ -1,6 +1,6 @@
 [package]
 name = "boneli-sigstore"
-description = "Boneli support crate: offline verification of Sigstore image signatures, cosign simple-signing layers and Sigstore bundles v0.3 (DSSE), against keys or a trusted root with Fulcio identities, SCTs and Rekor v1 promises (ADR-029), RFC 3161 timestamps as a time source (ADR-038), SLSA v1 provenance claims (ADR-031), and Fulcio certificate claims of GitHub Actions leaves (ADR-034)."
+description = "Boneli support crate: offline verification of Sigstore image signatures, cosign simple-signing layers and Sigstore bundles v0.3 (DSSE), against keys or a trusted root with Fulcio identities, SCTs and Rekor v1 promises (ADR-029), Rekor v2 entries with their inclusion proofs and checkpoints and RFC 3161 timestamps as a time source (ADR-038), SLSA v1 provenance claims (ADR-031), and Fulcio certificate claims of GitHub Actions leaves (ADR-034)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -173,7 +173,10 @@ provenance claims and refuses it under another source repository
 certificate claims with the statement agreement and refuses it under
 another build trigger (ADR-034), and `provenance_v02_on_ghcr` does the
 same as `provenance_claims_on_ghcr` for flux-cli's SLSA v0.2 provenance
-in a cosign `.att` (ADR-036); CI runs them in the weekly
+in a cosign `.att` (ADR-036), and `signatures_on_rekor_v2` pulls
+bex-cnb-run from GHCR, signed through a Rekor v2 entry with its time from
+an RFC 3161 timestamp, and refuses it under another SAN (ADR-038); CI
+runs them in the weekly
 `oci-acceptance` workflow, not on every PR.
 
 ```sh

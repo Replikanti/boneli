@@ -358,7 +358,8 @@ fixed sentence of `KeyError::TooLarge` stays true for both key types.
     (S5).
   - Rekor v2 and TSA time (#102), `signing_config*.json` targets, mirrors
     and private TUF repositories beyond the pinned initial root, and a
-    refresh inside the runner (#33) are out of scope.
+    refresh inside the runner (#33) are out of scope. ADR-038 closes the
+    Rekor v2 and TSA part (#102).
 
 ## Alternatives considered
 

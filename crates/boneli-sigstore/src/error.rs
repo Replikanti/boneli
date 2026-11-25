@@ -62,15 +62,17 @@ pub enum Refusal {
     NoTrustedKey,
     /// The trust is keyless only and the evidence has no certificate.
     NoCertificate,
-    /// A keyless signature needs exactly one transparency log entry with
-    /// an inclusion promise.
+    /// A keyless signature needs exactly one transparency log entry: a
+    /// Rekor v1 entry with its inclusion promise, or a Rekor v2 entry with
+    /// its inclusion proof (ADR-038, D2).
     TlogEntries,
     /// The integrated time is too large to compare in milliseconds (a
     /// negative one, or one above `i64`, does not parse).
     IntegratedTimeRange,
     /// The entry's log ID is no transparency log of the trusted root.
     UnknownLog,
-    /// The log's key is not valid at the integrated time.
+    /// The log's key is not valid at the integrated time (Rekor v1) or at
+    /// a verified time (Rekor v2).
     LogOutsideWindow,
     /// The inclusion promise (SET) does not verify under the log's key.
     SetInvalid,
@@ -79,6 +81,17 @@ pub enum Refusal {
     /// The entry body does not match the signature, payload or
     /// certificate.
     BodyMismatch,
+    /// The signing certificate's key is of a kind the Rekor v2 entry body
+    /// is not rebuilt for (P-256 only, ADR-038).
+    EntryKeyKind,
+    /// A Rekor v2 inclusion proof does not lead from the entry to the
+    /// checkpoint's root, or names another entry or a position past the
+    /// tree (ADR-038, D7).
+    InclusionProof,
+    /// A Rekor v2 checkpoint is not a signed note of the log's form, is not
+    /// signed exactly once by the log's key under the origin its key ID
+    /// binds, or names another tree than the proof (ADR-038, D6, D7).
+    Checkpoint,
     /// No certificate authority of the trusted root is valid at a
     /// verified time: the integrated time or a timestamp's (ADR-038).
     NoCaAtTime,
@@ -160,16 +173,21 @@ impl fmt::Display for Refusal {
             Refusal::NoTrustedKey => "no trusted key verifies the signature",
             Refusal::NoCertificate => "the signature has no certificate",
             Refusal::TlogEntries => {
-                "a keyless signature needs exactly one log entry with an inclusion promise"
+                "a keyless signature needs exactly one log entry with an inclusion promise or proof"
             }
             Refusal::IntegratedTimeRange => "the integrated time is out of range",
             Refusal::UnknownLog => "the transparency log is not trusted",
             Refusal::LogOutsideWindow => {
-                "the transparency log key is not valid at the integrated time"
+                "the transparency log key is not valid at a verified signing time"
             }
             Refusal::SetInvalid => "the inclusion promise does not verify",
             Refusal::EntryKind => "the transparency log entry is of the wrong kind",
             Refusal::BodyMismatch => "the transparency log entry does not match the signature",
+            Refusal::EntryKeyKind => "the transparency log entry's key kind is not supported",
+            Refusal::InclusionProof => "the inclusion proof does not reach the checkpoint's root",
+            Refusal::Checkpoint => {
+                "the checkpoint is malformed or not signed by the transparency log"
+            }
             Refusal::NoCaAtTime => {
                 "no trusted certificate authority is valid at a verified signing time"
             }

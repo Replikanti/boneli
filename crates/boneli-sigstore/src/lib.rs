@@ -11,10 +11,14 @@
 //! [`Trust`]: keys (ECDSA P-256 and P-384, Ed25519, RSA), or keyless,
 //! against the operator's [`TrustedRoot`] (`trusted_root.json`) and
 //! [`Identity`]s: the Fulcio chain at every verified time, an embedded
-//! SCT, the Rekor v1 inclusion promise (SET) and its entry body, and the
-//! OIDC issuer and SAN (S2). The verified times are Rekor's integrated
-//! time and the genTime of every RFC 3161 timestamp of a bundle that a
-//! timestamp authority of the root verifies (ADR-038).
+//! SCT, one Rekor entry, and the OIDC issuer and SAN (S2). The entry is
+//! Rekor v1's with its inclusion promise (SET) and its body, or, for a
+//! bundle, Rekor v2's `hashedrekord` 0.0.2 with its body rebuilt from the
+//! bundle, its inclusion proof and a checkpoint the log's key signed
+//! (ADR-038). The verified times are Rekor v1's integrated time and the
+//! genTime of every RFC 3161 timestamp of a bundle that a timestamp
+//! authority of the root verifies (ADR-038); a Rekor v2 entry has no
+//! time, so its bundle needs a timestamp.
 //!
 //! A trust may also carry SLSA provenance claims ([`Claims`], ADR-031):
 //! an exact builder ID, a source repository and ref (exact, or a prefix
@@ -44,9 +48,11 @@
 //! strict where its output decides, and every refusal is a fixed reason
 //! ([`Refusal`]) that echoes none of the input.
 //!
-//! Out of scope (ADR-029, ADR-038): Rekor v2 entries (they follow, ADR-038
-//! D2), inclusion proofs and checkpoints, RFC 3161 timestamps on cosign
-//! layers and on keyed signatures, fractional genTimes, TSA revocation,
+//! Out of scope (ADR-029, ADR-038): Rekor v1 inclusion proofs, Rekor v2
+//! `dsse` 0.0.2 entries and v2 entries of leaves other than P-256,
+//! witness cosignatures and consistency proofs, keyless bundles with no
+//! log entry, RFC 3161 timestamps on cosign layers and on keyed
+//! signatures, fractional genTimes, TSA revocation,
 //! `messageSignature` bundles and bundles before v0.3, Notation, Rekor
 //! `intoto` 0.0.2 entries, and `intoto` entries for bundles or `.sig`
 //! layers (ADR-037), SLSA v0.2 build types other than the container
@@ -57,6 +63,7 @@
 mod attestation;
 pub mod base64;
 mod bundle;
+mod checkpoint;
 mod cosign;
 mod dsse;
 mod error;

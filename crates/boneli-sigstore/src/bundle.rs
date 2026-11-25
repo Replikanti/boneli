@@ -12,13 +12,16 @@
 //!   v0.1/v0.2 field, is refused as a version mismatch, so a chain an
 //!   attacker sends along is never even parsed; intermediates come from
 //!   the trusted root only.
-//! - `tlogEntries`: each with `logIndex`, `logId.keyId`, `kindVersion`,
-//!   `integratedTime`, `canonicalizedBody` and, if present,
-//!   `inclusionPromise.signedEntryTimestamp`. A `kindVersion` that does
-//!   not name the body's kind and version is a malformed entry, as
-//!   sigstore-go treats it. `inclusionProof` is not read (out of scope,
-//!   ADR-029). An entry without `integratedTime`, as Rekor v2 writes
-//!   them, is malformed: Rekor v2 entries are not read yet (ADR-038).
+//! - `tlogEntries`: each with `logIndex`, `logId.keyId`, `kindVersion` and
+//!   `canonicalizedBody`. A `kindVersion` that does not name the body's
+//!   kind and version is a malformed entry, as sigstore-go treats it. An
+//!   entry with `inclusionPromise` (Rekor v1) also needs its
+//!   `signedEntryTimestamp` and `integratedTime`, and its `inclusionProof`
+//!   is not read (out of scope, ADR-029). An entry without one (Rekor v2,
+//!   which writes no integrated time) needs `inclusionProof` (ADR-038,
+//!   D7): `logIndex` and `treeSize` as int64 strings, `rootHash` and every
+//!   one of `hashes` of 32 bytes, and `checkpoint.envelope`, a string
+//!   `verify` parses; its `integratedTime` is not read.
 //! - `timestampVerificationData` (ADR-038): absent, `{}`, or
 //!   `rfc3161Timestamps`, at most [`MAX_TIMESTAMPS`] objects with a
 //!   non-empty `signedTimestamp`, kept as DER and parsed only by `verify`.
@@ -31,7 +34,7 @@ use boneli_json::Value;
 
 use crate::dsse::{self, IN_TOTO_PAYLOAD_TYPE};
 use crate::error::Refusal;
-use crate::rekor::TlogEntry;
+use crate::rekor::{InclusionProof, TlogEntry};
 use crate::verify::{Dsse, Evidence, Form};
 use crate::{MAX_BUNDLE_BYTES, MAX_TIMESTAMPS, json};
 
@@ -146,15 +149,43 @@ fn entry(value: &Value) -> Option<TlogEntry> {
     let log_id: [u8; 32] = json::base64(json::object(value, "logId")?, "keyId")?
         .try_into()
         .ok()?;
-    let set = match value.get("inclusionPromise") {
-        None => None,
-        Some(promise) => Some(json::base64(promise, "signedEntryTimestamp")?),
+    let (integrated_time, set, proof) = match value.get("inclusionPromise") {
+        Some(promise) => (
+            Some(json::decimal(value, "integratedTime")?),
+            Some(json::base64(promise, "signedEntryTimestamp")?),
+            None,
+        ),
+        None => (
+            None,
+            None,
+            Some(inclusion_proof(value.get("inclusionProof")?)?),
+        ),
     };
     Some(TlogEntry {
         body,
-        integrated_time: json::decimal(value, "integratedTime")?,
+        integrated_time,
         log_index: json::decimal(value, "logIndex")?,
         log_id,
         set,
+        proof,
+    })
+}
+
+/// An `InclusionProof` with its checkpoint (module doc).
+fn inclusion_proof(value: &Value) -> Option<InclusionProof> {
+    let hash = |v: &Value| -> Option<[u8; 32]> {
+        crate::base64::decode(v.as_str()?.as_bytes())?
+            .try_into()
+            .ok()
+    };
+    Some(InclusionProof {
+        log_index: json::decimal(value, "logIndex")?,
+        tree_size: json::decimal(value, "treeSize")?,
+        root_hash: json::base64(value, "rootHash")?.try_into().ok()?,
+        hashes: json::array(value, "hashes")?
+            .iter()
+            .map(hash)
+            .collect::<Option<Vec<_>>>()?,
+        checkpoint: json::string(json::object(value, "checkpoint")?, "envelope")?.to_owned(),
     })
 }

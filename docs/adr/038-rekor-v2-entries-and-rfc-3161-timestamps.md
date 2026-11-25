@@ -94,8 +94,13 @@ assets and OpenSSL:
    entry is still refused (#102 STOP 1, decision 2): accepting GitHub's
    private-repository bundles would also mean dropping the SCT rule for
    that root, and those images sit in private repositories, which boneli
-   cannot pull before #55 (follow-up #129). Until the second pull request
-   an entry without a SET is `TlogEntries` once a time was found.
+   cannot pull before #55 (follow-up #129). An entry without a SET is
+   read as Rekor v2 (it must carry its inclusion proof, else
+   `MalformedTlogEntry`), and once a time was found it must name a v2 log
+   of the root: the ID of a Rekor v1 log is `TlogEntries` (a v1 entry needs
+   its SET, so a v1 entry stripped of it is not read as a v2 one), any
+   other ID `UnknownLog`. Only a bundle takes a v2 entry; a cosign `.sig`
+   or `.att` layer always carries its SET.
 3. **D3, the token rules** (`boneli_https::TimestampToken`). Strict DER;
    the whole `TimeStampResp` with status 0 or 1 and nothing after it;
    ContentInfo `id-signedData`; eContentType `id-ct-TSTInfo` with the
@@ -171,12 +176,55 @@ assets and OpenSSL:
 6. **D6, the v2 log identity** (second pull request) comes from the
    signed-note key ID, SHA-256(origin ‖ `0x0A` ‖ `0x01` ‖ raw Ed25519
    key), compared with the root's `logId.keyId`; `baseUrl` is not read.
-7. **D7, the v2 entry check** (second pull request): the body rebuilt from
-   the bundle must equal `canonicalizedBody` byte for byte; the RFC 9162
-   inclusion proof from SHA-256(`0x00` ‖ body) must reach the
-   checkpoint's root; the checkpoint must carry exactly one signature of
-   the log key over its body; and the log's window must hold every
-   verified time.
+   The root reader keeps a Rekor log whose `keyId` is not the SHA-256 of
+   its key as a v2 log when the key is Ed25519 (`note_log_count`), and
+   leaves it out otherwise, as before: a signed note of Rekor v2 is signed
+   with Ed25519 only, and `log2025-1` is the one such log in the
+   public-good root. The key ID cannot be checked when the root is read,
+   since the origin is not in the root; it is checked against every
+   checkpoint's origin instead, which binds the origin to the operator's
+   root without trusting `baseUrl` (a look-alike origin, a zero-width
+   space or a trailing space hashes to another key ID). A bundle entry is
+   looked up by its `logId.keyId` among the v2 logs.
+7. **D7, the v2 entry check** (second pull request), after the time and
+   the Fulcio chain at every time (D1), in this order, each with its
+   refusal:
+   - the verified leaf's key is P-256 (`EntryKeyKind`): the rebuilt body
+     names `PKIX_ECDSA_P256_SHA_256`, and 12 of 12 measured leaves are
+     P-256; other kinds would need their own measured body;
+   - the body's `kind` and `apiVersion` are `hashedrekord` and `0.0.2`
+     (`EntryKind`); the bundle reader has already required `kindVersion`
+     to name them;
+   - the body rebuilt from the bundle (sorted keys, compact JSON: the
+     SHA-256 of the DSSE PAE as `data.digest`, the signature as
+     `signature.content`, the leaf as `verifier.x509Certificate.rawBytes`,
+     all base64, so nothing needs escaping) equals `canonicalizedBody` byte
+     for byte (`BodyMismatch`): 3 of 3 real entries do. Why rebuild: the
+     proof then commits to exactly the bytes we derived, so no field the
+     reader skips, no duplicate key and no other serialization can carry
+     something the check did not see;
+   - the proof's `logIndex` equals the entry's and is below `treeSize`
+     (`InclusionProof`): without the bound, a tree of one leaf would
+     verify the empty path at any index;
+   - the checkpoint (`Checkpoint`): a signed note read strictly, its text
+     up to the first blank line, the origin (printable ASCII), the size
+     (canonical decimal up to `i64::MAX`), the root (canonical base64 of
+     32 bytes) and optional extension lines (not empty, no control
+     character, not read), then at least one line `— <name> <base64>` (an
+     em dash, U+2014; base64 of at least the 4-byte hint and one byte);
+     CR anywhere refuses it. The origin hashes with the log key to the
+     root's key ID (D6); exactly one line has the origin as name and the
+     key ID's first 4 bytes as hint, and its signature verifies under the
+     log's Ed25519 key over the text; witness lines are parsed and not
+     verified (D8). Its size and root must be the proof's. Why one line:
+     two lines of the log over one text would be two signatures of which
+     we could check one, so the note is refused rather than read by the
+     line that passes;
+   - the RFC 9162 (section 2.1.3.2) path from SHA-256(`0x00` ‖ body)
+     reaches the root (`InclusionProof`); a hash past the path or a path
+     cut short fails;
+   - the log's window holds every verified time (`LogOutsideWindow`), as
+     the CA window must (D1): a v2 entry has no time of its own.
 8. **D8, what is trusted.** The SET rests on the Rekor v1 key, a v2
    inclusion proof on the v2 log key through the checkpoint, exactly as
    strongly, and a token on the TSA key. Not checked: witness
@@ -245,6 +293,21 @@ assets and OpenSSL:
 - `Accepted::Keyless` changed shape (`integrated_time: Option<u64>`,
   `signed_timestamps`), a breaking change of a public enum whose only
   users are this crate's tests.
+- A keyless bundle logged in Rekor v2 verifies when its leaf and CA hold
+  at every token time, its body rebuilds, its proof reaches a checkpoint
+  of a v2 log of the root and that log's window holds every time:
+  bex-cnb-run and aicr v1.3.0's recipe catalog, both in `log2025-1`,
+  report `integrated_time: None` and one verified token. Without a token
+  it is `NoTimeSource` (#102 AC 4, conformance
+  `rekor2-no-timestamp_fail`).
+- A bundle entry without a promise must now carry its inclusion proof
+  (`MalformedTlogEntry` otherwise), and `Refusal` has the variants
+  `EntryKeyKind`, `InclusionProof` and `Checkpoint`. `TrustedRoot`'s
+  `Debug` names its v2 logs (`note_logs`).
+- `boneli-https` exports `Ed25519Key`, a test signer like `EcdsaP256Key`
+  (ADR-033 S4), so tests sign synthetic checkpoints with the log's
+  scheme; production never signs with it, and `KeyError` has a variant
+  `NotEd25519`.
 - CMS is new parsing on the security boundary (`boneli-https` is on the
   always-review list). Mitigations: strict DER, embedded certificates
   never parsed, a fixed algorithm table, 7 real known answers, a mutant
@@ -256,8 +319,21 @@ assets and OpenSSL:
   (D4). Closure: a measured root with that shape, and a successor ADR
   that reads the leaf from the token's `certificates`.
 
-- Rekor v2 entries are still refused (`MalformedTlogEntry`: they have no
-  `integratedTime`). Closure: the second pull request of #102.
+- Rekor v2 `dsse` 0.0.2 entries are refused (`EntryKind`): all 12 v2
+  DSSE bundles seen are `hashedrekord` 0.0.2, and sigstore-go rebuilds
+  only `hashedrekord`. Closure: a captured `dsse` 0.0.2 entry and a
+  successor ADR that rebuilds its body.
+- A Rekor v2 entry of a leaf other than P-256 is refused (`EntryKeyKind`):
+  12 of 12 measured leaves are P-256. Closure: a captured entry of
+  another key kind, whose `keyDetails` the rebuild then names.
+- Witness cosignatures of a checkpoint are not verified and no
+  consistency proof is checked (D8): the root lists no witness keys, and
+  an offline verifier holds no earlier checkpoint. Closure: a trusted
+  root that lists witness keys, and a successor ADR with a witness
+  threshold.
+- A Rekor v2 log whose key is not Ed25519 is left out of the root (D6).
+  Closure: a root that lists one, and the signed-note signature type it
+  uses.
 - Keyless bundles with no log entry (GitHub's private-repository
   instance) are refused. Closure: #129, after #55.
 - RFC 3161 tokens in cosign `.sig` and `.att` annotations are not read
@@ -328,3 +404,38 @@ The anchor and skip rules are tested by `anchor_validity_at_gen_time`,
 `codesign::tests::anchor_validity_at_time`,
 `unusable_tsa_entry_anchors_no_token` and `root_tsa_and_note_logs`. The
 second part adds its own.
+
+**Result of the second pull request (Rekor v2).** bex-cnb-run and aicr
+v1.3.0's recipe catalog verify against the public-good root with
+`integrated_time: None`, one verified token and log indexes 176091980
+and 202433287 (`real_rekor_v2_bundles_verify`); the body rebuilt from
+each of the three v2 bundles equals its `canonicalizedBody`
+(`builders_round_trip`); bex without its token is `NoTimeSource`
+(`time_source_threshold`). Every edge case of the second part refuses
+with its named refusal (`tests/rekor_v2.rs`: `v2_body_rules`,
+`v2_log_lookup`, `v2_log_window_bounds`, `rekor_v2_needs_a_timestamp`,
+`merkle_paths_all_indices` over every index of every tree from 1 to 17
+leaves, `inclusion_proof_rejections`, `checkpoint_rules`,
+`proof_fields_read_strictly`, `root_note_logs`; `checkpoint::tests`), and
+`boneli-oci`'s fake registry keeps the real bex bundle and verifies it
+again with no request (`kept_rekor_v2_evidence_offline`). 47
+hand-applied mutants in `boneli-sigstore`, 47 killed: the v2 log in the
+root (Ed25519 only, the key ID from the file, the log kept at all), the
+proof reader (required, every hash 32 bytes, strict integers, the
+checkpoint an object, no integrated time read), the log lookup (a v1
+log's ID, an unknown ID), the check itself not called, the window over
+the first time only, each step of `check_v2` (key kind, entry kind, body
+equality, proof index equal and below the size, `>` for `>=`, the
+checkpoint, the path, the window, `all` for `any`, the leaf and node
+prefixes, the rebuilt key details), the RFC 9162 loop (the early stop,
+the final `sn == 0`, `fn == sn`, the inner shift, the hash order), and
+the checkpoint (the key-ID binding and its separator, exactly one log
+line, the name and hint filters, the signature, size, root, the signed
+text, extension lines, the size's digits, leading zero and maximum, the
+final newline, the dash, the shortest line and control characters in a
+name). The first run left two survivors, the loop's early stop and its
+final `sn == 0`: a hash past the path and a path cut short were refused
+only because their root differed. Both now have a case under a root the
+log signed (`inclusion_proof_rejections`), and both mutants are killed.
+The same test pins an entry index that differs from a valid proof's and
+index 1 of a tree of one leaf, which only the index checks refuse.

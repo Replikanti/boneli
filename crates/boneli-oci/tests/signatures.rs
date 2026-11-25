@@ -59,6 +59,12 @@ const JQ_CONFIG: &[u8] = include_bytes!("data/jq.amd64-config.json");
 const JQ_REFERRERS: &[u8] = include_bytes!("data/jq.referrers-tag.json");
 const JQ_REFERRER: &[u8] = include_bytes!("data/jq.referrer.json");
 const JQ_BUNDLE: &[u8] = include_bytes!("data/jq.bundle.json");
+const BEX_INDEX: &[u8] = include_bytes!("data/bex-cnb-run.index.json");
+const BEX_AMD64: &[u8] = include_bytes!("data/bex-cnb-run.amd64.json");
+const BEX_CONFIG: &[u8] = include_bytes!("data/bex-cnb-run.amd64-config.json");
+const BEX_REFERRERS: &[u8] = include_bytes!("data/bex-cnb-run.referrers-tag.json");
+const BEX_REFERRER: &[u8] = include_bytes!("data/bex-cnb-run.referrer.json");
+const BEX_BUNDLE: &[u8] = include_bytes!("data/bex-cnb-run.bundle.json");
 
 const REPO: &str = "library/app";
 const GITHUB_ACTIONS: &str = "https://token.actions.githubusercontent.com";
@@ -4639,4 +4645,125 @@ fn kept_attest_line_checked() {
         assert!(detail.contains(kept), "{case}: {detail}");
         assert!(att_requested(&fake), "{case}");
     }
+}
+
+// ---------------------------------------------------------------------
+// Rekor v2 entries (ADR-038)
+// ---------------------------------------------------------------------
+
+const BEX_REPO: &str = "bex-co/bex-cnb-run";
+const BEX_WORKFLOW: &str =
+    "https://github.com/bex-co/bex/.github/workflows/native-base-image.yml@refs/heads/main";
+
+/// bex-cnb-run's real index, amd64 manifest and config, and GHCR's listing
+/// for the tag `sha256-<index hex>` with its keyless `cosign sign`
+/// referrer, whose bundle is logged in Rekor v2 with one RFC 3161 token
+/// (captured 2026-11-25). No layer blob: a layer request is answered
+/// `404`.
+fn bex_hub() -> Hub {
+    let mut hub = Hub::default();
+    hub.document(BEX_REPO, media::INDEX, BEX_INDEX);
+    hub.document(BEX_REPO, media::MANIFEST, BEX_AMD64);
+    hub.document(BEX_REPO, media::MANIFEST, BEX_REFERRER);
+    hub.blob(BEX_REPO, BEX_CONFIG);
+    hub.blob(BEX_REPO, BEX_BUNDLE);
+    hub.tag(
+        BEX_REPO,
+        &tag_of(&digest_of(BEX_INDEX)),
+        media::INDEX,
+        BEX_REFERRERS,
+    );
+    hub
+}
+
+/// The public-good root with bex's workflow `san` as the one identity.
+fn bex_trust(san: &str) -> Arc<Trust> {
+    let root = Arc::new(TrustedRoot::from_json(TRUSTED_ROOT).expect("root"));
+    let identity = Identity::new(GITHUB_ACTIONS, SanRule::Uri(san.to_owned())).expect("id");
+    Arc::new(
+        Trust::new(
+            Vec::new(),
+            Some((root, vec![identity])),
+            vec![COSIGN_SIGN_PREDICATE.to_owned()],
+        )
+        .expect("trust"),
+    )
+}
+
+/// A Rekor v2 bundle that verified is kept and verified again offline:
+/// the cold pull goes on to the first layer (answered `404`) and keeps
+/// the referrer and the bundle; the second pull asks for neither the
+/// listing, the referrer nor the bundle and reaches the layer again.
+/// Under another SAN a fresh store is refused before any layer request.
+#[test]
+fn kept_rekor_v2_evidence_offline() {
+    let index = digest_of(BEX_INDEX);
+    let referrer = digest_of(BEX_REFERRER);
+    let bundle = digest_of(BEX_BUNDLE);
+    let compact: String = std::str::from_utf8(BEX_AMD64)
+        .expect("utf-8")
+        .split_whitespace()
+        .collect();
+    let first_layer = nth_digest(compact.as_bytes(), 1);
+    let reached = |seen: &[Seen]| {
+        targets(seen)
+            .iter()
+            .any(|t| t.ends_with(&format!("/blobs/{first_layer}")))
+    };
+    let signature_request = |seen: &[Seen]| {
+        targets(seen).into_iter().find(|t| {
+            t.contains(&tag_of(&index))
+                || t.contains("/referrers/")
+                || t.ends_with(&referrer)
+                || t.ends_with(&bundle)
+        })
+    };
+
+    let fake = hub_fake(bex_hub());
+    let tmp = TempDir::new("bex");
+    let root = tmp.path().join("store");
+    let store = open_with(&root, &fake, required(bex_trust(BEX_WORKFLOW)));
+    let detail = match store.pull(&image_ref(BEX_REPO, &index)) {
+        Err(ImageError::Failed { detail }) => detail,
+        other => panic!("{other:?}"),
+    };
+    assert!(!detail.contains("signature policy"), "{detail}");
+    assert!(reached(&fake.seen()), "{:?}", targets(&fake.seen()));
+    assert!(signature_request(&fake.seen()).is_some());
+    let pointer = std::fs::read_to_string(
+        root.join("signatures/sha256")
+            .join(index.trim_start_matches("sha256:")),
+    )
+    .expect("pointer");
+    assert_eq!(pointer, format!("bundle {referrer} {bundle}\n"));
+
+    let before = fake.seen().len();
+    let store = open_with(&root, &fake, required(bex_trust(BEX_WORKFLOW)));
+    let detail = match store.pull(&image_ref(BEX_REPO, &index)) {
+        Err(ImageError::Failed { detail }) => detail,
+        other => panic!("{other:?}"),
+    };
+    assert!(!detail.contains("signature policy"), "{detail}");
+    let warm = &fake.seen()[before..];
+    assert!(reached(warm), "{:?}", targets(warm));
+    assert_eq!(signature_request(warm), None);
+
+    let other = format!("{}other", BEX_WORKFLOW.trim_end_matches("main"));
+    let fake = hub_fake(bex_hub());
+    let tmp = TempDir::new("bex-other");
+    let store = open_with(
+        &tmp.path().join("store"),
+        &fake,
+        required(bex_trust(&other)),
+    );
+    let detail = match store.pull(&image_ref(BEX_REPO, &index)) {
+        Err(ImageError::Failed { detail }) => detail,
+        other => panic!("{other:?}"),
+    };
+    assert!(detail.starts_with("signature policy: "), "{detail}");
+    assert!(
+        detail.contains("the signer is not a trusted identity"),
+        "{detail}"
+    );
+    assert!(!reached(&fake.seen()), "{:?}", targets(&fake.seen()));
 }

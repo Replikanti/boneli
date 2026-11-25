@@ -49,6 +49,12 @@ and `release-cosign.pub` are the files of `crates/boneli-sigstore/tests/data`
 | `kyverno.amd64-config.json` | `0bd890f3…0b6a5bcd` | that manifest's config (1,045 bytes) |
 | `kyverno.att.json` | `81c56313…9f9923a2` | the cosign `.att` manifest of the index: one SLSA v0.2 layer logged as a Rekor `intoto` 0.0.1 entry, the file `kyverno-1.11.0.att.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
 | `kyverno.envelope.json` | `148c49dd…82837513` | its DSSE envelope, the file `kyverno-1.11.0.envelope.json` there |
+| `bex-cnb-run.index.json` | `b02a639b…bf1732df9` | the index of `ghcr.io/bex-co/bex-cnb-run`, an OCI index of 1,611 bytes (ADR-038); the referrers API answers 404 |
+| `bex-cnb-run.amd64.json` | `091e70c5…29fb4321` | its `linux/amd64` manifest (OCI, 3,534 bytes, 17 layers) |
+| `bex-cnb-run.amd64-config.json` | `58e0afde…0a006989` | that manifest's config (16,539 bytes) |
+| `bex-cnb-run.referrers-tag.json` | `e1d4df49…32668f7` | GHCR's answer to the tag `sha256-<index hex>`: five bundle referrers, one of them (`https://sigstore.dev/cosign/sign/v1`) the signature, 2,164 bytes |
+| `bex-cnb-run.referrer.json` | `9d24c9ab…561343c4` | that referrer's manifest, 1,013 bytes |
+| `bex-cnb-run.bundle.json` | `04b2bd8b…da2ba8c7` | its bundle: keyless `cosign sign`, a Rekor v2 `hashedrekord` 0.0.2 entry and one RFC 3161 token, the file `bex-cnb-run.bundle.json` of `crates/boneli-sigstore/tests/data` (same SHA-256) |
 
 From an empty directory, with `jq`:
 
@@ -114,7 +120,24 @@ curl -sSL -H "Authorization: Bearer $tok" -o kyverno.amd64-config.json \
 curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o kyverno.att.json "$gh/manifests/sha256-$kd.att"
 curl -sSL -H "Authorization: Bearer $tok" -o kyverno.envelope.json \
   "$gh/blobs/$(jq -r '.layers[0].digest' kyverno.att.json)"
+gh=https://ghcr.io/v2/bex-co/bex-cnb-run
+tok=$(curl -fsS 'https://ghcr.io/token?scope=repository:bex-co/bex-cnb-run:pull' | jq -r .token)
+bd=b02a639bada113f1b64024c23d5dce1ecb12b67ef4c75b1650999f2bf1732df9
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.index.json "$gh/manifests/sha256:$bd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.amd64.json \
+  "$gh/manifests/$(jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest' bex-cnb-run.index.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o bex-cnb-run.amd64-config.json \
+  "$gh/blobs/$(jq -r .config.digest bex-cnb-run.amd64.json)"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.referrers-tag.json "$gh/manifests/sha256-$bd"
+curl -sS -H "Authorization: Bearer $tok" -H "Accept: $acc" -o bex-cnb-run.referrer.json \
+  "$gh/manifests/$(jq -r '.manifests[] | select(.annotations["dev.sigstore.bundle.predicateType"] == "https://sigstore.dev/cosign/sign/v1") | .digest' bex-cnb-run.referrers-tag.json)"
+curl -sSL -H "Authorization: Bearer $tok" -o bex-cnb-run.bundle.json \
+  "$gh/blobs/$(jq -r '.layers[0].digest' bex-cnb-run.referrer.json)"
 ```
+
+The bex-cnb-run files name a fixed index digest. GHCR lists more
+referrers as bex signs and attests the image again, so a later capture of
+the tag may hold more entries; the files above stay as captured.
 
 ## Test keys
 

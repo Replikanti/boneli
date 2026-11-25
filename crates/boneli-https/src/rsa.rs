@@ -18,8 +18,9 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyError {
     /// The input is longer than [`RsaSha256Key::MAX_PEM_LEN`] (or
-    /// [`EcdsaP256Key::MAX_PEM_LEN`](crate::EcdsaP256Key::MAX_PEM_LEN),
-    /// the same number).
+    /// [`EcdsaP256Key::MAX_PEM_LEN`](crate::EcdsaP256Key::MAX_PEM_LEN) or
+    /// [`Ed25519Key::MAX_PEM_LEN`](crate::Ed25519Key::MAX_PEM_LEN), the
+    /// same number).
     TooLarge,
     /// The input does not hold exactly one PEM section.
     NotOneSection,
@@ -42,6 +43,10 @@ pub enum KeyError {
     /// ring accepts: a SEC1 `EC PRIVATE KEY`, a P-384, RSA or Ed25519 key,
     /// or an encrypted key.
     NotEcdsaP256,
+    /// For [`Ed25519Key`](crate::Ed25519Key): the one section is not an
+    /// unencrypted PKCS#8 `PRIVATE KEY` holding an Ed25519 key that ring
+    /// accepts: an ECDSA or RSA key, or an encrypted key.
+    NotEd25519,
 }
 
 impl fmt::Display for KeyError {
@@ -58,6 +63,9 @@ impl fmt::Display for KeyError {
             KeyError::SignFailed => "the signature failed",
             KeyError::NotEcdsaP256 => {
                 "the PEM section must be an unencrypted PKCS#8 PRIVATE KEY of ECDSA P-256"
+            }
+            KeyError::NotEd25519 => {
+                "the PEM section must be an unencrypted PKCS#8 PRIVATE KEY of Ed25519"
             }
         })
     }

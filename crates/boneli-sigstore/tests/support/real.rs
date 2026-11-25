@@ -378,11 +378,41 @@ pub fn generator_v190_identity() -> Identity {
 /// `ghcr.io/sigstore/scaffolding/trillian_log_server` v0.7.42: Rekor v1
 /// `dsse` 0.0.1 with a SET, and one RFC 3161 token of the public-good TSA.
 pub const TRILLIAN_BUNDLE: &[u8] = include_bytes!("../data/trillian-log-server.bundle.json");
-/// The Rekor v2 bundles (`hashedrekord` 0.0.2, no integrated time, one
-/// token each): read by PR 2 of #102; until then refused at the entry.
+/// The Rekor v2 bundles (`hashedrekord` 0.0.2 in `log2025-1`, no
+/// integrated time, one token each, ADR-038 D6 and D7).
 pub const BEX_BUNDLE: &[u8] = include_bytes!("../data/bex-cnb-run.bundle.json");
 pub const AICR_RECIPE_BUNDLE: &[u8] =
     include_bytes!("../data/aicr-recipe-catalog-1.3.0.sigstore.json");
+/// The third one: its statement is in-toto v0.1, which a bundle may not
+/// carry (ADR-029 S1), so only its entry body is a known answer.
+pub const AICR_SBOM_BUNDLE: &[u8] = include_bytes!("../data/aicr-sbom-1.3.0.sigstore.json");
+
+/// bex-cnb-run's index (the statement's subject), the SAN of its leaf and
+/// its entry's log index.
+pub const BEX_DIGEST: [u8; 32] =
+    hex32("b02a639bada113f1b64024c23d5dce1ecb12b67ef4c75b1650999f2bf1732df9");
+pub const BEX_WORKFLOW: &str =
+    "https://github.com/bex-co/bex/.github/workflows/native-base-image.yml@refs/heads/main";
+pub const BEX_LOG_INDEX: u64 = 176_091_980;
+/// The recipe catalog's subject, the SAN of both aicr leaves and the
+/// catalog entry's log index. Its predicate is SLSA provenance v1.
+pub const AICR_RECIPE_DIGEST: [u8; 32] =
+    hex32("ffb5e1c293e7a6bb48a7a51862317f631eaaeaf39cb39a6c2a1d23946da1b87f");
+pub const AICR_WORKFLOW: &str =
+    "https://github.com/NVIDIA/aicr/.github/workflows/on-tag.yaml@refs/tags/v1.3.0";
+pub const AICR_RECIPE_LOG_INDEX: u64 = 202_433_287;
+
+pub fn bex() -> Evidence {
+    Evidence::from_bundle(BEX_BUNDLE).expect("bex bundle")
+}
+
+pub fn bex_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(BEX_WORKFLOW.to_owned())).expect("identity")
+}
+
+pub fn aicr_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(AICR_WORKFLOW.to_owned())).expect("identity")
+}
 
 /// The image index the trillian bundle signs.
 pub const TRILLIAN_DIGEST: [u8; 32] =

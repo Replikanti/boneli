@@ -1,15 +1,17 @@
 //! `trusted_root.json`, the operator's statement of which Sigstore
-//! instance to trust (ADR-029, S2): the Rekor logs whose promises count,
+//! instance to trust (ADR-029, S2): the Rekor v1 logs whose promises
+//! count, the Rekor v2 logs whose checkpoints count (ADR-038, D6),
 //! the Fulcio certificate authorities that issue signing certificates,
 //! the CT logs whose SCTs count, and the timestamp authorities whose RFC
 //! 3161 tokens count as a time (ADR-038, D4), each with a validity window.
 //!
 //! It is read strictly, because a wrong reading would trust the wrong
 //! key: the media type byte for byte; every log ID recomputed from its key
-//! and compared with the file's `logId.keyId`; `keyDetails` naming the
-//! key's own kind (the algorithm still follows from the key alone,
-//! `boneli_https::PublicKey`); `hashAlgorithm` `SHA2_256`, the only hash
-//! RFC 6962 and Rekor v1 use; no log ID twice across the Rekor and CT
+//! and compared with the file's `logId.keyId` (a Rekor v2 log's from each
+//! checkpoint's origin); `keyDetails` naming the key's own kind (the
+//! algorithm still follows from the key alone, `boneli_https::PublicKey`);
+//! `hashAlgorithm` `SHA2_256`, the only hash RFC 6962 and both Rekor
+//! versions use; no log ID twice across the Rekor and CT
 //! logs; no window that ends before it starts. A field this crate does
 //! not use is not read: `baseUrl`, `uri` and `subject`. A timestamp
 //! authority's chain is read with its leaf first and its anchor last; one
@@ -19,13 +21,16 @@
 //!
 //! A CT log whose `keyId` is not the SHA-256 of its key refuses the file
 //! (RFC 6962 defines the log ID so). A Rekor log whose `keyId` is not is
-//! read and checked like the others, then left out: that is how a Rekor
-//! v2 log names itself (by its signed-note key ID; `log2025-1` in the
-//! public-good root, measured), and a v2 log issues no SET, so it can
-//! vouch for nothing here (Rekor v2 is out of scope, S2); its key still
-//! counts as a duplicate of any other log with the same key. Entries are
-//! looked up by the SHA-256 of the key either way, never by the file's
-//! `keyId`.
+//! read and checked like the others: that is how a Rekor v2 log names
+//! itself, by its signed-note key ID, SHA-256(origin ‖ `\n` ‖ 0x01 ‖ raw
+//! key) (`log2025-1` in the public-good root, measured). With an Ed25519
+//! key it is kept as a v2 log under that key ID, which the checkpoint's
+//! origin must hash to (ADR-038, D6), so `baseUrl` is never needed; with
+//! another key it is left out, since a signed note of Rekor v2 is signed
+//! with Ed25519 only. Its key still counts as a duplicate of any other
+//! log with the same key. Rekor v1 entries are looked up by the SHA-256
+//! of the key, never by the file's `keyId`; v2 entries by the key ID the
+//! checkpoint then proves.
 //!
 //! A key of a kind `PublicKey` does not support refuses the whole file,
 //! as does every other defect: the operator keeps the file that worked
@@ -74,6 +79,16 @@ pub(crate) struct Authority {
     pub(crate) window: Window,
 }
 
+/// A Rekor v2 log (ADR-038, D6): its Ed25519 key, its signed-note key ID
+/// as the root states it, and the window of verified times it vouches
+/// for.
+#[derive(Clone, Debug)]
+pub(crate) struct NoteLog {
+    pub(crate) key: PublicKey,
+    pub(crate) key_id: [u8; 32],
+    pub(crate) window: Window,
+}
+
 /// A timestamp authority (ADR-038, D4): its leaf, the certificates between
 /// the leaf and the anchor, the anchor, and the window of genTimes it
 /// vouches for.
@@ -91,6 +106,7 @@ pub(crate) struct Tsa {
 #[derive(Clone)]
 pub struct TrustedRoot {
     pub(crate) tlogs: Vec<Tlog>,
+    pub(crate) note_logs: Vec<NoteLog>,
     pub(crate) authorities: Vec<Authority>,
     pub(crate) ctlogs: Vec<CtLog>,
     pub(crate) tsas: Vec<Tsa>,
@@ -100,6 +116,7 @@ impl fmt::Debug for TrustedRoot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TrustedRoot")
             .field("tlogs", &self.tlogs.len())
+            .field("note_logs", &self.note_logs.len())
             .field("authorities", &self.authorities.len())
             .field("ctlogs", &self.ctlogs.len())
             .field("tsas", &self.tsas.len())
@@ -124,24 +141,31 @@ impl TrustedRoot {
             return Err(ConfigError::RootMediaType);
         }
         // A Rekor v2 log names itself by its signed-note key ID, not by
-        // the SHA-256 of its key (`log2025-1` in the public-good root), and
-        // never issues a SET: it is read like the others and left out. Its
-        // key still counts for the duplicate check below, so the same key
-        // once kept and once left out is refused like any duplicate.
+        // the SHA-256 of its key (`log2025-1` in the public-good root): it
+        // is read like the others and kept apart when its key is Ed25519,
+        // left out otherwise. Its key still counts for the duplicate check
+        // below, so the same key twice is refused like any duplicate.
         let mut ids = Vec::new();
         let mut tlogs = Vec::new();
+        let mut note_logs = Vec::new();
         for value in list(&root, "tlogs")? {
-            let (key, window, v1) = log(value)?;
+            let (key, window, id) = log(value)?;
             ids.push(key.key_id());
-            if v1 {
+            if id == key.key_id() {
                 tlogs.push(Tlog { key, window });
+            } else if key.kind() == KeyKind::Ed25519 {
+                note_logs.push(NoteLog {
+                    key,
+                    key_id: id,
+                    window,
+                });
             }
         }
         let ctlogs = list(&root, "ctlogs")?
             .iter()
             .map(|v| {
-                let (key, window, v1) = log(v)?;
-                if !v1 {
+                let (key, window, id) = log(v)?;
+                if id != key.key_id() {
                     return Err(ConfigError::RootLogId);
                 }
                 Ok(CtLog {
@@ -169,15 +193,21 @@ impl TrustedRoot {
         }
         Ok(TrustedRoot {
             tlogs,
+            note_logs,
             authorities,
             ctlogs,
             tsas,
         })
     }
 
-    /// How many Rekor v1 logs the root holds (v2 logs are left out).
+    /// How many Rekor v1 logs the root holds (v2 logs are counted apart).
     pub fn tlog_count(&self) -> usize {
         self.tlogs.len()
+    }
+
+    /// How many Rekor v2 logs the root holds (ADR-038, D6).
+    pub fn note_log_count(&self) -> usize {
+        self.note_logs.len()
     }
 
     /// How many Fulcio certificate authorities the root holds.
@@ -205,10 +235,11 @@ fn list<'a>(root: &'a Value, key: &str) -> Result<&'a [Value], ConfigError> {
 }
 
 /// A `TransparencyLogInstance`: the key, checked against `keyDetails`
-/// and `hashAlgorithm`, its window, and whether `logId.keyId` is the
-/// SHA-256 of the key (RFC 6962's log ID, which CT logs and Rekor v1 use).
-/// A `keyId` that is not 32 bytes of base64 refuses the file.
-fn log(value: &Value) -> Result<(PublicKey, Window, bool), ConfigError> {
+/// and `hashAlgorithm`, its window, and `logId.keyId`: the SHA-256 of the
+/// key for CT logs and Rekor v1 (RFC 6962's log ID), the signed-note key
+/// ID for Rekor v2. A `keyId` that is not 32 bytes of base64 refuses the
+/// file.
+fn log(value: &Value) -> Result<(PublicKey, Window, [u8; 32]), ConfigError> {
     if json::string(value, "hashAlgorithm") != Some("SHA2_256") {
         return Err(ConfigError::RootHashAlgorithm);
     }
@@ -224,8 +255,7 @@ fn log(value: &Value) -> Result<(PublicKey, Window, bool), ConfigError> {
     let id: [u8; 32] = json::base64(log_id, "keyId")
         .and_then(|id| id.try_into().ok())
         .ok_or(ConfigError::RootLogId)?;
-    let v1 = id == key.key_id();
-    Ok((key, window, v1))
+    Ok((key, window, id))
 }
 
 /// Whether `keyDetails` (protobuf's `PublicKeyDetails`) names `kind`.

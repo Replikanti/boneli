@@ -695,7 +695,7 @@ fn refusal_texts() {
         (Refusal::NoCertificate, "the signature has no certificate"),
         (
             Refusal::TlogEntries,
-            "a keyless signature needs exactly one log entry with an inclusion promise",
+            "a keyless signature needs exactly one log entry with an inclusion promise or proof",
         ),
         (
             Refusal::IntegratedTimeRange,
@@ -704,7 +704,7 @@ fn refusal_texts() {
         (Refusal::UnknownLog, "the transparency log is not trusted"),
         (
             Refusal::LogOutsideWindow,
-            "the transparency log key is not valid at the integrated time",
+            "the transparency log key is not valid at a verified signing time",
         ),
         (Refusal::SetInvalid, "the inclusion promise does not verify"),
         (

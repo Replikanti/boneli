@@ -101,10 +101,12 @@ signed bytes are also in `crates/boneli-https/tests/data/` (`tsa-*`).
 | --- | --- | --- |
 | `trillian-log-server.bundle.json` | `2ce141d6…d858c2e7` | the one Sigstore bundle v0.3 referrer of `ghcr.io/sigstore/scaffolding/trillian_log_server` (index `sha256:ec7c9ee7…91504f1f`, v0.7.42), listed by the tag `sha256-<index hex>`: referrer manifest `sha256:40bb0550…a3c4e199`, bundle 10,699 bytes, keyless `cosign sign` (`release.yaml@refs/tags/v0.7.42`), predicate `https://sigstore.dev/cosign/sign/v1`, Rekor v1 `dsse` 0.0.1 entry 4047157521 with a SET, integrated time 1795367610, and one RFC 3161 token whose genTime and the leaf's notBefore are that same second |
 | `bex-cnb-run.bundle.json` | `04b2bd8b…da2ba8c7` | the Sigstore bundle referrer `sha256:9d24c9ab…561343c4` of `ghcr.io/bex-co/bex-cnb-run` (index `sha256:b02a639b…bf1732df9`), 9,747 bytes: keyless `cosign sign` (`native-base-image.yml@refs/heads/main`), Rekor v2 `hashedrekord` 0.0.2 entry 176091980 in `log2025-1` with an inclusion proof of 20 hashes and a checkpoint, no integrated time, one token (genTime 1793371569, notBefore + 1) |
-| `aicr-recipe-catalog-1.3.0.sigstore.json` | `1eb27e1b…7c0dfc4a` | the release asset `recipe-catalog.sigstore.json` of `NVIDIA/aicr` v1.3.0, 10,076 bytes: Rekor v2 `hashedrekord` 0.0.2 entry 202433287, one token (genTime 1794873195 = notBefore) |
+| `aicr-recipe-catalog-1.3.0.sigstore.json` | `1eb27e1b…7c0dfc4a` | the release asset `recipe-catalog.sigstore.json` of `NVIDIA/aicr` v1.3.0, 10,076 bytes: Rekor v2 `hashedrekord` 0.0.2 entry 202433287, one token (genTime 1794873195 = notBefore), SLSA provenance v1 over the catalog (subject `sha256:ffb5e1c2…6da1b87f`), SAN `on-tag.yaml@refs/tags/v1.3.0` |
+| `aicr-sbom-1.3.0.sigstore.json` | `67c69e14…f5c97dbf` | the release asset `aicr_1.3.0_linux_amd64.sbom.json.sigstore.json` of the same release, 9,935 bytes: Rekor v2 `hashedrekord` 0.0.2 entry 202434074, one token; its statement is in-toto `Statement/v0.1`, which a bundle may not carry, so only its entry body is a known answer (`builders_round_trip`) |
 
-The two Rekor v2 bundles are read by the second step of ADR-038; until
-then `tests/timestamp.rs` pins that they are refused at their entry.
+`tests/rekor_v2.rs` verifies bex-cnb-run and the recipe catalog against
+the public-good root (ADR-038), and rebuilds the entry body of all three
+v2 bundles byte for byte.
 
 ```sh
 acc='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json'
@@ -123,6 +125,8 @@ blob bex-co/bex-cnb-run \
   bex-cnb-run.bundle.json
 curl -sSL -o aicr-recipe-catalog-1.3.0.sigstore.json \
   https://github.com/NVIDIA/aicr/releases/download/v1.3.0/recipe-catalog.sigstore.json
+curl -sSL -o aicr-sbom-1.3.0.sigstore.json \
+  https://github.com/NVIDIA/aicr/releases/download/v1.3.0/aicr_1.3.0_linux_amd64.sbom.json.sigstore.json
 ```
 
 The trillian bundle names a fixed index digest; `latest` moves on, so a
@@ -167,3 +171,12 @@ self-signed CA with the root's name:
 ```sh
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out test-only-tsa.key
 ```
+
+The synthetic Rekor v2 log (`NoteLog` and `V2Spec` in
+`tests/support/pki.rs`, ADR-038) signs its checkpoints with an Ed25519
+key made at test time from a fixed 32-byte seed, through
+`boneli_https::Ed25519Key`, as `log2025-1` signs with Ed25519. Its
+leaves carry the P-256 key `test-only-tsa.key`, reused (a v2 entry is
+rebuilt for P-256 leaves only, and a token names its TSA by certificate
+hash, not by key); they are issued by the RSA test intermediate as every
+other built leaf. No key file is added for either.
