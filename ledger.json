@@ -1667,16 +1667,16 @@
    "title": "boneli-https: investigate TimedOut in body_one_over_cap_is_too_large under CPU load",
    "epic": null,
    "order": 64,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "aac94746",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-25T13:08:19+00:00",
+   "note": "",
+   "updated_at": "2026-11-25T13:08:26+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:24:58+00:00",
-   "issue": 114,
-   "from": "ready",
-   "to": "claimed",
-   "by": "6cc0788e",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-24T09:24:58+00:00",
    "issue": 113,
@@ -2087,6 +2079,14 @@
    "to": "ready",
    "by": "sync",
    "note": "added"
+  },
+  {
+   "at": "2026-11-25T13:08:26+00:00",
+   "issue": 131,
+   "from": "ready",
+   "to": "claimed",
+   "by": "aac94746",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2118,7 +2118,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T13:08:19+00:00",
+ "updated_at": "2026-11-25T13:08:26+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
