@@ -1441,16 +1441,16 @@
    "title": "boneli-sigstore: accept Rekor v2 entries and RFC 3161 timestamps as the time source",
    "epic": null,
    "order": 55,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "3613ba8e",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 132,
    "note": "",
-   "updated_at": "2026-11-25T12:03:21+00:00",
+   "updated_at": "2026-11-25T13:13:54+00:00",
    "priority": "P3",
    "size": "large",
    "deps": [
@@ -1688,14 +1688,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T09:24:58+00:00",
-   "issue": 113,
-   "from": "ready",
-   "to": "claimed",
-   "by": "1806fc84",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-24T09:38:57+00:00",
    "issue": 113,
@@ -2087,6 +2079,14 @@
    "to": "claimed",
    "by": "aac94746",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-25T13:13:54+00:00",
+   "issue": 102,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "3613ba8e",
+   "note": null
   }
  ],
  "open": [
@@ -2118,7 +2118,7 @@
   131
  ],
  "xopen": [],
- "updated_at": "2026-11-25T13:08:51+00:00",
+ "updated_at": "2026-11-25T13:13:54+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
