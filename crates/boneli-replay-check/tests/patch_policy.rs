@@ -1,7 +1,7 @@
 //! The patch policy on inputs the domain's own tests cannot hold
 //! (ADR-013): the core token scan covers every file of the domain
 //! package, so realistic JavaScript (`async`, `await`, `process.env`) and
-//! the timing tests, which need a clock, live here.
+//! the one timing test, which needs a clock, live here.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -12,8 +12,9 @@ use boneli_domain::{
     PatchVerdict, PatchViolation, TestDisabling, patch_policy,
 };
 
-/// A bound on hostile shapes in a debug build. A quadratic algorithm on
-/// the same input takes hours, so the margin is wide.
+/// A bound on hostile shapes in a debug build, for `link_walk_is_bounded`
+/// only. A quadratic algorithm on the same input takes hours, so the
+/// margin is wide.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 fn entry(kind: EntryKind, data: &[u8]) -> Option<Entry> {
@@ -56,6 +57,10 @@ fn judge_within(
 /// Myers is cut off at the line budget: on a 200,000-line file (distinct
 /// lines) with edits spread evenly, the work is O(N * budget), not the
 /// 4 * 10^10 cells of an LCS table.
+///
+/// No clock: the bounded work is pinned by counters in the domain's unit
+/// test `line_search_is_bounded_by_size_times_budget` (`line_diff`
+/// module; #128). Here the verdicts are pinned.
 #[test]
 fn line_distance_is_linear_in_size_times_budget() {
     const LINES: usize = 200_000;
@@ -82,13 +87,11 @@ fn line_distance_is_linear_in_size_times_budget() {
             PatchVerdict::Reject(vec![PatchViolation::TooManyLines { limit: 1000 }]),
         ),
     ] {
-        let (verdict, took) = judge(
+        let (verdict, _) = judge(
             vec![change("src/big.ts", file(&before), file(&edited(edits)))],
             Vec::new(),
         );
         assert_eq!(verdict, want, "{edits} edits");
-        eprintln!("{edits} edits on {LINES} lines: {took:?}");
-        assert!(took < DEADLINE, "{edits} edits took {took:?}");
     }
 }
 
@@ -96,6 +99,12 @@ fn line_distance_is_linear_in_size_times_budget() {
 /// 4,095-byte targets walk 2,047 components deep along the shared prefix
 /// of 25 base links, and the file is 50,000 directories deep. The walk is
 /// one trie step per component.
+///
+/// This test keeps its clock (#128): it ran in 0.5 to 0.65 s unloaded,
+/// and the worst slowdown seen under background load (41x) leaves it at
+/// about 27 s, over 2x under `DEADLINE`. The walk has no work counter; if
+/// this ever fails under load, the remedy is a counter like #125's, not a
+/// larger bound.
 #[test]
 fn link_walk_is_bounded() {
     let prefix = "a/".repeat(2047);
@@ -448,6 +457,12 @@ fn policy_never_panics() {
 /// so long distinct lines cost their bytes once, not once per search step.
 /// 400 distinct lines of 25 KB per side (10 MB each), all different, take
 /// the full line budget of 800 steps.
+///
+/// No clock: the bytes hashed, the search probes and the line bytes the
+/// comparison reads are pinned by counters in the domain's unit test
+/// `line_cost_hashes_each_line_once` (`line_diff` module; #128), whose top
+/// rung is this exact input. The counters are crate-private to the domain
+/// (no test hook in its public API), so here the verdicts are pinned.
 #[test]
 fn line_cost_is_linear_in_bytes() {
     let side = |tag: char| -> String {
@@ -456,7 +471,7 @@ fn line_cost_is_linear_in_bytes() {
             .collect()
     };
     let (before, after) = (side('a'), side('b'));
-    let (verdict, took) = judge(
+    let (verdict, _) = judge(
         vec![change("data.txt", file(&before), file(&after))],
         Vec::new(),
     );
@@ -464,8 +479,6 @@ fn line_cost_is_linear_in_bytes() {
         verdict,
         PatchVerdict::Reject(vec![PatchViolation::TooManyBytes { limit: 42_000 }])
     );
-    eprintln!("400 + 400 lines of 25 KB: {took:?}");
-    assert!(took < Duration::from_secs(20), "took {took:?}");
     // A length difference above the byte budget refuses before any search.
     let (verdict, _) = judge(
         vec![change(

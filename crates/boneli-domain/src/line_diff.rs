@@ -17,9 +17,16 @@
 //! recovers is verified byte for byte once, so a hash collision can only
 //! refuse. The trace holds one entry per diagonal and step, at most
 //! (D + 1)(D + 2) / 2 for a distance of D.
+//!
+//! The time is pinned by three measures of [`Work`], not by a clock: the
+//! bytes hashed (each line of the middles exactly once), the probes of the
+//! search (calls of the line comparison, within Myers' O((N + M) D) bound
+//! for D up to the budget) and the line bytes the comparison reads (none
+//! when traced or when the hashes differ, so a probe costs no bytes).
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 /// The number of lines of `data`: `""` has none, `"a"`, `"a\n"` and `"\n"`
 /// have one, `"a\nb"` has two.
@@ -61,11 +68,14 @@ fn line_start(s: &[u8], end: usize) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-/// Line `i` of `s`, by its start in `starts`.
-fn line_at<'s>(s: &'s [u8], starts: &[usize], i: usize) -> Option<&'s [u8]> {
-    starts
+/// Line `i` of `s`, by its start in `starts`. Adds the bytes of the line
+/// (the bytes `line_end` scans) to `read`.
+fn line_at<'s>(s: &'s [u8], starts: &[usize], i: usize, read: &Cell<usize>) -> Option<&'s [u8]> {
+    let line = starts
         .get(i)
-        .and_then(|from| s.get(*from..line_end(s, *from)))
+        .and_then(|from| s.get(*from..line_end(s, *from)));
+    read.set(read.get().saturating_add(line.map_or(0, <[u8]>::len)));
+    line
 }
 
 /// The lines of `s`, in order, without collecting them.
@@ -74,8 +84,10 @@ fn lines(s: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// FNV-1a, 64 bits. Not collision resistant, and it need not be: equal
-/// hashes are verified byte for byte (traced) or compared directly.
-fn hash(line: &[u8]) -> u64 {
+/// hashes are verified byte for byte (traced) or compared directly. Adds
+/// the bytes of `line` to `hashed`.
+fn hash(line: &[u8], hashed: &Cell<usize>) -> u64 {
+    hashed.set(hashed.get().saturating_add(line.len()));
     line.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
@@ -89,17 +101,30 @@ const MAX_TRACED: usize = 4096;
 
 /// The cost of turning `a` into `b`, or the budget it crosses first.
 pub fn cost(a: &[u8], b: &[u8], max_lines: usize, max_bytes: usize) -> Result<Cost, Over> {
-    cost_counted(a, b, max_lines, max_bytes, &mut 0)
+    cost_counted(a, b, max_lines, max_bytes, &mut Work::default())
 }
 
-/// [`cost`], adding to `cells` every per-line and per-step cell it
-/// allocates, so a test can pin how memory grows.
+/// The work of one [`cost`], counted where it happens, so a test can pin
+/// how memory and time grow without a clock.
+#[derive(Debug, Default)]
+pub(crate) struct Work {
+    /// Every per-line and per-step cell allocated.
+    pub(crate) cells: usize,
+    /// The bytes passed through the line hash.
+    pub(crate) hashed: Cell<usize>,
+    /// The calls of the line comparison in the search.
+    pub(crate) probes: usize,
+    /// The line bytes the comparison reads.
+    pub(crate) compared: Cell<usize>,
+}
+
+/// [`cost`], adding its work to `work`.
 pub(crate) fn cost_counted(
     a: &[u8],
     b: &[u8],
     max_lines: usize,
     max_bytes: usize,
-    cells: &mut usize,
+    work: &mut Work,
 ) -> Result<Cost, Over> {
     if line_count(a).abs_diff(line_count(b)) > max_lines {
         return Err(Over::Lines);
@@ -129,9 +154,9 @@ pub(crate) fn cost_counted(
     let b = b.get(pb..sb).unwrap_or(&[]);
     let limit = max_lines.min(line_count(a).saturating_add(line_count(b)));
     let traced = limit <= MAX_TRACED;
-    let ha: Vec<u64> = lines(a).map(hash).collect();
-    let hb: Vec<u64> = lines(b).map(hash).collect();
-    *cells = cells.saturating_add(ha.len() + hb.len());
+    let ha: Vec<u64> = lines(a).map(|l| hash(l, &work.hashed)).collect();
+    let hb: Vec<u64> = lines(b).map(|l| hash(l, &work.hashed)).collect();
+    work.cells = work.cells.saturating_add(ha.len() + hb.len());
     // Untraced, an equal hash is checked against the bytes on the spot.
     let starts = |s: &[u8]| -> Vec<usize> {
         let mut at = 0;
@@ -155,9 +180,18 @@ pub(crate) fn cost_counted(
         if traced {
             return true;
         }
-        line_at(a, &sa_, x) == line_at(b, &sb_, y)
+        line_at(a, &sa_, x, &work.compared) == line_at(b, &sb_, y, &work.compared)
     };
-    let script = myers(ha.len(), hb.len(), limit, traced, &same, cells).ok_or(Over::Lines)?;
+    let script = myers(
+        ha.len(),
+        hb.len(),
+        limit,
+        traced,
+        &same,
+        &mut work.cells,
+        &mut work.probes,
+    )
+    .ok_or(Over::Lines)?;
     let bytes = if traced {
         verified_bytes(a, b, &script).ok_or(Over::Lines)?
     } else {
@@ -241,6 +275,8 @@ fn start(down: Option<usize>, right: Option<usize>, k: isize, n: usize, m: usize
     }
 }
 
+/// The search, adding its cells to `cells` and every call of `same` to
+/// `probes`.
 fn myers(
     n: usize,
     m: usize,
@@ -248,6 +284,7 @@ fn myers(
     traced: bool,
     same: &dyn Fn(usize, usize) -> bool,
     cells: &mut usize,
+    probes: &mut usize,
 ) -> Option<Script> {
     let width = limit.checked_mul(2)?.checked_add(3)?;
     let offset = isize::try_from(limit.checked_add(1)?).ok()?;
@@ -271,7 +308,11 @@ fn myers(
             let mut found = None;
             if let Some(mut x) = first {
                 let mut y = usize::try_from(isize::try_from(x).ok()?.checked_sub(k)?).ok()?;
-                while x < n && y < m && same(x, y) {
+                while x < n && y < m {
+                    *probes = probes.saturating_add(1);
+                    if !same(x, y) {
+                        break;
+                    }
                     x += 1;
                     y += 1;
                 }
@@ -519,7 +560,7 @@ mod tests {
 
     /// Memory is one hash per line of the middles plus cells sized by the
     /// budget and the distance; a 10 MB addition is cut off by the line
-    /// count before anything is allocated.
+    /// count before anything is allocated or hashed.
     #[test]
     fn memory_is_independent_of_the_file_size() {
         let base: Vec<u8> = (0..2_000_000u32)
@@ -528,9 +569,9 @@ mod tests {
         let mut edited = b"first\n".to_vec();
         edited.extend_from_slice(&base);
         edited.extend_from_slice(b"last\n");
-        let mut cells = 0;
+        let mut work = Work::default();
         assert_eq!(
-            cost_counted(&base, &edited, 1000, 100_000, &mut cells),
+            cost_counted(&base, &edited, 1000, 100_000, &mut work),
             Ok(Cost {
                 lines: 2,
                 bytes: 11
@@ -539,14 +580,30 @@ mod tests {
         // One hash per line of the middles (both whole files here, since
         // the edits sit at both ends), a row sized by the budget
         // (2 * 1000 + 3) and a trace sized by the distance.
-        assert!(cells <= 4_000_002 + 2_010, "{cells} cells");
-        let mut cells = 0;
+        assert!(work.cells <= 4_000_002 + 2_010, "{} cells", work.cells);
+        let mut work = Work::default();
         let added = vec![b'\n'; 10_000_000];
         assert_eq!(
-            cost_counted(b"", &added, 1000, usize::MAX, &mut cells),
+            cost_counted(b"", &added, 1000, usize::MAX, &mut work),
             Err(Over::Lines)
         );
-        assert_eq!(cells, 0);
+        assert_eq!(work.cells, 0);
+        assert_eq!(work.hashed.get(), 0);
+        assert_eq!(work.probes, 0);
+        assert_eq!(work.compared.get(), 0);
+        // A length difference over the byte budget is cut off before any
+        // line is hashed, too.
+        let mut work = Work::default();
+        let mut longer = b"x\n".to_vec();
+        longer.extend_from_slice(&[b'y'; 42_001]);
+        assert_eq!(
+            cost_counted(b"x\n", &longer, 1000, 42_000, &mut work),
+            Err(Over::Bytes)
+        );
+        assert_eq!(work.cells, 0);
+        assert_eq!(work.hashed.get(), 0);
+        assert_eq!(work.probes, 0);
+        assert_eq!(work.compared.get(), 0);
         // Spread edits: the cells follow the distance, not the size.
         let spread: Vec<u8> = (0..2_000_000u32)
             .flat_map(|k| {
@@ -557,10 +614,195 @@ mod tests {
                 }
             })
             .collect();
-        let mut cells = 0;
-        let got = cost_counted(&base, &spread, 1000, usize::MAX, &mut cells).expect("in budget");
+        let mut work = Work::default();
+        let got = cost_counted(&base, &spread, 1000, usize::MAX, &mut work).expect("in budget");
         assert_eq!(got.lines, 40);
-        assert!(cells <= 4_000_000 + 2_003 + 41 * 42, "{cells} cells");
+        assert!(
+            work.cells <= 4_000_000 + 2_003 + 41 * 42,
+            "{} cells",
+            work.cells
+        );
+    }
+
+    /// At most one probe per diagonal and step of a search that never
+    /// follows a snake: `(limit + 1)(limit + 2) / 2`.
+    fn steps(limit: usize) -> usize {
+        (limit + 1) * (limit + 2) / 2
+    }
+
+    /// `lines` distinct lines of `len` + 10 bytes, the tag at byte 0
+    /// (the shape of `line_cost_is_linear_in_bytes` in
+    /// `boneli-replay-check`).
+    fn distinct(tag: char, lines: usize, len: usize) -> String {
+        let pad = "x".repeat(len);
+        (0..lines).map(|k| format!("{tag}{k:08}{pad}\n")).collect()
+    }
+
+    /// Review round 2 of PR #70 (item 2), without a clock (#128): the line
+    /// cost hashes every line of the middles exactly once, so long distinct
+    /// lines cost their bytes once, not once per search step. A ladder of
+    /// growing shapes, smallest first, so a rehash per probe or per step
+    /// fails on the first rung in milliseconds. The top traced rung is the
+    /// 400 + 400 x 25 KB case: 800 x 25,010 = 20,008,000 bytes hashed, at
+    /// most 801 x 802 / 2 = 321,201 probes. The last rung takes a budget
+    /// above `MAX_TRACED`, where the search compares bytes on equal hashes
+    /// (none here), which is not hashing.
+    #[test]
+    fn line_cost_hashes_each_line_once() {
+        for (lines, len, max_lines, max_bytes, want) in [
+            (
+                10,
+                1_000,
+                1000,
+                42_000,
+                Ok(Cost {
+                    lines: 20,
+                    bytes: 20_200,
+                }),
+            ),
+            (40, 1_000, 1000, 42_000, Err(Over::Bytes)),
+            (400, 25_000, 1000, 42_000, Err(Over::Bytes)),
+            (2_500, 0, 5000, 42_000, Err(Over::Bytes)),
+        ] {
+            let (a, b) = (distinct('a', lines, len), distinct('b', lines, len));
+            let mut work = Work::default();
+            let got = cost_counted(a.as_bytes(), b.as_bytes(), max_lines, max_bytes, &mut work);
+            assert_eq!(got, want, "{lines} lines of {len}");
+            assert_eq!(
+                work.hashed.get(),
+                a.len() + b.len(),
+                "{lines} lines of {len}: bytes hashed"
+            );
+            // No two lines share a hash, so no probe reads a line's bytes,
+            // traced or not.
+            assert_eq!(
+                work.compared.get(),
+                0,
+                "{lines} lines of {len}: bytes compared"
+            );
+            let limit = max_lines.min(2 * lines);
+            assert!(
+                work.probes <= steps(limit),
+                "{lines} lines of {len}: {} probes over {}",
+                work.probes,
+                steps(limit)
+            );
+        }
+    }
+
+    /// Common head and tail lines are stripped before hashing: only the
+    /// changed middles are hashed. Identical sides hash and probe nothing;
+    /// an empty side hashes the other side's bytes and probes nothing.
+    #[test]
+    fn line_cost_hashes_only_the_middles() {
+        let head = format!("{}\n", "h".repeat(25_000));
+        let tail = format!("{}\n", "t".repeat(25_000));
+        let (left, right) = ("a1\na2\na3\n", "bb1\nbb2\nbb3\n");
+        let a = format!("{head}{left}{tail}");
+        let b = format!("{head}{right}{tail}");
+        let mut work = Work::default();
+        assert_eq!(
+            cost_counted(a.as_bytes(), b.as_bytes(), 1000, 42_000, &mut work),
+            Ok(Cost {
+                lines: 6,
+                bytes: left.len() + right.len()
+            })
+        );
+        assert_eq!(work.hashed.get(), left.len() + right.len());
+        assert!(work.probes <= steps(6), "{} probes", work.probes);
+        assert_eq!(work.compared.get(), 0);
+
+        let mut work = Work::default();
+        assert_eq!(
+            cost_counted(a.as_bytes(), a.as_bytes(), 1000, 42_000, &mut work),
+            Ok(Cost { lines: 0, bytes: 0 })
+        );
+        assert_eq!(work.hashed.get(), 0);
+        assert_eq!(work.probes, 0);
+
+        let added = "p\nqq\nrrr\n";
+        for (a, b) in [("", added), (added, "")] {
+            let mut work = Work::default();
+            assert_eq!(
+                cost_counted(a.as_bytes(), b.as_bytes(), 1000, 42_000, &mut work),
+                Ok(Cost {
+                    lines: 3,
+                    bytes: added.len()
+                })
+            );
+            assert_eq!(work.hashed.get(), added.len());
+            assert_eq!(work.probes, 0);
+        }
+    }
+
+    /// Myers is cut off at the line budget, without a clock (#128; the
+    /// shape of `line_distance_is_linear_in_size_times_budget` in
+    /// `boneli-replay-check`): distinct lines with edits spread evenly, 499
+    /// edits in budget (998 lines of 1000), 501 over. The probes stay
+    /// within Myers' O((N + M) D) bound, `(limit + 1)(n + m)` matches
+    /// along snakes (each diagonal's x only grows) plus one failing probe
+    /// per diagonal and step. Measured at 200,000 lines: 697,700 probes
+    /// (499 edits) and 700,501 (501 edits) against a bound of 400,901,501;
+    /// at 20,000 lines 518,420 and 520,501. An LCS table would need n x m
+    /// probes: 4 x 10^8 at 20,000 lines against a bound of 4 x 10^7.
+    #[test]
+    fn line_search_is_bounded_by_size_times_budget() {
+        for size in [2_000usize, 20_000, 200_000] {
+            let base: Vec<String> = (0..size).map(|k| format!("line {k}\n")).collect();
+            let edited = |edits: usize| -> String {
+                let step = size / edits;
+                let mut lines = base.clone();
+                for k in 0..edits {
+                    lines[k * step + step / 2] = format!("edited {k}\n");
+                }
+                lines.iter().map(String::as_str).collect::<String>()
+            };
+            let before = base.iter().map(String::as_str).collect::<String>();
+            // Budget 1000 is traced; 5000 is above `MAX_TRACED` once the
+            // middles hold more lines (20,000 lines and up), where every
+            // equal hash is checked against the bytes on the spot.
+            for (max_lines, edits, lines) in [
+                (1000, 499, Some(998)),
+                (1000, 501, None),
+                (5000, 499, Some(998)),
+                (5000, 501, Some(1002)),
+            ] {
+                let after = edited(edits);
+                let mut work = Work::default();
+                let got = cost_counted(
+                    before.as_bytes(),
+                    after.as_bytes(),
+                    max_lines,
+                    usize::MAX,
+                    &mut work,
+                );
+                let what = format!("{edits} edits on {size}, budget {max_lines}");
+                assert_eq!(got.ok().map(|c| c.lines), lines, "{what}");
+                if lines.is_none() {
+                    assert_eq!(got, Err(Over::Lines), "{what}");
+                }
+                let bound = (max_lines + 1) * (2 * size) + steps(max_lines);
+                assert!(
+                    work.probes <= bound,
+                    "{what}: {} probes over {bound}",
+                    work.probes
+                );
+                // Untraced, a probe reads the bytes of two lines only when
+                // their hashes match. Every line of `before` equals at most
+                // one line of `after`, and a pair is matched at most once
+                // (each diagonal's x only grows), so the bytes read stay
+                // within both sides, never once per step.
+                let compared = work.compared.get();
+                if max_lines <= MAX_TRACED {
+                    assert_eq!(compared, 0, "{what}: bytes compared");
+                } else {
+                    assert!(
+                        compared <= before.len() + after.len(),
+                        "{what}: {compared} bytes compared"
+                    );
+                }
+            }
+        }
     }
 
     /// A script that matches two different lines (what a hash collision
