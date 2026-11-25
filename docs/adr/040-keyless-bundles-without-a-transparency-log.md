@@ -346,3 +346,12 @@ test:
   and the reported token count fixed at 1 (`no_log_token_rules`); and
   `no_log: true` left out of `Debug` and `no_log()` always false
   (`no_log_debug`).
+
+**Accepted.** The `oci-acceptance` run dispatched on the pull request's
+branch, https://github.com/Replikanti/boneli/actions/runs/45723922807,
+passed on x86_64 and arm64: the 7 signature and pull tests of
+`network::` (`signatures_on_docker_hub`, `signatures_elsewhere`,
+`provenance_claims_on_ghcr`, `certificate_claims_on_ghcr`,
+`provenance_v02_on_ghcr`, `signatures_on_rekor_v2`,
+`node_and_postgres_run_in_sandbox`), the proxy pull and the TUF refresh,
+so every live keyless chain still verifies under the EKU rule of D4.
