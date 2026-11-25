@@ -2961,7 +2961,7 @@ mod tests {
             !drained.resolve(&tree, "p/package.json", b"../q", 1),
             "the byte budget does not stop a walk through a followed link"
         );
-        for (k, guards) in [(20_000, 1), (2_047, 23)] {
+        for (k, guards) in [(20_000, 1), (2_047, 1), (2_047, 23)] {
             let target = "x/".repeat(k);
             let mut changes = vec![add("X", link(&target)), add("x", link(&target))];
             for g in 0..guards {
@@ -2980,7 +2980,8 @@ mod tests {
                 "{guards} guards over {k}: the walk did not give up"
             );
             // The first guard's walk through the followed links `X` and
-            // `x` drains the budget: less than one longest target is left.
+            // `x` drains the budget: less than one longest target is left,
+            // with that guard alone as with all 23.
             if k == 2_047 {
                 assert!(
                     charged > MAX_STEPS - MAX_TARGET - 1,
@@ -2997,5 +2998,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every followed link is charged, up to the last hop `MAX_HOPS` allows,
+    /// not only the first few: a straight chain `p/package.json -> ../l0`,
+    /// `l{i} -> l{i+1}`, `l39 -> end` takes hops 1 to 40 (`MAX_HOPS`)
+    /// without branching, so the charge is exact. A budget that stops charging at some hop lets
+    /// the review shapes run on to the state cap and fails here at once.
+    #[test]
+    fn protected_walk_charges_every_hop() {
+        let mut links = vec![base_link("p/package.json", "../l0")];
+        let mut expected = "p".len() + 1 + "..".len() + 1 + "l0".len() + 1;
+        for i in 0..MAX_HOPS {
+            let next = if i == MAX_HOPS - 1 {
+                String::from("end")
+            } else {
+                format!("l{}", i + 1)
+            };
+            expected += next.len() + 1;
+            links.push(base_link(&format!("l{i}"), &next));
+        }
+        links.sort_by(|a, b| a.path.cmp(&b.path));
+        let patch = Patch {
+            changes: Vec::new(),
+            base_links: links,
+        };
+        let tree = LinkTree::after(&patch);
+        let mut reached = Reached::new();
+        assert!(reached.resolve(&tree, "p/package.json", b"../l0", 1));
+        assert_eq!(MAX_STEPS - reached.steps, expected, "a hop went uncharged");
     }
 }
