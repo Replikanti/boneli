@@ -491,8 +491,10 @@ fn line_cost_is_linear_in_bytes() {
 /// `protected_walk_cost_is_bounded_on_the_review_shapes` in
 /// `boneli-domain`'s `patch` module; #125). Here the verdict is pinned:
 /// the walk gives up and protects every path (ADR-013, D6), so every
-/// change, the unrelated link `X` included, is a forbidden dependency
-/// file.
+/// change is a forbidden dependency file. The links `X` and `x` do not
+/// show that: every guard's `../x` reaches them (`X` casefolds to `x`),
+/// and every `pNN/package.json` is forbidden by name. Only `src/a.ts`,
+/// which no walk reaches, is protected by the give-up alone.
 #[test]
 fn protected_walk_is_bounded() {
     for (k, guards) in [(20_000, 1), (2_047, 23)] {
@@ -500,6 +502,7 @@ fn protected_walk_is_bounded() {
         let mut changes = vec![
             change("X", None, entry(EntryKind::Symlink, target.as_bytes())),
             change("x", None, entry(EntryKind::Symlink, target.as_bytes())),
+            change("src/a.ts", file("a\n"), file("b\n")),
         ];
         for g in 0..guards {
             changes.push(change(
@@ -509,7 +512,10 @@ fn protected_walk_is_bounded() {
             ));
         }
         changes.sort_by(|a, b| a.path.cmp(&b.path));
+        // 23 guards, two links and `src/a.ts` are 26 changes, one over
+        // the default file limit.
         let limits = PatchLimits {
+            max_changed_files: NonZeroU32::MAX,
             max_changed_bytes: NonZeroU32::MAX,
             ..PatchLimits::DEFAULT
         };

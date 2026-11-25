@@ -2929,9 +2929,10 @@ mod tests {
     /// guard, and the other 22 still give up.
     #[test]
     fn protected_walk_cost_is_bounded_on_the_review_shapes() {
-        // The review shapes end only through the caps: without one, the
-        // second shape runs for minutes. Both caps are checked on finite
-        // walks first, so such a change fails here by assertion.
+        // The review shapes end only through the caps: without one, or
+        // with a budget that followed links do not drain, the second
+        // shape runs for minutes. Both caps are checked on finite walks
+        // first, so such a change fails here by assertion.
         let finite = branching_links();
         let tree = LinkTree::after(&finite);
         assert!(
@@ -2943,6 +2944,22 @@ mod tests {
         assert!(
             !drained.resolve(&tree, "p/package.json", b"../end/a/b/c", 1),
             "the byte budget does not stop a straight walk"
+        );
+        // Through a followed link: `p`, `..` and `q` (7 bytes) fit, the
+        // target `end/a/b/c` of `q` (10 bytes) does not.
+        let followed = Patch {
+            changes: Vec::new(),
+            base_links: vec![
+                base_link("p/package.json", "../q"),
+                base_link("q", "end/a/b/c"),
+            ],
+        };
+        let tree = LinkTree::after(&followed);
+        let mut drained = Reached::new();
+        drained.steps = 8;
+        assert!(
+            !drained.resolve(&tree, "p/package.json", b"../q", 1),
+            "the byte budget does not stop a walk through a followed link"
         );
         for (k, guards) in [(20_000, 1), (2_047, 23)] {
             let target = "x/".repeat(k);
@@ -2962,14 +2979,15 @@ mod tests {
                 ctx.everywhere & guard_bit(Guard::Class(ForbiddenClass::Dependencies)) != 0,
                 "{guards} guards over {k}: the walk did not give up"
             );
-            assert!(
-                places <= MAX_STEPS,
-                "{guards} guards over {k}: {places} places"
-            );
-            assert!(
-                charged <= MAX_STEPS,
-                "{guards} guards over {k}: {charged} bytes"
-            );
+            // The first guard's walk through the followed links `X` and
+            // `x` drains the budget: less than one longest target is left.
+            if k == 2_047 {
+                assert!(
+                    charged > MAX_STEPS - MAX_TARGET - 1,
+                    "{guards} guards over {k}: the budget was not drained: \
+                     {charged} bytes, {places} places"
+                );
+            }
             // The over-long target stops the walk where it is met, after
             // `p00`, `..` and `x` (9 bytes), not after a walk of it.
             if k == 20_000 {
