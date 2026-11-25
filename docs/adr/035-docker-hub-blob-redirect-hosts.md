@@ -162,8 +162,8 @@ connects, and that matters on its own:
   made 4,905. Fewer would risk a clean
   sample that proves nothing; more costs only runner time, which is free
   for a public repository. The clean runs refute the independence
-  assumption itself (Context, Reading), which is the finding: the rate is
-  not steady.
+  assumption itself (Context, Reading), which is the finding: the rate at
+  the first hop is not steady, and a later hop was not measured.
 - **Docker Hub's anonymous limit.** 100 manifest requests per hour per
   address (ADR-029). The measurement makes at most 66 per job (22 indexes,
   44 manifests); blob requests do not count. Each job runs on its own
