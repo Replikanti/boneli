@@ -30,6 +30,16 @@
 //!   certificate's key verifying the signature; exactly one SAN; the OIDC
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
 //!   and different is refused); and an identity matching issuer and SAN.
+//! - **Keyless without a log (ADR-040):** under a trust with the no-log
+//!   opt-in ([`Trust::with_no_log`], only for a root that lists no log), a
+//!   bundle must carry **no** log entry, its times are the verified
+//!   RFC 3161 tokens alone (at least one), the chain is checked at every
+//!   one, and the SCT list is not read; signature, SAN, issuer and
+//!   identity are checked as above. A keyless cosign layer is
+//!   `NoTimeSource` before its entry is read: its tokens are not read
+//!   (ADR-038) and the root has no log whose SET could time it. The result
+//!   is [`Accepted::KeylessWithoutLog`], so a caller can tell that no
+//!   transparency backs it.
 //!
 //! - **Certificate claims (ADR-034):** under a trust with
 //!   [`CertificateClaims`], the keyless leaf that passed must also meet
@@ -62,7 +72,7 @@ use boneli_https::{CertError, CodeSigningCert, PublicKey, verify_code_signing};
 use crate::dsse::Statement;
 use crate::error::{ConfigError, Refusal};
 use crate::fulcio::{self, CertificateClaims, Facts, GITHUB_ACTIONS_ISSUER, utf8_string};
-use crate::identity::{Identity, printable};
+use crate::identity::{Identity, SanRule, names_owner, printable};
 use crate::provenance::{self, Claims};
 use crate::rekor::{self, Expected, TlogEntry};
 use crate::root::TrustedRoot;
@@ -169,10 +179,12 @@ impl Evidence {
 /// What a rule trusts: keys, a keyless part (a trusted root and the
 /// identities it may vouch for), the predicate types a bundle's statement
 /// may have, and optionally the SLSA provenance claims (ADR-031) and the
-/// Fulcio certificate claims (ADR-034) it must meet.
+/// Fulcio certificate claims (ADR-034) it must meet, and whether its
+/// keyless bundles are accepted without a transparency log (ADR-040).
 ///
-/// `Debug` shows the counts only, `claims: true` when claims are set and
-/// `certificate_claims: true` when certificate claims are.
+/// `Debug` shows the counts only, `claims: true` when claims are set,
+/// `certificate_claims: true` when certificate claims are and
+/// `no_log: true` under the no-log opt-in.
 #[derive(Clone)]
 pub struct Trust {
     keys: Vec<PublicKey>,
@@ -180,6 +192,7 @@ pub struct Trust {
     predicate_types: Vec<String>,
     claims: Option<Claims>,
     certificate_claims: Option<CertificateClaims>,
+    no_log: bool,
 }
 
 impl fmt::Debug for Trust {
@@ -197,6 +210,9 @@ impl fmt::Debug for Trust {
         }
         if self.certificate_claims.is_some() {
             out.field("certificate_claims", &true);
+        }
+        if self.no_log {
+            out.field("no_log", &true);
         }
         out.finish()
     }
@@ -226,6 +242,7 @@ impl Trust {
             predicate_types,
             claims: None,
             certificate_claims: None,
+            no_log: false,
         })
     }
 
@@ -307,6 +324,48 @@ impl Trust {
     pub fn certificate_claims(&self) -> Option<&CertificateClaims> {
         self.certificate_claims.as_ref()
     }
+
+    /// This trust with the no-log opt-in (ADR-040, D1): its keyless
+    /// bundles then verify with no transparency log entry and no SCT,
+    /// timed by their RFC 3161 tokens alone (module doc), and only so.
+    /// Refused for a trust without a keyless part, for a root that lists
+    /// any Rekor log (v1, v2 or one the reader leaves out) or CT log, so
+    /// the opt-in never weakens a logged instance, for a root with no
+    /// usable timestamp authority, and unless every identity's SAN rule
+    /// names an owner at least: an exact email or URI, or a URI prefix of
+    /// `<scheme>://<host>/<owner>/` or longer. A no-log root such as
+    /// GitHub's is shared by every private repository on the host, so a
+    /// host-wide prefix would accept anyone's workflow. Keys stay allowed
+    /// and keyed signatures are unaffected; it composes with
+    /// [`Trust::with_claims`] and [`Trust::with_certificate_claims`] in
+    /// either order.
+    pub fn with_no_log(self) -> Result<Trust, ConfigError> {
+        let Some((root, identities)) = &self.keyless else {
+            return Err(ConfigError::NoLogWithoutKeyless);
+        };
+        if root.lists_logs() {
+            return Err(ConfigError::NoLogRootHasLogs);
+        }
+        if root.tsa_count() == 0 {
+            return Err(ConfigError::NoLogRootWithoutTsa);
+        }
+        let owned = |id: &Identity| match id.san() {
+            SanRule::Email(_) | SanRule::Uri(_) => true,
+            SanRule::UriPrefix(prefix) => names_owner(prefix),
+        };
+        if !identities.iter().all(owned) {
+            return Err(ConfigError::NoLogIdentityWithoutOwner);
+        }
+        Ok(Trust {
+            no_log: true,
+            ..self
+        })
+    }
+
+    /// Whether the trust carries the no-log opt-in (ADR-040).
+    pub fn no_log(&self) -> bool {
+        self.no_log
+    }
 }
 
 /// How evidence passed.
@@ -327,6 +386,16 @@ pub enum Accepted {
         signed_timestamps: usize,
         /// The entry's log index.
         log_index: u64,
+        /// The index of the first identity that matched.
+        identity: usize,
+    },
+    /// A certificate of the trusted root under the no-log opt-in
+    /// (ADR-040): timed by RFC 3161 timestamps alone, with no log entry
+    /// and no SCT, so no transparency backs it.
+    KeylessWithoutLog {
+        /// How many of the bundle's RFC 3161 timestamps verified (at
+        /// least 1).
+        signed_timestamps: usize,
         /// The index of the first identity that matched.
         identity: usize,
     },
@@ -403,7 +472,11 @@ fn signature(
             Refusal::NoTrustedKey
         });
     };
-    let (accepted, cert) = keyless(evidence, root, identities)?;
+    let (accepted, cert) = if trust.no_log {
+        keyless_without_log(evidence, root, identities)?
+    } else {
+        keyless(evidence, root, identities)?
+    };
     Ok((accepted, Some(cert)))
 }
 
@@ -510,12 +583,7 @@ fn keyless(
         }
         (None, _) => return Err(Refusal::TlogEntries),
     };
-    // The leaf and its CA must be valid at every verified time, so times
-    // that contradict each other refuse; the first time gives the leaf.
-    let cert = chain(certificate, root, first, first.saturating_mul(1_000))?;
-    for &at in &times[1..] {
-        chain(certificate, root, at, at.saturating_mul(1_000))?;
-    }
+    let cert = chain_at_every(certificate, root, first, &times[1..])?;
     // A Rekor v2 entry is checked against the leaf webpki verified.
     if let Some(log) = v2 {
         rekor::check_v2(
@@ -530,17 +598,7 @@ fn keyless(
     }
     cert.verify_embedded_sct(&root.ctlogs)
         .map_err(Refusal::Sct)?;
-    cert.public_key()
-        .verify(evidence.message(), evidence.signature())
-        .map_err(|_| Refusal::SignatureInvalid)?;
-    let [san] = cert.sans() else {
-        return Err(Refusal::SanCount);
-    };
-    let issuer = issuer(&cert)?;
-    let identity = identities
-        .iter()
-        .position(|id| id.matches(issuer, san))
-        .ok_or(Refusal::IdentityMismatch)?;
+    let identity = signer(evidence, &cert, identities)?;
     let accepted = Accepted::Keyless {
         integrated_time: entry.set.as_ref().and(entry.integrated_time),
         signed_timestamps,
@@ -548,6 +606,81 @@ fn keyless(
         identity,
     };
     Ok((accepted, cert))
+}
+
+/// The keyless path under the no-log opt-in (ADR-040, D2, module doc):
+/// a bundle with no log entry, timed by its verified tokens alone; a
+/// keyless cosign layer has no time source here.
+fn keyless_without_log(
+    evidence: &Evidence,
+    root: &TrustedRoot,
+    identities: &[Identity],
+) -> Result<(Accepted, CodeSigningCert), Refusal> {
+    let Form::Bundle(Dsse {
+        certificate: Some(certificate),
+        tlogs,
+        timestamps,
+        ..
+    }) = &evidence.form
+    else {
+        return Err(if evidence.is_keyless() {
+            Refusal::NoTimeSource
+        } else {
+            Refusal::NoCertificate
+        });
+    };
+    if !tlogs.is_empty() {
+        return Err(Refusal::TlogEntries);
+    }
+    let (times, first_failure) = timestamp::verified_times(timestamps, evidence.signature(), root);
+    let Some((&first, rest)) = times.split_first() else {
+        return Err(first_failure.unwrap_or(Refusal::NoTimeSource));
+    };
+    let cert = chain_at_every(certificate, root, first, rest)?;
+    // No CT log to check an SCT against: the list is not read.
+    let identity = signer(evidence, &cert, identities)?;
+    let accepted = Accepted::KeylessWithoutLog {
+        signed_timestamps: times.len(),
+        identity,
+    };
+    Ok((accepted, cert))
+}
+
+/// The certificate verified at `first` and at every one of `rest`: the
+/// leaf and its CA must be valid at every verified time, so times that
+/// contradict each other refuse; the first time gives the leaf.
+fn chain_at_every(
+    certificate: &[u8],
+    root: &TrustedRoot,
+    first: u64,
+    rest: &[u64],
+) -> Result<CodeSigningCert, Refusal> {
+    let cert = chain(certificate, root, first, first.saturating_mul(1_000))?;
+    for &at in rest {
+        chain(certificate, root, at, at.saturating_mul(1_000))?;
+    }
+    Ok(cert)
+}
+
+/// The checks on the verified leaf both keyless paths share: its key
+/// verifies the signature, it holds exactly one SAN, it names one OIDC
+/// issuer, and an identity matches them. Gives that identity's index.
+fn signer(
+    evidence: &Evidence,
+    cert: &CodeSigningCert,
+    identities: &[Identity],
+) -> Result<usize, Refusal> {
+    cert.public_key()
+        .verify(evidence.message(), evidence.signature())
+        .map_err(|_| Refusal::SignatureInvalid)?;
+    let [san] = cert.sans() else {
+        return Err(Refusal::SanCount);
+    };
+    let issuer = issuer(cert)?;
+    identities
+        .iter()
+        .position(|id| id.matches(issuer, san))
+        .ok_or(Refusal::IdentityMismatch)
 }
 
 /// The one log entry a DSSE carrier must have.

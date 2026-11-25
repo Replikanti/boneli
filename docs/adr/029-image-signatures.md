@@ -575,7 +575,9 @@ the digest binds the bytes and mirrors are legitimate.
   - An intermediate without the Code Signing EKU refuses the chain
     (webpki's rule, item 7). Go's verifier treats such an intermediate as
     unrestricted; Sigstore's public-good intermediate carries the EKU, so
-    only a private Fulcio whose intermediate lacks it is refused.
+    only a private Fulcio whose intermediate lacks it is refused. ADR-040
+    (#129) closes it: an intermediate without an EKU is unrestricted, the
+    leaf must still carry one, for GitHub's Fulcio intermediate `l1`.
   - SCTs issued through a precertificate signing certificate (RFC 6962
     3.1's special issuer) are untested. By RFC 6962 3.2 they verify with
     this code, because the log signs the final issuer's key hash and a TBS

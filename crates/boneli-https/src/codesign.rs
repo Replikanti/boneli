@@ -9,9 +9,14 @@
 //! (inclusive at both ends) of the leaf and the intermediates, while the
 //! trust anchor's own validity, which webpki never reads, is checked by
 //! `verify_chain` (ADR-038, D3), the basic constraints (the leaf must not be
-//! a CA), and the EKU, which `KeyUsage::required` demands of the leaf and
-//! of every intermediate on the path, as Sigstore's public-good
-//! intermediate carries it. Intermediates come only from the caller, so a
+//! a CA), and the EKU (ADR-040, D4, amending ADR-029 item 7): the leaf must
+//! carry an EKU extension, checked here, and webpki's
+//! `KeyUsage::required_if_present` demands that it, and every intermediate
+//! on the path that carries an EKU, list the purpose. An intermediate
+//! without an EKU is unrestricted, as in Go's `x509.Verify`, which
+//! sigstore-go and timestamp-authority use: GitHub's Fulcio intermediate
+//! `l1` carries none. `anyExtendedKeyUsage` never stands in for the
+//! purpose. Intermediates come only from the caller, so a
 //! chain an attacker sends along is never read; there is no CRL, because
 //! Fulcio publishes none and its leaves expire in minutes.
 //!
@@ -41,6 +46,8 @@ pub(crate) mod testing;
 
 /// id-kp-codeSigning, 1.3.6.1.5.5.7.3.3.
 const ID_KP_CODE_SIGNING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+/// id-ce-extKeyUsage, 2.5.29.37.
+const EXT_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
 /// id-ce-subjectAltName, 2.5.29.17.
 const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1D, 0x11];
 /// The embedded SCT list of RFC 6962, 3.3: 1.3.6.1.4.1.11129.2.4.2.
@@ -66,8 +73,8 @@ pub enum CertError {
     BadRoot,
     /// No path from the leaf through the given intermediates to a root.
     UnknownIssuer,
-    /// The leaf, or an intermediate on the path, lacks the Code Signing
-    /// EKU.
+    /// The leaf has no EKU or one without the Code Signing purpose, or an
+    /// intermediate on the path has an EKU without it (ADR-040, D4).
     NotCodeSigning,
     /// The leaf is a CA certificate.
     IsCa,
@@ -167,8 +174,8 @@ pub struct CodeSigningCert {
 /// Verifies `leaf` (DER) for code signing at `at_secs` (Unix seconds),
 /// through `intermediates` to one of `roots` (each DER). Only the given
 /// intermediates are path candidates. See the module doc for what webpki
-/// checks; on top, the leaf must be readable by the strict reader and
-/// carry a public key of a [`KeyKind`].
+/// checks; on top, the leaf must be readable by the strict reader, carry
+/// an EKU extension, and carry a public key of a [`KeyKind`].
 pub fn verify_code_signing(
     leaf: &[u8],
     intermediates: &[&[u8]],
@@ -199,10 +206,12 @@ pub fn verify_code_signing(
 }
 
 /// Verifies `leaf` through `intermediates` to one of `roots` at `at_secs`
-/// for the extended key usage `eku`, which webpki demands of the leaf and
-/// of every intermediate on the path (module doc): the one webpki call of
-/// code-signing chains and of timestamp authorities (`timestamp`). Gives
-/// the SubjectPublicKeyInfo of the leaf's issuer on the verified path.
+/// for the extended key usage `eku` (module doc): the leaf must carry an
+/// EKU extension (strict reader), and webpki demands `eku` of it and of
+/// every intermediate on the path that carries an EKU. The one webpki call
+/// of code-signing chains and of timestamp authorities (`timestamp`).
+/// Gives the SubjectPublicKeyInfo of the leaf's issuer on the verified
+/// path.
 ///
 /// webpki checks the validity of the certificates on the path only, never
 /// of the trust anchor (a `TrustAnchor` carries none), so the root that
@@ -218,6 +227,12 @@ pub(crate) fn verify_chain(
     at_secs: u64,
     eku: &'static [u8],
 ) -> Result<Vec<u8>, CertError> {
+    // webpki's `required_if_present` lets a leaf without an EKU pass, so
+    // the leaf's own EKU is required here (ADR-040, D4).
+    let parsed = parse(leaf).map_err(|_| CertError::Malformed)?;
+    if find(&parsed.extensions, EXT_KEY_USAGE).is_none() {
+        return Err(CertError::NotCodeSigning);
+    }
     let validity = roots
         .iter()
         .map(|root| {
@@ -266,7 +281,7 @@ pub(crate) fn verify_chain(
             &anchors,
             &intermediates,
             time,
-            webpki::KeyUsage::required(eku),
+            webpki::KeyUsage::required_if_present(eku),
             None,
             Some(&anchor_valid),
         )
@@ -703,8 +718,9 @@ mod tests {
         );
     }
 
-    /// The intermediates are only those passed in, and webpki demands the
-    /// Code Signing EKU of them too.
+    /// The intermediates are only those passed in. An intermediate
+    /// without an EKU is unrestricted (ADR-040, D4, amending ADR-029 item
+    /// 7): GitHub's Fulcio intermediate `l1` carries none.
     #[test]
     fn intermediates_only_those_passed() {
         let leaf = LeafSpec::email().build();
@@ -722,10 +738,42 @@ mod tests {
         assert!(verify_code_signing(&leaf, &[], &[&intermediate], T).is_ok());
         let mut under_no_eku = LeafSpec::email();
         under_no_eku.issuer = CA_NO_EKU;
-        assert_eq!(
-            verify(&under_no_eku.build(), CA_NO_EKU, T).expect_err("refused"),
-            CertError::NotCodeSigning
-        );
+        assert!(verify(&under_no_eku.build(), CA_NO_EKU, T).is_ok());
+    }
+
+    /// The leaf itself must carry an EKU that lists Code Signing, also
+    /// under an intermediate without one (ADR-040, D4): no EKU, an empty
+    /// one, serverAuth only and anyExtendedKeyUsage alone are refused.
+    #[test]
+    fn leaf_needs_its_eku() {
+        const ANY_EKU: &[u8] = &[0x55, 0x1D, 0x25, 0x00];
+        for issuer in [CA, CA_NO_EKU] {
+            let leaf = |eku_ext: Option<Vec<u8>>| {
+                let mut spec = LeafSpec::email();
+                spec.issuer = issuer;
+                match eku_ext {
+                    Some(e) => spec.extensions[1] = e,
+                    None => {
+                        spec.extensions.remove(1);
+                        spec.sct_position = 3;
+                    }
+                }
+                spec.build()
+            };
+            for (name, eku_ext) in [
+                ("no EKU", None),
+                ("empty EKU", Some(eku(&[]))),
+                ("serverAuth only", Some(eku(&[SERVER_AUTH]))),
+                ("anyExtendedKeyUsage only", Some(eku(&[ANY_EKU]))),
+            ] {
+                assert_eq!(
+                    verify(&leaf(eku_ext), issuer, T).expect_err("refused"),
+                    CertError::NotCodeSigning,
+                    "{name}"
+                );
+            }
+            assert!(verify(&leaf(Some(eku(&[CODE_SIGNING]))), issuer, T).is_ok());
+        }
     }
 
     #[test]

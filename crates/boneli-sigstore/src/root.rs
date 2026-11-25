@@ -110,6 +110,9 @@ pub struct TrustedRoot {
     pub(crate) authorities: Vec<Authority>,
     pub(crate) ctlogs: Vec<CtLog>,
     pub(crate) tsas: Vec<Tsa>,
+    /// Every log the file lists: each `tlogs` entry, kept as Rekor v1 or
+    /// v2 or left out, and each `ctlogs` entry (ADR-040, D1).
+    pub(crate) listed_logs: usize,
 }
 
 impl fmt::Debug for TrustedRoot {
@@ -187,6 +190,9 @@ impl TrustedRoot {
             .flatten()
             .collect::<Vec<_>>();
         ids.extend(ctlogs.iter().map(|l| l.key.key_id()));
+        // One ID per listed log, left-out Rekor logs included: the count
+        // before the duplicate check below.
+        let listed_logs = ids.len();
         ids.sort_unstable();
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(ConfigError::RootDuplicateLogId);
@@ -197,7 +203,15 @@ impl TrustedRoot {
             authorities,
             ctlogs,
             tsas,
+            listed_logs,
         })
+    }
+
+    /// Whether the file lists any Rekor log (v1, v2 or one left out) or
+    /// CT log: a root that does cannot carry the no-log opt-in (ADR-040,
+    /// D1), so the opt-in never weakens a logged instance.
+    pub(crate) fn lists_logs(&self) -> bool {
+        self.listed_logs > 0
     }
 
     /// How many Rekor v1 logs the root holds (v2 logs are counted apart).

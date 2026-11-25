@@ -1,6 +1,6 @@
 [package]
 name = "boneli-https"
-description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, name resolution under each request's deadline, and an HTTP proxy route (ADR-039), for boneli-http, the Dial seam of HTTPS clients, ring's SHA-256, RS256 signatures and random source, signature verification and code-signing chains for image signatures, and RFC 3161 timestamp tokens (ADR-038)."
+description = "Boneli support crate: a TLS client on rustls with the ring provider, hybrid post-quantum key exchange, certificate revocation by CRL and OCSP, of the leaf and its intermediates, name resolution under each request's deadline, and an HTTP proxy route (ADR-039), for boneli-http, the Dial seam of HTTPS clients, ring's SHA-256, RS256 signatures and random source, signature verification and code-signing chains for image signatures, and RFC 3161 timestamp tokens (ADR-038; SHA-384 tokens of P-384 authorities, ADR-040)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -60,6 +60,8 @@ zeroize = { version = "1.9.1", default-features = false }
 # `VerifiedPath::issuer_spki`.
 rustls-webpki = { version = "0.103.17", default-features = false, features = ["alloc"] }
 # SHA-1 for OCSP CertIDs only (`digest::SHA1_FOR_LEGACY_USE_ONLY`): every
-# measured responder answers with a SHA-1 CertID (ADR-020). Already in the
-# graph as rustls' provider; a direct edge, no new crate.
+# measured responder answers with a SHA-1 CertID (ADR-020); SHA-384 for
+# the messageDigest of RFC 3161 tokens of the SHA-384 pair (`digest::SHA384`,
+# GitHub's TSA, ADR-040 D5). Already in the graph as rustls' provider; a
+# direct edge, no new crate.
 ring = { version = "0.17.14", default-features = false }

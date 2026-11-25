@@ -6,7 +6,8 @@ Sigstore's public-good instance uses. Sigstore rotates them, and publishes
 the current file as a target of its TUF repository
 `https://tuf-repo-cdn.sigstore.dev`. `boneli-tuf` keeps the file current
 from that repository (ADR-033). This guide covers the initial root and its
-pin, the trust directory, when to refresh, and what each failure means.
+pin, the trust directory, when to refresh, what each failure means, and
+GitHub's private-repository root, which that refresh does not cover.
 The design and the reasons for every rule are in
 `docs/adr/033-sigstore-trust-root-by-tuf.md`.
 
@@ -122,6 +123,59 @@ stops at `Lock` instead of writing into the new `tuf/`: run the refresh
 again once it has ended. Do not remove the whole trust directory while a
 refresh may run: a refresh that recreates it at that moment can race the
 running one's last write (ADR-033, item 6).
+
+## GitHub's private-repository root
+
+GitHub signs the artifact attestations of private repositories with its
+own Sigstore instance, not with the public-good one. Its trusted root
+lists no Rekor log and no CT log, only Fulcio CAs and timestamp
+authorities, so its bundles carry an RFC 3161 timestamp and no log entry.
+They verify only under a trust with the no-log opt-in (ADR-040,
+`docs/adr/040-keyless-bundles-without-a-transparency-log.md`), which says
+what such a signature proves and what it does not: GitHub alone vouches
+for it, and nobody outside GitHub can see it.
+
+**Capture the root** with a logged-in `gh` and `jq`. `gh attestation
+trusted-root` prints two roots, one per line; GitHub's is the one whose
+first CA is `fulcio.githubapp.com`:
+
+```sh
+gh attestation trusted-root |
+  jq -c 'select(.certificateAuthorities[0].uri == "fulcio.githubapp.com")' \
+  > github-trusted-root.json
+jq '{tlogs: (.tlogs // [] | length), ctlogs: (.ctlogs // [] | length),
+     cas: (.certificateAuthorities | length),
+     tsas: (.timestampAuthorities | length)}' github-trusted-root.json
+```
+
+The second command must show 0 `tlogs` and 0 `ctlogs`; on 2026-11-26 it
+showed 6 CAs and 6 TSAs. Keep the file apart from the public-good
+`trusted_root.json`: each trust names its own root.
+
+**The opt-in.** Until the runner's policy file has a key for it (#32,
+#33), the opt-in is the library call `Trust::with_no_log()` on a trust
+over this root. It is refused when the root lists any log, when the root
+has no timestamp authority, and when an identity's SAN prefix does not
+name at least an owner (`https://github.com/<owner>/`): the root is
+shared by every private repository on GitHub, so a host-wide prefix would
+accept anyone's workflow. A verified signature reports
+`KeylessWithoutLog`.
+
+**Add certificate claims with the repository ID** (`CertificateClaims`
+with `with_repository_id`, the Fulcio extension 1.15, ADR-034). A
+repository name can be renamed or registered again by someone else, and
+with no log nobody would see a signature from the new owner; the numeric
+ID never moves to another repository.
+
+**Refresh it by hand.** The TUF refresh above covers Sigstore's
+public-good repository only, not this root; a TUF refresh of GitHub's
+root is #137. GitHub adds a new CA and TSA every 147 to 232 days (5
+measured gaps, with 12 to 31 days of overlap), so capture the file again
+at least every 147 days, and at once when GitHub bundles start failing
+with `Timestamp(SigningCertificate)`: that is the refusal a stale file
+gives, because its last window has no end and so holds the new time, but
+its TSA leaf did not sign the new token. Replace the file only with a
+capture that passes the check above.
 
 ## Live test
 

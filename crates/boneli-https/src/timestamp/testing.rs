@@ -3,9 +3,13 @@
 //! with the kept test TSA key `test-only-tsa.key` (P-256, through
 //! [`EcdsaP256Key`]), and TSA leaves issued by the code-signing test
 //! intermediate's key (`codesign/testing.rs`), which the tests use as the
-//! anchor, as the public-good TSA chain is a leaf and its anchor.
+//! anchor, as the public-good TSA chain is a leaf and its anchor. A token
+//! of the SHA-384 triple (ADR-040, D5) is signed with the P-384 key
+//! `test-only-p384.key` through rustls' ring signer.
 
 use rustls::SignatureScheme;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::pem::PemObject;
 
 use crate::codesign::testing::{CA, CA_KEY, ECDSA_SHA384, ROOT, pem_der, sign, spki, subject};
 use crate::der::{
@@ -21,6 +25,8 @@ use super::{
 /// The P-256 key of every built TSA leaf, and its public key.
 pub(crate) const TSA_KEY: &[u8] = include_bytes!("../../tests/data/test-only-tsa.key");
 pub(crate) const TSA_PUBLIC: &[u8] = include_bytes!("../../tests/data/test-only-tsa.pub.pem");
+/// The P-384 key of the SHA-384 triple's leaves (`TokenSpec::sha384`).
+pub(crate) const P384_KEY: &[u8] = include_bytes!("../../tests/data/test-only-p384.key");
 
 /// 2026-09-21T14:13:20Z, inside the test CA's validity: the default
 /// genTime.
@@ -104,6 +110,8 @@ pub(crate) struct TsaLeafSpec {
     pub(crate) not_before: u64,
     pub(crate) not_after: u64,
     pub(crate) extensions: Vec<Vec<u8>>,
+    /// The leaf's SubjectPublicKeyInfo, DER.
+    pub(crate) spki: Vec<u8>,
 }
 
 impl TsaLeafSpec {
@@ -115,6 +123,15 @@ impl TsaLeafSpec {
             not_before: LEAF_FROM,
             not_after: LEAF_TO,
             extensions: vec![key_usage(0x80), eku(true, &[ID_KP_TIME_STAMPING])],
+            spki: spki(TSA_PUBLIC),
+        }
+    }
+
+    /// The same leaf with the P-384 public key of `P384_KEY`.
+    pub(crate) fn p384() -> TsaLeafSpec {
+        TsaLeafSpec {
+            spki: p384_spki(),
+            ..TsaLeafSpec::good()
         }
     }
 
@@ -127,7 +144,7 @@ impl TsaLeafSpec {
         validity.extend(der::encode_generalized_time(self.not_after));
         body.extend(der::encode(SEQUENCE, &validity));
         body.extend(name("Boneli test TSA"));
-        body.extend(spki(TSA_PUBLIC));
+        body.extend_from_slice(&self.spki);
         if !self.extensions.is_empty() {
             body.extend(der::encode(
                 0xA3,
@@ -143,6 +160,20 @@ impl TsaLeafSpec {
         cert.extend(der::encode(BIT_STRING, &bits));
         der::encode(SEQUENCE, &cert)
     }
+}
+
+/// The SubjectPublicKeyInfo of `P384_KEY`, from rustls' ring signer.
+pub(crate) fn p384_spki() -> Vec<u8> {
+    let key = PrivateKeyDer::from_pem_slice(P384_KEY).expect("P-384 key PEM");
+    let key = rustls::crypto::ring::sign::any_ecdsa_type(&key).expect("ECDSA key");
+    key.public_key().expect("public key").as_ref().to_vec()
+}
+
+/// The SHA-384 of `data`, ring's.
+pub(crate) fn sha384(data: &[u8]) -> Vec<u8> {
+    ring::digest::digest(&ring::digest::SHA384, data)
+        .as_ref()
+        .to_vec()
 }
 
 /// The anchor of every built TSA leaf: the code-signing test
@@ -252,6 +283,10 @@ pub(crate) struct TokenSpec {
     pub(crate) corrupt: bool,
     /// Bytes after the TimeStampResp.
     pub(crate) trailing: Vec<u8>,
+    /// The SHA-384 triple's hash and key (ADR-040, D5): the default
+    /// messageDigest is the SHA-384 of the TSTInfo, and `P384_KEY` signs
+    /// with ECDSA-SHA384. The algorithm fields are set apart.
+    pub(crate) sha384: bool,
 }
 
 /// The signed attributes of a token.
@@ -285,6 +320,20 @@ impl TokenSpec {
             leaf: TsaLeafSpec::good().build(),
             corrupt: false,
             trailing: Vec::new(),
+            sha384: false,
+        }
+    }
+
+    /// A good token of the SHA-384 triple (ADR-040, D5) over `MESSAGE` at
+    /// `T`: digest SHA-384, `ecdsa-with-SHA384`, a 48-byte messageDigest,
+    /// signed by the P-384 leaf of [`TsaLeafSpec::p384`].
+    pub(crate) fn sha384() -> TokenSpec {
+        TokenSpec {
+            digest_algorithm: algorithm(SHA384, false),
+            signature_algorithm: algorithm(ECDSA_WITH_SHA384, false),
+            leaf: TsaLeafSpec::p384().build(),
+            sha384: true,
+            ..TokenSpec::good()
         }
     }
 
@@ -292,15 +341,18 @@ impl TokenSpec {
         TokenSpec::over(MESSAGE, T)
     }
 
-    /// The default signed attributes for `econtent`.
-    pub(crate) fn default_attributes(econtent: &[u8], leaf: &[u8]) -> Vec<Vec<u8>> {
+    /// The default signed attributes for `econtent`, its messageDigest
+    /// SHA-384 when `sha384`, else SHA-256.
+    pub(crate) fn default_attributes(econtent: &[u8], leaf: &[u8], sha384: bool) -> Vec<Vec<u8>> {
+        let digest = if sha384 {
+            self::sha384(econtent)
+        } else {
+            Sha256::digest(econtent).to_vec()
+        };
         vec![
             attribute(CONTENT_TYPE, &[der::encode(OID, ID_CT_TST_INFO)]),
             attribute(SIGNING_TIME, &[der::encode(0x17, b"260921141320Z")]),
-            attribute(
-                MESSAGE_DIGEST,
-                &[der::encode(OCTET_STRING, &Sha256::digest(econtent))],
-            ),
+            attribute(MESSAGE_DIGEST, &[der::encode(OCTET_STRING, &digest)]),
             signing_certificate_v2(None, &Sha256::digest(leaf)),
         ]
     }
@@ -308,17 +360,23 @@ impl TokenSpec {
     pub(crate) fn build(&self) -> Vec<u8> {
         let econtent = self.tst.build();
         let attributes = match self.attributes {
-            Attributes::Default => Some(Self::default_attributes(&econtent, &self.leaf)),
+            Attributes::Default => {
+                Some(Self::default_attributes(&econtent, &self.leaf, self.sha384))
+            }
             Attributes::Edited(edit) => {
-                let mut list = Self::default_attributes(&econtent, &self.leaf);
+                let mut list = Self::default_attributes(&econtent, &self.leaf, self.sha384);
                 edit(&mut list, &econtent, &self.leaf);
                 Some(list)
             }
             Attributes::Absent => None,
         };
-        let key = EcdsaP256Key::from_pem(&mut TSA_KEY.to_vec()).expect("test TSA key");
         let signed = der::encode(0x31, &attributes.clone().unwrap_or_default().concat());
-        let mut signature = key.sign(&signed).expect("sign");
+        let mut signature = if self.sha384 {
+            sign(P384_KEY, SignatureScheme::ECDSA_NISTP384_SHA384, &signed)
+        } else {
+            let key = EcdsaP256Key::from_pem(&mut TSA_KEY.to_vec()).expect("test TSA key");
+            key.sign(&signed).expect("sign")
+        };
         if self.corrupt {
             let last = signature.len() - 1;
             signature[last] ^= 0x01;

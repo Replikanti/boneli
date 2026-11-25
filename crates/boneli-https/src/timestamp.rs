@@ -5,9 +5,12 @@
 //!
 //! The parse decides, so it is strict ([`der::Reader`]): the whole
 //! `TimeStampResp` with status 0 or 1 and nothing after it; a ContentInfo
-//! of signed data over a TSTInfo; **exactly one** SignerInfo with digest
-//! SHA-256 and signature `ecdsa-with-SHA256`; signed attributes with
-//! contentType, messageDigest and signingCertificateV2 each exactly once;
+//! of signed data over a TSTInfo; **exactly one** SignerInfo whose digest
+//! and signature algorithm are one of two pairs, SHA-256 with
+//! `ecdsa-with-SHA256` (Sigstore's public-good TSA) or SHA-384 with
+//! `ecdsa-with-SHA384` (GitHub's TSA, ADR-040 D5); signed attributes with
+//! contentType, messageDigest (as long as the pair's digest) and
+//! signingCertificateV2 each exactly once;
 //! a TSTInfo of version 1, a SHA-256 imprint and a genTime in whole
 //! seconds. `certificates [0]` and `crls [1]` are skipped unread: the
 //! signer's chain comes only from the caller (the operator's trusted
@@ -21,9 +24,14 @@
 //! the message, the ESSCertIDv2 hash against the leaf, the leaf's EKU
 //! (critical and exactly `id-kp-timeStamping`, RFC 3161 2.3) and keyUsage,
 //! the chain by webpki at genTime with the anchor itself valid then
-//! (`codesign::verify_chain`), the messageDigest against the TSTInfo
-//! bytes, and the leaf's signature over
-//! the signed attributes. Every refusal is a fixed [`TimestampError`].
+//! (`codesign::verify_chain`), the messageDigest against the pair's digest
+//! of the TSTInfo bytes (SHA-384 is ring's, a direct dependency already),
+//! and the leaf's signature over the signed attributes under the pair's
+//! algorithm: a P-256 or P-384 key for the SHA-256 pair, a P-384 key only
+//! for the SHA-384 pair, so each pair is one of the two (digest,
+//! signature, key) triples ADR-040 D5 accepts. The imprint and the
+//! ESSCertIDv2 hash stay SHA-256 under both. Every refusal is a fixed
+//! [`TimestampError`].
 
 use std::fmt;
 
@@ -56,6 +64,8 @@ const SIGNING_CERTIFICATE_V2: &[u8] = &[
 ];
 /// id-sha256, 2.16.840.1.101.3.4.2.1.
 const SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+/// id-sha384, 2.16.840.1.101.3.4.2.2.
+const SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
 /// id-kp-timeStamping, 1.3.6.1.5.5.7.3.8.
 const ID_KP_TIME_STAMPING: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
 /// id-ce-extKeyUsage, 2.5.29.37.
@@ -82,12 +92,16 @@ pub enum TimestampError {
     ContentType,
     /// The signed data holds no SignerInfo or more than one.
     SignerCount,
-    /// The digest is not SHA-256, or the signature not `ecdsa-with-SHA256`.
+    /// The digest and the signature algorithm are not SHA-256 with
+    /// `ecdsa-with-SHA256` or SHA-384 with `ecdsa-with-SHA384` (ADR-040,
+    /// D5).
     Algorithm,
     /// The signed attributes are missing, or contentType or messageDigest
-    /// is missing, present twice or not one value.
+    /// is missing, present twice or not one value, or messageDigest is not
+    /// as long as the digest of the pair (32 or 48 bytes).
     SignedAttributes,
-    /// messageDigest is not the SHA-256 of the TSTInfo.
+    /// messageDigest is not the pair's digest (SHA-256 or SHA-384) of the
+    /// TSTInfo.
     MessageDigest,
     /// signingCertificateV2 is missing, present twice, not over SHA-256,
     /// or does not name the leaf.
@@ -151,6 +165,69 @@ impl fmt::Display for TimestampError {
 
 impl std::error::Error for TimestampError {}
 
+/// The digest and signature algorithm pair of a SignerInfo (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pair {
+    /// SHA-256 with `ecdsa-with-SHA256`, a P-256 or P-384 key.
+    Sha256,
+    /// SHA-384 with `ecdsa-with-SHA384`, a P-384 key only (ADR-040, D5).
+    Sha384,
+}
+
+impl Pair {
+    /// The pair whose digest algorithm is `identifier`, if any.
+    fn of_digest(identifier: &[u8]) -> Option<Pair> {
+        if is_algorithm(identifier, SHA256) {
+            Some(Pair::Sha256)
+        } else if is_algorithm(identifier, SHA384) {
+            Some(Pair::Sha384)
+        } else {
+            None
+        }
+    }
+
+    /// The signatureAlgorithm the pair needs, whole content.
+    fn signature_algorithm(self) -> &'static [u8] {
+        match self {
+            Pair::Sha256 => alg_id::ECDSA_SHA256.as_ref(),
+            Pair::Sha384 => alg_id::ECDSA_SHA384.as_ref(),
+        }
+    }
+
+    /// The length of the pair's digest.
+    fn digest_len(self) -> usize {
+        match self {
+            Pair::Sha256 => 32,
+            Pair::Sha384 => 48,
+        }
+    }
+
+    /// The pair's digest of `data`.
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Pair::Sha256 => Sha256::digest(data).to_vec(),
+            Pair::Sha384 => ring::digest::digest(&ring::digest::SHA384, data)
+                .as_ref()
+                .to_vec(),
+        }
+    }
+
+    /// Whether `algorithm` verifies signatures of the pair: its signature
+    /// algorithm, and a key of the triple.
+    fn admits(self, algorithm: &dyn SignatureVerificationAlgorithm) -> bool {
+        let key = algorithm.public_key_alg_id();
+        match self {
+            Pair::Sha256 => {
+                algorithm.signature_alg_id() == alg_id::ECDSA_SHA256
+                    && (key == alg_id::ECDSA_P256 || key == alg_id::ECDSA_P384)
+            }
+            Pair::Sha384 => {
+                algorithm.signature_alg_id() == alg_id::ECDSA_SHA384 && key == alg_id::ECDSA_P384
+            }
+        }
+    }
+}
+
 /// A parsed RFC 3161 timestamp token (module doc).
 ///
 /// `Debug` shows the genTime only.
@@ -160,7 +237,9 @@ pub struct TimestampToken {
     imprint: [u8; 32],
     /// The TSTInfo DER, the eContent octets.
     tst_info: Vec<u8>,
-    message_digest: [u8; 32],
+    pair: Pair,
+    /// As long as the pair's digest.
+    message_digest: Vec<u8>,
     cert_hash: [u8; 32],
     /// The signed attributes re-tagged as a SET: the signed bytes.
     signed_attributes: Vec<u8>,
@@ -225,6 +304,7 @@ impl TimestampToken {
             gen_time,
             imprint,
             tst_info: tst_info.to_vec(),
+            pair: signer.pair,
             message_digest: signer.message_digest,
             cert_hash: signer.cert_hash,
             signed_attributes: signer.signed_attributes,
@@ -282,7 +362,7 @@ impl TimestampToken {
             CertError::NotCodeSigning => TimestampError::NotTimestamping,
             other => TimestampError::Chain(other),
         })?;
-        if Sha256::digest(&self.tst_info) != self.message_digest {
+        if self.pair.digest(&self.tst_info) != self.message_digest {
             return Err(TimestampError::MessageDigest);
         }
         let algorithms: Vec<&dyn SignatureVerificationAlgorithm> =
@@ -291,15 +371,11 @@ impl TimestampToken {
                 .all
                 .iter()
                 .copied()
-                .filter(|a| {
-                    a.signature_alg_id() == alg_id::ECDSA_SHA256
-                        && (a.public_key_alg_id() == alg_id::ECDSA_P256
-                            || a.public_key_alg_id() == alg_id::ECDSA_P384)
-                })
+                .filter(|a| self.pair.admits(*a))
                 .collect();
         let ok = signature::verified(
             parsed.spki,
-            alg_id::ECDSA_SHA256.as_ref(),
+            self.pair.signature_algorithm(),
             &self.signed_attributes,
             &self.signature,
             &algorithms,
@@ -339,7 +415,8 @@ fn is_algorithm(identifier: &[u8], oid: &[u8]) -> bool {
 
 /// What the one SignerInfo holds.
 struct Signer {
-    message_digest: [u8; 32],
+    pair: Pair,
+    message_digest: Vec<u8>,
     cert_hash: [u8; 32],
     signed_attributes: Vec<u8>,
     signature: Vec<u8>,
@@ -357,16 +434,15 @@ fn signer_info(info: &[u8]) -> Result<Signer, TimestampError> {
         }
         _ => return Err(TimestampError::Malformed),
     }
-    if !is_algorithm(info.expect(SEQUENCE).map_err(malformed)?, SHA256) {
-        return Err(TimestampError::Algorithm);
-    }
+    let pair = Pair::of_digest(info.expect(SEQUENCE).map_err(malformed)?)
+        .ok_or(TimestampError::Algorithm)?;
     if info.peek() != Some(CONTEXT_0) {
         return Err(TimestampError::SignedAttributes);
     }
     let whole = info.expect_tlv(CONTEXT_0).map_err(malformed)?;
     let attributes = Reader::new(whole).expect(CONTEXT_0).map_err(malformed)?;
     let algorithm = info.expect(SEQUENCE).map_err(malformed)?;
-    if algorithm != alg_id::ECDSA_SHA256.as_ref() {
+    if algorithm != pair.signature_algorithm() {
         return Err(TimestampError::Algorithm);
     }
     let signature = info.expect(OCTET_STRING).map_err(malformed)?;
@@ -374,6 +450,9 @@ fn signer_info(info: &[u8]) -> Result<Signer, TimestampError> {
     info.finish().map_err(malformed)?;
 
     let (message_digest, cert_hash) = attributes_of(attributes)?;
+    if message_digest.len() != pair.digest_len() {
+        return Err(TimestampError::SignedAttributes);
+    }
     // RFC 5652, 5.4: the signature is over the attributes' DER with the
     // SET tag in place of the `[0]`.
     let mut signed_attributes = whole.to_vec();
@@ -381,6 +460,7 @@ fn signer_info(info: &[u8]) -> Result<Signer, TimestampError> {
         *tag = SET;
     }
     Ok(Signer {
+        pair,
         message_digest,
         cert_hash,
         signed_attributes,
@@ -389,8 +469,9 @@ fn signer_info(info: &[u8]) -> Result<Signer, TimestampError> {
 }
 
 /// The messageDigest and the first ESSCertIDv2 hash of the signed
-/// attributes; contentType must name a TSTInfo.
-fn attributes_of(attributes: &[u8]) -> Result<([u8; 32], [u8; 32]), TimestampError> {
+/// attributes; contentType must name a TSTInfo. The digest's length is
+/// the caller's to check against the pair.
+fn attributes_of(attributes: &[u8]) -> Result<(Vec<u8>, [u8; 32]), TimestampError> {
     let bad = |_: DerError| TimestampError::SignedAttributes;
     let mut attributes = Reader::new(attributes);
     let mut content_type = None;
@@ -430,10 +511,7 @@ fn attributes_of(attributes: &[u8]) -> Result<([u8; 32], [u8; 32]), TimestampErr
         return Err(TimestampError::ContentType);
     }
     let message_digest = message_digest.ok_or(TimestampError::SignedAttributes)?;
-    let message_digest: [u8; 32] = one(message_digest, OCTET_STRING)
-        .map_err(bad)?
-        .try_into()
-        .map_err(|_| TimestampError::SignedAttributes)?;
+    let message_digest = one(message_digest, OCTET_STRING).map_err(bad)?;
     let certificate = certificate.ok_or(TimestampError::SigningCertificate)?;
     let cert_hash = ess_cert_id_v2(certificate).ok_or(TimestampError::SigningCertificate)?;
     Ok((message_digest, cert_hash))
@@ -870,6 +948,171 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    /// The two accepted (digest, signature, key) triples (ADR-040, D5):
+    /// SHA-256 with `ecdsa-with-SHA256` and a P-256 or P-384 leaf, and
+    /// SHA-384 with `ecdsa-with-SHA384` and a P-384 leaf only. Every other
+    /// pairing is `Algorithm`, and messageDigest has the pair's length.
+    #[test]
+    fn sha384_triple_rules() {
+        let p256_leaf = TsaLeafSpec::good().build();
+        let cases: Vec<(&str, TokenSpec, Result<(), TimestampError>)> = vec![
+            (
+                "the SHA-384 triple, P-384 leaf",
+                TokenSpec::sha384(),
+                Ok(()),
+            ),
+            (
+                "SHA-384 digest, ecdsa-with-SHA256",
+                TokenSpec {
+                    signature_algorithm: algorithm(testing::ECDSA_WITH_SHA256, false),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Algorithm),
+            ),
+            (
+                "SHA-256 digest, ecdsa-with-SHA384",
+                TokenSpec {
+                    digest_algorithm: algorithm(SHA256, false),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Algorithm),
+            ),
+            (
+                "SHA-384 digest with NULL parameters",
+                TokenSpec {
+                    digest_algorithm: algorithm(testing::SHA384, true),
+                    ..TokenSpec::sha384()
+                },
+                Ok(()),
+            ),
+            (
+                "SHA-512 digest, ecdsa-with-SHA384",
+                TokenSpec {
+                    digest_algorithm: algorithm(testing::SHA512, false),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Algorithm),
+            ),
+            (
+                "the SHA-384 triple, P-256 leaf",
+                TokenSpec {
+                    leaf: p256_leaf.clone(),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Signature),
+            ),
+            (
+                "the SHA-384 triple, 32-byte messageDigest",
+                TokenSpec {
+                    attributes: Attributes::Edited(|list, econtent, _| {
+                        list[2] = testing::attribute(
+                            MESSAGE_DIGEST,
+                            &[der::encode(OCTET_STRING, &Sha256::digest(econtent))],
+                        );
+                    }),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::SignedAttributes),
+            ),
+            (
+                "the SHA-256 triple, 48-byte messageDigest",
+                TokenSpec {
+                    attributes: Attributes::Edited(|list, econtent, _| {
+                        list[2] = testing::attribute(
+                            MESSAGE_DIGEST,
+                            &[der::encode(OCTET_STRING, &testing::sha384(econtent))],
+                        );
+                    }),
+                    ..TokenSpec::good()
+                },
+                Err(TimestampError::SignedAttributes),
+            ),
+            (
+                "the SHA-384 triple, a wrong 48-byte messageDigest",
+                TokenSpec {
+                    attributes: Attributes::Edited(|list, _, _| {
+                        list[2] = testing::attribute(
+                            MESSAGE_DIGEST,
+                            &[der::encode(OCTET_STRING, &[7; 48])],
+                        );
+                    }),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::MessageDigest),
+            ),
+            (
+                "the SHA-384 triple, the messageDigest a SHA-256 padded to 48",
+                TokenSpec {
+                    attributes: Attributes::Edited(|list, econtent, _| {
+                        let mut digest = Sha256::digest(econtent).to_vec();
+                        digest.extend_from_slice(&[0; 16]);
+                        list[2] = testing::attribute(
+                            MESSAGE_DIGEST,
+                            &[der::encode(OCTET_STRING, &digest)],
+                        );
+                    }),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::MessageDigest),
+            ),
+            (
+                "the SHA-384 triple, one flipped signature byte",
+                TokenSpec {
+                    corrupt: true,
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Signature),
+            ),
+            (
+                "the SHA-256 triple, P-384 leaf signing ECDSA-SHA384",
+                TokenSpec {
+                    digest_algorithm: algorithm(SHA256, false),
+                    signature_algorithm: algorithm(testing::ECDSA_WITH_SHA256, false),
+                    attributes: Attributes::Edited(|list, econtent, _| {
+                        list[2] = testing::attribute(
+                            MESSAGE_DIGEST,
+                            &[der::encode(OCTET_STRING, &Sha256::digest(econtent))],
+                        );
+                    }),
+                    ..TokenSpec::sha384()
+                },
+                Err(TimestampError::Signature),
+            ),
+        ];
+        for (name, spec, verdict) in cases {
+            assert_eq!(check(&spec), verdict, "{name}");
+        }
+        // The SHA-256 triple keeps its P-256 leaf (the public-good TSA's
+        // tokens are P-384, `tests/timestamp.rs`).
+        assert_eq!(
+            check(&TokenSpec {
+                leaf: p256_leaf,
+                ..TokenSpec::good()
+            }),
+            Ok(())
+        );
+    }
+
+    /// A real P-256 ECDSA-SHA384 signature under the SHA-384 triple is
+    /// refused: the triple takes P-384 leaves only (ADR-040, D5). OpenSSL
+    /// made the token and its leaf, which the test intermediate's key
+    /// issued (`tests/data/README.md`); the same leaf under the SHA-256
+    /// triple would be accepted, so only the key filter refuses it.
+    #[test]
+    fn p256_leaf_under_sha384_refused() {
+        let token =
+            TimestampToken::from_response_der(include_bytes!("../tests/data/tsa-p256-sha384.tsr"))
+                .expect("parses");
+        assert_eq!(token.gen_time(), 1_795_648_254);
+        let leaf = crate::codesign::testing::pem_der(include_bytes!(
+            "../tests/data/tsa-p256-sha384-leaf.pem"
+        ));
+        assert_eq!(
+            token.verify(MESSAGE, &leaf, &[], &anchor()),
+            Err(TimestampError::Signature)
+        );
     }
 
     #[test]

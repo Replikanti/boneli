@@ -335,7 +335,9 @@ assets and OpenSSL:
   Closure: a root that lists one, and the signed-note signature type it
   uses.
 - Keyless bundles with no log entry (GitHub's private-repository
-  instance) are refused. Closure: #129, after #55.
+  instance) are refused. Closure: #129, after #55. ADR-040 accepts them
+  under an explicit per-trust opt-in, for a root that lists no log, and
+  amends D3 with the SHA-384 token triple of GitHub's TSA.
 - RFC 3161 tokens in cosign `.sig` and `.att` annotations are not read
   (no measured layer has one), and keyed signatures read no token.
   Closure: a captured layer with one, and a successor ADR.
