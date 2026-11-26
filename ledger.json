@@ -1641,16 +1641,16 @@
    "title": "boneli-sigstore: GitHub private-repo attestations with no transparency log entry",
    "epic": null,
    "order": 63,
-   "state": "pr-review",
-   "owner": "9cc7896e",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 138,
    "note": "PR #138 open",
-   "updated_at": "2026-11-25T23:48:31+00:00",
+   "updated_at": "2026-11-26T00:37:12+00:00",
    "priority": "P3",
    "size": "?",
    "deps": [
@@ -1691,7 +1691,7 @@
    "title": "boneli-tuf: refresh GitHub's Sigstore trusted root from tuf-repo.github.com",
    "epic": null,
    "order": 65,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1700,7 +1700,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-25T23:08:01+00:00",
+   "updated_at": "2026-11-26T00:37:14+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1714,22 +1714,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T19:42:44+00:00",
-   "issue": 113,
-   "from": "pr-review",
-   "to": "done",
-   "by": "1806fc84",
-   "note": null
-  },
-  {
-   "at": "2026-11-24T20:13:44+00:00",
-   "issue": 103,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #124 open"
-  },
   {
    "at": "2026-11-24T20:26:48+00:00",
    "issue": 114,
@@ -2113,6 +2097,22 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #138 open"
+  },
+  {
+   "at": "2026-11-26T00:37:12+00:00",
+   "issue": 129,
+   "from": "pr-review",
+   "to": "done",
+   "by": "9cc7896e",
+   "note": null
+  },
+  {
+   "at": "2026-11-26T00:37:14+00:00",
+   "issue": 137,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2138,11 +2138,10 @@
   45,
   49,
   69,
-  129,
   137
  ],
  "xopen": [],
- "updated_at": "2026-11-25T23:58:15+00:00",
+ "updated_at": "2026-11-26T00:37:14+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
