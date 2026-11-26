@@ -1023,9 +1023,30 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   trusted root are known answers; `docs/sigstore-trust.md` covers
   capturing that root by hand (its TUF refresh is #137). No new crate or
   dependency edge.
+- GitHub's trusted root through TUF (#137, ADR-041, accepted): `boneli-tuf`
+  refreshes GitHub's private-repository `trusted_root.json` from
+  `tuf-repo.github.com` with no change to the TUF client, from the pinned
+  GitHub root v3 (SHA-256 `98cba97b…`, byte for byte the root `cli/cli`
+  embeds) into a trust directory of its own beside Sigstore's. Known
+  answers on GitHub's roots v1 to v9 and its online metadata, fixture
+  tests of rollback, expiry, snapshot version, pin, lock and inode
+  re-check on the second root, and a weekly live refresh in
+  `oci-acceptance` (`github_refresh_live`) that verifies two
+  private-repository attestations under the installed file with the
+  no-log opt-in. `docs/sigstore-trust.md` replaces the capture by hand
+  with the TUF refresh. No new crate or dependency edge.
 
 ### Changed
 
+- A trust directory of `boneli-tuf` belongs to its pin: a refresh with
+  another pin now fails at `InitialRoot` before it removes a crashed
+  run's temporary files, so it changes nothing in the directory
+  (ADR-041, R1). A trust directory whose path has a component named
+  `tuf` in any ASCII case, or that is its parent's `tuf` entry, is
+  refused at `Lock` and leaves nothing behind (ADR-041, R2), and so is
+  one that holds another trust directory's state: TUF state files in the
+  directory itself, or `lock`, `trusted_root.json` or `tuf` in its
+  `tuf/` (R2 by content, which catches bind mounts and volumes).
 - A code-signing or TSA chain may pass through an intermediate without
   an EKU (ADR-040, D4, amending ADR-029 item 7): webpki now checks the
   purpose with `KeyUsage::required_if_present`, and the leaf itself must

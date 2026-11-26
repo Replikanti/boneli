@@ -315,9 +315,14 @@ cargo test -p boneli-https --lib -- --ignored ocsp::live
 `tests/network.rs` refreshes `trusted_root.json` from Sigstore's TUF
 repository `tuf-repo-cdn.sigstore.dev` over `TlsDial`, from the pinned
 root v16 (`tests/data/sigstore-16.root.json`) into an empty trust
-directory and once more, which must find the file current (ADR-033). It
-prints the versions, the run time and the target's SHA-256. CI runs it in
-the weekly `oci-acceptance` workflow on both architectures; run it by
+directory and once more, which must find the file current (ADR-033).
+`github_refresh_live` does the same for GitHub's private-repository root
+from `tuf-repo.github.com`, from the pinned root v3
+(`tests/data/github-3.root.json`), and verifies two captured
+private-repository attestations under the installed file with the no-log
+opt-in of ADR-040 (ADR-041). Both print the versions, the run time and
+the target's SHA-256. CI runs them in the weekly `oci-acceptance`
+workflow on both architectures; run them by
 hand before a change under `crates/boneli-tuf/src/` merges. Operator
 setup: `docs/sigstore-trust.md`.
 

@@ -32,7 +32,18 @@ name: oci-acceptance
 # the first refresh, 4 for the second, which finds the file current); weekly
 # because the timestamp expires 7 days after it is signed and upstream
 # drift (a new key type, the target moved into a delegation) must show up
-# within that week. Weekly, because
+# within that week. And of ADR-041 (#137): refresh GitHub's
+# trusted_root.json from tuf-repo.github.com the same way, from the pinned
+# GitHub root v3, and verify two private-repository attestations (K1, K2)
+# under it with the no-log opt-in of ADR-040 (`github_refresh_live`). Its
+# requests per architecture per run follow one rule: the first refresh
+# makes one per root newer than v3, the 404 of the next root, timestamp,
+# snapshot, targets and the target; the second makes the 404, timestamp,
+# snapshot and targets. With root v9 current that is 11 + 4 = 15, and one
+# more per later root. Drift it shows within a week: a new key type or
+# signature scheme in a threshold position, `trusted_root.json` moved or
+# renamed, and a CA or TSA window K1 or K2 needs retired (the remedy is a
+# newer capture, ADR-041 known limits). Weekly, because
 # registry changes (a garbage-collected digest, a CDN host move, the token
 # flow, a signature replaced) show up within 7 days at 15 Docker Hub
 # manifest, tag and referrers requests per architecture per run (4 before
@@ -105,10 +116,10 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope -q -p Delegate=yes \
             env BONELI_SYS_TEST_CGROUP=self \
             cargo test -p boneli-oci --test boneli_oci_tests -- --ignored network:: --nocapture
-      # ADR-033: the TUF refresh of Sigstore's trusted root, also when a
-      # pull above failed; versions, run time and the target's SHA-256 are
-      # printed. It needs no host preparation.
-      - name: Refresh Sigstore's trusted root through TUF
+      # ADR-033 and ADR-041: the TUF refreshes of Sigstore's and GitHub's
+      # trusted roots, also when a pull above failed; versions, run times
+      # and the targets' SHA-256 are printed. They need no host preparation.
+      - name: Refresh Sigstore's and GitHub's trusted roots through TUF
         if: ${{ !cancelled() }}
         run: cargo test -p boneli-tuf --test network -- --ignored --nocapture
       # ADR-039 (#55): node:22 through Squid, with direct outbound 80 and

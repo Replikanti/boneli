@@ -25,10 +25,13 @@ const REMEDY: &str = "remove the trust directory's tuf/ to bootstrap again from 
 /// The step a refresh failed at (ADR-033, item 9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// The trust directory broke a rule of ADR-021, its lock could not be
+    /// The trust directory broke a rule of ADR-021 or the `tuf` rule of
+    /// ADR-041 (it is, or lies inside, a directory named `tuf`, or it
+    /// holds another trust directory's state), its lock could not be
     /// taken ("busy" while another refresh holds it), or it could not be
-    /// opened; or, later in the run, the trust directory, its `tuf/` or its
-    /// lock was removed or replaced, so the refresh stopped writing there.
+    /// opened; or, later in the run, the trust directory, its `tuf/` or
+    /// its lock was removed or replaced, so the refresh stopped writing
+    /// there.
     Lock,
     /// The initial root does not hash to its pin, the pin is malformed,
     /// the root does not reach its own threshold, or the trust directory
@@ -204,13 +207,15 @@ impl Outcome {
 /// Refreshes `trusted_root.json` in the trust directory from the
 /// repository by the TUF workflow 5.1 to 5.7 (ADR-033). Spawns no thread.
 ///
-/// 1. The trust directory is checked and its lock (`<dir>/lock`, outside
-///    `tuf/`) taken for the whole refresh; before every read and write
+/// 1. The trust directory is checked, no component of its path may be a
+///    `tuf` entry (ADR-041, R2), and its lock (`<dir>/lock`, outside
+///    `tuf/`) is taken for the whole refresh; before every read and write
 ///    the directory, `tuf/` and the lock must still be the ones locked.
-///    A crashed run's temporary files are removed.
-/// 2. The trusted root is the stored one, or, in an empty directory, the
-///    initial root, whose pin is recorded. A recorded pin other than the
-///    initial root's fails until `tuf/` is removed.
+/// 2. A recorded pin other than the initial root's fails until `tuf/` is
+///    removed, before anything in the directory changes (ADR-041, R1).
+///    Then a crashed run's temporary files are removed, and the trusted
+///    root is the stored one or, in an empty directory, the initial root,
+///    whose pin is recorded.
 /// 3. `N+1.root.json` is fetched until a `404`, each root verified and
 ///    stored before the next is fetched, at most [`MAX_ROOT_ROTATIONS`]
 ///    per run. A root that changes the timestamp or snapshot keys deletes
@@ -239,7 +244,14 @@ pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshErr
             "busy: another refresh holds the trust directory's lock",
         ),
     })?;
-    let mut set = trusted_root(&dir, refresh)?;
+    // The pin before anything is written or swept: a directory of another
+    // root keeps every entry, a crashed run's included (ADR-041, R1). The
+    // sweep precedes the first write, whose `create_new` a leftover
+    // temporary file would fail.
+    let pinned = check_pin(&dir, refresh)?;
+    dir.sweep()
+        .map_err(|e| state_err(e, "removing a crashed run's temporary files"))?;
+    let mut set = trusted_root(&dir, refresh, pinned)?;
     root_chain(&dir, refresh, &mut set)?;
     let fetch = |file: &str, size: Size, step: Step| match fetch::get(
         refresh.dial,
@@ -342,27 +354,38 @@ pub fn refresh_trusted_root(refresh: &Refresh<'_>) -> Result<Outcome, RefreshErr
     Ok(Outcome::Updated(report))
 }
 
+/// The recorded pin `tuf/pin` (ADR-033 item 5, ADR-041 R1), read only:
+/// `true` when it is the initial root's, `false` when none is recorded,
+/// and [`Step::InitialRoot`] when it is another one, so the directory
+/// belongs to another root and nothing in it changes.
+fn check_pin(dir: &TrustDir, refresh: &Refresh<'_>) -> Result<bool, RefreshError> {
+    match read_tuf(dir, state::PIN, 65)? {
+        Some(Some(recorded)) if recorded == pin_line(refresh).as_bytes() => Ok(true),
+        Some(_) => Err(RefreshError::new(
+            Step::InitialRoot,
+            format!("the trust directory was set up from another initial root (tuf/pin); {REMEDY}"),
+        )),
+        None => Ok(false),
+    }
+}
+
+/// The content of `tuf/pin` for the initial root.
+fn pin_line(refresh: &Refresh<'_>) -> String {
+    format!("{}\n", refresh.initial_root.sha256_hex)
+}
+
 /// The trusted root to start the chain from (5.2): the stored one, or the
 /// initial root in an empty trust directory, which is then stored with
-/// its pin (pin first, so a stored root always has one).
-fn trusted_root(dir: &TrustDir, refresh: &Refresh<'_>) -> Result<TrustedSet, RefreshError> {
-    let pin = read_tuf(dir, state::PIN, 65)?;
-    let wanted = format!("{}\n", refresh.initial_root.sha256_hex);
-    match &pin {
-        Some(Some(recorded)) if recorded == wanted.as_bytes() => {}
-        Some(_) => {
-            return Err(RefreshError::new(
-                Step::InitialRoot,
-                format!(
-                    "the trust directory was set up from another initial root (tuf/pin); {REMEDY}"
-                ),
-            ));
-        }
-        None => {}
-    }
+/// its pin (pin first, so a stored root always has one). `pinned` is what
+/// [`check_pin`] found.
+fn trusted_root(
+    dir: &TrustDir,
+    refresh: &Refresh<'_>,
+    pinned: bool,
+) -> Result<TrustedSet, RefreshError> {
     match read_tuf(dir, state::ROOT, MAX_ROOT_BYTES)? {
         Some(stored) => {
-            if pin.is_none() {
+            if !pinned {
                 return Err(RefreshError::new(
                     Step::InitialRoot,
                     format!("the stored root tuf/root.json has no tuf/pin; {REMEDY}"),
@@ -384,8 +407,8 @@ fn trusted_root(dir: &TrustDir, refresh: &Refresh<'_>) -> Result<TrustedSet, Ref
             let initial = &refresh.initial_root.bytes;
             let set = TrustedSet::new(initial, refresh.start_secs)
                 .map_err(|e| RefreshError::new(Step::InitialRoot, e))?;
-            if pin.is_none() {
-                write_tuf(dir, state::PIN, wanted.as_bytes())?;
+            if !pinned {
+                write_tuf(dir, state::PIN, pin_line(refresh).as_bytes())?;
             }
             write_tuf(dir, state::ROOT, initial)?;
             Ok(set)

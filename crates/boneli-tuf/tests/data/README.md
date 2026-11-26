@@ -59,6 +59,69 @@ curl -sSf -o sigstore-14.targets.json "$base/14.targets.json"
 sha256sum sigstore-timestamp.json sigstore-166.snapshot.json sigstore-14.targets.json
 ```
 
+## GitHub's TUF roots (known answers, ADR-041)
+
+Captured on 2026-11-26 from GitHub's TUF repository, each file the bytes
+`https://tuf-repo.github.com/<N>.root.json` served for N from 1 to 9
+(`10.root.json` was 404). The tests check that each verifies against its
+own threshold and publishes consistent snapshots, that v1 to v9 chain
+under ADR-033's rules with no online key change, that every version is a
+pin the rules accept, and that only v9 had not expired on the capture
+date.
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `github-1.root.json` | 7660 | `b73aa59b16d2c4989de18e402e168183d0e58f8cf9249d7cb4dd0d1774830c6e` |
+| `github-2.root.json` | 7234 | `9fc6e4cf2bddf3005388d347c624b9f4feb8cd95b5507dbda41344d6238be0be` |
+| `github-3.root.json` | 7480 | `98cba97be9075bc98b2322de3de85fbd1b70ec7392991dfd2f53d215bede1a8d` |
+| `github-4.root.json` | 6537 | `a9fdd07ba2dfc9cc603e6250ea210356f5a5cf06028f329f527abc055af34fd3` |
+| `github-5.root.json` | 7482 | `546470a4aa294c76c75039d87ccca20b9e7e3494bfc89026afcd3b83c2d1541e` |
+| `github-6.root.json` | 7376 | `42e225b5eaed55755a637fb5150135d2930ecdf0b291c615fcd54a52a3fd2522` |
+| `github-7.root.json` | 6679 | `5f14db09da4f13783f2e25778f0f02685a5b5d3270cfca2763b720acc020db8b` |
+| `github-8.root.json` | 6976 | `87a67338159679a4e3f7b5c8cdc302cb364fd5e1d7d37ee2531a1cd8eb782999` |
+| `github-9.root.json` | 6734 | `eb303461e0109458144b6ebcbfd62aaa6f6d7481e9ca77504b85f17761661462` |
+
+`github-3.root.json` is the pin of ADR-041. It is byte for byte the root
+that `cli/cli` embeds for `tuf-repo.github.com`:
+
+```sh
+gh api repos/cli/cli/contents/pkg/cmd/attestation/verification/embed/tuf-repo.github.com/root.json \
+  -H 'Accept: application/vnd.github.raw' | cmp - github-3.root.json
+```
+
+## GitHub's online metadata and target (known answers, ADR-041)
+
+Captured on 2026-11-26 from the same repository, with the roots above:
+`timestamp.json` (v1027, which named snapshot v84), the files it led to,
+`84.snapshot.json` and `10.targets.json`, and the `trusted_root.json`
+target at its consistent-snapshot path. They are signed by root v9's
+keys. The tests check that they verify under v9 at the capture date,
+that the timestamp expires at 2026-12-03T07:22:31Z, and that the target
+is the same JSON as `crates/boneli-sigstore/tests/data/github-trusted-root.json`
+in other bytes (pretty-printed here, the compact line of `gh
+attestation trusted-root` there). The repository has signed newer
+timestamps since; the tests do not depend on which one is current.
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `github-timestamp.json` | 450 | `4e49f1483a728c6f5b064d26a95e15414830f19d263a75707961495c199708c4` |
+| `github-84.snapshot.json` | 446 | `7f2ee4dc13f4b3f4edfe828c4eb3b36ac61c4f3219f745c960395d5c8b5ec750` |
+| `github-10.targets.json` | 2974 | `0fa9dec2a92ff98570d611080ae334b6f0db4af42551d957de0fc447a18acc9c` |
+| `github-tuf-trusted-root.json` | 31645 | `484cdfe1a7c65479c5ba2a22193d1be90f0020db1997de696ab207434c62fbb7` |
+
+```sh
+base=https://tuf-repo.github.com
+for n in $(seq 1 9); do
+  curl -sSf -o "github-$n.root.json" "$base/$n.root.json"
+done
+curl -sSf -o github-timestamp.json "$base/timestamp.json"
+curl -sSf -o github-84.snapshot.json "$base/84.snapshot.json"
+curl -sSf -o github-10.targets.json "$base/10.targets.json"
+curl -sSf -o github-tuf-trusted-root.json \
+  "$base/targets/484cdfe1a7c65479c5ba2a22193d1be90f0020db1997de696ab207434c62fbb7.trusted_root.json"
+sha256sum github-*.json
+```
+
 ## Test-only signing keys
 
 `test-only-p256-1.key` to `test-only-p256-7.key` are ECDSA P-256 keys in
