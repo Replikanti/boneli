@@ -272,7 +272,7 @@ fn one_directory_per_pin() {
             ((&g_server, &g_initial), (&s_server, &s_initial))
         };
         run(first.0, &dir, first.1).expect("the first root");
-        for stale in [".tmp-root.json", "tuf/.tmp-root.json"] {
+        for stale in [".tmp-trusted_root.json", "tuf/.tmp-root.json"] {
             fs::write(dir.join(stale), b"left by a crashed run").expect("plant");
         }
         let before = tree(&dir);
@@ -442,4 +442,100 @@ fn trust_dir_look_alike_names_allowed() {
             run(&server, &dir, &initial).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
         assert!(matches!(outcome, Outcome::Updated(_)), "{outcome:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// R2 by content: another root's state reached through an alias
+// ---------------------------------------------------------------------
+
+/// A refusal at `Lock` whose detail holds `needle`, with no request.
+fn refused_with(server: &Server, dir: &Path, initial: &boneli_tuf::InitialRoot, needle: &str) {
+    let err = run(server, dir, initial).expect_err("refused by content");
+    assert_eq!(err.step, Step::Lock, "{}: {err}", dir.display());
+    assert!(err.detail.contains(needle), "{}: {err}", dir.display());
+    assert!(server.requested().is_empty());
+}
+
+/// Review run 1 of #137: another root's `tuf/` reached through an alias
+/// (a bind mount, a volume mapped one level too deep) passes every path
+/// rule. A trust directory that holds a trust directory's TUF state is
+/// refused before anything is written there, so the other root's
+/// in-flight temporary file survives. A bind mount needs root, so the
+/// alias is a copy of the entries: the rule reads the directory's
+/// contents, which are the same either way.
+#[test]
+fn trust_dir_holding_tuf_state_refused() {
+    let (g_server, g_initial, _) = github_fixture();
+    let (scratch, sigstore, _) = siblings("holds-state");
+    sigstore_set_up(&sigstore);
+    let alias = scratch.0.join("alias");
+    private_dir(&alias);
+    for entry in fs::read_dir(sigstore.join("tuf")).expect("list") {
+        let entry = entry.expect("entry");
+        fs::copy(entry.path(), alias.join(entry.file_name())).expect("copy");
+    }
+    fs::write(alias.join(".tmp-root.json"), b"Sigstore's, in flight").expect("plant");
+    let before = tree(&alias);
+    refused_with(&g_server, &alias, &g_initial, "TUF state");
+    assert_eq!(tree(&alias), before);
+
+    // Each state name alone, in its final and its temporary form.
+    for name in [
+        "pin",
+        "root.json",
+        "timestamp.json",
+        "snapshot.json",
+        ".tmp-pin",
+        ".tmp-root.json",
+        ".tmp-timestamp.json",
+        ".tmp-snapshot.json",
+    ] {
+        let dir = scratch.0.join(format!("one{name}"));
+        private_dir(&dir);
+        fs::write(dir.join(name), b"another root's").expect("plant");
+        let before = tree(&dir);
+        refused_with(&g_server, &dir, &g_initial, "TUF state");
+        assert_eq!(tree(&dir), before, "{name}");
+    }
+}
+
+/// The other way round: another root's trust directory reached as this
+/// one's `tuf/`. A `tuf/` that holds a trust directory's own entries is
+/// refused before anything is written, in this directory or in it.
+#[test]
+fn trust_dir_whose_tuf_is_a_trust_dir_refused() {
+    let (g_server, g_initial, _) = github_fixture();
+    let scratch = Scratch::new("tuf-is-dir");
+    for name in ["lock", "trusted_root.json", ".tmp-trusted_root.json", "tuf"] {
+        let github = scratch.0.join(format!("github{name}"));
+        private_dir(&github);
+        private_dir(&github.join("tuf"));
+        if name == "tuf" {
+            private_dir(&github.join("tuf/tuf"));
+        } else {
+            fs::write(github.join("tuf").join(name), b"another root's").expect("plant");
+        }
+        fs::write(github.join("tuf/.tmp-root.json"), b"in flight").expect("plant");
+        let before = tree(&github);
+        refused_with(&g_server, &github, &g_initial, "holds a trust directory");
+        assert_eq!(tree(&github), before, "{name}");
+    }
+}
+
+/// A trust directory set up by this client passes the content rule on
+/// every later run, a crashed run's temporary files included.
+#[test]
+fn own_state_passes_the_content_rule() {
+    let (g_server, g_initial, _) = github_fixture();
+    let (_scratch, _, github) = siblings("own-state");
+    run(&g_server, &github, &g_initial).expect("first run");
+    for stale in [
+        ".tmp-trusted_root.json",
+        "tuf/.tmp-pin",
+        "tuf/.tmp-root.json",
+    ] {
+        fs::write(github.join(stale), b"left by a crashed run").expect("plant");
+    }
+    let again = run(&g_server, &github, &g_initial).expect("own state");
+    assert!(matches!(again, Outcome::Unchanged(_)), "{again:?}");
 }

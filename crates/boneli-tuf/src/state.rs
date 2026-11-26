@@ -22,12 +22,21 @@
 //! folds to `tuf`. So no trust directory is another's `tuf/` or lies
 //! inside it, where the other refresh's sweep or the documented remedy
 //! (remove `tuf/`) would reach it. The rule runs on the path as given, as
-//! it would be created and as resolved, before anything is created.
+//! it would be created and as resolved. A refused path leaves nothing
+//! behind: the first two forms are refused before anything is created,
+//! and what only the resolved form shows (a name a case-folding
+//! filesystem folds to `tuf`) is removed again, empty directories only.
+//!
+//! A path cannot show an alias, such as a bind mount of another root's
+//! `tuf/`. So R2 also reads contents, before anything is written: a trust
+//! directory that holds TUF state (`pin`, `root.json`, ...) is another
+//! one's `tuf/`, and a `tuf/` that holds `lock`, `trusted_root.json` or
+//! `tuf` is another trust directory.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{self, Path, PathBuf};
 
 use boneli_private_dir::lock::{FileLock, Kind, TakeError};
 
@@ -104,8 +113,8 @@ impl TrustDir {
     /// run left is removed by [`sweep`](Self::sweep), which the refresh
     /// calls after the pin check.
     pub(crate) fn open(dir: &Path) -> Result<TrustDir, OpenError> {
-        let root = boneli_private_dir::prepare_root(dir, &tuf_rule)
-            .map_err(|e| OpenError::Dir(e.to_string()))?;
+        let root = prepare(dir, &tuf_rule)?;
+        content_rule(&root)?;
         let lock_path = root.join(LOCK);
         let file = OpenOptions::new()
             .read(true)
@@ -251,6 +260,91 @@ fn dir_err(path: &Path, e: &io::Error) -> OpenError {
     OpenError::Dir(format!("{}: {e}", path.display()))
 }
 
+/// `prepare_root` under `rule`, leaving nothing behind when it refuses.
+/// `prepare_root` creates a missing directory before it checks the
+/// resolved form, and only that check can see a name that a case-folding
+/// filesystem folds to `tuf` (as given and as it would be created, the
+/// name and its parent's `tuf` are both missing). So on any refusal the
+/// directories of `dir`'s tail that were missing before the call are
+/// removed again, deepest first, each only while empty, so no state is
+/// ever removed: a directory another process made there in the meantime
+/// and wrote into stays (ADR-041, R2).
+fn prepare(
+    dir: &Path,
+    rule: &dyn Fn(&Path) -> Result<(), &'static str>,
+) -> Result<PathBuf, OpenError> {
+    // A relative path or one with `.` or `..` is refused before anything
+    // is created, and its text does not name what creation would make.
+    let undoable = dir.is_absolute()
+        && !dir
+            .components()
+            .any(|c| matches!(c, path::Component::CurDir | path::Component::ParentDir));
+    let missing: Vec<&Path> = if undoable {
+        dir.ancestors()
+            .take_while(|a| {
+                matches!(fs::symlink_metadata(a), Err(e) if e.kind() == io::ErrorKind::NotFound)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    boneli_private_dir::prepare_root(dir, rule).map_err(|e| {
+        for created in &missing {
+            let _ = fs::remove_dir(created);
+        }
+        OpenError::Dir(e.to_string())
+    })
+}
+
+/// The TUF state names under `tuf/`, and the entries of a trust
+/// directory itself (ADR-041, R2 by content).
+const TUF_STATE: [&str; 4] = [PIN, ROOT, TIMESTAMP, SNAPSHOT];
+const TRUST_DIR_ENTRIES: [&str; 3] = [LOCK, TRUSTED_ROOT, TUF];
+
+/// R2 by content (ADR-041): `root` must not hold a trust directory's TUF
+/// state (it would be another trust directory's `tuf/`), and its `tuf/`
+/// must not hold a trust directory's own entries (it would be another
+/// trust directory). A name counts in its final and its temporary form.
+/// This catches the aliases no path can show, such as a bind mount of
+/// another root's `tuf/` or of its whole trust directory one level too
+/// deep, once that root has written its first file. It runs before
+/// anything is written to `root`.
+fn content_rule(root: &Path) -> Result<(), OpenError> {
+    if let Some(name) = holds(root, &TUF_STATE)? {
+        return Err(OpenError::Dir(format!(
+            "{}: holds the TUF state of a trust directory ({name}), so it is another trust \
+             directory's tuf/ reached by another path (ADR-041)",
+            root.display()
+        )));
+    }
+    let tuf = root.join(TUF);
+    if fs::symlink_metadata(&tuf).is_ok_and(|m| m.is_dir())
+        && let Some(name) = holds(&tuf, &TRUST_DIR_ENTRIES)?
+    {
+        return Err(OpenError::Dir(format!(
+            "{}: holds a trust directory ({name}), so the trust directory is another one's \
+             tuf/ or this tuf/ is another trust directory (ADR-041)",
+            tuf.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The first of `names` that `dir` holds, as given or behind
+/// [`TEMP_PREFIX`].
+fn holds(dir: &Path, names: &[&'static str]) -> Result<Option<&'static str>, OpenError> {
+    for entry in fs::read_dir(dir).map_err(|e| dir_err(dir, &e))? {
+        let entry = entry.map_err(|e| dir_err(dir, &e))?;
+        let file_name = entry.file_name();
+        let bytes = file_name.as_encoded_bytes();
+        let bare = bytes.strip_prefix(TEMP_PREFIX.as_bytes()).unwrap_or(bytes);
+        if let Some(name) = names.iter().find(|n| n.as_bytes() == bare) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// The reasons of the `tuf` rule (ADR-041, R2).
 const IS_TUF: &str = "must not be, or lie inside, a directory named tuf: that name holds a \
      trust directory's TUF state (ADR-041)";
@@ -270,7 +364,8 @@ struct Component<'a> {
 /// The `tuf` rule of ADR-041 (R2) as `prepare_root`'s text rule: no
 /// component of `path` other than `/` is a `tuf` entry. `prepare_root`
 /// calls it on the path as given, as it would be created and as
-/// resolved, so a refused path is never created.
+/// resolved; [`prepare`] removes again what a refusal of the resolved
+/// form leaves.
 fn tuf_rule(path: &Path) -> Result<(), &'static str> {
     tuf_problem(path.ancestors().filter_map(|at| {
         let name = at.file_name()?;
@@ -466,6 +561,50 @@ mod tests {
                 Err(TUF_UNCHECKED)
             );
         }
+    }
+
+    /// Review run 1 of #137: a path that only the check of the resolved
+    /// form refuses, such as a name a case-folding filesystem folds to
+    /// `tuf`, leaves nothing behind: the directories this call created are
+    /// removed again, and a directory that was there before stays. The
+    /// rule here refuses an existing `folded`, as the resolved check
+    /// refuses the folded name once it exists.
+    #[test]
+    fn refused_after_creation_leaves_nothing() {
+        let base = std::env::temp_dir().join(format!("boneli-tuf-undo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("kept")).expect("dirs");
+        fs::create_dir_all(base.join("before/folded")).expect("dirs");
+        let rule = |p: &Path| {
+            if p.file_name() == Some(std::ffi::OsStr::new("folded")) && p.exists() {
+                Err("folded")
+            } else {
+                Ok(())
+            }
+        };
+        let outcome = [
+            prepare(&base.join("new/deeper/folded"), &rule).map(|_| ()),
+            prepare(&base.join("kept/folded"), &rule).map(|_| ()),
+            prepare(&base.join("before/folded"), &rule).map(|_| ()),
+        ];
+        let left = [
+            base.join("new").exists(),
+            base.join("kept").exists(),
+            base.join("kept/folded").exists(),
+            base.join("before/folded").exists(),
+        ];
+        let plain = prepare(&base.join("new/plain"), &rule).map(|_| ());
+        let made = base.join("new/plain").is_dir();
+        let _ = fs::remove_dir_all(&base);
+        for result in outcome {
+            match result {
+                Err(OpenError::Dir(why)) => assert!(why.contains("folded"), "{why}"),
+                other => panic!("refused: {other:?}"),
+            }
+        }
+        assert_eq!(left, [false, true, false, true]);
+        assert!(plain.is_ok(), "{plain:?}");
+        assert!(made, "a path that passes is created");
     }
 
     /// The facts `tuf_rule` gathers on a real filesystem: a missing path

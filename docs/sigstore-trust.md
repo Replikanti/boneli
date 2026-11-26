@@ -105,7 +105,7 @@ the file, status, size or path, never text from the metadata.
 
 | Step | Meaning | What to do |
 | --- | --- | --- |
-| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others; a path component named `tuf` in any case, or the parent's `tuf` itself, "directory named tuf"), or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory (for two roots use the sibling layout below), or wait for the other refresh and run again. |
+| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others; a path component named `tuf` in any case, or the parent's `tuf` itself, "directory named tuf"; another trust directory's state in it, "holds the TUF state" or "holds a trust directory"), or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory (for two roots use the sibling layout below), or wait for the other refresh and run again. |
 | `InitialRoot` | The pin does not match the initial root, the root does not verify, the directory was set up from another pin, or `tuf/root.json` has no `tuf/pin`. | Check the pin. To change the initial root on purpose, remove `tuf/`. |
 | `Root(Some(N))` | `N.root.json` was refused: a status other than `200` or `404`, a signature or version check, more than 32 new roots in one run, the newest root expired, or a repository without consistent snapshots. | Retry. More than 32 roots: run again, the next run goes on. An expired newest root or a bad signature means the repository is stale or not Sigstore's: do not remove anything. |
 | `Root(None)` | The stored `tuf/root.json` does not parse or verify. | Remove `tuf/`; the next refresh bootstraps from the pin. |
@@ -229,9 +229,22 @@ other's directory:
   whose path has a component named `tuf` in any ASCII case, or a
   component that is its parent's `tuf` entry (what a case-insensitive
   filesystem folds to `tuf`), fails at `Lock` with "directory named tuf"
-  before anything is created. So no root's directory can sit inside the
-  other's `tuf/`, where that root's sweep or its remedy (remove `tuf/`)
-  would reach it. Do not name a directory on the path `tuf`.
+  and leaves nothing behind (a directory it had to create to see a
+  folded name is removed again). So no root's directory can sit inside
+  the other's `tuf/`, where that root's sweep or its remedy (remove
+  `tuf/`) would reach it. Do not name a directory on the path `tuf`.
+- **No trust directory that holds another's state.** A path cannot show
+  a mount: a bind mount or a container volume of the other root's
+  `tuf/`, or of its whole trust directory one level too deep, looks like
+  any other directory. So a trust directory that holds TUF state (`pin`,
+  `root.json`, `timestamp.json`, `snapshot.json`, also as `.tmp-<name>`)
+  fails at `Lock` with "holds the TUF state of a trust directory", and
+  one whose `tuf/` holds `lock`, `trusted_root.json` or `tuf` fails with
+  "holds a trust directory", before anything is written. Mount each
+  root's own directory, never a part of the other's. Two aliases stay
+  out of reach (ADR-041, known limits): a mount of a directory below the
+  other's `tuf/`, and one set up while the other root runs its very
+  first refresh.
 
 **Refresh** with `boneli trust refresh` (#32): it refreshes every
 configured root, one after another, each under its own lock, and

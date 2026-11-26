@@ -1043,7 +1043,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run's temporary files, so it changes nothing in the directory
   (ADR-041, R1). A trust directory whose path has a component named
   `tuf` in any ASCII case, or that is its parent's `tuf` entry, is
-  refused at `Lock` before anything is created (ADR-041, R2).
+  refused at `Lock` and leaves nothing behind (ADR-041, R2), and so is
+  one that holds another trust directory's state: TUF state files in the
+  directory itself, or `lock`, `trusted_root.json` or `tuf` in its
+  `tuf/` (R2 by content, which catches bind mounts and volumes).
 - A code-signing or TSA chain may pass through an intermediate without
   an EKU (ADR-040, D4, amending ADR-029 item 7): webpki now checks the
   purpose with `KeyUsage::required_if_present`, and the leaf itself must

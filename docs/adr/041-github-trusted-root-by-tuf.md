@@ -119,8 +119,9 @@ how two roots stay apart.
    the two refresh independently, and the remedy of ADR-033 (remove
    `tuf/`) resets one root only.
 3. **The isolation rule (D3)**, in code, so that "a refresh of one root
-   never touches the other root's directory" holds whatever paths an
-   operator configures:
+   never touches the other root's directory" holds for any paths an
+   operator configures and for the aliases its contents show (the
+   residue is a known limit below):
    - **R1, one directory per pin.** A trust directory belongs to the pin
      recorded in its `tuf/pin`. A refresh with another pin fails at
      `InitialRoot` before any request and before anything in the
@@ -135,16 +136,39 @@ how two roots stay apart.
      `tuf` ignoring ASCII case, or when its `(st_dev, st_ino)` equals
      that of its parent's `tuf` entry; the second test catches whatever a
      case-folding filesystem folds to `tuf`. A violation fails at
-     `Step::Lock` before anything is created; a failure to read a
-     component other than "missing" refuses too (fail closed).
-   - **Why R1 and R2 suffice.** A refresh of directory D writes, renames,
+     `Step::Lock` and leaves nothing behind: the forms as given and as
+     it would be created are refused before anything is created; only the
+     resolved form can show a folded name (before creation the name and
+     its parent's `tuf` are both missing), so the directories of the
+     path that were missing before the call are removed again, deepest
+     first and only while empty (review of this PR: without that, the
+     other root later adopted the leftover as its `tuf/`). A failure to
+     read a component other than "missing" refuses too (fail closed).
+   - **R2 by content.** A path cannot show an alias: a bind mount of
+     another root's `tuf/`, or a volume mapped one level too deep, has a
+     path no rule above refuses (review of this PR: GitHub's refresh
+     into a bind mount of Sigstore's `tuf/` wrote its state there and its
+     sweep deleted Sigstore's in-flight `.tmp-root.json`). So before
+     anything is written to it, a trust directory that holds a
+     trust directory's TUF state (`pin`, `root.json`, `timestamp.json`,
+     `snapshot.json`) is refused as another one's `tuf/`, and one whose
+     `tuf/` holds a trust directory's own entries (`lock`,
+     `trusted_root.json`, `tuf`) is refused as nested in another, each
+     name in its final and its `.tmp-` form. A directory this client set
+     up never meets either: its own root holds only `lock`,
+     `trusted_root.json` and `tuf/`, its `tuf/` only the TUF state.
+   - **What R1 and R2 prove.** A refresh of directory D writes, renames,
      removes or sweeps only names directly in D and in D/tuf. Two
      directories A and B share one of those names only if A = B (R1
-     refuses the second root), A = B/tuf, or A/tuf = B (R2 refuses the
-     inner one either way). R2 also keeps every trust directory out from
-     under another's `tuf/`, so the remedy cannot reach it. A trust
-     directory beside another's `tuf/` (B/x) shares nothing: the sweep is
-     not recursive, and `remove_file` fails on a directory.
+     refuses the second root; the lock is one file, so a concurrent one
+     is busy), A = B/tuf, or A/tuf = B. By path R2 refuses the inner one
+     either way and keeps every trust directory out from under another's
+     `tuf/`, so the remedy cannot reach it. By content R2 refuses A = B/tuf
+     and A/tuf = B as directories, however they are reached, once the
+     outer root has written its first file there: its `lock` (the first
+     thing a refresh creates) or its `pin` (the first file in `tuf/`). A
+     trust directory beside another's `tuf/` (B/x) shares nothing: the
+     sweep is not recursive, and `remove_file` fails on a directory.
 4. **The command and its cadence (D4).** `boneli trust refresh` (#32's
    scope) refreshes every configured root, one after another, each under
    its own lock; `--root sigstore|github` refreshes one. A failure of
@@ -191,7 +215,9 @@ how two roots stay apart.
   per run to `tuf-repo.github.com` while v9 is current, one more per
   later root.
 - **R2 refuses a path an operator might pick:** any trust directory whose
-  path has a component named `tuf` in any ASCII case (`/srv/TUF/github`).
+  path has a component named `tuf` in any ASCII case (`/srv/TUF/github`),
+  and any directory that already holds a file named like TUF state
+  (`pin`, `root.json`, ...).
   There are no deployments yet (#32 has not landed), and the error names
   the rule; the sibling layout of D2 never meets it.
 - A refresh with the wrong pin is now side-effect free in that
@@ -218,6 +244,20 @@ how two roots stay apart.
   - If GitHub retires CA and TSA window 0 from its root, K1 fails the
     live test. That is drift detection, not a defect of the refresh.
     Closure: a newer private-repository capture as the known answer.
+  - Two aliases R2 cannot see, both from configuring one root's directory
+    through a mount into the other's state. (1) An alias of a directory
+    *below* another root's `tuf/` (a bind mount of `<sigstore>/tuf/x`):
+    neither refresh touches the other's files, since the sweep is not
+    recursive, but the other root's remedy (remove `tuf/`) removes this
+    root's state. (2) An alias set up while the other root is between
+    creating its `tuf/` and writing its first file there: both may then
+    write into one directory, and the next run of either is refused by
+    content. Both cost availability, never trust (each refresh still
+    verifies its own chain from its own pin), and both fail closed.
+    Closure: `boneli trust refresh` (#32) knows every configured trust
+    directory, and checks them against each other by identity before it
+    refreshes: no directory's `(st_dev, st_ino)` may equal another's or
+    another's `tuf/`, or occur in another's `tuf/` subtree.
 
 ## Alternatives considered
 
@@ -284,6 +324,20 @@ mutants, 13 killed, each by an assertion of the named test:
 - `check_held` dropped (`github_tuf_removed_during_refresh`); the lock
   file at the trust directory's parent, shared by siblings
   (`github_lock_is_its_own`).
+
+Review run 1 found two gaps in R2, both fixed in this PR with a test
+written first (`refused_after_creation_leaves_nothing`,
+`trust_dir_holding_tuf_state_refused`,
+`trust_dir_whose_tuf_is_a_trust_dir_refused`; `own_state_passes_the_content_rule`
+pins that a directory this client set up passes). 6 more hand-applied
+mutants, 6 killed: the removal of what a refusal created dropped, and
+applied to every ancestor instead of the missing tail
+(`refused_after_creation_leaves_nothing`); the TUF-state check of the
+directory dropped (`trust_dir_holding_tuf_state_refused`); the
+trust-directory check of its `tuf/` dropped
+(`trust_dir_whose_tuf_is_a_trust_dir_refused`); the `.tmp-` form not
+counted, and the content rule moved after the lock is created (both
+content tests).
 
 **Accepted.** The pull request's own `oci-acceptance` run,
 https://github.com/Replikanti/boneli/actions/runs/45905779127, passed on

@@ -26,11 +26,12 @@ const REMEDY: &str = "remove the trust directory's tuf/ to bootstrap again from 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     /// The trust directory broke a rule of ADR-021 or the `tuf` rule of
-    /// ADR-041 (it is, or lies inside, a directory named `tuf`), its lock
-    /// could not be taken ("busy" while another refresh holds it), or it
-    /// could not be
-    /// opened; or, later in the run, the trust directory, its `tuf/` or its
-    /// lock was removed or replaced, so the refresh stopped writing there.
+    /// ADR-041 (it is, or lies inside, a directory named `tuf`, or it
+    /// holds another trust directory's state), its lock could not be
+    /// taken ("busy" while another refresh holds it), or it could not be
+    /// opened; or, later in the run, the trust directory, its `tuf/` or
+    /// its lock was removed or replaced, so the refresh stopped writing
+    /// there.
     Lock,
     /// The initial root does not hash to its pin, the pin is malformed,
     /// the root does not reach its own threshold, or the trust directory
