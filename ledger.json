@@ -1691,7 +1691,7 @@
    "title": "boneli-tuf: refresh GitHub's Sigstore trusted root from tuf-repo.github.com",
    "epic": null,
    "order": 65,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "7e21b49c",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1700,7 +1700,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-26T00:57:20+00:00",
+   "updated_at": "2026-11-26T22:06:03+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1714,14 +1714,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T20:26:56+00:00",
-   "issue": 118,
-   "from": "ready",
-   "to": "claimed",
-   "by": "2768f14b",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-24T20:43:13+00:00",
    "issue": 118,
@@ -2113,6 +2105,14 @@
    "to": "plan-review",
    "by": "7e21b49c",
    "note": null
+  },
+  {
+   "at": "2026-11-26T22:06:03+00:00",
+   "issue": 137,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "7e21b49c",
+   "note": null
   }
  ],
  "open": [
@@ -2141,7 +2141,7 @@
   137
  ],
  "xopen": [],
- "updated_at": "2026-11-26T00:57:20+00:00",
+ "updated_at": "2026-11-26T22:06:03+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2151,7 +2151,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795650511,
+  "at": 1795730763,
   "private": false
  },
  "schema": 2,
