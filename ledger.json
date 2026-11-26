@@ -1691,16 +1691,16 @@
    "title": "boneli-tuf: refresh GitHub's Sigstore trusted root from tuf-repo.github.com",
    "epic": null,
    "order": 65,
-   "state": "pr-review",
-   "owner": "7e21b49c",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 139,
    "note": "PR #139 open",
-   "updated_at": "2026-11-26T22:44:52+00:00",
+   "updated_at": "2026-11-26T23:50:56+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1714,14 +1714,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-24T22:45:05+00:00",
-   "issue": 118,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "2768f14b",
-   "note": null
-  },
   {
    "at": "2026-11-24T22:49:22+00:00",
    "issue": 125,
@@ -2113,6 +2105,14 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #139 open"
+  },
+  {
+   "at": "2026-11-26T23:50:56+00:00",
+   "issue": 137,
+   "from": "pr-review",
+   "to": "done",
+   "by": "7e21b49c",
+   "note": null
   }
  ],
  "open": [
@@ -2137,11 +2137,10 @@
   33,
   45,
   49,
-  69,
-  137
+  69
  ],
  "xopen": [],
- "updated_at": "2026-11-26T22:48:48+00:00",
+ "updated_at": "2026-11-26T23:50:58+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
