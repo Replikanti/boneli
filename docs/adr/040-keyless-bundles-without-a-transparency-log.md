@@ -276,7 +276,8 @@ refresh of GitHub's root is follow-up #137.
   TUF refresh of ADR-033 covers Sigstore's public-good repository only.
   Closure: #137, the TUF refresh of GitHub's root from
   `tuf-repo.github.com` (gh embeds its root v3 with 9 ECDSA P-256 keys
-  and consistent snapshots, the shape `boneli-tuf` reads).
+  and consistent snapshots, the shape `boneli-tuf` reads). ADR-041 closes
+  it.
 - No live acceptance test of a GitHub-instance image: no image-subject
   capture can be fetched on this plan (Context). Closure: an image with a
   fetchable GitHub-instance referrer (an Enterprise Cloud repository, or

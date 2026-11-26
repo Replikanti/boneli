@@ -7,9 +7,11 @@ the current file as a target of its TUF repository
 `https://tuf-repo-cdn.sigstore.dev`. `boneli-tuf` keeps the file current
 from that repository (ADR-033). This guide covers the initial root and its
 pin, the trust directory, when to refresh, what each failure means, and
-GitHub's private-repository root, which that refresh does not cover.
+GitHub's private-repository root, which the same client keeps current
+from GitHub's TUF repository in a trust directory of its own (ADR-041).
 The design and the reasons for every rule are in
-`docs/adr/033-sigstore-trust-root-by-tuf.md`.
+`docs/adr/033-sigstore-trust-root-by-tuf.md` and
+`docs/adr/041-github-trusted-root-by-tuf.md`.
 
 Until the `trust refresh` command of `boneli-cli` exists (#32), the
 refresh is the library call `boneli_tuf::refresh_trusted_root`, and the
@@ -103,7 +105,7 @@ the file, status, size or path, never text from the metadata.
 
 | Step | Meaning | What to do |
 | --- | --- | --- |
-| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others), or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory, or wait for the other refresh and run again. |
+| `Lock` | The trust directory breaks a rule (path, owner, mode, an ancestor writable by others; a path component named `tuf` in any case, or the parent's `tuf` itself, "directory named tuf"), or another refresh holds `lock` ("busy"); or the trust directory, `tuf/` or `lock` was removed or replaced while this refresh ran. | Fix the directory (for two roots use the sibling layout below), or wait for the other refresh and run again. |
 | `InitialRoot` | The pin does not match the initial root, the root does not verify, the directory was set up from another pin, or `tuf/root.json` has no `tuf/pin`. | Check the pin. To change the initial root on purpose, remove `tuf/`. |
 | `Root(Some(N))` | `N.root.json` was refused: a status other than `200` or `404`, a signature or version check, more than 32 new roots in one run, the newest root expired, or a repository without consistent snapshots. | Retry. More than 32 roots: run again, the next run goes on. An expired newest root or a bad signature means the repository is stale or not Sigstore's: do not remove anything. |
 | `Root(None)` | The stored `tuf/root.json` does not parse or verify. | Remove `tuf/`; the next refresh bootstraps from the pin. |
@@ -135,9 +137,10 @@ They verify only under a trust with the no-log opt-in (ADR-040,
 what such a signature proves and what it does not: GitHub alone vouches
 for it, and nobody outside GitHub can see it.
 
-**Capture the root** with a logged-in `gh` and `jq`. `gh attestation
-trusted-root` prints two roots, one per line; GitHub's is the one whose
-first CA is `fulcio.githubapp.com`:
+**Cross-check the root** with a logged-in `gh` and `jq`. The TUF refresh
+below keeps the file current; `gh attestation trusted-root` prints the
+same root, which serves as a second look. It prints two roots, one per
+line; GitHub's is the one whose first CA is `fulcio.githubapp.com`:
 
 ```sh
 gh attestation trusted-root |
@@ -149,7 +152,10 @@ jq '{tlogs: (.tlogs // [] | length), ctlogs: (.ctlogs // [] | length),
 ```
 
 The second command must show 0 `tlogs` and 0 `ctlogs`; on 2026-11-26 it
-showed 6 CAs and 6 TSAs. Keep the file apart from the public-good
+showed 6 CAs and 6 TSAs. The TUF file and this line are the same content
+in different bytes: the TUF file is pretty-printed (31,645 bytes on
+2026-11-26), the `gh` line compact (28,886), and `jq -S -c .` gives the
+same output for both. Keep the file apart from the public-good
 `trusted_root.json`: each trust names its own root.
 
 **The opt-in.** Until the runner's policy file has a key for it (#32,
@@ -177,15 +183,95 @@ renamed or registered again by someone else, and the numeric ID never
 moves to another repository. Since certificate claims refuse keys, a
 no-log trust holds no keys.
 
-**Refresh it by hand.** The TUF refresh above covers Sigstore's
-public-good repository only, not this root; a TUF refresh of GitHub's
-root is #137. GitHub adds a new CA and TSA every 147 to 232 days (5
-measured gaps, with 12 to 31 days of overlap), so capture the file again
-at least every 147 days, and at once when GitHub bundles start failing
-with `Timestamp(SigningCertificate)`: that is the refusal a stale file
-gives, because its last window has no end and so holds the new time, but
-its TSA leaf did not sign the new token. Replace the file only with a
-capture that passes the check above.
+### GitHub's root through TUF
+
+GitHub publishes this root as the target `trusted_root.json` of its own
+TUF repository, `https://tuf-repo.github.com`, and `boneli-tuf` refreshes
+it with the same client and the same rules as Sigstore's (ADR-041). Only
+the repository, the pin and the trust directory differ.
+
+**The pin** is GitHub's root v3: `3.root.json`, 7,480 bytes, SHA-256
+`98cba97be9075bc98b2322de3de85fbd1b70ec7392991dfd2f53d215bede1a8d`. It is
+the only GitHub root a second public channel carries byte for byte:
+`cli/cli` embeds it, and `gh attestation verify` starts from it. Fetch
+it from both and compare:
+
+```sh
+curl -sSf -o github-3.root.json https://tuf-repo.github.com/3.root.json
+gh api repos/cli/cli/contents/pkg/cmd/attestation/verification/embed/tuf-repo.github.com/root.json \
+  -H 'Accept: application/vnd.github.raw' | cmp - github-3.root.json
+sha256sum github-3.root.json
+```
+
+Every later GitHub root is also a pin the client accepts (v1 to v9 on
+2026-11-26), but only the repository itself serves them, because GitHub's
+source repository is not public. From v3 the first refresh verifies each
+later root: 11 requests with v9 current.
+
+**Two trust directories, side by side.** Each root has its own trust
+directory with its own `lock`, `tuf/` and `tuf/pin`:
+
+```text
+<trust base>/
+  sigstore/   trust directory for tuf-repo-cdn.sigstore.dev (pin: a Sigstore root)
+  github/     trust directory for tuf-repo.github.com (pin: GitHub's v3)
+```
+
+Each trust in the verifier's configuration (#32) names its own
+`trusted_root.json`. Two rules keep a refresh of one root out of the
+other's directory:
+
+- **One directory per pin.** A directory belongs to the pin in its
+  `tuf/pin`. A refresh with another pin, for example GitHub's pointed at
+  Sigstore's directory, fails at `InitialRoot` before any request and
+  changes nothing there, not even a crashed run's temporary files.
+- **No trust directory at or under a `tuf` entry.** A trust directory
+  whose path has a component named `tuf` in any ASCII case, or a
+  component that is its parent's `tuf` entry (what a case-insensitive
+  filesystem folds to `tuf`), fails at `Lock` with "directory named tuf"
+  before anything is created. So no root's directory can sit inside the
+  other's `tuf/`, where that root's sweep or its remedy (remove `tuf/`)
+  would reach it. Do not name a directory on the path `tuf`.
+
+**Refresh** with `boneli trust refresh` (#32): it refreshes every
+configured root, one after another, each under its own lock, and
+`--root sigstore` or `--root github` refreshes one. A failure of one root
+does not skip the other, and the exit status is non-zero when any root
+failed. Until the command exists, the refresh is the library call with
+`Repository::parse("https://tuf-repo.github.com")`, the pin above and
+`<trust base>/github` as `dir`.
+
+**When.** Weekly, as for Sigstore: GitHub's timestamp expires 7 days
+after it is signed, so a weekly run refuses a frozen repository at most
+14 days after the freeze. GitHub adds a CA and TSA window every 147 to
+232 days, so a weekly run never comes close to missing one. Refresh at
+once when GitHub bundles start failing with
+`Timestamp(SigningCertificate)`: that is the refusal a stale file gives,
+because its last window has no end and so holds the new time, but its
+TSA leaf did not sign the new token.
+
+A refresh of GitHub's root makes, while v9 is current, 4 requests when
+the file is current and 5 when it changed (the probe for the next root,
+timestamp, snapshot, targets, the file), to `tuf-repo.github.com` only,
+plus the CRL fetches of its certificate chain (`yr1.c.lencr.org`,
+`yr.c.lencr.org` on 2026-11-26). It never fetches the six
+`prod-*.trusted_root.json` roots of GHE.com tenants the repository also
+lists.
+
+**Changing the pin.** A rotation of GitHub's root never changes the pin:
+every new root is verified against the one before it and stored in
+`tuf/root.json`. To change the pin on purpose (for example after GitHub
+reset its repository, which fails every refresh at `Root` or
+`Timestamp`):
+
+1. Make sure no refresh runs.
+2. Remove only `<trust base>/github/tuf/`: never `lock`, and never the
+   Sigstore directory.
+3. Set the new root and pin in the configuration.
+4. Run the refresh; it bootstraps from the new pin.
+
+Until then every run fails at `InitialRoot` ("set up from another initial
+root") and the old `trusted_root.json` stays in place.
 
 ## Live test
 
@@ -193,7 +279,9 @@ capture that passes the check above.
 cargo test -p boneli-tuf --test network -- --ignored --nocapture
 ```
 
-It refreshes from the pinned root v16 into an empty trust directory under
-the temporary directory and once more, which must find the file current,
-and prints the versions and the file's SHA-256. CI runs it weekly in the
-`oci-acceptance` workflow on x86_64 and arm64.
+It refreshes Sigstore's root from the pinned v16 and GitHub's from the
+pinned v3, each into an empty trust directory under the temporary
+directory and once more, which must find the file current, and prints
+the versions and the file's SHA-256. GitHub's installed file must verify
+two captured private-repository attestations under the no-log opt-in. CI
+runs it weekly in the `oci-acceptance` workflow on x86_64 and arm64.

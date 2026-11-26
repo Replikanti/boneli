@@ -1,0 +1,84 @@
+{
+ "signatures": [
+  {
+   "keyid": "54809115b40137aac01af4b7ac2408c77ea0d58fa4dad48fc3196497d2a26f44",
+   "sig": ""
+  },
+  {
+   "keyid": "8b498a80a1b7af188c10c9abdf6aade81d14faaffcde2abcd6063baa673ebd12",
+   "sig": "3044022100eb105f88347fd534a9c88419995b14337fe074f354aa38a93d08946f73ce9f2c021f3c580d40fa63ceea9ddb45a8273a7a7595f34322290d240c73a93c257ac8a1"
+  },
+  {
+   "keyid": "56db9f7d64bef1feab6190760336643b20196af4875ee8be915e78f239863aae",
+   "sig": "3046022100f4ff8080f8c1ee2d279ddc7206be4ebbec8c8a69dee97bafb91a0074b51b7c230221009c74f08d31339c6ee9dcd86a9bfb65153c107be433f740aba552b8cc1e9dd409"
+  },
+  {
+   "keyid": "d6a89e23fb22801a0d1186bf1bdd007e228f65a8aa9964d24d06cb5fbb0ce91c",
+   "sig": "3046022100aeac69f089b6a4d2a4277e3b40b33734ec61f5372526c75151bab9807514e8b6022100e25b7db4cb422efafcb48ce5762e1112d3bedc540ba9a96b33184d2d404184d6"
+  },
+  {
+   "keyid": "a10513a5ab61acd0c6b6fbe0504856ead18f3b17c4fabbe3fa848c79a5a187cf",
+   "sig": "3045022100df3dedb518eb2e791d2925c5d175073175138ae8f5736dae4acda9705b7de62102205e329e773f19b166cb3d36c76bb1b3cdce8f073db0ba87fe51c22402aef1d061"
+  },
+  {
+   "keyid": "1b8fa2a77525b38ef24804d3d907ca96f76d178a49520333626ba36d319c5790",
+   "sig": "3046022100cba9dd5b2f0a478fe316bcfdc52084bf7836b908c1f84f633cac2bec4c649a25022100cf555a05603bfdc1ec519cd599f683112863f78ad8aef0039523a2e759ced09f"
+  },
+  {
+   "keyid": "88737ccdac7b49cc237e9aaead81be2a40278b886a693d8149a19cf543f093d3",
+   "sig": "304502200fa90cd79ba94d398eef811a98ec8c20c0bad571cde1234b280800339920c262022100c6f6aac668d64796f9ec8b236d9d8bb9153406d59190518064efcba28e88a255"
+  }
+ ],
+ "signed": {
+  "_type": "targets",
+  "expires": "2027-02-08T01:48:44Z",
+  "spec_version": "1.0.31",
+  "targets": {
+   "prod-ae-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "97190cc8a64240f8edf6b31fa9cf3f30ab01fd7be78dcd87b89e04db2669bbc5"
+    },
+    "length": 21275
+   },
+   "prod-cus-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "1c015c3da87f78949cffb4ced2bc3c59132d9c6529c6df9ff72e294126e9aed7"
+    },
+    "length": 21279
+   },
+   "prod-jpw-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "5001f277a59c749f7941e59da1eab938f3bb10ecabb858de36eadc58682b349f"
+    },
+    "length": 10673
+   },
+   "prod-sdc-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "d2e9f639d1bfdf2902b7ded13e3236861d9e125b1cacb5ebea803f0069c2fa15"
+    },
+    "length": 21279
+   },
+   "prod-weu-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "3a875d484ecf9843d4a4ba64cc13ff679eae282a50a4a3e8361b9cb2d96c58ae"
+    },
+    "length": 26576
+   },
+   "prod-wus3-01.trusted_root.json": {
+    "hashes": {
+     "sha256": "059b14df7aeb669add3949a37e9fd1df4b8de327eef2d1108214470cc949ba80"
+    },
+    "length": 10667
+   },
+   "trusted_root.json": {
+    "hashes": {
+     "sha256": "484cdfe1a7c65479c5ba2a22193d1be90f0020db1997de696ab207434c62fbb7"
+    },
+    "length": 31645
+   }
+  },
+  "version": 10,
+  "x-tuf-on-ci-expiry-period": 240,
+  "x-tuf-on-ci-signing-period": 60
+ }
+}

@@ -13,7 +13,16 @@
 //! anew with mode 0600, then `sync_all`, a rename over the final name and
 //! a sync of the directory, so a reader sees the old file or the new one,
 //! never a part, and a crash leaves at most a temporary file that the next
-//! refresh removes under the lock.
+//! refresh removes under the lock, once the pin check has passed: a
+//! directory set up from another pin keeps even those (ADR-041, R1).
+//!
+//! No component of a trust directory's path is a `tuf` entry (ADR-041,
+//! R2): its name is not `tuf` in any ASCII case, and it is not the entry
+//! its parent's `tuf` names, which catches what a case-folding filesystem
+//! folds to `tuf`. So no trust directory is another's `tuf/` or lies
+//! inside it, where the other refresh's sweep or the documented remedy
+//! (remove `tuf/`) would reach it. The rule runs on the path as given, as
+//! it would be created and as resolved, before anything is created.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -90,10 +99,12 @@ impl TrustDir {
     /// component, `0o700` and the caller's, every ancestor not writable by
     /// others unless sticky), creating it where it is missing; takes the
     /// exclusive lock on `<dir>/lock` without waiting; creates `tuf/`;
-    /// records the identities of the three; then removes what a crashed
-    /// run left.
+    /// records the identities of the three. `dir` must pass the `tuf` rule
+    /// of ADR-041 (R2) in each form `prepare_root` checks. What a crashed
+    /// run left is removed by [`sweep`](Self::sweep), which the refresh
+    /// calls after the pin check.
     pub(crate) fn open(dir: &Path) -> Result<TrustDir, OpenError> {
-        let root = boneli_private_dir::prepare_root(dir, &|_| Ok(()))
+        let root = boneli_private_dir::prepare_root(dir, &tuf_rule)
             .map_err(|e| OpenError::Dir(e.to_string()))?;
         let lock_path = root.join(LOCK);
         let file = OpenOptions::new()
@@ -138,14 +149,19 @@ impl TrustDir {
             held,
             _lock: lock,
         };
-        // A directory replaced between the lock and here is not swept.
-        dir.check_held().map_err(|e| match e {
-            StateError::Replaced(why) => OpenError::Dir(why.to_string()),
-            StateError::Io(e) => dir_err(&dir.root, &e),
-        })?;
-        sweep(&dir.root).map_err(|e| dir_err(&dir.root, &e))?;
-        sweep(&dir.tuf).map_err(|e| dir_err(&dir.tuf, &e))?;
         Ok(dir)
+    }
+
+    /// Removes what a crashed run left: every name with the temporary
+    /// prefix in the trust directory and in `tuf/`, not recursively. A
+    /// directory replaced since the lock is not swept. The refresh calls
+    /// it after the pin check and before its first write, whose
+    /// `create_new` a leftover temporary file would fail (ADR-041, R1).
+    pub(crate) fn sweep(&self) -> Result<(), StateError> {
+        self.check_held()?;
+        sweep(&self.root)?;
+        sweep(&self.tuf)?;
+        Ok(())
     }
 
     /// Fails with [`StateError::Replaced`] when the trust directory,
@@ -235,6 +251,68 @@ fn dir_err(path: &Path, e: &io::Error) -> OpenError {
     OpenError::Dir(format!("{}: {e}", path.display()))
 }
 
+/// The reasons of the `tuf` rule (ADR-041, R2).
+const IS_TUF: &str = "must not be, or lie inside, a directory named tuf: that name holds a \
+     trust directory's TUF state (ADR-041)";
+const TUF_UNCHECKED: &str = "a component of the path could not be compared with its parent's \
+     tuf entry, so the tuf rule cannot pass (ADR-041)";
+
+/// What the `tuf` rule knows of one component of a path: its name, and
+/// the identity of the component and of its parent's `tuf` entry, each
+/// `Ok(None)` when missing and `Err(())` when it could not be read.
+#[derive(Clone, Copy, Debug)]
+struct Component<'a> {
+    name: &'a [u8],
+    identity: Result<Option<Identity>, ()>,
+    parent_tuf: Result<Option<Identity>, ()>,
+}
+
+/// The `tuf` rule of ADR-041 (R2) as `prepare_root`'s text rule: no
+/// component of `path` other than `/` is a `tuf` entry. `prepare_root`
+/// calls it on the path as given, as it would be created and as
+/// resolved, so a refused path is never created.
+fn tuf_rule(path: &Path) -> Result<(), &'static str> {
+    tuf_problem(path.ancestors().filter_map(|at| {
+        let name = at.file_name()?;
+        let parent_tuf = at.parent().map_or(Ok(None), |p| stat(&p.join(TUF)));
+        Some(Component {
+            name: name.as_encoded_bytes(),
+            identity: stat(at),
+            parent_tuf,
+        })
+    }))
+}
+
+/// The decision of the `tuf` rule over the facts of each component: a
+/// name equal to `tuf` ignoring ASCII case, or the entry the parent's
+/// `tuf` names, refuses; so does a component whose facts could not be
+/// read (fail closed).
+fn tuf_problem<'a>(
+    components: impl IntoIterator<Item = Component<'a>>,
+) -> Result<(), &'static str> {
+    for c in components {
+        if c.name.eq_ignore_ascii_case(TUF.as_bytes()) {
+            return Err(IS_TUF);
+        }
+        match (c.identity, c.parent_tuf) {
+            (Err(()), _) | (_, Err(())) => return Err(TUF_UNCHECKED),
+            (Ok(Some(it)), Ok(Some(tuf))) if it == tuf => return Err(IS_TUF),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The identity of `path` itself, a symlink not followed: `Ok(None)` when
+/// it is missing, `Err(())` on any other failure.
+fn stat(path: &Path) -> Result<Option<Identity>, ()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(identity(&meta))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 /// Removes every file in `dir` whose name starts with [`TEMP_PREFIX`]. A
 /// name whose removal fails stays: it is never read, and failing the
 /// refresh for it would leave the directory stuck until removed by hand.
@@ -293,4 +371,123 @@ fn write_durably(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A component named `name` whose identity is `it` and whose parent's
+    /// `tuf` entry is `tuf`.
+    fn c(
+        name: &[u8],
+        it: Result<Option<Identity>, ()>,
+        tuf: Result<Option<Identity>, ()>,
+    ) -> Component<'_> {
+        Component {
+            name,
+            identity: it,
+            parent_tuf: tuf,
+        }
+    }
+
+    /// A component that exists and is not its parent's `tuf` entry.
+    fn plain(name: &[u8]) -> Component<'_> {
+        c(name, Ok(Some((1, 10))), Ok(Some((1, 11))))
+    }
+
+    #[test]
+    fn tuf_rule_by_name() {
+        assert_eq!(tuf_problem([]), Ok(()));
+        assert_eq!(tuf_problem([plain(b"trust"), plain(b"home")]), Ok(()));
+        for name in [&b"tuf"[..], b"TUF", b"Tuf", b"tUf", b"tuF"] {
+            // As the last component, as an ancestor, existing or missing.
+            assert_eq!(tuf_problem([plain(name)]), Err(IS_TUF), "{name:?}");
+            assert_eq!(
+                tuf_problem([plain(b"github"), plain(name), plain(b"base")]),
+                Err(IS_TUF),
+                "{name:?}"
+            );
+            assert_eq!(
+                tuf_problem([c(name, Ok(None), Ok(None))]),
+                Err(IS_TUF),
+                "{name:?}"
+            );
+        }
+        for name in [
+            &b"tuff"[..],
+            b".tuf",
+            b"tuf.d",
+            b"tu",
+            b"tu\xff",
+            "tuf\u{200b}".as_bytes(),
+            "\u{ff54}\u{ff55}\u{ff46}".as_bytes(),
+        ] {
+            assert_eq!(tuf_problem([plain(name)]), Ok(()), "{name:?}");
+        }
+        // Missing components and missing parents' entries pass.
+        assert_eq!(
+            tuf_problem([
+                c(b"github", Ok(None), Ok(None)),
+                c(b"base", Ok(Some((1, 3))), Ok(None)),
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tuf_rule_by_identity() {
+        // What a case-folding filesystem resolves to the parent's `tuf`.
+        for name in [&b"TUF"[..], "tu\u{200d}f".as_bytes(), b"github"] {
+            let same = c(name, Ok(Some((7, 42))), Ok(Some((7, 42))));
+            assert_eq!(tuf_problem([same]), Err(IS_TUF), "{name:?}");
+            assert_eq!(
+                tuf_problem([plain(b"x"), same, plain(b"base")]),
+                Err(IS_TUF),
+                "{name:?}"
+            );
+        }
+        // Same inode on another device, or another inode: not the entry.
+        for other in [(8, 42), (7, 43)] {
+            assert_eq!(
+                tuf_problem([c(b"github", Ok(Some((7, 42))), Ok(Some(other)))]),
+                Ok(())
+            );
+        }
+        // A fact that could not be read refuses, never passes.
+        for unread in [
+            c(b"github", Err(()), Ok(None)),
+            c(b"github", Ok(Some((1, 2))), Err(())),
+            c(b"github", Err(()), Err(())),
+        ] {
+            assert_eq!(tuf_problem([unread]), Err(TUF_UNCHECKED));
+            assert_eq!(
+                tuf_problem([plain(b"x"), unread, plain(b"base")]),
+                Err(TUF_UNCHECKED)
+            );
+        }
+    }
+
+    /// The facts `tuf_rule` gathers on a real filesystem: a missing path
+    /// passes, an entry under a regular file is refused (its stat fails
+    /// with `ENOTDIR`), and the parent's `tuf` itself is refused by name.
+    #[test]
+    fn tuf_rule_on_paths() {
+        let base = std::env::temp_dir().join(format!("boneli-tuf-rule-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("tuf")).expect("dirs");
+        fs::write(base.join("file"), b"").expect("file");
+        let outcome = [
+            tuf_rule(&base.join("missing/trust")),
+            tuf_rule(&base.join("file/trust")),
+            tuf_rule(&base.join("tuf")),
+            tuf_rule(&base.join("tuf/trust")),
+            tuf_rule(&base.join("trust")),
+        ];
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            outcome,
+            [Ok(()), Err(TUF_UNCHECKED), Err(IS_TUF), Err(IS_TUF), Ok(())]
+        );
+    }
 }

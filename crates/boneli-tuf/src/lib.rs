@@ -1,6 +1,9 @@
 //! A client for Sigstore's TUF repository that keeps the operator's
 //! `trusted_root.json` current (ADR-033), written here because every TUF
-//! crate pulls crates that `deny.toml` bans.
+//! crate pulls crates that `deny.toml` bans. The same client keeps
+//! GitHub's private-repository root current from GitHub's TUF repository
+//! `tuf-repo.github.com`, with its own pin and its own trust directory, so
+//! a refresh of one root never touches the other's files (ADR-041).
 //!
 //! The workflow is the TUF specification's (5.1 to 5.7), top-level roles
 //! only. [`refresh_trusted_root`] runs it: it fetches each file through

@@ -7,11 +7,14 @@
 //! trickle. Every dial and every request is recorded.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use boneli_http::{Headers, RequestHead, ResponseHead, Target};
 use boneli_https::{Dial, Sha256, Stream};
@@ -386,4 +389,65 @@ pub fn fixture() -> (Server, InitialRoot, Published) {
     let server = Server::new();
     let published = publish(&server, 1, real::TRUSTED_ROOT);
     (server, pinned(&root_v1()), published)
+}
+
+/// The fixture root of the second trust root (ADR-041): the default root
+/// v1 with another `expires`, so another pin over the same test keys.
+pub fn github_root_v1() -> Vec<u8> {
+    let mut root = RootBuilder::new(1);
+    root.expires = "2030-01-02T00:00:00Z".to_string();
+    root.bytes()
+}
+
+/// A server for the second trust root: version 1 of everything with
+/// GitHub's real trusted root as the target, and [`github_root_v1`]
+/// pinned as the initial root.
+pub fn github_fixture() -> (Server, InitialRoot, Published) {
+    let server = Server::new();
+    let published = publish(&server, 1, real::GITHUB_TRUSTED_ROOT);
+    (server, pinned(&github_root_v1()), published)
+}
+
+/// One entry of [`tree`]: the SHA-256 of its bytes (a file's content, a
+/// symlink's target, nothing for a directory), its inode and its mtime.
+pub type Entry = ([u8; 32], u64, SystemTime);
+
+/// Every entry under `dir`, by path relative to it, recursively and
+/// without following a symlink; empty when `dir` is missing. What the
+/// "untouched" assertions compare.
+pub fn tree(dir: &Path) -> BTreeMap<PathBuf, Entry> {
+    fn walk(base: &Path, at: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+        let Ok(entries) = fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("an entry").path();
+            let meta = fs::symlink_metadata(&path).expect("its metadata");
+            let bytes = if meta.is_dir() {
+                Vec::new()
+            } else if meta.file_type().is_symlink() {
+                fs::read_link(&path)
+                    .expect("its target")
+                    .into_os_string()
+                    .into_encoded_bytes()
+            } else {
+                fs::read(&path).expect("its bytes")
+            };
+            let rel = path.strip_prefix(base).expect("under base").to_path_buf();
+            out.insert(
+                rel,
+                (
+                    Sha256::digest(&bytes),
+                    meta.ino(),
+                    meta.modified().expect("an mtime"),
+                ),
+            );
+            if meta.is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
 }
