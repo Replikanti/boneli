@@ -1,6 +1,6 @@
 # ADR-041: GitHub's trusted root through TUF
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-26
 
 ## Context
@@ -284,3 +284,12 @@ mutants, 13 killed, each by an assertion of the named test:
 - `check_held` dropped (`github_tuf_removed_during_refresh`); the lock
   file at the trust directory's parent, shared by siblings
   (`github_lock_is_its_own`).
+
+**Accepted.** The pull request's own `oci-acceptance` run,
+https://github.com/Replikanti/boneli/actions/runs/45905779127, passed on
+x86_64 and arm64. `github_refresh_live` refreshed from the pin v3 to
+root v9, timestamp v1027, snapshot v84 and targets v10 (first run 1.34 s
+on x86_64 and 0.50 s on arm64), installed the 31,645-byte file with
+SHA-256 `484cdfe1…`, byte for byte the captured fixture, verified K1 and
+K2 under it, and found it current on the second run. Sigstore's refresh
+and the pull tests passed beside it.

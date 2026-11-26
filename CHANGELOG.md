@@ -1023,7 +1023,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   trusted root are known answers; `docs/sigstore-trust.md` covers
   capturing that root by hand (its TUF refresh is #137). No new crate or
   dependency edge.
-- GitHub's trusted root through TUF (#137, ADR-041): `boneli-tuf`
+- GitHub's trusted root through TUF (#137, ADR-041, accepted): `boneli-tuf`
   refreshes GitHub's private-repository `trusted_root.json` from
   `tuf-repo.github.com` with no change to the TUF client, from the pinned
   GitHub root v3 (SHA-256 `98cba97b…`, byte for byte the root `cli/cli`
