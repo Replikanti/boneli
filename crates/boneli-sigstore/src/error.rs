@@ -64,7 +64,8 @@ pub enum Refusal {
     NoCertificate,
     /// A keyless signature needs exactly one transparency log entry: a
     /// Rekor v1 entry with its inclusion promise, or a Rekor v2 entry with
-    /// its inclusion proof (ADR-038, D2).
+    /// its inclusion proof (ADR-038, D2). Under the no-log opt-in a
+    /// bundle needs none at all (ADR-040, D2).
     TlogEntries,
     /// The integrated time is too large to compare in milliseconds (a
     /// negative one, or one above `i64`, does not parse).
@@ -96,7 +97,9 @@ pub enum Refusal {
     /// verified time: the integrated time or a timestamp's (ADR-038).
     NoCaAtTime,
     /// A keyless signature has neither a Rekor v1 inclusion promise nor
-    /// an RFC 3161 timestamp that verifies (ADR-038, D1).
+    /// an RFC 3161 timestamp that verifies (ADR-038, D1); under the no-log
+    /// opt-in, no timestamp verifies or the evidence is a cosign layer,
+    /// whose timestamps are not read (ADR-040, D2).
     NoTimeSource,
     /// No timestamp authority of the trusted root is valid at a token's
     /// genTime.
@@ -309,6 +312,23 @@ pub enum ConfigError {
     /// least `<scheme>://<host>/<owner>/`, nor a `git+` repository material
     /// whose repository names one (ADR-036, item 4).
     ClaimsWithoutSource,
+    /// The no-log opt-in was asked for on a trust without a keyless part
+    /// (ADR-040, D1).
+    NoLogWithoutKeyless,
+    /// The no-log opt-in was asked for on a trusted root that lists a
+    /// Rekor log (v1, v2 or one left out) or a CT log.
+    NoLogRootHasLogs,
+    /// The no-log opt-in was asked for on a trusted root with no usable
+    /// timestamp authority, the only time source it leaves.
+    NoLogRootWithoutTsa,
+    /// The no-log opt-in was asked for with a SAN prefix that does not
+    /// name an owner (`<scheme>://<host>/<owner>/` at least).
+    NoLogIdentityWithoutOwner,
+    /// The no-log opt-in was asked for on a trust without certificate
+    /// claims that bind the source repository (an exact 1.12 rule, a 1.12
+    /// prefix naming an owner, or a 1.15 repository ID), or such claims
+    /// were replaced by ones that do not (ADR-040, D1).
+    NoLogWithoutRepository,
 }
 
 impl fmt::Display for ConfigError {
@@ -362,6 +382,21 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::WorkflowPathWithoutRepository => {
                 "a workflow path needs a source repository rule or a repository ID"
+            }
+            ConfigError::NoLogWithoutKeyless => {
+                "a trust without a transparency log needs a keyless part"
+            }
+            ConfigError::NoLogRootHasLogs => {
+                "a trust without a transparency log needs a trusted root that lists no Rekor or CT log"
+            }
+            ConfigError::NoLogRootWithoutTsa => {
+                "a trust without a transparency log needs a trusted root with a timestamp authority"
+            }
+            ConfigError::NoLogIdentityWithoutOwner => {
+                "a trust without a transparency log needs every SAN prefix to name an owner"
+            }
+            ConfigError::NoLogWithoutRepository => {
+                "a trust without a transparency log needs certificate claims, set first, that bind the source repository by URI or ID"
             }
         })
     }

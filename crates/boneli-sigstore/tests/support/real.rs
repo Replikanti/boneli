@@ -431,3 +431,80 @@ pub fn trillian() -> Evidence {
 pub fn trillian_identity() -> Identity {
     Identity::new(GITHUB_ACTIONS, SanRule::Uri(TRILLIAN_WORKFLOW.to_owned())).expect("identity")
 }
+
+// ---- GitHub's private-repository instance (ADR-040) ----------------------
+
+/// GitHub's own trusted root, the line of `gh attestation trusted-root`
+/// whose first CA is `fulcio.githubapp.com`: no Rekor or CT log, 6 Fulcio
+/// CAs and 6 TSAs, each a 3-certificate chain (`tests/data/README.md`).
+pub const GITHUB_ROOT: &[u8] = include_bytes!("../data/github-trusted-root.json");
+/// K1: the attest-demo bundle cli/cli keeps as a test fixture (MIT), from
+/// the private `actions/attest-demo`, CA and TSA window 0.
+pub const ATTEST_DEMO_BUNDLE: &[u8] = include_bytes!("../data/attest-demo-0.0.12.bundle.json");
+/// K2: the bundle of GitHub's prober of its instance in the MIT
+/// `actions/attest-build-provenance`, CA and TSA window 4.
+pub const PROBER_BUNDLE: &[u8] = include_bytes!("../data/attest-prober-github.bundle.json");
+
+/// The SHA-256 of the three files, as `tests/data/README.md` lists them.
+pub const GITHUB_ROOT_SHA256: [u8; 32] =
+    hex32("26b3382d5700afbcd84f980d1d5b6c52bff743dc2a8ee86b8b44c8e1245ce485");
+pub const ATTEST_DEMO_BUNDLE_SHA256: [u8; 32] =
+    hex32("4f8c096e38a0eee242574ab100d16701928605409225e59784a3636f742bb27e");
+pub const PROBER_BUNDLE_SHA256: [u8; 32] =
+    hex32("3a5c9bbb1f1e2e0950da9007d9379d54e59e53daaeef65897bfaf33bbb45e064");
+
+/// The statements' subjects: the attest-demo wheel and the prober's
+/// artifact.
+pub const ATTEST_DEMO_DIGEST: [u8; 32] =
+    hex32("ae57936def59bc4c75edd3a837d89bcefc6d3a5e31d55a6fa7a71624f92c3c3b");
+pub const PROBER_DIGEST: [u8; 32] =
+    hex32("f4a0d47c6bdbf3bdbe3478a043b7030fcef5fdf34be90d841891803c2efe9fc5");
+
+/// The SANs of the two leaves. In K1's, `\x79` is a `y`: the workflow
+/// file is named after an interpreter, a name CI refuses in tracked files
+/// (ADR-015, D10).
+pub const ATTEST_DEMO_WORKFLOW: &str =
+    "https://github.com/actions/attest-demo/.github/workflows/build-p\x79thon.yml@refs/heads/main";
+pub const PROBER_WORKFLOW: &str = "https://github.com/actions/attest-build-provenance/.github/workflows/prober.yml@refs/heads/main";
+/// What Fulcio wrote into the attest-demo leaf: 1.12, 1.15 and 1.20.
+pub const ATTEST_DEMO_REPOSITORY: &str = "https://github.com/actions/attest-demo";
+pub const ATTEST_DEMO_REPOSITORY_ID: &str = "763287532";
+pub const ATTEST_DEMO_TRIGGER: &str = "workflow_dispatch";
+/// And into the prober leaf. Its SAN (1.9) is `prober.yml`, the workflow
+/// that signed, while its Build Config URI (1.18) is `prober-github.yml`,
+/// the one the run started: a SAN need not name the run's entry point.
+pub const PROBER_REPOSITORY: &str = "https://github.com/actions/attest-build-provenance";
+pub const PROBER_REPOSITORY_ID: &str = "760702757";
+pub const PROBER_TRIGGER: &str = "schedule";
+
+/// Each token's genTime, which equals its leaf's notBefore.
+pub const ATTEST_DEMO_TIME: u64 = 1_713_807_206;
+pub const PROBER_TIME: u64 = 1_763_712_806;
+
+pub fn github_root_value() -> Value {
+    json(GITHUB_ROOT)
+}
+
+pub fn github_root() -> Arc<TrustedRoot> {
+    Arc::new(TrustedRoot::from_json(GITHUB_ROOT).expect("GitHub root"))
+}
+
+pub fn attest_demo() -> Evidence {
+    Evidence::from_bundle(ATTEST_DEMO_BUNDLE).expect("attest-demo bundle")
+}
+
+pub fn prober() -> Evidence {
+    Evidence::from_bundle(PROBER_BUNDLE).expect("prober bundle")
+}
+
+pub fn attest_demo_identity() -> Identity {
+    Identity::new(
+        GITHUB_ACTIONS,
+        SanRule::Uri(ATTEST_DEMO_WORKFLOW.to_owned()),
+    )
+    .expect("identity")
+}
+
+pub fn prober_identity() -> Identity {
+    Identity::new(GITHUB_ACTIONS, SanRule::Uri(PROBER_WORKFLOW.to_owned())).expect("identity")
+}

@@ -872,3 +872,76 @@ openssl pkey -in test-only-tsa.key -pubout -out test-only-tsa.pub.pem
 
 The test key is test-only and signs nothing outside these tests; the
 same key is in `crates/boneli-sigstore/tests/data/`.
+
+### GitHub's Fulcio and TSA (`tests/codesign.rs`, `tests/timestamp.rs`, ADR-040)
+
+The certificates of GitHub's private-repository instance and the tokens
+of its two committed bundles (K1, attest-demo, window 0; K2, GitHub's
+prober, window 4), captured on 2026-11-26 from
+`crates/boneli-sigstore/tests/data/` (`github-trusted-root.json`,
+`attest-demo-0.0.12.bundle.json`, `attest-prober-github.bundle.json`,
+whose README names their sources). Each leaf verifies with OpenSSL
+through l2 and l1 at its genTime (`openssl verify -purpose codesign
+-CAfile github-root.pem -untrusted <l2 + l1> -attime <genTime>`), and each
+token through its window's TSA leaf (`openssl ts -verify -CAfile
+github-root.pem -untrusted <leaf + intermediate> -attime <genTime>`).
+
+| File | SHA-256 | What |
+| --- | --- | --- |
+| `github-root.pem` | `6d6734c7…3beec26e` | "Internal Services Root" (O=GitHub, Inc.), 2023-08-07 to 2033-08-04, `CA:TRUE, pathlen:2`: the anchor of all 12 chains |
+| `github-fulcio-l1.pem` | `3094cea7…cbc03148` | "Fulcio Intermediate l1", 2023-09-11 to 2028-09-09, `CA:TRUE, pathlen:1`, **no EKU**: the second certificate of every CA entry |
+| `github-fulcio-0-l2.pem` | `82f6e41e…9c10c8f3` | "Fulcio Intermediate l2" of CA window 0, 2023-09-12 to 2024-09-11, EKU codeSigning, `pathlen:0` |
+| `github-fulcio-3-l2.pem` | `d6eaae55…4369d88b` | the same name in window 3, 2025-05-27 to 2026-05-27, another key |
+| `github-fulcio-4-l2.pem` | `7e157d19…e50a2d4d` | the same name in window 4, 2025-11-13 to 2026-11-13 |
+| `github-tsa-intermediate.pem` | `ebfcb01e…99c96eac` | "TSA intermediate", 2023-08-07 to 2028-08-05, EKU timeStamping: the second certificate of every TSA entry |
+| `github-tsa-0-leaf.pem` | `ddac887c…a31e78cc` | "TSA Timestamping" of TSA window 0, 2023-08-31 to 2024-08-30, EKU timeStamping (critical) |
+| `github-tsa-4-leaf.pem` | `61cbc008…b0a1e44d` | the same name in window 4, 2025-11-13 to 2026-11-13 |
+| `github-leaf-attest-demo.pem` | `9916d4b8…4038072a` | K1's leaf, SAN the URI of `actions/attest-demo`'s build workflow at `refs/heads/main` (`tests/codesign.rs` has it whole), 2024-04-22 17:33:26 to 17:43:26 UTC, no SCT list |
+| `github-leaf-prober.pem` | `79fabbc5…c11f98c0` | K2's leaf, SAN `URI:https://github.com/actions/attest-build-provenance/.github/workflows/prober.yml@refs/heads/main`, 2025-11-21 08:13:26 to 08:23:26 UTC, no SCT list |
+| `tsa-github-attest-demo.tsr`, `.sig` | `c2754515…4e6d94e3` | K1's token (SHA-384, `ecdsa-with-SHA384`, genTime 1713807206) and the DSSE signature it is over |
+| `tsa-github-prober.tsr`, `.sig` | `42ba708d…68cb087e` | K2's token (genTime 1763712806) and its signed bytes |
+| `tsa-p256-sha384.tsr` | `5ab67998…b2841a2a` | a synthetic token OpenSSL made over `the DSSE signature bytes` (genTime 1795648254), signed P-256 `ecdsa-with-SHA384` by `test-only-tsa.key`: the pairing the SHA-384 triple refuses, which ring cannot sign at test time |
+| `tsa-p256-sha384-leaf.pem` | `22d60115…64719bda` | its TSA leaf, P-256, issued by the code-signing test intermediate's key (`test-only-codesign-ca.key`), 2026-01-01 to 2126-01-01, keyUsage digitalSignature and EKU timeStamping, both critical |
+
+The SHA-256 is the token's for the `.tsr`/`.sig` rows. From the three
+GitHub files in the current directory, with `jq`:
+
+```sh
+R=github-trusted-root.json
+tsa() { jq -r ".timestampAuthorities[$1].certChain.certificates[$2].rawBytes" $R |
+  base64 -d | openssl x509 -inform DER -out "$3"; }
+ca() { jq -r ".certificateAuthorities[$1].certChain.certificates[$2].rawBytes" $R |
+  base64 -d | openssl x509 -inform DER -out "$3"; }
+tsa 0 0 github-tsa-0-leaf.pem; tsa 4 0 github-tsa-4-leaf.pem
+tsa 0 1 github-tsa-intermediate.pem; ca 0 2 github-root.pem; ca 0 1 github-fulcio-l1.pem
+ca 0 0 github-fulcio-0-l2.pem; ca 3 0 github-fulcio-3-l2.pem; ca 4 0 github-fulcio-4-l2.pem
+token() { # bundle, name
+  jq -r '.verificationMaterial.timestampVerificationData.rfc3161Timestamps[0].signedTimestamp' "$1" |
+    base64 -d > "tsa-$2.tsr"
+  jq -r '.dsseEnvelope.signatures[0].sig' "$1" | base64 -d > "tsa-$2.sig"
+}
+token attest-demo-0.0.12.bundle.json github-attest-demo
+token attest-prober-github.bundle.json github-prober
+leaf() { jq -r '.verificationMaterial.certificate.rawBytes' "$1" |
+  base64 -d | openssl x509 -inform DER -out "$2"; }
+leaf attest-demo-0.0.12.bundle.json github-leaf-attest-demo.pem
+leaf attest-prober-github.bundle.json github-leaf-prober.pem
+```
+
+The synthetic token, from this directory, with OpenSSL 3.5 (`ts.cnf`
+sets `signer_digest = sha384`, `digests = sha256`, `ess_cert_id_alg =
+sha256`, `accuracy = secs:1`, `ordering = no`, `tsa_name = no` and the
+policy `1.3.6.1.4.1.57264.2`):
+
+```sh
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\nbasicConstraints=critical,CA:FALSE\n' > leaf.ext
+openssl req -new -key test-only-tsa.key -subj "/CN=Boneli test TSA P-256 SHA-384" |
+  openssl x509 -req -CA codesign-intermediate.pem -CAkey test-only-codesign-ca.key \
+    -set_serial 12 -not_before 20260101000000Z -not_after 21260101000000Z \
+    -extfile leaf.ext -sha384 -out tsa-p256-sha384-leaf.pem
+printf 'the DSSE signature bytes' > msg
+openssl ts -query -data msg -sha256 -no_nonce -out q.tsq
+openssl ts -reply -config ts.cnf -queryfile q.tsq -signer tsa-p256-sha384-leaf.pem \
+  -inkey test-only-tsa.key -out tsa-p256-sha384.tsr
+rm leaf.ext msg q.tsq
+```

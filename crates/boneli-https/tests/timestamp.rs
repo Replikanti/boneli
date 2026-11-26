@@ -115,3 +115,55 @@ fn real_tokens_refuse_other_inputs() {
         }
     }
 }
+
+/// GitHub's TSA (ADR-040, D5): the tokens of the two committed
+/// GitHub-instance bundles, SHA-384 with `ecdsa-with-SHA384` by a P-384
+/// leaf, each verifies through the TSA chain of its own window
+/// (`tests/data/README.md`): leaf, `TSA intermediate`, `Internal Services
+/// Root`. Against the other window's leaf, or the public-good TSA, the
+/// token does not name the signer.
+#[test]
+fn real_github_tokens_verify() {
+    const DEMO: (&[u8], &[u8], u64) = (
+        include_bytes!("data/tsa-github-attest-demo.tsr"),
+        include_bytes!("data/tsa-github-attest-demo.sig"),
+        1_713_807_206,
+    );
+    const PROBER: (&[u8], &[u8], u64) = (
+        include_bytes!("data/tsa-github-prober.tsr"),
+        include_bytes!("data/tsa-github-prober.sig"),
+        1_763_712_806,
+    );
+    let leaf_0 = der(include_bytes!("data/github-tsa-0-leaf.pem"));
+    let leaf_4 = der(include_bytes!("data/github-tsa-4-leaf.pem"));
+    let intermediate = der(include_bytes!("data/github-tsa-intermediate.pem"));
+    let root = der(include_bytes!("data/github-root.pem"));
+    for ((token, signed, gen_time), own, other) in
+        [(DEMO, &leaf_0, &leaf_4), (PROBER, &leaf_4, &leaf_0)]
+    {
+        let parsed = TimestampToken::from_response_der(token).expect("token");
+        assert_eq!(parsed.gen_time(), gen_time);
+        assert_eq!(parsed.message_imprint(), &Sha256::digest(signed));
+        assert_eq!(parsed.verify(signed, own, &[&intermediate], &root), Ok(()));
+        assert_eq!(
+            parsed.verify(signed, other, &[&intermediate], &root),
+            Err(TimestampError::SigningCertificate),
+            "{gen_time}"
+        );
+        assert_eq!(
+            parsed.verify(signed, &der(TSA_LEAF), &[], &der(TSA_ROOT)),
+            Err(TimestampError::SigningCertificate),
+            "{gen_time}"
+        );
+        // Without the intermediate there is no path to the root.
+        assert_eq!(
+            parsed.verify(signed, own, &[], &root),
+            Err(TimestampError::Chain(CertError::UnknownIssuer))
+        );
+        // The imprint is over the DSSE signature, not anything near it.
+        assert_eq!(
+            parsed.verify(b"another signature", own, &[&intermediate], &root),
+            Err(TimestampError::Imprint)
+        );
+    }
+}

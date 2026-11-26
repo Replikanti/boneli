@@ -20,6 +20,13 @@
 //! authority of the root verifies (ADR-038); a Rekor v2 entry has no
 //! time, so its bundle needs a timestamp.
 //!
+//! A trust may carry the no-log opt-in ([`Trust::with_no_log`], ADR-040),
+//! only over a root that lists no Rekor or CT log, such as GitHub's
+//! private-repository instance, and with certificate claims that bind the
+//! source repository: its keyless bundles then verify with no
+//! log entry and no SCT, timed by their RFC 3161 timestamps alone, and
+//! pass as [`Accepted::KeylessWithoutLog`].
+//!
 //! A trust may also carry SLSA provenance claims ([`Claims`], ADR-031):
 //! an exact builder ID, a source repository and ref (exact, or a prefix
 //! ending in `/`), and resolved dependencies by URI and digest. Such a
@@ -51,13 +58,15 @@
 //! Out of scope (ADR-029, ADR-038): Rekor v1 inclusion proofs, Rekor v2
 //! `dsse` 0.0.2 entries and v2 entries of leaves other than P-256,
 //! witness cosignatures and consistency proofs, keyless bundles with no
-//! log entry, RFC 3161 timestamps on cosign layers and on keyed
+//! log entry outside the no-log opt-in and keyless cosign layers under it
+//! (ADR-040), RFC 3161 timestamps on cosign layers and on keyed
 //! signatures, fractional genTimes, TSA revocation,
 //! `messageSignature` bundles and bundles before v0.3, Notation, Rekor
 //! `intoto` 0.0.2 entries, and `intoto` entries for bundles or `.sig`
 //! layers (ADR-037), SLSA v0.2 build types other than the container
 //! generator's, certificate claims under issuers other than GitHub
-//! Actions (ADR-034), and keeping `trusted_root.json` current (TUF).
+//! Actions (ADR-034), keeping `trusted_root.json` current (TUF), and
+//! keeping GitHub's no-log root current (#137).
 #![doc(test(attr(forbid(unsafe_code))))]
 
 mod attestation;

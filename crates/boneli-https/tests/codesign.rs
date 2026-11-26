@@ -290,3 +290,75 @@ fn debug_hides_the_identity() {
     assert!(!shown.contains("krel"), "{shown}");
     assert!(!shown.contains("google"), "{shown}");
 }
+
+/// GitHub's Fulcio (ADR-040, D4, `tests/data/README.md`): its leaves
+/// chain through `Fulcio Intermediate l2` (EKU codeSigning) and
+/// `Fulcio Intermediate l1` (no EKU) to `Internal Services Root`, so the
+/// path verifies only with l1 unrestricted. The attest-demo leaf (window
+/// 0) and the prober leaf (window 4) at their genTimes, which equal their
+/// notBefore; the 6 windows share l1 and the root, and each l2 has the
+/// same name and its own key.
+#[test]
+fn github_fulcio_chains_verify() {
+    const ATTEST_DEMO: &[u8] = include_bytes!("data/github-leaf-attest-demo.pem");
+    const PROBER: &[u8] = include_bytes!("data/github-leaf-prober.pem");
+    const ATTEST_DEMO_TIME: u64 = 1_713_807_206;
+    const PROBER_TIME: u64 = 1_763_712_806;
+    let l2 = |window: usize| {
+        der(match window {
+            0 => include_bytes!("data/github-fulcio-0-l2.pem").as_slice(),
+            3 => include_bytes!("data/github-fulcio-3-l2.pem").as_slice(),
+            _ => include_bytes!("data/github-fulcio-4-l2.pem").as_slice(),
+        })
+    };
+    let l1 = der(include_bytes!("data/github-fulcio-l1.pem"));
+    let root = der(include_bytes!("data/github-root.pem"));
+    let check = |leaf: &[u8], window: usize, at: u64| {
+        verify_code_signing(&der(leaf), &[&l2(window), &l1], &[&root], at)
+    };
+    let demo = check(ATTEST_DEMO, 0, ATTEST_DEMO_TIME).expect("attest-demo leaf");
+    // `\x79` is a `y`: the workflow file is named after an interpreter, a
+    // name CI refuses in tracked files (ADR-015, D10).
+    assert_eq!(
+        demo.sans(),
+        &[San::Uri(
+            "https://github.com/actions/attest-demo/.github/workflows/build-p\x79thon.yml@refs/heads/main"
+                .into()
+        )]
+    );
+    assert_eq!(demo.not_before(), ATTEST_DEMO_TIME);
+    assert_eq!(
+        demo.extension(ISSUER_V2),
+        Some(&utf8_string("https://token.actions.githubusercontent.com")[..])
+    );
+    // No SCT list: GitHub's instance has no CT log.
+    assert_eq!(
+        demo.verify_embedded_sct(&[public_good_ct()]),
+        Err(SctError::Missing)
+    );
+    let prober = check(PROBER, 4, PROBER_TIME).expect("prober leaf");
+    assert_eq!(prober.not_before(), PROBER_TIME);
+    // The leaf's validity ends 600 s after notBefore, inclusive.
+    assert!(check(ATTEST_DEMO, 0, ATTEST_DEMO_TIME + 600).is_ok());
+    assert_eq!(
+        check(ATTEST_DEMO, 0, ATTEST_DEMO_TIME + 601).expect_err("refused"),
+        CertError::OutsideValidity
+    );
+    // Window 3's l2 has the same name and another key; window 0's expired
+    // on 2024-09-11.
+    assert_eq!(
+        check(PROBER, 3, PROBER_TIME).expect_err("refused"),
+        CertError::Invalid
+    );
+    assert_eq!(
+        check(PROBER, 0, PROBER_TIME).expect_err("refused"),
+        CertError::OutsideValidity
+    );
+    // Without l1 there is no path; with l1 as the anchor the chain needs
+    // nothing from the root.
+    assert_eq!(
+        verify_code_signing(&der(PROBER), &[&l2(4)], &[&root], PROBER_TIME).expect_err("refused"),
+        CertError::UnknownIssuer
+    );
+    assert!(verify_code_signing(&der(PROBER), &[&l2(4)], &[&l1], PROBER_TIME).is_ok());
+}

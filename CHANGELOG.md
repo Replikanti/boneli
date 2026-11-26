@@ -1003,9 +1003,38 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accepts `kinds = ["normal" | "dev" | "build"]` on an edge record and
   then approves the edge for those dependency kinds only (rule
   `dep-edge`); the `boneli-oci -> rustls` record is dev-only.
+- Keyless bundles without a transparency log (#129, ADR-040, accepted):
+  `boneli_sigstore::Trust::with_no_log()` is a per-trust opt-in under
+  which a keyless bundle with **no** log entry and no SCT verifies, timed
+  by its RFC 3161 timestamps alone (at least one, the chain checked at
+  every one), and reports `Accepted::KeylessWithoutLog`. It is refused
+  when the trust has no keyless part (`NoLogWithoutKeyless`), when the
+  root lists any Rekor log (v1, v2 or one left out) or CT log
+  (`NoLogRootHasLogs`), when the root has no usable timestamp authority
+  (`NoLogRootWithoutTsa`), when a SAN prefix does not name an owner
+  (`NoLogIdentityWithoutOwner`), and unless certificate claims, set
+  first, bind the source repository by an exact or owner-level 1.12 rule
+  or a 1.15 ID (`NoLogWithoutRepository`; the SAN names only the signing
+  workflow, which may be another owner's reusable one). Under it a bundle with a log entry is
+  `TlogEntries` and a keyless cosign layer `NoTimeSource`; without it
+  nothing changes. `boneli_https::TimestampToken` also accepts SHA-384
+  with `ecdsa-with-SHA384` from a P-384 leaf, GitHub's TSA. Two bundles
+  of GitHub's private-repository instance (from MIT sources) and its
+  trusted root are known answers; `docs/sigstore-trust.md` covers
+  capturing that root by hand (its TUF refresh is #137). No new crate or
+  dependency edge.
 
 ### Changed
 
+- A code-signing or TSA chain may pass through an intermediate without
+  an EKU (ADR-040, D4, amending ADR-029 item 7): webpki now checks the
+  purpose with `KeyUsage::required_if_present`, and the leaf itself must
+  still carry an EKU that lists it (`CertError::NotCodeSigning`).
+  GitHub's Fulcio intermediate `l1` has none.
+- **Breaking:** `boneli_sigstore::Accepted` has a variant
+  `KeylessWithoutLog`, and `ConfigError` the variants
+  `NoLogWithoutKeyless`, `NoLogRootHasLogs`, `NoLogRootWithoutTsa`,
+  `NoLogIdentityWithoutOwner` and `NoLogWithoutRepository` (ADR-040).
 - **Breaking:** `boneli_sigstore::Accepted::Keyless` carries
   `integrated_time: Option<u64>` and `signed_timestamps` (ADR-038), and a
   bundle entry without a promise and without a timestamp is now refused

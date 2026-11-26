@@ -133,6 +133,37 @@ The trillian bundle names a fixed index digest; `latest` moves on, so a
 later capture through the tag finds another bundle, and the file above
 stays.
 
+## GitHub's private-repository instance (ADR-040)
+
+GitHub's own Sigstore instance signs the attestations of private
+repositories; its trusted root lists no Rekor and no CT log. Captured on
+2026-11-26 with `gh` and `jq`, from redistributable (MIT) sources only.
+Both bundles verify with OpenSSL against the CA and TSA entry of their
+window (`openssl verify -purpose codesign -attime <genTime>` through l2
+and l1, `openssl ts -verify -attime <genTime>` through the TSA leaf and
+`TSA intermediate`); their tokens, signed bytes and certificates are also
+in `crates/boneli-https/tests/data/` (`tsa-github-*`, `github-*`).
+
+| File | SHA-256 | What |
+| --- | --- | --- |
+| `github-trusted-root.json` | `26b3382d…245ce485` | the line of `gh attestation trusted-root` whose first CA is `fulcio.githubapp.com`, 28,886 bytes: no `tlogs`, no `ctlogs`, 6 `certificateAuthorities` (`Fulcio Intermediate l2` → `Fulcio Intermediate l1` without an EKU → `Internal Services Root`) and 6 `timestampAuthorities` (TSA leaf → `TSA intermediate` → the same root), windows from 2023-10-27, 2024-05-13, 2024-10-07, 2025-05-27, 2025-11-13 and 2026-06-12, the last without an end |
+| `attest-demo-0.0.12.bundle.json` | `4f8c096e…742bb27e` | K1: `pkg/cmd/attestation/test/data/github_provenance_demo-0.0.12-py3-none-any-bundle.jsonl` of `cli/cli` (MIT) at `574e1310720e`, 4,885 bytes: a v0.3 DSSE bundle over SLSA v1 provenance (subject `sha256:ae57936d…f92c3c3b`) from the private `actions/attest-demo`, SAN the URI of its build workflow at `refs/heads/main` (`ATTEST_DEMO_WORKFLOW` in `tests/support/real.rs`), repository ID 763287532, trigger `workflow_dispatch`, no `tlogEntries`, one token (SHA-384, `ecdsa-with-SHA384`, genTime 1713807206 = the leaf's notBefore, CA and TSA window 0), no SCT |
+| `attest-prober-github.bundle.json` | `3a5c9bbb…bb45e064` | K2: the first attestation of `actions/attest-build-provenance` (MIT) for `sha256:f4a0d47c…2efe9fc5`, 4,997 bytes: GitHub's prober of its instance, SAN `https://github.com/actions/attest-build-provenance/.github/workflows/prober.yml@refs/heads/main`, trigger `schedule`, no `tlogEntries`, one token (genTime 1763712806 = the leaf's notBefore, inside windows 3 and 4; only window 4 verifies), no SCT |
+
+`tests/no_log.rs` verifies both under the no-log opt-in and refuses them
+without it. Later captures may differ (GitHub adds a CA and TSA window
+every 147 to 232 days); the files above stay as they are.
+
+```sh
+gh attestation trusted-root |
+  jq -c 'select(.certificateAuthorities[0].uri == "fulcio.githubapp.com")' \
+  > github-trusted-root.json
+gh api 'repos/cli/cli/contents/pkg/cmd/attestation/test/data/github_provenance_demo-0.0.12-py3-none-any-bundle.jsonl?ref=574e1310720e' \
+  --jq .content | base64 -d > attest-demo-0.0.12.bundle.json
+gh api repos/actions/attest-build-provenance/attestations/sha256:f4a0d47c6bdbf3bdbe3478a043b7030fcef5fdf34be90d841891803c2efe9fc5 \
+  --jq '.attestations[0].bundle' > attest-prober-github.bundle.json
+```
+
 ## Synthetic test instance
 
 `tests/support/pki.rs` builds a Sigstore instance at test time from the

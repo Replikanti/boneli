@@ -95,7 +95,10 @@
 //! embedded SCTs against the caller's CT logs (RFC 6962).
 //! [`TimestampToken`] reads an RFC 3161 timestamp token strictly and
 //! verifies it over a message against a timestamp authority's chain the
-//! caller supplies, at the token's own time (ADR-038, D3). The Sigstore
+//! caller supplies, at the token's own time (ADR-038, D3), under SHA-256
+//! or, from a P-384 authority, SHA-384 (ADR-040, D5). An intermediate
+//! without an EKU is unrestricted on both kinds of chain, while the leaf
+//! must carry one (ADR-040, D4). The Sigstore
 //! formats around them (signatures, bundles, Rekor entries, the trusted
 //! root) are not this crate's (ADR-029, S3).
 //!

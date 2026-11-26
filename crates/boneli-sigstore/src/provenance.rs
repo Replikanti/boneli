@@ -48,7 +48,7 @@ use boneli_json::{Object, Value};
 
 use crate::error::{ConfigError, Refusal};
 use crate::fulcio::{Agreement, CertificateRefusal, Extension};
-use crate::identity::printable;
+use crate::identity::{names_owner, printable};
 use crate::verify::SLSA_PROVENANCE_V02_PREDICATE;
 use crate::{MAX_BUNDLE_BYTES, json};
 
@@ -174,27 +174,6 @@ pub(crate) fn check_match(rule: &ClaimMatch) -> Result<(), ConfigError> {
         }
         _ => Ok(()),
     }
-}
-
-/// Whether `text` is `<scheme>://<host>/<owner>`, optionally followed by
-/// more path and a final `/`: a non-empty scheme and host, and at least
-/// one path segment, none of them empty, `.` or `..`. The owner is the
-/// smallest unit a forge gives one party control of; anything shorter
-/// covers every party on the host.
-fn names_owner(text: &str) -> bool {
-    let Some((scheme, rest)) = text.split_once("://") else {
-        return false;
-    };
-    let rest = rest.strip_suffix('/').unwrap_or(rest);
-    let mut segments = rest.split('/');
-    let host = segments.next().unwrap_or_default();
-    let path: Vec<&str> = segments.collect();
-    !scheme.is_empty()
-        && !host.is_empty()
-        && !path.is_empty()
-        && path
-            .iter()
-            .all(|s| !s.is_empty() && *s != "." && *s != "..")
 }
 
 /// Which claim a statement failed.
