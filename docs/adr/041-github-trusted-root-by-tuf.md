@@ -338,6 +338,10 @@ trust-directory check of its `tuf/` dropped
 (`trust_dir_whose_tuf_is_a_trust_dir_refused`); the `.tmp-` form not
 counted, and the content rule moved after the lock is created (both
 content tests).
+Review run 2 added `refused_after_creation_keeps_what_was_written`, which
+kills one more mutant: the removal widened from `remove_dir` to
+`remove_dir_all`, which would take a file another process wrote into a
+directory the call created.
 
 **Accepted.** The pull request's own `oci-acceptance` run,
 https://github.com/Replikanti/boneli/actions/runs/45905779127, passed on

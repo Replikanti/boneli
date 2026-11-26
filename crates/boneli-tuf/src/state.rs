@@ -607,6 +607,37 @@ mod tests {
         assert!(made, "a path that passes is created");
     }
 
+    /// Review run 2 of #137: the removal after a refusal takes only empty
+    /// directories. A file written into a directory this call created
+    /// (here by the rule itself, standing in for another process) keeps
+    /// that directory and the file; the created directories below it that
+    /// stayed empty are still removed.
+    #[test]
+    fn refused_after_creation_keeps_what_was_written() {
+        let base =
+            std::env::temp_dir().join(format!("boneli-tuf-undo-kept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("base");
+        let written = base.join("new/state");
+        let rule = |p: &Path| {
+            if p.file_name() == Some(std::ffi::OsStr::new("folded")) && p.exists() {
+                fs::write(&written, b"another process's").expect("write");
+                Err("folded")
+            } else {
+                Ok(())
+            }
+        };
+        let outcome = prepare(&base.join("new/deeper/folded"), &rule).map(|_| ());
+        let left = (
+            fs::read(&written).ok(),
+            base.join("new/deeper/folded").exists(),
+            base.join("new/deeper").exists(),
+        );
+        let _ = fs::remove_dir_all(&base);
+        assert!(matches!(outcome, Err(OpenError::Dir(_))), "{outcome:?}");
+        assert_eq!(left, (Some(b"another process's".to_vec()), false, false));
+    }
+
     /// The facts `tuf_rule` gathers on a real filesystem: a missing path
     /// passes, an entry under a regular file is refused (its stat fails
     /// with `ENOTDIR`), and the parent's `tuf` itself is refused by name.
