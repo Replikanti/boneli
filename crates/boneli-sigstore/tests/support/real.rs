@@ -470,6 +470,12 @@ pub const PROBER_WORKFLOW: &str = "https://github.com/actions/attest-build-prove
 pub const ATTEST_DEMO_REPOSITORY: &str = "https://github.com/actions/attest-demo";
 pub const ATTEST_DEMO_REPOSITORY_ID: &str = "763287532";
 pub const ATTEST_DEMO_TRIGGER: &str = "workflow_dispatch";
+/// And into the prober leaf. Its SAN (1.9) is `prober.yml`, the workflow
+/// that signed, while its Build Config URI (1.18) is `prober-github.yml`,
+/// the one the run started: a SAN need not name the run's entry point.
+pub const PROBER_REPOSITORY: &str = "https://github.com/actions/attest-build-provenance";
+pub const PROBER_REPOSITORY_ID: &str = "760702757";
+pub const PROBER_TRIGGER: &str = "schedule";
 
 /// Each token's genTime, which equals its leaf's notBefore.
 pub const ATTEST_DEMO_TIME: u64 = 1_713_807_206;

@@ -31,8 +31,9 @@
 //!   issuer from extension 1.3.6.1.4.1.57264.1.8, else 1.1 (both present
 //!   and different is refused); and an identity matching issuer and SAN.
 //! - **Keyless without a log (ADR-040):** under a trust with the no-log
-//!   opt-in ([`Trust::with_no_log`], only for a root that lists no log), a
-//!   bundle must carry **no** log entry, its times are the verified
+//!   opt-in ([`Trust::with_no_log`], only for a root that lists no log and
+//!   with certificate claims that bind the source repository), a bundle
+//!   must carry **no** log entry, its times are the verified
 //!   RFC 3161 tokens alone (at least one), the chain is checked at every
 //!   one, and the SCT list is not read; signature, SAN, issuer and
 //!   identity are checked as above. A keyless cosign layer is
@@ -314,6 +315,11 @@ impl Trust {
         if claims.path_binds_no_repository() {
             return Err(ConfigError::WorkflowPathWithoutRepository);
         }
+        // Replacing the claims of a no-log trust keeps its repository
+        // binding (ADR-040, D1).
+        if self.no_log && !claims.binds_repository() {
+            return Err(ConfigError::NoLogWithoutRepository);
+        }
         Ok(Trust {
             certificate_claims: Some(claims),
             ..self
@@ -331,14 +337,19 @@ impl Trust {
     /// Refused for a trust without a keyless part, for a root that lists
     /// any Rekor log (v1, v2 or one the reader leaves out) or CT log, so
     /// the opt-in never weakens a logged instance, for a root with no
-    /// usable timestamp authority, and unless every identity's SAN rule
-    /// names an owner at least: an exact email or URI, or a URI prefix of
-    /// `<scheme>://<host>/<owner>/` or longer. A no-log root such as
-    /// GitHub's is shared by every private repository on the host, so a
-    /// host-wide prefix would accept anyone's workflow. Keys stay allowed
-    /// and keyed signatures are unaffected; it composes with
-    /// [`Trust::with_claims`] and [`Trust::with_certificate_claims`] in
-    /// either order.
+    /// usable timestamp authority, unless every identity's SAN rule names
+    /// an owner at least (an exact email or URI, or a URI prefix of
+    /// `<scheme>://<host>/<owner>/` or longer), and unless the trust
+    /// already carries certificate claims ([`Trust::with_certificate_claims`],
+    /// set first) that bind the source repository: an exact 1.12 rule, a
+    /// 1.12 prefix that names an owner, or a 1.15 repository ID. A no-log
+    /// root such as GitHub's is shared by every private repository on the
+    /// host, and the SAN names only the workflow that signed, which may be
+    /// another owner's reusable workflow called from any repository; 1.12
+    /// and 1.15 name the repository the run belongs to. Certificate claims
+    /// set again on a no-log trust must bind a repository too. Since
+    /// certificate claims refuse keys, a no-log trust has none. It
+    /// composes with [`Trust::with_claims`] in either order.
     pub fn with_no_log(self) -> Result<Trust, ConfigError> {
         let Some((root, identities)) = &self.keyless else {
             return Err(ConfigError::NoLogWithoutKeyless);
@@ -355,6 +366,13 @@ impl Trust {
         };
         if !identities.iter().all(owned) {
             return Err(ConfigError::NoLogIdentityWithoutOwner);
+        }
+        if !self
+            .certificate_claims
+            .as_ref()
+            .is_some_and(CertificateClaims::binds_repository)
+        {
+            return Err(ConfigError::NoLogWithoutRepository);
         }
         Ok(Trust {
             no_log: true,

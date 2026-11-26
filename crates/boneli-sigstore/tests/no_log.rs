@@ -18,11 +18,11 @@ use boneli_sigstore::{
     SLSA_PROVENANCE_V1_PREDICATE, SanRule, Trust, TrustedRoot, base64, verify,
 };
 use support::pki::{
-    self, AttestationSpec, BundleSpec, CODE_SIGNING, CertSpec, EMAIL, EPOCH_2020, IMAGE,
-    INTERMEDIATE_NAME, ISSUER, LIFETIME, LeafSpec, NoteLog, Pki, ROOT_NAME, SERVER_AUTH, SctSigner,
-    SctSpec, T, Tsa, URI, V2Spec, authority, basic_constraints_ca, eku, email_identity, hex,
-    key_usage, keyless_trust_in, log_instance, name, obj, remove, root_value, s, set, to_bytes,
-    valid_for, with_tokens, with_tsas,
+    self, AttestationSpec, BundleSpec, CODE_SIGNING, CertSpec, EMAIL, EPOCH_2020, GH_ID,
+    GH_REPOSITORY, GH_TRIGGER, GH_WORKFLOW, IMAGE, INTERMEDIATE_NAME, LIFETIME, LeafSpec, NoteLog,
+    Pki, ROOT_NAME, SERVER_AUTH, SctSigner, SctSpec, T, Tsa, V2Spec, authority,
+    basic_constraints_ca, eku, hex, key_usage, keyless_trust_in, log_instance, name, obj, remove,
+    root_value, s, set, to_bytes, utf8, valid_for, with_tokens, with_tsas,
 };
 use support::real;
 
@@ -45,20 +45,71 @@ fn plain(root: &Value, identities: Vec<Identity>, predicates: &[&str]) -> Trust 
     .expect("trust")
 }
 
-/// [`plain`] with the opt-in.
-fn no_log(root: &Value, identities: Vec<Identity>, predicates: &[&str]) -> Trust {
+/// [`plain`] with the certificate `claims`, which must bind the source
+/// repository, and the opt-in.
+fn no_log(
+    root: &Value,
+    identities: Vec<Identity>,
+    predicates: &[&str],
+    claims: CertificateClaims,
+) -> Trust {
     plain(root, identities, predicates)
+        .with_certificate_claims(claims)
+        .expect("certificate claims")
         .with_no_log()
         .expect("with no log")
 }
 
-/// A trust in GitHub's root for `identity`, SLSA v1, with the opt-in.
-fn github(identity: Identity) -> Trust {
+/// A trust in GitHub's root for `identity`, SLSA v1, with `claims` and the
+/// opt-in.
+fn github(identity: Identity, claims: CertificateClaims) -> Trust {
     no_log(
         &real::github_root_value(),
         vec![identity],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        claims,
     )
+}
+
+/// Certificate claims with the repository rule `repository` (1.12) and
+/// the one trigger `trigger` (1.20).
+fn repo_claims(repository: ClaimMatch, trigger: &str) -> CertificateClaims {
+    CertificateClaims::new(Some(repository), None, vec![trigger.to_owned()]).expect("claims")
+}
+
+fn exact(text: &str) -> ClaimMatch {
+    ClaimMatch::Exact(text.to_owned())
+}
+
+fn prefix(text: &str) -> ClaimMatch {
+    ClaimMatch::Prefix(text.to_owned())
+}
+
+/// What the K1 leaf meets: its repository, ID and trigger.
+fn k1_claims() -> CertificateClaims {
+    repo_claims(
+        exact(real::ATTEST_DEMO_REPOSITORY),
+        real::ATTEST_DEMO_TRIGGER,
+    )
+    .with_repository_id(real::ATTEST_DEMO_REPOSITORY_ID)
+    .expect("repository id")
+}
+
+/// What the K2 leaf meets.
+fn k2_claims() -> CertificateClaims {
+    repo_claims(exact(real::PROBER_REPOSITORY), real::PROBER_TRIGGER)
+        .with_repository_id(real::PROBER_REPOSITORY_ID)
+        .expect("repository id")
+}
+
+/// What the synthetic GitHub leaf meets (`LeafSpec::github`).
+fn gh_claims() -> CertificateClaims {
+    repo_claims(exact(GH_REPOSITORY), GH_TRIGGER)
+}
+
+/// The synthetic GitHub leaf's identity: its exact SAN.
+fn gh_identity() -> Identity {
+    uri(GH_WORKFLOW)
 }
 
 fn uri(text: &str) -> Identity {
@@ -110,11 +161,12 @@ fn no_log_root(pki: &Pki, tsa: &Tsa) -> Value {
     root
 }
 
-/// An email leaf without an SCT list, as GitHub's leaves.
+/// A synthetic GitHub leaf (SAN `GH_WORKFLOW`, the claims of `acme/app`)
+/// without an SCT list, as GitHub's leaves.
 fn leaf() -> LeafSpec {
     LeafSpec {
         scts: Vec::new(),
-        ..LeafSpec::email()
+        ..LeafSpec::github(GH_WORKFLOW)
     }
 }
 
@@ -130,7 +182,7 @@ fn bundle(pki: &Pki, spec: &BundleSpec, tokens: &[Vec<u8>]) -> Evidence {
 }
 
 /// One synthetic world: the instance, its TSA, the no-log trust for the
-/// email identity and the bundle spec of `leaf`.
+/// GitHub identity and claims, and the bundle spec of `leaf`.
 struct World {
     pki: Pki,
     tsa: Tsa,
@@ -144,8 +196,9 @@ impl World {
         let tsa = Tsa::new(&pki);
         let trust = no_log(
             &no_log_root(&pki, &tsa),
-            vec![email_identity()],
+            vec![gh_identity()],
             &[COSIGN_SIGN_PREDICATE],
+            gh_claims(),
         );
         let spec = BundleSpec::keyless(&pki, leaf, &IMAGE);
         World {
@@ -175,7 +228,9 @@ fn no_log_config_rules() {
     let tsa = Tsa::new(&pki);
     let base = no_log_root(&pki, &tsa);
     let try_root = |root: &Value| {
-        plain(root, vec![email_identity()], &[COSIGN_SIGN_PREDICATE])
+        plain(root, vec![gh_identity()], &[COSIGN_SIGN_PREDICATE])
+            .with_certificate_claims(gh_claims())
+            .expect("claims")
             .with_no_log()
             .map(|_| ())
     };
@@ -269,7 +324,8 @@ fn no_log_config_rules() {
     assert_eq!(try_root(&single), Err(ConfigError::NoLogRootWithoutTsa));
     assert_eq!(root_of(&base).tsa_count(), 1);
 
-    // A keyless part is required; keys next to it are allowed.
+    // A keyless part is required. Keys next to it cannot carry the
+    // certificate claims the opt-in needs.
     let key = pki.signer_key.public.clone();
     let keys_only = Trust::new(
         vec![key.clone()],
@@ -283,19 +339,29 @@ fn no_log_config_rules() {
     );
     let both = Trust::new(
         vec![key],
-        Some((root_of(&base), vec![email_identity()])),
+        Some((root_of(&base), vec![gh_identity()])),
         vec![COSIGN_SIGN_PREDICATE.to_owned()],
     )
     .expect("trust");
-    assert!(both.with_no_log().is_ok());
+    assert_eq!(
+        both.clone().with_no_log().map(|_| ()),
+        Err(ConfigError::NoLogWithoutRepository)
+    );
+    assert_eq!(
+        both.with_certificate_claims(gh_claims()).map(|_| ()),
+        Err(ConfigError::CertificateClaimsWithKeys)
+    );
 
     // Identities: every one must name at least an owner.
     let with_ids = |ids: Vec<Identity>| {
         plain(&base, ids, &[COSIGN_SIGN_PREDICATE])
+            .with_certificate_claims(gh_claims())
+            .expect("claims")
             .with_no_log()
             .map(|_| ())
     };
-    let email = Identity::new(ISSUER, SanRule::Email(EMAIL.to_owned())).expect("identity");
+    let email =
+        Identity::new(GITHUB_ACTIONS_ISSUER, SanRule::Email(EMAIL.to_owned())).expect("identity");
     for passes in [
         uri(real::ATTEST_DEMO_WORKFLOW),
         email.clone(),
@@ -355,45 +421,231 @@ fn no_log_debug() {
         "Trust { keys: 0, identities: 1, predicate_types: 1 }"
     );
     assert!(!without.no_log());
-    let with = without.clone().with_no_log().expect("no log");
+    let with = without
+        .clone()
+        .with_certificate_claims(k1_claims())
+        .expect("claims")
+        .with_no_log()
+        .expect("no log");
     assert!(with.no_log());
     assert_eq!(
         format!("{with:?}"),
-        "Trust { keys: 0, identities: 1, predicate_types: 1, no_log: true }"
-    );
-    let claims = CertificateClaims::new(None, None, vec![real::ATTEST_DEMO_TRIGGER.to_owned()])
-        .expect("claims");
-    let first = with
-        .with_certificate_claims(claims.clone())
-        .expect("claims after");
-    let second = without
-        .with_certificate_claims(claims)
-        .expect("claims before")
-        .with_no_log()
-        .expect("no log after");
-    assert_eq!(format!("{first:?}"), format!("{second:?}"));
-    assert_eq!(
-        format!("{first:?}"),
         "Trust { keys: 0, identities: 1, predicate_types: 1, certificate_claims: true, no_log: true }"
     );
-    assert!(first.no_log() && second.no_log());
-    assert!(first.certificate_claims().is_some() && second.certificate_claims().is_some());
+    // Provenance claims compose in either order.
+    let provenance = Claims::new(
+        None,
+        Some(exact(real::ATTEST_DEMO_REPOSITORY)),
+        None,
+        Vec::new(),
+    )
+    .expect("claims");
+    let after = with.with_claims(provenance.clone()).expect("claims after");
+    let before = without
+        .with_claims(provenance)
+        .expect("claims before")
+        .with_certificate_claims(k1_claims())
+        .expect("certificate claims")
+        .with_no_log()
+        .expect("no log after");
+    assert_eq!(format!("{after:?}"), format!("{before:?}"));
+    assert_eq!(
+        format!("{after:?}"),
+        "Trust { keys: 0, identities: 1, predicate_types: 1, claims: true, certificate_claims: true, no_log: true }"
+    );
+    assert!(after.no_log() && before.no_log());
 }
 
+/// The opt-in needs certificate claims, set first, that bind the source
+/// repository (ADR-040, D1): the SAN names only the workflow that signed,
+/// which may be another owner's reusable workflow.
 #[test]
-fn no_log_keeps_keyed() {
+fn no_log_needs_repository_binding() {
+    let root = real::github_root_value();
+    let base = || {
+        plain(
+            &root,
+            vec![uri(real::ATTEST_DEMO_WORKFLOW)],
+            &[SLSA_PROVENANCE_V1_PREDICATE],
+        )
+    };
+    let trigger = || vec![real::ATTEST_DEMO_TRIGGER.to_owned()];
+    let try_claims = |claims: CertificateClaims| {
+        base()
+            .with_certificate_claims(claims)
+            .expect("claims")
+            .with_no_log()
+            .map(|_| ())
+    };
+    // No certificate claims at all.
+    assert_eq!(
+        base().with_no_log().map(|_| ()),
+        Err(ConfigError::NoLogWithoutRepository)
+    );
+    let unbound = [
+        (
+            "triggers only",
+            CertificateClaims::new(None, None, trigger()),
+        ),
+        (
+            "a ref rule only",
+            CertificateClaims::new(None, Some(exact("refs/heads/main")), trigger()),
+        ),
+        (
+            "a host-wide 1.12 prefix",
+            CertificateClaims::new(Some(prefix("https://github.com/")), None, trigger()),
+        ),
+        (
+            "a 1.12 prefix without a host",
+            CertificateClaims::new(Some(prefix("https:///actions/")), None, trigger()),
+        ),
+    ];
+    for (name, claims) in unbound {
+        assert_eq!(
+            try_claims(claims.expect("claims")),
+            Err(ConfigError::NoLogWithoutRepository),
+            "{name}"
+        );
+    }
+    let bound = [
+        (
+            "an exact 1.12",
+            repo_claims(
+                exact(real::ATTEST_DEMO_REPOSITORY),
+                real::ATTEST_DEMO_TRIGGER,
+            ),
+        ),
+        (
+            "an owner-level 1.12 prefix",
+            repo_claims(
+                prefix("https://github.com/actions/"),
+                real::ATTEST_DEMO_TRIGGER,
+            ),
+        ),
+        (
+            "a 1.15 ID only",
+            CertificateClaims::new(None, None, trigger())
+                .expect("claims")
+                .with_repository_id(real::ATTEST_DEMO_REPOSITORY_ID)
+                .expect("id"),
+        ),
+    ];
+    for (name, claims) in bound {
+        assert_eq!(try_claims(claims.clone()), Ok(()), "{name}");
+        // Each binding rule passes K1, which meets it.
+        let trust = base()
+            .with_certificate_claims(claims)
+            .expect("claims")
+            .with_no_log()
+            .expect("no log");
+        assert_eq!(
+            verify(&real::attest_demo(), &real::ATTEST_DEMO_DIGEST, &trust),
+            keyless_without_log(1),
+            "{name}"
+        );
+    }
+    // Claims set again on a no-log trust must still bind a repository.
+    let trust = github(uri(real::ATTEST_DEMO_WORKFLOW), k1_claims());
+    assert_eq!(
+        trust
+            .clone()
+            .with_certificate_claims(CertificateClaims::new(None, None, trigger()).expect("claims"))
+            .map(|_| ()),
+        Err(ConfigError::NoLogWithoutRepository)
+    );
+    let replaced = trust
+        .with_certificate_claims(
+            CertificateClaims::new(None, None, trigger())
+                .expect("claims")
+                .with_repository_id(real::ATTEST_DEMO_REPOSITORY_ID)
+                .expect("id"),
+        )
+        .expect("binding claims again");
+    assert!(replaced.no_log());
+}
+
+/// The attack the binding closes: a leaf whose SAN is the trusted owner's
+/// (reusable) workflow while 1.12 and 1.15 name another owner's
+/// repository, as a private repository of that owner calling the workflow
+/// would get. The SAN owner matches; the repository claim refuses it.
+#[test]
+fn no_log_other_owner_through_a_trusted_workflow() {
+    let evil = LeafSpec {
+        scts: Vec::new(),
+        ..LeafSpec::github(GH_WORKFLOW)
+            .fulcio(12, Some(utf8(b"https://github.com/evil/app")))
+            .fulcio(15, Some(utf8(b"9999")))
+    };
+    let pki = Pki::new();
+    let tsa = Tsa::new(&pki);
+    let root = no_log_root(&pki, &tsa);
+    let check = |identity: Identity, claims: CertificateClaims| {
+        let trust = no_log(&root, vec![identity], &[COSIGN_SIGN_PREDICATE], claims);
+        let spec = BundleSpec::keyless(&pki, &evil, &IMAGE);
+        let token = tsa.token(&spec.signature, T + 10);
+        verify(&bundle(&pki, &spec, &[token]), &IMAGE, &trust)
+    };
+    let mismatch = |e| Err(Refusal::CertificateClaim(CertificateRefusal::Mismatch(e)));
+    for identity in [gh_identity(), uri_prefix("https://github.com/acme/")] {
+        assert_eq!(
+            check(identity.clone(), gh_claims()),
+            mismatch(Extension::SourceRepositoryUri),
+            "{identity:?}"
+        );
+        assert_eq!(
+            check(
+                identity.clone(),
+                repo_claims(prefix("https://github.com/acme/"), GH_TRIGGER)
+            ),
+            mismatch(Extension::SourceRepositoryUri),
+            "{identity:?}"
+        );
+        let by_id = CertificateClaims::new(None, None, vec![GH_TRIGGER.to_owned()])
+            .expect("claims")
+            .with_repository_id(GH_ID)
+            .expect("id");
+        assert_eq!(
+            check(identity.clone(), by_id),
+            mismatch(Extension::SourceRepositoryIdentifier),
+            "{identity:?}"
+        );
+    }
+    // The honest leaf passes under the same rule.
+    let world = World::new(&leaf());
+    assert_eq!(world.verify(&[world.token(T + 10)]), keyless_without_log(1));
+    // K1 under a rule whose SAN identity is K1's but whose 1.12 names
+    // another owner.
+    let trust = github(
+        uri(real::ATTEST_DEMO_WORKFLOW),
+        repo_claims(
+            exact("https://github.com/evil/attest-demo"),
+            real::ATTEST_DEMO_TRIGGER,
+        ),
+    );
+    assert_eq!(
+        verify(&real::attest_demo(), &real::ATTEST_DEMO_DIGEST, &trust),
+        mismatch(Extension::SourceRepositoryUri)
+    );
+}
+
+/// A trust with keys cannot carry the opt-in: certificate claims refuse
+/// keys, and the opt-in needs them.
+#[test]
+fn no_log_refuses_keys() {
     let key = PublicKey::from_pem(real::COSIGN_RELEASE_KEY).expect("key");
     let trust = Trust::new(
         vec![key],
         Some((real::github_root(), vec![uri(real::ATTEST_DEMO_WORKFLOW)])),
         vec![COSIGN_SIGN_PREDICATE.to_owned()],
     )
-    .expect("trust")
-    .with_no_log()
-    .expect("no log");
+    .expect("trust");
     assert_eq!(
-        verify(&real::cosign(), &real::COSIGN_DIGEST, &trust),
-        Ok(Accepted::Keyed { key: 0 })
+        trust.clone().with_no_log().map(|_| ()),
+        Err(ConfigError::NoLogWithoutRepository)
+    );
+    assert_eq!(
+        trust.with_certificate_claims(k1_claims()).map(|_| ()),
+        Err(ConfigError::CertificateClaimsWithKeys)
     );
 }
 
@@ -421,7 +673,7 @@ fn real_github_bundles_verify_under_no_log() {
         verify(
             &real::attest_demo(),
             &real::ATTEST_DEMO_DIGEST,
-            &github(uri(real::ATTEST_DEMO_WORKFLOW))
+            &github(uri(real::ATTEST_DEMO_WORKFLOW), k1_claims())
         ),
         keyless_without_log(1)
     );
@@ -429,7 +681,7 @@ fn real_github_bundles_verify_under_no_log() {
         verify(
             &real::prober(),
             &real::PROBER_DIGEST,
-            &github(uri(real::PROBER_WORKFLOW))
+            &github(uri(real::PROBER_WORKFLOW), k2_claims())
         ),
         keyless_without_log(1)
     );
@@ -437,7 +689,10 @@ fn real_github_bundles_verify_under_no_log() {
         verify(
             &real::prober(),
             &real::PROBER_DIGEST,
-            &github(uri_prefix("https://github.com/actions/"))
+            &github(
+                uri_prefix("https://github.com/actions/"),
+                repo_claims(prefix("https://github.com/actions/"), real::PROBER_TRIGGER)
+            )
         ),
         keyless_without_log(1)
     );
@@ -446,6 +701,15 @@ fn real_github_bundles_verify_under_no_log() {
         &real::github_root_value(),
         vec![uri(real::ATTEST_DEMO_WORKFLOW), uri(real::PROBER_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        CertificateClaims::new(
+            Some(prefix("https://github.com/actions/")),
+            None,
+            vec![
+                real::ATTEST_DEMO_TRIGGER.to_owned(),
+                real::PROBER_TRIGGER.to_owned(),
+            ],
+        )
+        .expect("claims"),
     );
     assert_eq!(
         verify(&real::prober(), &real::PROBER_DIGEST, &trust),
@@ -459,7 +723,7 @@ fn real_github_bundles_verify_under_no_log() {
         verify(
             &real::attest_demo(),
             &real::PROBER_DIGEST,
-            &github(uri(real::ATTEST_DEMO_WORKFLOW))
+            &github(uri(real::ATTEST_DEMO_WORKFLOW), k1_claims())
         ),
         Err(Refusal::SubjectMismatch)
     );
@@ -547,6 +811,7 @@ fn no_log_tsa_not_in_root() {
         &root,
         vec![uri(real::ATTEST_DEMO_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        k1_claims(),
     );
     assert_eq!(
         verify(&real::attest_demo(), &real::ATTEST_DEMO_DIGEST, &trust),
@@ -564,7 +829,7 @@ fn no_log_tsa_not_in_root() {
 
 #[test]
 fn no_log_needs_a_timestamp() {
-    let trust = github(uri(real::ATTEST_DEMO_WORKFLOW));
+    let trust = github(uri(real::ATTEST_DEMO_WORKFLOW), k1_claims());
     let shapes: [fn(&mut Value); 3] = [
         |v| remove(v, &["verificationMaterial", "timestampVerificationData"]),
         |v| {
@@ -602,6 +867,7 @@ fn no_log_stale_root() {
         &root,
         vec![uri(real::PROBER_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        k2_claims(),
     );
     assert_eq!(
         verify(&real::prober(), &real::PROBER_DIGEST, &trust),
@@ -617,6 +883,7 @@ fn no_log_ca_windows() {
         &root,
         vec![uri(real::ATTEST_DEMO_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        k1_claims(),
     );
     assert_eq!(
         verify(&real::attest_demo(), &real::ATTEST_DEMO_DIGEST, &trust),
@@ -629,6 +896,7 @@ fn no_log_ca_windows() {
         &root,
         vec![uri(real::PROBER_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        k2_claims(),
     );
     assert_eq!(
         verify(&real::prober(), &real::PROBER_DIGEST, &trust),
@@ -644,6 +912,7 @@ fn no_log_ca_windows() {
         &root,
         vec![uri(real::PROBER_WORKFLOW)],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        k2_claims(),
     );
     assert_eq!(
         verify(&real::prober(), &real::PROBER_DIGEST, &trust),
@@ -734,6 +1003,7 @@ fn no_log_refuses_cosign_layers() {
         &real::github_root_value(),
         vec![real::chainguard_identity()],
         &[COSIGN_SIGN_PREDICATE],
+        repo_claims(exact(real::CHAINGUARD_REPOSITORY), real::CHAINGUARD_TRIGGER),
     );
     assert_eq!(
         verify(&real::chainguard(), &real::CHAINGUARD_DIGEST, &trust),
@@ -743,7 +1013,7 @@ fn no_log_refuses_cosign_layers() {
     let pki = Pki::new();
     let tsa = Tsa::new(&pki);
     let statement = pki::statement(&[&hex(&IMAGE)], SLSA_PROVENANCE_V1_PREDICATE);
-    let mut spec = AttestationSpec::keyless(&pki, &LeafSpec::uri(URI), statement);
+    let mut spec = AttestationSpec::keyless(&pki, &LeafSpec::github(GH_WORKFLOW), statement);
     spec.predicate_type = SLSA_PROVENANCE_V1_PREDICATE.to_owned();
     let claims = Claims::new(
         None,
@@ -754,8 +1024,9 @@ fn no_log_refuses_cosign_layers() {
     .expect("claims");
     let trust = no_log(
         &no_log_root(&pki, &tsa),
-        vec![Identity::new(ISSUER, SanRule::Uri(URI.to_owned())).expect("identity")],
+        vec![gh_identity()],
         &[SLSA_PROVENANCE_V1_PREDICATE],
+        gh_claims(),
     )
     .with_claims(claims)
     .expect("claims");
@@ -774,11 +1045,11 @@ fn no_log_sct_list_unread() {
             signer: SctSigner::Other,
             ..SctSpec::good()
         }],
-        ..LeafSpec::email()
+        ..LeafSpec::github(GH_WORKFLOW)
     };
     let world = World::new(&foreign);
     assert_eq!(world.verify(&[world.token(T + 10)]), keyless_without_log(1));
-    let logged = keyless_trust_in(&root_value(&world.pki), vec![email_identity()]);
+    let logged = keyless_trust_in(&root_value(&world.pki), vec![gh_identity()]);
     let evidence = Evidence::from_bundle(&world.spec.bytes(&world.pki)).expect("bundle");
     assert_eq!(
         verify(&evidence, &IMAGE, &logged),
@@ -792,7 +1063,7 @@ fn no_log_identity_mismatch() {
         verify(
             &real::attest_demo(),
             &real::ATTEST_DEMO_DIGEST,
-            &github(uri(real::PROBER_WORKFLOW))
+            &github(uri(real::PROBER_WORKFLOW), k2_claims())
         ),
         Err(Refusal::IdentityMismatch)
     );
@@ -800,9 +1071,10 @@ fn no_log_identity_mismatch() {
         verify(
             &real::attest_demo(),
             &real::ATTEST_DEMO_DIGEST,
-            &github(uri_prefix(
-                "https://github.com/actions/attest-build-provenance/"
-            ))
+            &github(
+                uri_prefix("https://github.com/actions/attest-build-provenance/"),
+                k1_claims()
+            )
         ),
         Err(Refusal::IdentityMismatch)
     );
@@ -821,7 +1093,7 @@ fn no_log_with_certificate_claims() {
         .expect("repository id")
     };
     let check = |id: &str, trigger: &str| {
-        let trust = github(uri(real::ATTEST_DEMO_WORKFLOW))
+        let trust = github(uri(real::ATTEST_DEMO_WORKFLOW), k1_claims())
             .with_certificate_claims(claims(id, trigger))
             .expect("certificate claims");
         verify(&real::attest_demo(), &real::ATTEST_DEMO_DIGEST, &trust)
@@ -907,7 +1179,12 @@ fn github_shaped_chain_rules() {
     let code_signing: &[&[u8]] = &[CODE_SIGNING];
     let server_auth: &[&[u8]] = &[SERVER_AUTH];
     let check = |root: &Value, leaf: &LeafSpec| {
-        let trust = no_log(root, vec![email_identity()], &[COSIGN_SIGN_PREDICATE]);
+        let trust = no_log(
+            root,
+            vec![gh_identity()],
+            &[COSIGN_SIGN_PREDICATE],
+            gh_claims(),
+        );
         let spec = BundleSpec::keyless(&pki, leaf, &IMAGE);
         let token = tsa.token(&spec.signature, T + 10);
         verify(&bundle(&pki, &spec, &[token]), &IMAGE, &trust)

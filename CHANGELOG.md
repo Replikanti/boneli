@@ -1011,8 +1011,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when the trust has no keyless part (`NoLogWithoutKeyless`), when the
   root lists any Rekor log (v1, v2 or one left out) or CT log
   (`NoLogRootHasLogs`), when the root has no usable timestamp authority
-  (`NoLogRootWithoutTsa`), and when a SAN prefix does not name an owner
-  (`NoLogIdentityWithoutOwner`). Under it a bundle with a log entry is
+  (`NoLogRootWithoutTsa`), when a SAN prefix does not name an owner
+  (`NoLogIdentityWithoutOwner`), and unless certificate claims, set
+  first, bind the source repository by an exact or owner-level 1.12 rule
+  or a 1.15 ID (`NoLogWithoutRepository`; the SAN names only the signing
+  workflow, which may be another owner's reusable one). Under it a bundle with a log entry is
   `TlogEntries` and a keyless cosign layer `NoTimeSource`; without it
   nothing changes. `boneli_https::TimestampToken` also accepts SHA-384
   with `ecdsa-with-SHA384` from a P-384 leaf, GitHub's TSA. Two bundles
@@ -1030,8 +1033,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   GitHub's Fulcio intermediate `l1` has none.
 - **Breaking:** `boneli_sigstore::Accepted` has a variant
   `KeylessWithoutLog`, and `ConfigError` the variants
-  `NoLogWithoutKeyless`, `NoLogRootHasLogs`, `NoLogRootWithoutTsa` and
-  `NoLogIdentityWithoutOwner` (ADR-040).
+  `NoLogWithoutKeyless`, `NoLogRootHasLogs`, `NoLogRootWithoutTsa`,
+  `NoLogIdentityWithoutOwner` and `NoLogWithoutRepository` (ADR-040).
 - **Breaking:** `boneli_sigstore::Accepted::Keyless` carries
   `integrated_time: Option<u64>` and `signed_timestamps` (ADR-038), and a
   bundle entry without a promise and without a timestamp is now refused

@@ -111,14 +111,33 @@ refresh of GitHub's root is follow-up #137.
      owner (`<scheme>://<host>/<owner>/` at least, no empty, `.` or `..`
      segment, the rule of ADR-036 item 4): `NoLogIdentityWithoutOwner`.
      Exact `Email` and `Uri` rules pass. Every identity must pass, not
-     any. Why: the root is shared by every private repository on GitHub,
-     so the identity rule is all that separates the operator's workflows
-     from everyone else's.
+     any. Why: a host-wide SAN prefix would admit every workflow on the
+     host. The rule binds only the signing workflow's owner, though, so
+     it is not what ties a signature to the operator's repositories (next
+     item);
+   - no certificate claims (ADR-034), set first, that bind the source
+     repository: an exact Source Repository URI (1.12), a 1.12 prefix
+     that names an owner (the same rule), or a Source Repository
+     Identifier (1.15): `NoLogWithoutRepository`. Certificate claims set
+     again on a no-log trust must bind one too (the same refusal). Why:
+     the SAN is the workflow that signed (`job_workflow_ref`), not the
+     repository the run belongs to. A public reusable workflow of the
+     trusted owner, called from another owner's private repository, gives
+     a leaf whose SAN is the trusted workflow and whose 1.12 and 1.15 name
+     the caller's repository. K2 shows that the SAN need not be the run's
+     entry point: its SAN and 1.9 are `prober.yml`, its Build Config URI
+     (1.18) `prober-github.yml`. With a log, a monitor could at least see
+     such a signature later; without one nobody can, so the repository
+     must be bound before it verifies. This is ADR-036 item 4's answer to
+     the shared generator SAN (`ClaimsWithoutSource`), applied to the
+     leaf. Both known answers carry 1.12, 1.14 and 1.15 and verify under
+     rules that bind them.
 
-   Keys stay allowed and keyed signatures are unaffected. The opt-in
-   composes with `with_claims` and `with_certificate_claims` in either
-   order; `Debug` names `no_log: true` only when set, so a trust without
-   it reads byte for byte as before.
+   Because certificate claims refuse keys (ADR-034), a no-log trust has
+   none. The opt-in composes with `with_claims` in either order, and
+   needs `with_certificate_claims` first, as the statement agreement of
+   ADR-034 needs provenance claims first; `Debug` names `no_log: true`
+   only when set, so a trust without it reads byte for byte as before.
 2. **D2, verification under the opt-in** (`keyless_without_log`):
    - a keyless cosign `.sig` or `.att` layer is `NoTimeSource` before its
      entry is read: its tokens are not read (ADR-038 limit), and the root
@@ -238,16 +257,18 @@ refresh of GitHub's root is follow-up #137.
   a stale file is open-ended, so it holds the new time, but its TSA leaf
   did not sign the token (`no_log_stale_root`). The operator guide says
   so.
-- **Breaking public enums:** `Accepted::KeylessWithoutLog` and four
+- **Breaking public enums:** `Accepted::KeylessWithoutLog` and five
   `ConfigError` variants. Only tests read `Accepted`'s fields;
   `boneli-oci` matches none of them.
 - `TrustedRoot` counts the logs it lists (`listed_logs`), a private
   field; its `Debug` does not change.
 - **Weak spots of the opt-in**, each by design: GitHub alone vouches
-  (D3); the root is shared by every private repository on GitHub, so a
-  renamed or re-registered repository is visible in no log, which is why
-  the operator guide recommends certificate claims with the repository
-  ID (1.15, ADR-034); and a stale root fails closed (above).
+  (D3); the root is shared by every private repository on GitHub, so the
+  certificate claims that bind the source repository are what keep
+  another owner's signature out (D1), and a renamed or re-registered
+  repository is visible in no log, which is why the operator guide
+  recommends the repository ID (1.15) over a 1.12 rule alone; and a
+  stale root fails closed (above).
 
 **Known limits, each with its closure:**
 
@@ -285,6 +306,10 @@ refresh of GitHub's root is follow-up #137.
   when present). Rejected: a public-good bundle stripped of its entry
   would then pass (`stripped_public_good_bundle_refused`), a downgrade
   for every rule that sets the opt-in by mistake.
+- **The SAN owner rule alone, with reusable-workflow callers as a known
+  limit.** Rejected after review run 1 (D1): another owner's private
+  repository calling the trusted owner's public reusable workflow would
+  verify, and with no log nobody could ever see it.
 - **A per-root EKU switch** instead of D4. Rejected (D4): the same
   validation rule twice, for no measured chain that the global rule gets
   wrong.
@@ -311,12 +336,12 @@ keyless chain the live tests verify) is green on x86_64 and arm64.
 `real_github_bundles_refused_without_opt_in`); their chains
 (`github_fulcio_chains_verify`) and tokens (`real_github_tokens_verify`)
 verify in `boneli-https`. Every edge case refuses with its named refusal
-(`crates/boneli-sigstore/tests/no_log.rs`, 18 tests; `leaf_needs_its_eku`,
+(`crates/boneli-sigstore/tests/no_log.rs`, 20 tests; `leaf_needs_its_eku`,
 `sha384_triple_rules` and `p256_leaf_under_sha384_refused` in
 `boneli-https`). The public-good known answers keep their verdicts
 (`tests/verify.rs`, `rekor.rs`, `rekor_v2.rs` and `timestamp.rs` of
 `boneli-sigstore` and the 7 tokens of `real_tokens_verify` unchanged).
-29 hand-applied mutants, 29 killed, each by an assertion of the named
+35 hand-applied mutants, 35 killed, each by an assertion of the named
 test:
 
 - `boneli-https` (9): `required_if_present` back to `required`
@@ -330,7 +355,7 @@ test:
   SHA-256 filter and the SHA-256 signature algorithm used for SHA-384
   tokens (`real_github_tokens_verify`); the SHA-256 triple dropped
   (`real_tokens_verify`).
-- `boneli-sigstore` (20): the root-has-logs check dropped, and
+- `boneli-sigstore` (26): the root-has-logs check dropped, and
   `listed_logs` counting without CT, without left-out or without v2
   logs (4, `no_log_config_rules`, one variant each); the TSA check
   dropped, or counting a skipped one-certificate entry (2); the identity
@@ -345,7 +370,14 @@ test:
   dropped (`no_log_refuses_cosign_layers`); only the first time checked,
   and the reported token count fixed at 1 (`no_log_token_rules`); and
   `no_log: true` left out of `Debug` and `no_log()` always false
-  (`no_log_debug`).
+  (`no_log_debug`); and after review run 1 the repository binding of
+  D1 (6, `no_log_needs_repository_binding`): the guard in `with_no_log`
+  dropped, its re-check when claims are set again dropped, a 1.12 prefix
+  taken without the owner rule, an exact 1.12 not counted, the 1.15 ID
+  not counted, and `||` turned into `&&`. `no_log_other_owner_through_a_trusted_workflow`
+  pins the attack it closes: a leaf with the trusted SAN and another
+  owner's 1.12 and 1.15 is `CertificateClaim(Mismatch(..))` under an
+  exact 1.12, an owner prefix and a 1.15 rule.
 
 **Accepted.** The `oci-acceptance` run dispatched on the pull request's
 branch, https://github.com/Replikanti/boneli/actions/runs/45723922807,

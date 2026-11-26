@@ -324,6 +324,11 @@ pub enum ConfigError {
     /// The no-log opt-in was asked for with a SAN prefix that does not
     /// name an owner (`<scheme>://<host>/<owner>/` at least).
     NoLogIdentityWithoutOwner,
+    /// The no-log opt-in was asked for on a trust without certificate
+    /// claims that bind the source repository (an exact 1.12 rule, a 1.12
+    /// prefix naming an owner, or a 1.15 repository ID), or such claims
+    /// were replaced by ones that do not (ADR-040, D1).
+    NoLogWithoutRepository,
 }
 
 impl fmt::Display for ConfigError {
@@ -389,6 +394,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::NoLogIdentityWithoutOwner => {
                 "a trust without a transparency log needs every SAN prefix to name an owner"
+            }
+            ConfigError::NoLogWithoutRepository => {
+                "a trust without a transparency log needs certificate claims, set first, that bind the source repository by URI or ID"
             }
         })
     }

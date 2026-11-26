@@ -154,18 +154,28 @@ showed 6 CAs and 6 TSAs. Keep the file apart from the public-good
 
 **The opt-in.** Until the runner's policy file has a key for it (#32,
 #33), the opt-in is the library call `Trust::with_no_log()` on a trust
-over this root. It is refused when the root lists any log, when the root
-has no timestamp authority, and when an identity's SAN prefix does not
-name at least an owner (`https://github.com/<owner>/`): the root is
-shared by every private repository on GitHub, so a host-wide prefix would
-accept anyone's workflow. A verified signature reports
-`KeylessWithoutLog`.
+over this root, after certificate claims (`with_certificate_claims`,
+ADR-034) that bind the source repository. It is refused when the root
+lists any log, when the root has no timestamp authority, when an
+identity's SAN prefix does not name at least an owner
+(`https://github.com/<owner>/`), and when the certificate claims do not
+bind the repository the run belongs to (`NoLogWithoutRepository`). A
+verified signature reports `KeylessWithoutLog`.
 
-**Add certificate claims with the repository ID** (`CertificateClaims`
-with `with_repository_id`, the Fulcio extension 1.15, ADR-034). A
-repository name can be renamed or registered again by someone else, and
-with no log nobody would see a signature from the new owner; the numeric
-ID never moves to another repository.
+**Bind the repository, not only the workflow.** The SAN names the
+workflow that signed, and that can be a public reusable workflow which
+any repository on GitHub may call: a private repository of another owner
+calling your `release.yml` gets a leaf with your workflow in the SAN and
+its own repository in the Source Repository URI (1.12) and ID (1.15).
+The root is shared by every private repository on GitHub, and with no
+log nobody would ever see such a signature, so the opt-in needs one of:
+an exact 1.12 rule (`ClaimMatch::Exact("https://github.com/<owner>/<repo>")`),
+a 1.12 prefix that names at least an owner
+(`https://github.com/<owner>/`), or the repository ID
+(`with_repository_id`, 1.15). Prefer the ID: a repository name can be
+renamed or registered again by someone else, and the numeric ID never
+moves to another repository. Since certificate claims refuse keys, a
+no-log trust holds no keys.
 
 **Refresh it by hand.** The TUF refresh above covers Sigstore's
 public-good repository only, not this root; a TUF refresh of GitHub's

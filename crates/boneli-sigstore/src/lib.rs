@@ -22,7 +22,8 @@
 //!
 //! A trust may carry the no-log opt-in ([`Trust::with_no_log`], ADR-040),
 //! only over a root that lists no Rekor or CT log, such as GitHub's
-//! private-repository instance: its keyless bundles then verify with no
+//! private-repository instance, and with certificate claims that bind the
+//! source repository: its keyless bundles then verify with no
 //! log entry and no SCT, timed by their RFC 3161 timestamps alone, and
 //! pass as [`Accepted::KeylessWithoutLog`].
 //!

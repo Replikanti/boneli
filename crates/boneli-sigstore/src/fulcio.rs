@@ -39,7 +39,7 @@ use std::fmt;
 use boneli_https::CodeSigningCert;
 
 use crate::error::{ConfigError, Refusal};
-use crate::identity::printable;
+use crate::identity::{names_owner, printable};
 use crate::provenance::{ClaimMatch, check_match, meets};
 
 /// GitHub Actions' OIDC issuer: the only one whose meaning of these
@@ -210,6 +210,23 @@ impl CertificateClaims {
     /// repository (`Trust::with_certificate_claims` refuses it).
     pub(crate) fn path_binds_no_repository(&self) -> bool {
         self.workflow_path.is_some() && self.repository.is_none() && self.repository_id.is_none()
+    }
+
+    /// Whether these claims bind the leaf to one source repository, or
+    /// at least to one owner's: an exact Source Repository Identifier
+    /// (1.15), an exact Source Repository URI (1.12), or a 1.12 prefix
+    /// that names an owner (`<scheme>://<host>/<owner>/` at least). The
+    /// no-log opt-in requires it (ADR-040, D1): the SAN names the
+    /// workflow that signed, which may be another owner's reusable
+    /// workflow, while 1.12 and 1.15 name the repository the run belongs
+    /// to.
+    pub(crate) fn binds_repository(&self) -> bool {
+        let uri = match &self.repository {
+            Some(ClaimMatch::Exact(_)) => true,
+            Some(ClaimMatch::Prefix(prefix)) => names_owner(prefix),
+            None => false,
+        };
+        uri || self.repository_id.is_some()
     }
 
     /// These claims with the statement agreement (module doc). Needs the
