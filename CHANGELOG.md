@@ -1090,9 +1090,29 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   private-repository attestations under the installed file with the
   no-log opt-in. `docs/sigstore-trust.md` replaces the capture by hand
   with the TUF refresh. No new crate or dependency edge.
+- Recorded seccomp denials, pure part (part 1 of #45, ADR-043, proposed):
+  `boneli-sys` assembles a notifying program next to the plain one, the
+  same instruction for instruction except that its 21 errno returns are
+  `SECCOMP_RET_USER_NOTIF`; a safe evaluator for the assembler's subset
+  (`seccomp::evaluate`, fails closed on anything else) and
+  `notify::decide`, which takes a notified call's errno and row from the
+  plain program; the record of denied calls (`seccomp::record`: 723 keys
+  per architecture, first occurrence kept, saturating counts, one ASCII
+  line per entry with decoded key arguments, `/proc/<pid>/status` parsing
+  for the inside pid and the comm, hostile comms escaped); the deny-only
+  reply `notify::Deny` (errno 1 to 4095, never a flag) and receive and
+  reply buffers sized by the kernel (`Error::NotifySizes`); a self-scan
+  test that bans the names and numbers of the reply flag that lets a
+  call run and of descriptor injection in every boneli-sys file. `spawn`
+  still installs the plain program; the supervisor lands in part 2.
 
 ### Changed
 
+- `boneli-sys` seccomp program (part 1 of #45, ADR-043 D2, amending
+  ADR-007 D2): every errno row returns at an instruction of its own
+  (`Program::row_at`), so the program has 104 instructions instead of 88;
+  every policy test of ADR-007 D2 is unchanged and green, so no decision
+  moved.
 - A trust directory of `boneli-tuf` belongs to its pin: a refresh with
   another pin now fails at `InitialRoot` before it removes a crashed
   run's temporary files, so it changes nothing in the directory
