@@ -977,6 +977,14 @@ features" step prints them on every run):
 | cgroup2 `memory_hugetlb_accounting` (PR 4 run) | present | absent |
 | `vm.nr_hugepages` / `vm.hugetlb_shm_group` / hugetlbfs (PR 4 run) | 0 / 0 / `/dev/hugepages`, `pagesize=2M` | the same |
 | `BONELI_SYS_HOST_GAPS` (since PR 4) | `syslog,shmget-hugetlb`: both rows give EPERM without the filter (`dmesg_restrict` 1; the runner user is not in `vm.hugetlb_shm_group`); every other kernel row observed | the same |
+| PR 5 run (46016830738, 2026-11-27): kernel | 7.0.0-1020-azure | 7.0.0-1020-azure |
+| Landlock ABI (PR 5 run) | 8 | 8 |
+| `tls` ULP in `tcp_available_ulp` (PR 5 runs) | absent (present on the runner of the first run, 46014469886) | present |
+| `CONFIG_TCP_AO` / `CONFIG_TCP_MD5SIG` (PR 5 run) | `y` / `y` | the same |
+| RTC alarm device (PR 5 run) | present: the alarm clocks reach their capability check | absent: `rtc0` exists, but `timer_create` and `clock_nanosleep` on `CLOCK_REALTIME_ALARM` answer EOPNOTSUPP (`alarm-rtc`) |
+| `NeedsCap` syscalls the kernel lacks (PR 5 run) | none | none |
+| `BONELI_SYS_HOST_GAPS` (since PR 5) | `syslog,shmget-hugetlb` | `syslog,shmget-hugetlb,alarm-rtc` |
+| host tests (PR 5 run) | 12 unit and 79 integration tests, step 62 s | 12 and 79, step 59 s |
 
 Every assumption above held but one: the AppArmor restriction shows as
 EACCES at the setgroups open, not EPERM (D3). The runner user has
