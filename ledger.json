@@ -1717,7 +1717,7 @@
    "title": "boneli-sys: two host tests flake on a loaded host (keeper cadence, buffered writes)",
    "epic": null,
    "order": 66,
-   "state": "implementing",
+   "state": "plan-review",
    "owner": "ae8af796",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1725,8 +1725,8 @@
    "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "",
-   "updated_at": "2026-11-27T17:08:51+00:00",
+   "note": "plan blocked by measurement: keeper bounds cannot separate honest load from K3; re-plan decision",
+   "updated_at": "2026-11-27T17:22:55+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1738,14 +1738,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T13:08:14+00:00",
-   "issue": 128,
-   "from": "pr-review",
-   "to": "done",
-   "by": "ea19b3dc",
-   "note": null
-  },
   {
    "at": "2026-11-25T13:08:19+00:00",
    "issue": 131,
@@ -2137,6 +2129,14 @@
    "to": "implementing",
    "by": "ae8af796",
    "note": null
+  },
+  {
+   "at": "2026-11-27T17:22:55+00:00",
+   "issue": 142,
+   "from": "implementing",
+   "to": "plan-review",
+   "by": "ae8af796",
+   "note": "plan blocked by measurement: keeper bounds cannot separate honest load from K3; re-plan decision"
   }
  ],
  "open": [
@@ -2164,7 +2164,7 @@
   142
  ],
  "xopen": [],
- "updated_at": "2026-11-27T17:08:51+00:00",
+ "updated_at": "2026-11-27T17:22:55+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
