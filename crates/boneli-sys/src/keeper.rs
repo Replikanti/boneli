@@ -222,11 +222,10 @@ impl StatsKeeper {
             let State { report, last, .. } = &mut *s;
             note_read(report, last, at, at.elapsed(), false);
         }
-        let first_deadline = at + STATS_KEEPER_PERIOD;
         let theirs = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("memcg-keeper".to_string())
-            .spawn(move || run(&theirs, &fd, first_deadline, STATS_KEEPER_PERIOD))
+            .spawn(move || run(&theirs, &fd, at, &Real))
             .map_err(|e| Error::Sys {
                 call: "spawn(memcg-keeper)",
                 errno: e.raw_os_error().unwrap_or(libc::EAGAIN),
@@ -284,12 +283,53 @@ impl Drop for StatsKeeper {
     }
 }
 
-/// The keeper thread: reads on [`next_tick`]'s schedule until stopped or
-/// until a read fails, which it records and ends on. After every read and
-/// at its end it records its own CPU time.
-fn run(shared: &Shared, fd: &OwnedFd, first: Instant, period: Duration) {
+/// Where the keeper loop takes its time from (#142). The loop's cadence
+/// (reads per period, late reads, the longest gap) cannot be judged by the
+/// wall clock on a loaded host, which freezes the thread for tens of
+/// milliseconds, so the unit tests drive [`run`] on a fake clock instead.
+/// Every clock read and every wait of the loop goes through it: one that
+/// bypassed it would be invisible to those tests. Two things stay real:
+/// the thread's CPU time, which is not scheduling, and the unit tests' own
+/// `EXIT_DELAY` after a stop, which is not part of the schedule.
+trait Clock {
+    /// The current instant.
+    fn now(&self) -> Instant;
+
+    /// Waits up to `d` on `wake` with the guard released, or until
+    /// notified, and returns the guard.
+    fn wait<'a>(
+        &self,
+        wake: &Condvar,
+        s: MutexGuard<'a, State>,
+        d: Duration,
+    ) -> MutexGuard<'a, State>;
+}
+
+/// The monotonic clock and the condition variable's own timed wait.
+struct Real;
+
+impl Clock for Real {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait<'a>(
+        &self,
+        wake: &Condvar,
+        s: MutexGuard<'a, State>,
+        d: Duration,
+    ) -> MutexGuard<'a, State> {
+        wake.wait_timeout(s, d).unwrap_or_else(|p| p.into_inner()).0
+    }
+}
+
+/// The keeper thread: reads on [`next_tick`]'s schedule, the first time
+/// one [`STATS_KEEPER_PERIOD`] after the synchronous first read at
+/// `first_read`, until stopped or until a read fails, which it records and
+/// ends on. After every read and at its end it records its own CPU time.
+fn run<C: Clock>(shared: &Shared, fd: &OwnedFd, first_read: Instant, clock: &C) {
     let mut buf = [0u8; READ_BUF];
-    let mut deadline = first;
+    let mut deadline = first_read + STATS_KEEPER_PERIOD;
     let mut s = shared.guard();
     loop {
         if s.stop {
@@ -301,19 +341,15 @@ fn run(shared: &Shared, fd: &OwnedFd, first: Instant, period: Duration) {
             std::thread::sleep(tests::EXIT_DELAY);
             return;
         }
-        match next_tick(deadline, Instant::now(), period) {
+        match next_tick(deadline, clock.now(), STATS_KEEPER_PERIOD) {
             Tick::Wait(d) => {
-                s = shared
-                    .wake
-                    .wait_timeout(s, d)
-                    .unwrap_or_else(|p| p.into_inner())
-                    .0;
+                s = clock.wait(&shared.wake, s, d);
             }
             Tick::Read { next, late } => {
                 drop(s);
-                let at = Instant::now();
+                let at = clock.now();
                 let r = read_stat(fd, &mut buf);
-                let took = at.elapsed();
+                let took = clock.now().saturating_duration_since(at);
                 let cpu = thread_cpu();
                 s = shared.guard();
                 s.report.cpu = cpu;
@@ -628,5 +664,183 @@ mod tests {
         k.stop();
         drop(k);
         assert!(within(|| keepers() == before));
+    }
+
+    /// A clock for [`run`] on the test's own thread (#142): `now` is
+    /// `base` plus a virtual time that only `wait` moves, by the time
+    /// asked plus the overshoot scripted for that call (a host that froze
+    /// the thread). It never blocks. Once the virtual time reaches `end`
+    /// it stops the loop as [`StatsKeeper::stop`] would, and once it
+    /// reaches the time in `empty` it empties that file, so the loop's
+    /// next read fails.
+    struct Fake {
+        base: Instant,
+        virt: std::cell::Cell<Duration>,
+        end: Duration,
+        /// (index of the wait call, from 0; its overshoot).
+        freeze: Vec<(usize, Duration)>,
+        waits: std::cell::Cell<usize>,
+        empty: Option<(Duration, std::path::PathBuf)>,
+    }
+
+    impl Fake {
+        fn new(end_ms: u64) -> Fake {
+            Fake {
+                base: Instant::now(),
+                virt: std::cell::Cell::new(Duration::ZERO),
+                end: ms(end_ms),
+                freeze: Vec::new(),
+                waits: std::cell::Cell::new(0),
+                empty: None,
+            }
+        }
+
+        /// The `n`th wait call (from 0) wakes `over` late.
+        fn freeze(mut self, n: usize, over: Duration) -> Fake {
+            self.freeze.push((n, over));
+            self
+        }
+    }
+
+    impl Clock for Fake {
+        fn now(&self) -> Instant {
+            self.base + self.virt.get()
+        }
+
+        fn wait<'a>(
+            &self,
+            _wake: &Condvar,
+            mut s: MutexGuard<'a, State>,
+            d: Duration,
+        ) -> MutexGuard<'a, State> {
+            let n = self.waits.get();
+            self.waits.set(n + 1);
+            let over = self
+                .freeze
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map_or(Duration::ZERO, |&(_, o)| o);
+            let t = self.virt.get() + d + over;
+            self.virt.set(t);
+            if let Some((at, path)) = &self.empty
+                && t >= *at
+            {
+                std::fs::write(path, b"").expect("empty the file");
+            }
+            if t >= self.end {
+                s.stop = true;
+            }
+            s
+        }
+    }
+
+    /// Runs the keeper loop on `fake` over `fd` after a synchronous first
+    /// read at the fake's start, as [`StatsKeeper::start`] seeds it, and
+    /// returns the report.
+    fn run_fake(fake: &Fake, fd: &OwnedFd, stopped: bool) -> KeeperReport {
+        let shared = Shared::default();
+        {
+            let mut s = shared.guard();
+            let State { report, last, .. } = &mut *s;
+            note_read(report, last, fake.base, Duration::ZERO, false);
+            s.stop = stopped;
+        }
+        run(&shared, fd, fake.base, fake);
+        shared.guard().report
+    }
+
+    /// A readable `memory.stat` stand-in and its descriptor.
+    fn stat_file(dir: &TempDir) -> (std::path::PathBuf, OwnedFd) {
+        let path = dir.0.join("memory.stat");
+        std::fs::write(&path, b"anon 0\nfile 0\n").expect("a memory.stat");
+        let fd = std::fs::File::open(&path).expect("open it").into();
+        (path, fd)
+    }
+
+    /// The loop's reads, late reads and longest gap.
+    fn shape(r: KeeperReport) -> (u64, u64, Duration) {
+        (r.reads, r.late, r.max_gap)
+    }
+
+    #[test]
+    fn keeper_loop_on_time() {
+        // The period ADR-007 D8 measured; a changed constant is a changed
+        // decision, not a refactoring.
+        assert_eq!(STATS_KEEPER_PERIOD, ms(5));
+        let dir = TempDir::new("on-time");
+        let (_, fd) = stat_file(&dir);
+        // Every wake on time, 1,001 ms: one read at 5, 10, ..., 1,000 ms
+        // after the synchronous one, none late, every gap 5 ms. A doubled
+        // period reads 100 times, a skipped period in four 160 times with
+        // a 10 ms gap, a read instant from the wall clock shows gaps of
+        // nanoseconds.
+        let fake = Fake::new(1001);
+        let r = run_fake(&fake, &fd, false);
+        assert_eq!(shape(r), (1 + 200, 0, ms(5)), "{r:?}");
+        assert_eq!(r.failed, None);
+        assert_eq!(
+            r.max_read,
+            Duration::ZERO,
+            "the read was timed on the wall clock"
+        );
+        assert_eq!(fake.waits.get(), 201, "one wait per period");
+        // Stopped exactly at 1,000 ms: the stop is seen before the read due
+        // then, so that read is not taken (exclusive end).
+        let r = run_fake(&Fake::new(1000), &fd, false);
+        assert_eq!(shape(r), (1 + 199, 0, ms(5)), "{r:?}");
+    }
+
+    #[test]
+    fn keeper_loop_freeze_reanchors() {
+        let dir = TempDir::new("freeze");
+        let (_, fd) = stat_file(&dir);
+        // The 11th wait (deadline 55 ms) wakes late. Under a period (3 ms):
+        // read at 58 ms, not late, the next at 60 ms, so the schedule and
+        // the count are those of an idle host; one gap of 8 ms.
+        let r = run_fake(&Fake::new(1001).freeze(10, ms(3)), &fd, false);
+        assert_eq!(shape(r), (1 + 200, 0, ms(8)), "{r:?}");
+        // Exactly a period (inclusive, as in keeper_schedule): one late
+        // read at 60 ms instead of two at 55 and 60.
+        let r = run_fake(&Fake::new(1001).freeze(10, ms(5)), &fd, false);
+        assert_eq!(shape(r), (1 + 199, 1, ms(10)), "{r:?}");
+        // 7 ms: one late read at 62 ms and the schedule starts again from
+        // it (67, 72, ..., 997 ms), so the read due at 1,000 ms moves past
+        // the end: 198 reads. A keeper that kept the old phase would read
+        // at 62 and again at once for 60 ms (a burst).
+        let r = run_fake(&Fake::new(1001).freeze(10, ms(7)), &fd, false);
+        assert_eq!(shape(r), (1 + 198, 1, ms(12)), "{r:?}");
+        // A 60 ms freeze: one late read at 115 ms, the 12 periods due from
+        // 55 to 110 ms are lost, not caught up (gap / period - 1 = 65 / 5
+        // - 1 reads lost per freeze, the load model of #142).
+        let r = run_fake(&Fake::new(1001).freeze(10, ms(60)), &fd, false);
+        assert_eq!(shape(r), (1 + 188, 1, ms(65)), "{r:?}");
+    }
+
+    #[test]
+    fn keeper_loop_ends_on_read_error_and_stop() {
+        let dir = TempDir::new("ends");
+        // A descriptor that cannot be read (a directory): the first read
+        // at 5 ms fails, the failure is kept and the loop ends there.
+        let fake = Fake::new(1001);
+        let r = run_fake(&fake, &dir.fd(), false);
+        assert_eq!(r.failed, Some(libc::EISDIR), "{r:?}");
+        assert_eq!(r.reads, 1, "{r:?}");
+        assert_eq!(fake.waits.get(), 1, "the loop went on after the failure");
+        // Emptied at 500 ms: the reads at 5, ..., 495 ms succeed, the one
+        // at 500 ms reads 0 bytes (EIO) and the loop ends without another
+        // wait or read.
+        let (path, fd) = stat_file(&dir);
+        let mut fake = Fake::new(1001);
+        fake.empty = Some((ms(500), path));
+        let r = run_fake(&fake, &fd, false);
+        assert_eq!(r.failed, Some(libc::EIO), "{r:?}");
+        assert_eq!(shape(r), (1 + 99, 0, ms(5)), "{r:?}");
+        assert_eq!(fake.waits.get(), 100, "the loop went on after the failure");
+        // Stopped before the first tick: no wait, no read.
+        let (_, fd) = stat_file(&dir);
+        let fake = Fake::new(1001);
+        let r = run_fake(&fake, &fd, true);
+        assert_eq!((r.reads, r.failed), (1, None), "{r:?}");
+        assert_eq!(fake.waits.get(), 0);
     }
 }

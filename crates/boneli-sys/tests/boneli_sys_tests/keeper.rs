@@ -150,50 +150,96 @@ fn read_slots(files: &[&Path]) -> Vec<usize> {
 }
 
 /// How many windows `keeper_reads_its_own_sandbox` tries, each with fresh
-/// keepers, before it fails on the cadence: a host that starves the
-/// keeper thread for a moment (the dev host under a parallel build showed
-/// a 56 ms gap) fails one window, a keeper that reads too seldom fails
-/// every one (the precedent is `cpu_limit_throttles`, ADR-007 D8).
+/// keepers, before it fails: a host that starves the keeper thread for a
+/// moment fails one window, a keeper that reads the wrong file, stopped
+/// or hangs fails every one (the precedent is `cpu_limit_throttles`,
+/// ADR-007 D8).
 const CADENCE_ATTEMPTS: usize = 3;
 
-/// The largest gap between two reads a window allows: 4 periods, 20 ms,
-/// the shortest read interval that lost a size in #54's M3 (reads every
-/// 20 ms at 64 MiB: 200 of 400 CI runs OOM-killed).
-const CADENCE_MAX_GAP: Duration = Duration::from_millis(20);
+/// The longest pause a window allows between two reads: 100 periods. A
+/// hang bound only, for a keeper that stopped; the largest honest gap
+/// measured on a loaded dev host was 56 ms (#142).
+const CADENCE_STALL: Duration = Duration::from_millis(500);
 
-/// What one window of `keeper_reads_its_own_sandbox` saw of one keeper.
-fn cadence_failure(
+/// What one window of `keeper_reads_its_own_sandbox` saw of one keeper:
+/// wiring and liveness, not cadence. How often and how regularly the
+/// keeper reads is pinned by the unit tests of its loop on a fake clock
+/// (`src/keeper.rs`), because a loaded host stretches any wall-clock
+/// bound: under `CPUQuota=300%` honest keepers read 60 to 75 % of the
+/// periods, up to 8.39 % of them late, and paused 25 to 70 ms (#142).
+fn liveness_failure(
     name: &str,
     slots: usize,
     before: KeeperReport,
     after: KeeperReport,
-    window: Duration,
 ) -> Option<String> {
     let reads = after.reads.saturating_sub(before.reads);
-    // At least 3/4 of the periods in the window: on time a keeper reads
-    // once per period, a late read re-anchors without catching up, and a
-    // quarter leaves room for that. It rejects any period over 4/3 of
-    // STATS_KEEPER_PERIOD, so a keeper at 2 or 10 periods fails.
-    let need = u64::try_from(window.as_nanos() * 3 / (4 * STATS_KEEPER_PERIOD.as_nanos()))
-        .unwrap_or(u64::MAX);
-    if slots * 4 < READ_SLOTS * 3 {
+    if let Some(errno) = after.failed {
+        Some(format!(
+            "the keeper of sandbox {name} failed (errno {errno})"
+        ))
+    } else if slots < READ_SLOTS / 4 {
+        // Its own file in at least a quarter of the slots, the share the
+        // parent's may have: an honest keeper filled 19 or 20 of 20 in
+        // every window measured on the loaded dev host, one that reads
+        // only the parent's fills none (#142).
         Some(format!(
             "the keeper of sandbox {name} read its memory.stat in {slots} of {READ_SLOTS} slots \
-             of 10 periods"
+             of 10 periods, under {}",
+            READ_SLOTS / 4
         ))
-    } else if reads < need {
+    } else if after.reads <= before.reads {
         Some(format!(
-            "the keeper of sandbox {name} read {reads} times in {window:?}, under the {need} \
-             (3/4 of one per {STATS_KEEPER_PERIOD:?})"
+            "the keeper of sandbox {name} read {reads} times in the window: it is not running"
         ))
-    } else if after.max_gap > CADENCE_MAX_GAP {
+    } else if after.max_gap > CADENCE_STALL {
         Some(format!(
-            "the keeper of sandbox {name} paused {:?} between two reads, over {CADENCE_MAX_GAP:?}",
+            "the keeper of sandbox {name} paused {:?} between two reads, over {CADENCE_STALL:?}",
             after.max_gap
         ))
     } else {
         None
     }
+}
+
+#[test]
+fn liveness_rule() {
+    let ms = Duration::from_millis;
+    let keeper = |reads: u64, late: u64, max_gap: Duration| KeeperReport {
+        reads,
+        late,
+        max_gap,
+        ..KeeperReport::default()
+    };
+    let before = keeper(10, 0, ms(5));
+    let rule = |slots: usize, after: KeeperReport| liveness_failure("a", slots, before, after);
+    // An honest keeper on an idle host.
+    assert_eq!(rule(READ_SLOTS, keeper(210, 0, ms(5))), None);
+    // An honest keeper on a loaded host (#142): 60 % of the periods read,
+    // 14 late, a 56 ms pause.
+    assert_eq!(rule(READ_SLOTS, keeper(130, 14, ms(56))), None);
+    // Own slots, inclusive at a quarter: 5 of 20 passes, 4 fails.
+    assert_eq!(rule(5, keeper(210, 0, ms(5))), None);
+    let m = rule(4, keeper(210, 0, ms(5))).expect("under a quarter of the slots");
+    assert!(m.contains("in 4 of 20 slots"), "{m}");
+    let m = rule(0, keeper(210, 0, ms(5))).expect("never its own file");
+    assert!(m.contains("in 0 of 20 slots"), "{m}");
+    // Alive: one read in the window passes, none fails.
+    assert_eq!(rule(READ_SLOTS, keeper(11, 0, ms(5))), None);
+    let m = rule(READ_SLOTS, keeper(10, 0, ms(5))).expect("no read in the window");
+    assert!(m.contains("read 0 times"), "{m}");
+    // A report that went backwards does not panic and fails on reads.
+    let m = rule(READ_SLOTS, keeper(3, 0, ms(5))).expect("an empty window");
+    assert!(m.contains("read 0 times"), "{m}");
+    // A failed keeper fails, also with reads in the window.
+    let mut failed = keeper(210, 0, ms(5));
+    failed.failed = Some(libc::EIO);
+    let m = rule(READ_SLOTS, failed).expect("a failed keeper");
+    assert!(m.contains("failed (errno 5)"), "{m}");
+    // The stall bound, inclusive.
+    assert_eq!(rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL)), None);
+    let m = rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL + ms(1))).expect("a stall");
+    assert!(m.contains("paused 501ms"), "{m}");
 }
 
 #[test]
@@ -205,9 +251,12 @@ fn keeper_reads_its_own_sandbox() {
     // descriptors show what a keeper holds; the inotify reads show which
     // file it reads: a keeper that holds its own file but opens, reads and
     // closes the parent's every period passed the descriptor checks alone
-    // (#78 review, run 1). The keeper's own report shows how often: a slot
-    // is 10 periods long, so a keeper reading every 10 periods filled
-    // every slot (#78 review, run 2).
+    // (#78 review, run 1). How often and how regularly it reads (a slot is
+    // 10 periods long, so a keeper reading every 10 periods filled every
+    // slot: #78 review, run 2) is pinned by the unit tests of its loop on
+    // a fake clock in src/keeper.rs, not here: a loaded host stretches any
+    // wall-clock bound (#142). This test pins that each keeper reads its
+    // own file, never the parent's, and is alive ([`liveness_failure`]).
     let _alone = support::exclusive();
     let parent_stat = cgroup::parent().path().join("memory.stat");
     let parent_before = descriptors_of(&parent_stat);
@@ -224,8 +273,8 @@ fn keeper_reads_its_own_sandbox() {
             parent_before,
             "a keeper holds the parent's memory.stat"
         );
-        // Each keeper reads its own file in at least 3 of 4 slots of 10
-        // periods (a keeper that reads every period fills every slot), and
+        // Each keeper reads its own file in at least a quarter of the slots
+        // of 10 periods (a keeper that reads every period fills every slot), and
         // the parent's file is read in at most a quarter of them (nothing
         // in this test reads it; a host's monitor may, about once a
         // second; a keeper that reads it every period fills every slot).
@@ -237,13 +286,15 @@ fn keeper_reads_its_own_sandbox() {
         report(&format!(
             "keeper_reads_its_own_sandbox: attempt {attempt}, slots of {:?} with a read, of \
              {READ_SLOTS}: sandbox a {}, sandbox b {}, parent {}; window {window:?}, reads a {} \
-             b {}; {a1:?} {b1:?}",
+             b {}, late a {} b {}; {a1:?} {b1:?}",
             10 * STATS_KEEPER_PERIOD,
             slots[0],
             slots[1],
             slots[2],
             a1.reads.saturating_sub(a0.reads),
             b1.reads.saturating_sub(b0.reads),
+            a1.late.saturating_sub(a0.late),
+            b1.late.saturating_sub(b0.late),
         ));
         assert!(
             slots[2] * 4 <= READ_SLOTS,
@@ -252,8 +303,8 @@ fn keeper_reads_its_own_sandbox() {
             slots
         );
         let failed: Vec<String> = [
-            cadence_failure("a", slots[0], a0, a1, window),
-            cadence_failure("b", slots[1], b0, b1, window),
+            liveness_failure("a", slots[0], a0, a1),
+            liveness_failure("b", slots[1], b0, b1),
         ]
         .into_iter()
         .flatten()
@@ -270,7 +321,7 @@ fn keeper_reads_its_own_sandbox() {
         return;
     }
     panic!(
-        "no window of {CADENCE_ATTEMPTS} kept the cadence: {}",
+        "no window of {CADENCE_ATTEMPTS} showed both keepers alive on their own files: {}",
         failures.join(" | ")
     );
 }
