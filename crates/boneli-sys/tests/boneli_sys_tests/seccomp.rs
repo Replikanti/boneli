@@ -16,6 +16,7 @@ const EPERM: u32 = errno_action(libc::EPERM);
 const ENOSYS: u32 = errno_action(libc::ENOSYS);
 const EAFNOSUPPORT: u32 = errno_action(libc::EAFNOSUPPORT);
 const EPROTONOSUPPORT: u32 = errno_action(libc::EPROTONOSUPPORT);
+const ENOPROTOOPT: u32 = errno_action(libc::ENOPROTOOPT);
 const KILL: u32 = libc::SECCOMP_RET_KILL_PROCESS;
 
 /// The numbers the rows name, per architecture (ADR-007 D2 and the huge
@@ -31,6 +32,8 @@ struct Numbers {
     shmget: u32,
     memfd_create: u32,
     ioctl: u32,
+    setsockopt: u32,
+    getsockopt: u32,
 }
 
 /// x86_64: io_uring_setup/enter/register, bpf, userfaultfd,
@@ -46,6 +49,8 @@ const X86_64: Numbers = Numbers {
     shmget: 29,
     memfd_create: 319,
     ioctl: 16,
+    setsockopt: 54,
+    getsockopt: 55,
 };
 
 /// aarch64, in the same order.
@@ -60,6 +65,8 @@ const AARCH64: Numbers = Numbers {
     shmget: 194,
     memfd_create: 279,
     ioctl: 29,
+    setsockopt: 208,
+    getsockopt: 209,
 };
 
 fn numbers(arch: Arch) -> &'static Numbers {
@@ -333,6 +340,34 @@ fn inet_protocol_rows() {
         );
         assert_eq!(socket(libc::AF_VSOCK as u64, stream, 6), EAFNOSUPPORT);
     }
+    // MPTCP and UDP-Lite stay refused (ADR-007 D2, the census verdict),
+    // named: both families, stream and datagram.
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        for protocol in [libc::IPPROTO_MPTCP, libc::IPPROTO_UDPLITE] {
+            for family in [libc::AF_INET, libc::AF_INET6] {
+                for ty in [libc::SOCK_STREAM, libc::SOCK_DGRAM] {
+                    let got = run(
+                        &prog,
+                        &Data::call(audit, n.socket)
+                            .arg(0, family as u64)
+                            .arg(1, ty as u64)
+                            .arg(2, protocol as u64),
+                    );
+                    assert_eq!(
+                        got,
+                        EPROTONOSUPPORT,
+                        "{}: family {family} type {ty} protocol {protocol}",
+                        arch.name()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(libc::IPPROTO_MPTCP, 262);
+    assert_eq!(libc::IPPROTO_UDPLITE, 136);
     assert_eq!(libc::IPPROTO_ICMP, 1);
     assert_eq!(libc::IPPROTO_TCP, 6);
     assert_eq!(libc::IPPROTO_UDP, 17);
@@ -578,6 +613,244 @@ fn hugetlb_flag_rows() {
 }
 
 #[test]
+fn ktls_row() {
+    // Written out: SOL_TLS is 282 (`include/linux/socket.h`), TCP_ULP 31.
+    const SOL_TLS: u64 = 282;
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let setsockopt = |fd: u64, level: u64, optname: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.setsockopt)
+                    .arg(0, fd)
+                    .arg(1, level)
+                    .arg(2, optname),
+            )
+        };
+        // Every option at this level: TLS_TX 1, TLS_RX 2, TLS_TX_ZEROCOPY_RO
+        // 3, TLS_RX_EXPECT_NO_PAD 4, TLS_TX_MAX_PAYLOAD_LEN 5, and values
+        // the kernel does not define.
+        for optname in [1, 2, 3, 4, 5, 0, 0xFFFF_FFFF] {
+            assert_eq!(
+                setsockopt(3, SOL_TLS, optname),
+                ENOPROTOOPT,
+                "{name}: optname {optname:#x}"
+            );
+        }
+        // `level` is an int: the high word is not part of it.
+        assert_eq!(setsockopt(3, (1 << 32) | SOL_TLS, 1), ENOPROTOOPT, "{name}");
+        assert_eq!(
+            setsockopt(3, 0xFFFF_FFFF_0000_011A, 1),
+            ENOPROTOOPT,
+            "{name}"
+        );
+        // The other levels, the neighbours among them: SOL_IP 0, SOL_SOCKET
+        // 1, SOL_IPV6 41.
+        for level in [0, 1, 41, 281, 283, 0xFFFF_FFFF] {
+            assert_eq!(setsockopt(3, level, 1), ALLOW, "{name}: level {level}");
+        }
+        // Attaching the ULP stays allowed: its autoload is capable()-gated.
+        assert_eq!(setsockopt(3, 6, 31), ALLOW, "{name}: TCP_ULP");
+        // The level is arg 1, not arg 2 or arg 0.
+        assert_eq!(setsockopt(3, 1, SOL_TLS), ALLOW, "{name}");
+        assert_eq!(setsockopt(SOL_TLS, 1, 1), ALLOW, "{name}");
+        // Reading the options allocates nothing.
+        assert_eq!(
+            run(
+                &prog,
+                &Data::call(audit, n.getsockopt)
+                    .arg(0, 3)
+                    .arg(1, SOL_TLS)
+                    .arg(2, 1)
+            ),
+            ALLOW,
+            "{name}: getsockopt"
+        );
+    }
+    assert_eq!(SOL_TLS, libc::SOL_TLS as u64);
+    assert_eq!(libc::TCP_ULP, 31);
+}
+
+#[test]
+fn tcp_signature_rows() {
+    // Written out: TCP_MD5SIG 14, TCP_MD5SIG_EXT 32 and TCP_AO_ADD_KEY 38
+    // (`include/uapi/linux/tcp.h`), at level IPPROTO_TCP 6.
+    const TCP: u64 = 6;
+    const SIGNED: [u64; 3] = [14, 32, 38];
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let setsockopt = |level: u64, optname: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.setsockopt)
+                    .arg(0, 3)
+                    .arg(1, level)
+                    .arg(2, optname),
+            )
+        };
+        for optname in SIGNED {
+            assert_eq!(
+                setsockopt(TCP, optname),
+                ENOPROTOOPT,
+                "{name}: optname {optname}"
+            );
+        }
+        // `level` and `optname` are ints.
+        assert_eq!(setsockopt((1 << 32) | TCP, 38), ENOPROTOOPT, "{name}");
+        assert_eq!(setsockopt(TCP, (1 << 32) | 38), ENOPROTOOPT, "{name}");
+        // The neighbours and the other TCP-AO options, which allocate
+        // nothing without a key: TCP_AO_DEL_KEY 39, TCP_AO_INFO 40,
+        // TCP_AO_GET_KEYS 41, TCP_AO_REPAIR 42.
+        for optname in [13, 15, 31, 33, 37, 39, 40, 41, 42] {
+            assert_eq!(setsockopt(TCP, optname), ALLOW, "{name}: optname {optname}");
+        }
+        // The same numbers name other options at other levels.
+        for level in [0, 1, 17, 41] {
+            for optname in SIGNED {
+                assert_eq!(
+                    setsockopt(level, optname),
+                    ALLOW,
+                    "{name}: level {level} optname {optname}"
+                );
+            }
+        }
+    }
+    assert_eq!(SIGNED[0], libc::TCP_MD5SIG as u64);
+    assert_eq!(SIGNED[1], libc::TCP_MD5SIG_EXT as u64);
+}
+
+#[test]
+fn bpfilter_row() {
+    // Written out: IPPROTO_IP (SOL_IP) is 0, and the bpfilter range is
+    // BPFILTER_IPT_SO_SET_REPLACE 64 to BPFILTER_IPT_SO_GET_REVISION_TARGET
+    // 67 (`include/uapi/linux/bpfilter.h` in 5.19), the iptables numbers.
+    const SOL_IP: u64 = 0;
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        for nr in [n.setsockopt, n.getsockopt] {
+            let call = |level: u64, optname: u64| {
+                run(
+                    &prog,
+                    &Data::call(audit, nr)
+                        .arg(0, 3)
+                        .arg(1, level)
+                        .arg(2, optname),
+                )
+            };
+            for optname in 64..=67 {
+                assert_eq!(
+                    call(SOL_IP, optname),
+                    ENOPROTOOPT,
+                    "{name}: nr {nr} optname {optname}"
+                );
+                // `level` and `optname` are ints.
+                assert_eq!(call(1 << 32, optname), ENOPROTOOPT, "{name}: nr {nr}");
+                assert_eq!(call(SOL_IP, (1 << 32) | optname), ENOPROTOOPT, "{name}");
+            }
+            // The neighbours and the IP options programs use: IP_TOS 1,
+            // IP_TTL 2, IP_MULTICAST_IF 32, IP_RECVERR 11, MCAST_JOIN_GROUP
+            // 42, IP_LOCAL_PORT_RANGE 51, IP_PROTOCOL 52, and 63, 68, 96
+            // (ARPT_SO_SET_REPLACE, judged by the kernel).
+            for optname in [0, 1, 2, 11, 32, 42, 51, 52, 63, 68, 96, 0xFFFF_FFFF] {
+                assert_eq!(call(SOL_IP, optname), ALLOW, "{name}: nr {nr} {optname}");
+            }
+            // The same numbers at other levels: SOL_SOCKET, IPPROTO_TCP,
+            // IPPROTO_UDP, SOL_IPV6 (whose 64-67 are ip6tables, which need
+            // CAP_NET_ADMIN and load no module).
+            for level in [1, 6, 17, 41] {
+                for optname in 64..=67 {
+                    assert_eq!(call(level, optname), ALLOW, "{name}: {level} {optname}");
+                }
+            }
+        }
+        // getsockopt keeps no other row.
+        let get = |level: u64, optname: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.getsockopt)
+                    .arg(1, level)
+                    .arg(2, optname),
+            )
+        };
+        assert_eq!(get(6, 38), ALLOW, "{name}: getsockopt TCP_AO_ADD_KEY");
+        assert_eq!(get(282, 1), ALLOW, "{name}: getsockopt SOL_TLS");
+    }
+}
+
+#[test]
+fn fs_crypto_ioctl_rows() {
+    // Written out, from the 7.2.4 uapi headers (`linux/fscrypt.h`,
+    // `linux/fsverity.h`): FS_IOC_ADD_ENCRYPTION_KEY,
+    // FS_IOC_SET_ENCRYPTION_POLICY, FS_IOC_ENABLE_VERITY.
+    const REFUSED: [u64; 3] = [0xc050_6617, 0x800c_6613, 0x4080_6685];
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let ioctl = |fd: u64, cmd: u64, arg: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.ioctl)
+                    .arg(0, fd)
+                    .arg(1, cmd)
+                    .arg(2, arg),
+            )
+        };
+        for cmd in REFUSED {
+            assert_eq!(ioctl(3, cmd, 0), EPERM, "{name}: cmd {cmd:#x}");
+            // `cmd` is an unsigned int.
+            assert_eq!(ioctl(3, (1 << 32) | cmd, 0), EPERM, "{name}: {cmd:#x}");
+            // The number in another argument selects nothing.
+            assert_eq!(ioctl(3, 0, cmd), ALLOW, "{name}: {cmd:#x} in arg 2");
+        }
+        // The other fscrypt and fs-verity ioctls: FS_IOC_GET_ENCRYPTION_PWSALT
+        // 0x40106614, FS_IOC_GET_ENCRYPTION_POLICY 0x400c6615,
+        // FS_IOC_GET_ENCRYPTION_POLICY_EX 0xc0096616,
+        // FS_IOC_REMOVE_ENCRYPTION_KEY 0xc0406618, its _ALL_USERS twin
+        // 0xc0406619, FS_IOC_GET_ENCRYPTION_KEY_STATUS 0xc080661a,
+        // FS_IOC_GET_ENCRYPTION_NONCE 0x8010661b, FS_IOC_MEASURE_VERITY
+        // 0xc0046686, FS_IOC_READ_VERITY_METADATA 0xc0286687; the add-key
+        // number with its size off by one either way; FS_IOC_SETFLAGS,
+        // which the kernel judges.
+        for cmd in [
+            0x4010_6614,
+            0x400c_6615,
+            0xc009_6616,
+            0xc040_6618,
+            0xc040_6619,
+            0xc080_661a,
+            0x8010_661b,
+            0xc004_6686,
+            0xc028_6687,
+            0xc051_6617,
+            0xc04f_6617,
+            0x4008_6602,
+        ] {
+            assert_eq!(ioctl(3, cmd, 0), ALLOW, "{name}: cmd {cmd:#x}");
+        }
+        // The rows before them keep their answers.
+        assert_eq!(ioctl(3, 0x5423, 0), EPERM, "{name}: TIOCSETD");
+        assert_eq!(ioctl(3, 0x8940, 0), EPERM, "{name}: SIOCGIFBR");
+        assert_eq!(ioctl(3, 0x89a3, 0), EPERM, "{name}: SIOCBRDELIF");
+    }
+    // The library builds the numbers with the asm-generic encoding.
+    use boneli_sys::seccomp::table::ioc;
+    assert_eq!(u64::from(ioc(3, 0x66, 23, 80)), REFUSED[0]);
+    assert_eq!(u64::from(ioc(2, 0x66, 19, 12)), REFUSED[1]);
+    assert_eq!(u64::from(ioc(1, 0x66, 133, 128)), REFUSED[2]);
+}
+
+#[test]
 fn program_shape() {
     for arch in Arch::ALL {
         let prog = program(arch);
@@ -614,7 +887,7 @@ fn program_shape() {
 }
 
 /// The assembler's instruction count, recorded in ADR-007 D2.
-const PROGRAM_LEN: usize = 69;
+const PROGRAM_LEN: usize = 88;
 
 /// The kernel rows (ADR-007, D2): the probe's id for each call and the
 /// result the policy must give inside, an errno or 0 for an allowed call.
@@ -646,6 +919,12 @@ const KERNEL_ROWS: &[(&str, i32)] = &[
     ("mmap-hugetlb", libc::EPERM),
     ("memfd-hugetlb", libc::EPERM),
     ("shmget-hugetlb", libc::EPERM),
+    ("setsockopt-tls", libc::ENOPROTOOPT),
+    ("setsockopt-tcp-ao", libc::ENOPROTOOPT),
+    ("setsockopt-tcp-md5", libc::ENOPROTOOPT),
+    ("ioctl-fscrypt-add-key", libc::EPERM),
+    ("ioctl-fscrypt-set-policy", libc::EPERM),
+    ("ioctl-fsverity-enable", libc::EPERM),
 ];
 
 /// What one kernel row showed on this host.
@@ -726,6 +1005,9 @@ fn kernel_row_classification() {
         "shmget-hugetlb",
         "ioctl-siocgifbr",
         "socket-inet-packet",
+        "setsockopt-tls",
+        "setsockopt-tcp-ao",
+        "setsockopt-tcp-md5",
     ] {
         assert!(KERNEL_ROWS.iter().any(|(id, _)| *id == gap), "{gap}");
     }
