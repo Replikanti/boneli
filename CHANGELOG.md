@@ -259,8 +259,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   profile, vendored from moby/profiles and read with `boneli-json` (a
   dev-dependency), derives the names Docker refuses and gives each of the
   67 this policy allows a reason. MPTCP and UDP-Lite stay refused.
-  `BONELI_SYS_HOST_GAPS` also takes `setsockopt-tls`,
-  `setsockopt-tcp-ao`, `setsockopt-tcp-md5` and `nosys-<name>`.
+  `BONELI_SYS_HOST_GAPS` also takes `setsockopt-tcp-ao`,
+  `setsockopt-tcp-md5`, `nosys-<name>` and `alarm-rtc`; the kTLS kernel
+  row follows the host's `tcp_available_ulp`.
 - `Features::probe`: a probe whose own machinery fails — a failed
   `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
   killed by a signal or ended before it could report, or a `clone3`

@@ -233,9 +233,15 @@ but one: `setsockopt-tls` sets `TCP_ULP` `"tls"` on an established
 loopback TCP connection and then `TLS_TX` with no crypto info, which
 gives EINVAL before any cipher lookup where the ULP attaches
 (`tls_main.c:651`) and ENOPROTOOPT where it does not (the dev host,
-which has no `tls` module loaded: the attach gives ENOENT, measured), so
-there it is the gap `setsockopt-tls`; trying cannot load anything,
-because the autoload needs `capable()`. `setsockopt-tcp-ao` and
+which has no `tls` module loaded: the attach gives ENOENT, measured);
+trying cannot load anything, because the autoload needs `capable()`.
+Which of the two a host shows is decided by the kernel's own list,
+`/proc/sys/net/ipv4/tcp_available_ulp`, read on the host, not by a gap
+id: whether `tls` is loaded differed between two x86_64 runners of the
+same CI image in PR 5's first two runs (present, then absent), so no
+reviewed list can name it. Where the list has `tls` the row must be
+observed, where it does not the baseline must be ENOPROTOOPT
+(`tls_row_classification`). `setsockopt-tcp-ao` and
 `setsockopt-tcp-md5` set the options with length 0 on an unconnected
 socket (EINVAL without the filter, measured; ENOPROTOOPT on a kernel
 without them, so a gap there; a length of 0 carries no algorithm name),
@@ -683,7 +689,8 @@ namespaces (D7) leave open, by name:
 6. **Rows a test host cannot observe**: `syslog` (wherever
    `dmesg_restrict` is 1), `shmget-hugetlb` (outside
    `vm.hugetlb_shm_group`), `setsockopt-tls` (where the `tls` ULP is not
-   available, the dev host among them), and the rows with no kernel row
+   available, the dev host and some CI runners among them), and the rows
+   with no kernel row
    (the VLAN pair and bpfilter, whose baseline would load a module).
    Only the interpreter proves them there; the kernel rows prove the
    others on every run.
@@ -880,9 +887,9 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   exact per host, and an id outside the known set fails: `syslog` and
   `shmget-hugetlb` for kernel rows a host cannot observe, D2,
   `socket-inet-packet` and `ioctl-siocgifbr` for kernel rows a host
-  without af_packet or bridge does not try, D2, `setsockopt-tls`,
-  `setsockopt-tcp-ao` and `setsockopt-tcp-md5` for a host without the
-  `tls` ULP or the TCP signature options, D2, `nosys-<name>` for a
+  without af_packet or bridge does not try, D2, `setsockopt-tcp-ao` and
+  `setsockopt-tcp-md5` for a kernel without the TCP signature options,
+  D2, `nosys-<name>` for a
   `NeedsCap` census entry the host kernel lacks, D2, `alarm-rtc` for a
   host without an RTC alarm device, D2, and `hugetlbfs-mount` for a host
   without a hugetlbfs, D7), Landlock rows

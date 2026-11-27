@@ -401,7 +401,6 @@ pub const KNOWN_GAPS: &[&str] = &[
     "hugetlbfs-mount",
     "ioctl-siocgifbr",
     "socket-inet-packet",
-    "setsockopt-tls",
     "setsockopt-tcp-ao",
     "setsockopt-tcp-md5",
     "alarm-rtc",

@@ -131,7 +131,7 @@ them. Run them in a delegated scope:
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
-  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS=syslog,shmget-hugetlb,setsockopt-tls \
+  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS=syslog,shmget-hugetlb \
   cargo test -p boneli-sys -- --ignored
 ```
 
@@ -146,16 +146,17 @@ systemd-run --user --scope -q -p Delegate=yes \
   lacks `CAP_IPC_LOCK`); `socket-inet-packet` and `ioctl-siocgifbr`: the
   host lacks af_packet (no `/proc/net/packet`) or the bridge module (no
   `/sys/module/bridge`), so the test does not try that row, which would
-  load the module; `setsockopt-tls`: the host's `tls` ULP is not
-  available, so the host answers ENOPROTOOPT at `SOL_TLS` already;
-  `setsockopt-tcp-ao` and `setsockopt-tcp-md5`: the kernel lacks the
-  option; `nosys-<name>`: the host kernel lacks the `NeedsCap` census
+  load the module; `setsockopt-tcp-ao` and `setsockopt-tcp-md5`: the
+  kernel lacks the option; `nosys-<name>`: the host kernel lacks the `NeedsCap` census
   syscall `<name>`; `alarm-rtc`: the host has no RTC alarm device, so
   `timer_create` and `clock_nanosleep` on an alarm clock answer
   EOPNOTSUPP before their capability check; `hugetlbfs-mount`: the host
   has no hugetlbfs mount. Exact: an unknown id fails, and so does a listed id that turns
   out observable. The command above has the dev host's value (Fedora 44,
-  measured); CI sets it per leg in `.github/workflows/ci.yml`.
+  measured); CI sets it per leg in `.github/workflows/ci.yml`. The kTLS
+  row is no gap id: whether the `tls` ULP is there differs between hosts
+  of one image, so the test reads `/proc/sys/net/ipv4/tcp_available_ulp`
+  and requires the row observed where it lists `tls`.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
   so the harness may reorganize its own cgroup: it moves the run's
   processes into `leaf/` and creates every sandbox's cgroup next to it

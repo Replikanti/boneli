@@ -322,12 +322,12 @@ jobs:
             # vm.hugetlb_shm_group, hugetlbfs-mount without a hugetlbfs,
             # socket-inet-packet and ioctl-siocgifbr without af_packet or
             # bridge (assumed present on the Docker runner images; the Host
-            # features step prints both), setsockopt-tls without the tls
-            # ULP, setsockopt-tcp-ao and setsockopt-tcp-md5 without the TCP
-            # options, nosys-<name> for a NeedsCap syscall the kernel lacks,
-            # alarm-rtc without an RTC alarm device (first run of PR 5: both
-            # legs have the tls module loaded, the TCP options and every
-            # NeedsCap syscall; arm64 has no RTC alarm device).
+            # features step prints both), setsockopt-tcp-ao and
+            # setsockopt-tcp-md5 without the TCP options, nosys-<name> for a
+            # NeedsCap syscall the kernel lacks, alarm-rtc without an RTC
+            # alarm device (PR 5's runs: both legs have the TCP options and
+            # every NeedsCap syscall, arm64 has no RTC alarm device; the kTLS
+            # row follows tcp_available_ulp, which differs between runners).
             host-gaps: syslog,shmget-hugetlb
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -395,9 +395,9 @@ jobs:
           echo "af_packet (/proc/net/packet): $( [ -e /proc/net/packet ] && echo present || echo absent)"
           echo "bridge (/sys/module/bridge): $( [ -e /sys/module/bridge ] && echo present || echo absent)"
           echo "8021q (/sys/module/8021q): $( [ -e /sys/module/8021q ] && echo present || echo absent)"
-          # The kTLS and TCP signature rows (ADR-007, D2): setsockopt-tls is
-          # a gap where the tls ULP cannot attach, the TCP rows where the
-          # kernel lacks the options.
+          # The kTLS and TCP signature rows (ADR-007, D2): seccomp_rows
+          # decides the kTLS row by tcp_available_ulp, the TCP rows are gaps
+          # where the kernel lacks the options.
           echo "tls (/sys/module/tls): $( [ -e /sys/module/tls ] && echo present || echo absent)"
           echo "tcp ulps: $(cat /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null || echo absent)"
           # The alarm clocks (census, alarm-rtc): an RTC device is what they

@@ -1005,12 +1005,62 @@ fn kernel_row_classification() {
         "shmget-hugetlb",
         "ioctl-siocgifbr",
         "socket-inet-packet",
-        "setsockopt-tls",
         "setsockopt-tcp-ao",
         "setsockopt-tcp-md5",
     ] {
         assert!(KERNEL_ROWS.iter().any(|(id, _)| *id == gap), "{gap}");
     }
+}
+
+/// Where the kernel lists the TCP upper-layer protocols it has
+/// registered: `tls` is there when the `tls` module is loaded or built in.
+const TCP_ULPS: &str = "/proc/sys/net/ipv4/tcp_available_ulp";
+
+/// The kTLS kernel row, decided by the host's `tcp_available_ulp`, not by
+/// a gap id: whether the `tls` module is loaded differs between runners of
+/// one CI image (present on one x86_64 runner, absent on the next, PR 5's
+/// first two runs), so no reviewed list can name it. With the ULP the row
+/// must be observed; without it the host answers ENOPROTOOPT at `SOL_TLS`
+/// already, and the baseline must say so. Exact both ways.
+fn tls_row_outcome(available: bool, baseline: i32, filtered: i32) -> Result<RowOutcome, String> {
+    let want = libc::ENOPROTOOPT;
+    if filtered != want {
+        return Err(format!(
+            "setsockopt-tls: the sandbox gave {filtered}, the policy says {want}"
+        ));
+    }
+    match (available, baseline == want) {
+        (true, false) => Ok(RowOutcome::Observed),
+        (false, true) => Ok(RowOutcome::Gap),
+        (true, true) => Err(format!(
+            "setsockopt-tls: {TCP_ULPS} lists tls, but the host gives {baseline} without the \
+             filter, so the ULP did not attach"
+        )),
+        (false, false) => Err(format!(
+            "setsockopt-tls: {TCP_ULPS} does not list tls, but the host gives {baseline} \
+             without the filter"
+        )),
+    }
+}
+
+#[test]
+fn tls_row_classification() {
+    let (enoprotoopt, einval) = (libc::ENOPROTOOPT, libc::EINVAL);
+    assert_eq!(
+        tls_row_outcome(true, einval, enoprotoopt),
+        Ok(RowOutcome::Observed)
+    );
+    assert_eq!(
+        tls_row_outcome(false, enoprotoopt, enoprotoopt),
+        Ok(RowOutcome::Gap)
+    );
+    assert!(tls_row_outcome(true, enoprotoopt, enoprotoopt).is_err());
+    assert!(tls_row_outcome(false, einval, enoprotoopt).is_err());
+    assert!(tls_row_outcome(true, einval, einval).is_err());
+    assert!(tls_row_outcome(false, enoprotoopt, libc::EPERM).is_err());
+    // Not a gap id: a list cannot name it.
+    assert!(!support::KNOWN_GAPS.contains(&"setsockopt-tls"));
+    assert!(KERNEL_ROWS.iter().any(|(id, _)| *id == "setsockopt-tls"));
 }
 
 /// The kernel rows that are tried only where the host has the module the
@@ -1082,6 +1132,12 @@ fn seccomp_rows() {
             }
         }
     }
+    // The kTLS row: decided by the kernel's own ULP list, read here on the
+    // host (the list is global, not per network namespace).
+    let tls_ulp = std::fs::read_to_string(TCP_ULPS)
+        .map(|t| t.split_whitespace().any(|u| u == "tls"))
+        .unwrap_or(false);
+    report(&format!("seccomp_rows: tls ULP available: {tls_ulp}"));
     // The baseline: the same calls on the host, without a filter, as the
     // unprivileged host user the sandbox maps to.
     let baseline = run_probe_host("seccomp-rows", &env);
@@ -1100,7 +1156,16 @@ fn seccomp_rows() {
             }
             let base = row_value(&baseline, id);
             let got = row_value(&filtered, id);
-            match classify_row(id, want, base, got, gaps.contains(id)) {
+            let outcome = if id == "setsockopt-tls" {
+                tls_row_outcome(tls_ulp, base, got)
+            } else {
+                classify_row(id, want, base, got, gaps.contains(id))
+            };
+            match outcome {
+                Ok(RowOutcome::Gap) if id == "setsockopt-tls" => report(&format!(
+                    "seccomp_rows: setsockopt-tls unobservable on this host (baseline {base}): \
+                     {TCP_ULPS} does not list tls"
+                )),
                 Ok(RowOutcome::Gap) => report(&format!(
                     "seccomp_rows: {id} unobservable on this host (baseline {base}), \
                      listed in BONELI_SYS_HOST_GAPS"
