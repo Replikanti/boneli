@@ -457,11 +457,11 @@
    "title": "boneli-sys: namespaces, mounts, pivot_root, cgroups v2, seccomp-bpf and Landlock",
    "epic": 23,
    "order": 6,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "c1dbcb12",
    "pr": 140,
    "note": "",
-   "updated_at": "2026-11-27T11:51:16+00:00",
+   "updated_at": "2026-11-27T12:21:13+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -1715,14 +1715,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T00:56:18+00:00",
-   "issue": 118,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "2768f14b",
-   "note": null
-  },
-  {
    "at": "2026-11-25T00:57:32+00:00",
    "issue": 117,
    "from": "pr-review",
@@ -2113,6 +2105,14 @@
    "to": "claimed",
    "by": "c1dbcb12",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-27T12:21:13+00:00",
+   "issue": 6,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "c1dbcb12",
+   "note": null
   }
  ],
  "open": [
@@ -2140,7 +2140,7 @@
   69
  ],
  "xopen": [],
- "updated_at": "2026-11-27T11:51:43+00:00",
+ "updated_at": "2026-11-27T12:21:13+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
