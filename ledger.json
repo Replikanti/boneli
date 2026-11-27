@@ -1717,7 +1717,7 @@
    "title": "boneli-sys: two host tests flake on a loaded host (keeper cadence, buffered writes)",
    "epic": null,
    "order": 66,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "ae8af796",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1726,7 +1726,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-27T15:56:06+00:00",
+   "updated_at": "2026-11-27T17:08:51+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1738,14 +1738,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T12:11:33+00:00",
-   "issue": 128,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "ea19b3dc",
-   "note": null
-  },
   {
    "at": "2026-11-25T13:08:14+00:00",
    "issue": 128,
@@ -2137,6 +2129,14 @@
    "to": "plan-review",
    "by": "909fb540",
    "note": null
+  },
+  {
+   "at": "2026-11-27T17:08:51+00:00",
+   "issue": 142,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "ae8af796",
+   "note": null
   }
  ],
  "open": [
@@ -2164,7 +2164,7 @@
   142
  ],
  "xopen": [],
- "updated_at": "2026-11-27T16:20:32+00:00",
+ "updated_at": "2026-11-27T17:08:51+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
