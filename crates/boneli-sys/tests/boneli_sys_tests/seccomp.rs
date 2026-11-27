@@ -29,6 +29,7 @@ struct Numbers {
     mmap: u32,
     shmget: u32,
     memfd_create: u32,
+    ioctl: u32,
 }
 
 /// x86_64: io_uring_setup/enter/register, bpf, userfaultfd,
@@ -43,6 +44,7 @@ const X86_64: Numbers = Numbers {
     mmap: 9,
     shmget: 29,
     memfd_create: 319,
+    ioctl: 16,
 };
 
 /// aarch64, in the same order.
@@ -56,6 +58,7 @@ const AARCH64: Numbers = Numbers {
     mmap: 222,
     shmget: 194,
     memfd_create: 279,
+    ioctl: 29,
 };
 
 fn numbers(arch: Arch) -> &'static Numbers {
@@ -239,9 +242,144 @@ fn netlink_protocol_rows() {
             arch.name()
         );
         assert_eq!(socket(netlink, 0xFFFF_FFFF), EPROTONOSUPPORT);
-        // The protocol of another family is the kernel's to judge.
+        // The protocol of a Unix socket is the kernel's to judge; IPv4 has
+        // its own protocol row (`inet_protocol_rows`).
         assert_eq!(socket(libc::AF_UNIX as u64, 12), ALLOW, "{}", arch.name());
-        assert_eq!(socket(libc::AF_INET as u64, 12), ALLOW, "{}", arch.name());
+        assert_eq!(
+            socket(libc::AF_INET as u64, 12),
+            EPROTONOSUPPORT,
+            "{}",
+            arch.name()
+        );
+    }
+}
+
+/// The IP protocols each family allows (ADR-007 D2): 0, TCP and UDP, and
+/// the family's own ICMP for unprivileged ping sockets.
+const INET_ALLOWED: [u64; 4] = [0, 1, 6, 17];
+const INET6_ALLOWED: [u64; 4] = [0, 6, 17, 58];
+
+#[test]
+fn inet_protocol_rows() {
+    let inet = libc::AF_INET as u64;
+    let inet6 = libc::AF_INET6 as u64;
+    let stream = libc::SOCK_STREAM as u64;
+    let raw = libc::SOCK_RAW as u64;
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let socket = |family: u64, ty: u64, protocol: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.socket)
+                    .arg(0, family)
+                    .arg(1, ty)
+                    .arg(2, protocol),
+            )
+        };
+        // Every protocol up to past IPPROTO_MAX (263), the module ones
+        // among them: L2TP 115, SCTP 132, UDP-Lite 136, SMC 256, MPTCP 262,
+        // DCCP 33, raw 255.
+        for p in 0u64..=300 {
+            for (family, allowed) in [(inet, INET_ALLOWED), (inet6, INET6_ALLOWED)] {
+                let want = if allowed.contains(&p) {
+                    ALLOW
+                } else {
+                    EPROTONOSUPPORT
+                };
+                for ty in [stream, libc::SOCK_DGRAM as u64, raw] {
+                    assert_eq!(
+                        socket(family, ty, p),
+                        want,
+                        "{name}: family {family} type {ty} protocol {p}"
+                    );
+                }
+            }
+        }
+        // Each family's ICMP is not the other's.
+        assert_eq!(socket(inet, raw, 58), EPROTONOSUPPORT, "{name}");
+        assert_eq!(socket(inet6, raw, 1), EPROTONOSUPPORT, "{name}");
+        // `protocol` is an int: the high word is not part of it, and -1 is
+        // no protocol.
+        for family in [inet, inet6] {
+            assert_eq!(socket(family, stream, (1 << 32) | 6), ALLOW, "{name}");
+            assert_eq!(socket(family, stream, 1 << 32), ALLOW, "{name}");
+            assert_eq!(
+                socket(family, stream, (1 << 32) | 132),
+                EPROTONOSUPPORT,
+                "{name}"
+            );
+            assert_eq!(socket(family, stream, 0xFFFF_FFFF), EPROTONOSUPPORT);
+            assert_eq!(
+                socket(family, stream, 0xFFFF_FFFF_0000_0006),
+                ALLOW,
+                "{name}"
+            );
+        }
+        // The flags in the type argument play no part.
+        let flags = (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64;
+        assert_eq!(socket(inet, stream | flags, 6), ALLOW, "{name}");
+        assert_eq!(socket(inet6, stream | flags, 132), EPROTONOSUPPORT);
+        // The other families keep their own rows: Unix takes any protocol,
+        // netlink only routing, the rest no family at all.
+        assert_eq!(socket(libc::AF_UNIX as u64, stream, 132), ALLOW, "{name}");
+        assert_eq!(
+            socket(libc::AF_NETLINK as u64, raw, 6),
+            EPROTONOSUPPORT,
+            "{name}"
+        );
+        assert_eq!(socket(libc::AF_VSOCK as u64, stream, 6), EAFNOSUPPORT);
+    }
+    assert_eq!(libc::IPPROTO_ICMP, 1);
+    assert_eq!(libc::IPPROTO_TCP, 6);
+    assert_eq!(libc::IPPROTO_UDP, 17);
+    assert_eq!(libc::IPPROTO_ICMPV6, 58);
+}
+
+#[test]
+fn tty_line_discipline_row() {
+    // The numbers are written out, like the syscall numbers above; they are
+    // the same on both architectures (asm-generic ioctls.h, which x86 and
+    // arm64 both use).
+    const TIOCSETD: u64 = 0x5423;
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let ioctl = |fd: u64, cmd: u64, arg: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.ioctl)
+                    .arg(0, fd)
+                    .arg(1, cmd)
+                    .arg(2, arg),
+            )
+        };
+        for fd in [0, 3, 0xFFFF_FFFF] {
+            assert_eq!(ioctl(fd, TIOCSETD, 0), EPERM, "{name}: fd {fd}");
+            assert_eq!(ioctl(fd, TIOCSETD, 0x7ffd_0000), EPERM, "{name}");
+        }
+        // `cmd` is an unsigned int: the high word is not part of it.
+        assert_eq!(ioctl(3, (1 << 32) | TIOCSETD, 0), EPERM, "{name}");
+        assert_eq!(ioctl(3, 1 << 32, 0), ALLOW, "{name}");
+        // The neighbours and the other tty ioctls stay allowed: TIOCNOTTY,
+        // TIOCGETD (reads the discipline), TIOCGPTPEER, TIOCSPTLCK, TCGETS.
+        for cmd in [
+            0,
+            TIOCSETD - 1,
+            TIOCSETD + 1,
+            0x5424,      // TIOCGETD
+            0x5441,      // TIOCGPTPEER
+            0x4004_5431, // TIOCSPTLCK
+            0x5401,      // TCGETS
+        ] {
+            assert_eq!(ioctl(3, cmd, 0), ALLOW, "{name}: cmd {cmd:#x}");
+        }
+        // The number in another argument selects nothing.
+        assert_eq!(ioctl(TIOCSETD, 0, TIOCSETD), ALLOW, "{name}");
     }
 }
 
@@ -346,7 +484,7 @@ fn program_shape() {
 }
 
 /// The assembler's instruction count, recorded in ADR-007 D2.
-const PROGRAM_LEN: usize = 46;
+const PROGRAM_LEN: usize = 56;
 
 /// The kernel rows (ADR-007, D2): the probe's id for each call and the
 /// result the policy must give inside, an errno or 0 for an allowed call.
@@ -365,6 +503,11 @@ const KERNEL_ROWS: &[(&str, i32)] = &[
     ("clone3", libc::ENOSYS),
     ("socket-vsock", libc::EAFNOSUPPORT),
     ("socket-unix", 0),
+    ("socket-inet-tcp", 0),
+    ("socket-inet6-udp", 0),
+    ("socket-inet-raw-protocol", libc::EPROTONOSUPPORT),
+    ("socket-inet6-raw-protocol", libc::EPROTONOSUPPORT),
+    ("ioctl-tiocsetd", libc::EPERM),
     ("netlink-netfilter", libc::EPROTONOSUPPORT),
     ("netlink-route", 0),
     ("socketpair-inet", libc::EAFNOSUPPORT),

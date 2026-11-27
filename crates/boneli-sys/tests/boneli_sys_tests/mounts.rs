@@ -112,6 +112,13 @@ fn pivot_root_hides_host() {
                 want.push(format!("{}/{sub}", target.as_str()));
             }
         }
+        // The keyring files, masked with the host's /dev/null (ADR-007,
+        // D7).
+        if let Mount::Proc { target } = &m {
+            for sub in ["keys", "key-users"] {
+                want.push(format!("{}/{sub}", target.as_str()));
+            }
+        }
     }
     want.sort();
     let mut got: Vec<String> = mounts_of(&p).into_iter().map(|(p, _, _)| p).collect();

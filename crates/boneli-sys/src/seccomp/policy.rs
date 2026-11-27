@@ -4,8 +4,9 @@
 
 use super::bpf::{self, AsmError, Insn, Label, Op, Target};
 use super::table::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, CEILING, CLONE_NEWUSER, MAP_HUGETLB, MFD_HUGETLB,
-    NETLINK_ROUTE, SHM_HUGETLB,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, CEILING, CLONE_NEWUSER, IPPROTO_ICMP,
+    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, NETLINK_ROUTE,
+    SHM_HUGETLB, TIOCSETD,
 };
 
 /// Offsets into `struct seccomp_data` (`include/uapi/linux/seccomp.h`):
@@ -53,6 +54,9 @@ pub enum Row {
     /// `socket` of family netlink with a protocol other than
     /// `NETLINK_ROUTE`: EPROTONOSUPPORT.
     NetlinkProtocol,
+    /// `socket` of family IPv4 or IPv6 with a protocol other than 0, TCP,
+    /// UDP and the family's ICMP: EPROTONOSUPPORT.
+    InetProtocol,
     /// `socketpair` with a family other than Unix: EAFNOSUPPORT.
     Socketpair,
     /// `mmap` with `MAP_HUGETLB` in the low word of arg 3: EPERM.
@@ -61,11 +65,13 @@ pub enum Row {
     HugetlbShmget,
     /// `memfd_create` with `MFD_HUGETLB` in the low word of arg 1: EPERM.
     HugetlbMemfd,
+    /// `ioctl` with `TIOCSETD` in the low word of arg 1: EPERM.
+    LineDiscipline,
 }
 
 impl Row {
     /// Every row, in table order.
-    pub const ALL: [Row; 14] = [
+    pub const ALL: [Row; 16] = [
         Row::ForeignArch,
         Row::Ceiling,
         Row::IoUring,
@@ -76,10 +82,12 @@ impl Row {
         Row::Clone3,
         Row::SocketFamily,
         Row::NetlinkProtocol,
+        Row::InetProtocol,
         Row::Socketpair,
         Row::HugetlbMmap,
         Row::HugetlbShmget,
         Row::HugetlbMemfd,
+        Row::LineDiscipline,
     ];
 
     /// The seccomp action of the row.
@@ -94,9 +102,10 @@ impl Row {
             | Row::NewUserNamespace
             | Row::HugetlbMmap
             | Row::HugetlbShmget
-            | Row::HugetlbMemfd => errno_action(libc::EPERM),
+            | Row::HugetlbMemfd
+            | Row::LineDiscipline => errno_action(libc::EPERM),
             Row::SocketFamily | Row::Socketpair => errno_action(libc::EAFNOSUPPORT),
-            Row::NetlinkProtocol => errno_action(libc::EPROTONOSUPPORT),
+            Row::NetlinkProtocol | Row::InetProtocol => errno_action(libc::EPROTONOSUPPORT),
         }
     }
 
@@ -139,6 +148,10 @@ const SOCKETPAIR: Label = Label(10);
 const MMAP: Label = Label(11);
 const SHMGET: Label = Label(12);
 const MEMFD: Label = Label(13);
+const INET: Label = Label(14);
+const INET6: Label = Label(15);
+const IP_PROTOCOL: Label = Label(16);
+const IOCTL: Label = Label(17);
 
 fn to(label: Label) -> Target {
     Target::Label(label)
@@ -193,23 +206,35 @@ impl Policy {
             Op::Jeq(nr.mmap, to(MMAP), NEXT),
             Op::Jeq(nr.shmget, to(SHMGET), NEXT),
             Op::Jeq(nr.memfd_create, to(MEMFD), NEXT),
+            Op::Jeq(nr.ioctl, to(IOCTL), NEXT),
             Op::Ret(libc::SECCOMP_RET_ALLOW),
             // Row NewUserNamespace: clone uses only the low word of its
             // flags, unshare rejects unknown upper bits.
             Op::Mark(CLONE_FLAGS),
             Op::Load(arg_low(0)),
             Op::Jset(CLONE_NEWUSER, to(EPERM), to(ALLOW)),
-            // Rows SocketFamily and NetlinkProtocol: `domain` and
-            // `protocol` are ints.
+            // Rows SocketFamily, NetlinkProtocol and InetProtocol: `domain`
+            // and `protocol` are ints.
             Op::Mark(SOCKET),
             Op::Load(arg_low(0)),
             Op::Jeq(AF_UNIX, to(ALLOW), NEXT),
-            Op::Jeq(AF_INET, to(ALLOW), NEXT),
-            Op::Jeq(AF_INET6, to(ALLOW), NEXT),
+            Op::Jeq(AF_INET, to(INET), NEXT),
+            Op::Jeq(AF_INET6, to(INET6), NEXT),
             Op::Jeq(AF_NETLINK, to(NETLINK), to(EAFNOSUPPORT)),
             Op::Mark(NETLINK),
             Op::Load(arg_low(2)),
             Op::Jeq(NETLINK_ROUTE, to(ALLOW), to(EPROTONOSUPPORT)),
+            // Each family's ICMP, then the protocols both share.
+            Op::Mark(INET),
+            Op::Load(arg_low(2)),
+            Op::Jeq(IPPROTO_ICMP, to(ALLOW), to(IP_PROTOCOL)),
+            Op::Mark(INET6),
+            Op::Load(arg_low(2)),
+            Op::Jeq(IPPROTO_ICMPV6, to(ALLOW), NEXT),
+            Op::Mark(IP_PROTOCOL),
+            Op::Jeq(IPPROTO_IP, to(ALLOW), NEXT),
+            Op::Jeq(IPPROTO_TCP, to(ALLOW), NEXT),
+            Op::Jeq(IPPROTO_UDP, to(ALLOW), to(EPROTONOSUPPORT)),
             // Row Socketpair.
             Op::Mark(SOCKETPAIR),
             Op::Load(arg_low(0)),
@@ -225,6 +250,10 @@ impl Policy {
             Op::Mark(MEMFD),
             Op::Load(arg_low(1)),
             Op::Jset(MFD_HUGETLB, to(EPERM), to(ALLOW)),
+            // Row LineDiscipline: `cmd` is an unsigned int.
+            Op::Mark(IOCTL),
+            Op::Load(arg_low(1)),
+            Op::Jeq(TIOCSETD, to(EPERM), to(ALLOW)),
             // The returns.
             Op::Mark(ALLOW),
             Op::Ret(libc::SECCOMP_RET_ALLOW),

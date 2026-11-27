@@ -77,7 +77,7 @@ the dev host's user does not meet it.
 One fixed policy, no configuration. The filter is a classic BPF program
 assembled by `boneli-sys`; classic BPF allows 4096 instructions
 (`BPF_MAXINSNS`) and jump offsets of 8 bits (at most 255), and the
-assembler checks both. The table below assembles to 46 instructions on
+assembler checks both. The table below assembles to 56 instructions on
 both architectures, and no jump needs more than an 8-bit offset
 (`program_shape` pins the count, so a change to the rows updates it
 here). The program is built once per spawn in the parent, before the
@@ -98,10 +98,12 @@ first match wins. Arguments are read at offset
 | `clone3` | ENOSYS | Its flags sit behind a pointer that seccomp cannot read. glibc 2.34 and newer fall back to `clone` on ENOSYS, where the row above applies; Docker's profile does the same. |
 | `socket` with low32(arg 0) not in {AF_UNIX 1, AF_INET 2, AF_INET6 10, AF_NETLINK 16} | EAFNOSUPPORT (97) | `AF_VSOCK` works in a fresh user and network namespace (measured) and would bypass "no network" on a VM host; other families load protocol modules on demand. Unix, IPv4 and IPv6 carry the brokers (ADR-006: a bound Unix socket, which the shim relays on loopback). `domain` is an `int`, so the low word is the whole value. |
 | `socket` with family 16 and low32(arg 2) ≠ `NETLINK_ROUTE` (0) | EPROTONOSUPPORT (93) | Other netlink protocols reach unrelated subsystems (netfilter, audit, generic netlink, uevents, xfrm, crypto), and creating the socket can autoload a module (`request_module` in `netlink_create`). Routing is what glibc's `getaddrinfo` (`AI_ADDRCONFIG`) and `getifaddrs`, libuv's interface list and Chromium's network-change watcher use; inside it reads only the sandbox's own network namespace, and changes need `CAP_NET_ADMIN`. EPROTONOSUPPORT is what `netlink_create` returns for an unavailable protocol, and libaudit reads it as "no audit support", so PAM-based tools keep working. Any further protocol needs a reason in this ADR. |
+| `socket` with family 2 or 10 and low32(arg 2) not in {0, IPPROTO_TCP 6, IPPROTO_UDP 17}, plus IPPROTO_ICMP 1 for AF_INET and IPPROTO_ICMPV6 58 for AF_INET6 | EPROTONOSUPPORT | The same reason as the netlink row: `inet_create` and `inet6_create` call `request_module("net-pf-<family>-proto-<p>-type-<t>")` and then `"net-pf-<family>-proto-<p>"` for a protocol no registered handler serves, with no capability check, so without this row a sandbox could load SCTP (132), L2TP-over-IP (115) or SMC (256) into the host kernel (all three ship as modules on the dev host and are not blacklisted; found in review of PR 4, where `socket(AF_INET, SOCK_STREAM, 33)` took 6.3-7.2 ms inside against 0.05-0.07 ms for TCP: two modprobe round trips). Why each entry: 0 lets the kernel pick the type's default (TCP for a stream, UDP for a datagram, the form most programs use), 6 and 17 are the same two by name, and 1 and 58 are the protocols of unprivileged ping sockets (`SOCK_DGRAM`, gated by `net.ipv4.ping_group_range`, which `inet_init_net` sets to no group (`1 0`) in every new network namespace, so inside they work only once that range is widened). Raw sockets need `CAP_NET_RAW`, which the workload lacks (D9), so allowing a raw protocol buys nothing. The list cannot itself trigger a load: the dev host's `modules.alias` names `net-pf-2-` and `net-pf-10-` only with protocols 115, 132 and 256 (8 aliases, measured), never 0, 1, 6, 17 or 58, so the names `request_module` builds for an allowed protocol with an unserved type match no module. Why not the rest: every other protocol is either a module (the three above, DCCP 33 on kernels that still have it) or a built-in the applications under debugging do not use, MPTCP 262 and UDP-Lite 136 among them, and each is attack surface the sandbox does not need. EPROTONOSUPPORT is what the kernel answers for a protocol it does not have, so a program that probes for one behaves as on a kernel built without it. Any further protocol needs a reason in this ADR. |
 | `socketpair` with low32(arg 0) ≠ AF_UNIX | EAFNOSUPPORT | Of the four allowed families only AF_UNIX implements `socketpair`; the others create a socket (for netlink possibly autoloading a module) and then fail with EOPNOTSUPP. Docker's current profile allows only AF_UNIX and AF_TIPC (moby/profiles `7b5ccfa`). |
 | `mmap` with `MAP_HUGETLB` (0x40000) in low32(arg 3) | EPERM | Huge pages are charged to `memory.max` only where cgroup2 is mounted with `memory_hugetlb_accounting` (D8), so on a host with reserved huge pages a sandbox could take them past its limit. `flags` is an `unsigned long`, but the kernel tests only this bit, which lies in the low word; the `MAP_HUGE_*` size bits (26–31) mean nothing without it. |
 | `shmget` with `SHM_HUGETLB` (0x800) in low32(arg 2) | EPERM | The same, for SysV segments. `shmflg` is an `int`. Neither architecture has the `ipc` multiplexer; the i386 one is killed by the arch row. |
 | `memfd_create` with `MFD_HUGETLB` (0x4) in low32(arg 1) | EPERM | The same, for memfds. `flags` is an `unsigned int`. |
+| `ioctl` with low32(arg 1) = `TIOCSETD` (0x5423) | EPERM | Setting a line discipline that is not registered makes `tty_ldisc_get` call `request_module("tty-ldisc-<n>")` without a capability check when `dev.tty.ldisc_autoload` is 1 (the default of `CONFIG_LDISC_AUTOLOAD`; both are so on the dev host, measured), and the sandbox has a pty of its own (D7's devpts and `/dev/ptmx`). The dev host ships 9 such modules, among them n_hdlc (tty-ldisc-13, the CVE-2017-2636 class); found in review of PR 4 (TIOCSETD 29, which has no module, took 3.2-4.3 ms inside against 0.02-0.04 ms for N_TTY). A program never needs to change its terminal's discipline to be debugged, so the whole ioctl is refused, N_TTY included; reading it (`TIOCGETD`, 0x5424) stays allowed. `cmd` is an `unsigned int`, and the number is the same on both architectures (`asm-generic/ioctls.h`). |
 | anything else | allow | Classified one by one in the census (PR 5). Capability-gated calls fail because the workload holds no capability in any namespace (D9), and the census proves each one. |
 
 The syscall numbers the rows use (uapi 7.2.4):
@@ -115,6 +117,7 @@ The syscall numbers the rows use (uapi 7.2.4):
 | clone / unshare / clone3 | 56 / 272 / 435 | 220 / 97 / 435 |
 | socket / socketpair | 41 / 53 | 198 / 199 |
 | mmap / shmget / memfd_create | 9 / 29 / 319 | 222 / 194 / 279 |
+| ioctl | 16 | 29 |
 
 `AUDIT_ARCH_X86_64` = `EM_X86_64` (62) | `__AUDIT_ARCH_64BIT` (0x80000000) |
 `__AUDIT_ARCH_LE` (0x40000000) = 0xC000003E; `AUDIT_ARCH_AARCH64` = 183 |
@@ -124,9 +127,10 @@ locally, each citing its uapi header.
 
 The flag values are libc 0.2.191's (`MAP_HUGETLB` is the same on both
 architectures, `SHM_HUGETLB` and `MFD_HUGETLB` sit in libc's shared
-Linux module), and `seccomp::table` pins every number and flag to
-`libc` at compile time for the build's architecture; the musl `cargo
-check` for aarch64 in CI evaluates the aarch64 assertions.
+Linux module), and `seccomp::table` pins every number and flag, the IP
+protocols and `TIOCSETD` included, to `libc` at compile time for the
+build's architecture; the musl `cargo check` for aarch64 in CI evaluates
+the aarch64 assertions.
 
 **The huge page rows answer EPERM, not ENOMEM.** Without the filter, as
 the unprivileged dev-host user with no reserved huge pages
@@ -161,7 +165,9 @@ from `seccomp::table`: every number from 0 to 479 with zeroed arguments,
 (`policy_decisions_x86_64`, `policy_decisions_aarch64`), and per row the
 argument forms that select it and the ones that must not
 (`user_namespace_rows`, `socket_family_rows`, `netlink_protocol_rows`,
-`hugetlb_flag_rows`), plus the shape of the program (`program_shape`).
+`inet_protocol_rows` over every protocol from 0 to 300 for both families
+and three socket types, `tty_line_discipline_row`, `hugetlb_flag_rows`),
+plus the shape of the program (`program_shape`).
 The interpreter shares assumptions with the assembler, so the kernel
 rows (`seccomp_rows`, host) make each call twice: once on the host as the
 unprivileged user without a filter (the baseline), and once in a
@@ -174,9 +180,14 @@ observable fails too, so the list is exact. On x86_64 an `int 0x80`
 7.2.10): `io_uring_setup`, `userfaultfd`, `perf_event_open`, `keyctl`,
 `add_key`, both new-user-namespace forms of `clone` and `unshare` (in a
 forked single-threaded child), `socket(AF_VSOCK)`,
-`socket(AF_NETLINK, NETLINK_NETFILTER)` and `memfd_create(MFD_HUGETLB)`
-succeed; zeroed `bpf` gives EINVAL, `request_key` ENOKEY, `unshare` with
-bit 32 EINVAL, `clone3(NULL, 0)` EINVAL, `socketpair(AF_INET)`
+`socket(AF_NETLINK, NETLINK_NETFILTER)`, `memfd_create(MFD_HUGETLB)`,
+`ioctl(TIOCSETD, N_TTY)` on a new pty and the allowed
+`socket(AF_INET, SOCK_STREAM, TCP)` and `socket(AF_INET6, SOCK_DGRAM, UDP)`
+succeed; `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` and its AF_INET6 twin
+give EPERM (no `CAP_NET_RAW`; a raw socket matches the raw entry for
+every protocol, so no module is asked for), which the filter turns into
+EPROTONOSUPPORT; zeroed `bpf` gives EINVAL, `request_key` ENOKEY,
+`unshare` with bit 32 EINVAL, `clone3(NULL, 0)` EINVAL, `socketpair(AF_INET)`
 EOPNOTSUPP, `mmap(MAP_HUGETLB)` ENOMEM; `syslog` (`dmesg_restrict` 1) and
 `shmget(SHM_HUGETLB)` give EPERM already, so those two are the dev
 host's gaps (`syslog,shmget-hugetlb`) and only the interpreter proves
@@ -184,6 +195,33 @@ them there. Under the filter a new thread, a forked child and a filter
 the workload stacks on top all keep the rows
 (`filter_covers_threads_children_and_stacking`), and glibc's thread start
 falls back from `clone3` to `clone` (`clone3_fallback_starts_threads`).
+
+**The keyring rows do not hide the runner's keys on their own.** The
+keyring is not namespaced: a procfs mounted in the sandbox's user
+namespace lists in `/proc/keys` every key, with description and serial,
+whose owner the namespace maps (the runner's, the single mapped id of
+D1), and `/proc/key-users` its quota line; and the clone copies the
+runner's session keyring, so the workload possesses it. Found in review
+of PR 4 (a user key added on the host showed inside for ids 0 and 999).
+So the sandbox's procfs covers both files with a read-only bind of the
+host's `/dev/null` (D7; reading them gives 0 bytes), as Docker's
+`MaskedPaths` do for other proc files, and the child joins a new
+anonymous session keyring (`keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`,
+`Step::SessionKeyring`, code 29) right after the id maps (D4). The join
+comes before the mounts because, joined after them, the runner's keyring
+kept one reference for as long as the sandbox ran (measured with the test
+below): something the mount steps create holds the credentials of that
+moment. The new keyring counts against the runner user's key quota
+(`kernel.keys.maxkeys` 200 and `maxbytes` 20000 on the dev host,
+measured) for as long as the sandbox lives, one keyring per sandbox; a
+refused join (over that quota, for example) fails the spawn at that
+step: closed, never a sandbox with the runner's keyring. `runner_keyring_hidden` (host) joins an
+anonymous session keyring in a thread of its own, so no key is added to
+the runner's keyrings and the keyring ends with that thread on every
+path, and reads its usage count in the host's `/proc/keys`: a host child
+of that thread raises it and lists it; a sandbox started from it, while
+alive, leaves the count at its base, and reads both files as empty, for
+inside ids 0 and 999.
 
 **Extension rule.** Raising the ceiling needs no new ADR: the PR
 regenerates the syscall extracts, the completeness test (PR 5) then fails
@@ -265,8 +303,9 @@ process until the clone:
    timeout the child is killed through its pidfd and reaped.
 
 The child runs a fixed sequence (`Step`): `deny` to `/proc/self/setgroups`,
-the gid map, the uid map; the cgroup namespace, the root, the mounts,
-`pivot_root`, the hostname and `lo` (D7, PR 2); `setsid` (a new session without a controlling
+the gid map, the uid map; a new anonymous session keyring (D2, PR 4);
+the cgroup namespace, the root, the mounts, `pivot_root`, the hostname
+and `lo` (D7, PR 2); `setsid` (a new session without a controlling
 terminal); every signal disposition 1–64 except SIGKILL and SIGSTOP to
 `SIG_DFL` through the raw `rt_sigaction` while every signal is still
 blocked, then an empty signal mask. So no parent handler can run in the
@@ -598,7 +637,11 @@ configured. Targets must exist in the root: the image or the top layer
   unchanged (`writable_overlay_mount`).
 - `Proc { target }`: `nosuid,nodev,noexec`, mounted before `pivot_root`,
   because the kernel lets a user namespace mount a new procfs only while
-  a fully visible one is in its mount namespace.
+  a fully visible one is in its mount namespace. Since PR 4 its `keys` and
+  `key-users` are covered by a bind of the host's `/dev/null`, read-only,
+  `nosuid,noexec`, opened beneath the new procfs without following any
+  symlink like the device nodes of `Dev` (D2; `pivot_root_hides_host`
+  counts the two mounts).
 - `Dev { target, shm_size_bytes }`: the OCI default devices without
   `/dev/console`. A tmpfs of 64 KiB, mode 0755, `nosuid,noexec`, holding
   `null`, `zero`, `full`, `random`, `urandom` and `tty` bound from the

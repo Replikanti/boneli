@@ -106,6 +106,7 @@ pub fn main(action: &str) -> ! {
         "clone3-fallback" => clone3_fallback(),
         "cgroup-view" => cgroup_view(),
         "landlock" => landlock(),
+        "keys" => keys(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     exit(0)
@@ -1009,6 +1010,52 @@ fn keyctl_get_keyring_id() -> i32 {
     rc_errno(rc)
 }
 
+/// `ioctl(TIOCSETD)` with `N_TTY` on the slave of a new pty from
+/// `/dev/ptmx` (in the sandbox its private devpts): its errno, 0 for
+/// success. The slave already has `N_TTY`, which is built in, so the call
+/// reaches `tty_set_ldisc` and returns at once without asking for a
+/// module; no other discipline is ever tried (13 would load n_hdlc).
+fn tiocsetd_n_tty() -> i32 {
+    const N_TTY: libc::c_int = 0;
+    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
+    let master = unsafe {
+        libc::open(
+            c"/dev/ptmx".as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if master < 0 {
+        fail(3, &format!("open /dev/ptmx: errno {}", errno()));
+    }
+    // SAFETY: master is the pty master opened above.
+    if unsafe { libc::unlockpt(master) } < 0 {
+        fail(3, &format!("unlockpt: errno {}", errno()));
+    }
+    // SAFETY: TIOCGPTPEER takes open flags and returns a new descriptor.
+    let slave = unsafe {
+        libc::ioctl(
+            master,
+            libc::TIOCGPTPEER as _,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave < 0 {
+        fail(3, &format!("TIOCGPTPEER: errno {}", errno()));
+    }
+    // SAFETY: TIOCSETD reads one int, valid for the call's duration.
+    let rc = unsafe { libc::ioctl(slave, libc::TIOCSETD as _, &N_TTY as *const libc::c_int) };
+    let result = if rc < 0 { errno() } else { 0 };
+    // SAFETY: both descriptors were opened here and nothing else owns them.
+    unsafe {
+        libc::close(slave);
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::close(master);
+    }
+    result
+}
+
 /// Closes `fd` if a call returned one.
 fn close_if(rc: libc::c_long) {
     if rc >= 0 {
@@ -1164,6 +1211,39 @@ fn seccomp_rows() {
     };
     socket("socket-vsock", libc::AF_VSOCK, libc::SOCK_STREAM, 0);
     socket("socket-unix", libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    socket(
+        "socket-inet-tcp",
+        libc::AF_INET,
+        libc::SOCK_STREAM,
+        libc::IPPROTO_TCP,
+    );
+    socket(
+        "socket-inet6-udp",
+        libc::AF_INET6,
+        libc::SOCK_DGRAM,
+        libc::IPPROTO_UDP,
+    );
+    // A protocol outside the row's list that loads no module either way:
+    // raw sockets match the raw wildcard entry for every protocol, so the
+    // kernel never calls request_module and refuses the unprivileged
+    // caller with EPERM (no CAP_NET_RAW); the filter answers
+    // EPROTONOSUPPORT before that. A protocol served by a module (SCTP 132,
+    // SMC 256, L2TP 115) is never tried here: the baseline would load it
+    // into the host kernel.
+    socket(
+        "socket-inet-raw-protocol",
+        libc::AF_INET,
+        libc::SOCK_RAW,
+        libc::IPPROTO_RAW,
+    );
+    socket(
+        "socket-inet6-raw-protocol",
+        libc::AF_INET6,
+        libc::SOCK_RAW,
+        libc::IPPROTO_RAW,
+    );
+
+    row("ioctl-tiocsetd", tiocsetd_n_tty());
     socket(
         "netlink-netfilter",
         libc::AF_NETLINK,
@@ -1436,6 +1516,37 @@ fn cgroup_view() {
 /// `r/g`, `w/a/x`, `w/b/`, `outside/f`, `u1/` and `u2/`; the probe makes
 /// the listeners before it restricts itself, so they are created outside
 /// the domain. A case above the kernel's ABI prints `n/a`.
+/// What the keyring files show (ADR-007, D2): the byte length of
+/// `/proc/keys` and `/proc/key-users` (or `errno=<n>`), and whether
+/// `/proc/keys` lists the key `BONELI_PROBE_SERIAL` (eight hex digits, as
+/// the file prints serials). Then it waits for EOF on stdin, so the test
+/// can look at the keyring while this process holds its credentials.
+fn keys() {
+    use std::io::Read;
+    let serial = input("BONELI_PROBE_SERIAL");
+    for (name, path) in [("keys", "/proc/keys"), ("key_users", "/proc/key-users")] {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                put(&format!("{name}_len"), &text.len().to_string());
+                let listed = text
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some(serial.as_str()));
+                put(
+                    &format!("{name}_lists_serial"),
+                    if listed { "1" } else { "0" },
+                );
+            }
+            Err(e) => put(
+                &format!("{name}_len"),
+                &format!("errno={}", e.raw_os_error().unwrap_or(-1)),
+            ),
+        }
+    }
+    put("waiting", "1");
+    let mut rest = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut rest);
+}
+
 fn landlock() {
     use boneli_sys::{Abi, AccessFs, AccessNet, Ruleset, Scope};
     use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};

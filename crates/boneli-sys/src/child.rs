@@ -96,11 +96,15 @@ pub enum Step {
     Capset = 27,
     /// `PR_SET_NO_NEW_PRIVS`.
     NoNewPrivs = 28,
+    /// `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`: a new anonymous session
+    /// keyring, so the program holds no reference to the runner's (ADR-007,
+    /// D2).
+    SessionKeyring = 29,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 28] = [
+    pub const ALL: [Step; 29] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -129,14 +133,16 @@ impl Step {
         Step::CapAmbient,
         Step::Capset,
         Step::NoNewPrivs,
+        Step::SessionKeyring,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
     /// [`Step::MountTarget`] precedes each mount.
-    pub const SEQUENCE: [Step; 28] = [
+    pub const SEQUENCE: [Step; 29] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
+        Step::SessionKeyring,
         Step::OomScoreAdj,
         Step::CgroupNs,
         Step::MakePrivate,
@@ -205,6 +211,7 @@ impl Step {
             Step::CapAmbient => "cap-ambient",
             Step::Capset => "capset",
             Step::NoNewPrivs => "no-new-privs",
+            Step::SessionKeyring => "session-keyring",
         }
     }
 }
@@ -492,6 +499,26 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     let Action::Exec(exec) = &plan.action else {
         return Ok(());
     };
+
+    // A new session keyring of its own: the clone copied the runner's, and
+    // the keyring is not namespaced. Before the mounts: joined after them,
+    // the runner's keyring kept a reference for as long as the sandbox ran
+    // (measured, ADR-007 D2), so something the mount steps create holds
+    // the credentials of that moment. Before the filter, which denies
+    // keyctl.
+    inject(fault, Step::SessionKeyring)?;
+    // SAFETY: a NULL name makes the kernel create an anonymous keyring; no
+    // memory is passed.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            ffi::KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<c_char>(),
+        )
+    };
+    if rc < 0 {
+        return Err(fail(Step::SessionKeyring, 0, errno()));
+    }
 
     inject(fault, Step::OomScoreAdj)?;
     raise_oom_score_adj()?;

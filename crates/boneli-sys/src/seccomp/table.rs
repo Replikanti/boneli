@@ -39,6 +39,22 @@ pub const AF_NETLINK: u32 = 16;
 /// `NETLINK_ROUTE`, `include/uapi/linux/netlink.h`: the one netlink
 /// protocol the policy allows.
 pub const NETLINK_ROUTE: u32 = 0;
+/// The IP protocols the policy allows for `AF_INET` and `AF_INET6`
+/// (`include/uapi/linux/in.h`, `in6.h`): `IPPROTO_IP` (0, the type's
+/// default), `IPPROTO_TCP`, `IPPROTO_UDP`, and each family's ICMP for
+/// unprivileged ping sockets.
+pub const IPPROTO_IP: u32 = 0;
+/// `IPPROTO_ICMP`, IPv4 only.
+pub const IPPROTO_ICMP: u32 = 1;
+/// `IPPROTO_TCP`.
+pub const IPPROTO_TCP: u32 = 6;
+/// `IPPROTO_UDP`.
+pub const IPPROTO_UDP: u32 = 17;
+/// `IPPROTO_ICMPV6`, IPv6 only.
+pub const IPPROTO_ICMPV6: u32 = 58;
+/// `TIOCSETD`, `include/uapi/asm-generic/ioctls.h` (x86 and arm64 both
+/// use the generic numbers): sets a tty's line discipline.
+pub const TIOCSETD: u32 = 0x5423;
 
 const _: () = assert!(MAP_HUGETLB == libc::MAP_HUGETLB as u32);
 const _: () = assert!(SHM_HUGETLB == libc::SHM_HUGETLB as u32);
@@ -49,6 +65,12 @@ const _: () = assert!(AF_INET == libc::AF_INET as u32);
 const _: () = assert!(AF_INET6 == libc::AF_INET6 as u32);
 const _: () = assert!(AF_NETLINK == libc::AF_NETLINK as u32);
 const _: () = assert!(NETLINK_ROUTE == libc::NETLINK_ROUTE as u32);
+const _: () = assert!(IPPROTO_IP == libc::IPPROTO_IP as u32);
+const _: () = assert!(IPPROTO_ICMP == libc::IPPROTO_ICMP as u32);
+const _: () = assert!(IPPROTO_TCP == libc::IPPROTO_TCP as u32);
+const _: () = assert!(IPPROTO_UDP == libc::IPPROTO_UDP as u32);
+const _: () = assert!(IPPROTO_ICMPV6 == libc::IPPROTO_ICMPV6 as u32);
+const _: () = assert!(TIOCSETD == libc::TIOCSETD as u32);
 
 /// An architecture the policy has a table for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +156,8 @@ pub struct Syscalls {
     pub shmget: u32,
     /// `memfd_create`.
     pub memfd_create: u32,
+    /// `ioctl`.
+    pub ioctl: u32,
 }
 
 /// x86_64, `arch/x86/include/uapi/asm/unistd_64.h` (7.2.4).
@@ -156,6 +180,7 @@ pub const X86_64: Syscalls = Syscalls {
     mmap: 9,
     shmget: 29,
     memfd_create: 319,
+    ioctl: 16,
 };
 
 /// aarch64, `include/uapi/asm-generic/unistd.h` as arm64 builds it (7.2.4).
@@ -178,6 +203,7 @@ pub const AARCH64: Syscalls = Syscalls {
     mmap: 222,
     shmget: 194,
     memfd_create: 279,
+    ioctl: 29,
 };
 
 /// The build's own table.
@@ -212,4 +238,5 @@ pin! {
     mmap => SYS_mmap,
     shmget => SYS_shmget,
     memfd_create => SYS_memfd_create,
+    ioctl => SYS_ioctl,
 }

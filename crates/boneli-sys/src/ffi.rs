@@ -33,6 +33,10 @@ const _: () = assert!(core::mem::size_of::<KernelSigaction>() == 32);
 // libc's SIG_DFL is the handler value 0 the kernel expects.
 const _: () = assert!(libc::SIG_DFL == 0);
 
+/// `KEYCTL_JOIN_SESSION_KEYRING`, `include/uapi/linux/keyctl.h`: with a
+/// NULL name, a new anonymous session keyring for the caller.
+pub(crate) const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+
 /// `OPEN_TREE_CLONE`, `include/uapi/linux/mount.h`: `open_tree` returns a
 /// detached copy of the mount instead of the mount itself.
 pub(crate) const OPEN_TREE_CLONE: u32 = 1 << 0;
