@@ -401,11 +401,11 @@
    "title": "boneli-sandbox-linux: the Sandbox port on our own runtime, pods with a shared network namespace",
    "epic": 23,
    "order": 7,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "9c692a2a",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-27T15:51:46+00:00",
+   "updated_at": "2026-11-27T15:52:08+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -418,10 +418,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null
   },
   {
@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "909fb540",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-27T15:51:46+00:00",
+   "updated_at": "2026-11-27T15:52:08+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -894,10 +894,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null
   },
   {
@@ -1717,16 +1717,16 @@
    "title": "boneli-sys: two host tests flake on a loaded host (keeper cadence, buffered writes)",
    "epic": null,
    "order": 66,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "ae8af796",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-27T15:51:46+00:00",
+   "note": "",
+   "updated_at": "2026-11-27T15:52:08+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1738,30 +1738,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T11:31:30+00:00",
-   "issue": 128,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "ea19b3dc",
-   "note": null
-  },
-  {
-   "at": "2026-11-25T11:46:28+00:00",
-   "issue": 102,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "3613ba8e",
-   "note": null
-  },
-  {
-   "at": "2026-11-25T12:03:21+00:00",
-   "issue": 102,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "3613ba8e",
-   "note": null
-  },
   {
    "at": "2026-11-25T12:04:53+00:00",
    "issue": 129,
@@ -2137,6 +2113,30 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-27T15:52:08+00:00",
+   "issue": 8,
+   "from": "ready",
+   "to": "claimed",
+   "by": "9c692a2a",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-27T15:52:08+00:00",
+   "issue": 45,
+   "from": "ready",
+   "to": "claimed",
+   "by": "909fb540",
+   "note": "dispatched"
+  },
+  {
+   "at": "2026-11-27T15:52:08+00:00",
+   "issue": 142,
+   "from": "ready",
+   "to": "claimed",
+   "by": "ae8af796",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2164,7 +2164,7 @@
   142
  ],
  "xopen": [],
- "updated_at": "2026-11-27T15:51:46+00:00",
+ "updated_at": "2026-11-27T15:52:08+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
