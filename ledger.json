@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "909fb540",
-   "pr": null,
+   "pr": 145,
    "note": "",
-   "updated_at": "2026-11-27T23:07:57+00:00",
+   "updated_at": "2026-11-27T23:52:23+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1765,14 +1765,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T15:00:23+00:00",
-   "issue": 131,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #133 open"
-  },
-  {
    "at": "2026-11-25T15:10:34+00:00",
    "issue": 102,
    "from": "implementing",
@@ -2163,6 +2155,14 @@
    "to": "implementing",
    "by": "909fb540",
    "note": null
+  },
+  {
+   "at": "2026-11-27T23:52:23+00:00",
+   "issue": 45,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "909fb540",
+   "note": null
   }
  ],
  "open": [
@@ -2191,7 +2191,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-27T23:07:57+00:00",
+ "updated_at": "2026-11-27T23:52:23+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
