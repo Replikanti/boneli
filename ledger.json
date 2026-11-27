@@ -1735,25 +1735,35 @@
     "sandbox"
    ],
    "manual": false
+  },
+  {
+   "issue": 144,
+   "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
+   "epic": null,
+   "order": 67,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-27T23:07:51+00:00",
+   "priority": "P3",
+   "size": "medium",
+   "deps": [
+    45
+   ],
+   "xdeps": [],
+   "areas": [
+    "ci"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T13:16:13+00:00",
-   "issue": 131,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "aac94746",
-   "note": null
-  },
-  {
-   "at": "2026-11-25T13:47:35+00:00",
-   "issue": 102,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "3613ba8e",
-   "note": "PR 1 #132 merged (RFC 3161); PR 2 Rekor v2 next"
-  },
   {
    "at": "2026-11-25T14:04:37+00:00",
    "issue": 131,
@@ -2137,6 +2147,22 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #143 open"
+  },
+  {
+   "at": "2026-11-27T23:07:51+00:00",
+   "issue": 144,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-27T23:07:51+00:00",
+   "issue": 144,
+   "from": "ready",
+   "to": "blocked",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2161,10 +2187,11 @@
   45,
   49,
   69,
-  142
+  142,
+  144
  ],
  "xopen": [],
- "updated_at": "2026-11-27T18:05:30+00:00",
+ "updated_at": "2026-11-27T23:07:51+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
