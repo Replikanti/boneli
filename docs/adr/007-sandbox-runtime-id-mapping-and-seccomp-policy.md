@@ -431,6 +431,12 @@ features" step prints them on every run):
 | host-setup block (linger, restart, bus wait) | 1 s | 1 s |
 | after the block, in a `Delegate=yes` scope | nothing missing (io included) | the same |
 | cgroup2 super options (since PR 3) | `nsdelegate` present | the same |
+| PR 4 run (45925071760, 2026-11-27): kernel | 7.0.0-1020-azure | 7.0.0-1017-azure |
+| LSMs (PR 4 run) | as above, `bpf` included | as above, without `bpf` |
+| Landlock ABI (PR 4 run) | 8, so the two ABI 9 rows of D10 print `n/a` | the same |
+| cgroup2 `memory_hugetlb_accounting` (PR 4 run) | present | absent |
+| `vm.nr_hugepages` / `vm.hugetlb_shm_group` / hugetlbfs (PR 4 run) | 0 / 0 / `/dev/hugepages`, `pagesize=2M` | the same |
+| `BONELI_SYS_HOST_GAPS` (since PR 4) | `syslog,shmget-hugetlb`: both rows give EPERM without the filter (`dmesg_restrict` 1; the runner user is not in `vm.hugetlb_shm_group`); every other kernel row observed | the same |
 
 Every assumption above held but one: the AppArmor restriction shows as
 EACCES at the setgroups open, not EPERM (D3). The runner user has
@@ -1675,7 +1681,9 @@ connect to a pathname socket created outside gives EACCES, and to the
 same kind of socket beneath a path allowed with `RESOLVE_UNIX` works
 (ABI 9); `NoNewPrivs` is 1 after `restrict_self`. Rows above the host's
 ABI print `n/a (ABI <n>)` outside libtest's capture, so CI's kernels run
-what they have and the dev host runs every row.
+what they have and the dev host runs every row. Both CI legs had ABI 8
+(Linux 7.0) in the PR 4 run, so `unix_outside` and `unix_allowed` run
+only on the dev host there.
 
 ## Consequences
 
