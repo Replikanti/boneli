@@ -9,7 +9,10 @@
 //! D7) inside a cgroup whose limits are in place before it starts
 //! ([`Cgroup`], ADR-007 D8) and whose own thread keeps its memory
 //! statistics fresh, so that a buffered writer is slowed rather than
-//! OOM-killed ([`STATS_KEEPER_PERIOD`], ADR-007 D8), and it checks that a
+//! OOM-killed ([`STATS_KEEPER_PERIOD`], ADR-007 D8), without any
+//! capability, with `no_new_privs` and under a seccomp-bpf policy it
+//! assembles itself ([`seccomp`], ADR-007 D2 and D9). It applies Landlock
+//! to the calling process ([`Ruleset`], ADR-007 D10), and it checks that a
 //! host has what the runtime needs ([`Features::probe`], ADR-007 D3). For
 //! tests that need a process whose main thread has exited while another
 //! thread runs, it can end the main thread alone ([`exit_main_thread`],
@@ -33,9 +36,12 @@ mod ffi;
 mod host;
 mod ids;
 mod keeper;
+mod landlock;
 mod layer;
 mod mount;
+mod privileges;
 mod report;
+pub mod seccomp;
 mod spawn;
 mod thread;
 
@@ -47,8 +53,10 @@ pub use error::{Error, ProtocolError, Result};
 pub use host::{Features, Missing, MissingId};
 pub use ids::Ids;
 pub use keeper::{KeeperReport, STATS_KEEPER_PERIOD};
+pub use landlock::{ABI_KNOWN, ABI_REQUIRED, Abi, AccessFs, AccessNet, Ruleset, Scope};
 pub use layer::{make_fifo, make_whiteout, mark_opaque, sync_filesystem, user_xattr};
 pub use mount::{DEV_ENTRIES, Hostname, InsidePath, Mount, OPTIONS_MAX, Root};
+pub use privileges::SECUREBITS;
 pub use spawn::{Child, ExitStatus, Spec, Stdio, spawn};
 pub use thread::exit_main_thread;
 

@@ -14,7 +14,9 @@ use crate::error::{Error, Result, errno};
 use crate::ffi;
 use crate::ids::Ids;
 use crate::mount::{self, Op, Root};
+use crate::privileges::{self, PrivilegeDrop};
 use crate::report;
+use crate::seccomp::{Arch, Policy, Program};
 
 /// The three standard descriptors of the program. They are duplicated
 /// while spawning; the spec keeps owning them, so dropping the spec after
@@ -221,6 +223,8 @@ struct Prepared {
     gid_line: Vec<u8>,
     stdio: [OwnedFd; 3],
     ops: Vec<Op>,
+    filter: Program,
+    cap_last_cap: u32,
 }
 
 fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
@@ -233,6 +237,11 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
     let (ruid, euid, rgid, egid) = caller();
     check_caller(ruid, euid, rgid, egid)?;
     let ops = mount::plan(&spec.root)?;
+    mount::refuse_hugetlbfs(&spec.root)?;
+    let filter = Policy::sandbox()
+        .program(Arch::NATIVE)
+        .map_err(Error::SeccompProgram)?;
+    let cap_last_cap = privileges::cap_last_cap()?;
 
     let program = c_string(
         spec.program.as_os_str().as_bytes().to_vec(),
@@ -275,6 +284,8 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
         gid_line: spec.ids.gid_map_line(egid).into_bytes(),
         stdio,
         ops,
+        filter,
+        cap_last_cap,
     })
 }
 
@@ -484,14 +495,16 @@ pub(crate) fn await_report(read: &OwnedFd, launched: &Launched, timeout: Duratio
 /// namespaces with the single id mapping of `spec.ids` (ADR-007,
 /// D1), the read-only root and mounts of `spec.root`, its hostname and `lo`
 /// up (ADR-007, D7), a new session, default signal dispositions, an empty
-/// signal mask and only descriptors 0-2 (ADR-007, D4). Returns once the
-/// program was exec'd.
+/// signal mask and only descriptors 0-2 (ADR-007, D4), without any
+/// capability, with `no_new_privs` and under the seccomp policy (ADR-007,
+/// D9 and D2). Returns once the program was exec'd.
 ///
 /// Errors before the clone: [`Error::ZeroSetupTimeout`],
 /// [`Error::RelativeProgram`], [`Error::RunningAsRoot`],
 /// [`Error::SetuidCaller`], [`Error::Nul`], [`Error::InvalidEnvName`], and
-/// for the root [`Error::InvalidRoot`], [`Error::InvalidMount`] and
-/// [`Error::MountOptionsTooLong`].
+/// for the root [`Error::InvalidRoot`], [`Error::InvalidMount`],
+/// [`Error::MountOptionsTooLong`] and [`Error::HugetlbfsSource`], and
+/// [`Error::CapLastCap`].
 /// After it: [`Error::Setup`] with the failed step, or
 /// [`Error::SetupTimeout`] and [`Error::Protocol`], after which the child
 /// was killed; in every error case it was reaped.
@@ -520,6 +533,10 @@ pub(crate) fn spawn_inner(spec: &Spec<'_>, fault: Fault, pid: &mut libc::pid_t) 
             stdio,
             ops: &prepared.ops,
             cgroup: spec.cgroup.dir_fd(),
+            privileges: PrivilegeDrop {
+                cap_last_cap: prepared.cap_last_cap,
+                filter: prepared.filter.instructions(),
+            },
         }),
         report_fd: write.as_raw_fd(),
         fault,
@@ -640,6 +657,10 @@ mod tests {
             stdio: [3, 4, 5],
             ops: &[],
             cgroup: 42,
+            privileges: PrivilegeDrop {
+                cap_last_cap: 40,
+                filter: &[],
+            },
         });
         let (flags, cgroup) = clone_flags(&exec);
         assert_eq!(
@@ -697,9 +718,8 @@ mod tests {
     #[ignore = "host: unprivileged user namespaces"]
     fn every_step_failure_is_reported() {
         let _host = crate::test_guard::host_lock();
-        // Step::Seccomp is not part of spawn's sequence yet (only the probe
-        // runs it; host::tests covers it there). The root has a mount of
-        // every kind, so every mount step is reached.
+        // The root has a mount of every kind, so every mount step is
+        // reached; the privilege steps and the filter come after it.
         let unit = crate::test_guard::UnitRoot::new();
         // The parent cgroup holds a descriptor for the rest of the run;
         // open it before the first count.

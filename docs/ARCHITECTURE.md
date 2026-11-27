@@ -61,8 +61,8 @@ Target state: during the agent phase the only way out is through the gateway to 
 - user, mount, pid, net, ipc, uts and cgroup namespaces; one id inside the container, root or the image's user, maps to the unprivileged host user (single id mapping, no setuid helpers; ADR-007),
 - `pivot_root` into a rootfs assembled from OCI layers, overlay and tmpfs (overlay inside a user namespace works since Linux 5.11),
 - cgroups v2 through writes to `/sys/fs/cgroup`: memory, CPU, process count, IO,
-- a seccomp-bpf filter assembled in Rust that additionally blocks `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, `keyctl` and new user namespaces, the kernel log, foreign ABIs, syscalls newer than the reviewed table, socket families other than Unix, IPv4, IPv6 and netlink, and netlink protocols other than routing (ADR-007),
-- `no_new_privs`, no capabilities, a read-only rootfs; only `/workspace` and `/tmp` are writable,
+- a seccomp-bpf filter assembled in Rust that additionally blocks `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, `keyctl` and new user namespaces, the kernel log, foreign ABIs, syscalls newer than the reviewed table, socket families other than Unix, IPv4, IPv6 and netlink, and netlink protocols other than routing, and huge pages (ADR-007),
+- `no_new_privs`, no capabilities (ADR-007), a read-only rootfs; only `/workspace` and `/tmp` are writable,
 - Landlock as a second layer, enabled by `boneli-shim` before it starts the agent; ABI 2 or newer, so Linux 5.19 (ADR-007).
 
 **Pod.** The application and its services (Postgres, Redis) share one network namespace, each with its own rootfs. They see each other on `127.0.0.1` and nothing leads outside.

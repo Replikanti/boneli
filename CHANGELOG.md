@@ -207,6 +207,26 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a hierarchy without `nsdelegate` themselves. Teardown lifts limits only
   after a successful kill, and kills through a `cgroup.kill` descriptor
   held open since `create`, so a mode change from inside cannot block it.
+- `boneli-sys` (ADR-007 D2, D9 and D10, part 4 of #6): the seccomp
+  policy, assembled in Rust (`seccomp::{table, bpf, policy}`, 46
+  instructions): foreign architectures killed, numbers above 471 ENOSYS,
+  `io_uring_*`, `bpf`, `userfaultfd`, `perf_event_open`, the keyring
+  calls, `syslog`, new user namespaces through `clone` and `unshare`, and
+  the huge page flags of `mmap`, `shmget` and `memfd_create` EPERM,
+  `clone3` ENOSYS, socket families other than Unix, IPv4, IPv6 and netlink
+  and `socketpair` other than Unix EAFNOSUPPORT, netlink protocols other
+  than routing EPROTONOSUPPORT. Every `spawn` drops every capability
+  (locked securebits 0xEF, an empty bounding set up to `cap_last_cap`, no
+  ambient, `capset` to zero), sets `no_new_privs` and installs the filter
+  as the last step before `execve`; it refuses a source on hugetlbfs
+  (`Error::HugetlbfsSource`). `Ruleset` applies Landlock (ABI 2 to 10) to
+  the calling process and fails closed on a right the ABI does not know.
+  Tests: a BPF interpreter over both architectures' programs, the rows in
+  the kernel against an unfiltered baseline (`BONELI_SYS_HOST_GAPS` now
+  takes `syslog`, `shmget-hugetlb` and `hugetlbfs-mount`), the privilege
+  drop seen from inside, Landlock rights on the host, the cgroup2 view
+  that no mount call can make writable; two PR 3 tests make their
+  capability step on the host side now.
 - `Features::probe`: a probe whose own machinery fails — a failed
   `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
   killed by a signal or ended before it could report, or a `clone3`

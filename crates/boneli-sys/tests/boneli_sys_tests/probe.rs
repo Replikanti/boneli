@@ -113,14 +113,25 @@ fn apparmor_profile_is_narrow() {
 #[test]
 #[ignore = "host: names the host's unobservable rows"]
 fn host_gaps_are_known() {
-    // Ids of rows a host may be unable to observe. None exist before the
-    // seccomp rows land (PR 4 of #6), so any value is a mistake.
-    const KNOWN: &[&str] = &[];
-    let raw = std::env::var("BONELI_SYS_HOST_GAPS").unwrap_or_default();
-    for id in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        assert!(
-            KNOWN.contains(&id),
-            "BONELI_SYS_HOST_GAPS names an unknown row {id:?}"
-        );
+    // Exact: every listed id is known (support::KNOWN_GAPS), and the tests
+    // that use one fail when a listed gap turns out observable
+    // (seccomp::seccomp_rows, mounts::hugetlbfs_source_refused).
+    let gaps = support::host_gaps();
+    report(&format!("host gaps: {gaps:?}"));
+}
+
+#[test]
+fn gap_ids_are_exact() {
+    let all = support::parse_gaps(" syslog,shmget-hugetlb , hugetlbfs-mount,").expect("known ids");
+    assert_eq!(all.len(), 3);
+    assert_eq!(support::parse_gaps("").expect("empty"), Default::default());
+    for bad in [
+        "bogus",
+        "syslog,bogus",
+        "nosys-read",
+        "SYSLOG",
+        "io-uring-setup",
+    ] {
+        assert!(support::parse_gaps(bad).is_err(), "{bad:?} was accepted");
     }
 }

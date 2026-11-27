@@ -2,8 +2,8 @@
 
 - Status: proposed
 - Date: 2026-11-13
-- Accept when: PR 4 of #6 merges with every host test green in CI on both
-  architectures and in a dev-host run.
+- Accept when: PR 5 of #6, the last one, merges with every host test green
+  in CI on both architectures and in a dev-host run.
 
 ## Context
 
@@ -23,12 +23,12 @@ sandboxed process is started. It also fixes how the runtime is tested,
 because none of it can be tested without a host that allows unprivileged
 user namespaces, and how the lints of the unsafe crate are kept honest.
 
-The work lands in four PRs under #6. This ADR is written in the first one
+The work lands in five PRs under #6. This ADR is written in the first one
 and grows while it is proposed: PR 2 adds the namespaces, mounts and broker
-sockets (D7), PR 3 the cgroups (D8), PR 4 the privilege drop (D9),
-Landlock (D10) and, in D2, the census of every syscall, the comparison
-with Docker's default profile and the residual risk. PR 4 sets it to
-accepted.
+sockets (D7), PR 3 the cgroups (D8), PR 4 the seccomp program and its
+huge page rows (D2), the privilege drop (D9) and Landlock (D10), and PR 5,
+in D2, the census of every syscall, the comparison with Docker's default
+profile and the residual risk. PR 5 sets it to accepted.
 
 Measurements quoted below were taken on 2026-11-13 on the dev host
 (Fedora 44, Linux 7.2.10 x86_64, uapi headers 7.2.4, cargo 1.98.0, libc
@@ -77,9 +77,13 @@ the dev host's user does not meet it.
 One fixed policy, no configuration. The filter is a classic BPF program
 assembled by `boneli-sys`; classic BPF allows 4096 instructions
 (`BPF_MAXINSNS`) and jump offsets of 8 bits (at most 255), and the
-assembler checks both. The table below needs about 40 instructions (an
-estimate from the rows; PR 4 records the assembler's count). Rows are
-read top to bottom, the first match wins. Arguments are read at offset
+assembler checks both. The table below assembles to 46 instructions on
+both architectures, and no jump needs more than an 8-bit offset
+(`program_shape` pins the count, so a change to the rows updates it
+here). The program is built once per spawn in the parent, before the
+clone (`Policy::sandbox().program(Arch::NATIVE)`), and installed as the
+child's last step before `execve` (D9). Rows are read top to bottom, the
+first match wins. Arguments are read at offset
 16 + 8·i of `seccomp_data`, the low 32-bit word on little-endian.
 
 | Match | Action | Why |
@@ -95,7 +99,10 @@ read top to bottom, the first match wins. Arguments are read at offset
 | `socket` with low32(arg 0) not in {AF_UNIX 1, AF_INET 2, AF_INET6 10, AF_NETLINK 16} | EAFNOSUPPORT (97) | `AF_VSOCK` works in a fresh user and network namespace (measured) and would bypass "no network" on a VM host; other families load protocol modules on demand. Unix, IPv4 and IPv6 carry the brokers (ADR-006: a bound Unix socket, which the shim relays on loopback). `domain` is an `int`, so the low word is the whole value. |
 | `socket` with family 16 and low32(arg 2) ≠ `NETLINK_ROUTE` (0) | EPROTONOSUPPORT (93) | Other netlink protocols reach unrelated subsystems (netfilter, audit, generic netlink, uevents, xfrm, crypto), and creating the socket can autoload a module (`request_module` in `netlink_create`). Routing is what glibc's `getaddrinfo` (`AI_ADDRCONFIG`) and `getifaddrs`, libuv's interface list and Chromium's network-change watcher use; inside it reads only the sandbox's own network namespace, and changes need `CAP_NET_ADMIN`. EPROTONOSUPPORT is what `netlink_create` returns for an unavailable protocol, and libaudit reads it as "no audit support", so PAM-based tools keep working. Any further protocol needs a reason in this ADR. |
 | `socketpair` with low32(arg 0) ≠ AF_UNIX | EAFNOSUPPORT | Of the four allowed families only AF_UNIX implements `socketpair`; the others create a socket (for netlink possibly autoloading a module) and then fail with EOPNOTSUPP. Docker's current profile allows only AF_UNIX and AF_TIPC (moby/profiles `7b5ccfa`). |
-| anything else | allow | Classified one by one in the census (PR 4). Capability-gated calls fail because the workload holds no capability in any namespace (D9), and the census proves each one. |
+| `mmap` with `MAP_HUGETLB` (0x40000) in low32(arg 3) | EPERM | Huge pages are charged to `memory.max` only where cgroup2 is mounted with `memory_hugetlb_accounting` (D8), so on a host with reserved huge pages a sandbox could take them past its limit. `flags` is an `unsigned long`, but the kernel tests only this bit, which lies in the low word; the `MAP_HUGE_*` size bits (26–31) mean nothing without it. |
+| `shmget` with `SHM_HUGETLB` (0x800) in low32(arg 2) | EPERM | The same, for SysV segments. `shmflg` is an `int`. Neither architecture has the `ipc` multiplexer; the i386 one is killed by the arch row. |
+| `memfd_create` with `MFD_HUGETLB` (0x4) in low32(arg 1) | EPERM | The same, for memfds. `flags` is an `unsigned int`. |
+| anything else | allow | Classified one by one in the census (PR 5). Capability-gated calls fail because the workload holds no capability in any namespace (D9), and the census proves each one. |
 
 The syscall numbers the rows use (uapi 7.2.4):
 
@@ -107,6 +114,7 @@ The syscall numbers the rows use (uapi 7.2.4):
 | syslog | 103 | 116 |
 | clone / unshare / clone3 | 56 / 272 / 435 | 220 / 97 / 435 |
 | socket / socketpair | 41 / 53 | 198 / 199 |
+| mmap / shmget / memfd_create | 9 / 29 / 319 | 222 / 194 / 279 |
 
 `AUDIT_ARCH_X86_64` = `EM_X86_64` (62) | `__AUDIT_ARCH_64BIT` (0x80000000) |
 `__AUDIT_ARCH_LE` (0x40000000) = 0xC000003E; `AUDIT_ARCH_AARCH64` = 183 |
@@ -114,8 +122,71 @@ the same bits = 0xC00000B7. libc 0.2.191 lacks the `AUDIT_ARCH_*`
 constants and the syscall numbers 463–471, so `boneli-sys` defines them
 locally, each citing its uapi header.
 
+The flag values are libc 0.2.191's (`MAP_HUGETLB` is the same on both
+architectures, `SHM_HUGETLB` and `MFD_HUGETLB` sit in libc's shared
+Linux module), and `seccomp::table` pins every number and flag to
+`libc` at compile time for the build's architecture; the musl `cargo
+check` for aarch64 in CI evaluates the aarch64 assertions.
+
+**The huge page rows answer EPERM, not ENOMEM.** Without the filter, as
+the unprivileged dev-host user with no reserved huge pages
+(`vm.nr_hugepages` 0, measured): `mmap(MAP_HUGETLB)` gives ENOMEM,
+`shmget(SHM_HUGETLB)` EPERM (outside `vm.hugetlb_shm_group`, without
+`CAP_IPC_LOCK`), `memfd_create(MFD_HUGETLB)` succeeds. EPERM is this
+table's answer for a refused feature, and it differs from the unfiltered
+`mmap` and `memfd_create` results, so those two rows are observable on
+every host. The weak spot is a program that falls back to normal pages
+only on ENOMEM. The two users that matter fall back on any error (read in
+their sources): glibc's `glibc.malloc.hugetlb` path in `sysmalloc` tries
+`sysmalloc_mmap` with `mp_.hp_flags` and, on `MAP_FAILED`, the same call
+with normal pages (`malloc/malloc.c` at glibc `04e750e`), and
+PostgreSQL's `huge_pages=try` in `CreateAnonymousSharedMemory` retries
+without `MAP_HUGETLB` whenever the first `mmap` returned `MAP_FAILED`
+(`src/backend/port/sysv_shmem.c` at PostgreSQL `ad33a14`); `huge_pages=on`
+fails the start, as it does on a host without huge pages. Left open, and
+why: transparent huge pages (`madvise(MADV_HUGEPAGE)`, `MADV_COLLAPSE`)
+are charged to the memory cgroup like normal pages; `shmat` reaches only
+segments the sandbox created (its own IPC namespace, D7); and the
+sandbox's tree has no hugetlbfs (`/dev` is a fresh tmpfs, mounting one
+needs the capabilities D9 removes, and `spawn` refuses a source on
+hugetlbfs, D7).
+
+**How the policy is tested.** The pure tests (in `check`) run the
+assembled program for both architectures through an interpreter of the
+same BPF subset, written from the opcode definitions and not from the
+assembler (`tests/boneli_sys_tests/support/bpf.rs`), with the syscall
+numbers of the table above written out in the test rather than taken
+from `seccomp::table`: every number from 0 to 479 with zeroed arguments,
+472, x32 numbers and −1, three foreign architectures
+(`policy_decisions_x86_64`, `policy_decisions_aarch64`), and per row the
+argument forms that select it and the ones that must not
+(`user_namespace_rows`, `socket_family_rows`, `netlink_protocol_rows`,
+`hugetlb_flag_rows`), plus the shape of the program (`program_shape`).
+The interpreter shares assumptions with the assembler, so the kernel
+rows (`seccomp_rows`, host) make each call twice: once on the host as the
+unprivileged user without a filter (the baseline), and once in a
+sandbox as inside ids 0 and 999, where the result must equal the row's
+action (an allowed call must succeed). When the baseline already equals
+the filtered result, the row is unobservable on that host and fails
+unless `BONELI_SYS_HOST_GAPS` lists it; a listed row that turns out
+observable fails too, so the list is exact. On x86_64 an `int 0x80`
+`getpid` must kill the probe with SIGSYS. Dev-host baselines (Linux
+7.2.10): `io_uring_setup`, `userfaultfd`, `perf_event_open`, `keyctl`,
+`add_key`, both new-user-namespace forms of `clone` and `unshare` (in a
+forked single-threaded child), `socket(AF_VSOCK)`,
+`socket(AF_NETLINK, NETLINK_NETFILTER)` and `memfd_create(MFD_HUGETLB)`
+succeed; zeroed `bpf` gives EINVAL, `request_key` ENOKEY, `unshare` with
+bit 32 EINVAL, `clone3(NULL, 0)` EINVAL, `socketpair(AF_INET)`
+EOPNOTSUPP, `mmap(MAP_HUGETLB)` ENOMEM; `syslog` (`dmesg_restrict` 1) and
+`shmget(SHM_HUGETLB)` give EPERM already, so those two are the dev
+host's gaps (`syslog,shmget-hugetlb`) and only the interpreter proves
+them there. Under the filter a new thread, a forked child and a filter
+the workload stacks on top all keep the rows
+(`filter_covers_threads_children_and_stacking`), and glibc's thread start
+falls back from `clone3` to `clone` (`clone3_fallback_starts_threads`).
+
 **Extension rule.** Raising the ceiling needs no new ADR: the PR
-regenerates the syscall extracts, the completeness test (PR 4) then fails
+regenerates the syscall extracts, the completeness test (PR 5) then fails
 until every new syscall has a census verdict, and a syscall that matches
 a row's criterion joins that row. A new criterion needs a new ADR.
 
@@ -138,7 +209,7 @@ that is cloned without a new user namespace (`SECCOMP_GET_ACTION_AVAIL`
 alone also succeeds on a kernel with `CONFIG_SECCOMP` but without
 `CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` only when the
 child's own filter step fails or its install hangs; it runs as
-`Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so that a
+`Step::Seccomp`, which `spawn` also runs, with the policy of D2 (D9). A separate child, so that a
 host lacking both filters and user namespaces is told about both: the
 probe reports the exact missing set), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup` mounted with `nsdelegate` (since PR 3,
@@ -206,8 +277,9 @@ std ignores SIGPIPE, and an ignored disposition survives `execve`, which
 is why every signal is reset; `dup2` of the
 three stdio descriptors; `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, so no
 other descriptor reaches the program (the CVE-2024-21626 class), while
-the report pipe stays open until the exec itself; `execve` with exactly
-the spec's environment.
+the report pipe stays open until the exec itself; the privilege drop and
+the seccomp filter (D9, PR 4); `execve` with exactly the spec's
+environment.
 
 **The child allocates nothing and takes no lock.** It is a copy of one
 thread of a process whose other threads may have held the allocator's or
@@ -251,8 +323,10 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   report decoding, step codes, probe messages and classification, the
   host-setup block, inside paths, hostnames, mount order and the mount
   plan, the overlay option limit; since PR 3 the cgroup limits, their
-  rendering, cgroup names and the mountinfo decoding and device mapping)
-  run in `check`.
+  rendering, cgroup names and the mountinfo decoding and device mapping;
+  since PR 4 the assembler, the policy through the BPF interpreter, the
+  kernel-row and gap classification, the Landlock rights per ABI, and the
+  hugetlbfs magic) run in `check`.
 - **Fixture roots** (PR 2). Every host test runs in a full sandbox on a
   fixture root under `CARGO_TARGET_TMPDIR`: a base layer with the mount
   points, the host's `/usr` (and `bin`, `lib`, `lib64`, `sbin` as the
@@ -261,18 +335,26 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   `/workspace`, a tmpfs `/tmp`, `/proc` and `/dev`; `etc/ld.so.cache` is
   copied from the host for the dynamic loader. The unit tests use a root
   next to the test binary with one mount of every kind, so a fault at
-  every step is reached.
-- **One integration test target**, `tests/boneli_sys_tests/`, so that the
-  binaries that need user namespaces are exactly two: `boneli_sys-<hash>`
-  (unit tests) and `boneli_sys_tests-<hash>`. Host tests re-execute their
-  own binary inside the sandbox as a probe (`--exact probe --nocapture`,
-  `BONELI_SYS_PROBE=<action>`), which prints `key=value` lines.
+  every step is reached. Two kinds of host test run the probe on the host
+  instead (`run_probe_host`): the baseline of the kernel rows (D2) and
+  the Landlock rows (D10), which restrict the calling process.
+- **One integration test target that needs user namespaces**,
+  `tests/boneli_sys_tests/`, so that the binaries that do are exactly
+  two: `boneli_sys-<hash>` (unit tests) and `boneli_sys_tests-<hash>`.
+  Since ADR-015 D10 the crate has a second integration target,
+  `tests/exit_main_thread.rs` (`harness = false`), which creates no
+  namespace and stays outside the AppArmor profile. Host tests
+  re-execute their own binary inside the sandbox as a probe (`--exact
+  probe --nocapture`, `BONELI_SYS_PROBE=<action>`), which prints
+  `key=value` lines.
 - **Running.** `cargo test -p boneli-sys -- --ignored` never skips: a
   missing feature fails with the probe's message. The only leniencies are
   visible: `BONELI_SYS_HOST_GAPS` (set in the workflow file, so reviewed;
-  exact per host; empty until PR 4), Landlock rows above the kernel's ABI
-  (PR 4), and `Unproven` census entries (PR 4), all printed outside
-  libtest's capture.
+  exact per host, and an id outside the known set fails: `syslog` and
+  `shmget-hugetlb` for kernel rows a host cannot observe, D2, and
+  `hugetlbfs-mount` for a host without a hugetlbfs, D7), Landlock rows
+  above the kernel's ABI (D10), and `Unproven` census entries (PR 5), all
+  printed outside libtest's capture.
 - **CI.** The job `sandbox` runs on `ubuntu-latest` (x86_64) and
   `ubuntu-24.04-arm` (aarch64, the only runtime check of the aarch64
   tables). It first runs the probe test on the stock runner with
@@ -288,9 +370,11 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
 - **AppArmor.** Ubuntu 23.10 and newer restrict unprivileged user
   namespaces through AppArmor. Instead of switching the restriction off
   for the whole host (the sysctl), the host-setup block loads a profile
-  that allows `userns` only for the two test binaries,
-  `$TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out}/boneli_sys{,_tests}-[0-9a-f]*`,
-  unconfined otherwise. The two alternatives are cargo's two layouts:
+  that allows `userns` only for the two test binaries, and since ADR-009
+  for boneli-oci's two as well,
+  `$TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out,build/boneli-oci/[0-9a-f]*/out}/boneli_{sys,oci}{,_tests}-[0-9a-f]*`
+  (the block in `CLAUDE.md` is the source),
+  unconfined otherwise. The alternatives are cargo's two layouts:
   `deps/` before cargo 1.100, and `build/<package>/<hash>/out/` since
   (measured: the CI runners' cargo 1.100 put the test binaries there,
   and the first CI run failed on a profile that named only `deps/`).
@@ -415,7 +499,9 @@ no `allow` attribute, so `forbid` costs nothing. Its lints:
   aborts it mid-setup without a report (the workspace has it at `deny`;
   here it is `forbid` like the rest).
 
-The checker stays Python per ADR-001 D4 (its Rust port is #35).
+The checker was Python per ADR-001 D4 when this rule landed; since
+ADR-015 it is Rust (`crates/boneli-arch-check`), and `sys-lints` was
+ported unchanged.
 
 ### D7. Namespaces, mounts and the brokers
 
@@ -488,6 +574,16 @@ configured. Targets must exist in the root: the image or the top layer
   a read-only bind of `/dev/shm` keeps its `nosuid,nodev`). The fallback
   the plan kept for a refused `mount_setattr` on a detached tree is not
   needed: it works in a user namespace (measured).
+- **No source on hugetlbfs** (PR 4). A file on hugetlbfs maps huge pages
+  without any flag the seccomp rows of D2 see, so the parent `statfs`es
+  every bind source, every root layer and every directory of a writable
+  overlay at spawn, and an `f_type` of `HUGETLBFS_MAGIC` (0x958458f6;
+  `/dev/hugepages` on the dev host, measured) is
+  `Error::HugetlbfsSource { path }` before the clone
+  (`hugetlbfs_source_refused`; a tmpfs source passes). Binds are not
+  recursive, so a source's own filesystem is the only one that enters
+  the tree. A path `statfs` cannot reach is left to the child, which
+  fails on it with its index.
 - `Tmpfs { target, size_bytes, mode }`: `nosuid,nodev`. Exec stays
   allowed on tmpfs, overlay and bind mounts, because test runners
   execute from `/tmp` and `/workspace`.
@@ -664,8 +760,9 @@ of D7):
   `limit_files_render_and_read_back`). Huge pages are charged to `memory.max`
   only when cgroup2 is mounted with `memory_hugetlb_accounting` (Linux
   6.6, off by default), which the arm64 CI runner lacks (measured; the dev
-  host and the x86_64 runner have it), so PR 4's seccomp rows refuse
-  `MAP_HUGETLB`, `SHM_HUGETLB` and `MFD_HUGETLB`.
+  host and the x86_64 runner have it), so the seccomp rows of D2 refuse
+  `MAP_HUGETLB`, `SHM_HUGETLB` and `MFD_HUGETLB`, and `spawn` refuses a
+  source on hugetlbfs (D7).
 - `memory_swap_max` any value, 0 for no swap; also rounded down to a page
   (measured).
 - `pids_max` at least 1: the kernel accepts 0 (measured), which leaves the
@@ -801,11 +898,12 @@ user the inside id maps to (the runner created them), so a writable view
 would let the sandbox raise its own limits; through the read-only mount,
 writing `memory.max`, `pids.max` or `cgroup.kill` gives EROFS for inside
 ids 0 and 999 (`sandbox_cannot_touch_own_limits`). A read-only cgroup2
-mount works in a user namespace (measured). Until PR 4 drops the
-capabilities (D9), inside id 0 can mount a writable cgroup2 of its own,
-and can remount the `Mount::Cgroup2` view read-write (it lives in the
+mount works in a user namespace (measured). Before the privilege drop of
+D9 (PR 4), inside id 0 could mount a writable cgroup2 of its own, and
+could remount the `Mount::Cgroup2` view read-write (it lives in the
 sandbox's own mount namespace, so no flag is locked; review of PR 3,
-measured). Two kernel-enforced layers sit under the read-only view, both
+measured). Since D9 every such attempt fails with EPERM for inside ids 0
+and 999 (`cgroup_view_stays_read_only`, below). Two kernel-enforced layers sit under the read-only view, both
 added in the review round of PR 3:
 
 - **`nsdelegate` is required** (`Features::probe`, id
@@ -832,12 +930,29 @@ added in the review round of PR 3:
   and `cgroup.max.depth` 0 and reads them back. `nsdelegate` does not stop
   `mkdir` (delegation is its purpose), and a sub-cgroup the sandbox made
   kept `destroy` from removing the cgroup (EBUSY, review of PR 3). With
-  both at 0, `mkdir` inside fails with EAGAIN, and raising
-  `cgroup.max.descendants` from inside fails with EPERM, because it is not
-  a delegatable file (`sandbox_cannot_create_sub_cgroups`, measured).
+  both at 0, `mkdir` inside failed with EAGAIN, and raising
+  `cgroup.max.descendants` from inside failed with EPERM, because it is
+  not a delegatable file (measured in PR 3 through inside id 0's own
+  cgroup2 mount). The limit holds for the cgroup's owner too: since PR 4
+  `sandbox_cannot_create_sub_cgroups` runs the `mkdir` as the test
+  process, which owns the cgroup and sits outside its namespace, and gets
+  EAGAIN.
 
-PR 4's capability drop then removes the mount and the remount
-themselves.
+The capability drop of D9 (PR 4) removes the mount and the remount
+themselves: `cgroup_view_stays_read_only` tries, for inside ids 0 and
+999, a remount of the view per mount (`MS_REMOUNT | MS_BIND`) and per
+superblock, `mount_setattr` clearing `MOUNT_ATTR_RDONLY`, and a cgroup2
+of its own through `mount(2)` and through `fsopen`; each gives EPERM
+from the missing `CAP_SYS_ADMIN` alone (Linux 7.2: `path_mount()`,
+`wants_mount_setattr()` and the `fsopen` syscall each return EPERM when
+`may_mount()` fails), and `fchmodat` of `cgroup.kill` through the view
+gives EROFS (`chmod_common()` takes `mnt_want_write()` first), with the
+mode unchanged on the host. The two kernel layers above stay as defense
+in depth. Weak spot: nsdelegate's refusal to raise
+`cgroup.max.descendants` at a cgroup namespace root has no per-run test
+any more, because nothing in the sandbox can hold `CAP_SYS_ADMIN` in a
+user namespace (no capabilities, `CLONE_NEWUSER` denied);
+`parent_requires_nsdelegate` still proves the option is present.
 
 **Destroying.** `Cgroup::destroy` writes `cgroup.kill` (Linux 5.14,
 below the floor of D3), then lifts the throttles that can hold a killed
@@ -903,15 +1018,16 @@ anyway, so the surviving workload ran without its CPU limit (about
 then left behind. Now a failed kill keeps every limit, skips the wait
 (nothing would empty the cgroup), still tries the removal, and returns
 `CgroupTeardown` with the cgroup recorded as left behind
-(`failed_kill_keeps_limits`). **The kill cannot be blocked from inside:**
-until PR 4 drops the capabilities, inside id 0 can mount a cgroup2 of its
-own and `chmod 444` its `cgroup.kill`, and a write that opens the file by
-name then fails with EACCES (measured). `create` therefore opens
+(`failed_kill_keeps_limits`). **The kill cannot be blocked:** before the
+privilege drop of D9 (PR 4), inside id 0 could mount a cgroup2 of its own
+and `chmod 444` its `cgroup.kill`, and a write that opens the file by
+name then fails with EACCES (measured in PR 3); the file's owner, the
+runner's user, can still do the same from the host side. `create` therefore opens
 `cgroup.kill` (write) and `cgroup.events` (read) once the limits are in
 place and before any task can enter, and teardown uses those descriptors:
 cgroupfs checks permission at open, not at each write, so a write through
 the held descriptor still kills after the mode change (measured;
-`kill_survives_chmod_from_inside`), and no `fchmodat` back is needed. The wait polls `cgroup.events` for `POLLPRI`
+`kill_survives_chmod`, which since PR 4 sets the mode as the owner), and no `fchmodat` back is needed. The wait polls `cgroup.events` for `POLLPRI`
 and re-reads it at least every 100 ms in case a notification is missed;
 10 s is a hang bound, not a target (`destroy_kills_all_and_removes`
 measured about 3 ms for three sleepers). A killed child that its `Child`
@@ -1440,6 +1556,127 @@ first missing controller in the probe's order, where the plan's example
 named `memory`; `block_device_of` finds the mount by its id and parses
 mountinfo as bytes.
 
+### D9. No capabilities, `no_new_privs`, the filter last
+
+Added by PR 4 of #6; measurements on the dev host on 2026-11-27 unless
+they name CI.
+
+A process in a new user namespace holds every capability in it, and with
+inside id 0 an `execve` would grant them again. The child therefore drops
+everything after `close_range` and before `execve`, in this order (each a
+`Step` with its own report code; `privileges::drop_all`):
+
+1. `Securebits`: `PR_SET_SECUREBITS` to 0xEF (239), the sum of `NOROOT`
+   (1), so uid 0 gains no capabilities at `execve`, and its lock (2);
+   `NO_SETUID_FIXUP` (4) and its lock (8); the lock of `KEEP_CAPS` (32)
+   with `KEEP_CAPS` itself off; `NO_CAP_AMBIENT_RAISE` (64) and its lock
+   (128). Every bit the workload could clear is locked, so
+   `PR_SET_SECUREBITS(0)` inside gives EPERM and `PR_GET_SECUREBITS`
+   reads 239 (`securebits_locked`, inside ids 0 and 999). It runs first
+   because it needs `CAP_SETPCAP`, which step 4 removes.
+2. `CapBoundingSet`: `PR_CAPBSET_DROP` of every capability from 0 to
+   `cap_last_cap`; the item of a failure is the capability number. The
+   parent reads `/proc/sys/kernel/cap_last_cap` at spawn (40 on the dev
+   host and both CI legs), so a newer kernel's capabilities are dropped
+   too; a value that does not read, or is not a decimal of at most 63 (the
+   bounding set is 64 bits wide), is `Error::CapLastCap` before the
+   clone. Dropping also needs `CAP_SETPCAP`. With an empty bounding set
+   no `execve` can raise a permitted capability, not even uid 0's
+   without `NOROOT` (`P' = fP & bset`), so steps 1 and 2 are two layers
+   for the same root case.
+3. `CapAmbient`: `PR_CAP_AMBIENT_CLEAR_ALL`.
+4. `Capset`: `capset` version 3 (`_LINUX_CAPABILITY_VERSION_3`, two data
+   elements, local in `ffi`) with empty effective, permitted and
+   inheritable sets.
+5. `NoNewPrivs`: `PR_SET_NO_NEW_PRIVS`. Without capabilities the kernel
+   accepts a seccomp filter only with it, and it keeps setuid bits and
+   file capabilities from granting anything at `execve`.
+6. `Seccomp`: the program of D2, assembled in the parent before the
+   clone, through `seccomp(SECCOMP_SET_MODE_FILTER)`. Last, so that only
+   `execve` (which the policy allows) runs under it before the program.
+
+Everything these steps need is prepared before the clone (the number and
+the assembled program), so they keep D4's rule: no allocation, no lock.
+
+**Measured inside**, for inside ids 0 and 999 (`privileges_all_dropped`):
+`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` all
+`0000000000000000`, `NoNewPrivs` 1, `Seccomp` 2 and `Seccomp_filters` 1.
+Inside id 0 re-executing the probe keeps all five sets empty, with
+`NoNewPrivs` 1 and `Seccomp` 2 (`root_inside_gains_nothing_on_exec`).
+
+**Consequences.** Capability-gated calls fail inside (the census of PR 5
+proves each one), among them every `mount`: the read-only cgroup2 view of
+D8 can no longer be remounted or replaced (`cgroup_view_stays_read_only`).
+Two PR 3 tests that used inside id 0's capabilities make that step on the
+host side now (`sandbox_cannot_create_sub_cgroups`, `kill_survives_chmod`,
+D8). Unaffected: `other_ids_unusable` (unmapped ids fail with EINVAL
+before any capability check, D1), `supplementary_groups_stay_unmapped`
+(its EPERM comes from `setgroups deny`) and
+`sandbox_cannot_touch_own_limits` (EROFS from the read-only view). A
+workload that binds a port below 1024 needs `CAP_NET_BIND_SERVICE` in the
+network namespace's user namespace, which it no longer has, so it gets
+EACCES (the kernel's bind check; not measured here); #8 decides whether a pod needs
+`net.ipv4.ip_unprivileged_port_start` lowered inside its network
+namespace before the drop. The drop and the filter apply to every
+`spawn`, including boneli-oci's sandbox runs (ADR-009): `node:22` as
+inside id 0 and `postgres:17` as 999 start under them in the
+`oci-acceptance` runs.
+
+### D10. Landlock
+
+Added by PR 4 of #6; measurements on the dev host (Landlock ABI 10) on
+2026-11-27 unless they name CI.
+
+`boneli-sys` offers Landlock as an in-process API (`Ruleset`) for the
+calling process, not as a `spawn` step: Landlock restricts the calling
+thread and what it starts later, and the useful rules name paths inside
+the sandbox's root and the shim's own relay, which only the shim (#9)
+knows. The shim applies it to itself as PID 1 before the agent starts.
+
+- **ABI.** `Abi::current()` asks the kernel
+  (`LANDLOCK_CREATE_RULESET_VERSION`); EOPNOTSUPP (built, not enabled) and
+  ENOSYS (not built) are `Error::LandlockUnavailable`. ABI 2 is the
+  minimum (D3: ABI 1 denies every rename or link into another directory),
+  so ABI 1 is `Error::LandlockAbiTooOld { found, required: 2 }`. ABIs
+  above 10, the newest the 7.2.4 headers describe, are treated as 10:
+  rights only grow, and the API knows only the bits of those headers.
+- **Rights per ABI** (`AccessFs`, `AccessNet`, `Scope`, each with
+  `all_for(abi)`; `access_sets_per_abi`): filesystem bits 0-12 from ABI 1
+  (0x1FFF), `REFER` 13 from ABI 2 (0x3FFF), `TRUNCATE` 14 from ABI 3
+  (0x7FFF), `IOCTL_DEV` 15 from ABI 5 (0xFFFF), `RESOLVE_UNIX` 16 from
+  ABI 9 (0x1FFFF); TCP bind and connect from ABI 4 (0x3), UDP bind and
+  connect-or-send from ABI 10 (0xF); the abstract Unix socket and signal
+  scopes from ABI 6 (0x3).
+- **Fail closed, never best effort.** `Ruleset::new` refuses a handled
+  right the ABI does not know (`Error::LandlockUnsupported { right, abi
+  }`), so a ruleset never silently handles less than its caller wrote;
+  `allow_path` and `allow_port` refuse a right outside the ruleset's
+  handled set and an empty rule (`Error::LandlockRuleNotHandled`;
+  `ruleset_fails_closed`). `restrict_self` sets `PR_SET_NO_NEW_PRIVS`
+  first, which Landlock requires without `CAP_SYS_ADMIN`.
+- **What the shim's ruleset must allow.** A ruleset that handles
+  `RESOLVE_UNIX` (ABI 9 and newer) must allow it beneath the egress
+  socket's path, because that socket is created outside the domain
+  (ADR-006, D7's broker bind); one that handles TCP must allow the
+  relay's loopback port.
+
+**Measured** (`landlock_rights_hold`, a probe on the host that restricts
+itself with every filesystem, network and scope right of its ABI
+handled, read and execute allowed beneath `R`, everything beneath `W`):
+read in `R` works; write in `R` and read outside both give EACCES;
+create in `W` works; a rename within `W` across directories works (ABI
+2); a rename from `R` into `W` gives EACCES, because `R` lacks
+`REMOVE_FILE`, which the kernel checks before `REFER` (otherwise it would
+be EXDEV); truncate in `R` gives EACCES (ABI 3); executing a program
+outside `R` gives EACCES; a TCP connect to a loopback port without a rule
+gives EACCES and to the allowed one works (ABI 4); `kill(parent, 0)` and
+a connect to an abstract socket created outside give EPERM (ABI 6); a
+connect to a pathname socket created outside gives EACCES, and to the
+same kind of socket beneath a path allowed with `RESOLVE_UNIX` works
+(ABI 9); `NoNewPrivs` is 1 after `restrict_self`. Rows above the host's
+ABI print `n/a (ABI <n>)` outside libtest's capture, so CI's kernels run
+what they have and the dev host runs every row.
+
 ## Consequences
 
 - `boneli-sys` depends on `libc` only (the edge `boneli-sys -> libc` is
@@ -1459,6 +1696,13 @@ mountinfo as bytes.
   reading that sandbox's `memory.stat` every 5 ms, and a buffered writer
   is held, not OOM-killed, only at `memory.max` 64 MiB and above (D8,
   "Buffered writes and the statistics keeper").
+- Every sandbox runs without any capability, with `no_new_privs`, locked
+  securebits and the seccomp policy of D2 (D9): capability-gated calls,
+  mounts included, fail inside, and a port below 1024 cannot be bound.
+- `spawn` refuses a host source on hugetlbfs (D7), and the policy refuses
+  the three huge page flags (D2).
+- Landlock is an API the shim applies to itself (D10); a host below ABI 2
+  is refused (D3).
 - One id inside: images that switch users fail, and the runner must be a
   dedicated user without privileged supplementary groups.
 - The host-setup block runs with root, on CI and on user hosts. It is
@@ -1483,7 +1727,7 @@ mountinfo as bytes.
   new syscall a libc or runtime adopts, and Docker's own allowlist
   already lags the kernel (its last sync is "profiles/seccomp: kernel
   v6.13"); the ENOSYS ceiling gives the same fail-closed behavior for
-  unknown calls, and the census (PR 4) reviews every known one.
+  unknown calls, and the census (PR 5) reviews every known one.
 - **Switching the AppArmor restriction off host-wide**
   (`kernel.apparmor_restrict_unprivileged_userns=0`). Simpler, but it
   lifts the restriction for every program on the host; the narrow profile
@@ -1493,5 +1737,7 @@ mountinfo as bytes.
 - **A floor of 5.15 (Ubuntu 22.04 GA)** with Landlock ABI 1. ABI 1 denies
   cross-directory renames and links, which git and npm need.
 - **One PR for all of #6.** This crate is the security boundary, and #28
-  took four review rounds on one surface; four PRs keep each review
-  bounded.
+  took four review rounds on one surface; five PRs keep each review
+  bounded (the operator split PR 4 from the census before it started:
+  the BPF and privilege code and the 385 census verdicts are separate
+  review surfaces).

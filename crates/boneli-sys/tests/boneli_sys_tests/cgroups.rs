@@ -3369,28 +3369,37 @@ fn destroy_lifts_cpu_throttle() {
 #[test]
 #[ignore = "host: cgroup v2 delegation with nsdelegate, user namespaces"]
 fn sandbox_cannot_create_sub_cgroups() {
-    // Review of PR 3: inside id 0 can mount a cgroup2 of its own (until
-    // PR 4 of #6 drops the capability) and create a sub-cgroup, which
-    // would make destroy fail with EBUSY. cgroup.max.descendants and
-    // cgroup.max.depth are 0, and nsdelegate keeps the sandbox from
-    // raising them again.
+    // Review of PR 3: a sub-cgroup would make destroy fail with EBUSY.
+    // cgroup.max.descendants and cgroup.max.depth are 0, and they hold for
+    // the cgroup's owner too: the test process, which owns it and sits
+    // outside its namespace, gets EAGAIN from mkdir. Nothing in the
+    // sandbox can mount a cgroup2 to try it from inside (no capabilities,
+    // ADR-007 D9; cgroup_view_stays_read_only).
     let cg = cgroup::sandbox("no-sub");
     assert_eq!(read(&cg, "cgroup.max.descendants").trim(), "0");
     assert_eq!(read(&cg, "cgroup.max.depth").trim(), "0");
     let fixture = Fixture::new("no-sub");
-    let p = run_probe_in("cgroup-mkdir", ids(0, 0), &[], fixture.root(), &cg);
-    p.assert_ok();
-    assert_eq!(p.get("mount_errno"), "0", "{}", p.raw);
+    // A sleeper inside, so the cgroup is populated while the owner tries.
+    let s = spec(fixture.root(), &cg, "/usr/bin/sleep", &["30"]);
+    let mut child = spawn(&s).expect("spawn a sleeper");
+    drop(s);
+    let sub = cg.path().join("sub");
+    let made = std::fs::create_dir(&sub);
+    if made.is_ok() {
+        let _ = std::fs::remove_dir(&sub);
+    }
     assert_eq!(
-        p.get("mkdir_errno"),
-        libc::EAGAIN.to_string(),
-        "a sub-cgroup was created: {}",
-        p.raw
+        made.as_ref().map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EAGAIN)),
+        "the owner created a sub-cgroup: {made:?}"
     );
-    assert_eq!(p.get("raise_errno"), libc::EPERM.to_string(), "{}", p.raw);
     assert_eq!(read(&cg, "cgroup.max.descendants").trim(), "0");
     let path = cg.path().to_path_buf();
     cg.destroy().expect("destroy");
+    assert_eq!(
+        wait_bounded(&mut child, Duration::from_secs(10)),
+        ExitStatus::Signaled(libc::SIGKILL)
+    );
     assert!(!path.exists());
 }
 
@@ -3536,57 +3545,43 @@ fn destroy_failure_is_recorded_with_path() {
 
 #[test]
 #[ignore = "host: cgroup v2 delegation, user namespaces"]
-fn kill_survives_chmod_from_inside() {
-    // Review round 3 of PR 3: inside id 0 mounts its own cgroup2 and makes
-    // cgroup.kill read-only. The kill goes through the descriptor create
-    // held open, so destroy still kills the workload and removes the
-    // cgroup.
+fn kill_survives_chmod() {
+    // Review round 3 of PR 3: cgroup.kill made read-only after create must
+    // not stop destroy. The sandbox cannot mount a cgroup2 to do it
+    // (ADR-007 D9, cgroup_view_stays_read_only), so the test process,
+    // which owns the file, sets mode 0444 itself while the workload
+    // sleeps; the kill goes through the
+    // descriptor create held open, so destroy still kills the workload and
+    // removes the cgroup.
     let cg = cgroup::sandbox("chmod-kill");
     let fixture = Fixture::new("chmod-kill");
-    let mut s = spec(
-        fixture.root(),
-        &cg,
-        crate::support::rootfs::PROBE,
-        &["--exact", "probe", "--nocapture", "--quiet"],
-    );
-    s.env = [
-        (support::probe::ACTION_VAR, "chmod-kill"),
-        ("BONELI_PROBE_FILE", "/workspace/out"),
-    ]
-    .iter()
-    .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-    .collect();
-    let mut child = spawn(&s).expect("spawn the probe");
+    let s = spec(fixture.root(), &cg, "/usr/bin/sleep", &["30"]);
+    let mut child = spawn(&s).expect("spawn a sleeper");
     drop(s);
-    let out_file = fixture.workspace.join("out");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let out = loop {
-        let text = std::fs::read_to_string(&out_file).unwrap_or_default();
-        if text.contains("done") || Instant::now() > deadline {
-            break text;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(
-        out.trim(),
-        "mount=0 chmod=0 done",
-        "the probe did not chmod"
-    );
     let path = cg.path().to_path_buf();
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path.join("cgroup.kill"))
-            .expect("stat cgroup.kill")
-            .permissions()
-            .mode()
-            & 0o777
-    };
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        path.join("cgroup.kill"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .expect("chmod 0444 cgroup.kill as its owner");
+    let mode = std::fs::metadata(path.join("cgroup.kill"))
+        .expect("stat cgroup.kill")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o444, "cgroup.kill is read-only now");
+    // A write by name fails now, so only the held descriptor can kill.
+    let by_name = std::fs::write(path.join("cgroup.kill"), "1");
+    assert_eq!(
+        by_name.as_ref().map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EACCES)),
+        "{by_name:?}"
+    );
     let result = cg.destroy();
     let left = path.exists();
     if left {
         // Clean up before waiting, so a failure here leaves nothing running.
-        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(
             path.join("cgroup.kill"),
             std::fs::Permissions::from_mode(0o644),
@@ -3601,4 +3596,71 @@ fn kill_survives_chmod_from_inside() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
     assert!(!left, "{} left behind", path.display());
+}
+
+#[test]
+#[ignore = "host: cgroup v2 delegation, user namespaces"]
+fn cgroup_view_stays_read_only() {
+    // The inside attempts that the PR 3 tests made with inside id 0's
+    // capabilities (sandbox_cannot_create_sub_cgroups,
+    // kill_survives_chmod): since the privilege drop (ADR-007, D9) every
+    // way to get a writable cgroup2 is refused by the missing
+    // CAP_SYS_ADMIN alone. Seccomp has no mount row and Landlock is not
+    // applied here. The functions are Linux 7.2's:
+    // - mount(2), both remounts and the new cgroup2: path_mount() returns
+    //   EPERM when may_mount() fails (fs/namespace.c);
+    // - mount_setattr: wants_mount_setattr() checks may_mount() before it
+    //   reads the attribute (fs/namespace.c);
+    // - fsopen: its syscall checks may_mount() first (fs/fsopen.c);
+    // - fchmodat of cgroup.kill: chmod_common() takes mnt_want_write()
+    //   before any owner check, so the read-only view gives EROFS
+    //   (fs/open.c). That case is an `Own` call, not a capability one.
+    // A different errno fails the case instead of widening it.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |cg: &Cgroup| {
+        std::fs::metadata(cg.path().join("cgroup.kill"))
+            .expect("stat cgroup.kill")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    for id in [0, 999] {
+        let cg = cgroup::sandbox("view");
+        let fixture = Fixture::new("view");
+        let before = mode(&cg);
+        let p = run_probe_in(
+            "cgroup-view",
+            ids(id, id),
+            &[],
+            root_with_cgroup(&fixture),
+            &cg,
+        );
+        p.assert_ok();
+        for key in [
+            "remount_bind",
+            "remount_sb",
+            "mount_setattr",
+            "mount_cgroup2",
+            "fsopen",
+        ] {
+            assert_eq!(
+                p.get(key),
+                libc::EPERM.to_string(),
+                "inside id {id}, {key}: {}",
+                p.raw
+            );
+        }
+        assert_eq!(
+            p.get("chmod_kill"),
+            libc::EROFS.to_string(),
+            "inside id {id}: {}",
+            p.raw
+        );
+        assert_eq!(
+            mode(&cg),
+            before,
+            "inside id {id} changed cgroup.kill's mode"
+        );
+        cg.destroy().expect("destroy");
+    }
 }
