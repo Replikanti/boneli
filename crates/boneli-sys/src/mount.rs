@@ -173,7 +173,9 @@ pub enum Mount {
         /// Where it appears.
         target: InsidePath,
     },
-    /// A procfs of the sandbox's PID namespace, `nosuid,nodev,noexec`.
+    /// A procfs of the sandbox's PID namespace, `nosuid,nodev,noexec`, with
+    /// `keys` and `key-users` covered by the host's `/dev/null` (ADR-007,
+    /// D7).
     Proc {
         /// Where it appears, normally `/proc`.
         target: InsidePath,
@@ -415,6 +417,50 @@ fn validate_root(root: &Root) -> Result<()> {
                     return Err(bad("shm size 0 means unlimited; give a size"));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a `statfs` `f_type` is hugetlbfs.
+pub(crate) fn is_hugetlbfs(f_type: u64) -> bool {
+    f_type == u64::from(ffi::HUGETLBFS_MAGIC)
+}
+
+/// Refuses a root whose host sources are on hugetlbfs: every bind source,
+/// every root layer and every directory of a writable overlay
+/// ([`Error::HugetlbfsSource`]). A file there maps huge pages without any
+/// flag the seccomp rows see, past `memory.max` on a host without
+/// `memory_hugetlb_accounting` (ADR-007, D2 and D7). Binds are not
+/// recursive, so a source's own file system is the only one that enters
+/// the tree. A path `statfs` cannot reach is left to the child, which
+/// opens it without following symlinks and fails with its index.
+pub(crate) fn refuse_hugetlbfs(root: &Root) -> Result<()> {
+    let mut sources: Vec<&Path> = root.layers.iter().map(PathBuf::as_path).collect();
+    for mount in &root.mounts {
+        match mount {
+            Mount::Bind { source, .. } => sources.push(source),
+            Mount::Overlay {
+                lower, upper, work, ..
+            } => sources.extend([lower.as_path(), upper, work]),
+            Mount::Tmpfs { .. }
+            | Mount::Proc { .. }
+            | Mount::Dev { .. }
+            | Mount::Cgroup2 { .. } => {}
+        }
+    }
+    for path in sources {
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+            // plan() rejects the NUL with the mount's index.
+            continue;
+        };
+        // SAFETY: an all-zero statfs is valid storage for statfs to fill.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: c is NUL-terminated and st is valid storage.
+        if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && is_hugetlbfs(st.f_type as u64) {
+            return Err(Error::HugetlbfsSource {
+                path: path.to_path_buf(),
+            });
         }
     }
     Ok(())
@@ -973,6 +1019,42 @@ fn dev(root: &Fd, index: u32, rel: &CStr, shm_data: &CStr, fault: Fault) -> Resu
     step(add_attrs(&dir, ffi::MOUNT_ATTR_RDONLY), Step::Dev, index)
 }
 
+/// The files of a new procfs that the host's `/dev/null` covers, read-only:
+/// `/proc/keys` and `/proc/key-users` list the keys and the key quota of
+/// every user the sandbox's user namespace maps, so the runner's, because
+/// the keyring is not namespaced (ADR-007, D2 and D7).
+const PROC_MASKED: [&CStr; 2] = [c"keys", c"key-users"];
+
+/// Binds the host's `/dev/null` over each of [`PROC_MASKED`] in the procfs
+/// just mounted at `rel`, as the devices of [`dev`] are bound.
+fn mask_proc(root: &Fd, rel: &CStr, index: u32) -> Result2<()> {
+    // The target again: now the root of the new procfs.
+    let dir = step(open_beneath(root.0, rel), Step::Proc, index)?;
+    let null = step(open_host(c"/dev/null"), Step::Proc, index)?;
+    for name in PROC_MASKED {
+        let file = step(
+            openat2(
+                dir.0,
+                name,
+                libc::O_PATH,
+                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS,
+            ),
+            Step::Proc,
+            index,
+        )?;
+        step(
+            bind(
+                &null,
+                &file,
+                ffi::MOUNT_ATTR_RDONLY | ffi::MOUNT_ATTR_NOSUID | ffi::MOUNT_ATTR_NOEXEC,
+            ),
+            Step::Proc,
+            index,
+        )?;
+    }
+    Ok(())
+}
+
 fn pivot(root: &Fd, cwd: &CStr, fault: Fault) -> Result2<()> {
     inject(fault, Step::Pivot)?;
     let check = |rc: c_int, item: u32| {
@@ -1176,6 +1258,7 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                             Step::Proc,
                             *index,
                         )?;
+                        mask_proc(new_root, rel, *index)?;
                     }
                     Op::Dev {
                         index,
@@ -1228,6 +1311,24 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hugetlbfs_magic_detected() {
+        // HUGETLBFS_MAGIC, include/uapi/linux/magic.h.
+        assert!(is_hugetlbfs(0x9584_58f6));
+        // tmpfs, ext4, overlayfs, cgroup2, btrfs, and the magic with a bit
+        // above the low word.
+        for other in [
+            0x0102_1994u64,
+            0xEF53,
+            0x794C_7630,
+            0x6367_7270,
+            0x9123_683E,
+            0x1_9584_58f6,
+        ] {
+            assert!(!is_hugetlbfs(other), "{other:#x}");
+        }
+    }
 
     fn p(s: &str) -> InsidePath {
         InsidePath::new(s).expect("valid inside path")

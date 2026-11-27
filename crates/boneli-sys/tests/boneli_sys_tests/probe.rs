@@ -7,7 +7,7 @@ use std::process::Command;
 
 use boneli_sys::{Features, MissingId};
 
-use crate::support::{self, Output, TempDir, parse_probe, report};
+use crate::support::{self, Output, TempDir, parse_probe, report, run_probe_host};
 
 /// The ids the host is expected to lack, from `BONELI_SYS_EXPECT_MISSING`.
 fn expected_missing() -> BTreeSet<MissingId> {
@@ -40,6 +40,28 @@ fn reports_expected_missing() {
     assert_eq!(
         got, want,
         "Features::probe reported {got:?}, BONELI_SYS_EXPECT_MISSING says {want:?}"
+    );
+}
+
+#[test]
+#[ignore = "host: user namespaces, cgroup v2 delegation, Linux 5.19"]
+fn refuses_host_without_keyrings() {
+    // A kernel without CONFIG_KEYS, as the probe sees it: keyctl gives
+    // ENOSYS (a filter of the probe process's own). The host is refused up
+    // front instead of failing every spawn at the keyring join (ADR-007,
+    // D3).
+    let p = run_probe_host("features-no-keyrings", &[]);
+    p.assert_ok();
+    assert!(
+        p.get("missing").split(',').any(|id| id == "keyrings"),
+        "keyrings not reported: {}",
+        p.raw
+    );
+    assert_eq!(
+        p.get("keyrings"),
+        format!("keyctl:{}", libc::ENOSYS),
+        "{}",
+        p.raw
     );
 }
 
@@ -113,14 +135,28 @@ fn apparmor_profile_is_narrow() {
 #[test]
 #[ignore = "host: names the host's unobservable rows"]
 fn host_gaps_are_known() {
-    // Ids of rows a host may be unable to observe. None exist before the
-    // seccomp rows land (PR 4 of #6), so any value is a mistake.
-    const KNOWN: &[&str] = &[];
-    let raw = std::env::var("BONELI_SYS_HOST_GAPS").unwrap_or_default();
-    for id in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        assert!(
-            KNOWN.contains(&id),
-            "BONELI_SYS_HOST_GAPS names an unknown row {id:?}"
-        );
+    // Exact: every listed id is known (support::KNOWN_GAPS), and the tests
+    // that use one fail when a listed gap turns out observable
+    // (seccomp::seccomp_rows, mounts::hugetlbfs_source_refused).
+    let gaps = support::host_gaps();
+    report(&format!("host gaps: {gaps:?}"));
+}
+
+#[test]
+fn gap_ids_are_exact() {
+    let all = support::parse_gaps(
+        " syslog,shmget-hugetlb , hugetlbfs-mount,ioctl-siocgifbr,socket-inet-packet",
+    )
+    .expect("known ids");
+    assert_eq!(all.len(), 5);
+    assert_eq!(support::parse_gaps("").expect("empty"), Default::default());
+    for bad in [
+        "bogus",
+        "syslog,bogus",
+        "nosys-read",
+        "SYSLOG",
+        "io-uring-setup",
+    ] {
+        assert!(support::parse_gaps(bad).is_err(), "{bad:?} was accepted");
     }
 }

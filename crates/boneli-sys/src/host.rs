@@ -50,13 +50,15 @@ pub enum MissingId {
     LandlockUnavailable,
     /// `landlock-abi`
     LandlockAbi,
+    /// `keyrings`
+    Keyrings,
     /// `probe-failed`
     ProbeFailed,
 }
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 14] = [
+    pub const ALL: [MissingId; 15] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
@@ -70,6 +72,7 @@ impl MissingId {
         MissingId::SeccompFilter,
         MissingId::LandlockUnavailable,
         MissingId::LandlockAbi,
+        MissingId::Keyrings,
         MissingId::ProbeFailed,
     ];
 
@@ -89,6 +92,7 @@ impl MissingId {
             MissingId::SeccompFilter => "seccomp-filter",
             MissingId::LandlockUnavailable => "landlock-unavailable",
             MissingId::LandlockAbi => "landlock-abi",
+            MissingId::Keyrings => "keyrings",
             MissingId::ProbeFailed => "probe-failed",
         }
     }
@@ -177,6 +181,17 @@ pub enum Missing {
         /// The ABI the runtime needs.
         required: u32,
     },
+    /// The kernel keyrings are not usable: built without `CONFIG_KEYS`
+    /// (`keyctl` gives ENOSYS, `/proc/keys` is absent), or `keyctl` is
+    /// filtered by the runner's own seccomp profile. Every spawn joins a
+    /// new session keyring and covers both proc files (ADR-007, D2 and
+    /// D3), so such a host could start no sandbox.
+    Keyrings {
+        /// What failed: `keyctl`, `/proc/keys` or `/proc/key-users`.
+        item: &'static str,
+        /// The errno.
+        errno: i32,
+    },
     /// A probe could not run its test, for a reason that says nothing
     /// about the feature (a resource limit, a failed pipe, a killed or
     /// mis-reporting probe child), so the feature is neither present nor
@@ -210,6 +225,7 @@ impl Missing {
             Missing::SeccompFilter { .. } => MissingId::SeccompFilter,
             Missing::LandlockUnavailable { .. } => MissingId::LandlockUnavailable,
             Missing::LandlockAbi { .. } => MissingId::LandlockAbi,
+            Missing::Keyrings { .. } => MissingId::Keyrings,
             Missing::ProbeFailed { .. } => MissingId::ProbeFailed,
         }
     }
@@ -287,6 +303,12 @@ impl fmt::Display for Missing {
                     "Landlock ABI {found} found, {required} or newer required (Linux 5.19)"
                 )
             }
+            Missing::Keyrings { item, errno } => write!(
+                f,
+                "the kernel keyrings are not usable: {item}: {} (every sandbox joins a new session keyring \
+                 and hides /proc/keys; the kernel needs CONFIG_KEYS, and keyctl must not be filtered)",
+                os(*errno)
+            ),
             Missing::ProbeFailed {
                 probe,
                 stage,
@@ -362,7 +384,8 @@ impl Features {
     /// single id map writes (through `clone3`), `close_range` with
     /// `CLOSE_RANGE_CLOEXEC`, `SECCOMP_RET_KILL_PROCESS`, Landlock ABI 2 or
     /// newer, cgroup v2 at `/sys/fs/cgroup`, and delegation of the caller's
-    /// own cgroup with the cpu, io, memory and pids controllers. Returns
+    /// own cgroup with the cpu, io, memory and pids controllers, and the
+    /// kernel keyrings (`keyctl`, `/proc/keys`, `/proc/key-users`). Returns
     /// every missing feature with its cause. Without `clone3` the user
     /// namespace is not tried.
     pub fn probe() -> std::result::Result<(), Vec<Missing>> {
@@ -371,6 +394,7 @@ impl Features {
         missing.extend(probe_close_range());
         missing.extend(probe_seccomp());
         missing.extend(probe_landlock());
+        missing.extend(probe_keyrings());
         missing.extend(probe_cgroup());
         if missing.is_empty() {
             Ok(())
@@ -609,6 +633,53 @@ fn probe_landlock() -> Option<Missing> {
     })
 }
 
+/// The keyrings the spawn needs (ADR-007, D3): `keyctl` with an operation
+/// no kernel defines, which changes nothing and fails with EOPNOTSUPP where
+/// keyrings exist (ENOSYS without `CONFIG_KEYS`, EPERM under a seccomp
+/// profile that filters it, as the spawn's join would), and the two proc
+/// files the sandbox covers.
+fn probe_keyrings() -> Option<Missing> {
+    const UNKNOWN_OPERATION: libc::c_long = i32::MAX as libc::c_long;
+    // SAFETY: keyctl with an unknown operation reads no argument.
+    let rc = unsafe { libc::syscall(libc::SYS_keyctl, UNKNOWN_OPERATION, 0, 0, 0, 0) };
+    let keyctl = if rc < 0 { errno() } else { 0 };
+    let stat = |path: &str| {
+        std::fs::metadata(path)
+            .err()
+            .map(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    };
+    classify_keyrings(keyctl, stat("/proc/keys"), stat("/proc/key-users"))
+}
+
+/// Names what the keyring probe found (pure, so every branch has a unit
+/// test): the errno of the unknown `keyctl` operation (EOPNOTSUPP where
+/// keyrings work) and of each proc file's `stat`, `None` when it exists.
+pub(crate) fn classify_keyrings(
+    keyctl: i32,
+    keys: Option<i32>,
+    key_users: Option<i32>,
+) -> Option<Missing> {
+    if keyctl != libc::EOPNOTSUPP {
+        // A success would mean the kernel knows the operation: not the
+        // kernel this probe was written for, so fail closed too.
+        let errno = if keyctl == 0 { libc::EINVAL } else { keyctl };
+        return Some(Missing::Keyrings {
+            item: "keyctl",
+            errno,
+        });
+    }
+    if let Some(errno) = keys {
+        return Some(Missing::Keyrings {
+            item: "/proc/keys",
+            errno,
+        });
+    }
+    key_users.map(|errno| Missing::Keyrings {
+        item: "/proc/key-users",
+        errno,
+    })
+}
+
 fn probe_cgroup() -> Vec<Missing> {
     // SAFETY: an all-zero statfs is valid storage for statfs to fill.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -720,6 +791,10 @@ mod tests {
                 found: 1,
                 required: 2,
             },
+            MissingId::Keyrings => Missing::Keyrings {
+                item: "keyctl",
+                errno: libc::ENOSYS,
+            },
             MissingId::ProbeFailed => Missing::ProbeFailed {
                 probe: "seccomp-filter",
                 stage: "clone3",
@@ -756,6 +831,11 @@ mod tests {
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
             "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
             format!(
+                "the kernel keyrings are not usable: keyctl: {} (every sandbox joins a new session keyring \
+                 and hides /proc/keys; the kernel needs CONFIG_KEYS, and keyctl must not be filtered)",
+                e(libc::ENOSYS)
+            ),
+            format!(
                 "the seccomp-filter probe could not run: clone3: {} (says nothing about seccomp-filter; retry once the cause is gone)",
                 e(libc::EAGAIN)
             ),
@@ -774,6 +854,7 @@ mod tests {
             "seccomp-filter",
             "landlock-unavailable",
             "landlock-abi",
+            "keyrings",
             "probe-failed",
         ];
         for (i, id) in MissingId::ALL.into_iter().enumerate() {
@@ -971,6 +1052,54 @@ mod tests {
             exit_detail(ExitStatus::Exited(crate::test_guard::EXIT_ALLOCATED)),
             "the probe child exited with code 97"
         );
+    }
+
+    #[test]
+    fn keyrings_classification() {
+        let none = |k, a, b| classify_keyrings(k, a, b);
+        assert_eq!(none(libc::EOPNOTSUPP, None, None), None);
+        // No CONFIG_KEYS: the call is not there, and neither are the files.
+        let no_keys = Some(Missing::Keyrings {
+            item: "keyctl",
+            errno: libc::ENOSYS,
+        });
+        assert_eq!(
+            none(libc::ENOSYS, Some(libc::ENOENT), Some(libc::ENOENT)),
+            no_keys
+        );
+        // keyctl filtered by the runner's own seccomp profile.
+        assert_eq!(
+            none(libc::EPERM, None, None),
+            Some(Missing::Keyrings {
+                item: "keyctl",
+                errno: libc::EPERM
+            })
+        );
+        // An operation the kernel knows after all: fail closed.
+        assert_eq!(
+            none(0, None, None),
+            Some(Missing::Keyrings {
+                item: "keyctl",
+                errno: libc::EINVAL
+            })
+        );
+        // Each file on its own.
+        assert_eq!(
+            none(libc::EOPNOTSUPP, Some(libc::ENOENT), None),
+            Some(Missing::Keyrings {
+                item: "/proc/keys",
+                errno: libc::ENOENT
+            })
+        );
+        assert_eq!(
+            none(libc::EOPNOTSUPP, None, Some(libc::EACCES)),
+            Some(Missing::Keyrings {
+                item: "/proc/key-users",
+                errno: libc::EACCES
+            })
+        );
+        // This host has keyrings (the host tests need them anyway).
+        assert_eq!(probe_keyrings(), None);
     }
 
     #[test]

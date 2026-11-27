@@ -317,12 +317,17 @@ jobs:
             runner: ubuntu-latest
             # The probe ids a stock runner lacks (BONELI_SYS_EXPECT_MISSING).
             expect-missing: userns-apparmor,cgroup-not-delegated
-            # Seccomp rows this kernel cannot observe (BONELI_SYS_HOST_GAPS).
-            host-gaps: ""
+            # What this host cannot show (BONELI_SYS_HOST_GAPS, ADR-007 D5):
+            # syslog with dmesg_restrict 1, shmget-hugetlb outside
+            # vm.hugetlb_shm_group, hugetlbfs-mount without a hugetlbfs,
+            # socket-inet-packet and ioctl-siocgifbr without af_packet or
+            # bridge (assumed present on the Docker runner images; the Host
+            # features step prints both).
+            host-gaps: syslog,shmget-hugetlb
           - arch: arm64
             runner: ubuntu-24.04-arm
             expect-missing: userns-apparmor,cgroup-not-delegated
-            host-gaps: ""
+            host-gaps: syslog,shmget-hugetlb
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -374,6 +379,17 @@ jobs:
           # the kernel/yama/ptrace_scope line above).
           echo "dd: $(command -v dd || echo absent): $(dd --version 2>/dev/null | head -n1 || true)"
           echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo absent)"
+          # Huge pages (ADR-007, D2 and D7): what the hugetlb rows and
+          # hugetlbfs_source_refused meet on this host.
+          for k in nr_hugepages hugetlb_shm_group; do
+            echo "vm.$k = $(cat "/proc/sys/vm/$k" 2>/dev/null || echo absent)"
+          done
+          echo "hugetlbfs: $(findmnt -rn -t hugetlbfs -o TARGET,OPTIONS 2>/dev/null | tr '\n' ' ' || true)"
+          # The module rows (ADR-007, D2): seccomp_rows tries them only where
+          # the module is there already, else they are host gaps.
+          echo "af_packet (/proc/net/packet): $( [ -e /proc/net/packet ] && echo present || echo absent)"
+          echo "bridge (/sys/module/bridge): $( [ -e /sys/module/bridge ] && echo present || echo absent)"
+          echo "8021q (/sys/module/8021q): $( [ -e /sys/module/8021q ] && echo present || echo absent)"
           # The statistics keeper (#54, ADR-007 D8): the flush threshold of a
           # memory.stat read scales with online CPUs, the memcg dirty limits
           # with memory, and the dirty intervals set the kernel's own flushes.

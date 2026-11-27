@@ -14,6 +14,7 @@ use std::os::raw::{c_char, c_int};
 use crate::error::errno;
 use crate::ffi;
 use crate::mount::{self, Op};
+use crate::privileges::{self, PrivilegeDrop};
 use crate::report;
 
 /// A step of the child's setup sequence. The codes are the wire format of
@@ -41,10 +42,11 @@ pub enum Step {
     CloseFds = 7,
     /// `execve` of the program.
     Exec = 8,
-    /// `PR_SET_NO_NEW_PRIVS` and a seccomp filter. Only the host probe's
-    /// filter child runs it so far, with an allow-all filter, to prove the
-    /// kernel installs filters at all (ADR-007, D3); `spawn` gets it before
-    /// `Exec` with the policy of ADR-007 D2 in a later part of #6.
+    /// The seccomp filter, the last step before `Exec`: in `spawn` the
+    /// policy of ADR-007 D2 (item 0, after [`Step::NoNewPrivs`], D9); in the
+    /// host probe's filter child `PR_SET_NO_NEW_PRIVS` (item 0) and an
+    /// allow-all filter (item 1), which prove the kernel installs filters
+    /// at all (D3).
     Seccomp = 9,
     /// `unshare(CLONE_NEWCGROUP)`: the cgroup namespace, created in the
     /// child and not by `clone3` (ADR-007, D7).
@@ -82,11 +84,27 @@ pub enum Step {
     /// every sandbox task unkillable by the OOM killer and void
     /// `memory.oom.group` (ADR-007, D8).
     OomScoreAdj = 23,
+    /// `PR_SET_SECUREBITS` to 0xEF: no capabilities for uid 0 at `execve`,
+    /// no setuid fixup, no ambient raise, all locked (ADR-007, D9).
+    Securebits = 24,
+    /// `PR_CAPBSET_DROP` of every capability up to `cap_last_cap`; the item
+    /// is the capability number.
+    CapBoundingSet = 25,
+    /// `PR_CAP_AMBIENT_CLEAR_ALL`.
+    CapAmbient = 26,
+    /// `capset` with empty effective, permitted and inheritable sets.
+    Capset = 27,
+    /// `PR_SET_NO_NEW_PRIVS`.
+    NoNewPrivs = 28,
+    /// `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`: a new anonymous session
+    /// keyring, so the program holds no reference to the runner's (ADR-007,
+    /// D2).
+    SessionKeyring = 29,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 23] = [
+    pub const ALL: [Step; 29] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -110,15 +128,21 @@ impl Step {
         Step::Loopback,
         Step::Cgroup2,
         Step::OomScoreAdj,
+        Step::Securebits,
+        Step::CapBoundingSet,
+        Step::CapAmbient,
+        Step::Capset,
+        Step::NoNewPrivs,
+        Step::SessionKeyring,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
-    /// [`Step::MountTarget`] precedes each mount; [`Step::Seccomp`] is the
-    /// probe's only (see there).
-    pub const SEQUENCE: [Step; 22] = [
+    /// [`Step::MountTarget`] precedes each mount.
+    pub const SEQUENCE: [Step; 29] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
+        Step::SessionKeyring,
         Step::OomScoreAdj,
         Step::CgroupNs,
         Step::MakePrivate,
@@ -137,6 +161,12 @@ impl Step {
         Step::Signals,
         Step::Stdio,
         Step::CloseFds,
+        Step::Securebits,
+        Step::CapBoundingSet,
+        Step::CapAmbient,
+        Step::Capset,
+        Step::NoNewPrivs,
+        Step::Seccomp,
         Step::Exec,
     ];
 
@@ -176,6 +206,12 @@ impl Step {
             Step::Loopback => "loopback",
             Step::Cgroup2 => "cgroup2",
             Step::OomScoreAdj => "oom-score-adj",
+            Step::Securebits => "securebits",
+            Step::CapBoundingSet => "cap-bounding-set",
+            Step::CapAmbient => "cap-ambient",
+            Step::Capset => "capset",
+            Step::NoNewPrivs => "no-new-privs",
+            Step::SessionKeyring => "session-keyring",
         }
     }
 }
@@ -195,6 +231,8 @@ pub(crate) struct ExecPlan<'a> {
     /// The directory descriptor of the cgroup `clone3` places the child in
     /// (`CLONE_INTO_CGROUP`, ADR-007 D8).
     pub cgroup: c_int,
+    /// The privilege drop and the seccomp filter (ADR-007, D9 and D2).
+    pub privileges: PrivilegeDrop<'a>,
 }
 
 /// What the child does.
@@ -462,6 +500,26 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Ok(());
     };
 
+    // A new session keyring of its own: the clone copied the runner's, and
+    // the keyring is not namespaced. Before the mounts: joined after them,
+    // the runner's keyring kept a reference for as long as the sandbox ran
+    // (measured, ADR-007 D2), so something the mount steps create holds
+    // the credentials of that moment. Before the filter, which denies
+    // keyctl.
+    inject(fault, Step::SessionKeyring)?;
+    // SAFETY: a NULL name makes the kernel create an anonymous keyring; no
+    // memory is passed.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            ffi::KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<c_char>(),
+        )
+    };
+    if rc < 0 {
+        return Err(fail(Step::SessionKeyring, 0, errno()));
+    }
+
     inject(fault, Step::OomScoreAdj)?;
     raise_oom_score_adj()?;
 
@@ -561,6 +619,10 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
         return Err(fail(Step::CloseFds, 0, errno()));
     }
 
+    // Capabilities, no_new_privs and the seccomp filter last, so that only
+    // execve runs under the filter before the program (ADR-007, D9).
+    privileges::drop_all(&exec.privileges, fault)?;
+
     inject(fault, Step::Exec)?;
     // SAFETY: program is NUL-terminated and argv and envp are
     // NULL-terminated arrays of pointers into memory prepared before the
@@ -624,11 +686,25 @@ mod tests {
         }
         assert_eq!(Step::from_code(0), None);
         assert_eq!(Step::from_code(Step::ALL.len() as u32 + 1), None);
-        // The sequence holds every step but the probe's Seccomp, once.
+        // The sequence holds every step once; the filter is the last step
+        // before the exec, after no_new_privs (ADR-007, D9).
         let mut seen: Vec<Step> = Step::SEQUENCE.to_vec();
-        seen.push(Step::Seccomp);
         seen.sort_by_key(|s| s.code());
         assert_eq!(seen, Step::ALL);
+        let n = Step::SEQUENCE.len();
+        assert_eq!(
+            Step::SEQUENCE[n - 8..],
+            [
+                Step::CloseFds,
+                Step::Securebits,
+                Step::CapBoundingSet,
+                Step::CapAmbient,
+                Step::Capset,
+                Step::NoNewPrivs,
+                Step::Seccomp,
+                Step::Exec
+            ]
+        );
         assert_eq!(Step::from_code(9999), None);
     }
 }

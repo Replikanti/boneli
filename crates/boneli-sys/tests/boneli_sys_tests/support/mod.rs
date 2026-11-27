@@ -2,6 +2,7 @@
 //! bounded waits and the probe runner (ADR-007, D5).
 
 pub mod alloc_guard;
+pub mod bpf;
 pub mod cgroup;
 pub mod probe;
 pub mod rootfs;
@@ -361,4 +362,63 @@ pub fn read_number(path: &str) -> u64 {
     text.trim()
         .parse()
         .unwrap_or_else(|e| panic!("parse {path} ({text:?}): {e}"))
+}
+
+/// Runs this test binary on the host, outside any sandbox, as a probe for
+/// `action` with only `env` in its environment: the baseline of the
+/// seccomp rows and the Landlock tests, which apply to the calling
+/// process.
+pub fn run_probe_host(action: &str, env: &[(&str, &str)]) -> Probe {
+    let _runs = shared();
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "probe", "--nocapture", "--quiet"])
+        .env_clear()
+        .env(probe::ACTION_VAR, action)
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run the probe on the host");
+    parse_probe(Output {
+        status: match out.status.code() {
+            Some(code) => ExitStatus::Exited(code),
+            None => ExitStatus::Signaled(
+                std::os::unix::process::ExitStatusExt::signal(&out.status).unwrap_or(0),
+            ),
+        },
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// The ids `BONELI_SYS_HOST_GAPS` may name: kernel rows of the seccomp
+/// policy a host cannot observe, and host features a test needs that a
+/// host may lack (ADR-007, D5).
+pub const KNOWN_GAPS: &[&str] = &[
+    "syslog",
+    "shmget-hugetlb",
+    "hugetlbfs-mount",
+    "ioctl-siocgifbr",
+    "socket-inet-packet",
+];
+
+/// Parses a comma-separated gap list; an id outside [`KNOWN_GAPS`] is an
+/// error naming it.
+pub fn parse_gaps(raw: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|id| {
+            if KNOWN_GAPS.contains(&id) {
+                Ok(id.to_string())
+            } else {
+                Err(format!("BONELI_SYS_HOST_GAPS names an unknown id {id:?}"))
+            }
+        })
+        .collect()
+}
+
+/// The ids listed in `BONELI_SYS_HOST_GAPS`; an unknown id fails the test.
+pub fn host_gaps() -> std::collections::BTreeSet<String> {
+    let raw = std::env::var("BONELI_SYS_HOST_GAPS").unwrap_or_default();
+    parse_gaps(&raw).unwrap_or_else(|e| panic!("{e}"))
 }

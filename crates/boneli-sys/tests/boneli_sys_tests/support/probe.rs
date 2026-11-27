@@ -11,6 +11,16 @@ use std::os::unix::ffi::OsStrExt;
 pub const ACTION_VAR: &str = "BONELI_SYS_PROBE";
 /// The prefix of every probe line.
 pub const PREFIX: &str = "BONELI_PROBE ";
+/// Set to 1 by `seccomp_rows` when the host has af_packet registered, so
+/// `socket(AF_INET, SOCK_PACKET)` asks for no module.
+pub const MODULE_PACKET_VAR: &str = "BONELI_SYS_PROBE_PACKET";
+/// Set to 1 by `seccomp_rows` when the host has the bridge module, so
+/// `SIOCGIFBR` asks for no module.
+pub const MODULE_BRIDGE_VAR: &str = "BONELI_SYS_PROBE_BRIDGE";
+/// The value of a kernel row the probe did not try.
+pub const UNTRIED: &str = "untried";
+/// `SOCK_PACKET`, `include/linux/net.h`; libc 0.2.191 lacks it for Linux.
+const SOCK_PACKET: i32 = 10;
 
 fn put(key: &str, value: &str) {
     let mut out = std::io::stdout();
@@ -24,7 +34,23 @@ fn errno() -> i32 {
 
 fn fail(code: i32, why: &str) -> ! {
     let _ = writeln!(std::io::stderr(), "probe: {why}");
-    std::process::exit(code)
+    exit(code)
+}
+
+/// Ends the probe with `code` through `_exit`, after flushing stdout.
+///
+/// Not `std::process::exit`: its runtime cleanup unmaps the main thread's
+/// alternate signal stack from the calling thread, and the probe runs in
+/// libtest's test thread. A probe that calls glibc's `setuid` or
+/// `setgroups` makes every thread run the `SIGSETXID` handler, on that
+/// stack (glibc installs it with `SA_ONSTACK`), and the handler wakes the
+/// caller before it has returned. If the probe thread then unmapped the
+/// stack first, the main thread died with SIGSEGV in the handler's
+/// epilogue (seen once in a host run and forced under gdb).
+fn exit(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    // SAFETY: _exit ends the process at once; nothing is left to run.
+    unsafe { libc::_exit(code) }
 }
 
 fn input(name: &str) -> String {
@@ -81,12 +107,20 @@ pub fn main(action: &str) -> ! {
         "pids" => pids(),
         "spin" => spin(),
         "io-write" => io_write(),
-        "cgroup-mkdir" => cgroup_mkdir(),
-        "chmod-kill" => chmod_kill(),
         "oom-adj-spawn" => oom_adj_spawn(),
+        "seccomp-rows" => seccomp_rows(),
+        "int80" => int80(),
+        "caps" => caps(),
+        "securebits" => securebits(),
+        "filter-reach" => filter_reach(),
+        "clone3-fallback" => clone3_fallback(),
+        "cgroup-view" => cgroup_view(),
+        "landlock" => landlock(),
+        "keys" => keys(),
+        "features-no-keyrings" => features_no_keyrings(),
         _ => fail(1, &format!("unknown action {action}")),
     }
-    std::process::exit(0)
+    exit(0)
 }
 
 fn ids() {
@@ -228,6 +262,69 @@ fn features() {
     put("missing", &ids);
 }
 
+/// `Features::probe` on a host whose kernel has no keyrings, as far as
+/// this process can tell: a filter of its own answers ENOSYS to `keyctl`,
+/// what a kernel without `CONFIG_KEYS` gives. Prints the missing ids and
+/// the keyring entry's item and errno. The host test runs it directly.
+fn features_no_keyrings() {
+    // Classic BPF: load the number, keyctl -> ERRNO(ENOSYS), else allow.
+    let insns = [
+        boneli_sys::seccomp::Insn {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_keyctl as u32,
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: boneli_sys::seccomp::errno_action(libc::ENOSYS),
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let prog = libc::sock_fprog {
+        len: insns.len() as u16,
+        filter: insns.as_ptr() as *mut libc::sock_filter,
+    };
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        fail(3, &format!("no_new_privs: errno {}", errno()));
+    }
+    // SAFETY: prog points to insns, which outlive the call; Insn has the
+    // layout of sock_filter.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if rc != 0 {
+        fail(3, &format!("seccomp: errno {}", errno()));
+    }
+    let missing = boneli_sys::Features::probe().err().unwrap_or_default();
+    let ids: Vec<&str> = missing.iter().map(|m| m.id().as_str()).collect();
+    put("missing", &ids.join(","));
+    for m in &missing {
+        if let boneli_sys::Missing::Keyrings { item, errno } = m {
+            put("keyrings", &format!("{item}:{errno}"));
+        }
+    }
+}
+
 /// Spawns a missing program with descriptors 0-2 closed in this process
 /// (a daemonized runner): the report pipe must not land on 0-2, where the
 /// child's stdio `dup2` would replace it. Exits 0 when spawn returns
@@ -288,7 +385,7 @@ fn closed_stdio_spawn() {
             Err(e) => format!("Err({e:?})"),
         };
         let _ = std::fs::write(&out, got);
-        std::process::exit(3);
+        exit(3);
     }
 }
 
@@ -914,34 +1011,6 @@ fn io_write() {
     }
 }
 
-/// Mounts a cgroup2 of the sandbox's own cgroup namespace at `/tmp/cg`
-/// (inside id 0 still has the capability before PR 4 of #6), then tries
-/// to create a sub-cgroup and to raise `cgroup.max.descendants`.
-fn cgroup_mkdir() {
-    if let Err(e) = std::fs::create_dir_all("/tmp/cg") {
-        fail(3, &format!("mkdir /tmp/cg: {e}"));
-    }
-    // SAFETY: every string is NUL-terminated; no data is passed.
-    let rc = unsafe {
-        libc::mount(
-            c"cgroup2".as_ptr(),
-            c"/tmp/cg".as_ptr(),
-            c"cgroup2".as_ptr(),
-            0,
-            std::ptr::null(),
-        )
-    };
-    put(
-        "mount_errno",
-        &if rc == 0 { 0 } else { errno() }.to_string(),
-    );
-    put("mkdir_errno", &code(&std::fs::create_dir("/tmp/cg/sub")));
-    put(
-        "raise_errno",
-        &code(&std::fs::write("/tmp/cg/cgroup.max.descendants", b"100")),
-    );
-}
-
 /// Not sandboxed: raises this process's own `oom_score_adj` to
 /// `BONELI_PROBE_VALUE`, then starts a probe sandbox that reads its own
 /// value, and prints it as `inside`.
@@ -966,12 +1035,564 @@ fn oom_adj_spawn() {
     );
 }
 
-/// Inside id 0 (which still has the capability before PR 4 of #6) mounts
-/// a cgroup2 of its own cgroup at `/tmp/cg` and makes its `cgroup.kill`
-/// read-only (mode 0444), writes what it did to `BONELI_PROBE_FILE`, then
-/// waits to be killed.
-fn chmod_kill() {
-    let out = input("BONELI_PROBE_FILE");
+/// The errno of a raw syscall result: 0 when it succeeded.
+fn rc_errno(rc: libc::c_long) -> i32 {
+    if rc < 0 { errno() } else { 0 }
+}
+
+/// Forks a child that runs `call`, which must not allocate (the child is a
+/// copy of one thread, see `alloc_guard`), and exits with its result;
+/// returns that exit code, or 255 when the child did not exit normally.
+fn in_fork(call: fn() -> i32) -> i32 {
+    // SAFETY: fork has no memory arguments; the child runs only `call`,
+    // which makes raw syscalls on prepared memory, and _exit.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail(3, &format!("fork: errno {}", errno()));
+    }
+    if pid == 0 {
+        let code = call();
+        // SAFETY: _exit ends the forked child without running anything.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: status is valid storage; pid is this process's child.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        fail(3, &format!("waitpid: errno {}", errno()));
+    }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        255
+    }
+}
+
+/// `keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0)`: its errno,
+/// 0 when it succeeded.
+fn keyctl_get_keyring_id() -> i32 {
+    const KEYCTL_GET_KEYRING_ID: libc::c_long = 0;
+    const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
+    // SAFETY: keyctl with this operation takes plain integers.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_GET_KEYRING_ID,
+            KEY_SPEC_SESSION_KEYRING,
+            0,
+        )
+    };
+    rc_errno(rc)
+}
+
+/// `ioctl(TIOCSETD)` with `N_TTY` on the slave of a new pty from
+/// `/dev/ptmx` (in the sandbox its private devpts): its errno, 0 for
+/// success. The slave already has `N_TTY`, which is built in, so the call
+/// reaches `tty_set_ldisc` and returns at once without asking for a
+/// module; no other discipline is ever tried (13 would load n_hdlc).
+fn tiocsetd_n_tty() -> i32 {
+    const N_TTY: libc::c_int = 0;
+    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
+    let master = unsafe {
+        libc::open(
+            c"/dev/ptmx".as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if master < 0 {
+        fail(3, &format!("open /dev/ptmx: errno {}", errno()));
+    }
+    // SAFETY: master is the pty master opened above.
+    if unsafe { libc::unlockpt(master) } < 0 {
+        fail(3, &format!("unlockpt: errno {}", errno()));
+    }
+    // SAFETY: TIOCGPTPEER takes open flags and returns a new descriptor.
+    let slave = unsafe {
+        libc::ioctl(
+            master,
+            libc::TIOCGPTPEER as _,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave < 0 {
+        fail(3, &format!("TIOCGPTPEER: errno {}", errno()));
+    }
+    // SAFETY: TIOCSETD reads one int, valid for the call's duration.
+    let rc = unsafe { libc::ioctl(slave, libc::TIOCSETD as _, &N_TTY as *const libc::c_int) };
+    let result = if rc < 0 { errno() } else { 0 };
+    // SAFETY: both descriptors were opened here and nothing else owns them.
+    unsafe {
+        libc::close(slave);
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::close(master);
+    }
+    result
+}
+
+/// Closes `fd` if a call returned one.
+fn close_if(rc: libc::c_long) {
+    if rc >= 0 {
+        // SAFETY: the call returned a new descriptor that nothing else owns.
+        unsafe { libc::close(rc as i32) };
+    }
+}
+
+/// The kernel rows of the seccomp policy (ADR-007, D2): makes each call
+/// the rows name and prints `row:<id>=<errno>`, 0 for success. The host
+/// test runs this action twice, once on the host without a filter (the
+/// baseline) and once in a sandbox. Every call is harmless if it
+/// succeeds: what it creates is closed, unmapped, removed or dies with
+/// the process (the key in the process keyring), and the namespaces are
+/// made by forked children that exit at once.
+fn seccomp_rows() {
+    let row = |id: &str, e: i32| put(&format!("row:{id}"), &e.to_string());
+
+    let mut params = [0u8; 120];
+    // SAFETY: params is zeroed io_uring_params storage of its full size
+    // (120 bytes); one entry.
+    let rc = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr()) };
+    row("io-uring-setup", rc_errno(rc));
+    close_if(rc);
+
+    // A zeroed BPF_MAP_CREATE attribute: rejected by the kernel's own
+    // checks if the call gets that far.
+    let attr = [0u8; 128];
+    // SAFETY: attr is valid for its size for the call's duration.
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, 0, attr.as_ptr(), attr.len()) };
+    row("bpf", rc_errno(rc));
+    close_if(rc);
+
+    const UFFD_USER_MODE_ONLY: libc::c_long = 1;
+    // SAFETY: userfaultfd takes plain flags.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_userfaultfd,
+            UFFD_USER_MODE_ONLY | libc::O_CLOEXEC as libc::c_long,
+        )
+    };
+    row("userfaultfd", rc_errno(rc));
+    close_if(rc);
+
+    // perf_event_attr, PERF_ATTR_SIZE_VER7 (128 bytes): a software CPU
+    // clock of this process, disabled, user space only.
+    let mut pattr = [0u64; 16];
+    pattr[0] = 1 | (128 << 32); // type PERF_TYPE_SOFTWARE, size 128
+    pattr[1] = 0; // config PERF_COUNT_SW_CPU_CLOCK
+    pattr[5] = 1 | (1 << 5) | (1 << 6); // disabled, exclude_kernel, exclude_hv
+    // SAFETY: pattr is a perf_event_attr of the size it names; pid 0, cpu
+    // -1, no group, no flags.
+    let rc = unsafe { libc::syscall(libc::SYS_perf_event_open, pattr.as_ptr(), 0, -1, -1, 0) };
+    row("perf-event-open", rc_errno(rc));
+    close_if(rc);
+
+    row("keyctl", keyctl_get_keyring_id());
+
+    const KEY_SPEC_PROCESS_KEYRING: libc::c_long = -2;
+    // SAFETY: every string is NUL-terminated and the payload is one byte.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_add_key,
+            c"user".as_ptr(),
+            c"boneli-probe".as_ptr(),
+            c"x".as_ptr(),
+            1usize,
+            KEY_SPEC_PROCESS_KEYRING,
+        )
+    };
+    row("add-key", rc_errno(rc));
+
+    // SAFETY: the strings are NUL-terminated; no callout, no keyring.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_request_key,
+            c"user".as_ptr(),
+            c"boneli-probe-absent".as_ptr(),
+            std::ptr::null::<libc::c_char>(),
+            0,
+        )
+    };
+    row("request-key", rc_errno(rc));
+
+    const SYSLOG_ACTION_SIZE_BUFFER: libc::c_long = 10;
+    // SAFETY: SIZE_BUFFER reads no buffer.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_syslog,
+            SYSLOG_ACTION_SIZE_BUFFER,
+            std::ptr::null_mut::<libc::c_char>(),
+            0,
+        )
+    };
+    row("syslog", rc_errno(rc));
+
+    // unshare in a forked child: a multithreaded process cannot unshare
+    // its user namespace (EINVAL), and the probe runs in libtest's thread.
+    row(
+        "unshare-newuser",
+        in_fork(|| {
+            // SAFETY: unshare takes plain flags.
+            rc_errno(unsafe {
+                libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER as libc::c_long)
+            })
+        }),
+    );
+    row(
+        "unshare-newuser-high",
+        in_fork(|| {
+            let flags: u64 = (1 << 32) | libc::CLONE_NEWUSER as u64;
+            // SAFETY: unshare takes plain flags.
+            rc_errno(unsafe { libc::syscall(libc::SYS_unshare, flags) })
+        }),
+    );
+
+    // clone with CLONE_NEWUSER and no stack, like fork; the child exits at
+    // once. The other arguments (tids, tls) are null on both arches.
+    // SAFETY: without CLONE_VM the child runs on a copy of this stack and
+    // only calls _exit.
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    if pid == 0 {
+        // SAFETY: _exit ends the cloned child without running anything.
+        unsafe { libc::_exit(0) };
+    }
+    if pid > 0 {
+        let mut st = 0;
+        // SAFETY: st is valid storage; pid is this process's child.
+        unsafe { libc::waitpid(pid as i32, &mut st, 0) };
+    }
+    row("clone-newuser", rc_errno(pid));
+
+    // clone3 with a null argument: EINVAL from the kernel's own checks,
+    // ENOSYS from the filter.
+    // SAFETY: a null pointer and size 0 make clone3 fail before it reads.
+    let rc = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+    row("clone3", rc_errno(rc));
+
+    let socket = |id: &str, family: i32, ty: i32, protocol: i32| {
+        // SAFETY: socket takes plain integers.
+        let fd = unsafe { libc::socket(family, ty | libc::SOCK_CLOEXEC, protocol) };
+        row(id, if fd < 0 { errno() } else { 0 });
+        close_if(fd as libc::c_long);
+    };
+    socket("socket-vsock", libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+    socket("socket-unix", libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    socket(
+        "socket-inet-tcp",
+        libc::AF_INET,
+        libc::SOCK_STREAM,
+        libc::IPPROTO_TCP,
+    );
+    socket(
+        "socket-inet6-udp",
+        libc::AF_INET6,
+        libc::SOCK_DGRAM,
+        libc::IPPROTO_UDP,
+    );
+    // A protocol outside the row's list that loads no module either way:
+    // with a protocol other than 0 a raw socket matches the raw wildcard
+    // entry, so the kernel never calls request_module and refuses the unprivileged
+    // caller with EPERM (no CAP_NET_RAW); the filter answers
+    // EPROTONOSUPPORT before that. A protocol served by a module (SCTP 132,
+    // SMC 256, L2TP 115) is never tried here: the baseline would load it
+    // into the host kernel.
+    socket(
+        "socket-inet-raw-protocol",
+        libc::AF_INET,
+        libc::SOCK_RAW,
+        libc::IPPROTO_RAW,
+    );
+    socket(
+        "socket-inet6-raw-protocol",
+        libc::AF_INET6,
+        libc::SOCK_RAW,
+        libc::IPPROTO_RAW,
+    );
+
+    row("ioctl-tiocsetd", tiocsetd_n_tty());
+    socket(
+        "netlink-netfilter",
+        libc::AF_NETLINK,
+        libc::SOCK_RAW,
+        libc::NETLINK_NETFILTER,
+    );
+    socket(
+        "netlink-route",
+        libc::AF_NETLINK,
+        libc::SOCK_RAW,
+        libc::NETLINK_ROUTE,
+    );
+
+    let mut pair = [-1; 2];
+    // SAFETY: pair is storage for two descriptors.
+    let rc = unsafe { libc::socketpair(libc::AF_INET, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) };
+    row("socketpair-inet", if rc < 0 { errno() } else { 0 });
+    if rc == 0 {
+        close_if(pair[0] as libc::c_long);
+        close_if(pair[1] as libc::c_long);
+    }
+
+    const TWO_MIB: usize = 2 << 20;
+    // SAFETY: an anonymous mapping with no address hint; unmapped below.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            TWO_MIB,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+            -1,
+            0,
+        )
+    };
+    row(
+        "mmap-hugetlb",
+        if p == libc::MAP_FAILED { errno() } else { 0 },
+    );
+    if p != libc::MAP_FAILED {
+        // SAFETY: p is the mapping created above, of that size.
+        unsafe { libc::munmap(p, TWO_MIB) };
+    }
+
+    // SAFETY: the name is NUL-terminated.
+    let fd = unsafe { libc::memfd_create(c"b".as_ptr(), libc::MFD_HUGETLB | libc::MFD_CLOEXEC) };
+    row("memfd-hugetlb", if fd < 0 { errno() } else { 0 });
+    close_if(fd as libc::c_long);
+
+    // SAFETY: shmget takes plain integers.
+    let id = unsafe {
+        libc::shmget(
+            libc::IPC_PRIVATE,
+            TWO_MIB,
+            libc::IPC_CREAT | libc::SHM_HUGETLB | 0o600,
+        )
+    };
+    row("shmget-hugetlb", if id < 0 { errno() } else { 0 });
+    if id >= 0 {
+        // SAFETY: id is the segment created above; IPC_RMID takes no buffer.
+        unsafe { libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut()) };
+    }
+
+    // The two module rows that can be shown without loading a module, and
+    // only on a host that has the module already (the test passes the
+    // host's state in both runs, ADR-007 D2 "Module autoload"): without
+    // af_packet the baseline's `socket(AF_INET, SOCK_PACKET, 0)` would ask
+    // for net-pf-17, without bridge its `SIOCGIFBR` would load bridge. The
+    // VLAN pair is never tried: 8021q is a module on the dev host.
+    let tried = |var: &str| std::env::var(var).as_deref() == Ok("1");
+    if tried(MODULE_PACKET_VAR) {
+        // A packet socket with the type the kernel rewrites; it needs
+        // CAP_NET_RAW, so the unprivileged baseline gets EPERM.
+        socket("socket-inet-packet", libc::AF_INET, SOCK_PACKET, 0);
+    } else {
+        put("row:socket-inet-packet", UNTRIED);
+    }
+    if tried(MODULE_BRIDGE_VAR) {
+        row("ioctl-siocgifbr", siocgifbr_version());
+    } else {
+        put("row:ioctl-siocgifbr", UNTRIED);
+    }
+}
+
+/// `ioctl(SIOCGIFBR, BRCTL_GET_VERSION)` on a new Unix datagram socket:
+/// its errno, 0 for success. With bridge loaded the kernel answers the
+/// version (1) from `br_ioctl_stub` without a capability check; the caller
+/// makes sure bridge is there, so nothing is asked for.
+fn siocgifbr_version() -> i32 {
+    const BRCTL_GET_VERSION: libc::c_ulong = 0;
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        fail(3, &format!("socket(AF_UNIX): errno {}", errno()));
+    }
+    let mut args: [libc::c_ulong; 3] = [BRCTL_GET_VERSION, 0, 0];
+    // SAFETY: SIOCGIFBR reads three unsigned longs through the pointer,
+    // valid for the call's duration.
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFBR as _, args.as_mut_ptr()) };
+    let result = if rc < 0 { errno() } else { 0 };
+    // SAFETY: fd was opened here and nothing else owns it.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// An i386 `getpid` through `int 0x80` (x86_64 only). Without a filter it
+/// prints the result; under the policy the arch row kills the process
+/// with SIGSYS. Core dumps are switched off first.
+fn int80() {
+    // SAFETY: PR_SET_DUMPABLE takes plain integers.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut eax: i64 = 20; // __NR_getpid of the i386 table
+        // SAFETY: int 0x80 with eax 20 runs the i386 getpid, which reads
+        // and writes no memory; it clobbers r8-r11 at most, declared here.
+        unsafe {
+            std::arch::asm!(
+                "int 0x80",
+                inout("rax") eax,
+                lateout("r8") _, lateout("r9") _, lateout("r10") _, lateout("r11") _,
+                options(nostack)
+            );
+        }
+        put("int80", &eax.to_string());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fail(2, "int80 exists on x86_64 only");
+}
+
+/// The capability, `no_new_privs` and seccomp lines of
+/// `/proc/self/status`. With `BONELI_PROBE_EXEC=1` it first re-executes
+/// this binary as the same action and prints the new image's lines with
+/// the prefix `exec_`.
+fn caps() {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_else(|e| fail(3, &format!("read status: {e}")));
+    for key in [
+        "CapInh",
+        "CapPrm",
+        "CapEff",
+        "CapBnd",
+        "CapAmb",
+        "NoNewPrivs",
+        "Seccomp",
+        "Seccomp_filters",
+    ] {
+        let v = status
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}:")))
+            .map_or("missing", str::trim);
+        put(key, v);
+    }
+    if std::env::var("BONELI_PROBE_EXEC").as_deref() == Ok("1") {
+        let exe = std::env::current_exe().unwrap_or_else(|e| fail(3, &format!("current_exe: {e}")));
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "probe", "--nocapture", "--quiet"])
+            .env_clear()
+            .env(ACTION_VAR, "caps")
+            .output()
+            .unwrap_or_else(|e| fail(3, &format!("re-exec: {e}")));
+        put("exec_status", &format!("{:?}", out.status.code()));
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.find(PREFIX).map(|p| &line[p + PREFIX.len()..])
+                && let Some((k, v)) = rest.split_once('=')
+            {
+                put(&format!("exec_{k}"), v);
+            }
+        }
+    }
+}
+
+/// `PR_GET_SECUREBITS`, then the errno of `PR_SET_SECUREBITS(0)`.
+fn securebits() {
+    // SAFETY: PR_GET_SECUREBITS takes no pointer.
+    let bits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+    put("securebits", &bits.to_string());
+    // SAFETY: PR_SET_SECUREBITS takes plain integers.
+    let rc = unsafe { libc::prctl(libc::PR_SET_SECUREBITS, 0, 0, 0, 0) };
+    put("set_errno", &if rc == 0 { 0 } else { errno() }.to_string());
+}
+
+/// `keyctl` from a new thread and from a forked child, then again after
+/// this process installed an allow-all filter of its own on top.
+fn filter_reach() {
+    let thread = std::thread::spawn(keyctl_get_keyring_id)
+        .join()
+        .unwrap_or_else(|_| fail(3, "the thread panicked"));
+    put("thread", &thread.to_string());
+    put("fork", &in_fork(keyctl_get_keyring_id).to_string());
+    let allow = [libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    }];
+    let prog = libc::sock_fprog {
+        len: 1,
+        filter: allow.as_ptr().cast_mut(),
+    };
+    // SAFETY: prog points at one valid instruction for the call's duration;
+    // no_new_privs is already set by the sandbox.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0u32,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    put("stack_errno", &rc_errno(rc).to_string());
+    put("stacked", &keyctl_get_keyring_id().to_string());
+}
+
+/// A raw `clone3`, then a thread started through glibc, which tries
+/// `clone3` first and falls back to `clone` on ENOSYS.
+fn clone3_fallback() {
+    // SAFETY: a null pointer and size 0 make clone3 fail before it reads.
+    let rc = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+    put("clone3_errno", &rc_errno(rc).to_string());
+    let started = std::thread::Builder::new()
+        .spawn(|| 7)
+        .map(|h| h.join().unwrap_or(0));
+    put("thread", &code(&started.map(|v| assert_eq!(v, 7))));
+}
+
+/// `struct mount_attr`, `include/uapi/linux/mount.h`.
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// Tries to make the read-only cgroup2 view at `/sys/fs/cgroup` writable,
+/// or to mount a cgroup2 of its own, each way the kernel offers, and to
+/// chmod `cgroup.kill` through the view. Prints each errno.
+fn cgroup_view() {
+    let target = c"/sys/fs/cgroup";
+    let mount = |key: &str, flags: libc::c_ulong| {
+        // SAFETY: target is NUL-terminated; no source, type or data.
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            )
+        };
+        put(key, &if rc == 0 { 0 } else { errno() }.to_string());
+    };
+    mount(
+        "remount_bind",
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+    );
+    mount("remount_sb", libc::MS_REMOUNT);
+    let attr = MountAttr {
+        attr_set: 0,
+        attr_clr: libc::MOUNT_ATTR_RDONLY,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: target is NUL-terminated and attr is valid for its size.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            0u32,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    put("mount_setattr", &rc_errno(rc).to_string());
     if let Err(e) = std::fs::create_dir_all("/tmp/cg") {
         fail(3, &format!("mkdir /tmp/cg: {e}"));
     }
@@ -985,15 +1606,206 @@ fn chmod_kill() {
             std::ptr::null(),
         )
     };
-    let mount = if rc == 0 { 0 } else { errno() };
-    use std::os::unix::fs::PermissionsExt;
-    let chmod = code(&std::fs::set_permissions(
-        "/tmp/cg/cgroup.kill",
-        std::fs::Permissions::from_mode(0o444),
-    ));
-    let _ = std::fs::write(&out, format!("mount={mount} chmod={chmod} done\n"));
-    loop {
-        // SAFETY: pause only waits for a signal.
-        unsafe { libc::pause() };
+    put(
+        "mount_cgroup2",
+        &if rc == 0 { 0 } else { errno() }.to_string(),
+    );
+    // SAFETY: the name is NUL-terminated; no flags.
+    let rc = unsafe { libc::syscall(libc::SYS_fsopen, c"cgroup2".as_ptr(), 0u32) };
+    put("fsopen", &rc_errno(rc).to_string());
+    close_if(rc);
+    // SAFETY: the path is NUL-terminated; no flags.
+    let rc = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            c"/sys/fs/cgroup/cgroup.kill".as_ptr(),
+            0o444,
+            0,
+        )
+    };
+    put("chmod_kill", &if rc == 0 { 0 } else { errno() }.to_string());
+}
+
+/// Not sandboxed: applies a Landlock ruleset to this process and prints
+/// what each access gives (ADR-007, D10). `BONELI_PROBE_DIR` holds `r/f`,
+/// `r/g`, `w/a/x`, `w/b/`, `outside/f`, `u1/` and `u2/`; the probe makes
+/// the listeners before it restricts itself, so they are created outside
+/// the domain. A case above the kernel's ABI prints `n/a`.
+/// What the keyring files show (ADR-007, D2): the byte length of
+/// `/proc/keys` and `/proc/key-users` (or `errno=<n>`), and whether
+/// `/proc/keys` lists the key `BONELI_PROBE_SERIAL` (eight hex digits, as
+/// the file prints serials). Then it waits for EOF on stdin, so the test
+/// can look at the keyring while this process holds its credentials.
+fn keys() {
+    use std::io::Read;
+    let serial = input("BONELI_PROBE_SERIAL");
+    for (name, path) in [("keys", "/proc/keys"), ("key_users", "/proc/key-users")] {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                put(&format!("{name}_len"), &text.len().to_string());
+                let listed = text
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some(serial.as_str()));
+                put(
+                    &format!("{name}_lists_serial"),
+                    if listed { "1" } else { "0" },
+                );
+            }
+            Err(e) => put(
+                &format!("{name}_len"),
+                &format!("errno={}", e.raw_os_error().unwrap_or(-1)),
+            ),
+        }
+    }
+    put("waiting", "1");
+    let mut rest = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut rest);
+}
+
+fn landlock() {
+    use boneli_sys::{Abi, AccessFs, AccessNet, Ruleset, Scope};
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+    let dir = input("BONELI_PROBE_DIR");
+    if let Err(e) = std::env::set_current_dir(&dir) {
+        fail(2, &format!("chdir {dir}: {e}"));
+    }
+    let abi = Abi::current().unwrap_or_else(|e| fail(3, &format!("Landlock: {e}")));
+    let v = abi.version();
+    put("abi", &v.to_string());
+
+    // Listeners, all outside the domain.
+    let tcp_ok = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| fail(3, &format!("bind tcp: {e}")));
+    let tcp_no = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| fail(3, &format!("bind tcp: {e}")));
+    let port = |l: &std::net::TcpListener| {
+        l.local_addr()
+            .unwrap_or_else(|e| fail(3, &format!("local_addr: {e}")))
+            .port()
+    };
+    let (p_ok, p_no) = (port(&tcp_ok), port(&tcp_no));
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("boneli-landlock-{}", std::process::id());
+    let abstract_addr = SocketAddr::from_abstract_name(name.as_bytes())
+        .unwrap_or_else(|e| fail(3, &format!("abstract name: {e}")));
+    let _abstract = UnixListener::bind_addr(&abstract_addr)
+        .unwrap_or_else(|e| fail(3, &format!("bind abstract: {e}")));
+    let _u1 = UnixListener::bind("u1/s").unwrap_or_else(|e| fail(3, &format!("bind u1/s: {e}")));
+    let _u2 = UnixListener::bind("u2/s").unwrap_or_else(|e| fail(3, &format!("bind u2/s: {e}")));
+    // execve of a program outside R, prepared before the fork.
+    let true_path = c"/usr/bin/true";
+
+    let fs = AccessFs::all_for(abi);
+    let net = AccessNet::all_for(abi);
+    let mut rules = Ruleset::new(abi, fs, net, Scope::all_for(abi))
+        .unwrap_or_else(|e| fail(3, &format!("ruleset: {e}")));
+    let read = AccessFs::READ_FILE
+        .union(AccessFs::READ_DIR)
+        .union(AccessFs::EXECUTE);
+    let allow = |rules: &mut Ruleset, path: &str, rights: AccessFs| {
+        rules
+            .allow_path(std::path::Path::new(path), rights)
+            .unwrap_or_else(|e| fail(3, &format!("rule {path}: {e}")));
+    };
+    allow(&mut rules, "r", read);
+    allow(&mut rules, "w", fs);
+    allow(&mut rules, "u1", AccessFs::READ_DIR);
+    if v >= 9 {
+        allow(
+            &mut rules,
+            "u2",
+            AccessFs::READ_DIR.union(AccessFs::RESOLVE_UNIX),
+        );
+    } else {
+        allow(&mut rules, "u2", AccessFs::READ_DIR);
+    }
+    if v >= 4 {
+        rules
+            .allow_port(p_ok, AccessNet::CONNECT_TCP)
+            .unwrap_or_else(|e| fail(3, &format!("rule port: {e}")));
+    }
+    rules
+        .restrict_self()
+        .unwrap_or_else(|e| fail(3, &format!("restrict_self: {e}")));
+
+    let case = |key: &str, since: u32, run: &dyn Fn() -> i32| {
+        if v < since {
+            put(key, "n/a");
+        } else {
+            put(key, &run().to_string());
+        }
+    };
+    let open = |path: &str, flags: i32| -> i32 {
+        let c = c_path(path);
+        // SAFETY: c is NUL-terminated; mode 0600 for O_CREAT.
+        let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
+        if fd < 0 {
+            return errno();
+        }
+        close_if(fd as libc::c_long);
+        0
+    };
+    let rename = |from: &str, to: &str| -> i32 { code_of(&std::fs::rename(from, to)) };
+    case("read_r", 1, &|| open("r/f", libc::O_RDONLY));
+    case("write_r", 1, &|| open("r/f", libc::O_WRONLY));
+    case("read_outside", 1, &|| open("outside/f", libc::O_RDONLY));
+    case("create_w", 1, &|| {
+        open("w/new", libc::O_CREAT | libc::O_WRONLY)
+    });
+    case("rename_w", 2, &|| rename("w/a/x", "w/b/x"));
+    case("rename_r_to_w", 2, &|| rename("r/g", "w/g"));
+    case("truncate_r", 3, &|| {
+        // SAFETY: the path is NUL-terminated.
+        let rc = unsafe { libc::truncate(c"r/f".as_ptr(), 0) };
+        if rc == 0 { 0 } else { errno() }
+    });
+    case("exec_outside", 1, &|| {
+        // SAFETY: the child only calls execve and _exit on prepared memory.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let argv = [true_path.as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null::<libc::c_char>()];
+            // SAFETY: both arrays are NULL-terminated and point at
+            // NUL-terminated strings.
+            unsafe { libc::execve(true_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            // SAFETY: _exit ends the forked child; its code is the errno.
+            unsafe { libc::_exit(errno()) };
+        }
+        let mut st = 0;
+        // SAFETY: st is valid storage; pid is this process's child.
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        if libc::WIFEXITED(st) {
+            libc::WEXITSTATUS(st)
+        } else {
+            255
+        }
+    });
+    let tcp = |p: u16| code_of(&std::net::TcpStream::connect(("127.0.0.1", p)));
+    case("tcp_allowed", 4, &|| tcp(p_ok));
+    case("tcp_denied", 4, &|| tcp(p_no));
+    case("kill_outside", 6, &|| {
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        // SAFETY: signal 0 only checks permission.
+        let rc = unsafe { libc::kill(parent, 0) };
+        if rc == 0 { 0 } else { errno() }
+    });
+    case("abstract_outside", 6, &|| {
+        code_of(&UnixStream::connect_addr(&abstract_addr))
+    });
+    case("unix_outside", 9, &|| code_of(&UnixStream::connect("u1/s")));
+    case("unix_allowed", 9, &|| code_of(&UnixStream::connect("u2/s")));
+    // SAFETY: PR_GET_NO_NEW_PRIVS takes no pointer.
+    let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    put("no_new_privs", &nnp.to_string());
+    drop((tcp_ok, tcp_no));
+}
+
+/// The errno of an I/O result as a number: 0 on success, -1 without one.
+fn code_of<T>(r: &std::io::Result<T>) -> i32 {
+    match r {
+        Ok(_) => 0,
+        Err(e) => e.raw_os_error().unwrap_or(-1),
     }
 }

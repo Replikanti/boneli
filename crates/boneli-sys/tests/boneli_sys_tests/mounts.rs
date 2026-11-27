@@ -112,6 +112,13 @@ fn pivot_root_hides_host() {
                 want.push(format!("{}/{sub}", target.as_str()));
             }
         }
+        // The keyring files, masked with the host's /dev/null (ADR-007,
+        // D7).
+        if let Mount::Proc { target } = &m {
+            for sub in ["keys", "key-users"] {
+                want.push(format!("{}/{sub}", target.as_str()));
+            }
+        }
     }
     want.sort();
     let mut got: Vec<String> = mounts_of(&p).into_iter().map(|(p, _, _)| p).collect();
@@ -882,4 +889,116 @@ fn fd_based_multi_layer_root_mounts() {
     p.assert_ok();
     assert_eq!(p.get("file:/shared"), "top", "{}", p.raw);
     assert_eq!(p.get("file:/bottom-only"), "b", "{}", p.raw);
+}
+
+/// The mount point of a hugetlbfs on this host, from its mountinfo.
+fn hugetlbfs_mount() -> Option<PathBuf> {
+    host_mountinfo().lines().find_map(|line| {
+        let (left, right) = line.split_once(" - ")?;
+        if right.split(' ').next()? != "hugetlbfs" {
+            return None;
+        }
+        // Octal escapes do not occur in the usual mount points; a point
+        // that has one is skipped rather than decoded.
+        let point = left.split(' ').nth(4)?;
+        (!point.contains('\\')).then(|| PathBuf::from(point))
+    })
+}
+
+#[test]
+#[ignore = "host: user namespaces, cgroup v2 delegation, a hugetlbfs mount"]
+fn hugetlbfs_source_refused() {
+    // A file on hugetlbfs maps huge pages without any flag the seccomp
+    // rows see, past memory.max where cgroup2 lacks
+    // memory_hugetlb_accounting (ADR-007, D2 and D7), so spawn refuses
+    // such a source before it clones.
+    let listed = support::host_gaps().contains("hugetlbfs-mount");
+    let Some(huge) = hugetlbfs_mount() else {
+        assert!(
+            listed,
+            "the host has no hugetlbfs mount; list hugetlbfs-mount in BONELI_SYS_HOST_GAPS"
+        );
+        report("hugetlbfs_source_refused: n/a (no hugetlbfs mount, listed as a host gap)");
+        return;
+    };
+    assert!(
+        !listed,
+        "hugetlbfs-mount is listed in BONELI_SYS_HOST_GAPS, but {} is a hugetlbfs",
+        huge.display()
+    );
+    let cg = support::cgroup::sandbox("hugetlbfs");
+    let fixture = Fixture::new("hugetlbfs");
+    let try_spawn = |root: Root| {
+        let spec = Spec {
+            program: PathBuf::from("/usr/bin/true"),
+            args: Vec::new(),
+            env: Vec::new(),
+            stdio: Stdio {
+                stdin: dev_null(),
+                stdout: dev_null(),
+                stderr: dev_null(),
+            },
+            ids: ids(0, 0),
+            setup_timeout: support::SETUP_TIMEOUT,
+            root,
+            cgroup: &cg,
+        };
+        spawn(&spec).map(|mut child| child.wait().expect("wait"))
+    };
+    let refused = |what: &str, result: Result<boneli_sys::ExitStatus, Error>| match result {
+        Err(Error::HugetlbfsSource { path }) => assert_eq!(path, huge, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    // A bind source.
+    let mut mounts = fixture.mounts();
+    mounts.push(Mount::Bind {
+        source: huge.clone(),
+        target: inside("/hp"),
+        writable: false,
+    });
+    refused(
+        "a bind of the hugetlbfs",
+        try_spawn(fixture.root_with(vec![fixture.layer.clone()], mounts)),
+    );
+    // A root layer.
+    refused(
+        "a root layer on hugetlbfs",
+        try_spawn(fixture.root_with(vec![fixture.layer.clone(), huge.clone()], fixture.mounts())),
+    );
+    // A writable overlay's lower directory.
+    let mut mounts = fixture.mounts();
+    mounts.push(Mount::Overlay {
+        lower: huge.clone(),
+        upper: fixture.tree().dir("ov-upper"),
+        work: fixture.tree().dir("ov-work"),
+        target: inside("/hp"),
+    });
+    refused(
+        "an overlay over hugetlbfs",
+        try_spawn(fixture.root_with(vec![fixture.layer.clone()], mounts)),
+    );
+    // A tmpfs source passes.
+    let shm = Path::new("/dev/shm");
+    let c = std::ffi::CString::new(shm.as_os_str().as_bytes()).expect("path");
+    // SAFETY: an all-zero statfs is valid storage for statfs to fill.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c is NUL-terminated and st is valid storage.
+    assert_eq!(unsafe { libc::statfs(c.as_ptr(), &mut st) }, 0);
+    assert_eq!(
+        st.f_type as u64,
+        libc::TMPFS_MAGIC as u64,
+        "the host's /dev/shm is not a tmpfs, so this case proves nothing"
+    );
+    std::fs::create_dir_all(fixture.layer.join("hp")).expect("mount point");
+    let mut mounts = fixture.mounts();
+    mounts.push(Mount::Bind {
+        source: shm.to_path_buf(),
+        target: inside("/hp"),
+        writable: false,
+    });
+    assert_eq!(
+        try_spawn(fixture.root_with(vec![fixture.layer.clone()], mounts)).expect("a tmpfs source"),
+        boneli_sys::ExitStatus::Exited(0)
+    );
+    cg.destroy().expect("destroy");
 }

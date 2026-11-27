@@ -163,6 +163,43 @@ pub enum Error {
         /// The `errno`; `EIO` for a file that read as empty.
         errno: i32,
     },
+    /// A bind source, root layer or overlay directory is on hugetlbfs, which
+    /// would map huge pages past the memory limit without any flag the
+    /// seccomp rows see (ADR-007, D2 and D7).
+    HugetlbfsSource {
+        /// The host path.
+        path: PathBuf,
+    },
+    /// `/proc/sys/kernel/cap_last_cap` could not be read, so the bounding
+    /// set cannot be dropped completely (ADR-007, D9).
+    CapLastCap(String),
+    /// The seccomp program could not be assembled (ADR-007, D2).
+    SeccompProgram(crate::seccomp::AsmError),
+    /// Landlock is not built into the kernel or not enabled (ADR-007, D10).
+    LandlockUnavailable {
+        /// The `errno` of `landlock_create_ruleset`.
+        errno: i32,
+    },
+    /// The kernel's Landlock ABI is older than the runtime needs.
+    LandlockAbiTooOld {
+        /// The ABI found.
+        found: u32,
+        /// The ABI required.
+        required: u32,
+    },
+    /// A ruleset asks for a right the ABI does not know; Landlock is never
+    /// applied as a best effort (ADR-007, D10).
+    LandlockUnsupported {
+        /// The right.
+        right: &'static str,
+        /// The ABI.
+        abi: u32,
+    },
+    /// A rule allows a right its ruleset does not handle, or none.
+    LandlockRuleNotHandled {
+        /// The right.
+        right: &'static str,
+    },
 }
 
 impl Error {
@@ -305,6 +342,30 @@ impl fmt::Display for Error {
                 f,
                 "the memory statistics keeper of a sandbox cgroup failed (errno {errno}); \
                  no sandbox is created without it (ADR-007, D8)"
+            ),
+            Error::HugetlbfsSource { path } => write!(
+                f,
+                "{} is on hugetlbfs, which would map huge pages past the memory limit",
+                path.display()
+            ),
+            Error::CapLastCap(why) => write!(
+                f,
+                "cannot read /proc/sys/kernel/cap_last_cap to drop every capability: {why}"
+            ),
+            Error::SeccompProgram(e) => write!(f, "the seccomp program does not assemble: {e}"),
+            Error::LandlockUnavailable { errno } => {
+                write!(f, "Landlock is unavailable: {}", strerror(*errno))
+            }
+            Error::LandlockAbiTooOld { found, required } => write!(
+                f,
+                "the kernel's Landlock ABI is {found}, the runtime needs {required}"
+            ),
+            Error::LandlockUnsupported { right, abi } => {
+                write!(f, "Landlock ABI {abi} does not know the right {right}")
+            }
+            Error::LandlockRuleNotHandled { right } => write!(
+                f,
+                "a Landlock rule allows {right}, which its ruleset does not handle"
             ),
         }
     }

@@ -17,10 +17,13 @@
 mod cgroups;
 mod host_setup;
 mod keeper;
+mod landlock;
 mod layer;
 mod mounts;
 mod namespaces;
+mod privileges;
 mod probe;
+mod seccomp;
 mod spawn;
 mod support;
 mod userns;

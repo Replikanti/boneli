@@ -131,7 +131,7 @@ them. Run them in a delegated scope:
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
-  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS= \
+  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS=syslog,shmget-hugetlb \
   cargo test -p boneli-sys -- --ignored
 ```
 
@@ -139,14 +139,26 @@ systemd-run --user --scope -q -p Delegate=yes \
   that the host lacks nothing; set to a comma-separated list of probe ids
   (`userns-apparmor`, `cgroup-not-delegated`, ...), it requires exactly
   that set. CI uses it to prove the error a stock runner gives.
-- `BONELI_SYS_HOST_GAPS`: kernel rows of the seccomp policy this host
-  cannot observe, by id. Exact: an unknown id fails, and so will a listed
-  row that turns out observable. Empty until the seccomp rows exist.
+- `BONELI_SYS_HOST_GAPS`: what this host cannot show, by id (ADR-007, D5).
+  `syslog`: the host gives EPERM to `syslog` without the filter already
+  (`kernel.dmesg_restrict` 1); `shmget-hugetlb`: likewise for
+  `shmget(SHM_HUGETLB)` (the user is outside `vm.hugetlb_shm_group` and
+  lacks `CAP_IPC_LOCK`); `socket-inet-packet` and `ioctl-siocgifbr`: the
+  host lacks af_packet (no `/proc/net/packet`) or the bridge module (no
+  `/sys/module/bridge`), so the test does not try that row, which would
+  load the module; `hugetlbfs-mount`: the host has no hugetlbfs
+  mount. Exact: an unknown id fails, and so does a listed id that turns
+  out observable. The command above has the dev host's value (Fedora 44,
+  measured); CI sets it per leg in `.github/workflows/ci.yml`.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
   so the harness may reorganize its own cgroup: it moves the run's
   processes into `leaf/` and creates every sandbox's cgroup next to it
   (ADR-007, D8). Without it every host test that starts a sandbox
   fails. Never set it in a terminal whose cgroup holds other processes.
+
+Every sandbox these tests start runs without capabilities, with
+`no_new_privs` and under the seccomp policy (ADR-007, D2 and D9); so do
+boneli-oci's sandbox runs below.
 
 ### Host tests (boneli-oci)
 

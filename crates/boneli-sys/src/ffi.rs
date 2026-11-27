@@ -33,6 +33,10 @@ const _: () = assert!(core::mem::size_of::<KernelSigaction>() == 32);
 // libc's SIG_DFL is the handler value 0 the kernel expects.
 const _: () = assert!(libc::SIG_DFL == 0);
 
+/// `KEYCTL_JOIN_SESSION_KEYRING`, `include/uapi/linux/keyctl.h`: with a
+/// NULL name, a new anonymous session keyring for the caller.
+pub(crate) const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+
 /// `OPEN_TREE_CLONE`, `include/uapi/linux/mount.h`: `open_tree` returns a
 /// detached copy of the mount instead of the mount itself.
 pub(crate) const OPEN_TREE_CLONE: u32 = 1 << 0;
@@ -89,3 +93,65 @@ const _: () = assert!(core::mem::size_of::<OpenHow>() == 24);
 /// for glibc and as a `c_int`, which cannot hold it (deprecated there as
 /// overflowing).
 pub(crate) const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// `_LINUX_CAPABILITY_VERSION_3`, `include/uapi/linux/capability.h`: the
+/// `capset` header version with two 32-bit data elements.
+pub(crate) const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `struct __user_cap_header_struct`, `include/uapi/linux/capability.h`.
+#[repr(C)]
+pub(crate) struct CapHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+/// `struct __user_cap_data_struct`, `include/uapi/linux/capability.h`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CapData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<CapHeader>() == 8);
+const _: () = assert!(core::mem::size_of::<CapData>() == 12);
+
+/// `HUGETLBFS_MAGIC`, `include/uapi/linux/magic.h`: `f_type` of hugetlbfs.
+pub(crate) const HUGETLBFS_MAGIC: u32 = 0x9584_58f6;
+
+const _: () = assert!(libc::HUGETLBFS_MAGIC as u32 == HUGETLBFS_MAGIC);
+
+/// `LANDLOCK_RULE_PATH_BENEATH`, `include/uapi/linux/landlock.h`.
+pub(crate) const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+/// `LANDLOCK_RULE_NET_PORT`, `include/uapi/linux/landlock.h`.
+pub(crate) const LANDLOCK_RULE_NET_PORT: u32 = 2;
+
+/// `struct landlock_ruleset_attr`, `include/uapi/linux/landlock.h`, up to
+/// `scoped` (ABI 6). The kernel accepts a struct of this size from ABI 1
+/// on as long as the fields it does not know are zero.
+#[repr(C)]
+pub(crate) struct LandlockRulesetAttr {
+    pub handled_access_fs: u64,
+    pub handled_access_net: u64,
+    pub scoped: u64,
+}
+
+/// `struct landlock_path_beneath_attr`, `include/uapi/linux/landlock.h`,
+/// packed.
+#[repr(C, packed)]
+pub(crate) struct LandlockPathBeneathAttr {
+    pub allowed_access: u64,
+    pub parent_fd: i32,
+}
+
+/// `struct landlock_net_port_attr`, `include/uapi/linux/landlock.h`.
+#[repr(C)]
+pub(crate) struct LandlockNetPortAttr {
+    pub allowed_access: u64,
+    pub port: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<LandlockRulesetAttr>() == 24);
+const _: () = assert!(core::mem::size_of::<LandlockPathBeneathAttr>() == 12);
+const _: () = assert!(core::mem::size_of::<LandlockNetPortAttr>() == 16);

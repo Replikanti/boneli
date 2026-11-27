@@ -2,8 +2,8 @@
 
 - Status: proposed
 - Date: 2026-11-13
-- Accept when: PR 4 of #6 merges with every host test green in CI on both
-  architectures and in a dev-host run.
+- Accept when: PR 5 of #6, the last one, merges with every host test green
+  in CI on both architectures and in a dev-host run.
 
 ## Context
 
@@ -23,12 +23,12 @@ sandboxed process is started. It also fixes how the runtime is tested,
 because none of it can be tested without a host that allows unprivileged
 user namespaces, and how the lints of the unsafe crate are kept honest.
 
-The work lands in four PRs under #6. This ADR is written in the first one
+The work lands in five PRs under #6. This ADR is written in the first one
 and grows while it is proposed: PR 2 adds the namespaces, mounts and broker
-sockets (D7), PR 3 the cgroups (D8), PR 4 the privilege drop (D9),
-Landlock (D10) and, in D2, the census of every syscall, the comparison
-with Docker's default profile and the residual risk. PR 4 sets it to
-accepted.
+sockets (D7), PR 3 the cgroups (D8), PR 4 the seccomp program and its
+huge page rows (D2), the privilege drop (D9) and Landlock (D10), and PR 5,
+in D2, the census of every syscall, the comparison with Docker's default
+profile and the residual risk. PR 5 sets it to accepted.
 
 Measurements quoted below were taken on 2026-11-13 on the dev host
 (Fedora 44, Linux 7.2.10 x86_64, uapi headers 7.2.4, cargo 1.98.0, libc
@@ -77,9 +77,13 @@ the dev host's user does not meet it.
 One fixed policy, no configuration. The filter is a classic BPF program
 assembled by `boneli-sys`; classic BPF allows 4096 instructions
 (`BPF_MAXINSNS`) and jump offsets of 8 bits (at most 255), and the
-assembler checks both. The table below needs about 40 instructions (an
-estimate from the rows; PR 4 records the assembler's count). Rows are
-read top to bottom, the first match wins. Arguments are read at offset
+assembler checks both. The table below assembles to 69 instructions on
+both architectures, and no jump needs more than an 8-bit offset
+(`program_shape` pins the count, so a change to the rows updates it
+here). The program is built once per spawn in the parent, before the
+clone (`Policy::sandbox().program(Arch::NATIVE)`), and installed as the
+child's last step before `execve` (D9). Rows are read top to bottom, the
+first match wins. Arguments are read at offset
 16 + 8·i of `seccomp_data`, the low 32-bit word on little-endian.
 
 | Match | Action | Why |
@@ -93,9 +97,16 @@ read top to bottom, the first match wins. Arguments are read at offset
 | `clone` or `unshare` with `CLONE_NEWUSER` (0x10000000) in the low 32 bits of arg 0 | EPERM | New user namespaces (named by the issue). `clone` uses only the low 32 bits of its flags; `unshare` rejects unknown upper bits with EINVAL. |
 | `clone3` | ENOSYS | Its flags sit behind a pointer that seccomp cannot read. glibc 2.34 and newer fall back to `clone` on ENOSYS, where the row above applies; Docker's profile does the same. |
 | `socket` with low32(arg 0) not in {AF_UNIX 1, AF_INET 2, AF_INET6 10, AF_NETLINK 16} | EAFNOSUPPORT (97) | `AF_VSOCK` works in a fresh user and network namespace (measured) and would bypass "no network" on a VM host; other families load protocol modules on demand. Unix, IPv4 and IPv6 carry the brokers (ADR-006: a bound Unix socket, which the shim relays on loopback). `domain` is an `int`, so the low word is the whole value. |
+| `socket` with family 2 and low32(arg 1) one of 10, 0x80A, 0x8000A, 0x8080A (`SOCK_PACKET`, alone or with `SOCK_NONBLOCK` 0x800 and `SOCK_CLOEXEC` 0x80000) | EAFNOSUPPORT | `__sock_create` turns `socket(AF_INET, SOCK_PACKET, ...)` into a `PF_PACKET` socket before it looks the family up (`net/socket.c:1600` in 7.2), so without this row the family row's exclusion of packet sockets is bypassed, and a kernel with af_packet as a module that is not loaded runs `request_module("net-pf-17")` (`net/socket.c:1632`); found in review of PR 4 (inside, the call gave `packet_create`'s EPERM where `socket(AF_PACKET, SOCK_RAW, 0)` gave the family row's EAFNOSUPPORT; af_packet is built in on the dev host, so nothing loaded). The call fails at `packet_create` without `CAP_NET_RAW` anyway (D9), so nothing that works today breaks. The four values are every form the kernel accepts with type 10: `__sys_socket_create` refuses any other bit beside the type with EINVAL (`net/socket.c:1742`), and `type` is an `int`. Only AF_INET is rewritten, so AF_INET6 keeps the protocol row. EAFNOSUPPORT is what a kernel without af_packet answers. |
 | `socket` with family 16 and low32(arg 2) ≠ `NETLINK_ROUTE` (0) | EPROTONOSUPPORT (93) | Other netlink protocols reach unrelated subsystems (netfilter, audit, generic netlink, uevents, xfrm, crypto), and creating the socket can autoload a module (`request_module` in `netlink_create`). Routing is what glibc's `getaddrinfo` (`AI_ADDRCONFIG`) and `getifaddrs`, libuv's interface list and Chromium's network-change watcher use; inside it reads only the sandbox's own network namespace, and changes need `CAP_NET_ADMIN`. EPROTONOSUPPORT is what `netlink_create` returns for an unavailable protocol, and libaudit reads it as "no audit support", so PAM-based tools keep working. Any further protocol needs a reason in this ADR. |
+| `socket` with family 2 or 10 and low32(arg 2) not in {0, IPPROTO_TCP 6, IPPROTO_UDP 17}, plus IPPROTO_ICMP 1 for AF_INET and IPPROTO_ICMPV6 58 for AF_INET6 | EPROTONOSUPPORT | The same reason as the netlink row: `inet_create` and `inet6_create` call `request_module("net-pf-<family>-proto-<p>-type-<t>")` and then `"net-pf-<family>-proto-<p>"` for a protocol no registered handler serves, with no capability check, so without this row a sandbox could load SCTP (132), L2TP-over-IP (115) or SMC (256) into the host kernel (all three ship as modules on the dev host and are not blacklisted; found in review of PR 4, where `socket(AF_INET, SOCK_STREAM, 33)` took 6.3-7.2 ms inside against 0.05-0.07 ms for TCP: two modprobe round trips). Why each entry: 0 lets the kernel pick the type's default (TCP for a stream, UDP for a datagram, the form most programs use), 6 and 17 are the same two by name, and 1 and 58 are the protocols of unprivileged ping sockets (`SOCK_DGRAM`, gated by `net.ipv4.ping_group_range`, which `inet_init_net` sets to no group (`1 0`) in every new network namespace, so inside they work only once that range is widened). Raw sockets need `CAP_NET_RAW`, which the workload lacks (D9), so allowing a raw protocol buys nothing. The list cannot itself trigger a load: the dev host's `modules.alias` names `net-pf-2-` and `net-pf-10-` only with protocols 115, 132 and 256 (8 aliases, measured), never 0, 1, 6, 17 or 58, so the names `request_module` builds for an allowed protocol with an unserved type match no module. Why not the rest: every other protocol is either a module (the three above, DCCP 33 on kernels that still have it) or a built-in the applications under debugging do not use, MPTCP 262 and UDP-Lite 136 among them, and each is attack surface the sandbox does not need. EPROTONOSUPPORT is what the kernel answers for a protocol it does not have, so a program that probes for one behaves as on a kernel built without it. Any further protocol needs a reason in this ADR. |
 | `socketpair` with low32(arg 0) ≠ AF_UNIX | EAFNOSUPPORT | Of the four allowed families only AF_UNIX implements `socketpair`; the others create a socket (for netlink possibly autoloading a module) and then fail with EOPNOTSUPP. Docker's current profile allows only AF_UNIX and AF_TIPC (moby/profiles `7b5ccfa`). |
-| anything else | allow | Classified one by one in the census (PR 4). Capability-gated calls fail because the workload holds no capability in any namespace (D9), and the census proves each one. |
+| `mmap` with `MAP_HUGETLB` (0x40000) in low32(arg 3) | EPERM | Huge pages are charged to `memory.max` only where cgroup2 is mounted with `memory_hugetlb_accounting` (D8), so on a host with reserved huge pages a sandbox could take them past its limit. `flags` is an `unsigned long`, but the kernel tests only this bit, which lies in the low word; the `MAP_HUGE_*` size bits (26–31) mean nothing without it. |
+| `shmget` with `SHM_HUGETLB` (0x800) in low32(arg 2) | EPERM | The same, for SysV segments. `shmflg` is an `int`. Neither architecture has the `ipc` multiplexer; the i386 one is killed by the arch row. |
+| `memfd_create` with `MFD_HUGETLB` (0x4) in low32(arg 1) | EPERM | The same, for memfds. `flags` is an `unsigned int`. |
+| `ioctl` with low32(arg 1) = `TIOCSETD` (0x5423) | EPERM | Setting a line discipline that is not registered makes `tty_ldisc_get` call `request_module("tty-ldisc-<n>")` without a capability check when `dev.tty.ldisc_autoload` is 1 (the default of `CONFIG_LDISC_AUTOLOAD`; both are so on the dev host, measured), and the sandbox has a pty of its own (D7's devpts and `/dev/ptmx`). The dev host ships 9 such modules, among them n_hdlc (tty-ldisc-13, the CVE-2017-2636 class); found in review of PR 4 (TIOCSETD 29, which has no module, took 3.2-4.3 ms inside against 0.02-0.04 ms for N_TTY). A program never needs to change its terminal's discipline to be debugged, so the whole ioctl is refused, N_TTY included; reading it (`TIOCGETD`, 0x5424) stays allowed. `cmd` is an `unsigned int`, and the number is the same on both architectures (`asm-generic/ioctls.h`). |
+| `ioctl` with low32(arg 1) one of `SIOCGIFBR` 0x8940, `SIOCSIFBR` 0x8941, `SIOCGIFVLAN` 0x8982, `SIOCSIFVLAN` 0x8983, `SIOCBRADDBR` 0x89a0, `SIOCBRDELBR` 0x89a1, `SIOCBRADDIF` 0x89a2, `SIOCBRDELIF` 0x89a3 | EPERM | `sock_ioctl` calls `request_module("8021q")` for the VLAN pair while no VLAN hook is set, and `br_ioctl_call` calls `request_module("bridge")` for the six bridge numbers (`net/socket.c:1381` and `:1269` in 7.2), with no capability check and on any socket, a Unix one included; found in review of PR 4 (8021q ships as a module on the dev host, is not loaded and not blacklisted; inside, `SIOCGIFBR` with `BRCTL_GET_VERSION` on a Unix socket returned the bridge module's answer 1 before this row). These are the legacy `brctl` and `vconfig` interfaces, which rtnetlink replaced, and a program under debugging never manages bridges or VLANs (creating either needs `CAP_NET_ADMIN`, D9), so the numbers are refused whole. `cmd` is an `unsigned int`; the numbers lie in the socket ioctl range (`sockios.h`, type 0x89) and are the same on both architectures, so no device ioctl shares them. |
+| anything else | allow | Classified one by one in the census (PR 5). Capability-gated calls fail because the workload holds no capability in any namespace (D9), and the census proves each one. |
 
 The syscall numbers the rows use (uapi 7.2.4):
 
@@ -107,6 +118,8 @@ The syscall numbers the rows use (uapi 7.2.4):
 | syslog | 103 | 116 |
 | clone / unshare / clone3 | 56 / 272 / 435 | 220 / 97 / 435 |
 | socket / socketpair | 41 / 53 | 198 / 199 |
+| mmap / shmget / memfd_create | 9 / 29 / 319 | 222 / 194 / 279 |
+| ioctl | 16 | 29 |
 
 `AUDIT_ARCH_X86_64` = `EM_X86_64` (62) | `__AUDIT_ARCH_64BIT` (0x80000000) |
 `__AUDIT_ARCH_LE` (0x40000000) = 0xC000003E; `AUDIT_ARCH_AARCH64` = 183 |
@@ -114,8 +127,192 @@ the same bits = 0xC00000B7. libc 0.2.191 lacks the `AUDIT_ARCH_*`
 constants and the syscall numbers 463–471, so `boneli-sys` defines them
 locally, each citing its uapi header.
 
+The flag values are libc 0.2.191's (`MAP_HUGETLB` is the same on both
+architectures, `SHM_HUGETLB` and `MFD_HUGETLB` sit in libc's shared
+Linux module), and `seccomp::table` pins every number and flag, the IP
+protocols, `TIOCSETD`, `SIOCGIFBR`, `SIOCSIFBR`, `SOCK_NONBLOCK` and
+`SOCK_CLOEXEC` included, to `libc` at compile time for the build's
+architecture; the musl `cargo check` for aarch64 in CI evaluates the
+aarch64 assertions. libc 0.2.191 defines `SOCK_PACKET`, the VLAN pair and
+the four `SIOCBR*` numbers for Android (and `SOCK_PACKET` for uclibc)
+only, so those seven cite `include/linux/net.h` and `sockios.h` instead,
+and the pure tests write them out.
+
+**The huge page rows answer EPERM, not ENOMEM.** Without the filter, as
+the unprivileged dev-host user with no reserved huge pages
+(`vm.nr_hugepages` 0, measured): `mmap(MAP_HUGETLB)` gives ENOMEM,
+`shmget(SHM_HUGETLB)` EPERM (outside `vm.hugetlb_shm_group`, without
+`CAP_IPC_LOCK`), `memfd_create(MFD_HUGETLB)` succeeds. EPERM is this
+table's answer for a refused feature, and it differs from the unfiltered
+`mmap` and `memfd_create` results, so those two rows are observable on
+every host. The weak spot is a program that falls back to normal pages
+only on ENOMEM. The two users that matter fall back on any error (read in
+their sources): glibc's `glibc.malloc.hugetlb` path in `sysmalloc` tries
+`sysmalloc_mmap` with `mp_.hp_flags` and, on `MAP_FAILED`, the same call
+with normal pages (`malloc/malloc.c` at glibc `04e750e`), and
+PostgreSQL's `huge_pages=try` in `CreateAnonymousSharedMemory` retries
+without `MAP_HUGETLB` whenever the first `mmap` returned `MAP_FAILED`
+(`src/backend/port/sysv_shmem.c` at PostgreSQL `ad33a14`); `huge_pages=on`
+fails the start, as it does on a host without huge pages. Left open, and
+why: transparent huge pages (`madvise(MADV_HUGEPAGE)`, `MADV_COLLAPSE`)
+are charged to the memory cgroup like normal pages; `shmat` reaches only
+segments the sandbox created (its own IPC namespace, D7); and the
+sandbox's tree has no hugetlbfs (`/dev` is a fresh tmpfs, mounting one
+needs the capabilities D9 removes, and `spawn` refuses a source on
+hugetlbfs, D7).
+
+**How the policy is tested.** The pure tests (in `check`) run the
+assembled program for both architectures through an interpreter of the
+same BPF subset, written from the opcode definitions and not from the
+assembler (`tests/boneli_sys_tests/support/bpf.rs`), with the syscall
+numbers of the table above written out in the test rather than taken
+from `seccomp::table`: every number from 0 to 479 with zeroed arguments,
+472, x32 numbers and −1, three foreign architectures
+(`policy_decisions_x86_64`, `policy_decisions_aarch64`), and per row the
+argument forms that select it and the ones that must not
+(`user_namespace_rows`, `socket_family_rows`, `netlink_protocol_rows`,
+`inet_protocol_rows` over every protocol from 0 to 300 for both families
+and three socket types, `sock_packet_row`, `tty_line_discipline_row`,
+`module_ioctl_rows`, `hugetlb_flag_rows`),
+plus the shape of the program (`program_shape`).
+The interpreter shares assumptions with the assembler, so the kernel
+rows (`seccomp_rows`, host) make each call twice: once on the host as the
+unprivileged user without a filter (the baseline), and once in a
+sandbox as inside ids 0 and 999, where the result must equal the row's
+action (an allowed call must succeed). When the baseline already equals
+the filtered result, the row is unobservable on that host and fails
+unless `BONELI_SYS_HOST_GAPS` lists it; a listed row that turns out
+observable fails too, so the list is exact. On x86_64 an `int 0x80`
+`getpid` must kill the probe with SIGSYS. Dev-host baselines (Linux
+7.2.10): `io_uring_setup`, `userfaultfd`, `perf_event_open`, `keyctl`,
+`add_key`, both new-user-namespace forms of `clone` and `unshare` (in a
+forked single-threaded child), `socket(AF_VSOCK)`,
+`socket(AF_NETLINK, NETLINK_NETFILTER)`, `memfd_create(MFD_HUGETLB)`,
+`ioctl(TIOCSETD, N_TTY)` on a new pty and the allowed
+`socket(AF_INET, SOCK_STREAM, TCP)` and `socket(AF_INET6, SOCK_DGRAM, UDP)`
+succeed; `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` and its AF_INET6 twin
+give EPERM (no `CAP_NET_RAW`; with a protocol other than 0 a raw socket
+matches the raw entry, so no module is asked for), which the filter turns
+into EPROTONOSUPPORT (`SOCK_RAW` with protocol 0 is another case: `0 ==
+IPPROTO_IP` matches no entry, so `inet_create` reaches
+`request_module("net-pf-2-proto-0-type-3")`, which no alias matches, the
+same as an allowed protocol with an unserved type in the protocol row);
+`socket(AF_INET, SOCK_PACKET, 0)` gives `packet_create`'s EPERM and
+`ioctl(SIOCGIFBR, BRCTL_GET_VERSION)` on a Unix socket returns 1 (af_packet
+is built in and bridge is loaded, so neither asks for a module); zeroed `bpf` gives EINVAL, `request_key` ENOKEY,
+`unshare` with bit 32 EINVAL, `clone3(NULL, 0)` EINVAL, `socketpair(AF_INET)`
+EOPNOTSUPP, `mmap(MAP_HUGETLB)` ENOMEM; `syslog` (`dmesg_restrict` 1) and
+`shmget(SHM_HUGETLB)` give EPERM already, so those two are the dev
+host's gaps (`syslog,shmget-hugetlb`) and only the interpreter proves
+them there. Two kernel rows are tried only where the host has the
+module their baseline call would otherwise ask for: `socket-inet-packet`
+where `/proc/net/packet` exists (af_packet registered in the host's
+network namespace) and `ioctl-siocgifbr` where `/sys/module/bridge`
+exists. The test decides on the host (the sandbox has no `/sys`) and
+passes the result to both runs, so neither the baseline nor the sandbox
+ever loads a module, not even under a broken filter; where the module is
+absent the row is untried and must be listed in `BONELI_SYS_HOST_GAPS`
+under its id, and a listed row whose module is present fails
+(`module_row_classification`). The VLAN pair is never tried, because
+8021q is a module the dev host has not loaded, so the interpreter alone
+proves it. Under the filter a new thread, a forked child and a filter
+the workload stacks on top all keep the rows
+(`filter_covers_threads_children_and_stacking`), and glibc's thread start
+falls back from `clone3` to `clone` (`clone3_fallback_starts_threads`).
+
+**The keyring rows do not hide the runner's keys on their own.** The
+keyring is not namespaced: a procfs mounted in the sandbox's user
+namespace lists in `/proc/keys` every key, with description and serial,
+whose owner the namespace maps (the runner's, the single mapped id of
+D1), and `/proc/key-users` its quota line; and the clone copies the
+runner's session keyring, so the workload possesses it. Found in review
+of PR 4 (a user key added on the host showed inside for ids 0 and 999).
+So the sandbox's procfs covers both files with a read-only bind of the
+host's `/dev/null` (D7; reading them gives 0 bytes), as Docker's
+`MaskedPaths` do for other proc files, and the child joins a new
+anonymous session keyring (`keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)`,
+`Step::SessionKeyring`, code 29) right after the id maps (D4). The join
+comes before the mounts because, joined after them, the runner's keyring
+kept one reference for as long as the sandbox ran (measured with the test
+below): something the mount steps create holds the credentials of that
+moment. The new keyring counts against the runner user's key quota
+(`kernel.keys.maxkeys` 200 and `maxbytes` 20000 on the dev host,
+measured) for as long as the sandbox lives, one keyring per sandbox; a
+refused join (over that quota, for example) fails the spawn at that
+step: closed, never a sandbox with the runner's keyring. `runner_keyring_hidden` (host) joins an
+anonymous session keyring in a thread of its own, so no key is added to
+the runner's keyrings and the keyring ends with that thread on every
+path, and reads its usage count in the host's `/proc/keys`: a host child
+of that thread raises it and lists it; a sandbox started from it, while
+alive, leaves the count at its base, and reads both files as empty, for
+inside ids 0 and 999. Both steps need the keyrings, so `Features::probe`
+checks them (`keyrings`, D3): a kernel without `CONFIG_KEYS` would pass
+every other probe and then fail every spawn at `session-keyring`
+(`keyctl` gives ENOSYS) or at the mask (`/proc/keys` is absent); review
+of PR 4.
+
+**Module autoload: every call site in Linux 7.2.** A capability-less
+process that makes the kernel call `request_module` loads a module into
+the host kernel for everyone; review of PR 4 found five such paths one
+at a time (the protocol, `TIOCSETD`, `SOCK_PACKET` and the two ioctl
+rows), so this PR enumerates the class instead. Method: every call of
+`request_module`, `request_module_nowait`, `__request_module`,
+`try_then_request_module` and `symbol_request` in the C sources of the
+`linux-7.2` tarball (SHA-256 `f9fef3d1…02b3`, as kernel.org's
+`sha256sums.asc` lists it), architectures other than x86 and arm64 and
+`drivers/gpu` left out, comments, strings and the definitions in
+`kmod.h`, `module.h` and `kmod.c` excluded: **326 sites**. A site counts
+as reachable when a syscall the policy allows leads to it without a
+capability check that the drop of D9 defeats (`capable()` checks the
+initial user namespace, where the runner user has nothing; `ns_capable`
+in the sandbox's own namespaces fails because every set is empty); for
+each site the path was read in the 7.2 source, line numbers below are
+7.2's. Result: **42 sites are covered by a row, 279 are unreachable, 5
+are residual** (42 + 279 + 5 = 326).
+
+| Group | Sites | Why |
+|---|---|---|
+| Covered: family row | 11 | `__sock_create`'s `net-pf-<family>` (`net/socket.c:1632`) for every refused family, and the protocol modules of the families that only a refused family reaches (`pppox`, ATM, CAN, Bluetooth, Phonet, RDS, `AF_ALG`'s `algif-<type>`). The `SOCK_PACKET` row closes the one rewrite to another family (`net/socket.c:1600`). An allowed family built as a module (`CONFIG_IPV6=m`) would load on its first socket, as the policy intends; the dev host builds all four in (`/boot` config). |
+| Covered: protocol row | 4 | `inet_create` and `inet6_create`, `net-pf-<f>-proto-<p>[-type-<t>]`; for an allowed protocol with an unserved type (and `SOCK_RAW` with protocol 0) the name matches no alias (D2's protocol row). |
+| Covered: netlink row | 24 | Reached only through a refused netlink protocol: `netlink_create` (`af_netlink.c:668`; `NETLINK_ROUTE` is registered at boot, so the `registered` test at `:666` never fails for it), `NETLINK_SOCK_DIAG` (`sock_load_diag_module`), generic netlink (`ctrl_getfamily`, and through it OVS, L2TP, team, IPVS), `NETLINK_NETFILTER` (nfnetlink, ctnetlink, nf_tables, nft_compat, ipset, log and queue), `NETLINK_RDMA`, and XFRM states (`NETLINK_XFRM`; `AF_KEY` is refused by the family row, and `IP_XFRM_POLICY`/`IPV6_XFRM_POLICY` need `CAP_NET_ADMIN`, `ip_sockglue.c:1345`, `ipv6_sockglue.c:933`). |
+| Covered: ioctl rows | 3 | `tty_ldisc_get` (`tty_ldisc.c:155`, `TIOCSETD`), `br_ioctl_call` and the VLAN branch of `sock_ioctl` (`net/socket.c:1269`, `:1381`). |
+| Unreachable: `capable()` | 4 | `dev_load` (`dev_ioctl.c:673`, `:675`: `capable(CAP_NET_ADMIN)`, `capable(CAP_SYS_MODULE)`; every `SIOC*` path that names a device goes through it, `devinet_ioctl` and wireless extensions included), the TCP ULP (`tcp_ulp.c:42`) and congestion control by name (`tcp_cong.c:55`), so `setsockopt(TCP_ULP)` and `TCP_CONGESTION` find only what is loaded and need no row. |
+| Unreachable: rtnetlink writes | 8 | `rtnl_newlink`'s `rtnl-link-<kind>`, lightweight tunnel encaps (new and deleted routes and nexthops), qdisc creation, tc actions, ematches, IFE metadata, DSA taggers: all behind `rtnetlink_rcv_msg`'s `CAP_NET_ADMIN` check for every message kind but GET (`rtnetlink.c:7003`; DSA taggers also through root-owned sysfs). |
+| Unreachable: netfilter configuration | 19 | x_tables matches, targets and tables, revisions, ebtables, IPVS, conntrack helpers, the bridge conntrack, the BPF link's defrag (`bpf` is refused) and `textsearch` (`xt_string`, `em_text`): reached from `setsockopt`/`getsockopt` behind `ns_capable(CAP_NET_ADMIN)` (`ip_tables.c:1622`, `:1653`, `ip6_tables.c:1631`, `:1662`, `arp_tables.c:1428`, `:1458`, `ebtables.c:2494`, `:2561`, `ip_vs_ctl.c:3485`, `:3792`), from rules those create, or from nfnetlink. |
+| Unreachable: sysctls | 2 | `nf_conntrack_log_invalid` and `net.core.default_qdisc`: writing a sysctl needs global root or, for a network namespace's own, `CAP_NET_ADMIN` in its owner (`fs/proc/proc_sysctl.c:427`, `net/sysctl_net.c:48`); `default_qdisc` exists only in the initial namespace (`sysctl_net_core.c:845`). |
+| Unreachable: mounts | 17 | `get_fs_type`'s `fs-<type>` (`filesystems.c:400`), NLS tables, Unicode, NFS, SunRPC, 9p, OCFS2, DLM, the BPF preload, quota formats: reached from `mount`, `fsopen` and `fsconfig` behind `may_mount` (`fs/namespace.c:2009`, callers `:4106` and `fsopen.c:127`), from in-kernel servers, or from `quotactl(Q_QUOTAON)` behind `capable(CAP_SYS_ADMIN)` (`fs/quota/quota.c:47`). |
+| Unreachable: device nodes | 19 | `char-major-<M>-<m>` and `block-major-<M>-<m>` (`char_dev.c:665`, `genhd.c:896`), misc, sound, framebuffer and PPP: they need a node the sandbox cannot open. Its `/dev` holds only `null`, `zero`, `full`, `random`, `urandom`, `tty` and its own devpts (D7), `mknod` of a device needs `capable(CAP_MKNOD)` (`fs/namei.c:5116`), and every other mount is `nodev` or created in the sandbox's user namespace, whose superblocks get `SB_I_NODEV` (`fs/super.c:359`, checked by `may_open_dev`, `fs/namei.c:4230`). |
+| Unreachable: drivers and internal | 210 | Driver probe and firmware callbacks, module init, hardware events, root-owned sysfs and configfs (`md`, `dm`, `target`, `nvmet`, governors, the I/O scheduler), and kernel-internal callers with fixed names; no syscall the sandbox makes leads there (`drivers/media` 92, `drivers/macintosh` 32 (PowerPC), `drivers/md` 10, `drivers/net` 8, `net/6lowpan` 7, `drivers/target` 7, and 54 more in 31 directories, listed below). |
+| **Residual: tc classifier by name** | 1 | `RTM_GETTFILTER` on `NETLINK_ROUTE` with `tcm_ifindex` = `TCM_IFINDEX_MAGIC_BLOCK` and a `TCA_KIND` reaches `tcf_proto_is_unlocked` → `tcf_proto_lookup_ops` → `request_module("net-cls-<kind>")` (`cls_api.c:2698`, `:360`, `:260`) with no capability check, because rtnetlink checks none for GET (`rtnetlink.c:7003`). Measured on the dev host as the unprivileged user (the same path inside): a kind without a module took 3.0–5.9 ms against 21–44 µs with no kind or the built-in `cgroup` kind (3 runs each, the modprobe round trip; no module named). The host has 8 `net-cls-*` aliases (`cls_basic`, `cls_bpf`, `cls_flow`, `cls_flower`, `cls_fw`, `cls_matchall`, `cls_route`, `cls_u32`), none loaded. No row can close it: the kind sits in the message, which seccomp cannot read, and refusing `NETLINK_ROUTE` would break `getifaddrs` (the netlink row's reason). A loaded classifier gives the sandbox nothing to use, since creating a filter needs `CAP_NET_ADMIN`; the risk is the module's code in the host kernel. Host mitigation: `install cls_<name> /bin/false` (or `blacklist cls_<name>`, which works here because the alias is the module's own) in `/etc/modprobe.d` for the eight, or `kernel.modules_disabled=1` after boot. PR 5's residual-risk item. |
+| **Residual: crypto algorithms by fixed name** | 4 | `crypto-<name>`, `crypto-<name>-all`, `cryptomgr` and templates (`crypto/api.c:303`, `:307`, `:330`, `crypto/algapi.c:638`) through in-kernel users the workload drives without a capability. fscrypt on a filesystem with encryption (ext4 or f2fs with the `encrypt` feature, CephFS): `FS_IOC_ADD_ENCRYPTION_KEY` needs `CAP_SYS_ADMIN` only for v1 keys (`fs/crypto/keyring.c:751`), `FS_IOC_SET_ENCRYPTION_POLICY` only ownership of an empty directory, and the first file allocates the mode's cipher (`fs/crypto/keysetup.c:107`, 8 names fixed at `:20`–`:73`, among them `adiantum(xchacha12,aes)`, `hctr2(aes)`, `xts(sm4)`). kTLS (`setsockopt(SOL_TLS, TLS_TX)`, `net/tls/tls_sw.c:2586`, 6 cipher names) once someone else has loaded `tls` (the ULP autoload is `capable()`-gated). No path takes a name the workload chooses: `AF_ALG`, `keyctl` and XFRM are refused by rows. Derived from the source, not measured: the dev host's workspace is btrfs (no fscrypt) and `tls` is not loaded. Host mitigation: `install <module> /bin/false` for the algorithm modules the host does not use, a workspace filesystem without `encrypt`, or `kernel.modules_disabled=1`. PR 5's residual-risk item. |
+
+Two paths the class could suggest have no site in 7.2: `fs/exec.c` calls
+no `request_module` (exec of an unknown format loads no `binfmt-<n>`),
+and `personality` loads nothing. A site added by a later kernel is found
+the same way when the census (PR 5) moves the reviewed table forward.
+
+<details>
+<summary>Every site by group (326)</summary>
+
+- Family row (11): `crypto/af_alg.c:177`, `drivers/net/ppp/pppox.c:121`, `net/atm/common.c:484`, `net/atm/ioctl.c:95`, `net/atm/ioctl.c:98`, `net/atm/resources.c:229`, `net/bluetooth/af_bluetooth.c:125`, `net/can/af_can.c:132`, `net/phonet/af_phonet.c:77`, `net/rds/transport.c:125`, `net/socket.c:1632`
+- Protocol row (4): `net/ipv4/af_inet.c:306`, `net/ipv4/af_inet.c:313`, `net/ipv6/af_inet6.c:151`, `net/ipv6/af_inet6.c:158`
+- Netlink row (24): `drivers/infiniband/core/device.c:1994`, `drivers/infiniband/core/netlink.c:101`, `drivers/infiniband/core/nldev.c:1811`, `drivers/net/team/team_core.c:480`, `net/core/sock.c:4326`, `net/core/sock.c:4338`, `net/l2tp/l2tp_netlink.c:630`, `net/netfilter/ipset/ip_set_core.c:113`, `net/netfilter/nfnetlink.c:234`, `net/netfilter/nfnetlink.c:397`, `net/netfilter/nfnetlink.c:722`, `net/netfilter/nfnetlink_log.c:951`, `net/netfilter/nfnetlink_queue.c:1851`, `net/netfilter/nft_compat.c:768`, `net/netfilter/nf_conntrack_netlink.c:1863`, `net/netfilter/nf_conntrack_netlink.c:1882`, `net/netfilter/nf_conntrack_netlink.c:2256`, `net/netfilter/nf_tables_api.c:11205`, `net/netlink/af_netlink.c:668`, `net/netlink/genetlink.c:1449`, `net/openvswitch/vport.c:233`, `net/xfrm/xfrm_state.c:368`, `net/xfrm/xfrm_state.c:451`, `net/xfrm/xfrm_state.c:581`
+- Ioctl row TIOCSETD (1): `drivers/tty/tty_ldisc.c:155`
+- Ioctl rows bridge and VLAN (2): `net/socket.c:1269`, `net/socket.c:1381`
+- capable() (4): `net/core/dev_ioctl.c:674`, `net/core/dev_ioctl.c:676`, `net/ipv4/tcp_cong.c:57`, `net/ipv4/tcp_ulp.c:44`
+- rtnetlink writes (8): `net/core/lwtunnel.c:169`, `net/core/rtnetlink.c:4091`, `net/dsa/tag.c:183`, `net/dsa/tag.c:209`, `net/sched/act_api.c:1373`, `net/sched/act_ife.c:275`, `net/sched/ematch.c:218`, `net/sched/sch_api.c:1814`
+- netfilter configuration (19): `lib/textsearch.c:281`, `net/bridge/netfilter/ebtables.c:371`, `net/bridge/netfilter/ebtables.c:413`, `net/bridge/netfilter/ebt_nflog.c:52`, `net/ipv4/netfilter/arp_tables.c:1490`, `net/ipv4/netfilter/ip_tables.c:1692`, `net/ipv6/netfilter/ip6_tables.c:1701`, `net/netfilter/ipvs/ip_vs_pe.c:57`, `net/netfilter/ipvs/ip_vs_sched.c:125`, `net/netfilter/nf_bpf_link.c:46`, `net/netfilter/nf_conntrack_helper.c:85`, `net/netfilter/nf_conntrack_helper.c:148`, `net/netfilter/nf_conntrack_proto.c:495`, `net/netfilter/xt_LOG.c:64`, `net/netfilter/xt_NFLOG.c:54`, `net/netfilter/xt_physdev.c:137`, `net/netfilter/x_tables.c:240`, `net/netfilter/x_tables.c:287`, `net/netfilter/x_tables.c:1382`
+- sysctls (2): `net/netfilter/nf_conntrack_standalone.c:578`, `net/sched/sch_api.c:233`
+- mounts (17): `fs/dlm/lowcomms.c:1885`, `fs/filesystems.c:400`, `fs/nfs/client.c:97`, `fs/nfs/pnfs.c:184`, `fs/nfs/pnfs_nfs.c:791`, `fs/nls/nls_base.c:304`, `fs/ocfs2/stackglue.c:133`, `fs/quota/dquot.c:208`, `fs/unicode/utf8-core.c:184`, `kernel/bpf/inode.c:1130`, `net/9p/mod.c:116`, `net/sunrpc/auth.c:148`, `net/sunrpc/auth_gss/gss_mech_switch.c:154`, `net/sunrpc/auth_gss/gss_mech_switch.c:167`, `net/sunrpc/auth_gss/gss_mech_switch.c:221`, `net/sunrpc/svc_xprt.c:334`, `net/sunrpc/xprt.c:217`
+- device nodes (19): `block/genhd.c:896`, `block/genhd.c:899`, `drivers/char/misc.c:138`, `drivers/net/ppp/ppp_generic.c:3063`, `drivers/video/fbdev/core/fbcon.c:3128`, `drivers/video/fbdev/core/fb_chrdev.c:336`, `fs/char_dev.c:665`, `fs/char_dev.c:667`, `sound/core/control.c:2281`, `sound/core/seq/seq_clientmgr.c:138`, `sound/core/seq_device.c:116`, `sound/core/sound.c:66`, `sound/core/sound.c:79`, `sound/core/timer.c:218`, `sound/core/timer.c:223`, `sound/sound_core.c:562`, `sound/sound_core.c:563`, `sound/sound_core.c:572`, `sound/sound_core.c:573`
+- drivers and internal (210): `block/elevator.c:783`, `drivers/char/ipmi/ipmi_si_platform.c:384`, `drivers/char/ipmi/ipmi_ssif.c:1471`, `drivers/cpufreq/cpufreq.c:676`, `drivers/cpufreq/powernow-k8.c:1166`, `drivers/crypto/intel/qat/qat_c3xxxvf/adf_drv.c:206`, `drivers/crypto/intel/qat/qat_c3xxx/adf_drv.c:236`, `drivers/crypto/intel/qat/qat_c62xvf/adf_drv.c:206`, `drivers/crypto/intel/qat/qat_c62x/adf_drv.c:236`, `drivers/crypto/intel/qat/qat_dh895xccvf/adf_drv.c:206`, `drivers/crypto/intel/qat/qat_dh895xcc/adf_drv.c:236`, `drivers/dax/hmem/hmem.c:217`, `drivers/dax/hmem/hmem.c:218`, `drivers/devfreq/devfreq.c:307`, `drivers/devfreq/devfreq.c:309`, `drivers/firmware/arm_scmi/driver.c:283`, `drivers/hwtracing/intel_th/core.c:589`, `drivers/hwtracing/stm/core.c:1347`, `drivers/input/serio/hp_sdc.c:932`, `drivers/leds/led-triggers.c:312`, `drivers/macintosh/therm_adt746x.c:611`, `drivers/macintosh/windfarm_pm72.c:820`, `drivers/macintosh/windfarm_pm72.c:821`, `drivers/macintosh/windfarm_pm72.c:822`, `drivers/macintosh/windfarm_pm72.c:823`, `drivers/macintosh/windfarm_pm72.c:824`, `drivers/macintosh/windfarm_pm81.c:783`, `drivers/macintosh/windfarm_pm81.c:784`, `drivers/macintosh/windfarm_pm81.c:785`, `drivers/macintosh/windfarm_pm81.c:786`, `drivers/macintosh/windfarm_pm91.c:711`, `drivers/macintosh/windfarm_pm91.c:712`, `drivers/macintosh/windfarm_pm91.c:713`, `drivers/macintosh/windfarm_pm91.c:714`, `drivers/macintosh/windfarm_pm112.c:693`, `drivers/macintosh/windfarm_pm112.c:694`, `drivers/macintosh/windfarm_pm112.c:695`, `drivers/macintosh/windfarm_pm112.c:696`, `drivers/macintosh/windfarm_pm112.c:697`, `drivers/macintosh/windfarm_pm112.c:698`, `drivers/macintosh/windfarm_pm121.c:1016`, `drivers/macintosh/windfarm_pm121.c:1017`, `drivers/macintosh/windfarm_pm121.c:1018`, `drivers/macintosh/windfarm_pm121.c:1019`, `drivers/macintosh/windfarm_pm121.c:1020`, `drivers/macintosh/windfarm_pm121.c:1021`, `drivers/macintosh/windfarm_rm31.c:712`, `drivers/macintosh/windfarm_rm31.c:713`, `drivers/macintosh/windfarm_rm31.c:714`, `drivers/macintosh/windfarm_rm31.c:715`, `drivers/macintosh/windfarm_rm31.c:716`, `drivers/macintosh/windfarm_rm31.c:717`, `drivers/md/dm-cache-policy.c:66`, `drivers/md/dm-exception-store.c:88`, `drivers/md/dm-log.c:85`, `drivers/md/dm-path-selector.c:64`, `drivers/md/dm-target.c:48`, `drivers/md/md.c:4102`, `drivers/md/md.c:4103`, `drivers/md/md.c:6658`, `drivers/md/md.c:6660`, `drivers/md/md.c:9174`, `drivers/media/common/siano/sms-cards.c:345`, `drivers/media/dvb-core/dvbdev.c:1038`, `drivers/media/pci/bt8xx/bttv-driver.c:187`, `drivers/media/pci/bt8xx/bttv-input.c:405`, `drivers/media/pci/cx18/cx18-driver.c:245`, `drivers/media/pci/cx88/cx88-mpeg.c:48`, `drivers/media/pci/cx88/cx88-mpeg.c:50`, `drivers/media/pci/cx88/cx88-video.c:1384`, `drivers/media/pci/cx88/cx88-video.c:1390`, `drivers/media/pci/cx23885/cx23885-cards.c:2071`, `drivers/media/pci/cx23885/cx23885-dvb.c:1159`, `drivers/media/pci/cx23885/cx23885-dvb.c:1826`, `drivers/media/pci/cx23885/cx23885-dvb.c:1843`, `drivers/media/pci/cx23885/cx23885-dvb.c:1864`, `drivers/media/pci/cx23885/cx23885-dvb.c:1897`, `drivers/media/pci/cx23885/cx23885-dvb.c:1914`, `drivers/media/pci/cx23885/cx23885-dvb.c:1947`, `drivers/media/pci/cx23885/cx23885-dvb.c:1983`, `drivers/media/pci/cx23885/cx23885-dvb.c:2001`, `drivers/media/pci/cx23885/cx23885-dvb.c:2028`, `drivers/media/pci/cx23885/cx23885-dvb.c:2046`, `drivers/media/pci/cx23885/cx23885-dvb.c:2075`, `drivers/media/pci/cx23885/cx23885-dvb.c:2124`, `drivers/media/pci/cx23885/cx23885-dvb.c:2144`, `drivers/media/pci/cx23885/cx23885-dvb.c:2189`, `drivers/media/pci/cx23885/cx23885-dvb.c:2207`, `drivers/media/pci/cx23885/cx23885-dvb.c:2239`, `drivers/media/pci/cx23885/cx23885-dvb.c:2256`, `drivers/media/pci/cx23885/cx23885-dvb.c:2281`, `drivers/media/pci/cx23885/cx23885-dvb.c:2299`, `drivers/media/pci/cx23885/cx23885-dvb.c:2340`, `drivers/media/pci/cx23885/cx23885-dvb.c:2358`, `drivers/media/pci/cx23885/cx23885-dvb.c:2398`, `drivers/media/pci/cx23885/cx23885-dvb.c:2416`, `drivers/media/pci/cx23885/cx23885-dvb.c:2458`, `drivers/media/pci/cx23885/cx23885-dvb.c:2499`, `drivers/media/pci/cx23885/cx23885-dvb.c:2533`, `drivers/media/pci/ivtv/ivtv-driver.c:275`, `drivers/media/pci/mgb4/mgb4_core.c:191`, `drivers/media/pci/mgb4/mgb4_core.c:292`, `drivers/media/pci/netup_unidvb/netup_unidvb_core.c:768`, `drivers/media/pci/saa7134/saa7134-core.c:149`, `drivers/media/pci/saa7134/saa7134-core.c:151`, `drivers/media/pci/saa7134/saa7134-core.c:153`, `drivers/media/pci/saa7134/saa7134-core.c:156`, `drivers/media/pci/saa7134/saa7134-core.c:712`, `drivers/media/pci/saa7164/saa7164-dvb.c:117`, `drivers/media/pci/saa7164/saa7164-dvb.c:637`, `drivers/media/pci/saa7164/saa7164-dvb.c:656`, `drivers/media/pci/saa7164/saa7164-dvb.c:680`, `drivers/media/pci/saa7164/saa7164-dvb.c:699`, `drivers/media/pci/smipcie/smipcie-main.c:490`, `drivers/media/platform/samsung/exynos4-is/media-dev.c:1569`, `drivers/media/rc/rc-main.c:114`, `drivers/media/rc/rc-main.c:1242`, `drivers/media/usb/as102/as102_drv.c:355`, `drivers/media/usb/cx231xx/cx231xx-cards.c:1523`, `drivers/media/usb/cx231xx/cx231xx-cards.c:1526`, `drivers/media/usb/cx231xx/cx231xx-input.c:60`, `drivers/media/usb/dvb-usb-v2/af9035.c:208`, `drivers/media/usb/dvb-usb-v2/af9035.c:1590`, `drivers/media/usb/dvb-usb-v2/anysee.c:640`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:731`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:952`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:988`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1007`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1045`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1242`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1266`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1297`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1343`, `drivers/media/usb/dvb-usb-v2/rtl28xxu.c:1389`, `drivers/media/usb/dvb-usb-v2/zd1301.c:141`, `drivers/media/usb/dvb-usb-v2/zd1301.c:174`, `drivers/media/usb/dvb-usb/af9005.c:1105`, `drivers/media/usb/dvb-usb/af9005.c:1106`, `drivers/media/usb/dvb-usb/af9005.c:1107`, `drivers/media/usb/dvb-usb/dib0700_devices.c:3774`, `drivers/media/usb/dvb-usb/dib0700_devices.c:3802`, `drivers/media/usb/dvb-usb/dw2102.c:1679`, `drivers/media/usb/dvb-usb/dw2102.c:1698`, `drivers/media/usb/em28xx/em28xx-cards.c:3465`, `drivers/media/usb/em28xx/em28xx-cards.c:3655`, `drivers/media/usb/em28xx/em28xx-cards.c:3664`, `drivers/media/usb/em28xx/em28xx-cards.c:3666`, `drivers/media/usb/em28xx/em28xx-cards.c:3668`, `drivers/media/usb/em28xx/em28xx-cards.c:3670`, `drivers/media/usb/em28xx/em28xx-cards.c:3673`, `drivers/media/usb/pvrusb2/pvrusb2-hdw.c:2069`, `drivers/media/v4l2-core/tuner-core.c:190`, `drivers/media/v4l2-core/v4l2-i2c.c:74`, `drivers/media/v4l2-core/v4l2-spi.c:46`, `drivers/mtd/chips/chipreg.c:62`, `drivers/mtd/chips/gen_probe.c:213`, `drivers/mtd/mtdpart.c:653`, `drivers/mtd/mtdpart.c:708`, `drivers/net/ethernet/airoha/airoha_ppe.c:1393`, `drivers/net/phy/phy_device.c:732`, `drivers/net/wireless/broadcom/brcm80211/brcmfmac/fwvid.c:69`, `drivers/net/wireless/intel/ipw2x00/libipw_wx.c:373`, `drivers/net/wireless/intel/ipw2x00/libipw_wx.c:585`, `drivers/net/wireless/intel/iwlwifi/iwl-drv.c:1925`, `drivers/net/wireless/mediatek/mt76/npu.c:457`, `drivers/net/wireless/mediatek/mt76/npu.c:468`, `drivers/nvme/host/fabrics.c:1324`, `drivers/nvme/target/core.c:329`, `drivers/of/module.c:76`, `drivers/parport/share.c:205`, `drivers/pci/switch/switchtec.c:1661`, `drivers/pcmcia/cs.c:189`, `drivers/perf/arm_cspmu/arm_cspmu.c:440`, `drivers/platform/x86/dell/dell-laptop.c:866`, `drivers/platform/x86/dell/dell-laptop.c:869`, `drivers/platform/x86/siemens/simatic-ipc.c:191`, `drivers/platform/x86/x86-android-tablets/core.c:472`, `drivers/pwm/core.c:1995`, `drivers/s390/block/dasd.c:3483`, `drivers/s390/crypto/pkey_base.c:350`, `drivers/s390/net/qeth_core_main.c:6168`, `drivers/s390/net/qeth_core_main.c:6172`, `drivers/scsi/scsi_dh.c:112`, `drivers/target/iscsi/iscsi_target_configfs.c:86`, `drivers/target/target_core_configfs.c:215`, `drivers/target/target_core_configfs.c:228`, `drivers/target/target_core_transport.c:204`, `drivers/target/target_core_transport.c:208`, `drivers/target/target_core_transport.c:212`, `drivers/target/target_core_transport.c:216`, `drivers/usb/common/ulpi.c:229`, `drivers/usb/gadget/functions.c:50`, `drivers/vfio/platform/vfio_platform_common.c:120`, `drivers/video/fbdev/n411.c:162`, `drivers/w1/w1.c:741`, `include/media/dvbdev.h:463`, `lib/test_kmod.c:224`, `net/6lowpan/core.c:162`, `net/6lowpan/core.c:163`, `net/6lowpan/core.c:164`, `net/6lowpan/core.c:165`, `net/6lowpan/core.c:166`, `net/6lowpan/core.c:167`, `net/6lowpan/core.c:168`, `sound/aoa/fabrics/layout.c:595`, `sound/hda/common/bind.c:234`, `sound/ppc/daca.c:245`, `sound/ppc/tumbler.c:1349`, `sound/soc/fsl/pcm030-audio-fabric.c:86`, `sound/soc/sof/intel/hda-codec.c:49`
+- residual, tc (1): `net/sched/cls_api.c:260`
+- residual, crypto (4): `crypto/algapi.c:638`, `crypto/api.c:303`, `crypto/api.c:307`, `crypto/api.c:330`
+
+</details>
+
 **Extension rule.** Raising the ceiling needs no new ADR: the PR
-regenerates the syscall extracts, the completeness test (PR 4) then fails
+regenerates the syscall extracts, the completeness test (PR 5) then fails
 until every new syscall has a census verdict, and a syscall that matches
 a row's criterion joins that row. A new criterion needs a new ADR.
 
@@ -138,13 +335,28 @@ that is cloned without a new user namespace (`SECCOMP_GET_ACTION_AVAIL`
 alone also succeeds on a kernel with `CONFIG_SECCOMP` but without
 `CONFIG_SECCOMP_FILTER`, review of PR 1; `seccomp-filter` only when the
 child's own filter step fails or its install hangs; it runs as
-`Step::Seccomp`, which `spawn` gets in PR 4. A separate child, so that a
+`Step::Seccomp`, which `spawn` also runs, with the policy of D2 (D9). A separate child, so that a
 host lacking both filters and user namespaces is told about both: the
 probe reports the exact missing set), the Landlock ABI, cgroup
 v2 at `/sys/fs/cgroup` mounted with `nsdelegate` (since PR 3,
 `cgroup-nsdelegate`, D8), and delegation of the caller's own cgroup (the
 directory, `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control`
-writable, and cpu, io, memory and pids in `cgroup.controllers`). Every
+writable, and cpu, io, memory and pids in `cgroup.controllers`), and
+since PR 4 the kernel keyrings (`keyrings`): `keyctl` with an operation
+no kernel defines must fail with EOPNOTSUPP, the answer of a kernel that
+has keyrings (ENOSYS means no `CONFIG_KEYS`, EPERM a seccomp profile of
+the runner's own that filters `keyctl`, as Docker's default profile
+does: `keyctl` is not on its allow list, moby/profiles `7b5ccfa`), and `/proc/keys` and `/proc/key-users` must exist. The unknown
+operation changes nothing, unlike a keyring lookup, which installs a
+session keyring in the caller. Why refuse such a host, not treat "no
+keyrings" as nothing to hide: this section and D5 treat every other
+feature a spawn step uses the same way (refused by the probe with a
+stable id, never skipped), and tolerating it would need a second spawn
+path without the join and the mask that no CI host takes; a filtered
+`keyctl` must be refused anyway, because there the keyrings exist and the
+runner's would stay with the sandbox. The cost is nil on the hosts
+measured: the dev host's kernel has `CONFIG_KEYS=y`, and the CI runners'
+`keyctl` baseline of the kernel rows succeeds (D2). Every
 missing feature is reported with a stable id and a message naming its
 cause; a failed user namespace is classified from the errno and the
 sysctls that explain it (`userns-apparmor`, `userns-disabled`,
@@ -194,8 +406,9 @@ process until the clone:
    timeout the child is killed through its pidfd and reaped.
 
 The child runs a fixed sequence (`Step`): `deny` to `/proc/self/setgroups`,
-the gid map, the uid map; the cgroup namespace, the root, the mounts,
-`pivot_root`, the hostname and `lo` (D7, PR 2); `setsid` (a new session without a controlling
+the gid map, the uid map; a new anonymous session keyring (D2, PR 4);
+the cgroup namespace, the root, the mounts, `pivot_root`, the hostname
+and `lo` (D7, PR 2); `setsid` (a new session without a controlling
 terminal); every signal disposition 1–64 except SIGKILL and SIGSTOP to
 `SIG_DFL` through the raw `rt_sigaction` while every signal is still
 blocked, then an empty signal mask. So no parent handler can run in the
@@ -206,8 +419,9 @@ std ignores SIGPIPE, and an ignored disposition survives `execve`, which
 is why every signal is reset; `dup2` of the
 three stdio descriptors; `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`, so no
 other descriptor reaches the program (the CVE-2024-21626 class), while
-the report pipe stays open until the exec itself; `execve` with exactly
-the spec's environment.
+the report pipe stays open until the exec itself; the privilege drop and
+the seccomp filter (D9, PR 4); `execve` with exactly the spec's
+environment.
 
 **The child allocates nothing and takes no lock.** It is a copy of one
 thread of a process whose other threads may have held the allocator's or
@@ -251,8 +465,10 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   report decoding, step codes, probe messages and classification, the
   host-setup block, inside paths, hostnames, mount order and the mount
   plan, the overlay option limit; since PR 3 the cgroup limits, their
-  rendering, cgroup names and the mountinfo decoding and device mapping)
-  run in `check`.
+  rendering, cgroup names and the mountinfo decoding and device mapping;
+  since PR 4 the assembler, the policy through the BPF interpreter, the
+  kernel-row and gap classification, the Landlock rights per ABI, and the
+  hugetlbfs magic) run in `check`.
 - **Fixture roots** (PR 2). Every host test runs in a full sandbox on a
   fixture root under `CARGO_TARGET_TMPDIR`: a base layer with the mount
   points, the host's `/usr` (and `bin`, `lib`, `lib64`, `sbin` as the
@@ -261,18 +477,28 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   `/workspace`, a tmpfs `/tmp`, `/proc` and `/dev`; `etc/ld.so.cache` is
   copied from the host for the dynamic loader. The unit tests use a root
   next to the test binary with one mount of every kind, so a fault at
-  every step is reached.
-- **One integration test target**, `tests/boneli_sys_tests/`, so that the
-  binaries that need user namespaces are exactly two: `boneli_sys-<hash>`
-  (unit tests) and `boneli_sys_tests-<hash>`. Host tests re-execute their
-  own binary inside the sandbox as a probe (`--exact probe --nocapture`,
-  `BONELI_SYS_PROBE=<action>`), which prints `key=value` lines.
+  every step is reached. Two kinds of host test run the probe on the host
+  instead (`run_probe_host`): the baseline of the kernel rows (D2) and
+  the Landlock rows (D10), which restrict the calling process.
+- **One integration test target that needs user namespaces**,
+  `tests/boneli_sys_tests/`, so that the binaries that do are exactly
+  two: `boneli_sys-<hash>` (unit tests) and `boneli_sys_tests-<hash>`.
+  Since ADR-015 D10 the crate has a second integration target,
+  `tests/exit_main_thread.rs` (`harness = false`), which creates no
+  namespace and stays outside the AppArmor profile. Host tests
+  re-execute their own binary inside the sandbox as a probe (`--exact
+  probe --nocapture`, `BONELI_SYS_PROBE=<action>`), which prints
+  `key=value` lines.
 - **Running.** `cargo test -p boneli-sys -- --ignored` never skips: a
   missing feature fails with the probe's message. The only leniencies are
   visible: `BONELI_SYS_HOST_GAPS` (set in the workflow file, so reviewed;
-  exact per host; empty until PR 4), Landlock rows above the kernel's ABI
-  (PR 4), and `Unproven` census entries (PR 4), all printed outside
-  libtest's capture.
+  exact per host, and an id outside the known set fails: `syslog` and
+  `shmget-hugetlb` for kernel rows a host cannot observe, D2,
+  `socket-inet-packet` and `ioctl-siocgifbr` for kernel rows a host
+  without af_packet or bridge does not try, D2, and `hugetlbfs-mount`
+  for a host without a hugetlbfs, D7), Landlock rows
+  above the kernel's ABI (D10), and `Unproven` census entries (PR 5), all
+  printed outside libtest's capture.
 - **CI.** The job `sandbox` runs on `ubuntu-latest` (x86_64) and
   `ubuntu-24.04-arm` (aarch64, the only runtime check of the aarch64
   tables). It first runs the probe test on the stock runner with
@@ -288,9 +514,11 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
 - **AppArmor.** Ubuntu 23.10 and newer restrict unprivileged user
   namespaces through AppArmor. Instead of switching the restriction off
   for the whole host (the sysctl), the host-setup block loads a profile
-  that allows `userns` only for the two test binaries,
-  `$TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out}/boneli_sys{,_tests}-[0-9a-f]*`,
-  unconfined otherwise. The two alternatives are cargo's two layouts:
+  that allows `userns` only for the two test binaries, and since ADR-009
+  for boneli-oci's two as well,
+  `$TARGET_DIR/*/{deps,build/boneli-sys/[0-9a-f]*/out,build/boneli-oci/[0-9a-f]*/out}/boneli_{sys,oci}{,_tests}-[0-9a-f]*`
+  (the block in `CLAUDE.md` is the source),
+  unconfined otherwise. The alternatives are cargo's two layouts:
   `deps/` before cargo 1.100, and `build/<package>/<hash>/out/` since
   (measured: the CI runners' cargo 1.100 put the test binaries there,
   and the first CI run failed on a profile that named only `deps/`).
@@ -347,6 +575,12 @@ features" step prints them on every run):
 | host-setup block (linger, restart, bus wait) | 1 s | 1 s |
 | after the block, in a `Delegate=yes` scope | nothing missing (io included) | the same |
 | cgroup2 super options (since PR 3) | `nsdelegate` present | the same |
+| PR 4 run (45925071760, 2026-11-27): kernel | 7.0.0-1020-azure | 7.0.0-1017-azure |
+| LSMs (PR 4 run) | as above, `bpf` included | as above, without `bpf` |
+| Landlock ABI (PR 4 run) | 8, so the two ABI 9 rows of D10 print `n/a` | the same |
+| cgroup2 `memory_hugetlb_accounting` (PR 4 run) | present | absent |
+| `vm.nr_hugepages` / `vm.hugetlb_shm_group` / hugetlbfs (PR 4 run) | 0 / 0 / `/dev/hugepages`, `pagesize=2M` | the same |
+| `BONELI_SYS_HOST_GAPS` (since PR 4) | `syslog,shmget-hugetlb`: both rows give EPERM without the filter (`dmesg_restrict` 1; the runner user is not in `vm.hugetlb_shm_group`); every other kernel row observed | the same |
 
 Every assumption above held but one: the AppArmor restriction shows as
 EACCES at the setgroups open, not EPERM (D3). The runner user has
@@ -415,7 +649,9 @@ no `allow` attribute, so `forbid` costs nothing. Its lints:
   aborts it mid-setup without a report (the workspace has it at `deny`;
   here it is `forbid` like the rest).
 
-The checker stays Python per ADR-001 D4 (its Rust port is #35).
+The checker was Python per ADR-001 D4 when this rule landed; since
+ADR-015 it is Rust (`crates/boneli-arch-check`), and `sys-lints` was
+ported unchanged.
 
 ### D7. Namespaces, mounts and the brokers
 
@@ -488,6 +724,16 @@ configured. Targets must exist in the root: the image or the top layer
   a read-only bind of `/dev/shm` keeps its `nosuid,nodev`). The fallback
   the plan kept for a refused `mount_setattr` on a detached tree is not
   needed: it works in a user namespace (measured).
+- **No source on hugetlbfs** (PR 4). A file on hugetlbfs maps huge pages
+  without any flag the seccomp rows of D2 see, so the parent `statfs`es
+  every bind source, every root layer and every directory of a writable
+  overlay at spawn, and an `f_type` of `HUGETLBFS_MAGIC` (0x958458f6;
+  `/dev/hugepages` on the dev host, measured) is
+  `Error::HugetlbfsSource { path }` before the clone
+  (`hugetlbfs_source_refused`; a tmpfs source passes). Binds are not
+  recursive, so a source's own filesystem is the only one that enters
+  the tree. A path `statfs` cannot reach is left to the child, which
+  fails on it with its index.
 - `Tmpfs { target, size_bytes, mode }`: `nosuid,nodev`. Exec stays
   allowed on tmpfs, overlay and bind mounts, because test runners
   execute from `/tmp` and `/workspace`.
@@ -496,7 +742,11 @@ configured. Targets must exist in the root: the image or the top layer
   unchanged (`writable_overlay_mount`).
 - `Proc { target }`: `nosuid,nodev,noexec`, mounted before `pivot_root`,
   because the kernel lets a user namespace mount a new procfs only while
-  a fully visible one is in its mount namespace.
+  a fully visible one is in its mount namespace. Since PR 4 its `keys` and
+  `key-users` are covered by a bind of the host's `/dev/null`, read-only,
+  `nosuid,noexec`, opened beneath the new procfs without following any
+  symlink like the device nodes of `Dev` (D2; `pivot_root_hides_host`
+  counts the two mounts).
 - `Dev { target, shm_size_bytes }`: the OCI default devices without
   `/dev/console`. A tmpfs of 64 KiB, mode 0755, `nosuid,noexec`, holding
   `null`, `zero`, `full`, `random`, `urandom` and `tty` bound from the
@@ -664,8 +914,9 @@ of D7):
   `limit_files_render_and_read_back`). Huge pages are charged to `memory.max`
   only when cgroup2 is mounted with `memory_hugetlb_accounting` (Linux
   6.6, off by default), which the arm64 CI runner lacks (measured; the dev
-  host and the x86_64 runner have it), so PR 4's seccomp rows refuse
-  `MAP_HUGETLB`, `SHM_HUGETLB` and `MFD_HUGETLB`.
+  host and the x86_64 runner have it), so the seccomp rows of D2 refuse
+  `MAP_HUGETLB`, `SHM_HUGETLB` and `MFD_HUGETLB`, and `spawn` refuses a
+  source on hugetlbfs (D7).
 - `memory_swap_max` any value, 0 for no swap; also rounded down to a page
   (measured).
 - `pids_max` at least 1: the kernel accepts 0 (measured), which leaves the
@@ -801,11 +1052,12 @@ user the inside id maps to (the runner created them), so a writable view
 would let the sandbox raise its own limits; through the read-only mount,
 writing `memory.max`, `pids.max` or `cgroup.kill` gives EROFS for inside
 ids 0 and 999 (`sandbox_cannot_touch_own_limits`). A read-only cgroup2
-mount works in a user namespace (measured). Until PR 4 drops the
-capabilities (D9), inside id 0 can mount a writable cgroup2 of its own,
-and can remount the `Mount::Cgroup2` view read-write (it lives in the
+mount works in a user namespace (measured). Before the privilege drop of
+D9 (PR 4), inside id 0 could mount a writable cgroup2 of its own, and
+could remount the `Mount::Cgroup2` view read-write (it lives in the
 sandbox's own mount namespace, so no flag is locked; review of PR 3,
-measured). Two kernel-enforced layers sit under the read-only view, both
+measured). Since D9 every such attempt fails with EPERM for inside ids 0
+and 999 (`cgroup_view_stays_read_only`, below). Two kernel-enforced layers sit under the read-only view, both
 added in the review round of PR 3:
 
 - **`nsdelegate` is required** (`Features::probe`, id
@@ -832,12 +1084,29 @@ added in the review round of PR 3:
   and `cgroup.max.depth` 0 and reads them back. `nsdelegate` does not stop
   `mkdir` (delegation is its purpose), and a sub-cgroup the sandbox made
   kept `destroy` from removing the cgroup (EBUSY, review of PR 3). With
-  both at 0, `mkdir` inside fails with EAGAIN, and raising
-  `cgroup.max.descendants` from inside fails with EPERM, because it is not
-  a delegatable file (`sandbox_cannot_create_sub_cgroups`, measured).
+  both at 0, `mkdir` inside failed with EAGAIN, and raising
+  `cgroup.max.descendants` from inside failed with EPERM, because it is
+  not a delegatable file (measured in PR 3 through inside id 0's own
+  cgroup2 mount). The limit holds for the cgroup's owner too: since PR 4
+  `sandbox_cannot_create_sub_cgroups` runs the `mkdir` as the test
+  process, which owns the cgroup and sits outside its namespace, and gets
+  EAGAIN.
 
-PR 4's capability drop then removes the mount and the remount
-themselves.
+The capability drop of D9 (PR 4) removes the mount and the remount
+themselves: `cgroup_view_stays_read_only` tries, for inside ids 0 and
+999, a remount of the view per mount (`MS_REMOUNT | MS_BIND`) and per
+superblock, `mount_setattr` clearing `MOUNT_ATTR_RDONLY`, and a cgroup2
+of its own through `mount(2)` and through `fsopen`; each gives EPERM
+from the missing `CAP_SYS_ADMIN` alone (Linux 7.2: `path_mount()`,
+`wants_mount_setattr()` and the `fsopen` syscall each return EPERM when
+`may_mount()` fails), and `fchmodat` of `cgroup.kill` through the view
+gives EROFS (`chmod_common()` takes `mnt_want_write()` first), with the
+mode unchanged on the host. The two kernel layers above stay as defense
+in depth. Weak spot: nsdelegate's refusal to raise
+`cgroup.max.descendants` at a cgroup namespace root has no per-run test
+any more, because nothing in the sandbox can hold `CAP_SYS_ADMIN` in a
+user namespace (no capabilities, `CLONE_NEWUSER` denied);
+`parent_requires_nsdelegate` still proves the option is present.
 
 **Destroying.** `Cgroup::destroy` writes `cgroup.kill` (Linux 5.14,
 below the floor of D3), then lifts the throttles that can hold a killed
@@ -903,15 +1172,16 @@ anyway, so the surviving workload ran without its CPU limit (about
 then left behind. Now a failed kill keeps every limit, skips the wait
 (nothing would empty the cgroup), still tries the removal, and returns
 `CgroupTeardown` with the cgroup recorded as left behind
-(`failed_kill_keeps_limits`). **The kill cannot be blocked from inside:**
-until PR 4 drops the capabilities, inside id 0 can mount a cgroup2 of its
-own and `chmod 444` its `cgroup.kill`, and a write that opens the file by
-name then fails with EACCES (measured). `create` therefore opens
+(`failed_kill_keeps_limits`). **The kill cannot be blocked:** before the
+privilege drop of D9 (PR 4), inside id 0 could mount a cgroup2 of its own
+and `chmod 444` its `cgroup.kill`, and a write that opens the file by
+name then fails with EACCES (measured in PR 3); the file's owner, the
+runner's user, can still do the same from the host side. `create` therefore opens
 `cgroup.kill` (write) and `cgroup.events` (read) once the limits are in
 place and before any task can enter, and teardown uses those descriptors:
 cgroupfs checks permission at open, not at each write, so a write through
 the held descriptor still kills after the mode change (measured;
-`kill_survives_chmod_from_inside`), and no `fchmodat` back is needed. The wait polls `cgroup.events` for `POLLPRI`
+`kill_survives_chmod`, which since PR 4 sets the mode as the owner), and no `fchmodat` back is needed. The wait polls `cgroup.events` for `POLLPRI`
 and re-reads it at least every 100 ms in case a notification is missed;
 10 s is a hang bound, not a target (`destroy_kills_all_and_removes`
 measured about 3 ms for three sleepers). A killed child that its `Child`
@@ -1440,6 +1710,129 @@ first missing controller in the probe's order, where the plan's example
 named `memory`; `block_device_of` finds the mount by its id and parses
 mountinfo as bytes.
 
+### D9. No capabilities, `no_new_privs`, the filter last
+
+Added by PR 4 of #6; measurements on the dev host on 2026-11-27 unless
+they name CI.
+
+A process in a new user namespace holds every capability in it, and with
+inside id 0 an `execve` would grant them again. The child therefore drops
+everything after `close_range` and before `execve`, in this order (each a
+`Step` with its own report code; `privileges::drop_all`):
+
+1. `Securebits`: `PR_SET_SECUREBITS` to 0xEF (239), the sum of `NOROOT`
+   (1), so uid 0 gains no capabilities at `execve`, and its lock (2);
+   `NO_SETUID_FIXUP` (4) and its lock (8); the lock of `KEEP_CAPS` (32)
+   with `KEEP_CAPS` itself off; `NO_CAP_AMBIENT_RAISE` (64) and its lock
+   (128). Every bit the workload could clear is locked, so
+   `PR_SET_SECUREBITS(0)` inside gives EPERM and `PR_GET_SECUREBITS`
+   reads 239 (`securebits_locked`, inside ids 0 and 999). It runs first
+   because it needs `CAP_SETPCAP`, which step 4 removes.
+2. `CapBoundingSet`: `PR_CAPBSET_DROP` of every capability from 0 to
+   `cap_last_cap`; the item of a failure is the capability number. The
+   parent reads `/proc/sys/kernel/cap_last_cap` at spawn (40 on the dev
+   host and both CI legs), so a newer kernel's capabilities are dropped
+   too; a value that does not read, or is not a decimal of at most 63 (the
+   bounding set is 64 bits wide), is `Error::CapLastCap` before the
+   clone. Dropping also needs `CAP_SETPCAP`. With an empty bounding set
+   no `execve` can raise a permitted capability, not even uid 0's
+   without `NOROOT` (`P' = fP & bset`), so steps 1 and 2 are two layers
+   for the same root case.
+3. `CapAmbient`: `PR_CAP_AMBIENT_CLEAR_ALL`.
+4. `Capset`: `capset` version 3 (`_LINUX_CAPABILITY_VERSION_3`, two data
+   elements, local in `ffi`) with empty effective, permitted and
+   inheritable sets.
+5. `NoNewPrivs`: `PR_SET_NO_NEW_PRIVS`. Without capabilities the kernel
+   accepts a seccomp filter only with it, and it keeps setuid bits and
+   file capabilities from granting anything at `execve`.
+6. `Seccomp`: the program of D2, assembled in the parent before the
+   clone, through `seccomp(SECCOMP_SET_MODE_FILTER)`. Last, so that only
+   `execve` (which the policy allows) runs under it before the program.
+
+Everything these steps need is prepared before the clone (the number and
+the assembled program), so they keep D4's rule: no allocation, no lock.
+
+**Measured inside**, for inside ids 0 and 999 (`privileges_all_dropped`):
+`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` all
+`0000000000000000`, `NoNewPrivs` 1, `Seccomp` 2 and `Seccomp_filters` 1.
+Inside id 0 re-executing the probe keeps all five sets empty, with
+`NoNewPrivs` 1 and `Seccomp` 2 (`root_inside_gains_nothing_on_exec`).
+
+**Consequences.** Capability-gated calls fail inside (the census of PR 5
+proves each one), among them every `mount`: the read-only cgroup2 view of
+D8 can no longer be remounted or replaced (`cgroup_view_stays_read_only`).
+Two PR 3 tests that used inside id 0's capabilities make that step on the
+host side now (`sandbox_cannot_create_sub_cgroups`, `kill_survives_chmod`,
+D8). Unaffected: `other_ids_unusable` (unmapped ids fail with EINVAL
+before any capability check, D1), `supplementary_groups_stay_unmapped`
+(its EPERM comes from `setgroups deny`) and
+`sandbox_cannot_touch_own_limits` (EROFS from the read-only view). A
+workload that binds a port below 1024 needs `CAP_NET_BIND_SERVICE` in the
+network namespace's user namespace, which it no longer has, so it gets
+EACCES (the kernel's bind check; not measured here); #8 decides whether a pod needs
+`net.ipv4.ip_unprivileged_port_start` lowered inside its network
+namespace before the drop. The drop and the filter apply to every
+`spawn`, including boneli-oci's sandbox runs (ADR-009): `node:22` as
+inside id 0 and `postgres:17` as 999 start under them in the
+`oci-acceptance` runs.
+
+### D10. Landlock
+
+Added by PR 4 of #6; measurements on the dev host (Landlock ABI 10) on
+2026-11-27 unless they name CI.
+
+`boneli-sys` offers Landlock as an in-process API (`Ruleset`) for the
+calling process, not as a `spawn` step: Landlock restricts the calling
+thread and what it starts later, and the useful rules name paths inside
+the sandbox's root and the shim's own relay, which only the shim (#9)
+knows. The shim applies it to itself as PID 1 before the agent starts.
+
+- **ABI.** `Abi::current()` asks the kernel
+  (`LANDLOCK_CREATE_RULESET_VERSION`); EOPNOTSUPP (built, not enabled) and
+  ENOSYS (not built) are `Error::LandlockUnavailable`. ABI 2 is the
+  minimum (D3: ABI 1 denies every rename or link into another directory),
+  so ABI 1 is `Error::LandlockAbiTooOld { found, required: 2 }`. ABIs
+  above 10, the newest the 7.2.4 headers describe, are treated as 10:
+  rights only grow, and the API knows only the bits of those headers.
+- **Rights per ABI** (`AccessFs`, `AccessNet`, `Scope`, each with
+  `all_for(abi)`; `access_sets_per_abi`): filesystem bits 0-12 from ABI 1
+  (0x1FFF), `REFER` 13 from ABI 2 (0x3FFF), `TRUNCATE` 14 from ABI 3
+  (0x7FFF), `IOCTL_DEV` 15 from ABI 5 (0xFFFF), `RESOLVE_UNIX` 16 from
+  ABI 9 (0x1FFFF); TCP bind and connect from ABI 4 (0x3), UDP bind and
+  connect-or-send from ABI 10 (0xF); the abstract Unix socket and signal
+  scopes from ABI 6 (0x3).
+- **Fail closed, never best effort.** `Ruleset::new` refuses a handled
+  right the ABI does not know (`Error::LandlockUnsupported { right, abi
+  }`), so a ruleset never silently handles less than its caller wrote;
+  `allow_path` and `allow_port` refuse a right outside the ruleset's
+  handled set and an empty rule (`Error::LandlockRuleNotHandled`;
+  `ruleset_fails_closed`). `restrict_self` sets `PR_SET_NO_NEW_PRIVS`
+  first, which Landlock requires without `CAP_SYS_ADMIN`.
+- **What the shim's ruleset must allow.** A ruleset that handles
+  `RESOLVE_UNIX` (ABI 9 and newer) must allow it beneath the egress
+  socket's path, because that socket is created outside the domain
+  (ADR-006, D7's broker bind); one that handles TCP must allow the
+  relay's loopback port.
+
+**Measured** (`landlock_rights_hold`, a probe on the host that restricts
+itself with every filesystem, network and scope right of its ABI
+handled, read and execute allowed beneath `R`, everything beneath `W`):
+read in `R` works; write in `R` and read outside both give EACCES;
+create in `W` works; a rename within `W` across directories works (ABI
+2); a rename from `R` into `W` gives EACCES, because `R` lacks
+`REMOVE_FILE`, which the kernel checks before `REFER` (otherwise it would
+be EXDEV); truncate in `R` gives EACCES (ABI 3); executing a program
+outside `R` gives EACCES; a TCP connect to a loopback port without a rule
+gives EACCES and to the allowed one works (ABI 4); `kill(parent, 0)` and
+a connect to an abstract socket created outside give EPERM (ABI 6); a
+connect to a pathname socket created outside gives EACCES, and to the
+same kind of socket beneath a path allowed with `RESOLVE_UNIX` works
+(ABI 9); `NoNewPrivs` is 1 after `restrict_self`. Rows above the host's
+ABI print `n/a (ABI <n>)` outside libtest's capture, so CI's kernels run
+what they have and the dev host runs every row. Both CI legs had ABI 8
+(Linux 7.0) in the PR 4 run, so `unix_outside` and `unix_allowed` run
+only on the dev host there.
+
 ## Consequences
 
 - `boneli-sys` depends on `libc` only (the edge `boneli-sys -> libc` is
@@ -1459,6 +1852,13 @@ mountinfo as bytes.
   reading that sandbox's `memory.stat` every 5 ms, and a buffered writer
   is held, not OOM-killed, only at `memory.max` 64 MiB and above (D8,
   "Buffered writes and the statistics keeper").
+- Every sandbox runs without any capability, with `no_new_privs`, locked
+  securebits and the seccomp policy of D2 (D9): capability-gated calls,
+  mounts included, fail inside, and a port below 1024 cannot be bound.
+- `spawn` refuses a host source on hugetlbfs (D7), and the policy refuses
+  the three huge page flags (D2).
+- Landlock is an API the shim applies to itself (D10); a host below ABI 2
+  is refused (D3).
 - One id inside: images that switch users fail, and the runner must be a
   dedicated user without privileged supplementary groups.
 - The host-setup block runs with root, on CI and on user hosts. It is
@@ -1483,7 +1883,7 @@ mountinfo as bytes.
   new syscall a libc or runtime adopts, and Docker's own allowlist
   already lags the kernel (its last sync is "profiles/seccomp: kernel
   v6.13"); the ENOSYS ceiling gives the same fail-closed behavior for
-  unknown calls, and the census (PR 4) reviews every known one.
+  unknown calls, and the census (PR 5) reviews every known one.
 - **Switching the AppArmor restriction off host-wide**
   (`kernel.apparmor_restrict_unprivileged_userns=0`). Simpler, but it
   lifts the restriction for every program on the host; the narrow profile
@@ -1493,5 +1893,7 @@ mountinfo as bytes.
 - **A floor of 5.15 (Ubuntu 22.04 GA)** with Landlock ABI 1. ABI 1 denies
   cross-directory renames and links, which git and npm need.
 - **One PR for all of #6.** This crate is the security boundary, and #28
-  took four review rounds on one surface; four PRs keep each review
-  bounded.
+  took four review rounds on one surface; five PRs keep each review
+  bounded (the operator split PR 4 from the census before it started:
+  the BPF and privilege code and the 385 census verdicts are separate
+  review surfaces).
