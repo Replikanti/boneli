@@ -16,6 +16,48 @@ pub enum CapOutcome {
     Absent,
     /// The syscall was removed after the floor and answers ENOSYS.
     Removed,
+    /// The host lacks what the call needs before its check (an RTC alarm
+    /// device), listed as a host gap.
+    Unreachable,
+}
+
+/// The gap id of a host without an RTC alarm device: the alarm clocks
+/// answer EOPNOTSUPP from `alarmtimer_get_rtcdev` before the capability
+/// check (`alarm_timer_create` and `alarm_timer_nsleep` in 7.2; the
+/// arm64 CI runners have no such device). `timerfd_create` checks the
+/// capability first, so it stays a full probe everywhere.
+pub const ALARM_RTC_GAP: &str = "alarm-rtc";
+
+/// The forms behind the RTC check.
+pub const ALARM_RTC_FORMS: [(&str, &str); 2] = [
+    ("timer_create", "CLOCK_REALTIME_ALARM"),
+    ("clock_nanosleep", "CLOCK_REALTIME_ALARM"),
+];
+
+/// Classifies a form that sits behind the RTC check, exact both ways:
+/// EOPNOTSUPP must be listed as [`ALARM_RTC_GAP`], and a listed gap must
+/// give EOPNOTSUPP. `None` for every other form.
+pub fn classify_rtc(
+    name: &str,
+    form: &Form,
+    got: i32,
+    listed: bool,
+) -> Option<Result<CapOutcome, String>> {
+    if !ALARM_RTC_FORMS.contains(&(name, form.form)) {
+        return None;
+    }
+    let at = format!("{name}:{}", form.form);
+    Some(match (got == libc::EOPNOTSUPP, listed) {
+        (true, true) => Ok(CapOutcome::Unreachable),
+        (true, false) => Err(format!(
+            "{at}: EOPNOTSUPP, so the host has no RTC alarm device and the check is not reached; \
+             list {ALARM_RTC_GAP} in BONELI_SYS_HOST_GAPS"
+        )),
+        (false, true) => Err(format!(
+            "{at}: {ALARM_RTC_GAP} is listed, but the call gave {got}, so the host has the device"
+        )),
+        (false, false) => return None,
+    })
 }
 
 /// Classifies the errno `got` of `form` of the census entry `name`.
@@ -62,6 +104,48 @@ pub fn classify_cap(
             form.errno, form.returned_by
         ))
     }
+}
+
+#[test]
+fn alarm_rtc_classification() {
+    let form = Form {
+        form: "CLOCK_REALTIME_ALARM",
+        errno: libc::EPERM,
+        returned_by: "alarm_timer_create",
+    };
+    let eopnotsupp = libc::EOPNOTSUPP;
+    assert_eq!(
+        classify_rtc("timer_create", &form, eopnotsupp, true),
+        Some(Ok(CapOutcome::Unreachable))
+    );
+    assert!(matches!(
+        classify_rtc("timer_create", &form, eopnotsupp, false),
+        Some(Err(_))
+    ));
+    assert!(matches!(
+        classify_rtc("clock_nanosleep", &form, libc::EPERM, true),
+        Some(Err(_))
+    ));
+    // Unlisted and refused: the normal classification decides.
+    assert_eq!(
+        classify_rtc("timer_create", &form, libc::EPERM, false),
+        None
+    );
+    // Only the two forms behind the RTC check: timerfd_create checks the
+    // capability first.
+    assert_eq!(
+        classify_rtc("timerfd_create", &form, eopnotsupp, true),
+        None
+    );
+    for (name, f) in ALARM_RTC_FORMS {
+        assert!(
+            crate::census::gated_forms()
+                .iter()
+                .any(|(n, g)| *n == name && g.form == f),
+            "{name}:{f} is not a census form"
+        );
+    }
+    assert!(crate::support::KNOWN_GAPS.contains(&ALARM_RTC_GAP));
 }
 
 #[test]
@@ -173,7 +257,14 @@ fn capability_gated_calls_fail() {
                 _ => None,
             };
             let listed = gaps.contains(&format!("nosys-{name}"));
-            match classify_cap(name, form, removed_in, got, listed) {
+            let outcome = classify_rtc(name, form, got, gaps.contains(ALARM_RTC_GAP))
+                .unwrap_or_else(|| classify_cap(name, form, removed_in, got, listed));
+            match outcome {
+                Ok(CapOutcome::Unreachable) => report(&format!(
+                    "capability_gated_calls_fail: {name}:{} not reached (no RTC alarm device), \
+                     listed as {ALARM_RTC_GAP}",
+                    form.form
+                )),
                 Ok(CapOutcome::Absent) => {
                     absent.insert(name);
                 }

@@ -146,10 +146,10 @@ fn host_gaps_are_known() {
 fn gap_ids_are_exact() {
     let all = support::parse_gaps(
         " syslog,shmget-hugetlb , hugetlbfs-mount,ioctl-siocgifbr,socket-inet-packet,\
-         setsockopt-tls,setsockopt-tcp-ao,setsockopt-tcp-md5,nosys-statmount",
+         setsockopt-tls,setsockopt-tcp-ao,setsockopt-tcp-md5,nosys-statmount,alarm-rtc",
     )
     .expect("known ids");
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 10);
     assert_eq!(support::parse_gaps("").expect("empty"), Default::default());
     // `nosys-` takes NeedsCap census names only, byte for byte: not an Own
     // entry (read), not a Row entry (setsockopt), not an empty or unknown

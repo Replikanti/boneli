@@ -324,12 +324,15 @@ jobs:
             # bridge (assumed present on the Docker runner images; the Host
             # features step prints both), setsockopt-tls without the tls
             # ULP, setsockopt-tcp-ao and setsockopt-tcp-md5 without the TCP
-            # options, nosys-<name> for a NeedsCap syscall the kernel lacks.
-            host-gaps: syslog,shmget-hugetlb,setsockopt-tls
+            # options, nosys-<name> for a NeedsCap syscall the kernel lacks,
+            # alarm-rtc without an RTC alarm device (first run of PR 5: both
+            # legs have the tls module loaded, the TCP options and every
+            # NeedsCap syscall; arm64 has no RTC alarm device).
+            host-gaps: syslog,shmget-hugetlb
           - arch: arm64
             runner: ubuntu-24.04-arm
             expect-missing: userns-apparmor,cgroup-not-delegated
-            host-gaps: syslog,shmget-hugetlb,setsockopt-tls
+            host-gaps: syslog,shmget-hugetlb,alarm-rtc
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -397,6 +400,9 @@ jobs:
           # kernel lacks the options.
           echo "tls (/sys/module/tls): $( [ -e /sys/module/tls ] && echo present || echo absent)"
           echo "tcp ulps: $(cat /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null || echo absent)"
+          # The alarm clocks (census, alarm-rtc): an RTC device is what they
+          # need before their capability check.
+          echo "rtc: $(ls /sys/class/rtc 2>/dev/null | tr '\n' ' ' || true)"
           for k in CONFIG_TLS CONFIG_TCP_AO CONFIG_TCP_MD5SIG; do
             echo "$k: $(grep -E "^(# )?$k[= ]" "/boot/config-$(uname -r)" 2>/dev/null || echo unreadable)"
           done

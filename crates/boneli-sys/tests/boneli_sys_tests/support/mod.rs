@@ -404,6 +404,7 @@ pub const KNOWN_GAPS: &[&str] = &[
     "setsockopt-tls",
     "setsockopt-tcp-ao",
     "setsockopt-tcp-md5",
+    "alarm-rtc",
 ];
 
 /// Whether `id` is `nosys-<name>` for a `NeedsCap` census entry, byte for

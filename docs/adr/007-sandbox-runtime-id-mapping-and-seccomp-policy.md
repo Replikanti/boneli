@@ -492,7 +492,13 @@ host tests: `capability_gated_calls_fail` starts one probe per inside id
 prints `cap:<name>:<form>=<errno>`; each result must be EPERM or the
 errno the census names, a call that succeeds fails the test (its check
 passed and it acted), and the failures are collected, not stopped at the
-first. ENOSYS for an entry can only mean the host kernel lacks it,
+first. Two forms sit behind a host device: `timer_create` and
+`clock_nanosleep` on `CLOCK_REALTIME_ALARM` answer EOPNOTSUPP before the
+capability check where the host has no RTC alarm device
+(`alarm_timer_create`, `alarm_timer_nsleep`: `alarmtimer_get_rtcdev`
+first), as on the arm64 CI runners, so there they are the gap `alarm-rtc`
+(exact both ways, `alarm_rtc_classification`); `timerfd_create` checks
+the capability first and is a full probe everywhere. ENOSYS for an entry can only mean the host kernel lacks it,
 because the filter allows every `NeedsCap` entry, so it fails unless
 `BONELI_SYS_HOST_GAPS` lists `nosys-<name>` (and a listed name that turns
 out present fails too). `Unproven` entries print with their reason
@@ -877,8 +883,9 @@ atomically (`CLONE_INTO_CGROUP`, PR 3).
   without af_packet or bridge does not try, D2, `setsockopt-tls`,
   `setsockopt-tcp-ao` and `setsockopt-tcp-md5` for a host without the
   `tls` ULP or the TCP signature options, D2, `nosys-<name>` for a
-  `NeedsCap` census entry the host kernel lacks, D2, and
-  `hugetlbfs-mount` for a host without a hugetlbfs, D7), Landlock rows
+  `NeedsCap` census entry the host kernel lacks, D2, `alarm-rtc` for a
+  host without an RTC alarm device, D2, and `hugetlbfs-mount` for a host
+  without a hugetlbfs, D7), Landlock rows
   above the kernel's ABI (D10), and `Unproven` census entries (D2), all
   printed outside libtest's capture.
 - **CI.** The job `sandbox` runs on `ubuntu-latest` (x86_64) and

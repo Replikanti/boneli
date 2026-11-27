@@ -150,8 +150,10 @@ systemd-run --user --scope -q -p Delegate=yes \
   available, so the host answers ENOPROTOOPT at `SOL_TLS` already;
   `setsockopt-tcp-ao` and `setsockopt-tcp-md5`: the kernel lacks the
   option; `nosys-<name>`: the host kernel lacks the `NeedsCap` census
-  syscall `<name>`; `hugetlbfs-mount`: the host has no hugetlbfs
-  mount. Exact: an unknown id fails, and so does a listed id that turns
+  syscall `<name>`; `alarm-rtc`: the host has no RTC alarm device, so
+  `timer_create` and `clock_nanosleep` on an alarm clock answer
+  EOPNOTSUPP before their capability check; `hugetlbfs-mount`: the host
+  has no hugetlbfs mount. Exact: an unknown id fails, and so does a listed id that turns
   out observable. The command above has the dev host's value (Fedora 44,
   measured); CI sets it per leg in `.github/workflows/ci.yml`.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
