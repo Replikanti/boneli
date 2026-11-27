@@ -143,7 +143,10 @@ systemd-run --user --scope -q -p Delegate=yes \
   `syslog`: the host gives EPERM to `syslog` without the filter already
   (`kernel.dmesg_restrict` 1); `shmget-hugetlb`: likewise for
   `shmget(SHM_HUGETLB)` (the user is outside `vm.hugetlb_shm_group` and
-  lacks `CAP_IPC_LOCK`); `hugetlbfs-mount`: the host has no hugetlbfs
+  lacks `CAP_IPC_LOCK`); `socket-inet-packet` and `ioctl-siocgifbr`: the
+  host lacks af_packet (no `/proc/net/packet`) or the bridge module (no
+  `/sys/module/bridge`), so the test does not try that row, which would
+  load the module; `hugetlbfs-mount`: the host has no hugetlbfs
   mount. Exact: an unknown id fails, and so does a listed id that turns
   out observable. The command above has the dev host's value (Fedora 44,
   measured); CI sets it per leg in `.github/workflows/ci.yml`.

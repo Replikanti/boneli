@@ -393,7 +393,13 @@ pub fn run_probe_host(action: &str, env: &[(&str, &str)]) -> Probe {
 /// The ids `BONELI_SYS_HOST_GAPS` may name: kernel rows of the seccomp
 /// policy a host cannot observe, and host features a test needs that a
 /// host may lack (ADR-007, D5).
-pub const KNOWN_GAPS: &[&str] = &["syslog", "shmget-hugetlb", "hugetlbfs-mount"];
+pub const KNOWN_GAPS: &[&str] = &[
+    "syslog",
+    "shmget-hugetlb",
+    "hugetlbfs-mount",
+    "ioctl-siocgifbr",
+    "socket-inet-packet",
+];
 
 /// Parses a comma-separated gap list; an id outside [`KNOWN_GAPS`] is an
 /// error naming it.

@@ -208,7 +208,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a successful kill, and kills through a `cgroup.kill` descriptor
   held open since `create`, so a mode change from inside cannot block it.
 - `boneli-sys` (ADR-007 D2, D9 and D10, part 4 of #6): the seccomp
-  policy, assembled in Rust (`seccomp::{table, bpf, policy}`, 56
+  policy, assembled in Rust (`seccomp::{table, bpf, policy}`, 69
   instructions): foreign architectures killed, numbers above 471 ENOSYS,
   `io_uring_*`, `bpf`, `userfaultfd`, `perf_event_open`, the keyring
   calls, `syslog`, new user namespaces through `clone` and `unshare`, and
@@ -216,8 +216,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `clone3` ENOSYS, socket families other than Unix, IPv4, IPv6 and netlink
   and `socketpair` other than Unix EAFNOSUPPORT, netlink protocols other
   than routing and IPv4/IPv6 protocols other than 0, TCP, UDP and the
-  family's ICMP EPROTONOSUPPORT, `ioctl(TIOCSETD)` EPERM (no line
-  discipline module can be loaded). The sandbox's procfs masks
+  family's ICMP EPROTONOSUPPORT, `socket(AF_INET, SOCK_PACKET)`
+  EAFNOSUPPORT (the kernel would make it a packet socket),
+  `ioctl(TIOCSETD)` and the eight bridge and VLAN socket ioctls EPERM (no
+  line discipline, bridge or 8021q module can be loaded). ADR-007 D2 lists
+  every `request_module` call site of Linux 7.2 (326: 42 covered by rows,
+  279 unreachable without a capability, 5 residual with a host-side
+  mitigation: tc classifiers named in `RTM_GETTFILTER`, crypto algorithms
+  by fixed name). `Features::probe` refuses a host without usable kernel
+  keyrings (`keyrings`). The sandbox's procfs masks
   `/proc/keys` and `/proc/key-users` with `/dev/null`, and the child joins
   a new anonymous session keyring before its mounts, so the runner's keys
   are neither listed nor possessed. Every `spawn` drops every capability
@@ -228,7 +235,8 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the calling process and fails closed on a right the ABI does not know.
   Tests: a BPF interpreter over both architectures' programs, the rows in
   the kernel against an unfiltered baseline (`BONELI_SYS_HOST_GAPS` now
-  takes `syslog`, `shmget-hugetlb` and `hugetlbfs-mount`), the privilege
+  takes `syslog`, `shmget-hugetlb`, `socket-inet-packet`, `ioctl-siocgifbr`
+  and `hugetlbfs-mount`), the privilege
   drop seen from inside, Landlock rights on the host, the cgroup2 view
   that no mount call can make writable; two PR 3 tests make their
   capability step on the host side now.

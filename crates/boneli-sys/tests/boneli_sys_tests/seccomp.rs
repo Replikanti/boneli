@@ -9,6 +9,7 @@
 use boneli_sys::seccomp::{Arch, CEILING, Policy, errno_action};
 
 use crate::support::bpf::{ALLOW, Data, program, run};
+use crate::support::probe::{MODULE_BRIDGE_VAR, MODULE_PACKET_VAR, UNTRIED};
 use crate::support::{self, ids, report, run_probe, run_probe_host};
 
 const EPERM: u32 = errno_action(libc::EPERM);
@@ -384,6 +385,135 @@ fn tty_line_discipline_row() {
 }
 
 #[test]
+fn sock_packet_row() {
+    // Written out: SOCK_PACKET is 10, SOCK_NONBLOCK 0x800 and SOCK_CLOEXEC
+    // 0x80000 on both architectures.
+    const PACKET: u64 = 10;
+    const NONBLOCK: u64 = 0x800;
+    const CLOEXEC: u64 = 0x8_0000;
+    let inet = libc::AF_INET as u64;
+    let inet6 = libc::AF_INET6 as u64;
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let socket = |family: u64, ty: u64, protocol: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.socket)
+                    .arg(0, family)
+                    .arg(1, ty)
+                    .arg(2, protocol),
+            )
+        };
+        // Every form the kernel accepts as SOCK_PACKET, with the protocols
+        // a packet socket takes (ETH_P_ALL 0x0300 in network order among
+        // them) and ones the protocol row would allow.
+        for ty in [
+            PACKET,
+            PACKET | NONBLOCK,
+            PACKET | CLOEXEC,
+            PACKET | NONBLOCK | CLOEXEC,
+        ] {
+            for protocol in [0, 1, 6, 17, 0x0300, 0x0003, 132] {
+                assert_eq!(
+                    socket(inet, ty, protocol),
+                    EAFNOSUPPORT,
+                    "{name}: type {ty:#x} protocol {protocol:#x}"
+                );
+            }
+            // `type` is an int: the high word is not part of it.
+            assert_eq!(socket(inet, (1 << 32) | ty, 0), EAFNOSUPPORT, "{name}");
+            assert_eq!(
+                socket(inet, 0xFFFF_FFFF_0000_0000 | ty, 6),
+                EAFNOSUPPORT,
+                "{name}"
+            );
+            // The kernel rewrites only PF_INET, so IPv6 keeps its protocol
+            // row, and the other families their own.
+            assert_eq!(socket(inet6, ty, 0), ALLOW, "{name}: inet6 {ty:#x}");
+            assert_eq!(socket(inet6, ty, 132), EPROTONOSUPPORT, "{name}");
+            assert_eq!(socket(libc::AF_UNIX as u64, ty, 0), ALLOW, "{name}");
+            assert_eq!(socket(libc::AF_PACKET as u64, ty, 0), EAFNOSUPPORT);
+        }
+        // The neighbouring types and other flag bits keep the protocol row:
+        // the kernel refuses unknown flags with EINVAL itself.
+        for ty in [
+            9,
+            11,
+            PACKET | 0x10,
+            PACKET | 0x40,
+            PACKET | 0x8_0800 | 0x1000,
+            libc::SOCK_STREAM as u64,
+            libc::SOCK_DGRAM as u64 | NONBLOCK,
+            libc::SOCK_RAW as u64 | CLOEXEC,
+        ] {
+            assert_eq!(socket(inet, ty, 6), ALLOW, "{name}: type {ty:#x}");
+            assert_eq!(socket(inet, ty, 132), EPROTONOSUPPORT, "{name}");
+        }
+        // ICMP still selects the IPv4 ping socket after the type check.
+        assert_eq!(socket(inet, libc::SOCK_DGRAM as u64, 1), ALLOW, "{name}");
+        // The type in another argument selects nothing: as a protocol, 10
+        // meets the protocol row.
+        assert_eq!(socket(inet, 0, PACKET), EPROTONOSUPPORT, "{name}");
+    }
+    assert_eq!(NONBLOCK, libc::SOCK_NONBLOCK as u64);
+    assert_eq!(CLOEXEC, libc::SOCK_CLOEXEC as u64);
+}
+
+#[test]
+fn module_ioctl_rows() {
+    // The socket ioctls whose handler asks for a module (sockios.h), the
+    // same on both architectures: SIOCGIFBR, SIOCSIFBR and SIOCBRADDBR to
+    // SIOCBRDELIF load bridge, SIOCGIFVLAN and SIOCSIFVLAN load 8021q.
+    const MODULE: [u64; 8] = [
+        0x8940, 0x8941, 0x8982, 0x8983, 0x89a0, 0x89a1, 0x89a2, 0x89a3,
+    ];
+    for arch in Arch::ALL {
+        let prog = program(arch);
+        let n = numbers(arch);
+        let audit = arch.audit_arch();
+        let name = arch.name();
+        let ioctl = |fd: u64, cmd: u64, arg: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.ioctl)
+                    .arg(0, fd)
+                    .arg(1, cmd)
+                    .arg(2, arg),
+            )
+        };
+        for cmd in MODULE {
+            // On every descriptor: the kernel reaches the module branch from
+            // any socket, a Unix one included.
+            for fd in [0, 3, 0xFFFF_FFFF] {
+                assert_eq!(ioctl(fd, cmd, 0), EPERM, "{name}: cmd {cmd:#x}");
+            }
+            // `cmd` is an unsigned int.
+            assert_eq!(ioctl(3, (1 << 32) | cmd, 0), EPERM, "{name}");
+            assert_eq!(ioctl(3, 0xFFFF_FFFF_0000_0000 | cmd, 7), EPERM);
+            // The number in another argument selects nothing.
+            assert_eq!(ioctl(cmd, 0, cmd), ALLOW, "{name}: cmd {cmd:#x}");
+        }
+        // The neighbours and the socket ioctls programs use stay allowed:
+        // SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFADDR, SIOCGIFMTU,
+        // SIOCGIFHWADDR, SIOCGIFNAME, SIOCETHTOOL, SIOCGSTAMP, FIONREAD,
+        // SIOCOUTQ, SIOCINQ's alias and SIOCGIFBRDADDR.
+        for cmd in [
+            0x893f, 0x8942, 0x8981, 0x8984, 0x899f, 0x89a4, 0x8912, 0x8913, 0x8933, 0x8915, 0x8921,
+            0x8927, 0x8910, 0x8946, 0x8906, 0x541b, 0x5411, 0x8919,
+        ] {
+            assert_eq!(ioctl(3, cmd, 0), ALLOW, "{name}: cmd {cmd:#x}");
+        }
+        // The TIOCSETD row still answers before them.
+        assert_eq!(ioctl(3, 0x5423, 0), EPERM, "{name}");
+    }
+    assert_eq!(MODULE[0], libc::SIOCGIFBR);
+    assert_eq!(MODULE[1], libc::SIOCSIFBR);
+}
+
+#[test]
 fn hugetlb_flag_rows() {
     const HUGE_SHIFT: u64 = libc::MAP_HUGE_SHIFT as u64;
     let private_anon = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
@@ -484,7 +614,7 @@ fn program_shape() {
 }
 
 /// The assembler's instruction count, recorded in ADR-007 D2.
-const PROGRAM_LEN: usize = 56;
+const PROGRAM_LEN: usize = 69;
 
 /// The kernel rows (ADR-007, D2): the probe's id for each call and the
 /// result the policy must give inside, an errno or 0 for an allowed call.
@@ -508,6 +638,8 @@ const KERNEL_ROWS: &[(&str, i32)] = &[
     ("socket-inet-raw-protocol", libc::EPROTONOSUPPORT),
     ("socket-inet6-raw-protocol", libc::EPROTONOSUPPORT),
     ("ioctl-tiocsetd", libc::EPERM),
+    ("ioctl-siocgifbr", libc::EPERM),
+    ("socket-inet-packet", libc::EAFNOSUPPORT),
     ("netlink-netfilter", libc::EPROTONOSUPPORT),
     ("netlink-route", 0),
     ("socketpair-inet", libc::EAFNOSUPPORT),
@@ -588,9 +720,51 @@ fn kernel_row_classification() {
     assert!(classify_row("r", eperm, eperm, libc::ENOSYS, true).is_err());
     assert!(classify_row("r", 0, 0, 0, true).is_err());
     assert!(classify_row("r", 0, 0, eperm, false).is_err());
-    // Every gap id of the kernel rows is a row.
-    for gap in ["syslog", "shmget-hugetlb"] {
+    // Every gap id of the kernel rows is a row, the module rows included.
+    for gap in [
+        "syslog",
+        "shmget-hugetlb",
+        "ioctl-siocgifbr",
+        "socket-inet-packet",
+    ] {
         assert!(KERNEL_ROWS.iter().any(|(id, _)| *id == gap), "{gap}");
+    }
+}
+
+/// The kernel rows that are tried only where the host has the module the
+/// call would otherwise ask for (ADR-007 D2, "Module autoload"), with the
+/// file that shows it: the probe never loads a module, on the host or
+/// inside. Where the module is absent the row is untried and must be listed
+/// in `BONELI_SYS_HOST_GAPS`; where it is present it must not be.
+const MODULE_ROWS: [(&str, &str, &str); 2] = [
+    ("socket-inet-packet", MODULE_PACKET_VAR, "/proc/net/packet"),
+    ("ioctl-siocgifbr", MODULE_BRIDGE_VAR, "/sys/module/bridge"),
+];
+
+/// What a module row may do on this host: tried when its module is there.
+fn module_row_untried(present: bool, listed: bool, id: &str) -> Result<bool, String> {
+    match (present, listed) {
+        (true, false) => Ok(false),
+        (false, true) => Ok(true),
+        (true, true) => Err(format!(
+            "{id}: listed in BONELI_SYS_HOST_GAPS, but the host has the module, so the row is observable"
+        )),
+        (false, false) => Err(format!(
+            "{id}: the host lacks the module the baseline would load, so the row is not tried; \
+             list it in BONELI_SYS_HOST_GAPS"
+        )),
+    }
+}
+
+#[test]
+fn module_row_classification() {
+    assert_eq!(module_row_untried(true, false, "r"), Ok(false));
+    assert_eq!(module_row_untried(false, true, "r"), Ok(true));
+    assert!(module_row_untried(true, true, "r").is_err());
+    assert!(module_row_untried(false, false, "r").is_err());
+    for (id, _, _) in MODULE_ROWS {
+        assert!(KERNEL_ROWS.iter().any(|(row, _)| *row == id), "{id}");
+        assert!(support::KNOWN_GAPS.contains(&id), "{id}");
     }
 }
 
@@ -604,15 +778,44 @@ fn row_value(p: &crate::support::Probe, id: &str) -> i32 {
 #[ignore = "host: user namespaces, cgroup v2 delegation, seccomp filters"]
 fn seccomp_rows() {
     let gaps = support::host_gaps();
+    let mut failures = Vec::new();
+    // The module rows: tried in both runs only where the host has the
+    // module, decided here on the host (the sandbox has no /sys).
+    let mut env = Vec::new();
+    let mut untried = Vec::new();
+    for (id, var, shows) in MODULE_ROWS {
+        let present = std::path::Path::new(shows).exists();
+        match module_row_untried(present, gaps.contains(id), id) {
+            Ok(true) => {
+                report(&format!(
+                    "seccomp_rows: {id} not tried ({shows} absent), listed in BONELI_SYS_HOST_GAPS"
+                ));
+                untried.push(id);
+            }
+            Ok(false) => env.push((var, "1")),
+            // Not tried either: the failure says why.
+            Err(e) => {
+                failures.push(e);
+                untried.push(id);
+            }
+        }
+    }
     // The baseline: the same calls on the host, without a filter, as the
     // unprivileged host user the sandbox maps to.
-    let baseline = run_probe_host("seccomp-rows", &[]);
+    let baseline = run_probe_host("seccomp-rows", &env);
     baseline.assert_ok();
-    let mut failures = Vec::new();
     for inside in [0, 999] {
-        let filtered = run_probe("seccomp-rows", ids(inside, inside), &[]);
+        let filtered = run_probe("seccomp-rows", ids(inside, inside), &env);
         filtered.assert_ok();
         for &(id, want) in KERNEL_ROWS {
+            if untried.contains(&id) {
+                for p in [&baseline, &filtered] {
+                    if p.get(&format!("row:{id}")) != UNTRIED {
+                        failures.push(format!("{id}: tried although its module is absent"));
+                    }
+                }
+                continue;
+            }
             let base = row_value(&baseline, id);
             let got = row_value(&filtered, id);
             match classify_row(id, want, base, got, gaps.contains(id)) {

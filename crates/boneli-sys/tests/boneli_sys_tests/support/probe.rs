@@ -11,6 +11,16 @@ use std::os::unix::ffi::OsStrExt;
 pub const ACTION_VAR: &str = "BONELI_SYS_PROBE";
 /// The prefix of every probe line.
 pub const PREFIX: &str = "BONELI_PROBE ";
+/// Set to 1 by `seccomp_rows` when the host has af_packet registered, so
+/// `socket(AF_INET, SOCK_PACKET)` asks for no module.
+pub const MODULE_PACKET_VAR: &str = "BONELI_SYS_PROBE_PACKET";
+/// Set to 1 by `seccomp_rows` when the host has the bridge module, so
+/// `SIOCGIFBR` asks for no module.
+pub const MODULE_BRIDGE_VAR: &str = "BONELI_SYS_PROBE_BRIDGE";
+/// The value of a kernel row the probe did not try.
+pub const UNTRIED: &str = "untried";
+/// `SOCK_PACKET`, `include/linux/net.h`; libc 0.2.191 lacks it for Linux.
+const SOCK_PACKET: i32 = 10;
 
 fn put(key: &str, value: &str) {
     let mut out = std::io::stdout();
@@ -107,6 +117,7 @@ pub fn main(action: &str) -> ! {
         "cgroup-view" => cgroup_view(),
         "landlock" => landlock(),
         "keys" => keys(),
+        "features-no-keyrings" => features_no_keyrings(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     exit(0)
@@ -249,6 +260,69 @@ fn features() {
             .join(","),
     };
     put("missing", &ids);
+}
+
+/// `Features::probe` on a host whose kernel has no keyrings, as far as
+/// this process can tell: a filter of its own answers ENOSYS to `keyctl`,
+/// what a kernel without `CONFIG_KEYS` gives. Prints the missing ids and
+/// the keyring entry's item and errno. The host test runs it directly.
+fn features_no_keyrings() {
+    // Classic BPF: load the number, keyctl -> ERRNO(ENOSYS), else allow.
+    let insns = [
+        boneli_sys::seccomp::Insn {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_keyctl as u32,
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: boneli_sys::seccomp::errno_action(libc::ENOSYS),
+        },
+        boneli_sys::seccomp::Insn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let prog = libc::sock_fprog {
+        len: insns.len() as u16,
+        filter: insns.as_ptr() as *mut libc::sock_filter,
+    };
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        fail(3, &format!("no_new_privs: errno {}", errno()));
+    }
+    // SAFETY: prog points to insns, which outlive the call; Insn has the
+    // layout of sock_filter.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if rc != 0 {
+        fail(3, &format!("seccomp: errno {}", errno()));
+    }
+    let missing = boneli_sys::Features::probe().err().unwrap_or_default();
+    let ids: Vec<&str> = missing.iter().map(|m| m.id().as_str()).collect();
+    put("missing", &ids.join(","));
+    for m in &missing {
+        if let boneli_sys::Missing::Keyrings { item, errno } = m {
+            put("keyrings", &format!("{item}:{errno}"));
+        }
+    }
 }
 
 /// Spawns a missing program with descriptors 0-2 closed in this process
@@ -1224,8 +1298,8 @@ fn seccomp_rows() {
         libc::IPPROTO_UDP,
     );
     // A protocol outside the row's list that loads no module either way:
-    // raw sockets match the raw wildcard entry for every protocol, so the
-    // kernel never calls request_module and refuses the unprivileged
+    // with a protocol other than 0 a raw socket matches the raw wildcard
+    // entry, so the kernel never calls request_module and refuses the unprivileged
     // caller with EPERM (no CAP_NET_RAW); the filter answers
     // EPROTONOSUPPORT before that. A protocol served by a module (SCTP 132,
     // SMC 256, L2TP 115) is never tried here: the baseline would load it
@@ -1305,6 +1379,47 @@ fn seccomp_rows() {
         // SAFETY: id is the segment created above; IPC_RMID takes no buffer.
         unsafe { libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut()) };
     }
+
+    // The two module rows that can be shown without loading a module, and
+    // only on a host that has the module already (the test passes the
+    // host's state in both runs, ADR-007 D2 "Module autoload"): without
+    // af_packet the baseline's `socket(AF_INET, SOCK_PACKET, 0)` would ask
+    // for net-pf-17, without bridge its `SIOCGIFBR` would load bridge. The
+    // VLAN pair is never tried: 8021q is a module on the dev host.
+    let tried = |var: &str| std::env::var(var).as_deref() == Ok("1");
+    if tried(MODULE_PACKET_VAR) {
+        // A packet socket with the type the kernel rewrites; it needs
+        // CAP_NET_RAW, so the unprivileged baseline gets EPERM.
+        socket("socket-inet-packet", libc::AF_INET, SOCK_PACKET, 0);
+    } else {
+        put("row:socket-inet-packet", UNTRIED);
+    }
+    if tried(MODULE_BRIDGE_VAR) {
+        row("ioctl-siocgifbr", siocgifbr_version());
+    } else {
+        put("row:ioctl-siocgifbr", UNTRIED);
+    }
+}
+
+/// `ioctl(SIOCGIFBR, BRCTL_GET_VERSION)` on a new Unix datagram socket:
+/// its errno, 0 for success. With bridge loaded the kernel answers the
+/// version (1) from `br_ioctl_stub` without a capability check; the caller
+/// makes sure bridge is there, so nothing is asked for.
+fn siocgifbr_version() -> i32 {
+    const BRCTL_GET_VERSION: libc::c_ulong = 0;
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        fail(3, &format!("socket(AF_UNIX): errno {}", errno()));
+    }
+    let mut args: [libc::c_ulong; 3] = [BRCTL_GET_VERSION, 0, 0];
+    // SAFETY: SIOCGIFBR reads three unsigned longs through the pointer,
+    // valid for the call's duration.
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCGIFBR as _, args.as_mut_ptr()) };
+    let result = if rc < 0 { errno() } else { 0 };
+    // SAFETY: fd was opened here and nothing else owns it.
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// An i386 `getpid` through `int 0x80` (x86_64 only). Without a filter it

@@ -319,7 +319,10 @@ jobs:
             expect-missing: userns-apparmor,cgroup-not-delegated
             # What this host cannot show (BONELI_SYS_HOST_GAPS, ADR-007 D5):
             # syslog with dmesg_restrict 1, shmget-hugetlb outside
-            # vm.hugetlb_shm_group, hugetlbfs-mount without a hugetlbfs.
+            # vm.hugetlb_shm_group, hugetlbfs-mount without a hugetlbfs,
+            # socket-inet-packet and ioctl-siocgifbr without af_packet or
+            # bridge (assumed present on the Docker runner images; the Host
+            # features step prints both).
             host-gaps: syslog,shmget-hugetlb
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -382,6 +385,11 @@ jobs:
             echo "vm.$k = $(cat "/proc/sys/vm/$k" 2>/dev/null || echo absent)"
           done
           echo "hugetlbfs: $(findmnt -rn -t hugetlbfs -o TARGET,OPTIONS 2>/dev/null | tr '\n' ' ' || true)"
+          # The module rows (ADR-007, D2): seccomp_rows tries them only where
+          # the module is there already, else they are host gaps.
+          echo "af_packet (/proc/net/packet): $( [ -e /proc/net/packet ] && echo present || echo absent)"
+          echo "bridge (/sys/module/bridge): $( [ -e /sys/module/bridge ] && echo present || echo absent)"
+          echo "8021q (/sys/module/8021q): $( [ -e /sys/module/8021q ] && echo present || echo absent)"
           # The statistics keeper (#54, ADR-007 D8): the flush threshold of a
           # memory.stat read scales with online CPUs, the memcg dirty limits
           # with memory, and the dirty intervals set the kernel's own flushes.

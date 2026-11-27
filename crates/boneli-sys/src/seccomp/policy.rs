@@ -5,8 +5,8 @@
 use super::bpf::{self, AsmError, Insn, Label, Op, Target};
 use super::table::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, CEILING, CLONE_NEWUSER, IPPROTO_ICMP,
-    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, NETLINK_ROUTE,
-    SHM_HUGETLB, TIOCSETD,
+    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, MODULE_IOCTLS,
+    NETLINK_ROUTE, SHM_HUGETLB, SOCK_PACKET_TYPES, TIOCSETD,
 };
 
 /// Offsets into `struct seccomp_data` (`include/uapi/linux/seccomp.h`):
@@ -51,6 +51,10 @@ pub enum Row {
     /// `socket` with a family other than Unix, IPv4, IPv6 and netlink:
     /// EAFNOSUPPORT.
     SocketFamily,
+    /// `socket` of family IPv4 with type `SOCK_PACKET` (10, with or
+    /// without `SOCK_NONBLOCK` and `SOCK_CLOEXEC`) in the low word of
+    /// arg 1, which the kernel turns into a packet socket: EAFNOSUPPORT.
+    SockPacket,
     /// `socket` of family netlink with a protocol other than
     /// `NETLINK_ROUTE`: EPROTONOSUPPORT.
     NetlinkProtocol,
@@ -67,11 +71,14 @@ pub enum Row {
     HugetlbMemfd,
     /// `ioctl` with `TIOCSETD` in the low word of arg 1: EPERM.
     LineDiscipline,
+    /// `ioctl` with one of the eight socket ioctls whose handler loads
+    /// `bridge` or `8021q` in the low word of arg 1: EPERM.
+    ModuleIoctl,
 }
 
 impl Row {
     /// Every row, in table order.
-    pub const ALL: [Row; 16] = [
+    pub const ALL: [Row; 18] = [
         Row::ForeignArch,
         Row::Ceiling,
         Row::IoUring,
@@ -81,6 +88,7 @@ impl Row {
         Row::NewUserNamespace,
         Row::Clone3,
         Row::SocketFamily,
+        Row::SockPacket,
         Row::NetlinkProtocol,
         Row::InetProtocol,
         Row::Socketpair,
@@ -88,6 +96,7 @@ impl Row {
         Row::HugetlbShmget,
         Row::HugetlbMemfd,
         Row::LineDiscipline,
+        Row::ModuleIoctl,
     ];
 
     /// The seccomp action of the row.
@@ -103,8 +112,11 @@ impl Row {
             | Row::HugetlbMmap
             | Row::HugetlbShmget
             | Row::HugetlbMemfd
-            | Row::LineDiscipline => errno_action(libc::EPERM),
-            Row::SocketFamily | Row::Socketpair => errno_action(libc::EAFNOSUPPORT),
+            | Row::LineDiscipline
+            | Row::ModuleIoctl => errno_action(libc::EPERM),
+            Row::SocketFamily | Row::SockPacket | Row::Socketpair => {
+                errno_action(libc::EAFNOSUPPORT)
+            }
             Row::NetlinkProtocol | Row::InetProtocol => errno_action(libc::EPROTONOSUPPORT),
         }
     }
@@ -224,8 +236,16 @@ impl Policy {
             Op::Mark(NETLINK),
             Op::Load(arg_low(2)),
             Op::Jeq(NETLINK_ROUTE, to(ALLOW), to(EPROTONOSUPPORT)),
-            // Each family's ICMP, then the protocols both share.
+            // Row SockPacket, IPv4 only (`__sock_create` rewrites only
+            // PF_INET): `type` is an int, and the kernel accepts no other
+            // value with type 10 in it.
             Op::Mark(INET),
+            Op::Load(arg_low(1)),
+            Op::Jeq(SOCK_PACKET_TYPES[0], to(EAFNOSUPPORT), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[1], to(EAFNOSUPPORT), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[2], to(EAFNOSUPPORT), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[3], to(EAFNOSUPPORT), NEXT),
+            // Each family's ICMP, then the protocols both share.
             Op::Load(arg_low(2)),
             Op::Jeq(IPPROTO_ICMP, to(ALLOW), to(IP_PROTOCOL)),
             Op::Mark(INET6),
@@ -250,10 +270,19 @@ impl Policy {
             Op::Mark(MEMFD),
             Op::Load(arg_low(1)),
             Op::Jset(MFD_HUGETLB, to(EPERM), to(ALLOW)),
-            // Row LineDiscipline: `cmd` is an unsigned int.
+            // Rows LineDiscipline and ModuleIoctl: `cmd` is an unsigned
+            // int.
             Op::Mark(IOCTL),
             Op::Load(arg_low(1)),
-            Op::Jeq(TIOCSETD, to(EPERM), to(ALLOW)),
+            Op::Jeq(TIOCSETD, to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[0], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[1], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[2], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[3], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[4], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[5], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[6], to(EPERM), NEXT),
+            Op::Jeq(MODULE_IOCTLS[7], to(EPERM), to(ALLOW)),
             // The returns.
             Op::Mark(ALLOW),
             Op::Ret(libc::SECCOMP_RET_ALLOW),

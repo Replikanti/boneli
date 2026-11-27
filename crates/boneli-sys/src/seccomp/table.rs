@@ -55,6 +55,57 @@ pub const IPPROTO_ICMPV6: u32 = 58;
 /// `TIOCSETD`, `include/uapi/asm-generic/ioctls.h` (x86 and arm64 both
 /// use the generic numbers): sets a tty's line discipline.
 pub const TIOCSETD: u32 = 0x5423;
+/// The socket ioctls whose handler asks for a module by name
+/// (`include/uapi/linux/sockios.h`, the same on both architectures):
+/// `SIOCGIFBR`, `SIOCSIFBR`, `SIOCBRADDBR`, `SIOCBRDELBR`, `SIOCBRADDIF`
+/// and `SIOCBRDELIF` reach `br_ioctl_call`, which loads `bridge`;
+/// `SIOCGIFVLAN` and `SIOCSIFVLAN` load `8021q` (`sock_ioctl`,
+/// `net/socket.c` in Linux 7.2).
+pub const MODULE_IOCTLS: [u32; 8] = [
+    SIOCGIFBR,
+    SIOCSIFBR,
+    SIOCGIFVLAN,
+    SIOCSIFVLAN,
+    SIOCBRADDBR,
+    SIOCBRDELBR,
+    SIOCBRADDIF,
+    SIOCBRDELIF,
+];
+/// `SIOCGIFBR`.
+pub const SIOCGIFBR: u32 = 0x8940;
+/// `SIOCSIFBR`.
+pub const SIOCSIFBR: u32 = 0x8941;
+/// `SIOCGIFVLAN`; libc 0.2.191 defines it for Android only.
+pub const SIOCGIFVLAN: u32 = 0x8982;
+/// `SIOCSIFVLAN`, likewise.
+pub const SIOCSIFVLAN: u32 = 0x8983;
+/// `SIOCBRADDBR`, likewise.
+pub const SIOCBRADDBR: u32 = 0x89a0;
+/// `SIOCBRDELBR`, likewise.
+pub const SIOCBRDELBR: u32 = 0x89a1;
+/// `SIOCBRADDIF`, likewise.
+pub const SIOCBRADDIF: u32 = 0x89a2;
+/// `SIOCBRDELIF`, likewise.
+pub const SIOCBRDELIF: u32 = 0x89a3;
+/// `SOCK_PACKET` (`include/linux/net.h`): `__sock_create` turns
+/// `socket(AF_INET, SOCK_PACKET, ...)` into a `PF_PACKET` socket. libc
+/// 0.2.191 defines it for Android and uclibc only.
+pub const SOCK_PACKET: u32 = 10;
+/// `SOCK_NONBLOCK` and `SOCK_CLOEXEC`, the only flags `socket` accepts
+/// beside the type (`__sys_socket_create`); `O_NONBLOCK` and `O_CLOEXEC`
+/// on both architectures.
+pub const SOCK_NONBLOCK: u32 = 0x800;
+/// `SOCK_CLOEXEC`.
+pub const SOCK_CLOEXEC: u32 = 0x8_0000;
+/// Every `type` argument `socket` accepts as `SOCK_PACKET`: the type with
+/// each combination of the two flags. Any other value with type 10 in its
+/// low four bits fails with EINVAL before the family is looked at.
+pub const SOCK_PACKET_TYPES: [u32; 4] = [
+    SOCK_PACKET,
+    SOCK_PACKET | SOCK_NONBLOCK,
+    SOCK_PACKET | SOCK_CLOEXEC,
+    SOCK_PACKET | SOCK_NONBLOCK | SOCK_CLOEXEC,
+];
 
 const _: () = assert!(MAP_HUGETLB == libc::MAP_HUGETLB as u32);
 const _: () = assert!(SHM_HUGETLB == libc::SHM_HUGETLB as u32);
@@ -71,6 +122,10 @@ const _: () = assert!(IPPROTO_TCP == libc::IPPROTO_TCP as u32);
 const _: () = assert!(IPPROTO_UDP == libc::IPPROTO_UDP as u32);
 const _: () = assert!(IPPROTO_ICMPV6 == libc::IPPROTO_ICMPV6 as u32);
 const _: () = assert!(TIOCSETD == libc::TIOCSETD as u32);
+const _: () = assert!(SIOCGIFBR == libc::SIOCGIFBR as u32);
+const _: () = assert!(SIOCSIFBR == libc::SIOCSIFBR as u32);
+const _: () = assert!(SOCK_NONBLOCK == libc::SOCK_NONBLOCK as u32);
+const _: () = assert!(SOCK_CLOEXEC == libc::SOCK_CLOEXEC as u32);
 
 /// An architecture the policy has a table for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
