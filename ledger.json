@@ -401,11 +401,11 @@
    "title": "boneli-sandbox-linux: the Sandbox port on our own runtime, pods with a shared network namespace",
    "epic": 23,
    "order": 7,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-12T07:00:29+00:00",
+   "updated_at": "2026-11-27T15:51:46+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -457,11 +457,11 @@
    "title": "boneli-sys: namespaces, mounts, pivot_root, cgroups v2, seccomp-bpf and Landlock",
    "epic": 23,
    "order": 6,
-   "state": "pr-review",
-   "owner": "c1dbcb12",
+   "state": "done",
+   "owner": null,
    "pr": 141,
    "note": "PR #141 open",
-   "updated_at": "2026-11-27T14:23:44+00:00",
+   "updated_at": "2026-11-27T15:51:42+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -472,10 +472,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-13T21:57:07+00:00",
+   "updated_at": "2026-11-27T15:51:46+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1711,41 +1711,33 @@
     "core"
    ],
    "manual": false
+  },
+  {
+   "issue": 142,
+   "title": "boneli-sys: two host tests flake on a loaded host (keeper cadence, buffered writes)",
+   "epic": null,
+   "order": 66,
+   "state": "ready",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
+   "parked": null,
+   "pr": null,
+   "note": "added by sync — run reorder",
+   "updated_at": "2026-11-27T15:51:46+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T11:24:07+00:00",
-   "issue": 128,
-   "from": null,
-   "to": "ready",
-   "by": "sync",
-   "note": "added"
-  },
-  {
-   "at": "2026-11-25T11:24:17+00:00",
-   "issue": 128,
-   "from": "ready",
-   "to": "claimed",
-   "by": "ea19b3dc",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-25T11:24:31+00:00",
-   "issue": 125,
-   "from": "pr-review",
-   "to": "done",
-   "by": "sync",
-   "note": "closed on GitHub"
-  },
-  {
-   "at": "2026-11-25T11:28:55+00:00",
-   "issue": 128,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "ea19b3dc",
-   "note": null
-  },
   {
    "at": "2026-11-25T11:31:30+00:00",
    "issue": 128,
@@ -2113,10 +2105,41 @@
    "to": "pr-review",
    "by": "sync",
    "note": "PR #141 open"
+  },
+  {
+   "at": "2026-11-27T15:51:42+00:00",
+   "issue": 6,
+   "from": "pr-review",
+   "to": "done",
+   "by": "c1dbcb12",
+   "note": null
+  },
+  {
+   "at": "2026-11-27T15:51:46+00:00",
+   "issue": 142,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-27T15:51:46+00:00",
+   "issue": 8,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
+  },
+  {
+   "at": "2026-11-27T15:51:46+00:00",
+   "issue": 45,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
-  6,
   8,
   9,
   11,
@@ -2137,10 +2160,11 @@
   33,
   45,
   49,
-  69
+  69,
+  142
  ],
  "xopen": [],
- "updated_at": "2026-11-27T14:53:58+00:00",
+ "updated_at": "2026-11-27T15:51:46+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
