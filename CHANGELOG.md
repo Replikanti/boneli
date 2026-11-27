@@ -247,9 +247,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `capability_gated_calls_fail` (every capability-gated form fails inside,
   for inside ids 0 and 999) and `not_implemented_entries_return_enosys`.
   Four new rows (88 instructions): `setsockopt` at `SOL_TLS` (kTLS),
-  `TCP_MD5SIG`, `TCP_MD5SIG_EXT` and `TCP_AO_ADD_KEY`, and `setsockopt`
-  and `getsockopt` at `SOL_IP` options 64 to 67 (bpfilter's module load on
-  older kernels) answer ENOPROTOOPT; `FS_IOC_ADD_ENCRYPTION_KEY`,
+  `TCP_MD5SIG`, `TCP_MD5SIG_EXT` and `TCP_AO_ADD_KEY`, and options 64 to
+  67 for `setsockopt` at `SOL_IP` and `getsockopt` at every level but
+  `SOL_SOCKET` (bpfilter's module load on 5.19 to 6.7) answer ENOPROTOOPT; `FS_IOC_ADD_ENCRYPTION_KEY`,
   `FS_IOC_SET_ENCRYPTION_POLICY` and `FS_IOC_ENABLE_VERITY` answer EPERM.
   ADR-007 D2 lists every by-name crypto allocation of 7.2 (305: 46
   covered, 259 unreachable), the `request_module` and crypto sites of

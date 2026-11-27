@@ -146,7 +146,8 @@ pub fn denied_form(row: Row) -> Option<[u64; 6]> {
             args[1] = 6;
             args[2] = 38;
         }
-        // IPPROTO_IP with BPFILTER_IPT_SO_SET_REPLACE.
+        // IPPROTO_IP with BPFILTER_IPT_SO_SET_REPLACE, the one level both
+        // calls refuse it at.
         Row::Bpfilter => {
             args[1] = 0;
             args[2] = 64;

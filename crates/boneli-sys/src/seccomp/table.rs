@@ -113,6 +113,10 @@ pub const SOCK_PACKET_TYPES: [u32; 4] = [
 pub const ENOPROTOOPT: i32 = 92;
 /// `SOL_TLS`, `include/linux/socket.h`: the socket level of kTLS.
 pub const SOL_TLS: u32 = 282;
+/// `SOL_SOCKET`, `include/uapi/asm-generic/socket.h` (x86 and arm64 use
+/// the generic value): the one level `getsockopt` answers in the socket
+/// core, before any protocol code.
+pub const SOL_SOCKET: u32 = 1;
 /// `TCP_MD5SIG`, `include/uapi/linux/tcp.h`: an RFC 2385 key.
 pub const TCP_MD5SIG: u32 = 14;
 /// `TCP_MD5SIG_EXT`, likewise, with prefix and interface.
@@ -120,13 +124,14 @@ pub const TCP_MD5SIG_EXT: u32 = 32;
 /// `TCP_AO_ADD_KEY`, `include/uapi/linux/tcp.h` (7.2.4): an RFC 5925
 /// key, with the algorithm named by the caller. libc 0.2.191 lacks it.
 pub const TCP_AO_ADD_KEY: u32 = 38;
-/// The first and last option numbers at `IPPROTO_IP` (`SOL_IP`) that
-/// kernels from 5.19 until bpfilter's removal (it is gone in 6.12) hand
-/// to bpfilter before any capability check
-/// (`ip_setsockopt` and `ip_getsockopt` with `CONFIG_BPFILTER_UMH`:
-/// `BPFILTER_IPT_SO_SET_REPLACE` 64 to `BPFILTER_IPT_SO_GET_REVISION_TARGET`
-/// 67, `include/uapi/linux/bpfilter.h` in 5.19), which loads the
-/// `bpfilter` module; iptables uses the same numbers.
+/// The first and last option numbers that kernels from 5.19 to 6.7
+/// (v6.8 removed bpfilter) hand to bpfilter before any capability check,
+/// which loads the `bpfilter` module: with `CONFIG_BPFILTER_UMH`,
+/// `ip_setsockopt` at `IPPROTO_IP` (`SOL_IP`) and `ip_getsockopt` at any
+/// level that reaches it (`BPFILTER_IPT_SO_SET_REPLACE` 64 to
+/// `BPFILTER_IPT_SO_GET_REVISION_TARGET` 67,
+/// `include/uapi/linux/bpfilter.h` in 5.19); iptables uses the same
+/// numbers.
 pub const BPFILTER_OPTIONS: (u32, u32) = (64, 67);
 /// The TCP options that set a signature key.
 pub const TCP_SIGNATURE_OPTIONS: [u32; 3] = [TCP_MD5SIG, TCP_MD5SIG_EXT, TCP_AO_ADD_KEY];
@@ -160,6 +165,7 @@ const _: () = assert!(FS_IOC_SET_ENCRYPTION_POLICY == 0x800c_6613);
 const _: () = assert!(FS_IOC_ENABLE_VERITY == 0x4080_6685);
 const _: () = assert!(ENOPROTOOPT == libc::ENOPROTOOPT);
 const _: () = assert!(SOL_TLS == libc::SOL_TLS as u32);
+const _: () = assert!(SOL_SOCKET == libc::SOL_SOCKET as u32);
 const _: () = assert!(TCP_MD5SIG == libc::TCP_MD5SIG as u32);
 const _: () = assert!(TCP_MD5SIG_EXT == libc::TCP_MD5SIG_EXT as u32);
 const _: () = assert!(MAP_HUGETLB == libc::MAP_HUGETLB as u32);

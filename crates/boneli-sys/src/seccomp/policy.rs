@@ -7,7 +7,7 @@ use super::table::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, BPFILTER_OPTIONS, CEILING, CLONE_NEWUSER,
     ENOPROTOOPT as ENOPROTOOPT_ERRNO, FS_CRYPTO_IOCTLS, IPPROTO_ICMP, IPPROTO_ICMPV6, IPPROTO_IP,
     IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, MODULE_IOCTLS, NETLINK_ROUTE, SHM_HUGETLB,
-    SOCK_PACKET_TYPES, SOL_TLS, TCP_SIGNATURE_OPTIONS, TIOCSETD,
+    SOCK_PACKET_TYPES, SOL_SOCKET, SOL_TLS, TCP_SIGNATURE_OPTIONS, TIOCSETD,
 };
 
 /// Offsets into `struct seccomp_data` (`include/uapi/linux/seccomp.h`):
@@ -82,9 +82,11 @@ pub enum Row {
     /// `TCP_MD5SIG`, `TCP_MD5SIG_EXT` or `TCP_AO_ADD_KEY` in the low word
     /// of arg 2: ENOPROTOOPT.
     TcpSignature,
-    /// `setsockopt` or `getsockopt` with `IPPROTO_IP` in the low word of
-    /// arg 1 and 64 to 67 in the low word of arg 2, the options kernels
-    /// from 5.19 until bpfilter's removal hand to bpfilter: ENOPROTOOPT.
+    /// 64 to 67 in the low word of arg 2, the options kernels from 5.19
+    /// to 6.7 hand to bpfilter, for `setsockopt` with `IPPROTO_IP` in the
+    /// low word of arg 1 and for `getsockopt` with anything but
+    /// `SOL_SOCKET` there (`ip_getsockopt` does not test the level, and
+    /// the filter cannot see the socket's family): ENOPROTOOPT.
     Bpfilter,
     /// `ioctl` with `FS_IOC_ADD_ENCRYPTION_KEY`,
     /// `FS_IOC_SET_ENCRYPTION_POLICY` or `FS_IOC_ENABLE_VERITY` in the low
@@ -326,11 +328,11 @@ impl Policy {
             Op::Jeq(TCP_SIGNATURE_OPTIONS[0], to(ENOPROTOOPT), NEXT),
             Op::Jeq(TCP_SIGNATURE_OPTIONS[1], to(ENOPROTOOPT), NEXT),
             Op::Jeq(TCP_SIGNATURE_OPTIONS[2], to(ENOPROTOOPT), to(ALLOW)),
-            // Row Bpfilter for getsockopt, then the option range both
-            // calls share, unsigned: 64 to 67.
+            // Row Bpfilter for getsockopt, at every level but SOL_SOCKET,
+            // then the option range both calls share, unsigned: 64 to 67.
             Op::Mark(GETSOCKOPT),
             Op::Load(arg_low(1)),
-            Op::Jeq(IPPROTO_IP, NEXT, to(ALLOW)),
+            Op::Jeq(SOL_SOCKET, to(ALLOW), NEXT),
             Op::Mark(IP_OPTION),
             Op::Load(arg_low(2)),
             Op::Jgt(BPFILTER_OPTIONS.1, to(ALLOW), NEXT),

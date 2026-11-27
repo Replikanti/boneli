@@ -763,27 +763,74 @@ fn bpfilter_row() {
             for optname in [0, 1, 2, 11, 32, 42, 51, 52, 63, 68, 96, 0xFFFF_FFFF] {
                 assert_eq!(call(SOL_IP, optname), ALLOW, "{name}: nr {nr} {optname}");
             }
-            // The same numbers at other levels: SOL_SOCKET, IPPROTO_TCP,
-            // IPPROTO_UDP, SOL_IPV6 (whose 64-67 are ip6tables, which need
-            // CAP_NET_ADMIN and load no module).
-            for level in [1, 6, 17, 41] {
-                for optname in 64..=67 {
-                    assert_eq!(call(level, optname), ALLOW, "{name}: {level} {optname}");
-                }
-            }
         }
-        // getsockopt keeps no other row.
-        let get = |level: u64, optname: u64| {
+        let set = |level: u64, optname: u64| {
             run(
                 &prog,
-                &Data::call(audit, n.getsockopt)
+                &Data::call(audit, n.setsockopt)
+                    .arg(0, 3)
                     .arg(1, level)
                     .arg(2, optname),
             )
         };
+        // setsockopt: the same numbers at other levels: SOL_SOCKET,
+        // IPPROTO_TCP, IPPROTO_UDP, SOL_IPV6 (whose 64-67 are ip6tables,
+        // which need CAP_NET_ADMIN and load no module). `ip_setsockopt`
+        // returns before bpfilter for every level but SOL_IP.
+        for level in [1, 6, 17, 41, 255] {
+            for optname in 64..=67 {
+                assert_eq!(set(level, optname), ALLOW, "{name}: set {level} {optname}");
+            }
+        }
+        let get = |level: u64, optname: u64| {
+            run(
+                &prog,
+                &Data::call(audit, n.getsockopt)
+                    .arg(0, 3)
+                    .arg(1, level)
+                    .arg(2, optname),
+            )
+        };
+        // getsockopt: `ip_getsockopt` hands 64 to 67 to bpfilter at any
+        // level the protocol passes down, and the filter cannot see the
+        // socket's family, so every level but SOL_SOCKET is refused:
+        // IPPROTO_TCP, IPPROTO_UDP, SOL_IPV6, an unknown level and the
+        // high word of an int.
+        for level in [0, 6, 17, 41, 255, 0xFFFF_FFFF, (1 << 32) | 41] {
+            for optname in 64..=67 {
+                assert_eq!(
+                    get(level, optname),
+                    ENOPROTOOPT,
+                    "{name}: get {level:#x} {optname}"
+                );
+            }
+        }
+        // SOL_SOCKET (1) never reaches the protocol, also with a high word.
+        for level in [1, (1 << 32) | 1] {
+            for optname in 64..=67 {
+                assert_eq!(
+                    get(level, optname),
+                    ALLOW,
+                    "{name}: get {level:#x} {optname}"
+                );
+            }
+        }
+        // The range's neighbours and options IPv6 programs read stay
+        // allowed: IPV6_V6ONLY 26, IPV6_RECVERR 25, 63 and 68.
+        for level in [0, 6, 41, 255] {
+            for optname in [25, 26, 63, 68] {
+                assert_eq!(get(level, optname), ALLOW, "{name}: get {level} {optname}");
+            }
+        }
+        // getsockopt keeps no other row.
         assert_eq!(get(6, 38), ALLOW, "{name}: getsockopt TCP_AO_ADD_KEY");
         assert_eq!(get(282, 1), ALLOW, "{name}: getsockopt SOL_TLS");
     }
+    // The IPv6 options the getsockopt half costs, and its neighbours.
+    assert_eq!(libc::IPV6_RECVTCLASS, 66);
+    assert_eq!(libc::IPV6_TCLASS, 67);
+    assert_eq!(libc::IPV6_RECVERR, 25);
+    assert_eq!(libc::IPV6_V6ONLY, 26);
 }
 
 #[test]
