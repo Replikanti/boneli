@@ -457,11 +457,11 @@
    "title": "boneli-sys: namespaces, mounts, pivot_root, cgroups v2, seccomp-bpf and Landlock",
    "epic": 23,
    "order": 6,
-   "state": "ready",
-   "owner": null,
+   "state": "claimed",
+   "owner": "bc767b73",
    "pr": 48,
-   "note": "resumed by operator 2026-11-27, continue PR 4 from WIP local commits 394969b + ea7b888 on feat/boneli-sys-part4 (not pushed, worktree boneli-sys-part4): libs, census data, change 11 tests, probe _exit flake fix (root cause: std exit unmaps alt stack under glibc setxid handler); missing: compile, all PR 4 tests, ADR/docs/CI, PR; plan + amendment issuecomment-6882405979; stopped 2026-11-14 because the safety classifier stopped 3 agents on PR 4",
-   "updated_at": "2026-11-27T00:31:05+00:00",
+   "note": "",
+   "updated_at": "2026-11-27T00:31:15+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -472,10 +472,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null
   },
   {
@@ -1715,14 +1715,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-24T22:49:22+00:00",
-   "issue": 125,
-   "from": "ready",
-   "to": "claimed",
-   "by": "48d4a169",
-   "note": "dispatched"
-  },
-  {
    "at": "2026-11-24T22:59:22+00:00",
    "issue": 125,
    "from": "claimed",
@@ -2113,6 +2105,14 @@
    "to": "ready",
    "by": "3ca43470",
    "note": "resumed by operator 2026-11-27, continue PR 4 from WIP local commits 394969b + ea7b888 on feat/boneli-sys-part4 (not pushed, worktree boneli-sys-part4): libs, census data, change 11 tests, probe _exit flake fix (root cause: std exit unmaps alt stack under glibc setxid handler); missing: compile, all PR 4 tests, ADR/docs/CI, PR; plan + amendment issuecomment-6882405979; stopped 2026-11-14 because the safety classifier stopped 3 agents on PR 4"
+  },
+  {
+   "at": "2026-11-27T00:31:15+00:00",
+   "issue": 6,
+   "from": "ready",
+   "to": "claimed",
+   "by": "bc767b73",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2140,7 +2140,7 @@
   69
  ],
  "xopen": [],
- "updated_at": "2026-11-27T00:31:05+00:00",
+ "updated_at": "2026-11-27T00:31:15+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
