@@ -457,11 +457,11 @@
    "title": "boneli-sys: namespaces, mounts, pivot_root, cgroups v2, seccomp-bpf and Landlock",
    "epic": 23,
    "order": 6,
-   "state": "pr-review",
-   "owner": "bc767b73",
+   "state": "ready",
+   "owner": null,
    "pr": 140,
-   "note": "",
-   "updated_at": "2026-11-27T02:04:09+00:00",
+   "note": "PR 4 merged (#140, e084d2b). Next: PR 5 (census, Docker comparison, kTLS+fscrypt rows, residual risk, ADR-007 accepted, Closes #6) per plan amendment; census WIP on local branch wip/boneli-sys-part5-census",
+   "updated_at": "2026-11-27T11:51:07+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -472,10 +472,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1715,14 +1715,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-24T23:48:24+00:00",
-   "issue": 102,
-   "from": "ready",
-   "to": "claimed",
-   "by": "3613ba8e",
-   "note": "dispatched"
-  },
-  {
    "at": "2026-11-25T00:46:08+00:00",
    "issue": 125,
    "from": "implementing",
@@ -2113,6 +2105,14 @@
    "to": "pr-review",
    "by": "bc767b73",
    "note": null
+  },
+  {
+   "at": "2026-11-27T11:51:07+00:00",
+   "issue": 6,
+   "from": "pr-review",
+   "to": "ready",
+   "by": "bc767b73",
+   "note": "PR 4 merged (#140, e084d2b). Next: PR 5 (census, Docker comparison, kTLS+fscrypt rows, residual risk, ADR-007 accepted, Closes #6) per plan amendment; census WIP on local branch wip/boneli-sys-part5-census"
   }
  ],
  "open": [
@@ -2140,7 +2140,7 @@
   69
  ],
  "xopen": [],
- "updated_at": "2026-11-27T02:04:09+00:00",
+ "updated_at": "2026-11-27T11:51:07+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2150,7 +2150,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795730763,
+  "at": 1795780267,
   "private": false
  },
  "schema": 2,
