@@ -2050,8 +2050,11 @@ code.
   the floor test on Azure x86_64, with p = 23/260, the kill rate of
   parent reads every 5 ms at 64 MiB there (M3, KP5), so it misses a
   kill with probability 1 % or less (R-S6). Since #142 the host pin
-  judges wiring and liveness only (own file read in at least 5 of 20
-  slots, the parent's in at most 5, a stall bound of 500 ms); the
+  judges wiring and liveness (own file read in at least 5 of 20 slots,
+  the parent's in at most 5, a stall bound of 500 ms) plus one loose
+  bound on the real wait, at most 50 % of a window's reads late (3x the
+  about 17 % derived for a scope frozen 75 ms of every 100 ms CFS
+  period; waits that oversleep a period on most calls show 75-100 %); the
   cadence (reads per period, late reads, longest gap) is pinned by unit
   tests of `run` on a fake clock, because under `CPUQuota=300%` honest
   keepers read 60-75 % of the periods with up to 8.39 % late reads while

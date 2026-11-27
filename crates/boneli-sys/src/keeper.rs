@@ -666,16 +666,28 @@ mod tests {
         assert!(within(|| keepers() == before));
     }
 
+    /// How long every read takes on the fake clock.
+    const READ: Duration = Duration::from_millis(1);
+
     /// A clock for [`run`] on the test's own thread (#142): `now` is
-    /// `base` plus a virtual time that only `wait` moves, by the time
-    /// asked plus the overshoot scripted for that call (a host that froze
-    /// the thread). It never blocks. Once the virtual time reaches `end`
-    /// it stops the loop as [`StatsKeeper::stop`] would, and once it
-    /// reaches the time in `empty` it empties that file, so the loop's
-    /// next read fails.
+    /// `base` plus a virtual time that `wait` moves, by the time asked
+    /// plus the overshoot scripted for that call (a host that froze the
+    /// thread), and that a read moves by [`READ`]. It never blocks. Once
+    /// the virtual time reaches `end` it stops the loop as
+    /// [`StatsKeeper::stop`] would, and once it reaches the time in
+    /// `empty` it empties that file, so the loop's next read fails.
+    ///
+    /// A read is the third clock read after a wait: `run` reads the clock
+    /// for the tick, for the read's start and for its end, so the end is
+    /// [`READ`] after the start, and a `took` that is not end minus start
+    /// on this clock shows as a `max_read` other than [`READ`] (the
+    /// virtual time runs ahead of the wall clock, so a read timed with
+    /// `Instant::now()` saturates to zero).
     struct Fake {
         base: Instant,
         virt: std::cell::Cell<Duration>,
+        /// Clock reads since the last wait.
+        nows: std::cell::Cell<usize>,
         end: Duration,
         /// (index of the wait call, from 0; its overshoot).
         freeze: Vec<(usize, Duration)>,
@@ -688,6 +700,7 @@ mod tests {
             Fake {
                 base: Instant::now(),
                 virt: std::cell::Cell::new(Duration::ZERO),
+                nows: std::cell::Cell::new(0),
                 end: ms(end_ms),
                 freeze: Vec::new(),
                 waits: std::cell::Cell::new(0),
@@ -704,6 +717,11 @@ mod tests {
 
     impl Clock for Fake {
         fn now(&self) -> Instant {
+            let n = self.nows.get() + 1;
+            self.nows.set(n);
+            if n == 3 {
+                self.virt.set(self.virt.get() + READ);
+            }
             self.base + self.virt.get()
         }
 
@@ -713,6 +731,7 @@ mod tests {
             mut s: MutexGuard<'a, State>,
             d: Duration,
         ) -> MutexGuard<'a, State> {
+            self.nows.set(0);
             let n = self.waits.get();
             self.waits.set(n + 1);
             let over = self
@@ -778,10 +797,11 @@ mod tests {
         let r = run_fake(&fake, &fd, false);
         assert_eq!(shape(r), (1 + 200, 0, ms(5)), "{r:?}");
         assert_eq!(r.failed, None);
+        // Each read took READ on the loop's clock; one timed on the wall
+        // clock reads as zero.
         assert_eq!(
-            r.max_read,
-            Duration::ZERO,
-            "the read was timed on the wall clock"
+            r.max_read, READ,
+            "the read was not timed on the loop's clock"
         );
         assert_eq!(fake.waits.get(), 201, "one wait per period");
         // Stopped exactly at 1,000 ms: the stop is seen before the read due

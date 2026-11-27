@@ -161,12 +161,33 @@ const CADENCE_ATTEMPTS: usize = 3;
 /// measured on a loaded dev host was 56 ms (#142).
 const CADENCE_STALL: Duration = Duration::from_millis(500);
 
+/// The largest share of a window's reads that may be late, in percent:
+/// a bound on the real wait, which the fake-clock unit tests never call
+/// (#143 review: `wait_timeout(s, d * 2)` in `Real::wait` read 111 times
+/// with 83 late, 75 %, and `d + 9 * period` 20 times, all late, while
+/// passing every other check). An honest keeper's late share is set by
+/// the host's freezes, not by the keeper: a cgroup out of CPU quota is
+/// frozen for the rest of each 100 ms CFS period, and every freeze adds
+/// one late read and loses the periods it covers, so a scope that runs
+/// `r` ms per period shows about 1 / (1 + r / 5 ms) late. Measured under
+/// `CPUQuota=300%`: up to 8.39 % (60 windows, #142); a 75 ms freeze per
+/// period (`r` = 25 ms, derived, not measured) gives 1/6, about 17 %, so
+/// 50 % keeps a margin of 3x over that and 6x over the measured worst.
+/// 50 % is reached at `r` = 5 ms, a scope frozen 95 % of the time. A
+/// lower threshold loses that margin: the period-skipping mutant (24-29 %)
+/// overlaps a harder-throttled honest host and stays pinned by the fake
+/// clock. A wait that wakes a period or more late on most calls, as both
+/// review mutants do, shows 75-100 %.
+const CADENCE_LATE_PERCENT: u64 = 50;
+
 /// What one window of `keeper_reads_its_own_sandbox` saw of one keeper:
 /// wiring and liveness, not cadence. How often and how regularly the
 /// keeper reads is pinned by the unit tests of its loop on a fake clock
 /// (`src/keeper.rs`), because a loaded host stretches any wall-clock
 /// bound: under `CPUQuota=300%` honest keepers read 60 to 75 % of the
 /// periods, up to 8.39 % of them late, and paused 25 to 70 ms (#142).
+/// The one cadence bound kept is [`CADENCE_LATE_PERCENT`], loose enough
+/// for any honest load, for a real wait that oversleeps.
 fn liveness_failure(
     name: &str,
     slots: usize,
@@ -174,6 +195,7 @@ fn liveness_failure(
     after: KeeperReport,
 ) -> Option<String> {
     let reads = after.reads.saturating_sub(before.reads);
+    let late = after.late.saturating_sub(before.late);
     if let Some(errno) = after.failed {
         Some(format!(
             "the keeper of sandbox {name} failed (errno {errno})"
@@ -191,6 +213,11 @@ fn liveness_failure(
     } else if after.reads <= before.reads {
         Some(format!(
             "the keeper of sandbox {name} read {reads} times in the window: it is not running"
+        ))
+    } else if late * 100 > reads * CADENCE_LATE_PERCENT {
+        Some(format!(
+            "the keeper of sandbox {name} read {late} of its {reads} reads in the window late, \
+             over {CADENCE_LATE_PERCENT} %"
         ))
     } else if after.max_gap > CADENCE_STALL {
         Some(format!(
@@ -236,6 +263,30 @@ fn liveness_rule() {
     failed.failed = Some(libc::EIO);
     let m = rule(READ_SLOTS, failed).expect("a failed keeper");
     assert!(m.contains("failed (errno 5)"), "{m}");
+    // The late share, inclusive at half the window's reads: 100 of 200
+    // passes, 101 fails; both review mutants of `Real::wait` (#143)
+    // fail.
+    assert_eq!(rule(READ_SLOTS, keeper(210, 100, ms(10))), None);
+    let m = rule(READ_SLOTS, keeper(210, 101, ms(10))).expect("over half late");
+    assert!(
+        m.contains("read 101 of its 200 reads in the window late"),
+        "{m}"
+    );
+    let m = rule(READ_SLOTS, keeper(10 + 111, 83, ms(15))).expect("wait d * 2");
+    assert!(m.contains("83 of its 111"), "{m}");
+    let m = rule(READ_SLOTS, keeper(10 + 20, 20, ms(50))).expect("wait d + 9 periods");
+    assert!(m.contains("20 of its 20"), "{m}");
+    // The share is of the window, not of the keeper's life: late reads
+    // before the window do not count, nor do reads before it dilute it.
+    let earlier = keeper(10, 8, ms(5));
+    assert_eq!(
+        liveness_failure("a", READ_SLOTS, earlier, keeper(14, 10, ms(10))),
+        None
+    );
+    let long = keeper(1000, 0, ms(5));
+    let m = liveness_failure("a", READ_SLOTS, long, keeper(1010, 6, ms(10)))
+        .expect("6 of 10 late in the window");
+    assert!(m.contains("6 of its 10"), "{m}");
     // The stall bound, inclusive.
     assert_eq!(rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL)), None);
     let m = rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL + ms(1))).expect("a stall");
@@ -256,7 +307,9 @@ fn keeper_reads_its_own_sandbox() {
     // slot: #78 review, run 2) is pinned by the unit tests of its loop on
     // a fake clock in src/keeper.rs, not here: a loaded host stretches any
     // wall-clock bound (#142). This test pins that each keeper reads its
-    // own file, never the parent's, and is alive ([`liveness_failure`]).
+    // own file, never the parent's, and is alive ([`liveness_failure`]),
+    // and, through the late share, that the real wait, which the fake
+    // clock replaces, does not oversleep by a period on most calls.
     let _alone = support::exclusive();
     let parent_stat = cgroup::parent().path().join("memory.stat");
     let parent_before = descriptors_of(&parent_stat);
