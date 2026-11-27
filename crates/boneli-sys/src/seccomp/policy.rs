@@ -4,9 +4,10 @@
 
 use super::bpf::{self, AsmError, Insn, Label, Op, Target};
 use super::table::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, CEILING, CLONE_NEWUSER, IPPROTO_ICMP,
-    IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, MODULE_IOCTLS,
-    NETLINK_ROUTE, SHM_HUGETLB, SOCK_PACKET_TYPES, TIOCSETD,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, Arch, BPFILTER_OPTIONS, CEILING, CLONE_NEWUSER,
+    ENOPROTOOPT as ENOPROTOOPT_ERRNO, FS_CRYPTO_IOCTLS, IPPROTO_ICMP, IPPROTO_ICMPV6, IPPROTO_IP,
+    IPPROTO_TCP, IPPROTO_UDP, MAP_HUGETLB, MFD_HUGETLB, MODULE_IOCTLS, NETLINK_ROUTE, SHM_HUGETLB,
+    SOCK_PACKET_TYPES, SOL_SOCKET, SOL_TLS, TCP_SIGNATURE_OPTIONS, TIOCSETD,
 };
 
 /// Offsets into `struct seccomp_data` (`include/uapi/linux/seccomp.h`):
@@ -74,11 +75,28 @@ pub enum Row {
     /// `ioctl` with one of the eight socket ioctls whose handler loads
     /// `bridge` or `8021q` in the low word of arg 1: EPERM.
     ModuleIoctl,
+    /// `setsockopt` with `SOL_TLS` in the low word of arg 1 (the level):
+    /// ENOPROTOOPT.
+    Ktls,
+    /// `setsockopt` with `IPPROTO_TCP` in the low word of arg 1 and
+    /// `TCP_MD5SIG`, `TCP_MD5SIG_EXT` or `TCP_AO_ADD_KEY` in the low word
+    /// of arg 2: ENOPROTOOPT.
+    TcpSignature,
+    /// 64 to 67 in the low word of arg 2, the options kernels from 5.19
+    /// to 6.7 hand to bpfilter, for `setsockopt` with `IPPROTO_IP` in the
+    /// low word of arg 1 and for `getsockopt` with anything but
+    /// `SOL_SOCKET` there (`ip_getsockopt` does not test the level, and
+    /// the filter cannot see the socket's family): ENOPROTOOPT.
+    Bpfilter,
+    /// `ioctl` with `FS_IOC_ADD_ENCRYPTION_KEY`,
+    /// `FS_IOC_SET_ENCRYPTION_POLICY` or `FS_IOC_ENABLE_VERITY` in the low
+    /// word of arg 1: EPERM.
+    FsCryptoIoctl,
 }
 
 impl Row {
     /// Every row, in table order.
-    pub const ALL: [Row; 18] = [
+    pub const ALL: [Row; 22] = [
         Row::ForeignArch,
         Row::Ceiling,
         Row::IoUring,
@@ -97,6 +115,10 @@ impl Row {
         Row::HugetlbMemfd,
         Row::LineDiscipline,
         Row::ModuleIoctl,
+        Row::Ktls,
+        Row::TcpSignature,
+        Row::Bpfilter,
+        Row::FsCryptoIoctl,
     ];
 
     /// The seccomp action of the row.
@@ -113,11 +135,13 @@ impl Row {
             | Row::HugetlbShmget
             | Row::HugetlbMemfd
             | Row::LineDiscipline
-            | Row::ModuleIoctl => errno_action(libc::EPERM),
+            | Row::ModuleIoctl
+            | Row::FsCryptoIoctl => errno_action(libc::EPERM),
             Row::SocketFamily | Row::SockPacket | Row::Socketpair => {
                 errno_action(libc::EAFNOSUPPORT)
             }
             Row::NetlinkProtocol | Row::InetProtocol => errno_action(libc::EPROTONOSUPPORT),
+            Row::Ktls | Row::TcpSignature | Row::Bpfilter => errno_action(ENOPROTOOPT_ERRNO),
         }
     }
 
@@ -164,6 +188,10 @@ const INET: Label = Label(14);
 const INET6: Label = Label(15);
 const IP_PROTOCOL: Label = Label(16);
 const IOCTL: Label = Label(17);
+const SETSOCKOPT: Label = Label(18);
+const ENOPROTOOPT: Label = Label(19);
+const GETSOCKOPT: Label = Label(20);
+const IP_OPTION: Label = Label(21);
 
 fn to(label: Label) -> Target {
     Target::Label(label)
@@ -219,6 +247,8 @@ impl Policy {
             Op::Jeq(nr.shmget, to(SHMGET), NEXT),
             Op::Jeq(nr.memfd_create, to(MEMFD), NEXT),
             Op::Jeq(nr.ioctl, to(IOCTL), NEXT),
+            Op::Jeq(nr.setsockopt, to(SETSOCKOPT), NEXT),
+            Op::Jeq(nr.getsockopt, to(GETSOCKOPT), NEXT),
             Op::Ret(libc::SECCOMP_RET_ALLOW),
             // Row NewUserNamespace: clone uses only the low word of its
             // flags, unshare rejects unknown upper bits.
@@ -270,8 +300,8 @@ impl Policy {
             Op::Mark(MEMFD),
             Op::Load(arg_low(1)),
             Op::Jset(MFD_HUGETLB, to(EPERM), to(ALLOW)),
-            // Rows LineDiscipline and ModuleIoctl: `cmd` is an unsigned
-            // int.
+            // Rows LineDiscipline, ModuleIoctl and FsCryptoIoctl: `cmd` is
+            // an unsigned int.
             Op::Mark(IOCTL),
             Op::Load(arg_low(1)),
             Op::Jeq(TIOCSETD, to(EPERM), NEXT),
@@ -282,7 +312,31 @@ impl Policy {
             Op::Jeq(MODULE_IOCTLS[4], to(EPERM), NEXT),
             Op::Jeq(MODULE_IOCTLS[5], to(EPERM), NEXT),
             Op::Jeq(MODULE_IOCTLS[6], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[7], to(EPERM), to(ALLOW)),
+            Op::Jeq(MODULE_IOCTLS[7], to(EPERM), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[0], to(EPERM), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[1], to(EPERM), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[2], to(EPERM), to(ALLOW)),
+            // Rows Ktls, TcpSignature and Bpfilter: `level` and `optname`
+            // are ints. Every other level and option is judged by the
+            // kernel.
+            Op::Mark(SETSOCKOPT),
+            Op::Load(arg_low(1)),
+            Op::Jeq(SOL_TLS, to(ENOPROTOOPT), NEXT),
+            Op::Jeq(IPPROTO_IP, to(IP_OPTION), NEXT),
+            Op::Jeq(IPPROTO_TCP, NEXT, to(ALLOW)),
+            Op::Load(arg_low(2)),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[0], to(ENOPROTOOPT), NEXT),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[1], to(ENOPROTOOPT), NEXT),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[2], to(ENOPROTOOPT), to(ALLOW)),
+            // Row Bpfilter for getsockopt, at every level but SOL_SOCKET,
+            // then the option range both calls share, unsigned: 64 to 67.
+            Op::Mark(GETSOCKOPT),
+            Op::Load(arg_low(1)),
+            Op::Jeq(SOL_SOCKET, to(ALLOW), NEXT),
+            Op::Mark(IP_OPTION),
+            Op::Load(arg_low(2)),
+            Op::Jgt(BPFILTER_OPTIONS.1, to(ALLOW), NEXT),
+            Op::Jgt(BPFILTER_OPTIONS.0 - 1, to(ENOPROTOOPT), to(ALLOW)),
             // The returns.
             Op::Mark(ALLOW),
             Op::Ret(libc::SECCOMP_RET_ALLOW),
@@ -294,6 +348,8 @@ impl Policy {
             Op::Ret(errno_action(libc::EAFNOSUPPORT)),
             Op::Mark(EPROTONOSUPPORT),
             Op::Ret(errno_action(libc::EPROTONOSUPPORT)),
+            Op::Mark(ENOPROTOOPT),
+            Op::Ret(errno_action(ENOPROTOOPT_ERRNO)),
             Op::Mark(KILL),
             Op::Ret(libc::SECCOMP_RET_KILL_PROCESS),
         ]);

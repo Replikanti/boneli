@@ -4,6 +4,7 @@
 pub mod alloc_guard;
 pub mod bpf;
 pub mod cgroup;
+pub mod gated;
 pub mod probe;
 pub mod rootfs;
 
@@ -392,23 +393,35 @@ pub fn run_probe_host(action: &str, env: &[(&str, &str)]) -> Probe {
 
 /// The ids `BONELI_SYS_HOST_GAPS` may name: kernel rows of the seccomp
 /// policy a host cannot observe, and host features a test needs that a
-/// host may lack (ADR-007, D5).
+/// host may lack (ADR-007, D5). `nosys-<name>` names a `NeedsCap` census
+/// entry the host kernel lacks ([`is_nosys_gap`]).
 pub const KNOWN_GAPS: &[&str] = &[
     "syslog",
     "shmget-hugetlb",
     "hugetlbfs-mount",
     "ioctl-siocgifbr",
     "socket-inet-packet",
+    "setsockopt-tcp-ao",
+    "setsockopt-tcp-md5",
+    "alarm-rtc",
 ];
 
-/// Parses a comma-separated gap list; an id outside [`KNOWN_GAPS`] is an
-/// error naming it.
+/// Whether `id` is `nosys-<name>` for a `NeedsCap` census entry, byte for
+/// byte.
+pub fn is_nosys_gap(id: &str) -> bool {
+    id.strip_prefix("nosys-")
+        .and_then(crate::census::entry)
+        .is_some_and(|e| matches!(e.verdict, crate::census::Verdict::NeedsCap { .. }))
+}
+
+/// Parses a comma-separated gap list; an id outside [`KNOWN_GAPS`] that
+/// is not a `nosys-` id of a `NeedsCap` entry is an error naming it.
 pub fn parse_gaps(raw: &str) -> Result<std::collections::BTreeSet<String>, String> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|id| {
-            if KNOWN_GAPS.contains(&id) {
+            if KNOWN_GAPS.contains(&id) || is_nosys_gap(id) {
                 Ok(id.to_string())
             } else {
                 Err(format!("BONELI_SYS_HOST_GAPS names an unknown id {id:?}"))

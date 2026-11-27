@@ -36,6 +36,12 @@ multiple_unsafe_ops_per_block = "forbid"
 # build script is approved by ADR-005. No other dependency (ADR-007).
 libc = "0.2.191"
 
+[dev-dependencies]
+# Reads Docker's vendored seccomp profile for the comparison in ADR-007 D2
+# (tests/boneli_sys_tests/census/docker.rs): a std-only member crate
+# (ADR-008), test-only, so `[dependencies]` keeps libc alone.
+boneli-json.workspace = true
+
 # Its own `main`: only the main thread can end itself with
 # `exit_main_thread`, and libtest runs every test on a spawned thread
 # (#35, ADR-015 D10).

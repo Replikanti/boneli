@@ -146,10 +146,17 @@ systemd-run --user --scope -q -p Delegate=yes \
   lacks `CAP_IPC_LOCK`); `socket-inet-packet` and `ioctl-siocgifbr`: the
   host lacks af_packet (no `/proc/net/packet`) or the bridge module (no
   `/sys/module/bridge`), so the test does not try that row, which would
-  load the module; `hugetlbfs-mount`: the host has no hugetlbfs
-  mount. Exact: an unknown id fails, and so does a listed id that turns
+  load the module; `setsockopt-tcp-ao` and `setsockopt-tcp-md5`: the
+  kernel lacks the option; `nosys-<name>`: the host kernel lacks the `NeedsCap` census
+  syscall `<name>`; `alarm-rtc`: the host has no RTC alarm device, so
+  `timer_create` and `clock_nanosleep` on an alarm clock answer
+  EOPNOTSUPP before their capability check; `hugetlbfs-mount`: the host
+  has no hugetlbfs mount. Exact: an unknown id fails, and so does a listed id that turns
   out observable. The command above has the dev host's value (Fedora 44,
-  measured); CI sets it per leg in `.github/workflows/ci.yml`.
+  measured); CI sets it per leg in `.github/workflows/ci.yml`. The kTLS
+  row is no gap id: whether the `tls` ULP is there differs between hosts
+  of one image, so the test reads `/proc/sys/net/ipv4/tcp_available_ulp`
+  and requires the row observed where it lists `tls`.
 - `BONELI_SYS_TEST_CGROUP=self`: the scope was started for this test run,
   so the harness may reorganize its own cgroup: it moves the run's
   processes into `leaf/` and creates every sandbox's cgroup next to it
@@ -158,7 +165,8 @@ systemd-run --user --scope -q -p Delegate=yes \
 
 Every sandbox these tests start runs without capabilities, with
 `no_new_privs` and under the seccomp policy (ADR-007, D2 and D9); so do
-boneli-oci's sandbox runs below.
+boneli-oci's sandbox runs below. `Unproven` census entries print with
+their reason outside libtest's capture on every run.
 
 ### Host tests (boneli-oci)
 

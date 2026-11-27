@@ -22,17 +22,17 @@ pub const UNTRIED: &str = "untried";
 /// `SOCK_PACKET`, `include/linux/net.h`; libc 0.2.191 lacks it for Linux.
 const SOCK_PACKET: i32 = 10;
 
-fn put(key: &str, value: &str) {
+pub(super) fn put(key: &str, value: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{PREFIX}{key}={value}");
     let _ = out.flush();
 }
 
-fn errno() -> i32 {
+pub(super) fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-fn fail(code: i32, why: &str) -> ! {
+pub(super) fn fail(code: i32, why: &str) -> ! {
     let _ = writeln!(std::io::stderr(), "probe: {why}");
     exit(code)
 }
@@ -118,6 +118,8 @@ pub fn main(action: &str) -> ! {
         "landlock" => landlock(),
         "keys" => keys(),
         "features-no-keyrings" => features_no_keyrings(),
+        "caps-gated" => super::gated::caps_gated(),
+        "nosys" => super::gated::nosys(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     exit(0)
@@ -1043,7 +1045,7 @@ fn rc_errno(rc: libc::c_long) -> i32 {
 /// Forks a child that runs `call`, which must not allocate (the child is a
 /// copy of one thread, see `alloc_guard`), and exits with its result;
 /// returns that exit code, or 255 when the child did not exit normally.
-fn in_fork(call: fn() -> i32) -> i32 {
+pub(super) fn in_fork(call: fn() -> i32) -> i32 {
     // SAFETY: fork has no memory arguments; the child runs only `call`,
     // which makes raw syscalls on prepared memory, and _exit.
     let pid = unsafe { libc::fork() };
@@ -1399,6 +1401,115 @@ fn seccomp_rows() {
     } else {
         put("row:ioctl-siocgifbr", UNTRIED);
     }
+
+    // kTLS: on an established loopback TCP connection, attach the `tls`
+    // ULP, then configure TLS_TX with no crypto info. Where the ULP
+    // attaches, the kernel answers EINVAL before it looks a cipher up
+    // (`do_tls_setsockopt_conf`); where it does not (the module is not
+    // loaded, and only a capable() caller may load it), the socket has no
+    // SOL_TLS level and answers ENOPROTOOPT, so the row is a host gap.
+    // Trying the ULP cannot load anything for this caller.
+    let (ulp, tls_tx) = ktls_tx();
+    put("ktls_ulp", &ulp.to_string());
+    row("setsockopt-tls", tls_tx);
+
+    // TCP signature keys with optlen 0 on an unconnected socket: EINVAL
+    // from the option's own length check, ENOPROTOOPT where the kernel
+    // lacks the option. An optlen of 0 carries no algorithm name.
+    row("setsockopt-tcp-ao", tcp_option_empty(TCP_AO_ADD_KEY));
+    row("setsockopt-tcp-md5", tcp_option_empty(libc::TCP_MD5SIG));
+
+    // The file-system crypto ioctls on a memfd, with a zeroed argument of
+    // the struct's size: shmem has no handler, so ENOTTY without the
+    // filter, and no key, policy or verity can be set on a memfd.
+    for (id, cmd, size) in FS_CRYPTO_IOCTLS {
+        row(id, memfd_ioctl(cmd, size));
+    }
+}
+
+/// `TCP_AO_ADD_KEY`, `include/uapi/linux/tcp.h`; libc 0.2.191 lacks it.
+const TCP_AO_ADD_KEY: i32 = 38;
+
+/// The file-system crypto ioctls of the kernel rows: id, number (7.2.4
+/// uapi headers) and the size of its argument.
+const FS_CRYPTO_IOCTLS: [(&str, u32, usize); 3] = [
+    ("ioctl-fscrypt-add-key", 0xc050_6617, 80),
+    ("ioctl-fscrypt-set-policy", 0x800c_6613, 12),
+    ("ioctl-fsverity-enable", 0x4080_6685, 128),
+];
+
+/// The errno of a libc call that returns -1 on failure: 0 when it
+/// succeeded.
+fn libc_errno(rc: libc::c_int) -> i32 {
+    if rc < 0 { errno() } else { 0 }
+}
+
+/// Attaches the `tls` ULP to the client end of a loopback TCP connection
+/// and then sets `TLS_TX` with no crypto info: both errnos.
+fn ktls_tx() -> (i32, i32) {
+    use std::os::fd::AsRawFd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| fail(3, &format!("listen on loopback: {e}")));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|e| fail(3, &format!("local_addr: {e}")));
+    let client = std::net::TcpStream::connect(addr)
+        .unwrap_or_else(|e| fail(3, &format!("connect on loopback: {e}")));
+    let _server = listener
+        .accept()
+        .unwrap_or_else(|e| fail(3, &format!("accept on loopback: {e}")));
+    let fd = client.as_raw_fd();
+    // SAFETY: the name is three valid bytes for the call's duration.
+    let ulp = libc_errno(unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_ULP,
+            c"tls".as_ptr().cast(),
+            3,
+        )
+    });
+    // SAFETY: a null option value of length 0; the kernel reads nothing.
+    let tx = libc_errno(unsafe { libc::setsockopt(fd, libc::SOL_TLS, 1, std::ptr::null(), 0) });
+    (ulp, tx)
+}
+
+/// `setsockopt(IPPROTO_TCP, optname, NULL, 0)` on a new TCP socket: its
+/// errno.
+fn tcp_option_empty(optname: i32) -> i32 {
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        fail(3, &format!("socket(AF_INET): errno {}", errno()));
+    }
+    // SAFETY: a null option value of length 0; the kernel reads nothing.
+    let result = libc_errno(unsafe {
+        libc::setsockopt(fd, libc::IPPROTO_TCP, optname, std::ptr::null(), 0)
+    });
+    // SAFETY: fd was opened here and nothing else owns it.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// `ioctl(cmd)` on a new memfd with a zeroed argument of `size` bytes: its
+/// errno.
+fn memfd_ioctl(cmd: u32, size: usize) -> i32 {
+    // SAFETY: the name is NUL-terminated.
+    let fd = unsafe { libc::memfd_create(c"fscrypt".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        fail(3, &format!("memfd_create: errno {}", errno()));
+    }
+    let mut arg = [0u8; 128];
+    if size > arg.len() {
+        fail(2, "argument larger than its buffer");
+    }
+    // SAFETY: arg is valid for `size` (at most 128) bytes, which is all the
+    // kernel may read or write for this number.
+    let rc = unsafe { libc::ioctl(fd, cmd as _, arg.as_mut_ptr()) };
+    let result = libc_errno(rc);
+    // SAFETY: fd was opened here and nothing else owns it.
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// `ioctl(SIOCGIFBR, BRCTL_GET_VERSION)` on a new Unix datagram socket:

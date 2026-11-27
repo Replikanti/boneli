@@ -107,6 +107,67 @@ pub const SOCK_PACKET_TYPES: [u32; 4] = [
     SOCK_PACKET | SOCK_NONBLOCK | SOCK_CLOEXEC,
 ];
 
+/// `ENOPROTOOPT`, `include/uapi/asm-generic/errno.h` (the same on both
+/// architectures): what a socket answers for a level or option it lacks,
+/// and the answer of the kTLS and TCP signature rows.
+pub const ENOPROTOOPT: i32 = 92;
+/// `SOL_TLS`, `include/linux/socket.h`: the socket level of kTLS.
+pub const SOL_TLS: u32 = 282;
+/// `SOL_SOCKET`, `include/uapi/asm-generic/socket.h` (x86 and arm64 use
+/// the generic value): the one level `getsockopt` answers in the socket
+/// core, before any protocol code.
+pub const SOL_SOCKET: u32 = 1;
+/// `TCP_MD5SIG`, `include/uapi/linux/tcp.h`: an RFC 2385 key.
+pub const TCP_MD5SIG: u32 = 14;
+/// `TCP_MD5SIG_EXT`, likewise, with prefix and interface.
+pub const TCP_MD5SIG_EXT: u32 = 32;
+/// `TCP_AO_ADD_KEY`, `include/uapi/linux/tcp.h` (7.2.4): an RFC 5925
+/// key, with the algorithm named by the caller. libc 0.2.191 lacks it.
+pub const TCP_AO_ADD_KEY: u32 = 38;
+/// The first and last option numbers that kernels from 5.19 to 6.7
+/// (v6.8 removed bpfilter) hand to bpfilter before any capability check,
+/// which loads the `bpfilter` module: with `CONFIG_BPFILTER_UMH`,
+/// `ip_setsockopt` at `IPPROTO_IP` (`SOL_IP`) and `ip_getsockopt` at any
+/// level that reaches it (`BPFILTER_IPT_SO_SET_REPLACE` 64 to
+/// `BPFILTER_IPT_SO_GET_REVISION_TARGET` 67,
+/// `include/uapi/linux/bpfilter.h` in 5.19); iptables uses the same
+/// numbers.
+pub const BPFILTER_OPTIONS: (u32, u32) = (64, 67);
+/// The TCP options that set a signature key.
+pub const TCP_SIGNATURE_OPTIONS: [u32; 3] = [TCP_MD5SIG, TCP_MD5SIG_EXT, TCP_AO_ADD_KEY];
+/// `FS_IOC_ADD_ENCRYPTION_KEY`, `include/uapi/linux/fscrypt.h`:
+/// `_IOWR('f', 23, struct fscrypt_add_key_arg)`, 80 bytes. libc 0.2.191
+/// lacks it, as it lacks the two below.
+pub const FS_IOC_ADD_ENCRYPTION_KEY: u32 = ioc(3, b'f' as u32, 23, 80);
+/// `FS_IOC_SET_ENCRYPTION_POLICY`, likewise: `_IOR('f', 19, struct
+/// fscrypt_policy_v1)`, 12 bytes (the uapi header's direction).
+pub const FS_IOC_SET_ENCRYPTION_POLICY: u32 = ioc(2, b'f' as u32, 19, 12);
+/// `FS_IOC_ENABLE_VERITY`, `include/uapi/linux/fsverity.h`: `_IOW('f',
+/// 133, struct fsverity_enable_arg)`, 128 bytes.
+pub const FS_IOC_ENABLE_VERITY: u32 = ioc(1, b'f' as u32, 133, 128);
+/// The file-system crypto ioctls the policy refuses.
+pub const FS_CRYPTO_IOCTLS: [u32; 3] = [
+    FS_IOC_ADD_ENCRYPTION_KEY,
+    FS_IOC_SET_ENCRYPTION_POLICY,
+    FS_IOC_ENABLE_VERITY,
+];
+
+/// An ioctl number in the encoding x86 and arm64 share
+/// (`include/uapi/asm-generic/ioctl.h`): the direction in bits 30-31
+/// (`_IOC_WRITE` 1, `_IOC_READ` 2), the argument size in bits 16-29, the
+/// type in bits 8-15 and the number in bits 0-7.
+pub const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
+    (dir << 30) | (size << 16) | (ty << 8) | nr
+}
+
+const _: () = assert!(FS_IOC_ADD_ENCRYPTION_KEY == 0xc050_6617);
+const _: () = assert!(FS_IOC_SET_ENCRYPTION_POLICY == 0x800c_6613);
+const _: () = assert!(FS_IOC_ENABLE_VERITY == 0x4080_6685);
+const _: () = assert!(ENOPROTOOPT == libc::ENOPROTOOPT);
+const _: () = assert!(SOL_TLS == libc::SOL_TLS as u32);
+const _: () = assert!(SOL_SOCKET == libc::SOL_SOCKET as u32);
+const _: () = assert!(TCP_MD5SIG == libc::TCP_MD5SIG as u32);
+const _: () = assert!(TCP_MD5SIG_EXT == libc::TCP_MD5SIG_EXT as u32);
 const _: () = assert!(MAP_HUGETLB == libc::MAP_HUGETLB as u32);
 const _: () = assert!(SHM_HUGETLB == libc::SHM_HUGETLB as u32);
 const _: () = assert!(MFD_HUGETLB == libc::MFD_HUGETLB);
@@ -213,6 +274,10 @@ pub struct Syscalls {
     pub memfd_create: u32,
     /// `ioctl`.
     pub ioctl: u32,
+    /// `setsockopt`.
+    pub setsockopt: u32,
+    /// `getsockopt`.
+    pub getsockopt: u32,
 }
 
 /// x86_64, `arch/x86/include/uapi/asm/unistd_64.h` (7.2.4).
@@ -236,6 +301,8 @@ pub const X86_64: Syscalls = Syscalls {
     shmget: 29,
     memfd_create: 319,
     ioctl: 16,
+    setsockopt: 54,
+    getsockopt: 55,
 };
 
 /// aarch64, `include/uapi/asm-generic/unistd.h` as arm64 builds it (7.2.4).
@@ -259,6 +326,8 @@ pub const AARCH64: Syscalls = Syscalls {
     shmget: 194,
     memfd_create: 279,
     ioctl: 29,
+    setsockopt: 208,
+    getsockopt: 209,
 };
 
 /// The build's own table.
@@ -294,4 +363,6 @@ pin! {
     shmget => SYS_shmget,
     memfd_create => SYS_memfd_create,
     ioctl => SYS_ioctl,
+    setsockopt => SYS_setsockopt,
+    getsockopt => SYS_getsockopt,
 }

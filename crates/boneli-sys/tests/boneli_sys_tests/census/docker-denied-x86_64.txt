@@ -1,0 +1,101 @@
+# Syscalls Docker's default seccomp profile does not allow unconditionally
+# on x86_64 (ADR-007, D2, the Docker comparison): "<name> denied", or
+# "<name> partial <rule> | <rule>" for names it allows only for some
+# arguments, each rule a conjunction "arg<i> <op> <value> [<value two>]"
+# of libseccomp comparisons on the full 64-bit argument, in the order of
+# syscalls-x86_64.txt.
+# Profile: moby/profiles commit 9ee3204f0d0cfa19ca2c6a7b0fcf5a2b353954ae,
+# seccomp/default.json (vendored as moby/default.json), sha256
+# 3320527d4568265ac97a077609b1bfd4cfd0d789eeb9239b7e094b1526675406.
+# Capabilities: Docker's 14 defaults, moby/moby commit
+# 06db1734267bf7770914b417bff6556d835bf8cc, daemon/pkg/oci/caps/defaults.go.
+# Kernel: the floor, 5.19 (rules with a higher minKernel do not apply).
+# Derivation: a rule applies when every capability it includes is one of
+# the 14, it names no architecture or names "amd64", its minKernel (two
+# numbers) is at most 5.19, it excludes none of the 14 and does not
+# exclude "amd64". A name that an applying SCMP_ACT_ALLOW rule without
+# arguments allows is left out; one that only applying rules with
+# arguments allow is partial, its rules in profile order; every other
+# name of the extract is denied. The test docker_lists_derive_from_profile
+# (census/docker.rs) derives this list from the vendored profile and
+# requires this file to equal it line for line.
+socket partial arg0 lt 3 | arg0 eq 7 | arg0 eq 8 | arg0 eq 9 | arg0 eq 10 | arg0 eq 13 | arg0 eq 14 | arg0 eq 15 | arg0 eq 16 | arg0 eq 17 | arg0 eq 18 | arg0 eq 21 | arg0 eq 22 | arg0 eq 24 | arg0 eq 26 | arg0 eq 27 | arg0 eq 28 | arg0 eq 29 | arg0 eq 30 | arg0 eq 31 | arg0 eq 32 | arg0 eq 33 | arg0 eq 35 | arg0 eq 36 | arg0 eq 39 | arg0 eq 41 | arg0 eq 42 | arg0 eq 43 | arg0 eq 44 | arg0 eq 45
+socketpair partial arg0 eq 1 | arg0 eq 30
+clone partial arg0 masked_eq 2114060288 0
+syslog denied
+uselib denied
+personality partial arg0 eq 0 | arg0 eq 8 | arg0 eq 131072 | arg0 eq 131080 | arg0 eq 4294967295
+ustat denied
+sysfs denied
+vhangup denied
+pivot_root denied
+_sysctl denied
+acct denied
+settimeofday denied
+mount denied
+umount2 denied
+swapon denied
+swapoff denied
+reboot denied
+sethostname denied
+setdomainname denied
+iopl denied
+ioperm denied
+create_module denied
+init_module denied
+delete_module denied
+get_kernel_syms denied
+query_module denied
+quotactl denied
+nfsservctl denied
+getpmsg denied
+putpmsg denied
+afs_syscall denied
+tuxcall denied
+security denied
+lookup_dcookie denied
+clock_settime denied
+vserver denied
+mbind denied
+set_mempolicy denied
+get_mempolicy denied
+kexec_load denied
+add_key denied
+request_key denied
+keyctl denied
+migrate_pages denied
+unshare denied
+move_pages denied
+perf_event_open denied
+fanotify_init denied
+open_by_handle_at denied
+setns denied
+kcmp denied
+finit_module denied
+kexec_file_load denied
+bpf denied
+userfaultfd denied
+uprobe denied
+io_uring_setup denied
+io_uring_enter denied
+io_uring_register denied
+open_tree denied
+move_mount denied
+fsopen denied
+fsconfig denied
+fsmount denied
+fspick denied
+clone3 denied
+pidfd_getfd denied
+process_madvise denied
+mount_setattr denied
+quotactl_fd denied
+set_mempolicy_home_node denied
+lsm_get_self_attr denied
+lsm_set_self_attr denied
+lsm_list_modules denied
+open_tree_attr denied
+file_getattr denied
+file_setattr denied
+listns denied
+rseq_slice_yield denied
