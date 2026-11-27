@@ -131,7 +131,7 @@ them. Run them in a delegated scope:
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
-  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS=syslog,shmget-hugetlb \
+  env BONELI_SYS_TEST_CGROUP=self BONELI_SYS_HOST_GAPS=syslog,shmget-hugetlb,setsockopt-tls \
   cargo test -p boneli-sys -- --ignored
 ```
 
@@ -146,7 +146,11 @@ systemd-run --user --scope -q -p Delegate=yes \
   lacks `CAP_IPC_LOCK`); `socket-inet-packet` and `ioctl-siocgifbr`: the
   host lacks af_packet (no `/proc/net/packet`) or the bridge module (no
   `/sys/module/bridge`), so the test does not try that row, which would
-  load the module; `hugetlbfs-mount`: the host has no hugetlbfs
+  load the module; `setsockopt-tls`: the host's `tls` ULP is not
+  available, so the host answers ENOPROTOOPT at `SOL_TLS` already;
+  `setsockopt-tcp-ao` and `setsockopt-tcp-md5`: the kernel lacks the
+  option; `nosys-<name>`: the host kernel lacks the `NeedsCap` census
+  syscall `<name>`; `hugetlbfs-mount`: the host has no hugetlbfs
   mount. Exact: an unknown id fails, and so does a listed id that turns
   out observable. The command above has the dev host's value (Fedora 44,
   measured); CI sets it per leg in `.github/workflows/ci.yml`.
@@ -158,7 +162,8 @@ systemd-run --user --scope -q -p Delegate=yes \
 
 Every sandbox these tests start runs without capabilities, with
 `no_new_privs` and under the seccomp policy (ADR-007, D2 and D9); so do
-boneli-oci's sandbox runs below.
+boneli-oci's sandbox runs below. `Unproven` census entries print with
+their reason outside libtest's capture on every run.
 
 ### Host tests (boneli-oci)
 

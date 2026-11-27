@@ -240,6 +240,27 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drop seen from inside, Landlock rights on the host, the cgroup2 view
   that no mount call can make writable; two PR 3 tests make their
   capability step on the host side now.
+- `boneli-sys` (ADR-007 D2, part 5 of #6, ADR-007 accepted): the census
+  of every syscall of the Linux 7.2 tables (385 names: 267 `Own`, 83
+  `NeedsCap`, 21 `Row`, 14 `NotImplemented`), tied to the extracts and the
+  policy by pure tests and shown on the host by
+  `capability_gated_calls_fail` (every capability-gated form fails inside,
+  for inside ids 0 and 999) and `not_implemented_entries_return_enosys`.
+  Four new rows (88 instructions): `setsockopt` at `SOL_TLS` (kTLS),
+  `TCP_MD5SIG`, `TCP_MD5SIG_EXT` and `TCP_AO_ADD_KEY`, and `setsockopt`
+  and `getsockopt` at `SOL_IP` options 64 to 67 (bpfilter's module load on
+  older kernels) answer ENOPROTOOPT; `FS_IOC_ADD_ENCRYPTION_KEY`,
+  `FS_IOC_SET_ENCRYPTION_POLICY` and `FS_IOC_ENABLE_VERITY` answer EPERM.
+  ADR-007 D2 lists every by-name crypto allocation of 7.2 (305: 46
+  covered, 259 unreachable), the `request_module` and crypto sites of
+  5.19, 6.12 and 7.0 that 7.2 lacks, the 326 module sites as 46 covered,
+  279 unreachable and 1 residual, and the residual risk with a host
+  mitigation for each item. The comparison with Docker's default seccomp
+  profile, vendored from moby/profiles and read with `boneli-json` (a
+  dev-dependency), derives the names Docker refuses and gives each of the
+  67 this policy allows a reason. MPTCP and UDP-Lite stay refused.
+  `BONELI_SYS_HOST_GAPS` also takes `setsockopt-tls`,
+  `setsockopt-tcp-ao`, `setsockopt-tcp-md5` and `nosys-<name>`.
 - `Features::probe`: a probe whose own machinery fails — a failed
   `pipe2`, `poll`, `read` or `waitid`, a malformed report, a probe child
   killed by a signal or ended before it could report, or a `clone3`

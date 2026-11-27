@@ -322,12 +322,14 @@ jobs:
             # vm.hugetlb_shm_group, hugetlbfs-mount without a hugetlbfs,
             # socket-inet-packet and ioctl-siocgifbr without af_packet or
             # bridge (assumed present on the Docker runner images; the Host
-            # features step prints both).
-            host-gaps: syslog,shmget-hugetlb
+            # features step prints both), setsockopt-tls without the tls
+            # ULP, setsockopt-tcp-ao and setsockopt-tcp-md5 without the TCP
+            # options, nosys-<name> for a NeedsCap syscall the kernel lacks.
+            host-gaps: syslog,shmget-hugetlb,setsockopt-tls
           - arch: arm64
             runner: ubuntu-24.04-arm
             expect-missing: userns-apparmor,cgroup-not-delegated
-            host-gaps: syslog,shmget-hugetlb
+            host-gaps: syslog,shmget-hugetlb,setsockopt-tls
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -390,6 +392,14 @@ jobs:
           echo "af_packet (/proc/net/packet): $( [ -e /proc/net/packet ] && echo present || echo absent)"
           echo "bridge (/sys/module/bridge): $( [ -e /sys/module/bridge ] && echo present || echo absent)"
           echo "8021q (/sys/module/8021q): $( [ -e /sys/module/8021q ] && echo present || echo absent)"
+          # The kTLS and TCP signature rows (ADR-007, D2): setsockopt-tls is
+          # a gap where the tls ULP cannot attach, the TCP rows where the
+          # kernel lacks the options.
+          echo "tls (/sys/module/tls): $( [ -e /sys/module/tls ] && echo present || echo absent)"
+          echo "tcp ulps: $(cat /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null || echo absent)"
+          for k in CONFIG_TLS CONFIG_TCP_AO CONFIG_TCP_MD5SIG; do
+            echo "$k: $(grep -E "^(# )?$k[= ]" "/boot/config-$(uname -r)" 2>/dev/null || echo unreadable)"
+          done
           # The statistics keeper (#54, ADR-007 D8): the flush threshold of a
           # memory.stat read scales with online CPUs, the memcg dirty limits
           # with memory, and the dirty intervals set the kernel's own flushes.

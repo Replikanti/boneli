@@ -61,7 +61,7 @@ Target state: during the agent phase the only way out is through the gateway to 
 - user, mount, pid, net, ipc, uts and cgroup namespaces; one id inside the container, root or the image's user, maps to the unprivileged host user (single id mapping, no setuid helpers; ADR-007),
 - `pivot_root` into a rootfs assembled from OCI layers, overlay and tmpfs (overlay inside a user namespace works since Linux 5.11),
 - cgroups v2 through writes to `/sys/fs/cgroup`: memory, CPU, process count, IO,
-- a seccomp-bpf filter assembled in Rust that additionally blocks `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, `keyctl` and new user namespaces, the kernel log, foreign ABIs, syscalls newer than the reviewed table, socket families other than Unix, IPv4, IPv6 and netlink, and netlink protocols other than routing, and huge pages (ADR-007),
+- a seccomp-bpf filter assembled in Rust that additionally blocks `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, `keyctl` and new user namespaces, the kernel log, foreign ABIs, syscalls newer than the reviewed table, socket families other than Unix, IPv4, IPv6 and netlink, netlink protocols other than routing, IP protocols other than TCP, UDP and ICMP, huge pages, and the calls through which the workload could make the kernel load a module or a crypto algorithm (ADR-007),
 - `no_new_privs`, no capabilities (ADR-007), a read-only rootfs; only `/workspace` and `/tmp` are writable,
 - Landlock as a second layer, enabled by `boneli-shim` before it starts the agent; ABI 2 or newer, so Linux 5.19 (ADR-007).
 
@@ -75,7 +75,7 @@ Target state: during the agent phase the only way out is through the gateway to 
 2. **Agent:** no network, only the gateway socket (in the MVP, the egress socket with an Anthropic-only allowlist). Dependencies are read-only.
 3. **Verify:** a clean sandbox with neither network nor gateway. It gets only the base SHA and the diff.
 
-**Residual risk.** We share the host kernel, so a kernel exploit remains possible. Mitigation: one customer per VM and, from v1, one host for sandboxes and a separate one for the gateway and the git token, so escaping a container does not yield keys. Our own runtime is more work than Podman, and a bug in it is a security bug, so it needs a red-team suite and fuzzing of the seccomp and mount logic.
+**Residual risk.** We share the host kernel, so a kernel exploit remains possible. Mitigation: one customer per VM and, from v1, one host for sandboxes and a separate one for the gateway and the git token, so escaping a container does not yield keys. Our own runtime is more work than Podman, and a bug in it is a security bug, so it needs a red-team suite and fuzzing of the seccomp and mount logic. ADR-007 D2 names what the filter leaves open (a kernel bug in an allowed syscall, side channels, the tc classifier by name, `binfmt-` by file content before Linux 7.0, kernels the sweeps did not read) and the host mitigation for each, `kernel.modules_disabled=1` after boot among them.
 
 ## LLM access and egress
 
