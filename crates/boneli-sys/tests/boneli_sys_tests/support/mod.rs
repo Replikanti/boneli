@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use boneli_sys::seccomp::Denials;
 use boneli_sys::{Cgroup, Child, ExitStatus, Ids, Root, Spec, Stdio, spawn};
 
 /// Hang bound of one probe run. A probe is this test binary started inside
@@ -125,6 +126,9 @@ pub struct Output {
     pub stdout: String,
     /// Everything it wrote to stderr.
     pub stderr: String,
+    /// The calls the seccomp policy denied (ADR-043); empty for a run on
+    /// the host.
+    pub denials: Denials,
 }
 
 /// Runs `program` (a path inside the sandbox) in a sandbox on a default
@@ -236,6 +240,7 @@ pub fn run_in(
         status,
         stdout,
         stderr,
+        denials: child.denials(),
     }
 }
 
@@ -251,6 +256,8 @@ fn read_all(fd: OwnedFd) -> String {
 pub struct Probe {
     /// How the probe ended.
     pub status: ExitStatus,
+    /// The calls the seccomp policy denied in its sandbox (ADR-043).
+    pub denials: Denials,
     /// Its `BONELI_PROBE key=value` lines; a repeated key keeps the last.
     pub values: BTreeMap<String, String>,
     /// Every such line in order.
@@ -337,6 +344,7 @@ pub fn parse_probe(out: Output) -> Probe {
     );
     Probe {
         status: out.status,
+        denials: out.denials,
         values,
         lines,
         raw,
@@ -388,6 +396,7 @@ pub fn run_probe_host(action: &str, env: &[(&str, &str)]) -> Probe {
         },
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        denials: Denials::default(),
     })
 }
 

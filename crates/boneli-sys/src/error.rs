@@ -18,6 +18,45 @@ pub enum ProtocolError {
     Length(usize),
     /// The report named a step code that does not exist.
     UnknownStep(u32),
+    /// The child's listener message was not exactly one byte with one
+    /// `SCM_RIGHTS` descriptor (ADR-043, D3).
+    Listener(ListenerError),
+}
+
+/// What was wrong with the listener message the child sends before
+/// `execve` (ADR-043, D3). Every descriptor that came with it was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerError {
+    /// No message was queued: the socket was empty or at its end.
+    Missing,
+    /// The payload had this many bytes instead of 1.
+    Payload(usize),
+    /// The kernel truncated the ancillary data (`MSG_CTRUNC`): more
+    /// descriptors than the one expected.
+    Truncated,
+    /// The ancillary data held this many descriptors instead of 1 (0 for
+    /// none or another kind of message).
+    Descriptors(usize),
+    /// `recvmsg` failed with this errno.
+    Recv(i32),
+}
+
+impl fmt::Display for ListenerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ListenerError::Missing => write!(f, "no listener message"),
+            ListenerError::Payload(n) => write!(f, "a listener message of {n} bytes instead of 1"),
+            ListenerError::Truncated => {
+                write!(f, "a listener message with truncated ancillary data")
+            }
+            ListenerError::Descriptors(n) => {
+                write!(f, "a listener message with {n} descriptors instead of 1")
+            }
+            ListenerError::Recv(errno) => {
+                write!(f, "recvmsg of the listener failed: {}", strerror(*errno))
+            }
+        }
+    }
 }
 
 impl fmt::Display for ProtocolError {
@@ -25,6 +64,7 @@ impl fmt::Display for ProtocolError {
         match self {
             ProtocolError::Length(n) => write!(f, "{n} bytes instead of 0 or 12"),
             ProtocolError::UnknownStep(code) => write!(f, "unknown step code {code}"),
+            ProtocolError::Listener(e) => write!(f, "{e}"),
         }
     }
 }
@@ -185,6 +225,12 @@ pub enum Error {
         resp: u16,
         /// `struct seccomp_data`.
         data: u16,
+    },
+    /// The seccomp supervisor thread could not be started (ADR-043, D4);
+    /// the child was killed and reaped.
+    Supervisor {
+        /// The `errno` of the thread's creation.
+        errno: i32,
     },
     /// Landlock is not built into the kernel or not enabled (ADR-007, D10).
     LandlockUnavailable {
@@ -367,6 +413,11 @@ impl fmt::Display for Error {
             Error::NotifySizes { notif, resp, data } => write!(
                 f,
                 "the kernel's seccomp notification sizes {notif}/{resp}/{data} are below 80/24/64"
+            ),
+            Error::Supervisor { errno } => write!(
+                f,
+                "the seccomp supervisor thread could not start: {}; the child was killed",
+                strerror(*errno)
             ),
             Error::LandlockUnavailable { errno } => {
                 write!(f, "Landlock is unavailable: {}", strerror(*errno))

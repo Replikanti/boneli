@@ -165,7 +165,16 @@ systemd-run --user --scope -q -p Delegate=yes \
 
 Every sandbox these tests start runs without capabilities, with
 `no_new_privs` and under the seccomp policy (ADR-007, D2 and D9); so do
-boneli-oci's sandbox runs below. `Unproven` census entries print with
+boneli-oci's sandbox runs below. Its errno rows are answered by a
+supervisor thread (`seccomp-notify`) in the test process, which records
+each denied call (ADR-043); the probe id `seccomp-notify` names a host
+whose kernel lacks the wait-killable receive (below 5.19) or whose
+runner already sits under a seccomp filter with a listener. The
+supervisor tests that need a seam (a lost supervisor, a killed caller,
+signals around the receive) are unit tests in
+`src/seccomp/notify.rs`, which re-run the unit-test binary in the
+sandbox; `notification_cost` prints what a denied call costs with and
+without the listener. `Unproven` census entries print with
 their reason outside libtest's capture on every run.
 
 ### Host tests (boneli-oci)

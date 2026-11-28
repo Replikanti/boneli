@@ -1116,6 +1116,30 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `boneli-git-cli` passes `TreeRule` (`TreePath::parse` and
   `TreePath::is_repository_metadata`, pinned by a test) and re-exports the
   moved types. No external crate or dependency edge.
+- Recorded seccomp denials, the supervisor (part 2 of #45, ADR-043,
+  accepted): `spawn` installs the notifying program with a listener and
+  the wait-killable receive; the child sends the listener to the caller
+  over a socket pair of its own (`Step::Listener`, code 30) and closes it
+  before `execve`, and a malformed hand-off fails closed
+  (`ProtocolError::Listener`, the child killed and reaped). A thread
+  named `seccomp-notify` per sandbox answers every notified call with the
+  plain program's errno only and records it; `Child::denials()` returns
+  the record, complete once `wait` returned, with `Denials::failed` when
+  the supervisor stopped early (the kernel then answers ENOSYS). `wait`
+  and `Drop` reap first, then stop and join the supervisor. A new probe
+  id `seccomp-notify` (`NotifyGap`) refuses a host whose kernel lacks the
+  wait-killable receive (below 5.19), that runs the runner under a
+  filter with a listener already, or whose notification structs are
+  smaller than the crate's; `Error::Supervisor` when the thread cannot
+  start. Host tests: every notifying row answers the same errno with and
+  without the listener, the record names the inside pid and the comm,
+  8,000 concurrent calls are all answered, a stopped, panicked or
+  inconsistent supervisor leaves calls denied with ENOSYS, a killed
+  caller is not a failure, signals around the receive never let a call
+  run, the workload's own filters never allow one, the supervisor ends
+  with its sandbox, the runner's own `setgid` returns while a sandbox
+  runs (the supervisor leaves the C library's signals unblocked), and
+  `notification_cost` prints the cost on both CI legs. boneli-oci's `node` and `postgres` runs print their records.
 
 ### Changed
 

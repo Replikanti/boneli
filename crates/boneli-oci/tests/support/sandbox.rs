@@ -201,6 +201,8 @@ pub struct Output {
     pub stdout: String,
     /// Its stderr.
     pub stderr: String,
+    /// The calls the seccomp policy denied (ADR-043).
+    pub denials: boneli_sys::seccomp::Denials,
 }
 
 fn read_all(fd: OwnedFd) -> String {
@@ -297,6 +299,7 @@ impl Running {
             status,
             stdout,
             stderr,
+            denials: self.child.denials(),
         }
     }
 }

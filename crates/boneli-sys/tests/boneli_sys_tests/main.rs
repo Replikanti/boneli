@@ -23,6 +23,7 @@ mod landlock;
 mod layer;
 mod mounts;
 mod namespaces;
+mod notify;
 mod notify_scan;
 mod privileges;
 mod probe;

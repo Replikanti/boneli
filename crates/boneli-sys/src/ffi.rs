@@ -155,3 +155,30 @@ pub(crate) struct LandlockNetPortAttr {
 const _: () = assert!(core::mem::size_of::<LandlockRulesetAttr>() == 24);
 const _: () = assert!(core::mem::size_of::<LandlockPathBeneathAttr>() == 12);
 const _: () = assert!(core::mem::size_of::<LandlockNetPortAttr>() == 16);
+
+/// The ancillary data of the listener message (ADR-043, D3): one
+/// `struct cmsghdr` and room for two descriptors, laid out as `CMSG_DATA`
+/// expects (`include/linux/socket.h`: the data starts at
+/// `CMSG_ALIGN(sizeof(struct cmsghdr))`, 16 bytes on both architectures
+/// and libcs). The child sends one descriptor; the parent receives into
+/// room for two, so a message with more than one is seen, not cut to one.
+#[repr(C, align(8))]
+pub(crate) struct FdMessage {
+    pub hdr: libc::cmsghdr,
+    pub fds: [libc::c_int; 2],
+}
+
+/// `CMSG_LEN(0)`: the header without data.
+// SAFETY: CMSG_LEN is pure arithmetic on its argument.
+pub(crate) const CMSG_LEN_0: usize = unsafe { libc::CMSG_LEN(0) } as usize;
+/// `CMSG_LEN(sizeof(int))`: the header with one descriptor.
+// SAFETY: as above.
+pub(crate) const CMSG_LEN_1: usize = unsafe { libc::CMSG_LEN(4) } as usize;
+/// `CMSG_SPACE(sizeof(int))`: one descriptor's message with its padding.
+// SAFETY: CMSG_SPACE is pure arithmetic on its argument.
+pub(crate) const CMSG_SPACE_1: usize = unsafe { libc::CMSG_SPACE(4) } as usize;
+
+const _: () = assert!(core::mem::offset_of!(FdMessage, fds) == CMSG_LEN_0);
+const _: () = assert!(CMSG_LEN_0 == 16 && CMSG_LEN_1 == 20 && CMSG_SPACE_1 == 24);
+// SAFETY: as above.
+const _: () = assert!(core::mem::size_of::<FdMessage>() == unsafe { libc::CMSG_SPACE(8) } as usize);

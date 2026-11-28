@@ -114,6 +114,11 @@ pub fn main(action: &str) -> ! {
         "securebits" => securebits(),
         "filter-reach" => filter_reach(),
         "clone3-fallback" => clone3_fallback(),
+        "notify-forms" => notify_forms(),
+        "notify-threads" => notify_threads(),
+        "notify-child" => notify_child(),
+        "notify-stack" => notify_stack(),
+        "notify-cost" => notify_cost(),
         "cgroup-view" => cgroup_view(),
         "landlock" => landlock(),
         "keys" => keys(),
@@ -1919,4 +1924,304 @@ fn code_of<T>(r: &std::io::Result<T>) -> i32 {
         Ok(_) => 0,
         Err(e) => e.raw_os_error().unwrap_or(-1),
     }
+}
+
+// ADR-043: the probe side of the notification tests (`notify.rs`).
+
+/// Set to 1 by `notified_rows_answer_as_plain_filter` for its run on the
+/// host: the probe installs the plain program on itself first, so both
+/// runs answer under a filter, one with and one without a listener.
+pub const PLAIN_FILTER_VAR: &str = "BONELI_SYS_PLAIN_FILTER";
+
+/// The eight socket ioctls of the ModuleIoctl row (`include/uapi/linux/sockios.h`),
+/// tried on a memfd, which has no socket ioctl handler and so asks for no
+/// module even without the filter.
+pub const MODULE_IOCTL_FORMS: [(&str, u32); 8] = [
+    ("module-ioctl-siocgifbr", 0x8940),
+    ("module-ioctl-siocsifbr", 0x8941),
+    ("module-ioctl-siocgifvlan", 0x8982),
+    ("module-ioctl-siocsifvlan", 0x8983),
+    ("module-ioctl-siocbraddbr", 0x89a0),
+    ("module-ioctl-siocbrdelbr", 0x89a1),
+    ("module-ioctl-siocbraddif", 0x89a2),
+    ("module-ioctl-siocbrdelif", 0x89a3),
+];
+
+/// The Bpfilter row's forms on a Unix socket, which never reaches
+/// `ip_setsockopt` or `ip_getsockopt`: `(id, getsockopt, level, option)`.
+pub fn bpfilter_forms() -> Vec<(String, bool, i32, i32)> {
+    let mut forms = Vec::new();
+    for opt in 64..=67 {
+        forms.push((
+            format!("bpfilter-set-ip-{opt}"),
+            false,
+            libc::IPPROTO_IP,
+            opt,
+        ));
+        forms.push((
+            format!("bpfilter-get-ip-{opt}"),
+            true,
+            libc::IPPROTO_IP,
+            opt,
+        ));
+        forms.push((
+            format!("bpfilter-get-tcp-{opt}"),
+            true,
+            libc::IPPROTO_TCP,
+            opt,
+        ));
+    }
+    forms
+}
+
+/// The ceiling forms: `(id, nr)`. 472 is the first number above the
+/// ceiling, `0x40000001` an x32 number (x86_64's x32 `write`; above the
+/// ceiling on aarch64 too) and −1 the number nobody calls.
+pub const CEILING_FORMS: [(&str, i64); 3] = [
+    ("ceiling-472", 472),
+    ("ceiling-x32", 0x4000_0001),
+    ("ceiling-minus-1", -1),
+];
+
+/// `TCP_MD5SIG_EXT`, `include/uapi/linux/tcp.h`.
+pub const TCP_MD5SIG_EXT: i32 = 32;
+
+/// Installs the plain program of the policy (ADR-007 D2) on this process,
+/// with `no_new_privs`.
+fn install_plain_filter() {
+    let program = boneli_sys::seccomp::Policy::sandbox()
+        .program(boneli_sys::seccomp::Arch::NATIVE)
+        .unwrap_or_else(|e| fail(3, &format!("assemble the plain program: {e}")));
+    let insns = program.instructions();
+    let prog = libc::sock_fprog {
+        len: insns.len() as u16,
+        filter: insns.as_ptr() as *mut libc::sock_filter,
+    };
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        fail(3, &format!("no_new_privs: errno {}", errno()));
+    }
+    // SAFETY: prog points to the program's instructions, which outlive the
+    // call; Insn has the layout of sock_filter.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if rc != 0 {
+        fail(3, &format!("seccomp: errno {}", errno()));
+    }
+}
+
+/// Every form of every notifying row (ADR-043, AC2): the kernel rows of
+/// `seccomp-rows`, the module ioctls on a memfd, the Bpfilter options on a
+/// Unix socket, `TCP_MD5SIG_EXT`, and the ceiling forms. With
+/// [`PLAIN_FILTER_VAR`] the plain program is installed first.
+fn notify_forms() {
+    if std::env::var(PLAIN_FILTER_VAR).as_deref() == Ok("1") {
+        install_plain_filter();
+    }
+    seccomp_rows();
+    let row = |id: &str, e: i32| put(&format!("row:{id}"), &e.to_string());
+    for (id, cmd) in MODULE_IOCTL_FORMS {
+        row(id, memfd_ioctl(cmd, 0));
+    }
+    // SAFETY: socket takes plain integers.
+    let unix = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if unix < 0 {
+        fail(3, &format!("socket(AF_UNIX): errno {}", errno()));
+    }
+    for (id, get, level, opt) in bpfilter_forms() {
+        let rc = if get {
+            let mut buf = [0u8; 64];
+            let mut len = buf.len() as libc::socklen_t;
+            // SAFETY: buf and len are valid for the call's duration.
+            unsafe { libc::getsockopt(unix, level, opt, buf.as_mut_ptr().cast(), &mut len) }
+        } else {
+            // SAFETY: a null option value of length 0; the kernel reads nothing.
+            unsafe { libc::setsockopt(unix, level, opt, std::ptr::null(), 0) }
+        };
+        row(&id, libc_errno(rc));
+    }
+    // SAFETY: unix was opened above and nothing else owns it.
+    unsafe { libc::close(unix) };
+    row("setsockopt-tcp-md5-ext", tcp_option_empty(TCP_MD5SIG_EXT));
+    for (id, nr) in CEILING_FORMS {
+        // SAFETY: a number above the ceiling with zero arguments; on a
+        // kernel that knew it (x32 write of 0 bytes to fd 0) it does
+        // nothing.
+        row(
+            id,
+            rc_errno(unsafe { libc::syscall(nr as libc::c_long, 0, 0, 0, 0, 0, 0) }),
+        );
+    }
+}
+
+/// `socket(AF_VSOCK, SOCK_STREAM, 0)`: its errno, 0 if it succeeded.
+fn vsock_errno() -> i32 {
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    close_if(fd as libc::c_long);
+    if fd < 0 { errno() } else { 0 }
+}
+
+/// 8 threads × 1,000 denied `socket(AF_VSOCK)` calls; prints how many did
+/// not get EAFNOSUPPORT.
+fn notify_threads() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..1000)
+                    .filter(|_| vsock_errno() != libc::EAFNOSUPPORT)
+                    .count()
+            })
+        })
+        .collect();
+    let wrong: usize = threads
+        .into_iter()
+        .map(|t| t.join().unwrap_or_else(|_| fail(3, "a thread panicked")))
+        .sum();
+    put("wrong", &wrong.to_string());
+}
+
+/// The comm `notify-child` sets before it forks.
+pub const CHILD_COMM: &str = "bnl-child";
+
+/// One denied `socket(AF_ALG)` from a forked child whose comm is
+/// [`CHILD_COMM`]: prints this process's pid, the child's pid as `fork`
+/// returned it (in the sandbox's PID namespace) and the child's errno.
+fn notify_child() {
+    // SAFETY: PR_SET_NAME reads a NUL-terminated name of at most 16 bytes.
+    if unsafe { libc::prctl(libc::PR_SET_NAME, c"bnl-child".as_ptr(), 0, 0, 0) } != 0 {
+        fail(3, &format!("PR_SET_NAME: errno {}", errno()));
+    }
+    // SAFETY: getpid has no preconditions.
+    put("pid", &unsafe { libc::getpid() }.to_string());
+    // SAFETY: the child makes one raw syscall and _exits.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail(3, &format!("fork: errno {}", errno()));
+    }
+    if pid == 0 {
+        // SAFETY: socket takes plain integers.
+        let fd =
+            unsafe { libc::socket(libc::AF_ALG, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        let code = if fd < 0 { errno() } else { 0 };
+        // SAFETY: _exit ends the forked child without running anything.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: status is valid storage; pid is this process's child.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    put("child_pid", &pid.to_string());
+    put(
+        "child_errno",
+        &if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        }
+        .to_string(),
+    );
+}
+
+/// Installs `insns` as a filter of this process with `flags`: the
+/// install's errno, 0 when it succeeded (a listener is closed at once).
+fn stack_filter(insns: &[libc::sock_filter], flags: libc::c_ulong) -> i32 {
+    let prog = libc::sock_fprog {
+        len: insns.len() as u16,
+        filter: insns.as_ptr().cast_mut(),
+    };
+    // SAFETY: prog points at valid instructions for the call's duration;
+    // no_new_privs is already set by the sandbox.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            flags,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if rc > 0 && flags != 0 {
+        close_if(rc);
+    }
+    rc_errno(rc)
+}
+
+/// A filter that answers `nr` with `action` and allows everything else.
+fn one_call_filter(nr: libc::c_long, action: u32) -> [libc::sock_filter; 4] {
+    let insn = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt,
+        jf,
+        k,
+    };
+    [
+        insn(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+        insn(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, nr as u32),
+        insn(libc::BPF_RET | libc::BPF_K, 0, 0, action),
+        insn(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
+/// The workload's own filters on top of the sandbox's (ADR-043,
+/// Consequences): one with a listener (EBUSY, a task has only one), an
+/// ERRNO(EACCES) on `socket` (which outranks the sandbox's notification,
+/// so `socket(AF_VSOCK)` gets EACCES and is not notified), and a
+/// USER_NOTIF without a listener on `keyctl` (the newest filter wins a
+/// tie, so `keyctl` gets ENOSYS and is not notified either).
+fn notify_stack() {
+    let allow = [libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    }];
+    let flags =
+        libc::SECCOMP_FILTER_FLAG_NEW_LISTENER | libc::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+    put("listener_errno", &stack_filter(&allow, flags).to_string());
+    let errno_filter = one_call_filter(
+        libc::SYS_socket,
+        libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+    );
+    put("errno_install", &stack_filter(&errno_filter, 0).to_string());
+    put("vsock", &vsock_errno().to_string());
+    let notify_filter = one_call_filter(libc::SYS_keyctl, libc::SECCOMP_RET_USER_NOTIF);
+    put(
+        "notify_install",
+        &stack_filter(&notify_filter, 0).to_string(),
+    );
+    put("keyctl", &keyctl_get_keyring_id().to_string());
+}
+
+/// The number of denied calls `notify-cost` makes.
+pub const COST_CALLS: usize = 20_000;
+
+/// [`COST_CALLS`] denied `socket(AF_VSOCK)` calls, each timed: prints the
+/// p50 and p99 in nanoseconds, then waits for its stdin to close, so the
+/// test can read the supervisor's CPU time while the sandbox still runs.
+/// With [`PLAIN_FILTER_VAR`] the plain program is installed first.
+fn notify_cost() {
+    if std::env::var(PLAIN_FILTER_VAR).as_deref() == Ok("1") {
+        install_plain_filter();
+    }
+    let mut ns: Vec<u128> = Vec::with_capacity(COST_CALLS);
+    let mut wrong = 0;
+    for _ in 0..COST_CALLS {
+        let t = std::time::Instant::now();
+        if vsock_errno() != libc::EAFNOSUPPORT {
+            wrong += 1;
+        }
+        ns.push(t.elapsed().as_nanos());
+    }
+    ns.sort_unstable();
+    put("wrong", &wrong.to_string());
+    put("p50_ns", &ns[COST_CALLS / 2].to_string());
+    put("p99_ns", &ns[COST_CALLS * 99 / 100].to_string());
+    put("done", "1");
+    let mut rest = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut rest);
 }

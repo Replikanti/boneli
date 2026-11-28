@@ -1,6 +1,6 @@
 # ADR-043: Recorded seccomp denials: errno rows answered by a supervisor in the runner
 
-- Status: proposed
+- Status: accepted (2026-11-28, with part 2 of #45)
 - Date: 2026-11-28
 
 Amends ADR-007 D2 (how the errno rows are answered, and the program's
@@ -134,10 +134,20 @@ filter before `execve`; neither is denied by any row. The parent reads the
 message after the setup report succeeded with `MSG_DONTWAIT |
 MSG_CMSG_CLOEXEC` and requires exactly one byte and one `SCM_RIGHTS`
 message holding exactly one descriptor, without `MSG_CTRUNC`; anything
-else is a protocol error, and the child is killed and reaped. The message
+else is a protocol error (`ProtocolError::Listener`), and the child is
+killed and reaped. The receive buffer has room for two descriptors, so a
+message with two is seen as two, not cut to one, and every descriptor
+that arrived is owned at once and closed on refusal. No message at all
+(an empty socket, or its end once the child's copy closed at exec) is
+`Missing`; so is a child that died before the hand-off, which used to
+look like an exec with an exit code and now fails the spawn. The message
 is queued before the report pipe's EOF because the child sends it before
 `execve`. `Step::Listener` gets the new code 30 (the codes are wire
-format, ADR-007 D4).
+format, ADR-007 D4). `listener_hand_off_fails_closed` injects a failed
+step, no message, a message without a descriptor, one with two and one
+without its byte, and checks each is refused with the child reaped and
+no descriptor left; `listener_is_close_on_exec_in_the_runner` checks the
+runner's copy has `FD_CLOEXEC` and is gone after `wait`.
 
 Why a separate socket: ADR-007 D4's 12-byte/EOF report protocol stays as
 it is. Rejected: rewriting the report channel as `SOCK_SEQPACKET` (a
@@ -160,7 +170,31 @@ error, an inconsistent evaluation or a panic sets `failed`
 (`SupervisorFailure`), ends the loop and drops the listener. The loop
 ends on `POLLHUP` (5.19 `:1759`: no task uses the filter any more) or on
 stop. `Child::wait` reaps, then stops and joins the supervisor; `Drop`
-kills, reaps, stops and joins.
+kills, reaps, stops and joins. `spawn` returns only after the thread
+has started, named itself and set its signal mask (a ready message from
+the thread). The thread blocks every signal but the C library's own
+(`sigfillset` + `pthread_sigmask`, which leave out glibc's 32 and 33 and
+musl's 32 to 34), so a process-directed signal of the runner goes to
+another thread and none of its waits is interrupted. The library's own
+signals must stay open: `setuid`, `setgid` and `setgroups` send
+`SIGSETXID` to every thread and wait for each handler, so a supervisor
+that blocked it would hang them, every later thread start and its own
+exit (found in review of PR 2, which blocked all 64 through the raw
+syscall; `set_id_calls_run_while_a_sandbox_runs` hangs on that mask and
+passes on this one). On every path that ends the loop with a failure the
+supervisor records the failure before any call gets ENOSYS for it: the
+inconsistent path records it before its own ENOSYS reply, and the stop,
+panic and listener-error paths record it before they close the listener.
+So a reader that sees a call answered ENOSYS can find the reason in the
+record even while the sandbox runs. That order is fixed in the code and
+kept by review, not proven by a test: the window it closes lasts
+microseconds, and in review the swapped order still passed
+`panicked_supervisor_leaves_calls_denied` and
+`inconsistent_notification_is_denied_and_fails` 10 of 10 times (it failed
+only with a 200 ms delay put between reply and record). Those tests show
+the record after `wait`, and that a read made once the call returned
+finds it in the common case. The record is complete once `wait`
+returned, which is what a caller relies on (#8 reads it then).
 
 **A lost supervisor leaves calls denied, not hung.** When the listener's
 last descriptor closes (stop, panic, runner death), the kernel answers
@@ -182,8 +216,15 @@ a non-fatal signal no longer turns the denial into EINTR or a restart
 SENT` at 7.2 `:1160`); a killing signal still ends the task. Its cost was
 within noise: p50 8.6 to 10.2 µs per denied call with it, 8.4 to 9.9 µs
 without (3 runs × 20,000 calls each). Before the receive, a signal still
-interrupts (without `SA_RESTART`) or restarts the call, which then counts
-twice; it is never allowed.
+interrupts (without `SA_RESTART`) or restarts the call; it is never
+allowed. The interrupted task withdraws its notification before any
+receive (`list_del` on the interrupted path of
+`seccomp_do_user_notification`), so the call that fails with EINTR is
+not in the record and a restarted call is counted once
+(`signal_before_receive_restarts_or_interrupts`, which delays every
+receive by 1 s and interrupts the call with a 100 ms timer). The plan of
+#45 expected a restarted call to count twice; the host test showed it
+counts once, and the record misses an interrupted one.
 
 ### D5. Deny-only replies
 
@@ -358,7 +399,7 @@ contain and v5.19 does (checked against both tags). It is the newest
 feature used, so the mechanism's minimum equals the floor; the others are
 older and present in 5.19 at the lines above.
 
-`Features::probe` gets the id `seccomp-notify` (PR 2):
+`Features::probe` has the id `seccomp-notify` (`NotifyGap`):
 it is reported when installing an allow-all filter with both flags fails
 (EINVAL: no `WAIT_KILLABLE_RECV`, a kernel below 5.19; EBUSY: the runner
 already runs under a filter with a listener, `has_duplicate_listener`,
@@ -386,7 +427,7 @@ larger structs work: the crate reads and writes only its own prefix
 | Number | Value | Where it comes from, and what breaks at another value |
 |---|---|---|
 | Program length | 104 | 88 (ADR-007 D2) − 5 shared returns + 21 row returns, measured by `program_shape`. A shared return would need a Rust map from argument values to rows instead (D2). |
-| Denied call cost | p50 0.19–0.43 µs plain, p50 8.4–10.2 µs and p99 12.7–16.4 µs notified | 3 runs × 20,000 calls with a minimal supervisor. About 9 µs per round trip; PR 2 measures it with the real supervisor on both CI legs (`notification_cost`). |
+| Denied call cost | p50 0.19–0.43 µs plain, p50 8.4–10.2 µs and p99 12.7–16.4 µs notified | 3 runs × 20,000 calls with a minimal supervisor. About 9 µs per round trip. With the real supervisor (`notification_cost`, "Accept when"): p50 13.6–30.0 µs on the dev host, 19.9 µs on CI x86_64 and 17.8 µs on CI arm64. |
 | Spawn cost | 706–777 µs plain, 694–726 µs notified (3 of 4 runs; 1,071 µs in one) | `posix_spawn` + `waitpid` of `/bin/true`; within noise, because one `clone3` notification per spawn costs about 9 µs against about 700 µs. |
 | Keys | 723 | D6's table. A larger table costs memory linearly; a smaller one would merge keys the agent needs apart (a family per key is what tells AF_VSOCK from AF_ALG). |
 | Record bound | 723 × 144 bytes = 104,112 bytes per sandbox | `size_of::<Denial>()` is 144 on x86_64 (printed by `key_space_is_bounded`, which fails above 160). A flood cannot grow it. |
@@ -402,8 +443,10 @@ sandbox, charged to the runner's cgroup rather than the sandbox's
 runner core while it spends its own CPU on them. Repeated keys skip the
 `/proc` reads, so a flood costs receive, evaluate and reply only. No rate
 limit: a limit would be a number without data, and it would slow
-spawn-heavy builds (make notifies one `clone3` per recipe line, D1). PR 2
-measures the supervisor's CPU time per notification.
+spawn-heavy builds (make notifies one `clone3` per recipe line, D1). The
+supervisor's CPU time per notification is 7.9 to 20.1 µs on the dev host
+(`notification_cost`, "Accept when"), so one core answers on the order
+of 50,000 to 125,000 denied calls a second.
 
 ## Consequences
 
@@ -417,7 +460,8 @@ measures the supervisor's CPU time per notification.
 - A runner that already runs under a listener filter (LXD/Incus syscall
   interception, sysbox) is refused by the probe (`seccomp-notify`).
 - The pre-receive signal window (D4): a call interrupted before the
-  supervisor received it returns EINTR or restarts and counts twice.
+  supervisor received it returns EINTR and is missing from the record,
+  or restarts and is counted once.
 - Runner CPU (D8): S hostile sandboxes on one runner can take S runner
   cores. ARCHITECTURE's one-customer-per-VM rule bounds who pays for it.
 - One more runner thread per sandbox.
@@ -474,3 +518,48 @@ PR 2's host tests (`notified_rows_answer_as_plain_filter`,
 `panicked_supervisor_leaves_calls_denied` and the rest of #45's plan) are
 green on both CI legs and the dev host, with `notification_cost`'s
 numbers and boneli-oci's `node` and `postgres` records recorded here.
+
+Met on 2026-11-28 by part 2's PR. Every host test of boneli-sys, the
+unit tests with a seam included, is green on the dev host (Fedora 44,
+Linux 7.2.10 x86_64) and on both CI legs (Linux 7.0, x86_64 and arm64, CI run 46097425588: 20 unit and 85
+integration host tests on each leg). Where each criterion is shown:
+
+| Criterion | Test |
+|---|---|
+| Same errno with and without the listener, every notifying row (AC2) | `notified_rows_answer_as_plain_filter`: every form of `seccomp_rows`, the eight module ioctls on a memfd, the twelve Bpfilter forms on a Unix socket, `TCP_MD5SIG_EXT` and three ceiling forms, under the plain program on the host and in a sandbox for inside ids 0 and 999; each form's key is in the record, and the forms cover all 21 notifying rows (SockPacket only where af_packet is there) |
+| The record names the call, its pid inside and its comm (AC1) | `record_names_the_inside_pid_and_comm`: a forked child's `socket(AF_ALG)`, pid 3 inside, comm `bnl-child` |
+| Every notification is answered (AC4) | `every_notification_is_answered`: 8 threads × 1,000 calls, all EAFNOSUPPORT, count 8,000, one Clone3 entry |
+| A lost supervisor leaves calls denied (AC4) | `stopped_supervisor_leaves_calls_denied`, `panicked_supervisor_leaves_calls_denied`, `inconsistent_notification_is_denied_and_fails` (unit tests with a seam, `src/seccomp/notify.rs`): the call it held or received and the next one get ENOSYS, `failed` says why; the held call returned 3 ms after the stop on the dev host and 4 ms on both CI legs (printed, not asserted) |
+| A killed caller is not a failure | `killed_caller_is_not_a_failure`: `unanswered` 1, `failed` none |
+| Signals | `signal_after_receive_keeps_the_errno`: the row's errno and the handler ran; `signal_before_receive_restarts_or_interrupts`: EINTR with no entry, or a restart with one (D4) |
+| The runner stays usable | `set_id_calls_run_while_a_sandbox_runs`: `setgid(getgid())` from another runner thread returns while a sandbox runs, and a thread starts after it |
+| The workload's filters never allow a call | `stacked_filters_never_allow`: EBUSY for a second listener, EACCES under its ERRNO filter, ENOSYS under its USER_NOTIF without a listener, neither recorded |
+| The supervisor ends with its sandbox | `supervisor_ends_with_the_sandbox`, `listener_is_close_on_exec_in_the_runner` |
+| The hand-off fails closed | `listener_hand_off_fails_closed` |
+| The probe | `probe_notify_classification`; `reports_expected_missing` on both legs with the stock runner's set unchanged |
+
+`notification_cost` (20,000 denied `socket(AF_VSOCK)` calls, each timed
+in the probe; the supervisor's time on the CPU from its `schedstat`
+divided by the notifications; 3 runs each on the dev host, one per CI
+leg):
+
+| Host | Build | Plain p50 / p99 | Notified p50 / p99 | Supervisor CPU per notification |
+|---|---|---|---|---|
+| dev host, `heavy.slice` | debug (as CI) | 0.24–0.62 / 0.49–1.26 µs | 13.6–30.0 / 24.6–141.6 µs | 8.9–20.1 µs |
+| dev host, `heavy.slice` | release | 0.37–0.50 / 0.59–0.88 µs | 14.6–18.1 / 25.7–45.5 µs | 7.9–11.1 µs |
+| CI `sandbox (x86_64)`, Linux 7.0 | debug | 0.39 / 0.46 µs | 19.9 / 30.4 µs | 11.4 µs |
+| CI `sandbox (arm64)`, Linux 7.0 | debug | 0.27 / 0.30 µs | 17.8 / 21.1 µs | 8.5 µs |
+
+The CI rows are one run each (the `sandbox` job runs the test once). So
+a denied call costs about 15 to 20 µs with the real supervisor against
+the planning harness's 9 µs: the supervisor polls, receives, evaluates the
+plain program, takes the record's lock and replies, where the harness
+only received and replied. The spawn cost of D8 is unchanged in kind:
+one `clone3` notification per `posix_spawn` against about 700 µs.
+
+boneli-oci's `node_and_postgres_run_in_sandbox` printed its records on
+the dev host: `node --version` as inside id 0 and `postgres --version`
+as 999 made no denied call (both records empty, `failed` none). Neither
+starts a thread before it prints its version, so not even the Clone3
+entry of D1 shows; a run with threads shows it
+(`every_notification_is_answered`).

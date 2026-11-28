@@ -46,6 +46,8 @@ pub enum MissingId {
     SeccompKillProcess,
     /// `seccomp-filter`
     SeccompFilter,
+    /// `seccomp-notify`
+    SeccompNotify,
     /// `landlock-unavailable`
     LandlockUnavailable,
     /// `landlock-abi`
@@ -58,7 +60,7 @@ pub enum MissingId {
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 15] = [
+    pub const ALL: [MissingId; 16] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
@@ -70,6 +72,7 @@ impl MissingId {
         MissingId::CloseRange,
         MissingId::SeccompKillProcess,
         MissingId::SeccompFilter,
+        MissingId::SeccompNotify,
         MissingId::LandlockUnavailable,
         MissingId::LandlockAbi,
         MissingId::Keyrings,
@@ -90,6 +93,7 @@ impl MissingId {
             MissingId::CloseRange => "close-range",
             MissingId::SeccompKillProcess => "seccomp-kill-process",
             MissingId::SeccompFilter => "seccomp-filter",
+            MissingId::SeccompNotify => "seccomp-notify",
             MissingId::LandlockUnavailable => "landlock-unavailable",
             MissingId::LandlockAbi => "landlock-abi",
             MissingId::Keyrings => "keyrings",
@@ -169,6 +173,9 @@ pub enum Missing {
         /// The errno of the attempt.
         errno: i32,
     },
+    /// seccomp user notification as the sandbox uses it (ADR-043, D7) is
+    /// not available.
+    SeccompNotify(NotifyGap),
     /// Landlock is not built in or not enabled.
     LandlockUnavailable {
         /// The errno of the attempt.
@@ -223,6 +230,7 @@ impl Missing {
             Missing::CloseRange { .. } => MissingId::CloseRange,
             Missing::SeccompKillProcess { .. } => MissingId::SeccompKillProcess,
             Missing::SeccompFilter { .. } => MissingId::SeccompFilter,
+            Missing::SeccompNotify(_) => MissingId::SeccompNotify,
             Missing::LandlockUnavailable { .. } => MissingId::LandlockUnavailable,
             Missing::LandlockAbi { .. } => MissingId::LandlockAbi,
             Missing::Keyrings { .. } => MissingId::Keyrings,
@@ -292,6 +300,7 @@ impl fmt::Display for Missing {
                 "seccomp filters cannot be installed: {} (the kernel needs CONFIG_SECCOMP_FILTER)",
                 os(*errno)
             ),
+            Missing::SeccompNotify(gap) => write!(f, "{gap}"),
             Missing::LandlockUnavailable { errno } => write!(
                 f,
                 "Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)",
@@ -316,6 +325,83 @@ impl fmt::Display for Missing {
             } => write!(
                 f,
                 "the {probe} probe could not run: {stage}: {detail} (says nothing about {probe}; retry once the cause is gone)"
+            ),
+        }
+    }
+}
+
+/// Why seccomp user notification, as the sandbox's supervisor uses it, is
+/// not available (ADR-043, D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyGap {
+    /// Installing a filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER |
+    /// SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` failed in the probe's
+    /// filter child: EINVAL on a kernel below 5.19, which lacks the second
+    /// flag; EBUSY when this process already runs under a filter with a
+    /// listener (`has_duplicate_listener`, 5.19 `kernel/seccomp.c:1807`),
+    /// as under the syscall interception of LXD, Incus or sysbox.
+    Install {
+        /// The errno of the install.
+        errno: i32,
+    },
+    /// `SECCOMP_GET_ACTION_AVAIL` refuses `SECCOMP_RET_USER_NOTIF`.
+    Action {
+        /// The errno.
+        errno: i32,
+    },
+    /// `SECCOMP_GET_NOTIF_SIZES` failed.
+    SizesUnreadable {
+        /// The errno.
+        errno: i32,
+    },
+    /// The kernel's notification structs are smaller than this crate's
+    /// (80, 24 and 64 bytes).
+    SizesTooSmall {
+        /// `struct seccomp_notif`.
+        notif: u16,
+        /// The reply struct.
+        resp: u16,
+        /// `struct seccomp_data`.
+        data: u16,
+    },
+}
+
+impl fmt::Display for NotifyGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const WHY: &str =
+            "every sandbox's denied calls are answered by a supervisor in this process";
+        match self {
+            NotifyGap::Install { errno } if *errno == libc::EINVAL => write!(
+                f,
+                "a seccomp filter with a listener and the wait-killable receive cannot be installed: {} \
+                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV needs Linux 5.19 or newer; {WHY})",
+                os(*errno)
+            ),
+            NotifyGap::Install { errno } if *errno == libc::EBUSY => write!(
+                f,
+                "a seccomp filter with a listener cannot be installed: {} (this process already runs \
+                 under a seccomp filter with a listener, such as a container runtime's syscall \
+                 interception, and a task can have only one; {WHY})",
+                os(*errno)
+            ),
+            NotifyGap::Install { errno } => write!(
+                f,
+                "a seccomp filter with a listener cannot be installed: {} ({WHY})",
+                os(*errno)
+            ),
+            NotifyGap::Action { errno } => write!(
+                f,
+                "seccomp cannot notify a supervisor (SECCOMP_RET_USER_NOTIF): {} (boneli needs Linux 5.19 or newer)",
+                os(*errno)
+            ),
+            NotifyGap::SizesUnreadable { errno } => write!(
+                f,
+                "the kernel's seccomp notification sizes cannot be read (SECCOMP_GET_NOTIF_SIZES): {}",
+                os(*errno)
+            ),
+            NotifyGap::SizesTooSmall { notif, resp, data } => write!(
+                f,
+                "the kernel's seccomp notification sizes {notif}/{resp}/{data} are below 80/24/64"
             ),
         }
     }
@@ -382,7 +468,9 @@ pub struct Features;
 impl Features {
     /// Tries every feature the runtime needs: a user namespace with the
     /// single id map writes (through `clone3`), `close_range` with
-    /// `CLOSE_RANGE_CLOEXEC`, `SECCOMP_RET_KILL_PROCESS`, Landlock ABI 2 or
+    /// `CLOSE_RANGE_CLOEXEC`, `SECCOMP_RET_KILL_PROCESS`, seccomp user
+    /// notification with a listener and the wait-killable receive
+    /// (ADR-043, D7), Landlock ABI 2 or
     /// newer, cgroup v2 at `/sys/fs/cgroup`, and delegation of the caller's
     /// own cgroup with the cpu, io, memory and pids controllers, and the
     /// kernel keyrings (`keyctl`, `/proc/keys`, `/proc/key-users`). Returns
@@ -393,6 +481,7 @@ impl Features {
         missing.extend(probe_children(Fault::None, Fault::None, PROBE_TIMEOUT));
         missing.extend(probe_close_range());
         missing.extend(probe_seccomp());
+        missing.extend(probe_seccomp_notify());
         missing.extend(probe_landlock());
         missing.extend(probe_keyrings());
         missing.extend(probe_cgroup());
@@ -568,6 +657,12 @@ pub(crate) fn classify_filter_failure(stage: &'static str, error: &Error) -> Opt
     Some(match error {
         // Without clone3 the user-namespace child already says so.
         Error::Sys { errno, .. } if stage == "clone3" && *errno == libc::ENOSYS => return None,
+        // Item 2, the filter with the notifying program's flags.
+        Error::Setup {
+            step: Step::Seccomp,
+            index: 2,
+            errno,
+        } => Missing::SeccompNotify(NotifyGap::Install { errno: *errno }),
         Error::Setup {
             step: Step::Seccomp,
             errno,
@@ -610,6 +705,52 @@ fn probe_seccomp() -> Option<Missing> {
         )
     };
     (rc < 0).then(|| Missing::SeccompKillProcess { errno: errno() })
+}
+
+/// `SECCOMP_RET_USER_NOTIF` and the kernel's notification sizes (ADR-043,
+/// D7); the install with the notifying program's flags is item 2 of the
+/// filter child.
+fn probe_seccomp_notify() -> Option<Missing> {
+    let action: u32 = libc::SECCOMP_RET_USER_NOTIF;
+    // SAFETY: SECCOMP_GET_ACTION_AVAIL reads one u32 through the pointer,
+    // which is valid for the call's duration.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_GET_ACTION_AVAIL,
+            0u32,
+            &action as *const u32,
+        )
+    };
+    let action = if rc < 0 { Err(errno()) } else { Ok(()) };
+    classify_notify(action, crate::seccomp::notify::kernel_sizes())
+}
+
+/// Names what the notification probe found (pure, so every branch has a
+/// unit test): the action's availability and the sizes the kernel reports.
+pub(crate) fn classify_notify(
+    action: std::result::Result<(), i32>,
+    sizes: std::result::Result<libc::seccomp_notif_sizes, i32>,
+) -> Option<Missing> {
+    if let Err(errno) = action {
+        return Some(Missing::SeccompNotify(NotifyGap::Action { errno }));
+    }
+    match sizes {
+        Err(errno) => Some(Missing::SeccompNotify(NotifyGap::SizesUnreadable { errno })),
+        Ok(s) => match crate::seccomp::Buffers::for_sizes(s) {
+            Ok(_) => None,
+            Err(Error::NotifySizes { notif, resp, data }) => {
+                Some(Missing::SeccompNotify(NotifyGap::SizesTooSmall {
+                    notif,
+                    resp,
+                    data,
+                }))
+            }
+            Err(_) => Some(Missing::SeccompNotify(NotifyGap::SizesUnreadable {
+                errno: libc::EINVAL,
+            })),
+        },
+    }
 }
 
 fn probe_landlock() -> Option<Missing> {
@@ -784,6 +925,9 @@ mod tests {
             MissingId::SeccompFilter => Missing::SeccompFilter {
                 errno: libc::EINVAL,
             },
+            MissingId::SeccompNotify => Missing::SeccompNotify(NotifyGap::Install {
+                errno: libc::EINVAL,
+            }),
             MissingId::LandlockUnavailable => Missing::LandlockUnavailable {
                 errno: libc::EOPNOTSUPP,
             },
@@ -828,6 +972,12 @@ mod tests {
                 "seccomp filters cannot be installed: {} (the kernel needs CONFIG_SECCOMP_FILTER)",
                 e(libc::EINVAL)
             ),
+            format!(
+                "a seccomp filter with a listener and the wait-killable receive cannot be installed: {} \
+                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV needs Linux 5.19 or newer; every sandbox's \
+                 denied calls are answered by a supervisor in this process)",
+                e(libc::EINVAL)
+            ),
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
             "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
             format!(
@@ -852,6 +1002,7 @@ mod tests {
             "close-range",
             "seccomp-kill-process",
             "seccomp-filter",
+            "seccomp-notify",
             "landlock-unavailable",
             "landlock-abi",
             "keyrings",
@@ -955,6 +1106,105 @@ mod tests {
 
     fn errno_detail(errno: i32) -> String {
         std::io::Error::from_raw_os_error(errno).to_string()
+    }
+
+    use crate::seccomp::notify::sizes as notif_sizes;
+
+    #[test]
+    fn probe_notify_classification() {
+        let e = |n| std::io::Error::from_raw_os_error(n).to_string();
+        // Item 2 of the filter child: the install with both flags.
+        let install = |errno| {
+            classify_filter_failure(
+                "report",
+                &Error::Setup {
+                    step: Step::Seccomp,
+                    index: 2,
+                    errno,
+                },
+            )
+        };
+        let einval = install(libc::EINVAL).expect("a gap");
+        assert_eq!(einval.id(), MissingId::SeccompNotify);
+        assert!(
+            einval.to_string().contains("needs Linux 5.19 or newer"),
+            "{einval}"
+        );
+        let ebusy = install(libc::EBUSY).expect("a gap");
+        assert_eq!(
+            ebusy,
+            Missing::SeccompNotify(NotifyGap::Install { errno: libc::EBUSY })
+        );
+        assert!(
+            ebusy
+                .to_string()
+                .contains("already runs under a seccomp filter with a listener"),
+            "{ebusy}"
+        );
+        // Items 0 and 1 stay the filter itself.
+        for index in [0, 1] {
+            assert_eq!(
+                classify_filter_failure(
+                    "report",
+                    &Error::Setup {
+                        step: Step::Seccomp,
+                        index,
+                        errno: libc::EINVAL,
+                    },
+                ),
+                Some(Missing::SeccompFilter {
+                    errno: libc::EINVAL
+                })
+            );
+        }
+        // The action and the sizes.
+        let ours = notif_sizes(80, 24, 64);
+        assert_eq!(classify_notify(Ok(()), Ok(ours)), None);
+        assert_eq!(
+            classify_notify(Ok(()), Ok(notif_sizes(96, 32, 72))),
+            None,
+            "a newer kernel's larger structs"
+        );
+        assert_eq!(
+            classify_notify(Err(libc::EOPNOTSUPP), Ok(ours)),
+            Some(Missing::SeccompNotify(NotifyGap::Action {
+                errno: libc::EOPNOTSUPP
+            }))
+        );
+        assert_eq!(
+            classify_notify(Ok(()), Err(libc::EINVAL)),
+            Some(Missing::SeccompNotify(NotifyGap::SizesUnreadable {
+                errno: libc::EINVAL
+            }))
+        );
+        for (n, r, d) in [(79, 24, 64), (80, 23, 64), (80, 24, 63)] {
+            let m = classify_notify(Ok(()), Ok(notif_sizes(n, r, d)));
+            assert_eq!(
+                m,
+                Some(Missing::SeccompNotify(NotifyGap::SizesTooSmall {
+                    notif: n,
+                    resp: r,
+                    data: d
+                }))
+            );
+            assert_eq!(m.expect("a gap").id().as_str(), "seccomp-notify");
+        }
+        assert_eq!(
+            NotifyGap::SizesTooSmall {
+                notif: 79,
+                resp: 24,
+                data: 64
+            }
+            .to_string(),
+            "the kernel's seccomp notification sizes 79/24/64 are below 80/24/64"
+        );
+        assert!(
+            NotifyGap::Action {
+                errno: libc::EOPNOTSUPP
+            }
+            .to_string()
+            .contains(&e(libc::EOPNOTSUPP))
+        );
     }
 
     #[test]
