@@ -1786,25 +1786,33 @@
     "sandbox"
    ],
    "manual": false
+  },
+  {
+   "issue": 151,
+   "title": "boneli-sys: destroy_lifts_cpu_throttle flakes with SetupTimeout under a loaded host",
+   "epic": null,
+   "order": 69,
+   "state": "claimed",
+   "owner": "734ee990",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
+   "parked": null,
+   "pr": null,
+   "note": "",
+   "updated_at": "2026-11-28T15:30:06+00:00",
+   "priority": "P3",
+   "size": "small",
+   "deps": [],
+   "xdeps": [],
+   "areas": [
+    "sandbox"
+   ],
+   "manual": false
   }
  ],
  "log": [
-  {
-   "at": "2026-11-26T00:37:21+00:00",
-   "issue": 137,
-   "from": "ready",
-   "to": "claimed",
-   "by": "7e21b49c",
-   "note": "dispatched"
-  },
-  {
-   "at": "2026-11-26T00:57:20+00:00",
-   "issue": 137,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "7e21b49c",
-   "note": null
-  },
   {
    "at": "2026-11-26T22:06:03+00:00",
    "issue": 137,
@@ -2188,6 +2196,22 @@
    "to": "implementing",
    "by": "9c692a2a",
    "note": "PRs 1-3/6 merged (#146, #147, #150); PR 4 trees + freeze next"
+  },
+  {
+   "at": "2026-11-28T15:30:06+00:00",
+   "issue": 151,
+   "from": null,
+   "to": "ready",
+   "by": "sync",
+   "note": "added"
+  },
+  {
+   "at": "2026-11-28T15:30:06+00:00",
+   "issue": 151,
+   "from": "ready",
+   "to": "claimed",
+   "by": "734ee990",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2212,10 +2236,11 @@
   49,
   69,
   144,
-  149
+  149,
+  151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T15:25:07+00:00",
+ "updated_at": "2026-11-28T15:30:06+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
