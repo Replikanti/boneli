@@ -185,10 +185,16 @@ passes on this one). On every path that ends the loop with a failure the
 supervisor records the failure before any call gets ENOSYS for it: the
 inconsistent path records it before its own ENOSYS reply, and the stop,
 panic and listener-error paths record it before they close the listener.
-So a reader that sees a call answered ENOSYS finds the reason in the
-record even while the sandbox runs (`panicked_supervisor_leaves_calls_denied`
-and `inconsistent_notification_is_denied_and_fails` read it then); the
-record is complete once `wait` returned.
+So a reader that sees a call answered ENOSYS can find the reason in the
+record even while the sandbox runs. That order is fixed in the code and
+kept by review, not proven by a test: the window it closes lasts
+microseconds, and in review the swapped order still passed
+`panicked_supervisor_leaves_calls_denied` and
+`inconsistent_notification_is_denied_and_fails` 10 of 10 times (it failed
+only with a 200 ms delay put between reply and record). Those tests show
+the record after `wait`, and that a read made once the call returned
+finds it in the common case. The record is complete once `wait`
+returned, which is what a caller relies on (#8 reads it then).
 
 **A lost supervisor leaves calls denied, not hung.** When the listener's
 last descriptor closes (stop, panic, runner death), the kernel answers

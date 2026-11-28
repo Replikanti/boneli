@@ -354,7 +354,25 @@ impl Listener {
 
     /// `SECCOMP_IOCTL_NOTIF_ID_VALID`: whether notification `id` is still
     /// pending, so its caller is still the task the notification named.
+    /// Retried on EINTR: the thread blocks every signal but the C
+    /// library's own, and those (glibc's `SIGSETXID` from a set*id call in
+    /// the runner) can still interrupt the request; a lost answer would
+    /// drop a key's pid and comm.
     fn id_valid(&self, id: u64) -> bool {
+        loop {
+            match self.id_valid_once(id) {
+                Ok(()) => return true,
+                Err(libc::EINTR) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn id_valid_once(&self, id: u64) -> std::result::Result<(), i32> {
+        #[cfg(test)]
+        if ID_VALID_EINTR_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(libc::EINTR);
+        }
         // SAFETY: the kernel reads one u64 through the pointer, valid for
         // the call's duration.
         let rc = unsafe {
@@ -364,7 +382,11 @@ impl Listener {
                 &id as *const u64,
             )
         };
-        rc == 0
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(crate::error::errno())
+        }
     }
 
     /// `SECCOMP_IOCTL_NOTIF_SEND` of `deny`, written into the reply buffer
@@ -400,6 +422,13 @@ impl core::fmt::Debug for Listener {
         f.write_str("Listener")
     }
 }
+
+/// The unit tests' way to interrupt the next ID_VALID request once with
+/// EINTR, as a C library signal would. The host unit tests are serialized
+/// by `test_guard::host_lock`, so one flag serves them.
+#[cfg(test)]
+pub(crate) static ID_VALID_EINTR_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// What the supervisor needs besides the listener, prepared before the
 /// clone.
@@ -505,7 +534,9 @@ impl Drop for Supervisor {
 /// that ends the loop with a failure records it before any call is
 /// answered ENOSYS for it (the inconsistent path records it before its
 /// own ENOSYS reply, in `serve`), so a reader that sees a call answered
-/// ENOSYS also sees why.
+/// ENOSYS can see why even before `wait`. No test can pin this order
+/// (the window is microseconds); it is kept by review, and the record is
+/// complete once `wait` returned (ADR-043, D4).
 fn supervise(
     listener: Listener,
     stop: OwnedFd,
@@ -675,7 +706,8 @@ fn serve(
         seam_before_send(seam, listener, stop, &n)?;
         // An inconsistent call is answered ENOSYS and ends the loop as
         // failed; the failure is recorded first, so a reader that sees the
-        // ENOSYS sees why (D4).
+        // ENOSYS can see why (D4; the order is kept by review, no test
+        // pins it).
         if let Decision::Inconsistent { action } = decision {
             lock(record).fail(SupervisorFailure::Inconsistent {
                 nr: n.data.nr,
@@ -1289,8 +1321,9 @@ mod host {
             get(&v, "ms0"),
             get(&v, "ms1")
         ));
-        // While the sandbox still runs: the panic is recorded before the
-        // listener closes, so the caller's ENOSYS comes with its reason.
+        // While the sandbox still runs, once the caller has its ENOSYS, a
+        // read finds the panic in the common case. This does not pin the
+        // order of record and close (D4): the window is microseconds.
         let run = start("vsock-wait", &[], Seam::PanicAfterRecv { nr: socket_nr() });
         assert_eq!(run.await_line("errno0"), enosys);
         assert_eq!(
@@ -1332,8 +1365,9 @@ mod host {
             })
         );
         assert_eq!(vsock_count(&denials), 0);
-        // While the sandbox still runs: once the caller has its ENOSYS, the
-        // record already says why (D4), not only after `wait`.
+        // While the sandbox still runs, once the caller has its ENOSYS, a
+        // read finds the failure in the common case. This does not pin the
+        // order of record and reply (D4): the window is microseconds.
         let run = start("vsock-wait", &[], seam);
         assert_eq!(run.await_line("errno0"), enosys);
         assert_eq!(
@@ -1342,10 +1376,36 @@ mod host {
                 nr: getpid,
                 action: libc::SECCOMP_RET_ALLOW,
             }),
-            "the failure is recorded before the reply"
+            "a read once the call returned"
         );
         let (status, _, _) = run.finish();
         assert_eq!(status, ExitStatus::Exited(0));
+    }
+
+    #[test]
+    #[ignore = "host: user namespaces, cgroup v2 delegation, seccomp user notification"]
+    fn interrupted_id_check_is_retried() {
+        let _host = host_lock();
+        // The first key's ID_VALID request is interrupted once, as a C
+        // library signal (glibc's SIGSETXID) can do: it is retried, so the
+        // key keeps the pid and comm it read. Without the retry that entry
+        // would have neither.
+        ID_VALID_EINTR_ONCE.store(true, Ordering::SeqCst);
+        let run = start("vsock-twice", &[], Seam::None);
+        let (status, v, denials) = run.finish();
+        assert_eq!(status, ExitStatus::Exited(0), "{v:?}");
+        assert!(
+            !ID_VALID_EINTR_ONCE.load(Ordering::SeqCst),
+            "the interruption was taken"
+        );
+        assert!(!denials.entries().is_empty(), "{denials:?}");
+        for d in denials.entries() {
+            assert!(
+                d.first.call.pid.is_some() && d.first.call.comm.is_some(),
+                "{d:?}"
+            );
+        }
+        assert_eq!(denials.failed(), None);
     }
 
     #[test]

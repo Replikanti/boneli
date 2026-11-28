@@ -452,9 +452,14 @@ struct Held {
     out: BufReader<std::fs::File>,
     cg: Option<boneli_sys::Cgroup>,
     _fixture: rootfs::Fixture,
+    /// The shared run lock, as every sandbox run of this binary holds it,
+    /// so a test that counts supervisor threads under the exclusive lock
+    /// sees none of this run's; `None` under that exclusive lock.
+    _runs: Option<support::RunsGuard>,
 }
 
 fn start_held(action: &str, program: &str, args: &[&str]) -> Held {
+    let runs = support::shared();
     let fixture = rootfs::Fixture::new("held");
     let cg = cgroup::sandbox("held");
     let (in_r, in_w) = pipe();
@@ -484,6 +489,7 @@ fn start_held(action: &str, program: &str, args: &[&str]) -> Held {
         out: BufReader::new(std::fs::File::from(out_r)),
         cg: Some(cg),
         _fixture: fixture,
+        _runs: runs,
     }
 }
 
