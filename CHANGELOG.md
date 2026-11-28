@@ -1137,8 +1137,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inconsistent supervisor leaves calls denied with ENOSYS, a killed
   caller is not a failure, signals around the receive never let a call
   run, the workload's own filters never allow one, the supervisor ends
-  with its sandbox, and `notification_cost` prints the cost on both CI
-  legs. boneli-oci's `node` and `postgres` runs print their records.
+  with its sandbox, the runner's own `setgid` returns while a sandbox
+  runs (the supervisor leaves the C library's signals unblocked), and
+  `notification_cost` prints the cost on both CI legs. boneli-oci's `node` and `postgres` runs print their records.
 
 ### Changed
 

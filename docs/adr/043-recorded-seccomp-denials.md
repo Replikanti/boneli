@@ -170,12 +170,25 @@ error, an inconsistent evaluation or a panic sets `failed`
 (`SupervisorFailure`), ends the loop and drops the listener. The loop
 ends on `POLLHUP` (5.19 `:1759`: no task uses the filter any more) or on
 stop. `Child::wait` reaps, then stops and joins the supervisor; `Drop`
-kills, reaps, stops and joins. The thread blocks every signal, so a
-process-directed signal of the runner goes to another thread and none of
-its waits is interrupted. It records a failure before it closes the
-listener, so a reader that sees a call answered ENOSYS by the kernel
-finds the reason in the record; the record is complete once `wait`
-returned.
+kills, reaps, stops and joins. `spawn` returns only after the thread
+has started, named itself and set its signal mask (a ready message from
+the thread). The thread blocks every signal but the C library's own
+(`sigfillset` + `pthread_sigmask`, which leave out glibc's 32 and 33 and
+musl's 32 to 34), so a process-directed signal of the runner goes to
+another thread and none of its waits is interrupted. The library's own
+signals must stay open: `setuid`, `setgid` and `setgroups` send
+`SIGSETXID` to every thread and wait for each handler, so a supervisor
+that blocked it would hang them, every later thread start and its own
+exit (found in review of PR 2, which blocked all 64 through the raw
+syscall; `set_id_calls_run_while_a_sandbox_runs` hangs on that mask and
+passes on this one). On every path that ends the loop with a failure the
+supervisor records the failure before any call gets ENOSYS for it: the
+inconsistent path records it before its own ENOSYS reply, and the stop,
+panic and listener-error paths record it before they close the listener.
+So a reader that sees a call answered ENOSYS finds the reason in the
+record even while the sandbox runs (`panicked_supervisor_leaves_calls_denied`
+and `inconsistent_notification_is_denied_and_fails` read it then); the
+record is complete once `wait` returned.
 
 **A lost supervisor leaves calls denied, not hung.** When the listener's
 last descriptor closes (stop, panic, runner death), the kernel answers
@@ -513,6 +526,7 @@ integration host tests on each leg). Where each criterion is shown:
 | A lost supervisor leaves calls denied (AC4) | `stopped_supervisor_leaves_calls_denied`, `panicked_supervisor_leaves_calls_denied`, `inconsistent_notification_is_denied_and_fails` (unit tests with a seam, `src/seccomp/notify.rs`): the call it held or received and the next one get ENOSYS, `failed` says why; the held call returned 3 ms after the stop on the dev host and 4 ms on both CI legs (printed, not asserted) |
 | A killed caller is not a failure | `killed_caller_is_not_a_failure`: `unanswered` 1, `failed` none |
 | Signals | `signal_after_receive_keeps_the_errno`: the row's errno and the handler ran; `signal_before_receive_restarts_or_interrupts`: EINTR with no entry, or a restart with one (D4) |
+| The runner stays usable | `set_id_calls_run_while_a_sandbox_runs`: `setgid(getgid())` from another runner thread returns while a sandbox runs, and a thread starts after it |
 | The workload's filters never allow a call | `stacked_filters_never_allow`: EBUSY for a second listener, EACCES under its ERRNO filter, ENOSYS under its USER_NOTIF without a listener, neither recorded |
 | The supervisor ends with its sandbox | `supervisor_ends_with_the_sandbox`, `listener_is_close_on_exec_in_the_runner` |
 | The hand-off fails closed | `listener_hand_off_fails_closed` |

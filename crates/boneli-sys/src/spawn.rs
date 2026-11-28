@@ -472,7 +472,7 @@ pub(crate) fn recv_listener(sock: &OwnedFd) -> std::result::Result<OwnedFd, List
 
 /// Sets the calling thread's signal mask with the raw syscall, which also
 /// covers the signals glibc reserves; returns the previous mask.
-pub(crate) fn set_signal_mask(mask: u64) -> Result<u64> {
+fn set_signal_mask(mask: u64) -> Result<u64> {
     let mut old: u64 = 0;
     // SAFETY: both sets are valid kernel signal sets of the size passed.
     let rc = unsafe {

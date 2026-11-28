@@ -424,6 +424,27 @@ fn supervisor_threads() -> usize {
         .count()
 }
 
+/// Waits until [`supervisor_threads`] is `n`, within the hang bound. The
+/// supervisor is joined when `wait` or the drop returns, but glibc's join
+/// returns when the kernel clears the thread's tid, before the exiting
+/// task leaves `/proc/self/task`, so the count catches up a moment later
+/// (2 of 20 runs saw the old count at once in review, 9 of 50 under load).
+/// A supervisor that does not end fails here after the bound.
+fn await_supervisor_threads(n: usize, when: &str) {
+    let deadline = Instant::now() + support::PROBE_HANG_BOUND;
+    loop {
+        let got = supervisor_threads();
+        if got == n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{when}: {got} supervisor threads, want {n}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// A probe started in a sandbox with its stdin a pipe the test closes.
 struct Held {
     child: boneli_sys::Child,
@@ -485,8 +506,10 @@ fn supervisor_ends_with_the_sandbox() {
     // No other sandbox of this binary runs meanwhile, so every supervisor
     // thread counted is this test's.
     let _only = support::exclusive();
-    assert_eq!(supervisor_threads(), 0, "before");
-    // Running: one thread. Waited: none.
+    // An earlier test's supervisor may still be leaving /proc.
+    await_supervisor_threads(0, "before");
+    // Running: one thread each, at once: `spawn` returns after the
+    // supervisor has named itself. Waited or dropped: none.
     let held = start_held("ids", "/usr/bin/sleep", &["30"]);
     assert_eq!(supervisor_threads(), 1, "while the sandbox runs");
     let fixture = rootfs::Fixture::new("ends");
@@ -509,10 +532,10 @@ fn supervisor_ends_with_the_sandbox() {
     assert_eq!(supervisor_threads(), 2, "two sandboxes");
     child.kill().expect("kill");
     child.wait().expect("wait");
-    assert_eq!(supervisor_threads(), 1, "after wait");
+    await_supervisor_threads(1, "after wait");
     // Dropped without a wait: killed, reaped, the supervisor joined.
     drop(held.child);
-    assert_eq!(supervisor_threads(), 0, "after dropping an unwaited child");
+    await_supervisor_threads(0, "after dropping an unwaited child");
     drop(child);
     for c in [cg, held.cg.expect("cgroup")] {
         c.destroy().expect("destroy");
@@ -590,4 +613,44 @@ fn notification_cost() {
         values["p50_ns"],
         values["p99_ns"],
     );
+}
+
+#[test]
+#[ignore = "host: user namespaces, cgroup v2 delegation, seccomp user notification"]
+fn set_id_calls_run_while_a_sandbox_runs() {
+    // glibc's and musl's setgid, setuid and setgroups signal every thread
+    // of the process and wait for each one's handler (SIGSETXID, 33 in
+    // glibc), so a supervisor that blocked that signal would hang them,
+    // every later thread start and its own exit. setgid to the current
+    // group needs no privilege. The bound turns a hang into a failure: a
+    // hung call holds glibc's thread-stack lock, so unwinding (which joins
+    // the supervisor) would hang too, and the test aborts instead.
+    let held = start_held("ids", "/usr/bin/sleep", &["30"]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: getgid has no preconditions and cannot fail.
+        let gid = unsafe { libc::getgid() };
+        // SAFETY: setgid to the current real group changes nothing.
+        let rc = unsafe { libc::setgid(gid) };
+        let _ = tx.send(rc);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(rc) => assert_eq!(rc, 0, "setgid(getgid())"),
+        Err(e) => {
+            let _ = held.child.kill();
+            let _ = writeln!(
+                std::io::stderr(),
+                "set_id_calls_run_while_a_sandbox_runs: setgid with a running sandbox did not \
+                 return within 10 s ({e}); aborting, since unwinding would join the hung \
+                 supervisor"
+            );
+            std::process::abort();
+        }
+    }
+    // A thread starts as before, and the sandbox ends.
+    std::thread::spawn(|| ()).join().expect("a thread starts");
+    held.child.kill().expect("kill");
+    let (status, denials) = held.finish();
+    assert_eq!(status, ExitStatus::Signaled(libc::SIGKILL));
+    assert_eq!(denials.failed(), None);
 }

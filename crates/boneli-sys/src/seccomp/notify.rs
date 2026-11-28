@@ -456,12 +456,18 @@ impl Supervisor {
         let (stop_read, stop_write) = crate::spawn::report_pipe()?;
         let record: Shared = Default::default();
         let shared = record.clone();
+        let (ready_tx, ready) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name(THREAD_NAME.to_string())
-            .spawn(move || supervise(listener, stop_read, plan, &shared, seam))
+            .spawn(move || supervise(listener, stop_read, plan, &shared, seam, ready_tx))
             .map_err(|e| Error::Supervisor {
                 errno: e.raw_os_error().unwrap_or(libc::EAGAIN),
             })?;
+        // The thread is named and its signal mask set before it says so,
+        // so once `spawn` returns `/proc` shows the supervisor by its name.
+        // It cannot end without sending or dropping the sender, and either
+        // wakes this receive.
+        let _ = ready.recv();
         Ok(Supervisor {
             record,
             stop: Some(stop_write),
@@ -495,18 +501,21 @@ impl Drop for Supervisor {
 }
 
 /// The supervisor thread's body: the loop under `catch_unwind`, then the
-/// failure recorded, then the listener closed, in that order, so a caller
-/// that sees its call answered ENOSYS also sees why.
+/// failure recorded, then the listener closed, in that order. Every path
+/// that ends the loop with a failure records it before any call is
+/// answered ENOSYS for it (the inconsistent path records it before its
+/// own ENOSYS reply, in `serve`), so a reader that sees a call answered
+/// ENOSYS also sees why.
 fn supervise(
     listener: Listener,
     stop: OwnedFd,
     mut plan: SupervisorPlan,
     record: &Shared,
     seam: Seam,
+    ready: std::sync::mpsc::Sender<()>,
 ) {
-    // Every signal blocked: a process-directed signal goes to another
-    // thread, and the loop's waits are never interrupted.
-    let _ = crate::spawn::set_signal_mask(!0);
+    block_signals();
+    let _ = ready.send(());
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         serve(&listener, &stop, &mut plan, record, seam)
     }));
@@ -519,6 +528,24 @@ fn supervise(
         lock(record).fail(failure);
     }
     drop(listener);
+}
+
+/// Blocks every signal of the calling thread but the ones the C library
+/// reserves for itself, so a process-directed signal goes to another
+/// thread and the loop's waits are never interrupted. `sigfillset` leaves
+/// the reserved ones out (glibc: 32 `SIGCANCEL` and 33 `SIGSETXID`; musl:
+/// 32 to 34), and glibc's `pthread_sigmask` clears them again. They must
+/// stay deliverable: `setuid`, `setgid` or `setgroups` in the runner sends
+/// `SIGSETXID` to every thread and waits for each handler, so a thread
+/// that blocked it would hang that call, every later thread start and
+/// this thread's own exit (review of #45 PR 2).
+fn block_signals() {
+    // SAFETY: an all-zero sigset_t is valid storage for sigfillset.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: set is valid storage of the right type.
+    unsafe { libc::sigfillset(&mut set) };
+    // SAFETY: set is a valid signal set; no old mask is requested.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
 }
 
 /// What woke the supervisor.
@@ -646,6 +673,15 @@ fn serve(
             lock(record).note(key, call);
         }
         seam_before_send(seam, listener, stop, &n)?;
+        // An inconsistent call is answered ENOSYS and ends the loop as
+        // failed; the failure is recorded first, so a reader that sees the
+        // ENOSYS sees why (D4).
+        if let Decision::Inconsistent { action } = decision {
+            lock(record).fail(SupervisorFailure::Inconsistent {
+                nr: n.data.nr,
+                action,
+            });
+        }
         let Some(deny) = Deny::new(n.id, decision.errno()) else {
             // decision.errno() is a row's errno or ENOSYS; nothing else.
             return Err(SupervisorFailure::Inconsistent {
@@ -896,7 +932,7 @@ mod host {
     use crate::spawn::{Child, ExitStatus, Spec, Stdio, spawn_with};
     use crate::test_guard::{UNIT_PROBE, UnitRoot, host_lock, sandbox_cgroup};
     use std::collections::BTreeMap;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -1036,6 +1072,13 @@ mod host {
                     put(&format!("ms{i}"), &t.elapsed().as_millis().to_string());
                 }
             }
+            // One call, then wait for stdin to end, so the test can read
+            // the record while the sandbox still runs.
+            Some("vsock-wait") => {
+                put("errno0", &vsock().to_string());
+                let mut rest = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut rest);
+            }
             Some("signal-after") => put("code", &in_fork(signalled_call).to_string()),
             Some("signal-before") => put("code", &in_fork(timed_call).to_string()),
             _ => put("unknown", "1"),
@@ -1048,7 +1091,10 @@ mod host {
     /// A probe running in a sandbox under `seam`.
     struct Running {
         child: Child,
-        out: std::thread::JoinHandle<String>,
+        /// The probe's stdout, line by line.
+        out: std::sync::mpsc::Receiver<String>,
+        /// The probe's stdin; `vsock-wait` waits for its end.
+        stdin: Option<std::io::PipeWriter>,
         _cgroup: crate::Cgroup,
         _unit: UnitRoot,
     }
@@ -1057,6 +1103,7 @@ mod host {
         let unit = UnitRoot::with_probe();
         let cg = sandbox_cgroup("notify");
         let (out_r, out_w) = std::io::pipe().expect("pipe");
+        let (in_r, in_w) = std::io::pipe().expect("pipe");
         let null = || -> OwnedFd {
             std::fs::File::options()
                 .read(true)
@@ -1081,7 +1128,7 @@ mod host {
             .collect(),
             env: vars,
             stdio: Stdio {
-                stdin: null(),
+                stdin: in_r.into(),
                 stdout: out_w.into(),
                 stderr: null(),
             },
@@ -1093,20 +1140,42 @@ mod host {
         let mut pid = 0;
         let child = spawn_with(&spec, Fault::None, seam, &mut pid).expect("spawn the probe");
         drop(spec);
-        let out = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::fs::File::from(OwnedFd::from(out_r)).read_to_string(&mut s);
-            s
+        let (lines, out) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out_r).lines().map_while(Result::ok) {
+                let _ = lines.send(line);
+            }
         });
         Running {
             child,
             out,
+            stdin: Some(in_w),
             _cgroup: cg,
             _unit: unit,
         }
     }
 
     impl Running {
+        /// The value of the probe's next line with `key`, within the hang
+        /// bound.
+        fn await_line(&self, key: &str) -> String {
+            let deadline = Instant::now() + HANG_BOUND;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let line = self
+                    .out
+                    .recv_timeout(left)
+                    .unwrap_or_else(|e| panic!("no {key} line within {HANG_BOUND:?}: {e}"));
+                if let Some((k, v)) = line
+                    .split_once(PREFIX)
+                    .and_then(|(_, kv)| kv.split_once('='))
+                    && k == key
+                {
+                    return v.to_string();
+                }
+            }
+        }
+
         /// Polls the record until it holds an entry, within the hang bound.
         fn await_entry(&self) {
             let deadline = Instant::now() + HANG_BOUND;
@@ -1130,6 +1199,7 @@ mod host {
             BTreeMap<String, String>,
             super::super::record::Denials,
         ) {
+            drop(self.stdin.take());
             let deadline = Instant::now() + HANG_BOUND;
             loop {
                 let mut pfd = libc::pollfd {
@@ -1147,12 +1217,14 @@ mod host {
                 }
             }
             let status = self.child.wait().expect("wait");
-            let out = self.out.join().expect("stdout reader");
-            let values = out
-                .lines()
-                .filter_map(|l| l.split_once(PREFIX).map(|(_, kv)| kv))
-                .filter_map(|kv| kv.split_once('='))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+            let values = self
+                .out
+                .iter()
+                .filter_map(|l| {
+                    l.split_once(PREFIX)
+                        .and_then(|(_, kv)| kv.split_once('='))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
                 .collect();
             let denials = self.child.denials();
             let _ = self._cgroup.destroy();
@@ -1217,6 +1289,16 @@ mod host {
             get(&v, "ms0"),
             get(&v, "ms1")
         ));
+        // While the sandbox still runs: the panic is recorded before the
+        // listener closes, so the caller's ENOSYS comes with its reason.
+        let run = start("vsock-wait", &[], Seam::PanicAfterRecv { nr: socket_nr() });
+        assert_eq!(run.await_line("errno0"), enosys);
+        assert_eq!(
+            run.child.denials().failed(),
+            Some(&SupervisorFailure::Panicked)
+        );
+        let (status, _, _) = run.finish();
+        assert_eq!(status, ExitStatus::Exited(0));
     }
 
     #[test]
@@ -1250,6 +1332,20 @@ mod host {
             })
         );
         assert_eq!(vsock_count(&denials), 0);
+        // While the sandbox still runs: once the caller has its ENOSYS, the
+        // record already says why (D4), not only after `wait`.
+        let run = start("vsock-wait", &[], seam);
+        assert_eq!(run.await_line("errno0"), enosys);
+        assert_eq!(
+            run.child.denials().failed(),
+            Some(&SupervisorFailure::Inconsistent {
+                nr: getpid,
+                action: libc::SECCOMP_RET_ALLOW,
+            }),
+            "the failure is recorded before the reply"
+        );
+        let (status, _, _) = run.finish();
+        assert_eq!(status, ExitStatus::Exited(0));
     }
 
     #[test]
