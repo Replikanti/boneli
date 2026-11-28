@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "909fb540",
    "pr": 145,
-   "note": "",
-   "updated_at": "2026-11-27T23:52:23+00:00",
+   "note": "PR 1 #145 merged (25238a6, ADR-043 proposed); PR 2 next: FFI, supervisor, host tests, ADR accepted",
+   "updated_at": "2026-11-28T01:03:13+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1765,14 +1765,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T17:22:07+00:00",
-   "issue": 131,
-   "from": "pr-review",
-   "to": "done",
-   "by": "aac94746",
-   "note": null
-  },
-  {
    "at": "2026-11-25T17:31:14+00:00",
    "issue": 55,
    "from": "implementing",
@@ -2163,6 +2155,14 @@
    "to": "pr-review",
    "by": "9c692a2a",
    "note": null
+  },
+  {
+   "at": "2026-11-28T01:03:13+00:00",
+   "issue": 45,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "909fb540",
+   "note": "PR 1 #145 merged (25238a6, ADR-043 proposed); PR 2 next: FFI, supervisor, host tests, ADR accepted"
   }
  ],
  "open": [
@@ -2190,7 +2190,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T00:56:23+00:00",
+ "updated_at": "2026-11-28T01:03:13+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
