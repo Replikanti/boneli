@@ -842,18 +842,33 @@ fn runner_buffers_next_to_named_mappings_are_released() {
     let fixture = Fixture::new("anchor-adjacent");
     let exe = File::open(std::env::current_exe().expect("current_exe")).expect("open the binary");
     for below in ["shared page", "file mapping"] {
-        // SAFETY: an anonymous private mapping with no address hint.
-        let buf = unsafe {
+        // One reservation for the page and the buffer above it, so no other
+        // thread's mapping can land in between; both are then mapped into
+        // it at fixed addresses.
+        // SAFETY: an anonymous private reservation with no address hint.
+        let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                LEN,
-                libc::PROT_READ | libc::PROT_WRITE,
+                LEN + 4096,
+                libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
         };
-        assert_ne!(buf, libc::MAP_FAILED);
+        assert_ne!(base, libc::MAP_FAILED);
+        // SAFETY: the buffer replaces the reservation above its first page.
+        let buf = unsafe {
+            libc::mmap(
+                (base as usize + 4096) as *mut libc::c_void,
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(buf as usize, base as usize + 4096);
         // SAFETY: buf is LEN writable bytes, used only here.
         let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), LEN) };
         for i in (0..LEN).step_by(4096) {
@@ -869,23 +884,10 @@ fn runner_buffers_next_to_named_mappings_are_released() {
         } else {
             (libc::MAP_PRIVATE, exe.as_raw_fd(), libc::PROT_READ)
         };
-        // SAFETY: one page right below the buffer, refused if anything is
-        // mapped there.
-        let page = unsafe {
-            libc::mmap(
-                (buf as usize - 4096) as *mut libc::c_void,
-                4096,
-                prot,
-                flags | libc::MAP_FIXED_NOREPLACE,
-                fd,
-                0,
-            )
-        };
-        assert_eq!(
-            page as usize,
-            buf as usize - 4096,
-            "{below} right below the buffer"
-        );
+        // SAFETY: the page replaces the reservation's first page, right
+        // below the buffer.
+        let page = unsafe { libc::mmap(base, 4096, prot, flags | libc::MAP_FIXED, fd, 0) };
+        assert_eq!(page, base, "{below} right below the buffer");
         let cg = cgroup::sandbox("anchor-adjacent");
         let anchor = pod(&fixture, &cg, "adjacent", Vec::new());
         // The runner is done with the secret: it zeroes and unmaps both.
@@ -943,6 +945,24 @@ extern "C" fn main_anchor() {
     // environment block on the main thread's stack, or null.
     let env = unsafe { libc::getenv(c"BONELI_SYS_MAIN_SECRET".as_ptr()) } as usize;
     let stale = stale_secret();
+    // Review run 2: the marker in stale frames right under this one, in
+    // this frame, in the main thread's thread-local, and live in the frame
+    // of another runner thread, which exists before the pod as the
+    // keeper threads of earlier cgroups do.
+    stale_markers();
+    let mut live = [0u8; 64];
+    live[..24].copy_from_slice(&marker());
+    std::hint::black_box(&mut live);
+    MARKED.with(|c| c.set(marker()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let neighbour = std::thread::spawn(move || {
+        let mut held = [0u8; 64];
+        held[..24].copy_from_slice(&marker());
+        std::hint::black_box(&mut held);
+        let _ = rx.recv();
+        held.fill(0);
+        std::hint::black_box(&mut held);
+    });
     let fixture = Fixture::new("anchor-main");
     let cg = cgroup::sandbox("anchor-main");
     let anchor = pod(&fixture, &cg, "main", Vec::new());
@@ -953,6 +973,10 @@ extern "C" fn main_anchor() {
     let mut rest = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut rest);
     drop(anchor);
+    let _ = tx.send(());
+    let _ = neighbour.join();
+    live.fill(0);
+    std::hint::black_box(&mut live);
     let code = i32::from(cg.destroy().is_err());
     let _ = out.flush();
     // SAFETY: _exit ends the process before libtest's main runs.
@@ -1002,10 +1026,22 @@ fn main_thread_anchor_keeps_no_runner_stack() {
     let in_env = holds(&anchor, env, SECRET);
     let in_stale = holds(&anchor, stale, SECRET);
     let kib = anonymous_kib(&anchor);
+    // Review run 2: no copy of the marker anywhere in the anchor, while the
+    // runner holds it in a stale and a live frame, a thread-local and a
+    // neighbour thread's frame (the control).
+    let markers = marker_hits(&anchor);
+    let in_runner = marker_hits(&runner_pid).len();
     report(&format!(
         "main_thread_anchor_keeps_no_runner_stack: env {in_env:?}, stale frame {in_stale:?}, \
-         anchor Anonymous {kib} kB"
+         {} marker copies in the anchor and {in_runner} in the runner, anchor Anonymous {kib} kB",
+        markers.len()
     ));
+    assert!(in_runner > 1, "the runner holds the markers");
+    assert_eq!(
+        markers,
+        Vec::<usize>::new(),
+        "the anchor holds a runner marker"
+    );
     drop(runner.stdin.take());
     let status = runner.wait().expect("reap the runner");
     assert!(status.success(), "the runner's teardown: {status:?}");
@@ -1018,5 +1054,125 @@ fn main_thread_anchor_keeps_no_runner_stack() {
         in_stale,
         (false, false),
         "the anchor keeps a stale runner frame"
+    );
+}
+
+/// A token-shaped marker, XOR-masked so that the binary's read-only data
+/// never holds it in clear: only memory a test wrote it to does.
+const MARKER_MASKED: [u8; 24] = {
+    let clear = *b"anchor-r2-runner-tok-81c";
+    let mut out = [0u8; 24];
+    let mut i = 0;
+    while i < 24 {
+        out[i] = clear[i] ^ 0xa5;
+        i += 1;
+    }
+    out
+};
+
+/// The marker in clear.
+#[inline(never)]
+fn marker() -> [u8; 24] {
+    let mut out = std::hint::black_box(MARKER_MASKED);
+    for b in &mut out {
+        *b ^= 0xa5;
+    }
+    out
+}
+
+/// Every address in `pid`'s readable memory where the marker starts.
+fn marker_hits(pid: &str) -> Vec<usize> {
+    use std::io::{Seek, SeekFrom};
+    let want = marker();
+    let mut mem = File::open(format!("/proc/{pid}/mem")).expect("open mem");
+    let mut hits = Vec::new();
+    for (s, e) in ranges_of(pid) {
+        if s >= 0xffff_ffff_ff60_0000 {
+            continue;
+        }
+        let mut data = vec![0u8; e - s];
+        for (k, page) in data.chunks_mut(4096).enumerate() {
+            let read = mem
+                .seek(SeekFrom::Start((s + k * 4096) as u64))
+                .and_then(|_| mem.read_exact(page));
+            if read.is_err() {
+                page.fill(0);
+            }
+        }
+        for (i, w) in data.windows(want.len()).enumerate() {
+            if w == want {
+                hits.push(s + i);
+            }
+        }
+    }
+    hits
+}
+
+/// A deep frame filled with copies of the marker, returned from: stale
+/// data right under the frame that creates the anchor.
+#[inline(never)]
+fn stale_markers() -> usize {
+    let mut frame = [0u8; 256 << 10];
+    let clear = marker();
+    for chunk in frame.chunks_mut(32) {
+        chunk[..24].copy_from_slice(&clear);
+    }
+    std::hint::black_box(&mut frame);
+    frame.as_ptr() as usize
+}
+
+std::thread_local! {
+    /// A thread-local the tests put the marker in.
+    static MARKED: std::cell::Cell<[u8; 24]> = const { std::cell::Cell::new([0; 24]) };
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, cgroup v2 delegation"]
+fn worker_thread_anchor_keeps_no_runner_secret() {
+    // Review run 2: a pod created on a runner thread kept that thread's
+    // stack top through the TLS window (a live frame of the caller, the
+    // thread's own thread-locals) and the stale frames under the release.
+    let fixture = Fixture::new("anchor-worker");
+    let mut kept = Vec::new();
+    for case in ["live frame", "stale frame", "thread-local"] {
+        let fixture = &fixture;
+        let (hits, kib) = std::thread::scope(|s| {
+            s.spawn(move || {
+                let mut live = [0u8; 64];
+                match case {
+                    "live frame" => live[..24].copy_from_slice(&marker()),
+                    "stale frame" => {
+                        stale_markers();
+                    }
+                    _ => MARKED.with(|c| c.set(marker())),
+                }
+                std::hint::black_box(&mut live);
+                let cg = cgroup::sandbox("anchor-worker");
+                let anchor = pod(fixture, &cg, "worker", Vec::new());
+                let pid = anchor.pid().to_string();
+                let out = (marker_hits(&pid), anonymous_kib(&pid));
+                drop(anchor);
+                cg.destroy().expect("destroy the cgroup");
+                live.fill(0);
+                std::hint::black_box(&mut live);
+                MARKED.with(|c| c.set([0; 24]));
+                out
+            })
+            .join()
+            .expect("the runner thread")
+        });
+        report(&format!(
+            "worker_thread_anchor_keeps_no_runner_secret: {case}: {} copies in the anchor, \
+             Anonymous {kib} kB",
+            hits.len()
+        ));
+        if !hits.is_empty() {
+            kept.push((case, hits.len()));
+        }
+    }
+    assert_eq!(
+        kept,
+        [],
+        "cases whose marker the anchor holds, with the copies"
     );
 }

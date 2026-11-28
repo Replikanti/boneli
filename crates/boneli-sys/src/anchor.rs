@@ -286,6 +286,153 @@ fn kill_and_reap(launched: &Launched) {
     let _ = reap(&launched.pidfd);
 }
 
+/// The stack an anchor is cloned on (ADR-042, D3): the clone continues on
+/// a copy of the calling thread's stack and holds its TLS, so an anchor is
+/// cloned from a thread of its own, on a stack mapped for it alone. The
+/// thread's start, the clone and the child's whole setup ran with every
+/// test passing on a 128 KiB stack and failed on 64 KiB (measured,
+/// unoptimized, review run 2 of part 3); 1 MiB is eight times what was
+/// enough, and the guard page under it turns an overflow into a SIGSEGV
+/// that fails the setup.
+const ANCHOR_STACK: usize = 1 << 20;
+
+/// [`launch`] on a new thread whose stack is a fresh anonymous mapping of
+/// [`ANCHOR_STACK`] with a guard page under it (`pthread_attr_setstack`),
+/// joined before this returns; the mapping is unmapped after the join. The
+/// clone copies that thread only: its stack holds nothing but this
+/// crate's own frames, and the C library puts the thread's TLS and control
+/// block at the top of a stack it was given, so they are fresh too. Not
+/// `std::thread`: glibc caches the stacks of exited threads and hands them
+/// out again with their contents (review of part 3, run 2).
+fn launch_on_fresh_stack(plan: &ChildPlan<'_>) -> Result<Launched> {
+    let page = crate::cgroup::page_size() as usize;
+    let len = ANCHOR_STACK + page;
+    // SAFETY: an anonymous private mapping takes no file and no address.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(Error::last("mmap(anchor stack)"));
+    }
+    let (result, joined) = launch_on(plan, base, page);
+    if joined {
+        // SAFETY: the mapping was made above with this length, and no
+        // thread runs on it any more; the anchor holds its own copy.
+        unsafe { libc::munmap(base, len) };
+    }
+    result
+}
+
+/// The thread part of [`launch_on_fresh_stack`], on the mapping at `base`,
+/// and whether no thread runs on the mapping any more. A thread that could
+/// not be joined, which only a bug causes, keeps its stack: it is never
+/// unmapped from under it.
+fn launch_on(
+    plan: &ChildPlan<'_>,
+    base: *mut libc::c_void,
+    page: usize,
+) -> (Result<Launched>, bool) {
+    match run_on(plan, base, page) {
+        Ok(result) => (result, true),
+        Err((e, joined)) => (Err(e), joined),
+    }
+}
+
+/// [`launch_on`]: `Ok` with the launch's result once the thread was
+/// joined, `Err` with the error and whether no thread runs on the stack.
+fn run_on(
+    plan: &ChildPlan<'_>,
+    base: *mut libc::c_void,
+    page: usize,
+) -> std::result::Result<Result<Launched>, (Error, bool)> {
+    // SAFETY: the first page of the mapping made by the caller.
+    if unsafe { libc::mprotect(base, page, libc::PROT_NONE) } < 0 {
+        return Err((Error::last("mprotect(anchor stack guard)"), true));
+    }
+    let mut result: Option<Result<Launched>> = None;
+    let mut job = || result = Some(launch(plan));
+    let mut job: &mut dyn FnMut() = &mut job;
+    extern "C" fn run(arg: *mut libc::c_void) -> *mut libc::c_void {
+        // SAFETY: arg is the `&mut dyn FnMut()` below, which outlives the
+        // thread: the caller joins it before the closure goes out of scope.
+        let job = unsafe { &mut *arg.cast::<&mut dyn FnMut()>() };
+        job();
+        std::ptr::null_mut()
+    }
+    // SAFETY: an all-zero pthread_attr_t is valid storage for init to fill.
+    let mut attr: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
+    // SAFETY: attr is valid storage.
+    let rc = unsafe { libc::pthread_attr_init(&mut attr) };
+    if rc != 0 {
+        return Err((
+            Error::Sys {
+                call: "pthread_attr_init",
+                errno: rc,
+            },
+            true,
+        ));
+    }
+    // SAFETY: the stack is the mapping above its guard page, ANCHOR_STACK
+    // bytes, page-aligned and used by nothing else.
+    let rc = unsafe {
+        libc::pthread_attr_setstack(
+            &mut attr,
+            base.cast::<u8>().wrapping_add(page).cast(),
+            ANCHOR_STACK,
+        )
+    };
+    // SAFETY: pthread_t is an integer on glibc and a pointer on musl; all
+    // zeroes is a valid placeholder for pthread_create to overwrite.
+    let mut thread: libc::pthread_t = unsafe { std::mem::zeroed() };
+    let rc = if rc == 0 {
+        // SAFETY: attr is initialized; run takes the job pointer, which
+        // stays valid until the join below.
+        unsafe {
+            libc::pthread_create(
+                &mut thread,
+                &attr,
+                run,
+                (&mut job as *mut &mut dyn FnMut()).cast(),
+            )
+        }
+    } else {
+        rc
+    };
+    // SAFETY: attr was initialized above and is destroyed once.
+    unsafe { libc::pthread_attr_destroy(&mut attr) };
+    if rc != 0 {
+        return Err((
+            Error::Sys {
+                call: "pthread_create(anchor stack)",
+                errno: rc,
+            },
+            true,
+        ));
+    }
+    // SAFETY: thread was created above and is joined once.
+    let rc = unsafe { libc::pthread_join(thread, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err((
+            Error::Sys {
+                call: "pthread_join(anchor stack)",
+                errno: rc,
+            },
+            false,
+        ));
+    }
+    Ok(result.unwrap_or(Err(Error::Sys {
+        call: "pthread_create(anchor stack)",
+        errno: libc::EIO,
+    })))
+}
+
 /// Whether `fd` became readable before `deadline`: a pidfd once its
 /// process exited, a pipe once it holds data or its writers are gone.
 fn ready_by(pidfd: &OwnedFd, deadline: Instant) -> Result<bool> {
@@ -529,7 +676,9 @@ impl Anchor {
     /// Creates a pod's first anchor in `spec.cgroup` (placed there at the
     /// clone) and in new user, mount, PID, network, IPC, UTS and cgroup
     /// namespaces with the single id mapping of `spec.ids`, as `spawn`
-    /// creates a sandbox, but with `lo` up before the root (ADR-042, D3).
+    /// creates a sandbox, but with `lo` up before the root (ADR-042, D3),
+    /// cloned from a thread of its own on a freshly mapped stack, joined
+    /// before this returns.
     /// Returns once the anchor waits at its fill point: the caller fills
     /// through [`Anchor::fill`] and resumes it, after which it finishes its
     /// mounts, pivots, sets its hostname, drops every privilege, loads the
@@ -575,7 +724,7 @@ impl Anchor {
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let launched = launch(&plan)?;
+        let launched = launch_on_fresh_stack(&plan)?;
         drop(write);
         drop(resume_child);
         let anchor = Anchor {
@@ -684,7 +833,7 @@ impl Anchor {
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let first = launch(&plan)?;
+        let first = launch_on_fresh_stack(&plan)?;
         drop(write);
         drop(resume_child);
         let mut reports = Reports {
@@ -1310,6 +1459,76 @@ mod tests {
         assert_eq!(children(), vec![pod.pid()], "join: both stages reaped");
         drop(pod);
         cg.destroy().expect("destroy the cgroup");
+    }
+
+    /// Every address in `pid`'s readable memory where the stale marker of
+    /// `Fault::Stale` starts.
+    fn stale_hits(pid: i32) -> Vec<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut want = crate::child::STALE_MARKER;
+        for b in &mut want {
+            *b ^= 0xa5;
+        }
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("maps");
+        let mut mem = std::fs::File::open(format!("/proc/{pid}/mem")).expect("mem");
+        let mut hits = Vec::new();
+        for line in maps.lines() {
+            let Some((s, e)) = line
+                .split_whitespace()
+                .next()
+                .and_then(|r| r.split_once('-'))
+            else {
+                continue;
+            };
+            let (s, e) = (
+                usize::from_str_radix(s, 16).expect("hex"),
+                usize::from_str_radix(e, 16).expect("hex"),
+            );
+            if s >= 0xffff_ffff_ff60_0000 {
+                continue;
+            }
+            let mut data = vec![0u8; e - s];
+            for (k, page) in data.chunks_mut(4096).enumerate() {
+                let read = mem
+                    .seek(SeekFrom::Start((s + k * 4096) as u64))
+                    .and_then(|_| mem.read_exact(page));
+                if read.is_err() {
+                    page.fill(0);
+                }
+            }
+            for (i, w) in data.windows(want.len()).enumerate() {
+                if w == want {
+                    hits.push(s + i);
+                }
+            }
+        }
+        hits
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn release_zeroes_stale_frames_under_it() {
+        // Review run 2: the stack the release keeps under its frame held
+        // what deeper calls had left there. The anchor leaves 40 KiB of
+        // markers in a frame it returned from right before the release, under
+        // the release's own frame and the margin it keeps.
+        let _host = host_lock();
+        let unit = UnitRoot::new();
+        let cg = sandbox_cgroup("stale");
+        let mut anchor = Anchor::create_inner(
+            &spec(&unit, &cg, Duration::from_secs(10)),
+            Fault::Stale(Step::Release),
+        )
+        .expect("create");
+        anchor
+            .fill()
+            .expect("at the fill point")
+            .resume()
+            .expect("resume");
+        let hits = stale_hits(anchor.pid());
+        drop(anchor);
+        cg.destroy().expect("destroy the cgroup");
+        assert_eq!(hits.len(), 0, "stale markers kept under the release frame");
     }
 
     #[test]

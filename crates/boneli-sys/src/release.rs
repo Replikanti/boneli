@@ -2,16 +2,19 @@
 //!
 //! An anchor is a clone of the runner that never execs, so without this it
 //! would keep a copy-on-write image of the runner's memory as it was at
-//! the clone (its heap, other threads' stacks, its own stack with the
-//! environment and stale frames, shared pages, buffers the runner has
-//! freed since) for the pod's life. Last in its setup, after the privilege
-//! drop and the filter, it unmaps every shared and every anonymous mapping
-//! but three kinds of ranges: each ELF object's `.bss`, as its `PT_LOAD`
-//! headers place it (read by the parent before the clone), the stack from
-//! [`STACK_BELOW`] under the release's frame up to its caller's frame, and
-//! [`TLS_AROUND`] around its thread's TLS (a thread-local of this crate and
-//! libc's `errno`). A mapping that holds part of a kept range loses the
-//! rest. Then it blocks every signal and waits forever.
+//! the clone (its heap, other threads' stacks, shared pages, buffers the
+//! runner has freed since) for the pod's life. It is cloned from a thread
+//! of its own on a freshly mapped stack (`anchor::launch_on_fresh_stack`),
+//! so its own stack and TLS hold nothing of the runner's. Last in its
+//! setup, after the privilege drop and the filter, it unmaps every shared
+//! and every anonymous mapping but three kinds of ranges: each ELF
+//! object's `.bss`, as its `PT_LOAD` headers place it (read by the parent
+//! before the clone), the stack from [`STACK_BELOW`] under the release's
+//! frame up to its caller's frame, and [`TLS_AROUND`] around its thread's
+//! TLS (a thread-local of this crate and libc's `errno`). Each window ends
+//! at the mapping that holds its address, and a mapping that holds part of
+//! a kept range loses the rest. The kept stack under the release's frame
+//! is zeroed. Then it blocks every signal and waits forever.
 //!
 //! The `.bss` stays because code the compiler emits on its own needs it:
 //! a stack buffer is zeroed by a call of libc's `memset`, which reads its
@@ -61,16 +64,20 @@ const KEPT: usize = BSS_MAX + 3;
 
 /// How far under the release's frame the stack stays: the frames it calls
 /// after the first `munmap` (the scan, libc's `syscall`) are a few KiB
-/// deep even unoptimized; 64 KiB leaves a margin of more than ten, and
-/// the stack grows down into the gap if it ever needed more.
+/// deep even unoptimized; 64 KiB leaves a margin of more than ten. The
+/// window ends at the bottom of the stack's mapping, and all of it but
+/// [`ZERO_MARGIN`] under the release's frame is zeroed before the first
+/// `munmap` (review of part 3, run 2).
 pub(crate) const STACK_BELOW: usize = 64 << 10;
 
 /// How far around each of its two addresses the TLS stays: glibc's static
 /// TLS block with its surplus and the thread control block, which holds
 /// the stack protector's canary on x86_64, are a few KiB; musl's are
 /// smaller. 64 KiB on each side covers them with a margin of more than
-/// ten, and bounds what of the mapping around them (a thread's stack top,
-/// the runner's heap) stays.
+/// ten. Each window ends at the mapping that holds its address, which for
+/// an anchor is the stack it was cloned on, where the C library put the
+/// thread's TLS (review of part 3, run 2: unclipped, it reached into the
+/// mapping next to the TLS, another runner thread's stack).
 pub(crate) const TLS_AROUND: usize = 64 << 10;
 
 std::thread_local! {
@@ -297,29 +304,23 @@ fn outside(
     }
 }
 
-/// Reads the maps file once from its start and collects up to [`RANGES`]
-/// ranges to unmap: the parts of each released mapping outside `kept`;
-/// returns how many.
-fn scan(
+/// Reads the maps file once from its start and calls `each` for every
+/// line; a line it cannot parse is item 2, a failed read item 1.
+fn each_line(
     maps: c_int,
-    kept: &[(usize, usize)],
     buf: &mut [u8; CHUNK],
-    out: &mut [(usize, usize); RANGES],
-) -> Result<usize, Failure> {
+    each: &mut dyn FnMut(&Line) -> Result<(), Failure>,
+) -> Result<(), Failure> {
     // SAFETY: lseek takes plain integers.
     if unsafe { libc::syscall(libc::SYS_lseek, maps, 0 as libc::off_t, libc::SEEK_SET) } < 0 {
         return Err((1, errno()));
     }
     let mut line = Line::new();
-    let mut count = 0;
-    let mut collect = |line: &Line, count: &mut usize| -> Result<(), Failure> {
+    let mut check = |line: &Line| -> Result<(), Failure> {
         if line.phase != 2 || line.field < 4 || line.start >= line.end {
             return Err((2, libc::EINVAL));
         }
-        if line.released() {
-            outside(line.start, line.end, kept, out, count);
-        }
-        Ok(())
+        each(line)
     };
     loop {
         // SAFETY: buf is valid writable memory of the length passed.
@@ -335,7 +336,7 @@ fn scan(
         }
         for &b in buf.get(..n as usize).unwrap_or(&[]) {
             if b == b'\n' {
-                collect(&line, &mut count)?;
+                check(&line)?;
                 line.reset();
             } else {
                 line.push(b).map_err(|e| (2, e))?;
@@ -343,13 +344,60 @@ fn scan(
         }
     }
     if line.any {
-        collect(&line, &mut count)?;
+        check(&line)?;
     }
+    Ok(())
+}
+
+/// Reads the maps file once and collects up to [`RANGES`] ranges to
+/// unmap: the parts of each released mapping outside `kept`; returns how
+/// many.
+fn scan(
+    maps: c_int,
+    kept: &[(usize, usize)],
+    buf: &mut [u8; CHUNK],
+    out: &mut [(usize, usize); RANGES],
+) -> Result<usize, Failure> {
+    let mut count = 0;
+    each_line(maps, buf, &mut |line| {
+        if line.released() {
+            outside(line.start, line.end, kept, out, &mut count);
+        }
+        Ok(())
+    })?;
     Ok(count)
 }
 
+/// The mapping that holds each of `addrs`; one that none holds is item 6,
+/// EFAULT.
+fn holding(
+    maps: c_int,
+    buf: &mut [u8; CHUNK],
+    addrs: [usize; 3],
+) -> Result<[(usize, usize); 3], Failure> {
+    let mut found = [(0usize, 0usize); 3];
+    each_line(maps, buf, &mut |line| {
+        for (i, &a) in addrs.iter().enumerate() {
+            if line.start <= a
+                && a < line.end
+                && let Some(slot) = found.get_mut(i)
+            {
+                *slot = (line.start, line.end);
+            }
+        }
+        Ok(())
+    })?;
+    if found.iter().any(|&(s, e)| s >= e) {
+        return Err((6, libc::EFAULT));
+    }
+    Ok(found)
+}
+
 /// The kept ranges in ascending order of their start: `.bss` ranges from
-/// the parent, the stack window and the two TLS windows (ADR-042, D3).
+/// the parent, the stack window and the two TLS windows (ADR-042, D3),
+/// each window clipped to `held_in`, the mapping that holds its address
+/// (stack, then the two TLS addresses): a window never reaches into a
+/// neighbouring mapping (review of part 3, run 2).
 /// Fails with E2BIG when there are more `.bss` ranges than [`BSS_MAX`],
 /// EINVAL for a page size that is no power of two or a caller frame not
 /// above this one.
@@ -359,6 +407,7 @@ fn kept_ranges(
     stack: usize,
     caller: usize,
     tls: [usize; 2],
+    held_in: [(usize, usize); 3],
     kept: &mut [(usize, usize); KEPT],
 ) -> Result<usize, Failure> {
     if page == 0 || !page.is_power_of_two() || caller <= stack {
@@ -370,7 +419,11 @@ fn kept_ranges(
     let down = |a: usize| a & !(page - 1);
     let up = |a: usize| a.saturating_add(page - 1) & !(page - 1);
     let mut n = 0;
+    let clip = |w: (usize, usize), m: (usize, usize)| (w.0.max(m.0), w.1.min(m.1));
     let mut add = |r: (usize, usize), n: &mut usize| {
+        if r.0 >= r.1 {
+            return;
+        }
         if let Some(slot) = kept.get_mut(*n) {
             *slot = r;
             *n += 1;
@@ -381,18 +434,25 @@ fn kept_ranges(
     }
     // From below the deepest frame the code after the first munmap needs
     // up to the caller's frame: nothing above it is ever returned to.
+    let [stack_in, tls_in @ ..] = held_in;
     add(
-        (
-            down(stack.saturating_sub(STACK_BELOW)),
-            up(caller.saturating_add(1)),
+        clip(
+            (
+                down(stack.saturating_sub(STACK_BELOW)),
+                up(caller.saturating_add(1)),
+            ),
+            stack_in,
         ),
         &mut n,
     );
-    for a in tls {
+    for (a, m) in tls.into_iter().zip(tls_in) {
         add(
-            (
-                down(a.saturating_sub(TLS_AROUND)),
-                up(a.saturating_add(TLS_AROUND)),
+            clip(
+                (
+                    down(a.saturating_sub(TLS_AROUND)),
+                    up(a.saturating_add(TLS_AROUND)),
+                ),
+                m,
             ),
             &mut n,
         );
@@ -421,6 +481,21 @@ fn kept_ranges(
     Ok(n)
 }
 
+/// How far under a frame one call deeper than the release's the zeroing
+/// of the kept stack stops: the calls the release makes while it zeroes
+/// and afterwards (the volatile write, the scan, libc's `syscall`) use a
+/// few hundred bytes there; 4 KiB keeps them clear of it with a margin of
+/// more than ten. What lies in that margin was written by the anchor's own
+/// setup, on a stack that held nothing of the runner's.
+const ZERO_MARGIN: usize = 4 << 10;
+
+/// The address of a local one call deeper than the caller's frame.
+#[inline(never)]
+fn frame_below() -> usize {
+    let local = 0u8;
+    std::hint::black_box(&local) as *const u8 as usize
+}
+
 /// Unmaps every shared and every anonymous mapping of the process, but
 /// the `.bss` of each ELF object (`bss`, page-aligned, from the parent),
 /// the stack from [`STACK_BELOW`] under this frame up to `caller`, the
@@ -445,16 +520,45 @@ pub(crate) fn release_and_hold(
     let tls = MARK.with(|m| m as *const u8 as usize);
     // SAFETY: __errno_location returns this thread's errno slot.
     let errno_at = unsafe { libc::__errno_location() } as usize;
+    // Both buffers are zeroed here, before anything is gone.
+    let mut buf = [0u8; CHUNK];
+    let mut ranges = [(0usize, 0usize); RANGES];
+    let held_in = match holding(maps, &mut buf, [stack, tls, errno_at]) {
+        Ok(h) => h,
+        Err(f) => die(report_fd, f),
+    };
     let mut kept = [(0usize, 0usize); KEPT];
-    let n = match kept_ranges(bss, page, stack, caller, [tls, errno_at], &mut kept) {
+    let n = match kept_ranges(
+        bss,
+        page,
+        stack,
+        caller,
+        [tls, errno_at],
+        held_in,
+        &mut kept,
+    ) {
         Ok(n) => n,
         Err(f) => die(report_fd, f),
     };
     let kept = kept.get(..n).unwrap_or(&[]);
 
-    // Both buffers are zeroed here, before anything is gone.
-    let mut buf = [0u8; CHUNK];
-    let mut ranges = [(0usize, 0usize); RANGES];
+    // The kept stack under this frame holds whatever deeper calls left
+    // there before (review of part 3, run 2): zeroed, from the bottom of
+    // the window up to ZERO_MARGIN under a frame one call deeper than this
+    // one, which no live frame reaches. The writes are volatile, so the
+    // compiler neither drops them nor makes them a call of `memset`.
+    let deeper = frame_below();
+    let top = deeper.saturating_sub(ZERO_MARGIN) & !7;
+    let mut at = (stack.saturating_sub(STACK_BELOW) & !(page.wrapping_sub(1)))
+        .max(held_in[0].0)
+        .saturating_add(7)
+        & !7;
+    while at < top {
+        // SAFETY: `at` lies in the mapping that holds this stack, under
+        // every live frame and above the window's bottom, aligned to 8.
+        unsafe { std::ptr::write_volatile(at as *mut u64, 0) };
+        at = at.saturating_add(8);
+    }
     let mut done = false;
     for _ in 0..PASSES {
         let n = match scan(maps, kept, &mut buf, &mut ranges) {
@@ -664,7 +768,13 @@ c000-14000 rw-p 00000000 00:00 0 [stack]\n\
         let stack = 0x7ffc_0010_0123;
         let caller = 0x7ffc_0010_4567;
         let tls = [0x7f10_0000_0800, 0x7f10_0000_0f00];
-        let n = kept_ranges(&bss, 4096, stack, caller, tls, &mut kept).expect("kept");
+        // Mappings wide enough that no window is clipped.
+        let wide = [
+            (0x7ffc_0000_0000, 0x7ffc_0100_0000),
+            (0x7f0f_0000_0000, 0x7f11_0000_0000),
+            (0x7f0f_0000_0000, 0x7f11_0000_0000),
+        ];
+        let n = kept_ranges(&bss, 4096, stack, caller, tls, wide, &mut kept).expect("kept");
         assert_eq!(
             kept[..n],
             [
@@ -677,19 +787,65 @@ c000-14000 rw-p 00000000 00:00 0 [stack]\n\
                 (0x7ffc_000f_0000, 0x7ffc_0010_5000),
             ]
         );
+        // Review of part 3, run 2: each window ends at the mapping that
+        // holds its address, and a TLS window at the top of a stack does
+        // not reach the mapping above or below.
+        let tight = [
+            (0x7ffc_000f_8000, 0x7ffc_0010_3000),
+            (0x7f10_0000_0000, 0x7f10_0000_2000),
+            (0x7f10_0000_0000, 0x7f10_0000_1000),
+        ];
+        let n = kept_ranges(&bss, 4096, stack, caller, tls, tight, &mut kept).expect("kept");
+        assert_eq!(
+            kept[..n],
+            [
+                (0x5000_0000, 0x5000_2000),
+                (0x7f00_0000_0000, 0x7f00_0000_8000),
+                (0x7f10_0000_0000, 0x7f10_0000_2000),
+                (0x7f10_0000_0000, 0x7f10_0000_1000),
+                (0x7ffc_000f_8000, 0x7ffc_0010_3000),
+            ]
+        );
         let many = [(0usize, 0usize); BSS_MAX + 1];
         assert_eq!(
-            kept_ranges(&many, 4096, stack, caller, tls, &mut kept),
+            kept_ranges(&many, 4096, stack, caller, tls, wide, &mut kept),
             Err((6, libc::E2BIG))
         );
         assert_eq!(
-            kept_ranges(&bss, 4096, caller, stack, tls, &mut kept),
+            kept_ranges(&bss, 4096, caller, stack, tls, wide, &mut kept),
             Err((6, libc::EINVAL)),
             "a caller frame below this one"
         );
         assert_eq!(
-            kept_ranges(&bss, 4095, stack, caller, tls, &mut kept),
+            kept_ranges(&bss, 4095, stack, caller, tls, wide, &mut kept),
             Err((6, libc::EINVAL))
+        );
+    }
+
+    #[test]
+    fn mappings_holding_addresses() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let text = b"1000-3000 rw-p 00000000 00:00 0 \n\
+3000-4000 rw-p 00000000 00:00 0 [stack]\n\
+8000-9000 r--p 00000000 00:1f 1 /lib/x.so\n";
+        // SAFETY: the name is NUL-terminated; memfd_create takes flags.
+        let fd = unsafe { libc::memfd_create(c"maps".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create");
+        // SAFETY: memfd_create returned a new descriptor nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        std::fs::File::from(fd.try_clone().expect("dup"))
+            .write_all(text)
+            .expect("write");
+        let mut buf = [0u8; CHUNK];
+        assert_eq!(
+            holding(fd.as_raw_fd(), &mut buf, [0x3800, 0x1000, 0x2fff]),
+            Ok([(0x3000, 0x4000), (0x1000, 0x3000), (0x1000, 0x3000)])
+        );
+        assert_eq!(
+            holding(fd.as_raw_fd(), &mut buf, [0x3800, 0x5000, 0x1000]),
+            Err((6, libc::EFAULT)),
+            "an address no mapping holds"
         );
     }
 }

@@ -527,6 +527,42 @@ pub(crate) enum Fault {
     TwoListeners,
     /// The listener message has no payload byte.
     EmptyListener,
+    /// At the step, the child fills a deep stack frame with copies of
+    /// [`STALE_MARKER`] and returns from it: stale data under the frame
+    /// that runs next, which the release must zero (ADR-042, D3).
+    Stale(Step),
+}
+
+/// The bytes [`Fault::Stale`] writes, XOR-masked with 0xa5 so that the
+/// binary's read-only data never holds them in clear.
+#[cfg(test)]
+pub(crate) const STALE_MARKER: [u8; 16] = {
+    let clear = *b"stale-anchor-81c";
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = clear[i] ^ 0xa5;
+        i += 1;
+    }
+    out
+};
+
+/// Fills the lowest 40 KiB of a 64 KiB frame under the caller's frame with
+/// the marker.
+#[cfg(test)]
+#[inline(never)]
+fn stale_frame() {
+    let mut frame = [0u8; 64 << 10];
+    let mut clear = std::hint::black_box(STALE_MARKER);
+    for b in &mut clear {
+        *b ^= 0xa5;
+    }
+    // The lowest 40 KiB only: the top 24 KiB is where the release's own
+    // frame and the margin it leaves unzeroed lie (ADR-042, D3).
+    for chunk in frame[..40 << 10].chunks_mut(32) {
+        chunk[..16].copy_from_slice(&clear);
+    }
+    std::hint::black_box(&mut frame);
 }
 
 /// Without tests there is nothing to inject.
@@ -546,6 +582,10 @@ pub(crate) fn inject(fault: Fault, step: Step) -> Result<(), Failure> {
         },
         Fault::Allocate(s) if s == step => {
             std::hint::black_box(Box::new(step));
+            Ok(())
+        }
+        Fault::Stale(s) if s == step => {
+            stale_frame();
             Ok(())
         }
         _ => Ok(()),

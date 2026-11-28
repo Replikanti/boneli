@@ -1155,9 +1155,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Fill::loopback`, `Fill::resume`), then pivots, drops every privilege,
   loads the plain seccomp program, keeps only its pins and unmaps every
   shared and anonymous mapping of the runner but a 64 KiB stack window
-  under its own frame, 64 KiB around its TLS and each ELF object's `.bss`
-  from its `PT_LOAD` headers (560 kB left of 263,304 kB measured; the
-  environment and stale frames of a main-thread runner go too). The
+  under its own frame (zeroed under it), 64 KiB around its TLS (each
+  window clipped to its mapping) and each ELF object's `.bss` from its
+  `PT_LOAD` headers. An anchor is cloned from a thread of its own on a
+  freshly mapped 1 MiB stack, so its stack and TLS hold nothing of the
+  runner's (568 kB left of 263,272 kB measured; no marker of a runner
+  frame, thread-local or neighbour thread survives). The
   setup report gains progress records and steps 31 to 36;
   `Mount::Tmpfs` gains `inodes`. Host tests on both CI legs, among them
   every step's failure report for the three new sequences,

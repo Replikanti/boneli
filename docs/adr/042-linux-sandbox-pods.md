@@ -435,6 +435,30 @@ after its last record: a holding anchor has exactly its pins open
 runner is killed, until `cgroup.kill` (`anchor_pins_outlive_the_runner`;
 #33 sweeps such pods after a crash).
 
+**A fresh stack for every anchor.** A clone without `CLONE_VM`
+continues on a copy of the calling thread's stack, with that thread's
+TLS. So `create` and `join` clone the anchor (or a later anchor's first
+stage) from a thread of their own, whose stack is an anonymous mapping
+made for it alone (`pthread_attr_setstack`, 1 MiB with a guard page
+under it). The thread is joined before the call returns, and the mapping
+is unmapped after the join. The C library puts the thread's TLS and
+control block at the top of a stack it is given (glibc; musl does the
+same where they fit and maps a fresh region of its own otherwise), so the
+anchor's stack and TLS hold nothing but this crate's frames. 1 MiB: every
+test passed with a 128 KiB stack and failed with 64 KiB (measured,
+unoptimized), so 1 MiB is eight times what was enough. Not `std::thread`:
+glibc keeps the stacks of exited threads in a cache and hands them to new
+threads with their contents. Execs need no such thread: `execve`
+replaces their memory. Review run 2 of part 3 showed why this is
+needed. An anchor created from a runner thread kept a live marker in the
+frame that called `create` and the thread's own thread-local, because
+the TLS window lay at the top of that thread's stack. On the main thread
+the window reached into the mapping next to rtld's TLS, the top of the
+crate's own `memcg-keeper` thread stack. Stale frames under the release
+were kept too (1,759 copies of a marker; 1,697 on the main thread)
+(`worker_thread_anchor_keeps_no_runner_secret`,
+`main_thread_anchor_keeps_no_runner_stack`).
+
 **The memory release.** An anchor never execs, so without a release it
 keeps a copy-on-write image of the runner's memory as it was at the
 clone, for the pod's life and past the runner's own exit: up to that
@@ -461,11 +485,22 @@ the rest:
   unoptimized, so 64 KiB is a margin of more than ten. The local's
   address escapes into the call, so the call cannot become a tail call
   that would put the caller's frame below the release's, and the release
-  refuses a caller address not above its own frame;
+  refuses a caller address not above its own frame. Before the first
+  `munmap` the release zeroes this window with volatile writes, from its
+  bottom up to 4 KiB under a frame one call deeper than its own
+  (`ZERO_MARGIN`; the calls it makes from there use a few hundred bytes,
+  so 4 KiB is a margin of more than ten). That keeps no stale frame of
+  earlier, deeper calls (`release_zeroes_stale_frames_under_it`: 1,280
+  copies of a marker survive without it);
 - 64 KiB around each of two thread-locals, one of the crate and libc's
   `errno`: glibc's static TLS block with its surplus and the thread
   control block, which holds the stack protector's canary on x86_64, are
   a few KiB, musl's smaller.
+
+Each window ends at the mapping that holds its address, which the
+release reads from its maps file before the first `munmap`. So a window
+never reaches into a neighbouring mapping, and a window whose address no
+mapping holds fails the setup.
 
 The `.bss` stays because code the compiler emits on its own needs it:
 the first release unmapped it and crashed with SIGSEGV in glibc's
@@ -502,11 +537,13 @@ fails the setup instead of looping. `anchor_releases_runner_memory`
 dirties 268,435,456 bytes of heap before `create` and requires each
 anchor's `Anonymous` in `smaps_rollup` below 64 MiB, a quarter of the
 buffer, so a release that keeps the heap fails four times over.
-Measured on the dev host: 560 kB for the first anchor and 564 kB for a
-later one, against 263,304 kB in the runner, and 588 kB for an anchor
-created on the main thread (656 and 660 kB before review run 1, when the
-thread's whole stack mapping stayed); with the release removed, the
-first anchor kept 263,448 kB.
+Measured on the dev host in two runs: 568 and 572 kB for the first
+anchor and 572 and 576 kB for a later one, against 263,272 and 263,380 kB
+in the runner, and 568 and 572 kB for an anchor created on the main
+thread (656 and 660 kB before review run 1, when the
+thread's whole stack mapping stayed; 560 and 564 kB after run 1, before
+the fresh stack); with the release removed, the first anchor kept
+263,448 kB.
 
 **The report protocol** (ADR-007, D4) becomes a stream of the same
 12-byte records, ended by EOF. A record with errno 0 is a progress
@@ -535,7 +572,9 @@ runs on the dev host: a first anchor from the clone to its hold, created
 and resumed with nothing to fill, 7.3 / 9.7 / 13.3 / 47.4 ms and
 4.0 / 5.6 / 10.9 / 16.0 ms; a later one 6.8 / 8.9 / 11.6 / 12.8 ms and
 3.3 / 5.1 / 6.9 / 7.5 ms; an exec from the clone to `execve`
-3.5 / 5.3 / 7.7 / 9.6 ms and 2.5 / 3.2 / 4.4 / 4.8 ms. Part 5 fixes the
+3.5 / 5.3 / 7.7 / 9.6 ms and 2.5 / 3.2 / 4.4 / 4.8 ms. After review run 2,
+with the clone on a thread of its own: 5.8 / 7.2 / 8.9 / 13.6 ms,
+7.2 / 13.6 / 20.2 / 21.7 ms and 4.4 / 7.2 / 10.9 / 11.8 ms. Part 5 fixes the
 bounds from these and the CI legs' numbers by D8's rule.
 
 Rejected:
@@ -549,11 +588,12 @@ Rejected:
   `memcmp`): Rust gives no way to forbid them, and the measured crash
   was one. **Finding the `.bss` by adjacency** (an unnamed mapping that
   starts where a named one ends), the first version: it kept runner
-  buffers (review run 1). **Running the anchor on a small stack of its
-  own** instead of the stack window: a stack switch needs assembly per
-  architecture, and a fork-like `clone3` cannot continue a Rust frame
-  on another stack; the window bounds what stays to the release's own
-  frame plus 64 KiB.
+  buffers (review run 1). **Switching the anchor to a stack of its own
+  inside the clone**: a stack switch needs assembly per architecture,
+  and a fork-like `clone3` cannot continue a Rust frame on another
+  stack; a thread on its own stack gets the same without either.
+  **A `std::thread` for the clone**: glibc reuses the stacks of exited
+  threads with their contents (review run 2).
 - **One stage with `setns` into the anchor's PID namespace**: the
   program would then share the anchor's namespace, see it and be no PID
   1, and its orphans would go to the anchor, which never reaps.
@@ -599,7 +639,9 @@ states for unswept kernels.
   nothing else in its process may reap with `waitpid(-1)` or ignore
   `SIGCHLD`. Each anchor costs one task of the pod's `processes` and,
   after the release, a window of its stack, a window around its TLS and
-  the runner's `.bss` in resident memory (564 kB measured).
+  the runner's `.bss` in resident memory (572 kB measured). Creating
+  an anchor starts a thread of the runner for the clone, on a 1 MiB
+  mapping that is unmapped once the thread has been joined.
 - An anchor's root needs a procfs and a minimal `/dev` (D3); the adapter
   of part 5 always mounts both, and `Anchor::create` refuses a root
   without them before the clone.
