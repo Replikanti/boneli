@@ -160,7 +160,7 @@ impl Drop for Child {
     }
 }
 
-fn send_kill(pidfd: &OwnedFd) -> Result<()> {
+pub(crate) fn send_kill(pidfd: &OwnedFd) -> Result<()> {
     // SAFETY: pidfd_send_signal takes a descriptor, a signal number, a null
     // siginfo (the kernel fills a default one) and no flags.
     let rc = unsafe {
@@ -180,7 +180,7 @@ fn send_kill(pidfd: &OwnedFd) -> Result<()> {
 }
 
 /// Blocks until the child behind `pidfd` exits and reaps it.
-fn reap(pidfd: &OwnedFd) -> Result<ExitStatus> {
+pub(crate) fn reap(pidfd: &OwnedFd) -> Result<ExitStatus> {
     loop {
         // SAFETY: an all-zero siginfo_t is valid storage for waitid to fill.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -223,7 +223,7 @@ pub(crate) fn check_caller(ruid: u32, euid: u32, rgid: u32, egid: u32) -> Result
     Ok(())
 }
 
-fn caller() -> (u32, u32, u32, u32) {
+pub(crate) fn caller() -> (u32, u32, u32, u32) {
     // SAFETY: the four id getters have no preconditions and cannot fail.
     let ruid = unsafe { libc::getuid() };
     // SAFETY: as above.
@@ -235,13 +235,13 @@ fn caller() -> (u32, u32, u32, u32) {
     (ruid, euid, rgid, egid)
 }
 
-fn c_string(bytes: Vec<u8>, what: &'static str) -> Result<CString> {
+pub(crate) fn c_string(bytes: Vec<u8>, what: &'static str) -> Result<CString> {
     CString::new(bytes).map_err(|_| Error::Nul(what))
 }
 
 /// A descriptor duplicated to >= 3 with close-on-exec, so the child's dup2
 /// onto 0-2 never overwrites another source.
-fn dup_high(fd: &OwnedFd) -> Result<OwnedFd> {
+pub(crate) fn dup_high(fd: &OwnedFd) -> Result<OwnedFd> {
     // SAFETY: F_DUPFD_CLOEXEC takes a descriptor and a minimum number.
     let new = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if new < 0 {
@@ -253,34 +253,39 @@ fn dup_high(fd: &OwnedFd) -> Result<OwnedFd> {
 
 /// Every byte the child needs, prepared before the clone.
 struct Prepared {
-    program: CString,
-    _strings: Vec<CString>,
-    argv: Vec<*const c_char>,
-    envp: Vec<*const c_char>,
+    command: Command,
     uid_line: Vec<u8>,
     gid_line: Vec<u8>,
     stdio: [OwnedFd; 3],
     ops: Vec<Op>,
-    /// The notifying program the child installs (ADR-043, D2).
-    filter: Program,
-    /// The plain program the supervisor answers from (ADR-043, D2).
-    plain: Program,
-    /// The supervisor's buffers in the kernel's sizes (ADR-043, D7).
-    buffers: Buffers,
-    cap_last_cap: u32,
+    filters: Filters,
 }
 
-fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
-    if spec.setup_timeout.is_zero() {
-        return Err(Error::ZeroSetupTimeout);
-    }
-    if !spec.program.is_absolute() {
-        return Err(Error::RelativeProgram(spec.program.clone()));
-    }
-    let (ruid, euid, rgid, egid) = caller();
-    check_caller(ruid, euid, rgid, egid)?;
-    let ops = mount::plan(&spec.root)?;
-    mount::refuse_hugetlbfs(&spec.root)?;
+/// The program, `argv` and `envp` as C strings and pointer arrays
+/// (ADR-007, D4).
+pub(crate) struct Command {
+    pub program: CString,
+    _strings: Vec<CString>,
+    /// NULL-terminated.
+    pub argv: Vec<*const c_char>,
+    /// NULL-terminated.
+    pub envp: Vec<*const c_char>,
+}
+
+/// The seccomp programs, the supervisor's buffers and `cap_last_cap`.
+pub(crate) struct Filters {
+    /// The notifying program an exec installs (ADR-043, D2).
+    pub filter: Program,
+    /// The plain program the supervisor answers from (ADR-043, D2), which
+    /// an anchor installs (ADR-042, D3).
+    pub plain: Program,
+    /// The supervisor's buffers in the kernel's sizes (ADR-043, D7).
+    pub buffers: Buffers,
+    pub cap_last_cap: u32,
+}
+
+/// Assembles both programs and reads what the privilege drop needs.
+pub(crate) fn prepare_filters() -> Result<Filters> {
     let policy = Policy::sandbox();
     let filter = policy
         .notifying_program(Arch::NATIVE)
@@ -294,18 +299,60 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
     })?;
     let buffers = Buffers::for_sizes(sizes)?;
     let cap_last_cap = privileges::cap_last_cap()?;
+    Ok(Filters {
+        filter,
+        plain,
+        buffers,
+        cap_last_cap,
+    })
+}
 
-    let program = c_string(
-        spec.program.as_os_str().as_bytes().to_vec(),
-        "the program path",
-    )?;
-    let mut strings = Vec::with_capacity(spec.args.len() + spec.env.len() + 1);
+fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
+    if spec.setup_timeout.is_zero() {
+        return Err(Error::ZeroSetupTimeout);
+    }
+    if !spec.program.is_absolute() {
+        return Err(Error::RelativeProgram(spec.program.clone()));
+    }
+    let (ruid, euid, rgid, egid) = caller();
+    check_caller(ruid, euid, rgid, egid)?;
+    let ops = mount::plan(&spec.root)?;
+    mount::refuse_hugetlbfs(&spec.root)?;
+    let filters = prepare_filters()?;
+    let command = prepare_command(&spec.program, &spec.args, &spec.env)?;
+    let stdio = [
+        dup_high(&spec.stdio.stdin)?,
+        dup_high(&spec.stdio.stdout)?,
+        dup_high(&spec.stdio.stderr)?,
+    ];
+    Ok(Prepared {
+        command,
+        uid_line: spec.ids.uid_map_line(euid).into_bytes(),
+        gid_line: spec.ids.gid_map_line(egid).into_bytes(),
+        stdio,
+        ops,
+        filters,
+    })
+}
+
+/// The command's strings: NUL bytes, empty environment names and names
+/// with `=` are refused, and a relative program (no `PATH` search).
+pub(crate) fn prepare_command(
+    program: &std::path::Path,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+) -> Result<Command> {
+    if !program.is_absolute() {
+        return Err(Error::RelativeProgram(program.to_path_buf()));
+    }
+    let program = c_string(program.as_os_str().as_bytes().to_vec(), "the program path")?;
+    let mut strings = Vec::with_capacity(args.len() + env.len() + 1);
     strings.push(program.clone());
-    for arg in &spec.args {
+    for arg in args {
         strings.push(c_string(arg.clone().into_vec(), "an argument")?);
     }
     let argc = strings.len();
-    for (name, value) in &spec.env {
+    for (name, value) in env {
         let name = name.as_bytes();
         if name.is_empty() || name.contains(&b'=') {
             return Err(Error::InvalidEnvName(OsString::from_vec(name.to_vec())));
@@ -321,25 +368,11 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
     argv.push(std::ptr::null());
     let mut envp: Vec<*const c_char> = strings[argc..].iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
-
-    let stdio = [
-        dup_high(&spec.stdio.stdin)?,
-        dup_high(&spec.stdio.stdout)?,
-        dup_high(&spec.stdio.stderr)?,
-    ];
-    Ok(Prepared {
+    Ok(Command {
         program,
         _strings: strings,
         argv,
         envp,
-        uid_line: spec.ids.uid_map_line(euid).into_bytes(),
-        gid_line: spec.ids.gid_map_line(egid).into_bytes(),
-        stdio,
-        ops,
-        filter,
-        plain,
-        buffers,
-        cap_last_cap,
     })
 }
 
@@ -515,8 +548,54 @@ pub(crate) fn clone_flags(action: &Action<'_>) -> (u64, u64) {
             SPAWN_NAMESPACES | libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP,
             exec.cgroup as u64,
         ),
+        // A pod's first anchor gets the namespaces of a sandbox, like
+        // spawn's child (ADR-042, D3).
+        Action::Anchor(anchor) => (
+            SPAWN_NAMESPACES | libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP,
+            anchor.cgroup as u64,
+        ),
+        // The first stage of a join: into the pod's cgroup, no namespace;
+        // it joins the anchor's itself.
+        Action::Join(join) => (
+            libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP,
+            join.cgroup as u64,
+        ),
     }
 }
+
+/// The flags of the first stage's `clone3` of the second (ADR-042, D3):
+/// `CLONE_PARENT`, so the second stage is the runner's child, whose exit
+/// the runner reaps through a pidfd of its own, and `CLONE_PARENT_SETTID`,
+/// so the kernel writes its pid into the runner's shared page during the
+/// clone and the runner can reap it even when the first stage dies before
+/// its record. It inherits the pod's cgroup and the namespaces the first
+/// stage joined and created.
+pub(crate) fn inner_clone_flags() -> u64 {
+    (libc::CLONE_PARENT | libc::CLONE_PARENT_SETTID) as u64
+}
+
+/// The namespaces of its anchor an exec joins: user, network, cgroup,
+/// mount, UTS and IPC, everything but the PID namespace (ADR-042, D3).
+pub(crate) const EXEC_SETNS: c_int = libc::CLONE_NEWUSER
+    | libc::CLONE_NEWNET
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWNS
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWIPC;
+
+/// The namespaces an exec creates: a copy of its anchor's mount namespace
+/// and a PID namespace whose PID 1 it is, so it never sees the anchor.
+pub(crate) const EXEC_UNSHARE: c_int = libc::CLONE_NEWNS | libc::CLONE_NEWPID;
+
+/// The namespaces of the pod's first anchor a later anchor joins: user,
+/// network (the pod's loopback) and cgroup.
+pub(crate) const ANCHOR_SETNS: c_int =
+    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWCGROUP;
+
+/// The namespaces a later anchor creates: its container's mount, PID, UTS
+/// and IPC namespaces.
+pub(crate) const ANCHOR_UNSHARE: c_int =
+    libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
 
 /// Clones a child that runs `plan`: in the namespaces of
 /// [`SPAWN_NAMESPACES`] for `spawn`, in a new user namespace only for the
@@ -699,15 +778,16 @@ pub(crate) fn spawn_with(
         gid_line: &prepared.gid_line,
         uid_line: &prepared.uid_line,
         action: Action::Exec(ExecPlan {
-            program: &prepared.program,
-            argv: &prepared.argv,
-            envp: &prepared.envp,
+            program: &prepared.command.program,
+            argv: &prepared.command.argv,
+            envp: &prepared.command.envp,
             stdio,
             ops: &prepared.ops,
             cgroup: spec.cgroup.dir_fd(),
             privileges: PrivilegeDrop {
-                cap_last_cap: prepared.cap_last_cap,
-                filter: prepared.filter.instructions(),
+                cap_last_cap: prepared.filters.cap_last_cap,
+                filter: prepared.filters.filter.instructions(),
+                listener: true,
             },
             listener_sock: sock_child.as_raw_fd(),
         }),
@@ -721,7 +801,18 @@ pub(crate) fn spawn_with(
     drop(write);
     drop(sock_child);
     await_report(&read, &launched, spec.setup_timeout)?;
-    // The program runs now; from here every failure kills and reaps it.
+    supervise(launched, sock, prepared.filters, started, seam)
+}
+
+/// After the exec: receives the listener the child sent (ADR-043, D3) and
+/// starts the supervisor; every failure kills and reaps the program.
+pub(crate) fn supervise(
+    launched: Launched,
+    sock: OwnedFd,
+    filters: Filters,
+    started: Instant,
+    seam: Seam,
+) -> Result<Child> {
     let fail = |e: Error| {
         let _ = send_kill(&launched.pidfd);
         let _ = reap(&launched.pidfd);
@@ -734,8 +825,8 @@ pub(crate) fn spawn_with(
     drop(sock);
     let plan = SupervisorPlan {
         arch: Arch::NATIVE,
-        plain: prepared.plain,
-        buffers: prepared.buffers,
+        plain: filters.plain,
+        buffers: filters.buffers,
         started,
     };
     let supervisor = match Supervisor::start(listener, plan, seam) {
@@ -857,6 +948,7 @@ mod tests {
             privileges: PrivilegeDrop {
                 cap_last_cap: 40,
                 filter: &[],
+                listener: true,
             },
             listener_sock: 6,
         });
@@ -884,6 +976,99 @@ mod tests {
         assert_eq!(
             clone_flags(&Action::ProbeFilter),
             (libc::CLONE_PIDFD as u64, 0)
+        );
+
+        // A pod's first anchor: the namespaces of a sandbox, into the pod's
+        // cgroup (ADR-042, D3).
+        let anchor = || crate::child::AnchorPlan {
+            ops: &[],
+            fill_at: 0,
+            resume: 7,
+            keep: &[],
+            hold: &[],
+            privileges: PrivilegeDrop {
+                cap_last_cap: 40,
+                filter: &[],
+                listener: false,
+            },
+            maps: c"/proc/self/maps",
+            cgroup: 43,
+        };
+        assert_eq!(
+            clone_flags(&Action::Anchor(anchor())),
+            (
+                (libc::CLONE_NEWUSER
+                    | libc::CLONE_NEWNS
+                    | libc::CLONE_NEWPID
+                    | libc::CLONE_NEWNET
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUTS
+                    | libc::CLONE_PIDFD) as u64
+                    | ffi::CLONE_INTO_CGROUP,
+                43
+            )
+        );
+        // A join's first stage: no namespace at all, into the pod's cgroup;
+        // what follows it does not change its clone.
+        for then in [
+            crate::child::Joined::Anchor(anchor()),
+            crate::child::Joined::Exec(ExecPlan {
+                program,
+                argv: &argv,
+                envp: &envp,
+                stdio: [3, 4, 5],
+                ops: &[],
+                cgroup: 44,
+                privileges: PrivilegeDrop {
+                    cap_last_cap: 40,
+                    filter: &[],
+                    listener: true,
+                },
+                listener_sock: 6,
+            }),
+        ] {
+            let join = Action::Join(crate::child::JoinPlan {
+                anchor: 8,
+                setns: EXEC_SETNS,
+                unshare: EXEC_UNSHARE,
+                keep: &[],
+                cgroup: 44,
+                tid: 0,
+                then,
+            });
+            assert_eq!(
+                clone_flags(&join),
+                (libc::CLONE_PIDFD as u64 | ffi::CLONE_INTO_CGROUP, 44)
+            );
+        }
+        // Its clone of the second stage: the runner's child, whose pid the
+        // kernel writes into the runner's page, nothing else.
+        assert_eq!(
+            inner_clone_flags(),
+            (libc::CLONE_PARENT | libc::CLONE_PARENT_SETTID) as u64
+        );
+        // What a join enters and creates: an exec everything of its
+        // anchor's but the PID namespace, then a PID namespace and a copy
+        // of the mount namespace; a later anchor the pod's user, network
+        // and cgroup namespaces, then a container of its own.
+        assert_eq!(
+            EXEC_SETNS,
+            libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNET
+                | libc::CLONE_NEWCGROUP
+                | libc::CLONE_NEWNS
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_NEWIPC
+        );
+        assert_eq!(EXEC_SETNS & libc::CLONE_NEWPID, 0);
+        assert_eq!(EXEC_UNSHARE, libc::CLONE_NEWNS | libc::CLONE_NEWPID);
+        assert_eq!(
+            ANCHOR_SETNS,
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWCGROUP
+        );
+        assert_eq!(
+            ANCHOR_UNSHARE,
+            libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC
         );
     }
 

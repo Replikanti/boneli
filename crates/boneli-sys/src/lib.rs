@@ -13,12 +13,17 @@
 //! capability, with `no_new_privs` and under a seccomp-bpf policy it
 //! assembles itself ([`seccomp`], ADR-007 D2 and D9), whose denied calls a
 //! supervisor thread of the caller answers and records
-//! ([`Child::denials`], ADR-043). It applies Landlock
-//! to the calling process ([`Ruleset`], ADR-007 D10), and it checks that a
-//! host has what the runtime needs ([`Features::probe`], ADR-007 D3). For
-//! tests that need a process whose main thread has exited while another
-//! thread runs, it can end the main thread alone ([`exit_main_thread`],
-//! ADR-015 D10). The kernel is reached through `libc` only.
+//! ([`Child::denials`], ADR-043). For a pod of several containers it
+//! creates an [`Anchor`] per container, a no-exec clone that owns the
+//! container's namespaces and holds its layer pins, and runs commands
+//! joined to it, each PID 1 of a PID namespace of its own (ADR-042, D3);
+//! the runner is the parent of all of them, so nothing else in its
+//! process may reap with `waitpid(-1)` or ignore `SIGCHLD`. It applies
+//! Landlock to the calling process ([`Ruleset`], ADR-007 D10), and it
+//! checks that a host has what the runtime needs ([`Features::probe`],
+//! ADR-007 D3). For tests that need a process whose main thread has
+//! exited while another thread runs, it can end the main thread alone
+//! ([`exit_main_thread`], ADR-015 D10). The kernel is reached through `libc` only.
 //!
 //! The crate builds only for little-endian Linux on x86_64 and aarch64:
 //! the syscall tables and the `seccomp_data` layout the runtime relies on
@@ -31,6 +36,7 @@
 )))]
 compile_error!("boneli-sys supports only little-endian Linux on x86_64 and aarch64 (ADR-007)");
 
+mod anchor;
 mod cgroup;
 mod child;
 mod error;
@@ -42,11 +48,13 @@ mod landlock;
 mod layer;
 mod mount;
 mod privileges;
+mod release;
 mod report;
 pub mod seccomp;
 mod spawn;
 mod thread;
 
+pub use anchor::{Anchor, AnchorSpec, ExecSpec, Families, Fill};
 pub use cgroup::{
     Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
 };

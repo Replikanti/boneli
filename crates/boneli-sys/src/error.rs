@@ -21,6 +21,21 @@ pub enum ProtocolError {
     /// The child's listener message was not exactly one byte with one
     /// `SCM_RIGHTS` descriptor (ADR-043, D3).
     Listener(ListenerError),
+    /// A progress record of this step came where another record was
+    /// expected (ADR-042, D3).
+    Unexpected(Step),
+    /// The report ended before the progress record of this step
+    /// (ADR-042, D3).
+    Ended(Step),
+    /// A progress record of this step carried a value it cannot hold: a
+    /// pid of 0, loopback families outside the two known bits
+    /// (ADR-042, D3).
+    Value {
+        /// The step.
+        step: Step,
+        /// The value.
+        value: u32,
+    },
 }
 
 /// What was wrong with the listener message the child sends before
@@ -65,6 +80,15 @@ impl fmt::Display for ProtocolError {
             ProtocolError::Length(n) => write!(f, "{n} bytes instead of 0 or 12"),
             ProtocolError::UnknownStep(code) => write!(f, "unknown step code {code}"),
             ProtocolError::Listener(e) => write!(f, "{e}"),
+            ProtocolError::Unexpected(step) => {
+                write!(f, "an unexpected progress record of step {}", step.name())
+            }
+            ProtocolError::Ended(step) => {
+                write!(f, "the report ended before step {}", step.name())
+            }
+            ProtocolError::Value { step, value } => {
+                write!(f, "step {} reported the value {value}", step.name())
+            }
         }
     }
 }
@@ -257,6 +281,11 @@ pub enum Error {
         /// The right.
         right: &'static str,
     },
+    /// An anchor (ADR-042, D3) was asked for something its spec or state
+    /// does not allow: a fill point past the last mount, a root without a
+    /// procfs or a minimal `/dev`, other ids than its pod's, an exec
+    /// before the fill point was resumed, or an anchor that has failed.
+    InvalidAnchor(&'static str),
 }
 
 impl Error {
@@ -433,6 +462,7 @@ impl fmt::Display for Error {
                 f,
                 "a Landlock rule allows {right}, which its ruleset does not handle"
             ),
+            Error::InvalidAnchor(why) => write!(f, "invalid anchor request: {why}"),
         }
     }
 }

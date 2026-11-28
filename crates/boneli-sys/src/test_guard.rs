@@ -158,6 +158,7 @@ impl UnitRoot {
             Mount::Tmpfs {
                 target: InsidePath::new("/tmp").expect("path"),
                 size_bytes: 1 << 20,
+                inodes: None,
                 mode: 0o1777,
             },
             Mount::Overlay {

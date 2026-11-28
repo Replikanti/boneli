@@ -125,6 +125,9 @@ pub fn main(action: &str) -> ! {
         "features-no-keyrings" => features_no_keyrings(),
         "caps-gated" => super::gated::caps_gated(),
         "nosys" => super::gated::nosys(),
+        "tcp-serve" => tcp_serve(),
+        "tcp-connect" => tcp_connect(),
+        "anchor-runner" => crate::anchors::runner(),
         _ => fail(1, &format!("unknown action {action}")),
     }
     exit(0)
@@ -2224,4 +2227,33 @@ fn notify_cost() {
     put("done", "1");
     let mut rest = Vec::new();
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut rest);
+}
+
+/// Listens on `127.0.0.1:<BONELI_PROBE_PORT>`, prints `listening=1`, and
+/// writes one byte to the first connection (ADR-042, D3: a pod's loopback).
+fn tcp_serve() {
+    use std::io::Write as _;
+    let port = input("BONELI_PROBE_PORT");
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .unwrap_or_else(|e| fail(3, &format!("bind 127.0.0.1:{port}: {e}")));
+    put("listening", "1");
+    let (mut conn, _) = listener
+        .accept()
+        .unwrap_or_else(|e| fail(3, &format!("accept: {e}")));
+    put("write_errno", &code(&conn.write_all(b"k")));
+}
+
+/// Connects to `127.0.0.1:<BONELI_PROBE_PORT>` and reads one byte.
+fn tcp_connect() {
+    use std::io::Read;
+    let port = input("BONELI_PROBE_PORT");
+    match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+        Ok(mut s) => {
+            put("connect_errno", "0");
+            let mut b = [0u8; 1];
+            put("read_errno", &code(&s.read_exact(&mut b)));
+            put("byte", &(b[0] as char).to_string());
+        }
+        Err(e) => put("connect_errno", &e.raw_os_error().unwrap_or(-1).to_string()),
+    }
 }

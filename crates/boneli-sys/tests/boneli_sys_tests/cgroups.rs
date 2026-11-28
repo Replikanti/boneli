@@ -1830,6 +1830,7 @@ fn failed_spawn_leaves_no_cgroup_process() {
     missing_target.push(Mount::Tmpfs {
         target: inside("/no-such-dir"),
         size_bytes: 1 << 20,
+        inodes: None,
         mode: 0o755,
     });
     let cases: [(Root, &str, Step, i32); 2] = [

@@ -1,6 +1,6 @@
 //! The cloned child's setup sequence (ADR-007, D4).
 //!
-//! The child is a copy of one thread of a possibly multithreaded process,
+//! The child is a copy o one thread of a possibly multithreaded process,
 //! made by a raw `clone3`. Another thread may have held a lock (the
 //! allocator's, stdio's, the environment's) at that moment, and the copy
 //! of that lock stays held forever. So this code allocates nothing, takes
@@ -38,7 +38,11 @@ pub enum Step {
     Signals = 5,
     /// `dup2` of the three stdio descriptors; the item is the target fd.
     Stdio = 6,
-    /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`.
+    /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`. For an anchor and a
+    /// join (ADR-042, D3): item 0 every descriptor but the kept ones closed
+    /// right after the clone, item 1 an anchor's close down to its pins
+    /// and report pipe before the release, item 2 a later anchor's close
+    /// down to its own after the inner clone.
     CloseFds = 7,
     /// `execve` of the program.
     Exec = 8,
@@ -106,11 +110,38 @@ pub enum Step {
     /// listener socket and closed (ADR-043, D3); item 0 the send, item 1
     /// the close.
     Listener = 30,
+    /// `setns` of the first stage of a join (an exec, or a pod's later
+    /// anchor) into an anchor's namespaces through its pidfd (ADR-042,
+    /// D3).
+    Setns = 31,
+    /// `unshare` of the first stage's new namespaces: mount and PID for an
+    /// exec, also UTS and IPC for an anchor (ADR-042, D3).
+    Unshare = 32,
+    /// The first stage's `clone3(CLONE_PARENT | CLONE_PARENT_SETTID)` of
+    /// the second stage, item 0; item 1 the gate pipe that holds the second
+    /// stage back until the first has recorded its pid, item 2 the second
+    /// stage's wait at it, item 3 its unmap of the runner's pid page
+    /// (ADR-042, D3).
+    InnerClone = 33,
+    /// The first stage's record of the second stage's pid: a progress
+    /// record, the pid as the item and errno 0. As a failure the item is
+    /// that pid too, so the runner reaps the second stage, its child.
+    Forked = 34,
+    /// An anchor's fill point: a progress record with the loopback
+    /// families as the item (bit 0 IPv4, bit 1 IPv6). As a failure, item 0
+    /// the families' probe, item 1 the record's write, item 2 the wait for
+    /// the runner's resume (ECANCELED when the runner went away).
+    Fill = 35,
+    /// An anchor's memory release and hold: a progress record once only
+    /// its pins are left. As a failure, item 0 opening its maps, 1 reading
+    /// them, 2 a line it cannot parse, 3 an `munmap`, 4 a release that has
+    /// not ended within its passes, 5 the signal mask (ADR-042, D3).
+    Release = 36,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 30] = [
+    pub const ALL: [Step; 36] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -141,6 +172,12 @@ impl Step {
         Step::NoNewPrivs,
         Step::SessionKeyring,
         Step::Listener,
+        Step::Setns,
+        Step::Unshare,
+        Step::InnerClone,
+        Step::Forked,
+        Step::Fill,
+        Step::Release,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
@@ -177,6 +214,108 @@ impl Step {
         Step::Listener,
         Step::Exec,
     ];
+
+    /// The steps of a pod's first anchor in order (`Anchor::create`,
+    /// ADR-042 D3): the descriptors it does not keep closed first, `lo`
+    /// before the root, the fill point between the mounts, and the memory
+    /// release last. [`Step::MountTarget`] precedes each mount.
+    pub const ANCHOR_SEQUENCE: [Step; 28] = [
+        Step::CloseFds,
+        Step::SetGroups,
+        Step::GidMap,
+        Step::UidMap,
+        Step::SessionKeyring,
+        Step::OomScoreAdj,
+        Step::CgroupNs,
+        Step::Loopback,
+        Step::MakePrivate,
+        Step::Root,
+        Step::MountTarget,
+        Step::Bind,
+        Step::Tmpfs,
+        Step::Overlay,
+        Step::Proc,
+        Step::Dev,
+        Step::Cgroup2,
+        Step::Fill,
+        Step::Pivot,
+        Step::Hostname,
+        Step::Setsid,
+        Step::Securebits,
+        Step::CapBoundingSet,
+        Step::CapAmbient,
+        Step::Capset,
+        Step::NoNewPrivs,
+        Step::Seccomp,
+        Step::Release,
+    ];
+
+    /// The steps of a pod's later anchor in order (`Anchor::join`): the
+    /// first stage up to [`Step::Forked`], then the second, the anchor.
+    pub const JOIN_SEQUENCE: [Step; 27] = [
+        Step::CloseFds,
+        Step::OomScoreAdj,
+        Step::Setns,
+        Step::SessionKeyring,
+        Step::Unshare,
+        Step::InnerClone,
+        Step::Forked,
+        Step::MakePrivate,
+        Step::Root,
+        Step::MountTarget,
+        Step::Bind,
+        Step::Tmpfs,
+        Step::Overlay,
+        Step::Proc,
+        Step::Dev,
+        Step::Cgroup2,
+        Step::Fill,
+        Step::Pivot,
+        Step::Hostname,
+        Step::Setsid,
+        Step::Securebits,
+        Step::CapBoundingSet,
+        Step::CapAmbient,
+        Step::Capset,
+        Step::NoNewPrivs,
+        Step::Seccomp,
+        Step::Release,
+    ];
+
+    /// The steps of an exec joined to an anchor in order (`Anchor::exec`):
+    /// the first stage up to [`Step::Forked`], then the second, which
+    /// mounts its own procfs ([`Step::Root`] opens its current root,
+    /// [`Step::Pivot`] item 4 is the working directory) and goes on as
+    /// `spawn` does from `setsid` to `execve`.
+    pub const EXEC_SEQUENCE: [Step; 21] = [
+        Step::CloseFds,
+        Step::OomScoreAdj,
+        Step::Setns,
+        Step::SessionKeyring,
+        Step::Unshare,
+        Step::InnerClone,
+        Step::Forked,
+        Step::Root,
+        Step::MountTarget,
+        Step::Proc,
+        Step::Setsid,
+        Step::Signals,
+        Step::Stdio,
+        Step::Securebits,
+        Step::CapBoundingSet,
+        Step::CapAmbient,
+        Step::Capset,
+        Step::NoNewPrivs,
+        Step::Seccomp,
+        Step::Listener,
+        Step::Exec,
+    ];
+
+    /// Whether a record of this step with errno 0 is a progress record
+    /// (ADR-042, D3); every other record is a failure.
+    pub(crate) fn is_progress(self) -> bool {
+        matches!(self, Step::Forked | Step::Fill | Step::Release)
+    }
 
     /// The step's code in the setup report.
     pub fn code(self) -> u32 {
@@ -221,6 +360,12 @@ impl Step {
             Step::NoNewPrivs => "no-new-privs",
             Step::SessionKeyring => "session-keyring",
             Step::Listener => "listener",
+            Step::Setns => "setns",
+            Step::Unshare => "unshare",
+            Step::InnerClone => "inner-clone",
+            Step::Forked => "forked",
+            Step::Fill => "fill",
+            Step::Release => "release",
         }
     }
 }
@@ -248,10 +393,79 @@ pub(crate) struct ExecPlan<'a> {
     pub listener_sock: c_int,
 }
 
+/// What an anchor runs (ADR-042, D3). Every pointer refers to memory the
+/// parent prepared before the clone.
+pub(crate) struct AnchorPlan<'a> {
+    /// `lo` (the first anchor only), the root, the mounts, `pivot_root`
+    /// and the hostname ([`crate::mount::plan_anchor`]).
+    pub ops: &'a [Op],
+    /// The index in `ops` of the first operation after the fill point.
+    pub fill_at: usize,
+    /// The anchor's end of the resume socket: the runner sends one byte once the
+    /// fill is done, and closes it without one when it gives up.
+    pub resume: c_int,
+    /// Every descriptor the anchor keeps from the clone, ascending: the
+    /// report pipe, the resume socket and the pins.
+    pub keep: &'a [c_int],
+    /// The descriptors left once it pivoted, ascending: the report pipe
+    /// and the pins.
+    pub hold: &'a [c_int],
+    /// The privilege drop and the plain seccomp program, without a
+    /// listener: the anchor runs no workload, so it has no denied call to
+    /// record (ADR-042, D3; ADR-043).
+    pub privileges: PrivilegeDrop<'a>,
+    /// `<procfs>/self/maps` in its own root, which the release reads.
+    pub maps: &'a CStr,
+    /// The pod's cgroup, for `CLONE_INTO_CGROUP`.
+    pub cgroup: c_int,
+}
+
+/// The first stage of a join (ADR-042, D3): a process cloned into the
+/// pod's cgroup with no new namespace that joins an anchor's namespaces,
+/// creates its own and clones the second stage as the runner's child.
+pub(crate) struct JoinPlan<'a> {
+    /// The anchor's pidfd.
+    pub anchor: c_int,
+    /// The `CLONE_NEW*` flags of the anchor's namespaces it joins.
+    pub setns: c_int,
+    /// The namespaces it creates.
+    pub unshare: c_int,
+    /// Every descriptor both stages keep, ascending.
+    pub keep: &'a [c_int],
+    /// The pod's cgroup, for `CLONE_INTO_CGROUP`.
+    pub cgroup: c_int,
+    /// The start of a page the runner mapped shared before the clone: the
+    /// inner clone writes the second stage's pid there itself
+    /// (`CLONE_PARENT_SETTID`), so the runner learns it even when the first
+    /// stage dies before its record (ADR-042, D3).
+    pub tid: usize,
+    /// What the second stage runs.
+    pub then: Joined<'a>,
+}
+
+/// The length of the runner's pid page ([`JoinPlan::tid`]): one page on
+/// every supported kernel (4 KiB, or more on arm64, which `mmap` rounds up
+/// to).
+pub(crate) const TID_PAGE: usize = 4096;
+
+/// The second stage of a join.
+pub(crate) enum Joined<'a> {
+    /// A pod's later anchor.
+    Anchor(AnchorPlan<'a>),
+    /// A program in an anchor's container: its procfs, then the sequence
+    /// of `spawn` from `setsid` to `execve`.
+    Exec(ExecPlan<'a>),
+}
+
 /// What the child does.
 pub(crate) enum Action<'a> {
     /// The id maps and the whole sequence, then `execve` (`spawn`).
     Exec(ExecPlan<'a>),
+    /// A pod's first anchor: the id maps, its sequence up to the fill
+    /// point, the rest, the release and the hold (`Anchor::create`).
+    Anchor(AnchorPlan<'a>),
+    /// The first stage of a join (`Anchor::join`, `Anchor::exec`).
+    Join(JoinPlan<'a>),
     /// The host probe's user-namespace child: the id maps, then exit 0.
     ProbeIds,
     /// The host probe's filter child, cloned without a new user namespace
@@ -281,6 +495,9 @@ pub(crate) struct Failure {
 /// Every failure, injected ones included, is built here, so a change that
 /// made failures allocate shows in the fault tests.
 pub(crate) fn fail(step: Step, index: u32, errno: i32) -> Failure {
+    // A record with errno 0 is a progress record for some steps (ADR-042,
+    // D3), so a failure never carries 0, even if the call left none.
+    let errno = if errno == 0 { libc::EIO } else { errno };
     Failure { step, index, errno }
 }
 
@@ -592,27 +809,29 @@ fn raise_oom_score_adj() -> Result<(), Failure> {
     result
 }
 
-fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
-    let fault = plan.fault;
-
-    if let Action::ProbeFilter = plan.action {
-        allow_all_filter()?;
-        // After the install, so that a test hanging here sees the filter.
-        inject(fault, Step::Seccomp)?;
-        return Ok(());
+/// Closes every descriptor but `keep` (ascending, each >= 0) with
+/// `close_range` over the gaps.
+pub(crate) fn close_except(keep: &[c_int]) -> Result<(), i32> {
+    let mut from: u32 = 0;
+    for &fd in keep {
+        let fd = fd as u32;
+        if fd > from {
+            close_gap(from, fd - 1)?;
+        }
+        // fd is at most i32::MAX, so this cannot overflow.
+        from = fd + 1;
     }
+    close_gap(from, u32::MAX)
+}
 
-    inject(fault, Step::SetGroups)?;
-    write_proc(c"/proc/self/setgroups", b"deny", Step::SetGroups)?;
-    inject(fault, Step::GidMap)?;
-    write_proc(c"/proc/self/gid_map", plan.gid_line, Step::GidMap)?;
-    inject(fault, Step::UidMap)?;
-    write_proc(c"/proc/self/uid_map", plan.uid_line, Step::UidMap)?;
+fn close_gap(first: u32, last: u32) -> Result<(), i32> {
+    // SAFETY: close_range takes plain integers.
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) };
+    if rc < 0 { Err(errno()) } else { Ok(()) }
+}
 
-    let Action::Exec(exec) = &plan.action else {
-        return Ok(());
-    };
-
+/// The step [`Step::SessionKeyring`].
+fn join_session_keyring(fault: Fault) -> Result<(), Failure> {
     // A new session keyring of its own: the clone copied the runner's, and
     // the keyring is not namespaced. Before the mounts: joined after them,
     // the runner's keyring kept a reference for as long as the sandbox ran
@@ -632,10 +851,11 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     if rc < 0 {
         return Err(fail(Step::SessionKeyring, 0, errno()));
     }
+    Ok(())
+}
 
-    inject(fault, Step::OomScoreAdj)?;
-    raise_oom_score_adj()?;
-
+/// The step [`Step::CgroupNs`].
+fn new_cgroup_namespace(fault: Fault) -> Result<(), Failure> {
     // The cgroup namespace is created here, by a process CLONE_INTO_CGROUP
     // has already placed in its sandbox cgroup, so it is rooted there.
     // copy_process creates clone3's namespaces before the move, but since
@@ -649,10 +869,353 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } < 0 {
         return Err(fail(Step::CgroupNs, 0, errno()));
     }
+    Ok(())
+}
 
-    // The root, the mounts, pivot_root, the hostname and lo.
-    mount::run(exec.ops, fault)?;
+fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
+    let fault = plan.fault;
 
+    match &plan.action {
+        Action::ProbeFilter => {
+            allow_all_filter()?;
+            // After the install, so that a test hanging here sees the filter.
+            inject(fault, Step::Seccomp)?;
+            return Ok(());
+        }
+        Action::Join(join) => return join_steps(join, plan.report_fd, fault),
+        Action::Anchor(anchor) => {
+            // First of all: the clone copied every descriptor of the runner,
+            // among them the report pipes of other setups, whose end this
+            // copy would hold open while the anchor waits at its fill point
+            // (ADR-042, D3).
+            inject(fault, Step::CloseFds)?;
+            close_except(anchor.keep).map_err(|e| fail(Step::CloseFds, 0, e))?;
+        }
+        Action::Exec(_) | Action::ProbeIds => {}
+    }
+
+    inject(fault, Step::SetGroups)?;
+    write_proc(c"/proc/self/setgroups", b"deny", Step::SetGroups)?;
+    inject(fault, Step::GidMap)?;
+    write_proc(c"/proc/self/gid_map", plan.gid_line, Step::GidMap)?;
+    inject(fault, Step::UidMap)?;
+    write_proc(c"/proc/self/uid_map", plan.uid_line, Step::UidMap)?;
+
+    match &plan.action {
+        Action::Exec(exec) => {
+            join_session_keyring(fault)?;
+            inject(fault, Step::OomScoreAdj)?;
+            raise_oom_score_adj()?;
+            new_cgroup_namespace(fault)?;
+            // The root, the mounts, pivot_root, the hostname and lo.
+            mount::run(exec.ops, fault)?;
+            exec_tail(exec, fault)
+        }
+        Action::Anchor(anchor) => {
+            join_session_keyring(fault)?;
+            inject(fault, Step::OomScoreAdj)?;
+            raise_oom_score_adj()?;
+            new_cgroup_namespace(fault)?;
+            anchor_steps(anchor, plan.report_fd, fault)
+        }
+        Action::ProbeIds | Action::ProbeFilter | Action::Join(_) => Ok(()),
+    }
+}
+
+/// Writes one progress record (ADR-042, D3) in one `write`: a pipe write
+/// of 12 bytes is atomic (below `PIPE_BUF`), so records of two writers
+/// never interleave.
+fn write_progress(fd: c_int, step: Step, value: u32) -> Result<(), i32> {
+    let bytes = report::encode(step, value, 0);
+    loop {
+        // SAFETY: bytes is valid for its length; fd is the report pipe.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if n < 0 {
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return Err(errno());
+        }
+        return if n as usize == bytes.len() {
+            Ok(())
+        } else {
+            Err(libc::EIO)
+        };
+    }
+}
+
+/// Reads one byte from `fd`, retrying on EINTR: `Ok(true)` for the byte,
+/// `Ok(false)` at EOF.
+fn read_byte(fd: c_int) -> Result<bool, i32> {
+    let mut b = [0u8; 1];
+    loop {
+        // SAFETY: b is valid writable memory of the length passed.
+        let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return Err(errno());
+        }
+        return Ok(n == 1);
+    }
+}
+
+/// Whether `lo` holds the loopback address of `family`: a datagram socket
+/// binds to it (ADR-042, D3; `/etc/hosts` lists `::1` only where it does).
+/// A family the kernel lacks (EAFNOSUPPORT) or an address `lo` lacks
+/// (EADDRNOTAVAIL) is absent; any other error fails the step.
+fn has_loopback(family: c_int) -> Result<bool, i32> {
+    // SAFETY: socket takes plain integers.
+    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return match errno() {
+            libc::EAFNOSUPPORT => Ok(false),
+            e => Err(e),
+        };
+    }
+    let rc = if family == libc::AF_INET {
+        // SAFETY: an all-zero sockaddr_in is valid; the fields are set below.
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        // SAFETY: addr is a valid sockaddr_in of the length passed.
+        unsafe {
+            libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+    } else {
+        // SAFETY: an all-zero sockaddr_in6 is valid; the fields are set below.
+        let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        addr.sin6_addr.s6_addr[15] = 1;
+        // SAFETY: addr is a valid sockaddr_in6 of the length passed.
+        unsafe {
+            libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_in6).cast(),
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    };
+    let result = if rc == 0 {
+        Ok(true)
+    } else {
+        match errno() {
+            libc::EADDRNOTAVAIL => Ok(false),
+            e => Err(e),
+        }
+    };
+    // SAFETY: fd was opened above and is closed once.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// The loopback families of the anchor's network namespace as the bits of
+/// [`FAMILY_IPV4`] and [`FAMILY_IPV6`].
+fn loopback_families() -> Result<u32, i32> {
+    let mut bits = 0;
+    if has_loopback(libc::AF_INET)? {
+        bits |= FAMILY_IPV4;
+    }
+    if has_loopback(libc::AF_INET6)? {
+        bits |= FAMILY_IPV6;
+    }
+    Ok(bits)
+}
+
+/// The bit of a fill point's progress record for `127.0.0.1` on `lo`.
+pub(crate) const FAMILY_IPV4: u32 = 1;
+/// The bit for `::1` on `lo`.
+pub(crate) const FAMILY_IPV6: u32 = 2;
+
+/// An anchor's sequence after its namespaces exist (ADR-042, D3): the
+/// operations up to the fill point, the fill point, the rest, `setsid`,
+/// the privilege drop and the plain filter, every descriptor but the
+/// report pipe and the pins closed, then the memory release and the hold,
+/// which never return. Returns only a failure.
+fn anchor_steps(a: &AnchorPlan<'_>, report_fd: c_int, fault: Fault) -> Result<(), Failure> {
+    let (Some(before), Some(after)) = (a.ops.get(..a.fill_at), a.ops.get(a.fill_at..)) else {
+        return Err(fail(Step::Fill, 0, libc::EINVAL));
+    };
+    let mut state = mount::State::new();
+    mount::run_with(before, fault, &mut state)?;
+
+    // The fill point: the runner copies the workspace in and creates the
+    // mount points of the binds after it, through /proc/<pid>/root, while
+    // this process waits for one byte on the resume socket.
+    inject(fault, Step::Fill)?;
+    let families = loopback_families().map_err(|e| fail(Step::Fill, 0, e))?;
+    write_progress(report_fd, Step::Fill, families).map_err(|e| fail(Step::Fill, 1, e))?;
+    match read_byte(a.resume) {
+        Ok(true) => {}
+        Ok(false) => return Err(fail(Step::Fill, 2, libc::ECANCELED)),
+        Err(e) => return Err(fail(Step::Fill, 2, e)),
+    }
+    // The binds onto the new mount points, pivot_root and the hostname.
+    mount::run_with(after, fault, &mut state)?;
+    // The root's descriptor; closed now, before the close below counts.
+    drop(state);
+
+    inject(fault, Step::Setsid)?;
+    // SAFETY: setsid has no memory arguments.
+    if unsafe { libc::setsid() } < 0 {
+        return Err(fail(Step::Setsid, 0, errno()));
+    }
+
+    // The plain program, no listener: nothing is notified (ADR-043).
+    privileges::drop_all(&a.privileges, fault)?;
+
+    // The resume socket goes here, and anything opened since the first
+    // close; the pins stay, and the report pipe until the hold.
+    close_except(a.hold).map_err(|e| fail(Step::CloseFds, 1, e))?;
+
+    inject(fault, Step::Release)?;
+    // SAFETY: maps is NUL-terminated and prepared before the clone.
+    let maps = unsafe { libc::open(a.maps.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if maps < 0 {
+        return Err(fail(Step::Release, 0, errno()));
+    }
+    crate::release::release_and_hold(maps, report_fd)
+}
+
+/// The first stage of a join (ADR-042, D3), then, in the second stage it
+/// clones, the anchor or the exec. Returns in the first stage once it
+/// recorded the second's pid; in the second only a failure.
+fn join_steps(join: &JoinPlan<'_>, report_fd: c_int, fault: Fault) -> Result<(), Failure> {
+    // As for an anchor: the runner's other report pipes must not stay
+    // open here (ADR-042, D3).
+    inject(fault, Step::CloseFds)?;
+    close_except(join.keep).map_err(|e| fail(Step::CloseFds, 0, e))?;
+
+    // Before setns: once in the anchor's mount namespace, /proc is the
+    // anchor's, which does not show this process.
+    inject(fault, Step::OomScoreAdj)?;
+    raise_oom_score_adj()?;
+
+    inject(fault, Step::Setns)?;
+    // SAFETY: setns takes a descriptor and plain flags.
+    if unsafe { libc::setns(join.anchor, join.setns) } < 0 {
+        return Err(fail(Step::Setns, 0, errno()));
+    }
+    // setns leaves the process dumpable: commit_creds counts the runner's
+    // credentials, the owner's in the parent namespace, as a superset of
+    // the ones setns gives, so the runner still opens /proc/<pid>/root of
+    // a later anchor at its fill point (measured; the tests' later anchors
+    // are filled through it).
+
+    join_session_keyring(fault)?;
+
+    inject(fault, Step::Unshare)?;
+    // SAFETY: unshare takes plain flags.
+    if unsafe { libc::unshare(join.unshare) } < 0 {
+        return Err(fail(Step::Unshare, 0, errno()));
+    }
+
+    inject(fault, Step::InnerClone)?;
+    // The gate: the second stage waits for EOF or a byte on it, so its own
+    // records never come before the first stage's pid record.
+    let mut gate = [0 as c_int; 2];
+    // SAFETY: gate is a valid array of two ints for pipe2 to fill.
+    if unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(fail(Step::InnerClone, 1, errno()));
+    }
+    let args = libc::clone_args {
+        flags: crate::spawn::inner_clone_flags(),
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: join.tid as u64,
+        // clone3 refuses CLONE_PARENT with an exit signal; the child gets
+        // this process's, SIGCHLD to the runner.
+        exit_signal: 0,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
+    };
+    // SAFETY: args is a valid clone_args of the size passed. Without
+    // CLONE_VM the child gets a copy of this address space, as with fork,
+    // and continues on its copy of this stack.
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const libc::clone_args,
+            std::mem::size_of::<libc::clone_args>(),
+        )
+    };
+    if pid < 0 {
+        let e = errno();
+        // SAFETY: both ends were opened above and are closed once.
+        unsafe { libc::close(gate[0]) };
+        // SAFETY: as above.
+        unsafe { libc::close(gate[1]) };
+        return Err(fail(Step::InnerClone, 0, e));
+    }
+    if pid == 0 {
+        // The second stage: PID 1 of the new PID namespace.
+        // SAFETY: the write end is this copy's; closed once.
+        unsafe { libc::close(gate[1]) };
+        let opened = read_byte(gate[0]);
+        // SAFETY: the read end is this copy's; closed once.
+        unsafe { libc::close(gate[0]) };
+        match opened {
+            Ok(true) => {}
+            Ok(false) => {
+                // The first stage died or failed after the clone; the
+                // runner knows this pid from its page and reaps this
+                // process. No second report.
+                // SAFETY: _exit ends this process without running anything
+                // of the runner's copy.
+                unsafe { libc::_exit(127) }
+            }
+            Err(e) => return Err(fail(Step::InnerClone, 2, e)),
+        }
+        // The runner's pid page goes; an anchor would keep it for good.
+        // SAFETY: the page was mapped by the runner before the clone, at
+        // this address and of this length; nothing here refers to it.
+        if unsafe { libc::munmap(join.tid as *mut libc::c_void, TID_PAGE) } < 0 {
+            return Err(fail(Step::InnerClone, 3, errno()));
+        }
+        return match &join.then {
+            Joined::Anchor(a) => {
+                // Down to the anchor's own: the first stage kept the pidfd
+                // of the anchor it joined, which this one does not need.
+                close_except(a.keep).map_err(|e| fail(Step::CloseFds, 2, e))?;
+                anchor_steps(a, report_fd, fault)
+            }
+            Joined::Exec(exec) => {
+                mount::run(exec.ops, fault)?;
+                exec_tail(exec, fault)
+            }
+        };
+    }
+    // The first stage. Every failure from here carries the pid, so the
+    // runner reaps the second stage, which the closed gate ends.
+    let pid = pid as u32;
+    // SAFETY: the read end is this copy's; closed once.
+    unsafe { libc::close(gate[0]) };
+    inject(fault, Step::Forked).map_err(|f| fail(f.step, pid, f.errno))?;
+    write_progress(report_fd, Step::Forked, pid).map_err(|e| fail(Step::Forked, pid, e))?;
+    let one = [1u8; 1];
+    // SAFETY: one is valid for its length; gate[1] is the write end.
+    let n = unsafe { libc::write(gate[1], one.as_ptr().cast(), 1) };
+    if n != 1 {
+        return Err(fail(Step::Forked, pid, errno()));
+    }
+    // SAFETY: the write end is this copy's; closed once.
+    unsafe { libc::close(gate[1]) };
+    Ok(())
+}
+
+/// The sequence of `spawn` from `setsid` to `execve` (ADR-007, D4), also
+/// the second stage of an exec joined to an anchor. Returns only a
+/// failure.
+fn exec_tail(exec: &ExecPlan<'_>, fault: Fault) -> Result<(), Failure> {
     inject(fault, Step::Setsid)?;
     // SAFETY: setsid has no memory arguments.
     if unsafe { libc::setsid() } < 0 {
@@ -806,9 +1369,35 @@ mod tests {
         // The sequence holds every step once; the filter comes after
         // no_new_privs (ADR-007, D9), and only the listener hand-off sits
         // between it and the exec (ADR-043, D3); the listener's code is 30.
+        // spawn's sequence holds the 30 steps it had before the anchors;
+        // each sequence holds a step at most once, and together they hold
+        // every step (ADR-042, D3).
         let mut seen: Vec<Step> = Step::SEQUENCE.to_vec();
         seen.sort_by_key(|s| s.code());
-        assert_eq!(seen, Step::ALL);
+        assert_eq!(seen, Step::ALL[..30]);
+        let mut union = std::collections::BTreeSet::new();
+        for sequence in [
+            &Step::SEQUENCE[..],
+            &Step::ANCHOR_SEQUENCE,
+            &Step::JOIN_SEQUENCE,
+            &Step::EXEC_SEQUENCE,
+        ] {
+            let codes: std::collections::BTreeSet<u32> =
+                sequence.iter().map(|s| s.code()).collect();
+            assert_eq!(codes.len(), sequence.len(), "no step twice: {sequence:?}");
+            union.extend(codes);
+        }
+        assert_eq!(union.len(), Step::ALL.len(), "every step in a sequence");
+        // The anchors end in the release, after the filter; the joins
+        // record the second stage's pid right after the inner clone.
+        assert_eq!(Step::ANCHOR_SEQUENCE[27], Step::Release);
+        assert_eq!(Step::ANCHOR_SEQUENCE[26], Step::Seccomp);
+        assert_eq!(Step::JOIN_SEQUENCE[26], Step::Release);
+        for joined in [&Step::JOIN_SEQUENCE[..], &Step::EXEC_SEQUENCE] {
+            assert_eq!(joined[5..7], [Step::InnerClone, Step::Forked]);
+        }
+        assert_eq!(Step::EXEC_SEQUENCE[20], Step::Exec);
+        assert_eq!(Step::Release.code(), 36);
         let n = Step::SEQUENCE.len();
         assert_eq!(
             Step::SEQUENCE[n - 9..],
