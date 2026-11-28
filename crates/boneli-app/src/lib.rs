@@ -58,7 +58,9 @@ pub use image::{ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, P
 pub use job::{JobFailure, MAX_DETAIL_BYTES, cap_detail};
 pub use path::{RelativePath, TreePath, TreePathProblem, Uncitable};
 pub use sandbox::{
-    Command, ExecResult, ExitStatus, Limits, Phase, Sandbox, SandboxError, SandboxId, SandboxSpec,
+    Broker, BrokerName, Command, ContainerName, ContainerSpec, ExecResult, ExitStatus, LayerRef,
+    LimitProblem, Limits, NameProblem, Phase, PodLimits, Sandbox, SandboxError, SandboxId,
+    SandboxSpec, SpecProblem, WorkspaceBytes, overlapping_paths,
 };
 pub use store::{EventStore, RunLog, RunStart, StoreError, replay};
 pub use verifier::Verifier;

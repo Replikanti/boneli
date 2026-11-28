@@ -28,6 +28,9 @@ use boneli_app::{
     RelativePath, RepoUrl, ReproductionRequest, RootCauseReport, RootCauseRequest, RunLog,
     RunStart, SandboxError, StoreError, TreePath, TriageReport, TriageRequest, Verifier, Written,
 };
+use boneli_app::{
+    BrokerName, ContainerName, LayerRef, LimitProblem, NameProblem, SpecProblem, WorkspaceBytes,
+};
 use boneli_domain::{
     Budget, CheckStatus, Citation, CitationStatus, CommitSha, DomainError, EventKind, EvidenceRef,
     FixChecks, Patch, PatchLimits, RunEvent, RunId, Stage, TestStatus, Ticket, TicketSource,
@@ -785,6 +788,57 @@ pub fn render_app_errors() -> String {
     for error in data {
         let _ = writeln!(out, "display app: {error}\n{error:?}");
     }
+    // The pod spec problems of ADR-042 (D2), every variant.
+    let names = [
+        NameProblem::Empty,
+        NameProblem::TooLong {
+            length: 64,
+            max: 63,
+        },
+        NameProblem::Character { offset: 2 },
+        NameProblem::Reserved,
+    ];
+    for problem in names {
+        let _ = writeln!(out, "display app: {problem}\n{problem:?}");
+    }
+    let limits = [
+        LimitProblem::NoContainers,
+        LimitProblem::Zero { field: "tmp_bytes" },
+        LimitProblem::MemoryBelowStorage {
+            storage: Some(2_348_810_240),
+            memory: 2_147_483_648,
+        },
+        LimitProblem::MemoryBelowStorage {
+            storage: None,
+            memory: 1,
+        },
+        LimitProblem::TooFewProcesses {
+            needed: 4,
+            processes: 3,
+        },
+        LimitProblem::CpuBelowFloor { cpu_millis: 9 },
+    ];
+    for problem in limits {
+        let _ = writeln!(out, "display app: {problem}\n{problem:?}");
+    }
+    let container = ContainerName::parse("app");
+    let broker = BrokerName::parse("sql");
+    if let (Ok(container), Ok(broker)) = (container, broker) {
+        let specs = [
+            SpecProblem::Limits(LimitProblem::NoContainers),
+            SpecProblem::DuplicateContainer(container),
+            SpecProblem::DuplicateBroker(broker.clone()),
+            SpecProblem::DuplicateDependency(LayerRef::new(String::from("layer-1"))),
+            SpecProblem::BrokerSocket(broker),
+            SpecProblem::VerifyWithBrokers,
+            SpecProblem::User,
+        ];
+        for problem in specs {
+            let _ = writeln!(out, "display app: {problem}\n{problem:?}");
+        }
+    }
+    let workspace = WorkspaceBytes::new(b"fn main() {}".to_vec());
+    let _ = writeln!(out, "debug app: {workspace:?}");
     // `TreePath`'s `Debug` (ADR-018): a UTF-8 path and one that is not.
     for bytes in [&b"src/a\\b.rs"[..], b"x\xff\"\\"] {
         if let Ok(path) = TreePath::parse(bytes) {
