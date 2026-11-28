@@ -868,6 +868,15 @@ fn probe_cgroup() -> Vec<Missing> {
         missing.push(Missing::Cgroup2Missing);
         return missing;
     };
+    missing.extend(probe_cgroup_dir(dir));
+    missing
+}
+
+/// The checks on the caller's cgroup directory, in order: the kernel
+/// floor, delegation, the controllers, and the floor's last word (a
+/// function of the directory alone, so a test can run it on a temp dir).
+fn probe_cgroup_dir(dir: String) -> Vec<Missing> {
+    let mut missing = Vec::new();
     // Before the delegation check, so that a host that is not delegated
     // and also below 6.1 is told both (ADR-044, D3).
     let floor = kernel_floor(&dir);
@@ -1852,6 +1861,79 @@ mod tests {
             kernel_floor(&not_dir),
             floor_failed("pids.max", io(libc::ENOTDIR).to_string())
         );
+    }
+
+    /// A temp dir laid out as a delegated cgroup: the three files the
+    /// delegation check needs, writable, and `cgroup.controllers`.
+    fn delegated(tag: &str, controllers: &str) -> TempDir {
+        let dir = TempDir::new(tag);
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            dir.write(file, b"");
+        }
+        dir.write("cgroup.controllers", controllers.as_bytes());
+        dir
+    }
+
+    #[test]
+    fn probe_cgroup_dir_wires_the_floor_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let all = "cpu io memory pids\n";
+        let floor = |dir: &TempDir| Missing::KernelFloor {
+            path: dir.path().into(),
+        };
+
+        // Below 6.1 and not delegated: both, the floor first (ADR-044 D3).
+        // Mode 0444 makes access(W_OK) fail for the non-root test user.
+        let old = delegated("dir-old-undelegated", all);
+        old.write("pids.max", b"max\n");
+        let procs = old.0.join("cgroup.procs");
+        std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod cgroup.procs");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            probe_cgroup_dir(old.path().into()),
+            vec![
+                floor(&old),
+                Missing::CgroupNotDelegated {
+                    path: old.path().into(),
+                    file: format!("{}/cgroup.procs", old.path()),
+                    uid,
+                },
+            ]
+        );
+
+        // Below 6.1 and delegated with every controller: the floor alone.
+        let old = delegated("dir-old", all);
+        old.write("pids.max", b"max\n");
+        assert_eq!(probe_cgroup_dir(old.path().into()), vec![floor(&old)]);
+
+        // Neither pids file, but pids listed: fail closed, never Ok.
+        let unseen = delegated("dir-unseen", all);
+        assert_eq!(
+            probe_cgroup_dir(unseen.path().into()),
+            vec![Missing::ProbeFailed {
+                probe: "kernel-floor",
+                stage: "pids.max",
+                detail: "pids is in cgroup.controllers, pids.max is absent".into(),
+            }]
+        );
+
+        // Neither pids file and pids not listed: the controllers check says it.
+        let unlisted = delegated("dir-unlisted", "cpu io memory\n");
+        assert_eq!(
+            probe_cgroup_dir(unlisted.path().into()),
+            vec![Missing::CgroupControllerMissing {
+                path: unlisted.path().into(),
+                controller: "pids",
+            }]
+        );
+
+        // Met, delegated, every controller: nothing missing.
+        let met = delegated("dir-met", all);
+        met.write("pids.max", b"max\n");
+        met.write("pids.peak", b"3\n");
+        assert_eq!(probe_cgroup_dir(met.path().into()), Vec::new());
     }
 
     #[test]

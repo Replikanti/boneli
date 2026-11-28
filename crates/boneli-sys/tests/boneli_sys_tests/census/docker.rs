@@ -418,12 +418,14 @@ fn docker_rule_applicability() {
         r
     };
     let kernel = |k: &str| with(&|r| r.includes.min_kernel = Some(parse_kernel(k).expect(k)));
-    // Against the floor 6.1 (ADR-044 D1): 5.20 < 6.1 because 5 < 6, and
-    // 6.10 > 6.1 because 10 > 1, where a string compare gets both wrong.
+    // Against the floor 6.1 (ADR-044 D1): 5.20 < 6.1 because 5 < 6, which
+    // a compare of each component on its own gets wrong (20 > 1); 6.10 >
+    // 6.1 because 10 > 1, which a float compare gets wrong (6.10 = 6.1);
+    // 10.0 > 6.1 because 10 > 6, which a string compare gets wrong.
     for k in ["4.8", "5.2", "5.19", "5.20", "6.0", "6.1"] {
         assert!(applies(&kernel(k), "amd64"), "minKernel {k}");
     }
-    for k in ["6.2", "6.10", "7.0"] {
+    for k in ["6.2", "6.10", "7.0", "10.0"] {
         assert!(!applies(&kernel(k), "amd64"), "minKernel {k}");
     }
     // Capabilities: included ones must all be defaults, excluded ones none.
