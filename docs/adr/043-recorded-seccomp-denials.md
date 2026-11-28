@@ -188,15 +188,25 @@ twice; it is never allowed.
 ### D5. Deny-only replies
 
 `notify::Deny::new(id, errno)` is the only constructor of a reply. It
-accepts errno 1 to 4095 and encodes `val` 0, `error` −errno and `flags`
-0. Why that range: `MAX_ERRNO` is 4095 (`include/linux/err.h`), and the
-kernel returns `error` when it is non-zero and `val` otherwise
+accepts errno 1 to 511 and encodes `val` 0, `error` −errno and `flags`
+0. Why that range. The kernel returns `error` when it is non-zero and `val` otherwise
 (`syscall_set_return_value(..., err, ret)`, 5.19 `:1186`; on x86
 `regs->ax = (long) error ?: val`, `arch/x86/include/asm/syscall.h:78`).
-So `error` 0 makes the call return `val`, a success, and an `error` below
-−4095 is a return value libc does not read as an errno
-(`deny_reply_encoding`). The kernel's send path
-itself bounds neither (5.19 `seccomp_notify_send`, `:1525`–`1568`).
+So `error` 0 makes the call return `val`, a success. At the other end,
+512 and up are the kernel's own codes, which "should never be seen by
+user programs" (`include/linux/errno.h`, 512 `ERESTARTSYS` to 531
+`ENOGRACE` in 7.2): with a signal pending, `ERESTARTSYS`,
+`ERESTARTNOINTR` and `ERESTARTNOHAND` make the kernel restart the call
+instead of failing it, and `ERESTART_RESTARTBLOCK` (516) runs the task's
+restart block, which is another syscall's continuation (found in review
+of PR 1). So the bound is 511, one below `ERESTARTSYS`. It costs nothing:
+the highest errno in the uapi headers of both architectures is
+`EHWPOISON` (133, `include/uapi/asm-generic/errno.h`), and the rows use
+five errnos up to 97. `MAX_ERRNO` (4095, `include/linux/err.h`), the
+kernel's bound for a return value to be an error at all, would admit the
+internal codes (`deny_reply_encoding` refuses 0, 512 to 531, 4095 and
+4096). The kernel's send path itself bounds none of this (5.19
+`seccomp_notify_send`, `:1525`–`1568`).
 
 Nothing in boneli-sys can reply with the flag that lets a notified call
 run, nor inject a descriptor (which with its send flag fakes a success).
@@ -206,15 +216,34 @@ and `tests/` and fails on the names of the continue flag, the
 descriptor-injection ioctl, its two flags and its struct, and the
 flag-setting ioctl, in code, a comment or a string, after `libc::` or
 renamed with `use ... as`. The send ioctl's name and the reply struct may
-appear only in `src/seccomp/notify.rs`. The send ioctl's number may
-appear only there and the injection ioctl's number nowhere, in any base,
-hex case or with `_` separators (`continue_scan_catches_every_form`).
+appear only in `src/seccomp/notify.rs`.
+
+For numbers the scan reads every integer literal, in any base, hex case,
+with `_` separators and a suffix, and folds it to its low 32 bits, because
+`cmd` is an `unsigned int` and the kernel drops the rest; after a `-` or
+`!` it also checks the negated and complemented value. The send ioctl's
+32-bit number may then appear only in notify.rs: the kernel matches it
+exactly. The injection ioctl is matched on its type and number bits only
+(`'!'`, 3: the low 16 bits 0x2103), because the kernel dispatches it on
+`EA_IOCTL(cmd)`, which masks the direction and size bits
+(`seccomp_notify_ioctl`, `kernel/seccomp.c:1726` in 5.19, `:1846` in
+7.2). So no literal anywhere may carry those 16 bits. The reviewer's C
+probe on 7.2.10 reached the handler with every direction, with size 32,
+with a 64-bit request whose low word is the ioctl's and with the send
+number's 64-bit and negative spellings, and the first version of the scan
+missed them (found in review of PR 1); each is now a fixture of
+`continue_scan_catches_every_form`, with neighbours that must pass. What
+the scan proves is therefore about literals: no integer literal in
+boneli-sys, alone or negated or complemented, is a request the kernel
+dispatches to the injection ioctl, or to the send ioctl outside
+notify.rs.
 Only boneli-sys can issue an ioctl (`unsafe` is allowed nowhere else,
 rules `unsafe-token` and `lints-unsafe`), so one crate's sources are the
 whole scope. Rust has no stable way to build an identifier without a proc
 macro, which rule `proc-macro` bans, so a name has to be written to be
-used. Residual: a number computed inside boneli-sys (through `ioc()`, for
-example) is caught only by review; boneli-sys is always reviewed, and
+used. Residual: a number computed inside boneli-sys (through `ioc()`, a
+shift, an `|` of two harmless literals, a constant expression) is caught
+only by review; boneli-sys is always reviewed, and
 PR 2's host tests show that no notified form succeeds. Rejected: a
 checker rule, which would add a third always-review surface for the same
 names.
@@ -356,7 +385,7 @@ larger structs work: the crate reads and writes only its own prefix
 | Spawn cost | 706–777 µs plain, 694–726 µs notified (3 of 4 runs; 1,071 µs in one) | `posix_spawn` + `waitpid` of `/bin/true`; within noise, because one `clone3` notification per spawn costs about 9 µs against about 700 µs. |
 | Keys | 723 | D6's table. A larger table costs memory linearly; a smaller one would merge keys the agent needs apart (a family per key is what tells AF_VSOCK from AF_ALG). |
 | Record bound | 723 × 144 bytes = 104,112 bytes per sandbox | `size_of::<Denial>()` is 144 on x86_64 (printed by `key_space_is_bounded`, which fails above 160). A flood cannot grow it. |
-| errno range | 1 to 4095 | `MAX_ERRNO` (D5). 0 would be a success; below −4095 a non-error return. |
+| errno range | 1 to 511 | One below `ERESTARTSYS` (512), where the kernel's internal codes start (D5). 0 would be a success; 512 to 531 restart the call or run its restart block; every uapi errno is at most 133. |
 | Struct sizes | 80 / 24 / 64 bytes | `seccomp_notif`, `seccomp_notif_resp`, `seccomp_data` in the uapi header and in libc 0.2.191, pinned at compile time. |
 | Status bound | 8,192 bytes | The dev host's longest `/proc/<pid>/status` among the user's processes was 1,542 bytes (measured 2026-11-28), a 5.3× margin. The bound keeps the read bounded: `Groups:` can grow to the 65,536 supplementary groups of `NGROUPS_MAX`, about 720 KB, and it comes before `NStgid:`, so such a file costs only the pid (`parse_status_forms` parses an `NStgid:` line ending at byte 8,192 and refuses one ending at 8,193). `Name:` and `Pid:` come first, so the comm survives. |
 | Ceiling window | 472 to 511 | D6: about five to six years of new syscalls at the 2019–2026 rate. |

@@ -14,11 +14,21 @@ use super::record::Key;
 use super::table::Arch;
 use crate::error::Error;
 
-/// `MAX_ERRNO` (`include/linux/err.h`): the kernel's syscall return path
-/// treats only -1 to -4095 as an error. A reply with `error` 0 makes the
-/// call return `val`, a success, and one below -4095 returns a value that
-/// libc does not read as an errno.
-pub const MAX_ERRNO: i32 = 4095;
+/// The highest errno a reply may carry (ADR-043, D5): one below
+/// `ERESTARTSYS` (512, `include/linux/errno.h`). From 512 up the kernel
+/// keeps its own codes, "never seen by user programs": a pending signal
+/// turns `ERESTARTSYS`, `ERESTARTNOINTR` or `ERESTARTNOHAND` into a
+/// restart of the call, and `ERESTART_RESTARTBLOCK` runs the task's
+/// restart block, another syscall. Every errno user space knows lies below:
+/// the highest in the uapi headers of both architectures is `EHWPOISON`
+/// (133, `include/uapi/asm-generic/errno.h`). The kernel's own bound,
+/// `MAX_ERRNO` (4095, `include/linux/err.h`), is where a return value
+/// stops being an error at all; a reply with `error` 0 makes the call
+/// return `val`, a success.
+pub const MAX_REPLY_ERRNO: i32 = 511;
+
+const _: () = assert!(MAX_REPLY_ERRNO < 512);
+const _: () = assert!(libc::EHWPOISON <= MAX_REPLY_ERRNO);
 
 const _: () = assert!(core::mem::size_of::<libc::seccomp_notif>() == NOTIF_SIZE);
 const _: () = assert!(core::mem::size_of::<libc::seccomp_notif_resp>() == RESP_SIZE);
@@ -43,9 +53,9 @@ pub struct Deny(libc::seccomp_notif_resp);
 
 impl Deny {
     /// The reply to notification `id` with `errno`, which must be 1 to
-    /// [`MAX_ERRNO`].
+    /// [`MAX_REPLY_ERRNO`].
     pub fn new(id: u64, errno: i32) -> Option<Deny> {
-        if !(1..=MAX_ERRNO).contains(&errno) {
+        if !(1..=MAX_REPLY_ERRNO).contains(&errno) {
             return None;
         }
         Some(Deny(libc::seccomp_notif_resp {
@@ -270,7 +280,13 @@ mod tests {
 
     #[test]
     fn deny_reply_encoding() {
-        for errno in [1, libc::EPERM, libc::ENOSYS, MAX_ERRNO] {
+        for errno in [
+            1,
+            libc::EPERM,
+            libc::ENOSYS,
+            libc::EHWPOISON,
+            MAX_REPLY_ERRNO,
+        ] {
             let d = Deny::new(7, errno).expect("in range");
             assert_eq!(
                 (d.id(), d.val(), d.error(), d.flags()),
@@ -278,7 +294,14 @@ mod tests {
                 "errno {errno}"
             );
         }
-        for errno in [0, MAX_ERRNO + 1, -1, i32::MIN, i32::MAX] {
+        // 0 is a success; 512 to 531 are the kernel's internal codes
+        // (ERESTARTSYS, ERESTARTNOINTR, ERESTARTNOHAND, ENOIOCTLCMD,
+        // ERESTART_RESTARTBLOCK, ..., ENOGRACE); 4095 is MAX_ERRNO.
+        let internal = 512..=531;
+        for errno in [0, -1, i32::MIN, i32::MAX, 4095, 4096]
+            .into_iter()
+            .chain(internal)
+        {
             assert!(Deny::new(7, errno).is_none(), "errno {errno}");
         }
         let d = Deny::new(u64::MAX, libc::EPERM).expect("in range");

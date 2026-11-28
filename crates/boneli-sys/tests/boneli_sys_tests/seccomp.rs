@@ -1528,8 +1528,8 @@ fn seccomp_data_round_trip() {
         u64::from_le_bytes(q)
     };
     assert_eq!(d.instruction_pointer, quad(8));
-    for i in 0..6 {
-        assert_eq!(d.args[i], quad(16 + 8 * i), "args[{i}]");
+    for (i, arg) in d.args.iter().enumerate() {
+        assert_eq!(*arg, quad(16 + 8 * i), "args[{i}]");
     }
     let e = sdata(Arch::X86_64, 0xFFFF_FFFF, [u64::MAX, 0, 1, 2, 3, 1 << 63]);
     assert_eq!(SeccompData::from_bytes(&e.to_bytes()), e);

@@ -1100,7 +1100,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per architecture, first occurrence kept, saturating counts, one ASCII
   line per entry with decoded key arguments, `/proc/<pid>/status` parsing
   for the inside pid and the comm, hostile comms escaped); the deny-only
-  reply `notify::Deny` (errno 1 to 4095, never a flag) and receive and
+  reply `notify::Deny` (errno 1 to 511, never a flag) and receive and
   reply buffers sized by the kernel (`Error::NotifySizes`); a self-scan
   test that bans the names and numbers of the reply flag that lets a
   call run and of descriptor injection in every boneli-sys file. `spawn`
