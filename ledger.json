@@ -1768,16 +1768,16 @@
    "title": "boneli-sys: raise the kernel floor from Linux 5.19 to 6.1",
    "epic": null,
    "order": 68,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "a0b0e5e8",
    "user": "ylohnitram",
    "machine": "df82df",
    "session": true,
    "dispatched": true,
    "parked": null,
-   "pr": null,
+   "pr": 152,
    "note": "",
-   "updated_at": "2026-11-28T15:30:29+00:00",
+   "updated_at": "2026-11-28T16:08:55+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [],
@@ -1813,14 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-27T00:31:05+00:00",
-   "issue": 6,
-   "from": "stopped",
-   "to": "ready",
-   "by": "3ca43470",
-   "note": "resumed by operator 2026-11-27, continue PR 4 from WIP local commits 394969b + ea7b888 on feat/boneli-sys-part4 (not pushed, worktree boneli-sys-part4): libs, census data, change 11 tests, probe _exit flake fix (root cause: std exit unmaps alt stack under glibc setxid handler); missing: compile, all PR 4 tests, ADR/docs/CI, PR; plan + amendment issuecomment-6882405979; stopped 2026-11-14 because the safety classifier stopped 3 agents on PR 4"
-  },
   {
    "at": "2026-11-27T00:31:15+00:00",
    "issue": 6,
@@ -2212,6 +2204,14 @@
    "to": "plan-review",
    "by": "734ee990",
    "note": null
+  },
+  {
+   "at": "2026-11-28T16:08:55+00:00",
+   "issue": 149,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "a0b0e5e8",
+   "note": null
   }
  ],
  "open": [
@@ -2240,7 +2240,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T15:50:21+00:00",
+ "updated_at": "2026-11-28T16:08:55+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
