@@ -234,15 +234,20 @@ number's 64-bit and negative spellings, and the first version of the scan
 missed them (found in review of PR 1); each is now a fixture of
 `continue_scan_catches_every_form`, with neighbours that must pass. What
 the scan proves is therefore about literals: no integer literal in
-boneli-sys, alone or negated or complemented, is a request the kernel
-dispatches to the injection ioctl, or to the send ioctl outside
-notify.rs.
+boneli-sys, written alone or directly after one unary `-` or `!` (blanks
+aside), is a request the kernel dispatches to the injection ioctl, or to
+the send ioctl outside notify.rs. It does not read float literals and
+does not look past a parenthesis, a comment or a second unary operator
+between the operator and the literal (`-(N)`, `- /*c*/ N`, `-!N`,
+`N as f64 as _`; found in review of PR 1); those are spellings someone
+has to write on purpose, and they belong to the residual below.
 Only boneli-sys can issue an ioctl (`unsafe` is allowed nowhere else,
 rules `unsafe-token` and `lints-unsafe`), so one crate's sources are the
 whole scope. Rust has no stable way to build an identifier without a proc
 macro, which rule `proc-macro` bans, so a name has to be written to be
 used. Residual: a number computed inside boneli-sys (through `ioc()`, a
-shift, an `|` of two harmless literals, a constant expression) is caught
+shift, an `|` of two harmless literals, a constant expression, or one of
+the deliberate literal spellings above) is caught
 only by review; boneli-sys is always reviewed, and
 PR 2's host tests show that no notified form succeeds. Rejected: a
 checker rule, which would add a third always-review surface for the same
