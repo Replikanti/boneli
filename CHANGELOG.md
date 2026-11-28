@@ -1177,9 +1177,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry as itself (`O_PATH`) and classify it by `fstat`, carry symlinks
   raw, read hardlinks as content, map the owner's exec bit to `x`, skip
   FIFOs, sockets, devices, empty directories and mount points, and walk
-  in git tree order into `Workspace::from_sorted`. Caps: 200,000 nodes,
-  400,000 names, `workspace_bytes + 51,800,000` bytes, paths of 4,095
-  bytes. Unit tests on plain host directories for every edge case of
+  in git tree order, checked as `Workspace::from_sorted` checks. Caps:
+  200,000 nodes, 400,000 names, `workspace_bytes + 51,800,000` bytes,
+  paths of 4,095 bytes. A walk holds at most 34 directory descriptors at
+  any depth: its top level, a checkpoint every 64 levels and the level it
+  is in, the rest re-opened beneath their checkpoint when the walk
+  returns. An export encodes each entry into one output reserved at the
+  byte cap, so it holds its bytes once (review run 1 of part 4). Unit tests on plain host directories for every edge case of
   D5, among them the exact caps, a 1,900-directory chain whose work is
   counted, hostile names, modes, specials that never block; one host
   test mounts a dependency in `unshare -Urm`.

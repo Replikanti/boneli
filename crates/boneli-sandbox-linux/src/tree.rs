@@ -23,10 +23,15 @@
 //!   setuid, setgid and sticky bits do not count.
 //! - Siblings are taken in the order of a git tree, where a directory sorts
 //!   as `name/`, so the entries come out in the byte order of their full
-//!   paths and go to `Workspace::from_sorted` as they are.
+//!   paths; the export encodes each into its output as it comes, under the
+//!   checks `Workspace::from_sorted` makes, so it holds its bytes once.
 //! - [`Caps`] bounds the nodes (files, symlinks and the directories they
 //!   imply, as the format counts them), the names the walk looks at and
 //!   the bytes of the export; a path longer than [`PATH_MAX`] is refused.
+//! - A walk holds at most 34 directory descriptors whatever the depth
+//!   (`HELD_MAX`): its top level, one every 64 levels and the level it is
+//!   in; any other level is opened again beneath the checkpoint above it
+//!   when the walk returns to it.
 //!
 //! The pod is frozen (`Cgroup::freeze`) while any of this runs, so the tree
 //! does not change under the walk; the inode checks catch a tree that
@@ -79,8 +84,8 @@ pub type Workspace = boneli_workspace::Workspace<TreeRule>;
 /// path-based calls (`materialize`, ADR-010 D3) and git does the same, and
 /// both fail with ENAMETOOLONG past it, so a longer path could never reach
 /// a diff. It also bounds a walk's depth, at 2,048 directories of a
-/// one-byte name each, and with it the descriptors a walk holds open: one
-/// per directory level.
+/// one-byte name each, and with it the checkpoints a walk keeps open
+/// (`CHECKPOINT`).
 pub const PATH_MAX: usize = 4095;
 
 /// The bytes of an encoded entry besides its path and data: the kind byte
@@ -380,30 +385,64 @@ fn same(fd: &OwnedFd, before: &fs::Metadata, path: &[u8]) -> Result<(), TreeErro
 /// Repository metadata is carried: the snapshot's `.git` is part of the
 /// workspace, and `Git::diff` drops it (ADR-010, D1).
 pub fn export(root: BorrowedFd<'_>, caps: &Caps) -> Result<Vec<u8>, TreeError> {
-    export_counted(root, caps).map(|(bytes, _)| bytes)
+    export_measured(root, caps).map(|(bytes, _)| bytes)
 }
 
-/// [`export`] and the walk's work counter.
-pub(crate) fn export_counted(
+/// What a walk measured, for the tests of its bounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Measure {
+    /// The walk's work counter.
+    pub work: u64,
+    /// The most directory descriptors the walk held at once.
+    pub held: usize,
+}
+
+/// [`export`] and what the walk measured.
+///
+/// The output is reserved once, at `caps.bytes` and one byte more, and
+/// every entry is encoded into it as the walk accepts it: a file's data is
+/// read straight into the output and held nowhere else, so the export's
+/// memory is the output, at most `caps.bytes`, plus the walk's names and
+/// path checks. The reservation is address space; its pages become
+/// resident as they are written. A reservation the allocator refuses
+/// fails the export, it never aborts the runner.
+pub(crate) fn export_measured(
     root: BorrowedFd<'_>,
     caps: &Caps,
-) -> Result<(Vec<u8>, u64), TreeError> {
+) -> Result<(Vec<u8>, Measure), TreeError> {
+    let reserve = usize::try_from(caps.bytes.saturating_add(1)).unwrap_or(usize::MAX);
+    let mut out = Vec::new();
+    out.try_reserve_exact(reserve).map_err(|e| {
+        TreeError::at(
+            b"",
+            Problem::Io {
+                call: "reserve",
+                detail: e.to_string(),
+            },
+        )
+    })?;
+    out.extend_from_slice(MAGIC);
     let mut walk = Walk::new(caps, MAGIC.len() as u64);
     let top = root
         .try_clone_to_owned()
         .map_err(|e| TreeError::at(b"", io_problem("dup", &e)))?;
-    let mut sink = Collect::default();
+    let mut sink = Encode::new(out);
     walk.walk(top, b"", &mut sink)?;
-    let workspace = Workspace::from_sorted(sink.entries, caps.nodes)
-        .map_err(|e| TreeError::at(b"", Problem::Format(e.to_string())))?;
-    let encoded = workspace.encode();
+    let mut encoded = sink.out;
     if encoded.len() as u64 > caps.bytes {
         return Err(TreeError::at(
             b"",
             Problem::TooManyBytes { max: caps.bytes },
         ));
     }
-    Ok((encoded, walk.work))
+    encoded.shrink_to_fit();
+    Ok((
+        encoded,
+        Measure {
+            work: walk.work,
+            held: walk.max_held,
+        },
+    ))
 }
 
 /// `seal`'s copier (ADR-042, D6): copies each directory of `paths` in the
@@ -493,35 +532,107 @@ trait Sink {
     fn link(&mut self, path: &[u8], target: Vec<u8>) -> Result<(), TreeError>;
 }
 
-/// The export's sink: every entry in memory, in walk order.
-#[derive(Default)]
-struct Collect {
-    entries: Vec<(TreePath, Kind, Vec<u8>)>,
+/// Bytes a file is read in, into the export's output.
+const READ_CHUNK: usize = 64 << 10;
+
+/// The export's sink: every entry encoded into `out` as it comes
+/// (ADR-010, D2), after the checks `Workspace::from_sorted` makes, so a
+/// walk that broke the format's order or nesting fails closed: each path
+/// passes the tree path rule, sorts after the one before it, and lies
+/// beneath no earlier entry. The nesting check keeps, as `from_sorted`
+/// does, only the earlier paths that are a string prefix of the previous
+/// one, at most 4,095 paths of at most [`PATH_MAX`] bytes.
+struct Encode {
+    out: Vec<u8>,
+    previous: Option<Vec<u8>>,
+    prefixes: Vec<Vec<u8>>,
+    chunk: Vec<u8>,
 }
 
-impl Collect {
-    fn push(&mut self, path: &[u8], kind: Kind, data: Vec<u8>) -> Result<(), TreeError> {
-        let parsed = TreePath::parse(path)
-            .map_err(|e| TreeError::at(path, Problem::Format(format!("{e:?}"))))?;
-        self.entries.push((parsed, kind, data));
+impl Encode {
+    fn new(out: Vec<u8>) -> Encode {
+        Encode {
+            out,
+            previous: None,
+            prefixes: Vec::new(),
+            chunk: vec![0; READ_CHUNK],
+        }
+    }
+
+    /// The checks, then the kind byte and the path.
+    fn begin(&mut self, path: &[u8], kind: Kind) -> Result<(), TreeError> {
+        let bad = |why: &str| TreeError::at(path, Problem::Format(why.to_string()));
+        TreePath::parse(path).map_err(|e| bad(&format!("{e:?}")))?;
+        if let Some(previous) = &self.previous
+            && path <= previous.as_slice()
+        {
+            return Err(bad("not after the previous entry"));
+        }
+        while self
+            .prefixes
+            .last()
+            .is_some_and(|top| !path.starts_with(top))
+        {
+            self.prefixes.pop();
+        }
+        if self
+            .prefixes
+            .iter()
+            .any(|p| path.get(p.len()) == Some(&b'/'))
+        {
+            return Err(bad("beneath a file or symlink entry"));
+        }
+        self.prefixes.push(path.to_vec());
+        self.previous = Some(path.to_vec());
+        self.out.push(kind.byte());
+        self.out
+            .extend_from_slice(&(path.len() as u64).to_be_bytes());
+        self.out.extend_from_slice(path);
         Ok(())
     }
 }
 
-impl Sink for Collect {
-    fn file(&mut self, path: &[u8], exec: bool, file: File, limit: u64) -> Result<u64, TreeError> {
-        let mut data = Vec::new();
-        file.take(limit.saturating_add(1))
-            .read_to_end(&mut data)
-            .map_err(|e| TreeError::at(path, io_problem("read", &e)))?;
-        let n = data.len() as u64;
-        let kind = if exec { Kind::Executable } else { Kind::File };
-        self.push(path, kind, data)?;
+impl Sink for Encode {
+    fn file(
+        &mut self,
+        path: &[u8],
+        exec: bool,
+        mut file: File,
+        limit: u64,
+    ) -> Result<u64, TreeError> {
+        self.begin(path, if exec { Kind::Executable } else { Kind::File })?;
+        let at = self.out.len();
+        self.out.extend_from_slice(&[0; 8]);
+        let mut n = 0u64;
+        while n <= limit {
+            let want = usize::try_from((limit - n).saturating_add(1))
+                .unwrap_or(usize::MAX)
+                .min(READ_CHUNK);
+            let got = match file.read(&mut self.chunk[..want]) {
+                Ok(0) => break,
+                Ok(got) => got,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(TreeError::at(path, io_problem("read", &e))),
+            };
+            self.out.extend_from_slice(&self.chunk[..got]);
+            n += got as u64;
+        }
+        self.out[at..at + 8].copy_from_slice(&n.to_be_bytes());
         Ok(n)
     }
 
     fn link(&mut self, path: &[u8], target: Vec<u8>) -> Result<(), TreeError> {
-        self.push(path, Kind::Symlink, target)
+        if target.is_empty() || target.contains(&0) {
+            return Err(TreeError::at(
+                path,
+                Problem::Format("a symlink target that is empty or holds NUL".to_string()),
+            ));
+        }
+        self.begin(path, Kind::Symlink)?;
+        self.out
+            .extend_from_slice(&(target.len() as u64).to_be_bytes());
+        self.out.extend_from_slice(&target);
+        Ok(())
     }
 }
 
@@ -620,9 +731,40 @@ impl Child {
     }
 }
 
+/// Every this many levels of the walk's stack keep their descriptor while
+/// the walk is deeper (ADR-042, D5): the top level, at index 0, and each
+/// at a multiple of 64. Any other level's descriptor is closed once the
+/// walk opens a directory below it, and opened again from the checkpoint
+/// above it, at most 63 components down, when the walk returns to it with
+/// names left. With [`PATH_MAX`] a stack has at most [`DEPTH_MAX`]
+/// levels, so a walk holds at most [`HELD_MAX`] directory descriptors,
+/// whatever the depth. 64 keeps both costs small: 34 descriptors, about 3 %
+/// of the default soft `RLIMIT_NOFILE` of 1,024, and a re-open of at most
+/// 63 lookups per directory the walk returns to; 32 would hold 66, 128
+/// would re-open through 127.
+pub(crate) const CHECKPOINT: usize = 64;
+
+/// The most levels a walk's stack holds: a directory at depth 2,047 of
+/// one-byte names has a path of 4,093 bytes, and a name beneath it makes
+/// 4,095 ([`PATH_MAX`]).
+pub(crate) const DEPTH_MAX: usize = PATH_MAX / 2 + 1;
+
+/// The most directory descriptors a walk holds at once: the checkpoints
+/// of a full stack (index 0 to 1,984, 32 of them), the deepest level and,
+/// for a moment, the directory it enters before the deepest level's
+/// descriptor is closed: 34. The walk's other descriptors are one at a
+/// time: the name it classifies (and its `fstat` copy) or the file it
+/// reads.
+pub(crate) const HELD_MAX: usize = DEPTH_MAX.div_ceil(CHECKPOINT) + 2;
+
 /// A directory on the walk's stack.
 struct Level {
-    dir: OwnedFd,
+    /// Its descriptor, `None` while the walk is below it and it is no
+    /// checkpoint.
+    dir: Option<OwnedFd>,
+    /// Its inode, checked when it is opened again.
+    dev: u64,
+    ino: u64,
     children: Vec<Child>,
     next: usize,
     /// The length of the walk's path buffer that is this directory's path.
@@ -641,6 +783,9 @@ struct Walk<'c> {
     /// Operations: every call into the kernel and every byte of a path
     /// written or copied, for `export_deep_chain_is_linear`.
     work: u64,
+    /// Directory descriptors held now, and the most held at once.
+    held: usize,
+    max_held: usize,
 }
 
 impl<'c> Walk<'c> {
@@ -651,7 +796,15 @@ impl<'c> Walk<'c> {
             nodes: 0,
             bytes,
             work: 0,
+            held: 0,
+            max_held: 0,
         }
+    }
+
+    fn hold(&mut self) {
+        self.held += 1;
+        self.max_held = self.max_held.max(self.held);
+        debug_assert!(self.held <= HELD_MAX, "{} directories held", self.held);
     }
 
     /// Walks the directory `top`, whose path in the workspace is `prefix`
@@ -665,8 +818,12 @@ impl<'c> Walk<'c> {
     ) -> Result<usize, TreeError> {
         let mut path = prefix.to_vec();
         let children = self.list(&top, &mut path)?;
+        let meta = stat(&top, &path)?;
+        self.hold();
         let mut stack = vec![Level {
-            dir: top,
+            dir: Some(top),
+            dev: meta.dev(),
+            ino: meta.ino(),
             children,
             next: 0,
             path_len: path.len(),
@@ -675,7 +832,9 @@ impl<'c> Walk<'c> {
         let mut entries = 0usize;
         while let Some(level) = stack.last_mut() {
             let Some(child) = level.children.get_mut(level.next) else {
-                stack.pop();
+                if stack.pop().is_some_and(|l| l.dir.is_some()) {
+                    self.held -= 1;
+                }
                 continue;
             };
             level.next += 1;
@@ -693,13 +852,32 @@ impl<'c> Walk<'c> {
                 Node::File { .. } => Open::Read,
                 Node::Symlink => Open::Path,
             };
-            let fd = self.reopen(&level.dir, &name, &path, open, dev, ino)?;
+            let depth = stack.len() - 1;
+            if stack[depth].dir.is_none() {
+                self.restore(&mut stack, &path)?;
+            }
+            let parent = stack[depth].dir.as_ref().ok_or_else(|| {
+                TreeError::at(&path, Problem::Format("no descriptor".to_string()))
+            })?;
+            let fd = self.reopen(parent, &name, &path, open, dev, ino)?;
             match node {
                 Node::Skipped => {}
                 Node::Directory => {
+                    // Unreachable under PATH_MAX; kept so the descriptor
+                    // bound cannot outgrow its derivation.
+                    if stack.len() >= DEPTH_MAX {
+                        return Err(TreeError::at(&path, Problem::PathTooLong { max: PATH_MAX }));
+                    }
                     let children = self.list(&fd, &mut path)?;
+                    self.hold();
+                    // The parent stays open only as a checkpoint.
+                    if depth % CHECKPOINT != 0 && stack[depth].dir.take().is_some() {
+                        self.held -= 1;
+                    }
                     stack.push(Level {
-                        dir: fd,
+                        dir: Some(fd),
+                        dev,
+                        ino,
                         children,
                         next: 0,
                         path_len: path.len(),
@@ -742,6 +920,34 @@ impl<'c> Walk<'c> {
             }
         }
         Ok(entries)
+    }
+
+    /// Opens the deepest level of `stack` again, whose descriptor was
+    /// closed while the walk was below it: from the checkpoint above it by
+    /// its path relative to that checkpoint, at most `CHECKPOINT - 1`
+    /// components, beneath it and without following anything, and checks
+    /// it is the inode the walk entered. `path` holds the level's path.
+    fn restore(&mut self, stack: &mut [Level], path: &[u8]) -> Result<(), TreeError> {
+        let depth = stack.len() - 1;
+        let checkpoint = depth - depth % CHECKPOINT;
+        let here = &path[..stack[depth].path_len];
+        let from = stack[checkpoint].path_len;
+        let suffix = &here[if from == 0 { 0 } else { from + 1 }..];
+        let base = stack[checkpoint]
+            .dir
+            .as_ref()
+            .ok_or_else(|| TreeError::at(here, Problem::Format("no checkpoint".to_string())))?;
+        let (dev, ino) = (stack[depth].dev, stack[depth].ino);
+        self.work += 2 + suffix.len() as u64;
+        let fd = open_beneath(base.as_fd(), suffix, Open::Directory)
+            .map_err(|e| TreeError::at(here, problem_of("openat2", &e, self.caps)))?;
+        let meta = stat(&fd, here)?;
+        if meta.dev() != dev || meta.ino() != ino {
+            return Err(TreeError::at(here, Problem::Changed));
+        }
+        self.hold();
+        stack[depth].dir = Some(fd);
+        Ok(())
     }
 
     /// Counts the entry at `path` and every directory above it on the

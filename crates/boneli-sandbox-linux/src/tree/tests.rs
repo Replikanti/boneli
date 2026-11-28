@@ -98,6 +98,13 @@ fn remove_tree(dir: &Path) {
 /// longer than the path-based calls of std take is made without a
 /// `chdir`, which would change every test thread's directory.
 fn chain(dir: &Path, name: &str, depth: usize, leaf: &str) {
+    chain_with(dir, name, depth, leaf, None);
+}
+
+/// [`chain`], with a file `sibling` next to the directory at every level
+/// but the top, which sorts after `name/`, so the walk comes back to every
+/// level for it.
+fn chain_with(dir: &Path, name: &str, depth: usize, leaf: &str, sibling: Option<&str>) {
     let built = dir.join("chain-built");
     let next = dir.join("chain-next");
     fs::create_dir(&built).expect("mkdir");
@@ -105,6 +112,9 @@ fn chain(dir: &Path, name: &str, depth: usize, leaf: &str) {
     for _ in 1..depth {
         fs::create_dir(&next).expect("mkdir");
         fs::rename(&built, next.join(name)).expect("move the chain down");
+        if let Some(sibling) = sibling {
+            fs::write(next.join(sibling), b"s").expect("write the sibling");
+        }
         fs::rename(&next, &built).expect("move it back up");
     }
     fs::rename(&built, dir.join(name)).expect("name the top");
@@ -602,9 +612,9 @@ fn export_deep_chain_is_linear() {
     let chain = |depth: usize| {
         let s = Scratch::new("chain");
         chain(&s.0, "d", depth, "f");
-        let (encoded, work) = export_counted(s.fd().as_fd(), &caps()).expect("export");
+        let (encoded, measure) = export_measured(s.fd().as_fd(), &caps()).expect("export");
         assert_eq!(paths(&decode(&encoded))[0].len(), 2 * depth + 1);
-        work
+        measure.work
     };
     let half = chain(950);
     let full = chain(1900);
@@ -655,6 +665,192 @@ fn reopen_refuses_another_inode() {
         refused(walk.reopen(&fd, b"a", b"a", Open::Read, meta.dev() + 1, meta.ino())),
         (b"a".to_vec(), Problem::Changed)
     );
+}
+
+/// The variable that tells a re-run of this binary which soft
+/// `RLIMIT_NOFILE` it was started under.
+const UNDER_LIMIT: &str = "BONELI_SANDBOX_LINUX_TEST_NOFILE";
+
+/// Runs the test `name` of this binary again in a child process: under
+/// `sh -c 'ulimit -Sn <limit>'` when `limit` is given, alone, so that
+/// what it measures of the process (descriptors, peak memory) is its own.
+fn rerun(name: &str, limit: Option<u32>) {
+    let exe = std::env::current_exe().expect("current_exe");
+    let limit_cmd = limit.map_or(String::new(), |l| format!("ulimit -Sn {l} && "));
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{limit_cmd}exec \"$0\" --exact \"$1\" --nocapture --test-threads=1"
+        ))
+        .arg(exe)
+        .arg(name)
+        .env(
+            UNDER_LIMIT,
+            limit.map_or(String::from("none"), |l| l.to_string()),
+        )
+        .status()
+        .expect("run sh");
+    assert!(status.success(), "{name} under {limit:?}: {status}");
+}
+
+/// Review run 1 of part 4: the walk holds a bounded number of directory
+/// descriptors, whatever the depth. A tree at the path cap's depth, 2,047
+/// directories with a file next to each, so the walk returns to every
+/// level, exports (and one of 1,500 levels seals) under a soft
+/// `RLIMIT_NOFILE` of 1,024 and of
+/// 64, holding at most `HELD_MAX` (34) directory descriptors; a walk that
+/// kept one per level failed at about 1,018 levels under 1,024.
+#[test]
+fn walk_descriptors_stay_bounded() {
+    let Some(limit) = std::env::var_os(UNDER_LIMIT) else {
+        for limit in [1024, 64] {
+            rerun("tree::tests::walk_descriptors_stay_bounded", Some(limit));
+        }
+        return;
+    };
+    assert_ne!(limit, "none");
+    let s = Scratch::new("held");
+    chain_with(&s.0, "d", DEPTH_MAX - 1, "f", Some("e"));
+    let (encoded, measure) = export_measured(s.fd().as_fd(), &caps()).expect("export");
+    let got = decode(&encoded);
+    assert_eq!(got.len(), DEPTH_MAX - 1, "2,046 siblings and the leaf");
+    assert_eq!(
+        paths(&got).iter().map(Vec::len).max(),
+        Some(PATH_MAX),
+        "the leaf at the path cap"
+    );
+    assert_eq!(HELD_MAX, 34);
+    assert!(
+        measure.held <= HELD_MAX,
+        "held {} directories",
+        measure.held
+    );
+    assert!(
+        measure.held >= HELD_MAX - 1,
+        "the checkpoints are held: {}",
+        measure.held
+    );
+    // The seal walks the same way. Its writes are path-based below the
+    // layer directory (ADR-042, D6), so its tree is 1,500 levels deep, which
+    // the layer's own path plus 3,001 bytes leaves under PATH_MAX; still
+    // past the depth where a walk with a descriptor per level failed.
+    let s = Scratch::new("held-seal");
+    chain_with(&s.0, "d", 1500, "f", Some("e"));
+    let target = layer("layer-held");
+    copy_tree(s.fd().as_fd(), &[rel("d")], &target.0, &caps()).expect("seal");
+    let sealed = decode(&export(target.fd().as_fd(), &caps()).expect("export the layer"));
+    assert_eq!(
+        sealed,
+        decode(&export(s.fd().as_fd(), &caps()).expect("export"))
+    );
+}
+
+/// A level opened again from its checkpoint must be the inode the walk
+/// entered.
+#[test]
+fn restore_refuses_another_inode() {
+    let s = Scratch::new("restore");
+    s.write("a/b/f", b"1");
+    let caps = caps();
+    let level = |dir: Option<OwnedFd>, path_len: usize, ino: u64, dev: u64| Level {
+        dir,
+        dev,
+        ino,
+        children: Vec::new(),
+        next: 0,
+        path_len,
+        counted: true,
+    };
+    let a = fs::metadata(s.path("a/b")).expect("stat");
+    for (ino, ok) in [(a.ino(), true), (a.ino() + 1, false)] {
+        let mut walk = Walk::new(&caps, 0);
+        let mut stack = vec![
+            level(Some(s.fd()), 0, 0, 0),
+            level(None, 1, 0, 0),
+            level(None, 3, ino, a.dev()),
+        ];
+        let result = walk.restore(&mut stack, b"a/b/f");
+        if ok {
+            assert_eq!(result, Ok(()));
+            assert!(stack[2].dir.is_some(), "a/b opened again");
+        } else {
+            assert_eq!(refused(result), (b"a/b".to_vec(), Problem::Changed));
+        }
+    }
+}
+
+/// The export's encoder keeps the format's rules (ADR-010, D2), so a walk
+/// that broke them fails closed: entries in order, none beneath a file or
+/// symlink entry, and symlink targets that are not empty.
+#[test]
+fn encoder_keeps_the_format_rules() {
+    let begin = |paths: &[&[u8]]| {
+        let mut e = Encode::new(Vec::new());
+        paths.iter().try_for_each(|p| e.begin(p, Kind::File))
+    };
+    assert_eq!(begin(&[b"a", b"a-b", b"a.txt", b"b/c"]), Ok(()));
+    for (paths, at) in [
+        (&[&b"b"[..], b"a"][..], &b"a"[..]),
+        (&[b"a", b"a"], b"a"),
+        (&[b"a", b"a-b", b"a/x"], b"a/x"),
+        (&[b"x", b"x "], b"x "),
+    ] {
+        let (path, problem) = refused(begin(paths));
+        assert_eq!(path, at, "{paths:?}");
+        assert!(
+            matches!(problem, Problem::Format(_)),
+            "{paths:?}: {problem:?}"
+        );
+    }
+    let mut e = Encode::new(Vec::new());
+    assert!(matches!(
+        refused(e.link(b"l", Vec::new())).1,
+        Problem::Format(_)
+    ));
+}
+
+/// Review run 1 of part 4: an export holds its bytes once. A sparse file
+/// of 128 MiB takes no space in the file system and still makes 128 MiB
+/// of export; the process's peak resident memory grows by about that much,
+/// not by twice it (the first version kept every file's data and then
+/// copied it into the encoding: 2.0 times). Measured in a process of its
+/// own, so no other test's memory counts.
+#[test]
+fn export_holds_its_bytes_once() {
+    if std::env::var_os(UNDER_LIMIT).is_none() {
+        rerun("tree::tests::export_holds_its_bytes_once", None);
+        return;
+    }
+    const SIZE: u64 = 128 << 20;
+    let hwm = || -> u64 {
+        let status = fs::read_to_string("/proc/self/status").expect("status");
+        let line = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .expect("VmHWM");
+        line.trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse::<u64>()
+            .expect("kB")
+            << 10
+    };
+    let s = Scratch::new("sparse");
+    File::create(s.path("sparse"))
+        .expect("create")
+        .set_len(SIZE)
+        .expect("a sparse file");
+    let fd = s.fd();
+    let before = hwm();
+    let encoded = export(fd.as_fd(), &Caps::for_workspace(SIZE).expect("caps")).expect("export");
+    let grew = hwm().saturating_sub(before);
+    assert_eq!(
+        encoded.len() as u64,
+        MAGIC.len() as u64 + ENTRY_BYTES + 6 + SIZE
+    );
+    eprintln!("export of {SIZE} bytes: peak resident memory grew by {grew} bytes");
+    assert!(grew >= SIZE, "the export is resident once: {grew}");
+    assert!(grew <= SIZE + SIZE / 8, "and only once: {grew}");
 }
 
 #[test]

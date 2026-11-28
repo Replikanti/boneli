@@ -674,7 +674,8 @@ O_CLOEXEC`. The path must be relative, without NUL and without an empty,
 `..`, the one step for which the kernel answers EAGAIN when a rename or
 a mount anywhere on the host races it. `copy_out` resolves its path in
 one call; the walk opens one component at a time from the directory
-descriptor it holds, one per level. A symlink at any component is ELOOP
+descriptor of the level it is in (the descriptors it keeps are below). A
+symlink at any component is ELOOP
 (as a directory, ENOTDIR at the last one), a mount point EXDEV.
 
 **Each entry is opened as itself first.** `O_PATH`, which never blocks on
@@ -723,12 +724,15 @@ once, without waiting for a writer (`copy_out_fifo_does_not_block`).
 - Bytes: `workspace_bytes + 51,800,000` for the encoded export, the magic
   included. 51,800,000 is 200,000 nodes × 259 bytes, where 259 is the 17
   bytes of an entry's kind and two lengths plus 242, the longest path of
-  the largest measured candidate tree (ADR-010, D2). File data is already
-  bounded by the tmpfs (D4); this budget bounds what the tmpfs size does
-  not, the paths and the link targets. Without it a hostile tree at the
-  node cap reaches 200,000 × (17 + 4,096 + 4,095) = 1,641,600,000 bytes of
-  metadata. A file is read at most one byte past what is left, so a file
-  over the budget is never read whole.
+  the largest measured candidate tree (ADR-010, D2). `workspace_bytes`
+  is what the tmpfs holds, so a workspace of real files fits; the 51.8 MB
+  bound the paths and link targets, which the tmpfs size does not. Without
+  it a hostile tree at the node cap reaches 200,000 × (17 + 4,096 +
+  4,095) = 1,641,600,000 bytes of metadata. The cap, not the tmpfs, is
+  what bounds the export: a sparse file (`truncate -s`) takes no tmpfs
+  space and reads as zeros of its full size (review run 1 of part 4). A
+  file is read at most one byte past what is left, so a file over the
+  budget is never read whole.
 - Names: 400,000, twice the node cap. Every name the walk sees costs an
   open and an `fstat`, skipped or not, and the tmpfs's inode cap does not
   bound names: hardlinks of one FIFO are one inode and any number of
@@ -740,9 +744,58 @@ once, without waiting for a writer (`copy_out_fifo_does_not_block`).
 - Path length: 4,095 bytes, `PATH_MAX` without its NUL. The git adapter
   writes every exported path with path-based calls (`materialize`,
   ADR-010 D3), and git does the same; both fail past it, so a longer path
-  could never reach a diff. It also bounds the walk's depth at 2,048
-  directories and with it the descriptors the walk holds, one per level;
-  past the runner's `RLIMIT_NOFILE` the walk fails with EMFILE, closed.
+  could never reach a diff. It also bounds the walk's depth: with
+  one-byte names, 2,048 levels.
+
+**Descriptors: at most 34 directories, whatever the depth.** The first
+version held one descriptor per level. Review run 1 of part 4 ran it
+under the default soft `RLIMIT_NOFILE` of 1,024, which ADR-006, 009 and
+025 assume for the runner: a chain of 1,100 directories, inside the path
+cap, failed with EMFILE, and at 1,018 levels another runner thread that
+only opened `/dev/null` got EMFILE 7 times in 20 exports. Now the walk
+keeps the descriptor of its top level and of every level at a multiple
+of 64 below it (the checkpoints), and of the level it is in. Any other
+level's descriptor is closed when the walk enters a directory below it,
+and when the walk comes back to it with names left, it opens it again
+from the checkpoint above it: `openat2` beneath that checkpoint by the
+path between them, at most 63 components, with the same four `RESOLVE_*`
+flags, and `fstat` must show the inode it entered. With 2,048 levels at
+most, that is 32 checkpoints, the level it is in, and for a moment the
+directory it enters before the parent's descriptor is closed: 34
+(`HELD_MAX`). Its other descriptors are one at a time: the name it
+classifies with its `fstat` copy, or the file it reads. The seal walks
+the same way. `walk_descriptors_stay_bounded` exports a tree at the path
+cap's depth (2,047 directories, a file next to each, so the walk returns
+to every level) under a soft limit of 1,024 and of 64. It also seals a
+tree of 1,500 levels. Both hold at most 34 directories, counted. The
+mutant that never closes a level fails under both limits. Why 64: the
+checkpoints cost 2,048 / 64 = 32 descriptors, about 3 % of a soft limit
+of 1,024, and a re-open costs at most 63 lookups per directory the walk
+returns to, so the walk stays linear. 32 would hold 66, and 128 would
+re-open through 127.
+
+**Memory: the export is held once.** The first version kept every file's
+data in the entries for `Workspace::from_sorted` and then copied all of
+it into the encoding, about twice the cap at the peak (review run 1: 802
+MiB for a 400 MiB export of one sparse file). Now the output is reserved
+once, at the byte cap and one byte more. That reservation is address
+space, and its pages become resident as they are written. Each entry is
+encoded into the output as the walk accepts it, and a file's data is read
+straight into it, in 64 KiB pieces, and held nowhere else. The output
+never grows past its reservation, so it is never copied. A reservation
+the allocator refuses fails the export; it never aborts the runner. The
+checks `from_sorted` made run on the paths as they come: the tree path
+rule, a strictly increasing order, and no entry beneath a file or symlink
+entry. The order and nesting checks keep only the earlier paths that are
+a string prefix of the previous one, as `from_sorted` does, at most 4,095
+paths of at most 4,095 bytes. Empty or NUL-bearing link targets are
+refused too. So a walk that broke the format still fails closed
+(`encoder_keeps_the_format_rules`). An export's peak memory is therefore
+its output, at most `workspace_bytes + 51,800,000` bytes, plus the walk's
+name lists, which the name cap bounds. `export_holds_its_bytes_once`
+exports a sparse 128 MiB file in a process of its own. Its peak resident
+memory grew by 134,332,416 bytes for an export of 134,217,753 bytes
+(1.001 times). With a second copy held, the mutant, it fails.
 
 The walk is linear in the names and the bytes of their paths: one path
 buffer grows and shrinks with the walk, and only an accepted entry's path
@@ -793,9 +846,17 @@ Rejected:
 - **Reading files with a single `O_RDONLY | O_NONBLOCK` open**: a FIFO
   opens and reads as empty, and a device open reaches its driver; the
   `O_PATH` open first reaches neither.
-- **Holding fewer descriptors by reopening each directory from the root
-  by its path**: quadratic in the depth, the cost #30's `materialize`
-  removed (500 entries under 1,900 directories took 150 s).
+- **Reopening every directory from the root by its path**: quadratic in
+  the depth, the cost #30's `materialize` removed (500 entries under
+  1,900 directories took 150 s); the checkpoints bound a re-open at 63
+  components.
+- **One descriptor per level and a raised soft `RLIMIT_NOFILE`**: the
+  first version. The descriptors would still scale with the depth an
+  agent chooses, and every other thread of the runner shares the limit.
+- **A depth cap from a descriptor budget**: it refuses deep trees that git
+  holds, for a bound the checkpoints give without refusing anything.
+- **Collecting entries and encoding afterwards**: twice the cap at the
+  peak (above).
 - **No name cap**, relying on `workspace_inodes`: names are not inodes
   (hardlinks), so the walk would be bounded only by the pod's memory.
 
@@ -815,7 +876,10 @@ same directory would hold (`seal_round_trips`). The directories above a
 sealed path are not counted as nodes: at most as many as its
 components. The writes are path-based, as `materialize`'s (ADR-010,
 D3): within the private target only a process of the runner's own uid
-could plant a symlink while the copy runs. On an error the target may
+could plant a symlink while the copy runs. Being path-based, they take
+the layer directory's own path from `PATH_MAX`, so an entry whose path
+there is longer fails with ENAMETOOLONG, which is closed (the tests seal
+1,500 levels). On an error the target may
 hold part of the copy, and the pod removes it. The binds at `create`,
 the refusal of a dependency path at or above a tracked file and the
 release rules are part 5.
@@ -862,9 +926,11 @@ release rules are part 5.
 - A musl runner whose TLS does not fit on the anchor's fresh stack fails
   `create` (D3, part 4); the release ships glibc builds only (ADR-019).
 - Every sandbox cgroup holds one more descriptor, `cgroup.freeze` (D5).
-- An export holds the whole workspace in the runner's memory, at most
-  `workspace_bytes + 51,800,000` bytes, and one descriptor per directory
-  level, at most 2,048; a seal streams and holds neither (D5, D6).
+- An export holds the whole workspace in the runner's memory once, at
+  most `workspace_bytes + 51,800,000` bytes, and reserves that much address
+  space up front. A runner sized for pods that export at the same time
+  needs that sum. A seal streams and holds no file's data. Both walks hold
+  at most 34 directory descriptors and a few more one at a time (D5, D6).
 - A tree with more than 400,000 names, or a path longer than 4,095
   bytes, cannot be exported or sealed (D5).
 - `export_skips_dependency_mounts` needs `unshare -Urm`; it is a host
