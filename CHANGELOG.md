@@ -1158,9 +1158,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under its own frame (zeroed under it), 64 KiB around its TLS (each
   window clipped to its mapping) and each ELF object's `.bss` from its
   `PT_LOAD` headers. An anchor is cloned from a thread of its own on a
-  freshly mapped 1 MiB stack, so its stack and TLS hold nothing of the
-  runner's (568 kB left of 263,272 kB measured; no marker of a runner
-  frame, thread-local or neighbour thread survives). The
+  freshly mapped 1 MiB stack, guarded at both ends and whose bounds the
+  release clips to, so its stack and TLS hold nothing of the runner's
+  (568 kB left of 263,272 kB measured; no marker of a runner frame,
+  thread-local, neighbour thread or neighbouring mapping survives). The
   setup report gains progress records and steps 31 to 36;
   `Mount::Tmpfs` gains `inodes`. Host tests on both CI legs, among them
   every step's failure report for the three new sequences,

@@ -1176,3 +1176,74 @@ fn worker_thread_anchor_keeps_no_runner_secret() {
         "cases whose marker the anchor holds, with the copies"
     );
 }
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, cgroup v2 delegation"]
+fn fresh_stack_neighbour_is_released() {
+    // Review run 3: the anchor's fresh stack had a guard page only at its
+    // bottom, so its top merged with a runner mapping right above it into
+    // one mapping, and the TLS window kept the neighbour's lowest 64 KiB.
+    // On Linux 6.7 and later MAP_STACK gives the neighbour the same flags
+    // as the fresh stack, so the kernel merges them; on 5.19-6.6 and
+    // without THP any private anonymous mapping does.
+    const LEN: usize = 1 << 20;
+    let fixture = Fixture::new("anchor-neighbour");
+    let mut kept = Vec::new();
+    for stack in [true, false] {
+        let fixture = &fixture;
+        let (hits, kib) = std::thread::scope(|s| {
+            s.spawn(move || {
+                // The cgroup first: its keeper thread's stack is mapped then,
+                // so the next mappings are the buffer, then the fresh stack
+                // right below it.
+                let cg = cgroup::sandbox("anchor-neighbour");
+                let flags = libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | if stack { libc::MAP_STACK } else { 0 };
+                // SAFETY: an anonymous private mapping with no address hint.
+                let at = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        LEN,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        flags,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(at, libc::MAP_FAILED);
+                // SAFETY: at is LEN writable bytes, used only here.
+                let buf = unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), LEN) };
+                let clear = marker();
+                for chunk in buf[..128 << 10].chunks_mut(32) {
+                    chunk[..24].copy_from_slice(&clear);
+                }
+                let anchor = pod(fixture, &cg, "neighbour", Vec::new());
+                // The runner is done with the buffer.
+                buf.fill(0);
+                // SAFETY: mapped above with this length.
+                unsafe { libc::munmap(at, LEN) };
+                let pid = anchor.pid().to_string();
+                let out = (marker_hits(&pid), anonymous_kib(&pid));
+                drop(anchor);
+                cg.destroy().expect("destroy the cgroup");
+                out
+            })
+            .join()
+            .expect("the runner thread")
+        });
+        report(&format!(
+            "fresh_stack_neighbour_is_released: MAP_STACK {stack}: {} copies in the anchor, \
+             Anonymous {kib} kB",
+            hits.len()
+        ));
+        if !hits.is_empty() {
+            kept.push((stack, hits.len()));
+        }
+    }
+    assert_eq!(
+        kept,
+        [],
+        "neighbours whose marker the anchor holds, with the copies"
+    );
+}

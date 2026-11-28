@@ -393,6 +393,31 @@ fn holding(
     Ok(found)
 }
 
+/// Narrows each mapping of `held` to `fresh`, the read-write part of the
+/// stack the anchor was cloned on, where its address lies there: a mapping
+/// line can be that stack merged with a neighbour (review of part 3, run
+/// 3), and the fresh stack is all of it that is the anchor's. A TLS
+/// address outside it (a C library that mapped the thread's TLS apart)
+/// keeps its mapping line. The stack address must lie in `fresh`, else
+/// item 6, EFAULT.
+fn within_fresh(
+    held: [(usize, usize); 3],
+    addrs: [usize; 3],
+    fresh: (usize, usize),
+) -> Result<[(usize, usize); 3], Failure> {
+    let inside = |a: usize| fresh.0 <= a && a < fresh.1;
+    if !inside(addrs[0]) {
+        return Err((6, libc::EFAULT));
+    }
+    let mut out = held;
+    for (slot, &a) in out.iter_mut().zip(addrs.iter()) {
+        if inside(a) {
+            *slot = (slot.0.max(fresh.0), slot.1.min(fresh.1));
+        }
+    }
+    Ok(out)
+}
+
 /// The kept ranges in ascending order of their start: `.bss` ranges from
 /// the parent, the stack window and the two TLS windows (ADR-042, D3),
 /// each window clipped to `held_in`, the mapping that holds its address
@@ -500,9 +525,12 @@ fn frame_below() -> usize {
 /// the `.bss` of each ELF object (`bss`, page-aligned, from the parent),
 /// the stack from [`STACK_BELOW`] under this frame up to `caller`, the
 /// address of a local in the caller's frame, and [`TLS_AROUND`] around this
-/// thread's TLS. Then it holds: every signal blocked, the release's
-/// progress record written, the report pipe and the maps file closed, and
-/// `rt_sigsuspend` with every signal blocked forever, so only SIGKILL
+/// thread's TLS, each window clipped to the mapping that holds its
+/// address and, on the fresh stack the anchor was cloned on, to `fresh`,
+/// that stack's read-write part. Then it holds: every signal blocked, the
+/// release's progress record written, the report pipe and the maps file
+/// closed, and `rt_sigsuspend` with every signal blocked forever, so only
+/// SIGKILL
 /// (`cgroup.kill` of the pod, or the runner through the pidfd) ends it. A
 /// failure is reported as [`Step::Release`] and ends the process.
 #[inline(never)]
@@ -512,6 +540,7 @@ pub(crate) fn release_and_hold(
     bss: &[(usize, usize)],
     page: usize,
     caller: usize,
+    fresh: (usize, usize),
 ) -> ! {
     // Every range that must stay mapped, taken before anything is gone:
     // `bss` is in the runner's heap and is copied here first.
@@ -523,7 +552,9 @@ pub(crate) fn release_and_hold(
     // Both buffers are zeroed here, before anything is gone.
     let mut buf = [0u8; CHUNK];
     let mut ranges = [(0usize, 0usize); RANGES];
-    let held_in = match holding(maps, &mut buf, [stack, tls, errno_at]) {
+    let held_in = match holding(maps, &mut buf, [stack, tls, errno_at])
+        .and_then(|held| within_fresh(held, [stack, tls, errno_at], fresh))
+    {
         Ok(h) => h,
         Err(f) => die(report_fd, f),
     };
@@ -819,6 +850,29 @@ c000-14000 rw-p 00000000 00:00 0 [stack]\n\
         assert_eq!(
             kept_ranges(&bss, 4095, stack, caller, tls, wide, &mut kept),
             Err((6, libc::EINVAL))
+        );
+    }
+
+    #[test]
+    fn windows_end_at_the_fresh_stack() {
+        // Review run 3: the fresh stack merged with a neighbour into one
+        // mapping line; only the fresh stack's part stays.
+        let fresh = (0x10_0000, 0x20_0000);
+        let merged = (0x10_0000, 0x30_0000);
+        let apart = (0x50_0000, 0x50_2000);
+        assert_eq!(
+            within_fresh(
+                [merged, merged, apart],
+                [0x1f_0000, 0x1f_f000, 0x50_0100],
+                fresh
+            ),
+            Ok([fresh, fresh, apart]),
+            "a TLS mapped apart keeps its line"
+        );
+        assert_eq!(
+            within_fresh([merged; 3], [0x20_0000, 0x1f_f000, 0x1f_f000], fresh),
+            Err((6, libc::EFAULT)),
+            "a stack address outside the fresh stack"
         );
     }
 

@@ -994,6 +994,7 @@ mod tests {
             maps: c"/proc/self/maps",
             bss: &[],
             page: 4096,
+            stack: (0, 0),
             cgroup: 43,
         };
         assert_eq!(

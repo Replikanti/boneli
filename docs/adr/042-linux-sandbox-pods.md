@@ -439,9 +439,10 @@ runner is killed, until `cgroup.kill` (`anchor_pins_outlive_the_runner`;
 continues on a copy of the calling thread's stack, with that thread's
 TLS. So `create` and `join` clone the anchor (or a later anchor's first
 stage) from a thread of their own, whose stack is an anonymous mapping
-made for it alone (`pthread_attr_setstack`, 1 MiB with a guard page
-under it). The thread is joined before the call returns, and the mapping
-is unmapped after the join. The C library puts the thread's TLS and
+made for it alone (`pthread_attr_setstack`, 1 MiB with a `PROT_NONE`
+guard page at each end). The thread is joined before the call returns,
+and the mapping is unmapped after the join. The C library puts the
+thread's TLS and
 control block at the top of a stack it is given (glibc; musl does the
 same where they fit and maps a fresh region of its own otherwise), so the
 anchor's stack and TLS hold nothing but this crate's frames. 1 MiB: every
@@ -498,9 +499,21 @@ the rest:
   a few KiB, musl's smaller.
 
 Each window ends at the mapping that holds its address, which the
-release reads from its maps file before the first `munmap`. So a window
-never reaches into a neighbouring mapping, and a window whose address no
-mapping holds fails the setup.
+release reads from its maps file before the first `munmap`, and a window
+whose address no mapping holds fails the setup. A window around an
+address on the fresh stack also ends at that stack's read-write part,
+whose bounds the plan carries; the stack address must lie there. Both
+ends of that part are guarded, because one mapping line is no proof of
+one mapping: with a guard only under it, the fresh stack's top merged
+with a runner mapping right above it into one line, and the TLS window
+kept that neighbour's lowest 64 KiB (review run 3 of part 3, 2,048
+copies of a marker, `fresh_stack_neighbour_is_released`). The
+neighbour in the test is a `MAP_STACK` mapping, which since Linux 6.7
+carries the same flags as the fresh stack. On 5.19 to 6.6, and on a
+kernel without transparent huge pages, any private anonymous mapping
+does, a malloc chunk of 128 KiB or more for one. Either the upper guard
+or the clip alone keeps the neighbour out (measured: 0 copies each);
+with both removed, 1,920 copies stay.
 
 The `.bss` stays because code the compiler emits on its own needs it:
 the first release unmapped it and crashed with SIGSEGV in glibc's

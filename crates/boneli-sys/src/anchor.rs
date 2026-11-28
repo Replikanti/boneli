@@ -286,76 +286,103 @@ fn kill_and_reap(launched: &Launched) {
     let _ = reap(&launched.pidfd);
 }
 
-/// The stack an anchor is cloned on (ADR-042, D3): the clone continues on
-/// a copy of the calling thread's stack and holds its TLS, so an anchor is
-/// cloned from a thread of its own, on a stack mapped for it alone. The
-/// thread's start, the clone and the child's whole setup ran with every
-/// test passing on a 128 KiB stack and failed on 64 KiB (measured,
-/// unoptimized, review run 2 of part 3); 1 MiB is eight times what was
-/// enough, and the guard page under it turns an overflow into a SIGSEGV
-/// that fails the setup.
+/// The size of the stack an anchor is cloned on (ADR-042, D3): the clone
+/// continues on a copy of the calling thread's stack and holds its TLS, so
+/// an anchor is cloned from a thread of its own, on a stack mapped for it
+/// alone ([`FreshStack`]). The thread's start, the clone and the child's
+/// whole setup ran with every test passing on a 128 KiB stack and failed
+/// on 64 KiB (measured, unoptimized, review run 2 of part 3); 1 MiB is
+/// eight times what was enough.
 const ANCHOR_STACK: usize = 1 << 20;
 
-/// [`launch`] on a new thread whose stack is a fresh anonymous mapping of
-/// [`ANCHOR_STACK`] with a guard page under it (`pthread_attr_setstack`),
-/// joined before this returns; the mapping is unmapped after the join. The
-/// clone copies that thread only: its stack holds nothing but this
-/// crate's own frames, and the C library puts the thread's TLS and control
-/// block at the top of a stack it was given, so they are fresh too. Not
-/// `std::thread`: glibc caches the stacks of exited threads and hands them
-/// out again with their contents (review of part 3, run 2).
-fn launch_on_fresh_stack(plan: &ChildPlan<'_>) -> Result<Launched> {
-    let page = crate::cgroup::page_size() as usize;
-    let len = ANCHOR_STACK + page;
-    // SAFETY: an anonymous private mapping takes no file and no address.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(Error::last("mmap(anchor stack)"));
-    }
-    let (result, joined) = launch_on(plan, base, page);
-    if joined {
-        // SAFETY: the mapping was made above with this length, and no
-        // thread runs on it any more; the anchor holds its own copy.
-        unsafe { libc::munmap(base, len) };
-    }
-    result
-}
-
-/// The thread part of [`launch_on_fresh_stack`], on the mapping at `base`,
-/// and whether no thread runs on the mapping any more. A thread that could
-/// not be joined, which only a bug causes, keeps its stack: it is never
-/// unmapped from under it.
-fn launch_on(
-    plan: &ChildPlan<'_>,
+/// The stack an anchor is cloned on (ADR-042, D3): [`ANCHOR_STACK`] bytes
+/// of a fresh anonymous mapping with a `PROT_NONE` guard page at each end.
+/// The guard under it turns an overflow into a SIGSEGV that fails the
+/// setup. The guard above it keeps its read-write part from ever merging
+/// with a runner mapping right above it into one mapping, whose runner
+/// part the release would then take for this stack (review of part 3, run
+/// 3: 64 KiB of a neighbouring buffer were kept). The release also clips
+/// its windows to [`FreshStack::bounds`], so a merge it did not foresee
+/// keeps nothing either.
+struct FreshStack {
     base: *mut libc::c_void,
+    len: usize,
     page: usize,
-) -> (Result<Launched>, bool) {
-    match run_on(plan, base, page) {
-        Ok(result) => (result, true),
-        Err((e, joined)) => (Err(e), joined),
+}
+
+impl FreshStack {
+    fn new() -> Result<FreshStack> {
+        let page = crate::cgroup::page_size() as usize;
+        let len = ANCHOR_STACK + 2 * page;
+        // SAFETY: an anonymous private mapping takes no file and no address.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(Error::last("mmap(anchor stack)"));
+        }
+        let stack = FreshStack { base, len, page };
+        let top = base.cast::<u8>().wrapping_add(len - page).cast();
+        for guard in [base, top] {
+            // SAFETY: a page of the mapping made above.
+            if unsafe { libc::mprotect(guard, page, libc::PROT_NONE) } < 0 {
+                // The drop unmaps the whole mapping.
+                return Err(Error::last("mprotect(anchor stack guard)"));
+            }
+        }
+        Ok(stack)
+    }
+
+    /// The read-write part, `[start, end)`, between the guard pages.
+    fn bounds(&self) -> (usize, usize) {
+        let start = self.base as usize + self.page;
+        (start, start + ANCHOR_STACK)
+    }
+
+    /// [`launch`] on a new thread on this stack (`pthread_attr_setstack`),
+    /// joined before this returns; the mapping is unmapped after the join.
+    /// The clone copies that thread only: its stack holds nothing but this
+    /// crate's own frames, and the C library puts the thread's TLS and
+    /// control block at the top of a stack it was given, so they are fresh
+    /// too. Not `std::thread`: glibc caches the stacks of exited threads
+    /// and hands them out again with their contents (review of part 3, run
+    /// 2). A thread that could not be joined, which only a bug causes,
+    /// keeps its stack: it is never unmapped from under it.
+    fn launch(self, plan: &ChildPlan<'_>) -> Result<Launched> {
+        let (result, joined) = match run_on(plan, self.base, self.page) {
+            Ok(result) => (result, true),
+            Err((e, joined)) => (Err(e), joined),
+        };
+        if !joined {
+            std::mem::forget(self);
+        }
+        result
     }
 }
 
-/// [`launch_on`]: `Ok` with the launch's result once the thread was
-/// joined, `Err` with the error and whether no thread runs on the stack.
+impl Drop for FreshStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping was made by new() with this length, and no
+        // thread runs on it any more; an anchor holds its own copy.
+        unsafe { libc::munmap(self.base, self.len) };
+    }
+}
+
+/// [`FreshStack::launch`]: `Ok` with the launch's result once the thread
+/// was joined, `Err` with the error and whether no thread runs on the
+/// stack.
 fn run_on(
     plan: &ChildPlan<'_>,
     base: *mut libc::c_void,
     page: usize,
 ) -> std::result::Result<Result<Launched>, (Error, bool)> {
-    // SAFETY: the first page of the mapping made by the caller.
-    if unsafe { libc::mprotect(base, page, libc::PROT_NONE) } < 0 {
-        return Err((Error::last("mprotect(anchor stack guard)"), true));
-    }
     let mut result: Option<Result<Launched>> = None;
     let mut job = || result = Some(launch(plan));
     let mut job: &mut dyn FnMut() = &mut job;
@@ -379,7 +406,7 @@ fn run_on(
             true,
         ));
     }
-    // SAFETY: the stack is the mapping above its guard page, ANCHOR_STACK
+    // SAFETY: the stack is the mapping between its guard pages, ANCHOR_STACK
     // bytes, page-aligned and used by nothing else.
     let rc = unsafe {
         libc::pthread_attr_setstack(
@@ -697,6 +724,7 @@ impl Anchor {
 
     pub(crate) fn create_inner(spec: &AnchorSpec<'_>, fault: Fault) -> Result<Anchor> {
         let prepared = prepare(spec, true)?;
+        let stack = FreshStack::new()?;
         let staging = staging_of(&spec.root)?;
         let (_, euid, _, egid) = caller();
         let uid_line = spec.ids.uid_map_line(euid).into_bytes();
@@ -720,11 +748,12 @@ impl Anchor {
                 &keep,
                 &hold,
                 spec.cgroup.dir_fd(),
+                stack.bounds(),
             )),
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let launched = launch_on_fresh_stack(&plan)?;
+        let launched = stack.launch(&plan)?;
         drop(write);
         drop(resume_child);
         let anchor = Anchor {
@@ -797,6 +826,7 @@ impl Anchor {
             ));
         }
         let prepared = prepare(spec, false)?;
+        let stack = FreshStack::new()?;
         let tid = TidPage::new()?;
         let staging = staging_of(&spec.root)?;
         let cgroup = dup_raw(self.cgroup.as_raw_fd())?;
@@ -828,12 +858,13 @@ impl Anchor {
                     &keep,
                     &hold,
                     self.cgroup.as_raw_fd(),
+                    stack.bounds(),
                 )),
             }),
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let first = launch_on_fresh_stack(&plan)?;
+        let first = stack.launch(&plan)?;
         drop(write);
         drop(resume_child);
         let mut reports = Reports {
@@ -1048,6 +1079,7 @@ fn anchor_plan<'a>(
     keep: &'a [RawFd],
     hold: &'a [RawFd],
     cgroup: RawFd,
+    stack: (usize, usize),
 ) -> AnchorPlan<'a> {
     AnchorPlan {
         ops: &prepared.ops,
@@ -1063,6 +1095,7 @@ fn anchor_plan<'a>(
         maps: &prepared.maps,
         bss: &prepared.bss,
         page: prepared.page,
+        stack,
         cgroup,
     }
 }

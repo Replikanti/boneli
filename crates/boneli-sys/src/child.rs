@@ -423,6 +423,10 @@ pub(crate) struct AnchorPlan<'a> {
     pub bss: &'a [(usize, usize)],
     /// The page size.
     pub page: usize,
+    /// The read-write part of the fresh stack the anchor was cloned on,
+    /// `[start, end)`: the release clips its stack and TLS windows to it
+    /// (ADR-042, D3).
+    pub stack: (usize, usize),
     /// The pod's cgroup, for `CLONE_INTO_CGROUP`.
     pub cgroup: c_int,
 }
@@ -1132,7 +1136,7 @@ fn anchor_steps(a: &AnchorPlan<'_>, report_fd: c_int, fault: Fault) -> Result<()
     // stays above the release's.
     let frame = 0u8;
     let caller = std::hint::black_box(&frame) as *const u8 as usize;
-    crate::release::release_and_hold(maps, report_fd, a.bss, a.page, caller)
+    crate::release::release_and_hold(maps, report_fd, a.bss, a.page, caller, a.stack)
 }
 
 /// The first stage of a join (ADR-042, D3), then, in the second stage it
