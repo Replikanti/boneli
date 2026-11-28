@@ -467,7 +467,7 @@ fn run_on(plan: &ChildPlan<'_>, base: *mut libc::c_void, page: usize) -> Result<
         });
     }
     #[cfg(test)]
-    let skip = matches!(plan.fault, Fault::JoinFails);
+    let skip = matches!(plan.fault, Fault::JoinFails | Fault::JoinFailsAfterExit);
     #[cfg(not(test))]
     let skip = false;
     let rc = if skip {
@@ -485,6 +485,10 @@ fn run_on(plan: &ChildPlan<'_>, base: *mut libc::c_void, page: usize) -> Result<
         if done.load(Ordering::Acquire)
             && let Some(Ok(launched)) = result.take()
         {
+            #[cfg(test)]
+            if matches!(plan.fault, Fault::JoinFailsAfterExit) {
+                let _ = ready_by(&launched.pidfd, Instant::now() + Duration::from_secs(10));
+            }
             kill_and_reap(&launched);
         }
         return Err(Error::Sys {
@@ -925,7 +929,20 @@ impl Anchor {
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let first = stack.launch(&plan)?;
+        let first = match stack.launch(&plan) {
+            Ok(first) => first,
+            Err(e) => {
+                // The launch killed and reaped the first stage if it had
+                // cloned one (a failed join of its thread, part 4); once it
+                // is gone, the page holds the second stage's pid, if the
+                // first had cloned it, and nothing else reaps that child.
+                let pid = tid.pid();
+                if pid > 0 {
+                    kill_pid(pid);
+                }
+                return Err(e);
+            }
+        };
         drop(write);
         drop(resume_child);
         let mut reports = Reports {
@@ -1442,24 +1459,35 @@ mod tests {
         let cg = sandbox_cgroup("join-fails");
         let s = spec(&unit, &cg, Duration::from_secs(10));
         let pod = holding(&s);
-        for later in [false, true] {
+        // A later anchor's first stage may have cloned the second before
+        // it is killed: `JoinFailsAfterExit` makes that certain (CI showed
+        // the second stage left unreaped where the race went that way).
+        for (later, fault) in [
+            (false, Fault::JoinFails),
+            (true, Fault::JoinFails),
+            (true, Fault::JoinFailsAfterExit),
+        ] {
             FRESH.with(|f| f.set((0, 0)));
             let result = if later {
-                pod.join_inner(&s, Fault::JoinFails).map(|_| ())
+                pod.join_inner(&s, fault).map(|_| ())
             } else {
-                Anchor::create_inner(&s, Fault::JoinFails).map(|_| ())
+                Anchor::create_inner(&s, fault).map(|_| ())
             };
             match result {
                 Err(Error::Sys {
                     call: "pthread_join(anchor stack)",
                     errno: libc::EINVAL,
                 }) => {}
-                other => panic!("later {later}: {other:?}"),
+                other => panic!("{fault:?}, later {later}: {other:?}"),
             }
             let (mapped, unmapped) = FRESH.with(std::cell::Cell::get);
-            assert_ne!(mapped, 0, "later {later}: a fresh stack was mapped");
-            assert_eq!(unmapped, mapped, "later {later}: and unmapped");
-            assert_eq!(children(), vec![pod.pid()], "later {later}: reaped");
+            assert_ne!(mapped, 0, "{fault:?}: a fresh stack was mapped");
+            assert_eq!(unmapped, mapped, "{fault:?}: and unmapped");
+            assert_eq!(
+                children(),
+                vec![pod.pid()],
+                "{fault:?}, later {later}: reaped"
+            );
         }
         drop(pod);
         drop(s);

@@ -455,8 +455,14 @@ thread, which frees the C library's record of an ended joinable thread
 (glibc keeps that record in a list, on the fresh stack itself, until a
 join or a detach; unmapped without it, the list would point into freed
 memory), kills and reaps what the thread launched, unmaps the stack and
-fails with `pthread_join`'s errno (`failed_join_unmaps_the_fresh_stack`,
-which skips the join through a test seam). A tid comes back only after
+fails with `pthread_join`'s errno. For a later anchor what was launched
+is the first stage, which may have cloned the second already: once the
+first is reaped, the pid page (above) holds the second's pid, and `join`
+kills and reaps it too. The first version of this left that second stage
+unreaped on both CI legs, where the race went that way, and not on the
+dev host (`failed_join_unmaps_the_fresh_stack`, which skips the join
+through a test seam, and with `JoinFailsAfterExit` waits until the first
+stage has exited by itself, so the second always exists). A tid comes back only after
 the kernel's cyclic allocation has gone round all of `pid_max`, so the
 wait cannot take a new thread for this one. Before part 4, a failed join
 returned at once and left the mapping mapped, and the thread could still

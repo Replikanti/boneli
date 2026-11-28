@@ -1208,8 +1208,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   7, EFAULT), so a C library that maps a large TLS apart (musl) fails
   `create` instead of keeping a window only its mapping line bounds; a
   failed `pthread_join` of the clone's thread waits until the thread is
-  gone, detaches it, kills and reaps what it launched and unmaps the
-  fresh stack, where it used to return at once with the mapping kept.
+  gone, detaches it, kills and reaps what it launched (for a later
+  anchor also the second stage, from the pid page) and unmaps the fresh
+  stack, where it used to return at once with the mapping kept.
 - `boneli-sys` seccomp program (part 1 of #45, ADR-043 D2, amending
   ADR-007 D2): every errno row returns at an instruction of its own
   (`Program::row_at`), so the program has 104 instructions instead of 88;

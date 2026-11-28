@@ -538,6 +538,10 @@ pub(crate) enum Fault {
     /// The runner side of an anchor's launch skips `pthread_join` and takes
     /// it as failed with EINVAL, while the thread may still run (part 4).
     JoinFails,
+    /// As `JoinFails`, and the failure path first waits until the launched
+    /// process has exited by itself: a join's first stage, which by then
+    /// has cloned the second (part 4).
+    JoinFailsAfterExit,
 }
 
 /// The bytes [`Fault::Stale`] writes, XOR-masked with 0xa5 so that the
