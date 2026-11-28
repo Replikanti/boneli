@@ -31,6 +31,7 @@ use crate::ffi;
 use crate::ids::Ids;
 use crate::mount::{self, InsidePath, Mount, Op, Root};
 use crate::privileges::PrivilegeDrop;
+use crate::release;
 use crate::report::{self, Record};
 use crate::seccomp::notify::Seam;
 use crate::spawn::{
@@ -142,6 +143,8 @@ struct Prepared {
     fill_at: usize,
     maps: CString,
     filters: Filters,
+    bss: Vec<(usize, usize)>,
+    page: usize,
 }
 
 fn prepare(spec: &AnchorSpec<'_>, loopback: bool) -> Result<Prepared> {
@@ -174,12 +177,70 @@ fn prepare(spec: &AnchorSpec<'_>, loopback: bool) -> Result<Prepared> {
         format!("{}/self/maps", proc.as_str()).into_bytes(),
         "the procfs path",
     )?;
+    let page = crate::cgroup::page_size() as usize;
     Ok(Prepared {
         ops,
         fill_at,
         maps,
         filters: spawn::prepare_filters()?,
+        bss: bss_ranges(page)?,
+        page,
     })
+}
+
+/// The `.bss` of every ELF object loaded in this process, page-aligned:
+/// for each `PT_LOAD` whose memory size exceeds its file size, the pages
+/// from the end of its file part, rounded up, to the end of its memory,
+/// rounded up. The loader maps exactly these as anonymous memory; the
+/// partial page before them is part of the file mapping. An anchor keeps
+/// them through its release (ADR-042, D3), and only them: an unnamed
+/// mapping next to a named one is no evidence of a `.bss`. More than
+/// [`release::BSS_MAX`] is [`Error::InvalidAnchor`].
+fn bss_ranges(page: usize) -> Result<Vec<(usize, usize)>> {
+    unsafe extern "C" fn each(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> c_int {
+        // SAFETY: data is the Vec passed to dl_iterate_phdr below, which
+        // outlives the iteration and is used by nothing else meanwhile.
+        let out = unsafe { &mut *data.cast::<Vec<(usize, usize, usize)>>() };
+        // SAFETY: the loader passes a valid dl_phdr_info for the call.
+        let info = unsafe { &*info };
+        for i in 0..usize::from(info.dlpi_phnum) {
+            // SAFETY: dlpi_phdr points at dlpi_phnum program headers, so the
+            // i-th lies inside that array.
+            let at = unsafe { info.dlpi_phdr.add(i) };
+            // SAFETY: as above; the header is valid for reads.
+            let ph = unsafe { &*at };
+            if ph.p_type == libc::PT_LOAD && ph.p_memsz > ph.p_filesz {
+                let at = info.dlpi_addr as usize + ph.p_vaddr as usize;
+                out.push((at, ph.p_filesz as usize, ph.p_memsz as usize));
+            }
+        }
+        0
+    }
+    let mut segments: Vec<(usize, usize, usize)> = Vec::new();
+    // SAFETY: the callback only reads the headers the loader passes and
+    // writes to the Vec behind data.
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(each),
+            (&mut segments as *mut Vec<(usize, usize, usize)>).cast(),
+        )
+    };
+    let up = |a: usize| a.saturating_add(page - 1) & !(page - 1);
+    let bss: Vec<(usize, usize)> = segments
+        .into_iter()
+        .map(|(at, file, mem)| (up(at.saturating_add(file)), up(at.saturating_add(mem))))
+        .filter(|(start, end)| end > start)
+        .collect();
+    if bss.len() > release::BSS_MAX {
+        return Err(Error::InvalidAnchor(
+            "more ELF objects with a .bss than an anchor's release keeps",
+        ));
+    }
+    Ok(bss)
 }
 
 /// The resume socket of an anchor's fill point, `(runner, anchor)`, both
@@ -851,6 +912,8 @@ fn anchor_plan<'a>(
             listener: false,
         },
         maps: &prepared.maps,
+        bss: &prepared.bss,
+        page: prepared.page,
         cgroup,
     }
 }
@@ -1247,6 +1310,50 @@ mod tests {
         assert_eq!(children(), vec![pod.pid()], "join: both stages reaped");
         drop(pod);
         cg.destroy().expect("destroy the cgroup");
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn concurrent_setup_pid_page_is_released() {
+        // Review run 1: while an exec waits for its second stage, its pid
+        // page is mapped shared in the runner. A pod created meanwhile
+        // must not keep it, nor the mapping above it.
+        let _host = host_lock();
+        let unit = UnitRoot::new();
+        let cg = sandbox_cgroup("tid-page");
+        let cg_other = sandbox_cgroup("tid-page-other");
+        let pod = holding(&spec(&unit, &cg, Duration::from_secs(10)));
+        let (maps, exec) = std::thread::scope(|s| {
+            let exec = s.spawn(|| {
+                pod.exec_inner(
+                    &exec_spec("/bin/true", Duration::from_secs(3)),
+                    stdio(),
+                    Fault::Hang(Step::Setsid),
+                    Seam::None,
+                )
+                .map(|_| ())
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while children().len() < 2 {
+                assert!(Instant::now() < deadline, "no second stage");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let other = holding(&spec(&unit, &cg_other, Duration::from_secs(10)));
+            let maps = std::fs::read_to_string(format!("/proc/{}/maps", other.pid()))
+                .expect("the other anchor's maps");
+            drop(other);
+            (maps, exec.join().expect("the exec thread"))
+        });
+        assert!(matches!(exec, Err(Error::SetupTimeout(_))), "{exec:?}");
+        drop(pod);
+        cg.destroy().expect("destroy the cgroup");
+        cg_other.destroy().expect("destroy the other cgroup");
+        assert!(
+            !maps
+                .lines()
+                .any(|l| l.contains("/dev/zero") || l.contains(" rw-s ")),
+            "a concurrent setup's shared pid page is kept:\n{maps}"
+        );
     }
 
     #[test]

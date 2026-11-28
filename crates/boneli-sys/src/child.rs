@@ -135,7 +135,9 @@ pub enum Step {
     /// An anchor's memory release and hold: a progress record once only
     /// its pins are left. As a failure, item 0 opening its maps, 1 reading
     /// them, 2 a line it cannot parse, 3 an `munmap`, 4 a release that has
-    /// not ended within its passes, 5 the signal mask (ADR-042, D3).
+    /// not ended within its passes, 5 the signal mask, 6 the kept ranges
+    /// (more `.bss` ranges than it holds, a bad page size or caller frame)
+    /// (ADR-042, D3).
     Release = 36,
 }
 
@@ -416,6 +418,11 @@ pub(crate) struct AnchorPlan<'a> {
     pub privileges: PrivilegeDrop<'a>,
     /// `<procfs>/self/maps` in its own root, which the release reads.
     pub maps: &'a CStr,
+    /// The `.bss` ranges of the runner's ELF objects, page-aligned, which
+    /// the release keeps (ADR-042, D3).
+    pub bss: &'a [(usize, usize)],
+    /// The page size.
+    pub page: usize,
     /// The pod's cgroup, for `CLONE_INTO_CGROUP`.
     pub cgroup: c_int,
 }
@@ -1079,7 +1086,13 @@ fn anchor_steps(a: &AnchorPlan<'_>, report_fd: c_int, fault: Fault) -> Result<()
     if maps < 0 {
         return Err(fail(Step::Release, 0, errno()));
     }
-    crate::release::release_and_hold(maps, report_fd)
+    // A local of this frame: the release keeps the stack up to it and no
+    // further, since nothing above is ever returned to. Its address
+    // escapes into the call, so the call is no tail call and this frame
+    // stays above the release's.
+    let frame = 0u8;
+    let caller = std::hint::black_box(&frame) as *const u8 as usize;
+    crate::release::release_and_hold(maps, report_fd, a.bss, a.page, caller)
 }
 
 /// The first stage of a join (ADR-042, D3), then, in the second stage it

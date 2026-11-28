@@ -283,7 +283,8 @@ pub enum Error {
     },
     /// An anchor (ADR-042, D3) was asked for something its spec or state
     /// does not allow: a fill point past the last mount, a root without a
-    /// procfs or a minimal `/dev`, other ids than its pod's, an exec
+    /// procfs or a minimal `/dev`, more ELF objects with a `.bss` than its
+    /// release keeps, other ids than its pod's, an exec
     /// before the fill point was resumed, or an anchor that has failed.
     InvalidAnchor(&'static str),
 }

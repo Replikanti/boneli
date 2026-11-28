@@ -797,3 +797,226 @@ fn setup_timing_report() {
     drop(first);
     cg.destroy().expect("destroy the cgroup");
 }
+
+/// `(start, end)` of every mapping of `pid`.
+fn ranges_of(pid: &str) -> Vec<(usize, usize)> {
+    std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .expect("read maps")
+        .lines()
+        .filter_map(|l| {
+            let (s, e) = l.split_whitespace().next()?.split_once('-')?;
+            Some((
+                usize::from_str_radix(s, 16).ok()?,
+                usize::from_str_radix(e, 16).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Whether `pid` maps `addr`, and if so whether `want` reads back there
+/// through `/proc/<pid>/mem`.
+fn holds(pid: &str, addr: usize, want: &[u8]) -> (bool, bool) {
+    use std::io::{Seek, SeekFrom};
+    let mapped = ranges_of(pid).iter().any(|&(s, e)| s <= addr && addr < e);
+    if !mapped {
+        return (false, false);
+    }
+    let mut mem = File::open(format!("/proc/{pid}/mem")).expect("open mem");
+    mem.seek(SeekFrom::Start(addr as u64)).expect("seek");
+    let mut got = vec![0u8; want.len()];
+    let read = mem.read_exact(&mut got).is_ok() && got == want;
+    (true, read)
+}
+
+/// A secret marker no test writes elsewhere.
+const SECRET: &[u8] = b"boneli-anchor-secret-marker-7f3a5c91e0d2";
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, cgroup v2 delegation"]
+fn runner_buffers_next_to_named_mappings_are_released() {
+    // Review run 1: a runner buffer that starts where a named mapping
+    // ends, a shared anonymous page (the pid page of a concurrent join)
+    // or a private file mapping, is runner heap, not an ELF object's
+    // `.bss`, and goes with the release.
+    const LEN: usize = 32 << 20;
+    let fixture = Fixture::new("anchor-adjacent");
+    let exe = File::open(std::env::current_exe().expect("current_exe")).expect("open the binary");
+    for below in ["shared page", "file mapping"] {
+        // SAFETY: an anonymous private mapping with no address hint.
+        let buf = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(buf, libc::MAP_FAILED);
+        // SAFETY: buf is LEN writable bytes, used only here.
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), LEN) };
+        for i in (0..LEN).step_by(4096) {
+            slice[i] = 1;
+        }
+        slice[8192..8192 + SECRET.len()].copy_from_slice(SECRET);
+        let (flags, fd, prot) = if below == "shared page" {
+            (
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        } else {
+            (libc::MAP_PRIVATE, exe.as_raw_fd(), libc::PROT_READ)
+        };
+        // SAFETY: one page right below the buffer, refused if anything is
+        // mapped there.
+        let page = unsafe {
+            libc::mmap(
+                (buf as usize - 4096) as *mut libc::c_void,
+                4096,
+                prot,
+                flags | libc::MAP_FIXED_NOREPLACE,
+                fd,
+                0,
+            )
+        };
+        assert_eq!(
+            page as usize,
+            buf as usize - 4096,
+            "{below} right below the buffer"
+        );
+        let cg = cgroup::sandbox("anchor-adjacent");
+        let anchor = pod(&fixture, &cg, "adjacent", Vec::new());
+        // The runner is done with the secret: it zeroes and unmaps both.
+        slice[8192..8192 + SECRET.len()].fill(0);
+        // SAFETY: both were mapped above with these lengths.
+        unsafe { libc::munmap(buf, LEN) };
+        // SAFETY: as above.
+        unsafe { libc::munmap(page, 4096) };
+        let pid = anchor.pid().to_string();
+        let (mapped, readable) = holds(&pid, buf as usize + 8192, SECRET);
+        let kib = anonymous_kib(&pid);
+        report(&format!(
+            "runner_buffers_next_to_named_mappings_are_released: after a {below}: \
+             buffer mapped {mapped}, secret readable {readable}, anchor Anonymous {kib} kB"
+        ));
+        assert!(
+            !mapped,
+            "the anchor keeps the runner's buffer after a {below}"
+        );
+        drop(anchor);
+        cg.destroy().expect("destroy the cgroup");
+    }
+}
+
+/// Set when the test below re-executes this binary: the constructor then
+/// creates a pod on the process's main thread, before libtest's `main`.
+const MAIN_ANCHOR_VAR: &str = "BONELI_SYS_MAIN_ANCHOR";
+
+/// The environment variable whose value the main-thread runner holds on
+/// its `[stack]`, as a token in a runner's environment would be.
+const MAIN_SECRET_VAR: &str = "BONELI_SYS_MAIN_SECRET";
+
+// Runs on the main thread before `main` (ELF `.init_array`), where libtest
+// would never run a test: the only way to clone an anchor from the
+// runner's main thread, whose `[stack]` holds `envp` and `argv`.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static MAIN_ANCHOR: extern "C" fn() = main_anchor;
+
+/// Fills a deep stack frame with the secret and returns its address:
+/// stale data far below the frame that creates the anchor.
+#[inline(never)]
+fn stale_secret() -> usize {
+    let mut frame = [0u8; 1 << 20];
+    frame[..SECRET.len()].copy_from_slice(SECRET);
+    std::hint::black_box(&mut frame);
+    frame.as_ptr() as usize
+}
+
+extern "C" fn main_anchor() {
+    if std::env::var_os(MAIN_ANCHOR_VAR).is_none() {
+        return;
+    }
+    // SAFETY: the name is NUL-terminated; getenv returns a pointer into the
+    // environment block on the main thread's stack, or null.
+    let env = unsafe { libc::getenv(c"BONELI_SYS_MAIN_SECRET".as_ptr()) } as usize;
+    let stale = stale_secret();
+    let fixture = Fixture::new("anchor-main");
+    let cg = cgroup::sandbox("anchor-main");
+    let anchor = pod(&fixture, &cg, "main", Vec::new());
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "anchor={} env={env} stale={stale}", anchor.pid());
+    let _ = out.flush();
+    // Holds the pod until the test closes stdin.
+    let mut rest = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut rest);
+    drop(anchor);
+    let code = i32::from(cg.destroy().is_err());
+    let _ = out.flush();
+    // SAFETY: _exit ends the process before libtest's main runs.
+    unsafe { libc::_exit(code) }
+}
+
+#[test]
+#[ignore = "host: unprivileged user namespaces, cgroup v2 delegation"]
+fn main_thread_anchor_keeps_no_runner_stack() {
+    // Review run 1: an anchor cloned on the runner's main thread kept that
+    // thread's whole `[stack]`: the environment block at its top and the
+    // stale frames below.
+    let secret = std::str::from_utf8(SECRET).expect("ascii");
+    let mut runner = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args(["--exact", "probe", "--quiet"])
+        .env_clear()
+        .env(MAIN_ANCHOR_VAR, "1")
+        .env(MAIN_SECRET_VAR, secret)
+        .env(cgroup::TEST_CGROUP_VAR, "self")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the main-thread runner");
+    let mut line = String::new();
+    BufReader::new(runner.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("the runner's line");
+    let field = |k: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|f| f.strip_prefix(&format!("{k}=")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {k} in {line:?}"))
+    };
+    let (anchor, env, stale) = (field("anchor").to_string(), field("env"), field("stale"));
+    let runner_pid = runner.id().to_string();
+    // The control: both secrets are where the runner says.
+    assert_eq!(
+        holds(&runner_pid, env, SECRET),
+        (true, true),
+        "env in the runner"
+    );
+    assert_eq!(
+        holds(&runner_pid, stale, SECRET),
+        (true, true),
+        "stale frame in the runner"
+    );
+    let in_env = holds(&anchor, env, SECRET);
+    let in_stale = holds(&anchor, stale, SECRET);
+    let kib = anonymous_kib(&anchor);
+    report(&format!(
+        "main_thread_anchor_keeps_no_runner_stack: env {in_env:?}, stale frame {in_stale:?}, \
+         anchor Anonymous {kib} kB"
+    ));
+    drop(runner.stdin.take());
+    let status = runner.wait().expect("reap the runner");
+    assert!(status.success(), "the runner's teardown: {status:?}");
+    assert_eq!(
+        in_env,
+        (false, false),
+        "the anchor keeps the runner's environment"
+    );
+    assert_eq!(
+        in_stale,
+        (false, false),
+        "the anchor keeps a stale runner frame"
+    );
+}

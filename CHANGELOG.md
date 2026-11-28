@@ -1153,13 +1153,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its own pidfd. An anchor waits at its fill point (`Fill::open` beneath
   its new root through `/proc/<pid>/root` without following any symlink,
   `Fill::loopback`, `Fill::resume`), then pivots, drops every privilege,
-  loads the plain seccomp program, keeps only its pins and unmaps the
-  runner's anonymous memory but its stack, its TLS and the `.bss` of each
-  ELF object (656 kB left of 263,332 kB measured). The setup report
-  gains progress records and steps 31 to 36; `Mount::Tmpfs` gains
-  `inodes`. Host tests on both CI legs, among them every step's failure
-  report for the three new sequences, `setup_timing_report`, and the
-  memory, descriptor, privilege, PID-namespace and loopback checks.
+  loads the plain seccomp program, keeps only its pins and unmaps every
+  shared and anonymous mapping of the runner but a 64 KiB stack window
+  under its own frame, 64 KiB around its TLS and each ELF object's `.bss`
+  from its `PT_LOAD` headers (560 kB left of 263,304 kB measured; the
+  environment and stale frames of a main-thread runner go too). The
+  setup report gains progress records and steps 31 to 36;
+  `Mount::Tmpfs` gains `inodes`. Host tests on both CI legs, among them
+  every step's failure report for the three new sequences,
+  `setup_timing_report`, and the memory, descriptor, privilege,
+  PID-namespace and loopback checks.
 
 ### Changed
 

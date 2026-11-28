@@ -436,27 +436,63 @@ runner is killed, until `cgroup.kill` (`anchor_pins_outlive_the_runner`;
 #33 sweeps such pods after a crash).
 
 **The memory release.** An anchor never execs, so without a release it
-keeps a copy-on-write image of the runner's anonymous memory as it was at
-the clone, for the pod's life: up to that much memory per container,
-buffers the runner has freed since included. Last in its setup, it reads
-its own `/proc/self/maps` (in its own procfs, which is why an anchor's
-root needs a `Mount::Proc`; it also needs a `Mount::Dev`, whose `null`
-covers an exec's procfs keys) and unmaps every anonymous mapping (no
-name, `[heap]`, `[stack…]`, `[anon:…]`) except three kinds: the one that
-holds its stack pointer, the ones that hold a thread-local of the crate
-and libc's `errno` (its thread's TLS block), and each unnamed mapping
-that starts where a file mapping ends, which is that ELF object's
-`.bss`. The `.bss` stays because code the compiler emits on its own needs
-it: the first release unmapped it and crashed with SIGSEGV in glibc's
+keeps a copy-on-write image of the runner's memory as it was at the
+clone, for the pod's life and past the runner's own exit: up to that
+much memory per container, buffers the runner has freed or zeroed since
+included. Last in its setup, it reads its own `/proc/self/maps` (in its
+own procfs, which is why an anchor's root needs a `Mount::Proc`; it also
+needs a `Mount::Dev`, whose `null` covers an exec's procfs keys) and
+unmaps every shared mapping, whatever its name (an anonymous shared page
+reads as `/dev/zero (deleted)`, a memfd and SysV memory have names too),
+and every anonymous one (no name, `[heap]`, `[stack…]`, `[anon:…]`),
+except three kinds of ranges; a mapping that holds part of one loses
+the rest:
+
+- each ELF object's `.bss`, from its `PT_LOAD` headers, which the parent
+  reads before the clone (`dl_iterate_phdr`): for each segment whose
+  memory size exceeds its file size, the pages from the end of its file
+  part to the end of its memory, both rounded up to a page, which is
+  what the loader maps as anonymous memory. At most 64 such ranges
+  (`BSS_MAX`; the dev host's runner has four objects, the binary, libc,
+  libgcc_s and the loader), else `create` fails before the clone;
+- the stack from 64 KiB under the release's frame up to a local of its
+  caller's frame: nothing above is ever returned to, and the calls after
+  the first `munmap` (the scan, libc's `syscall`) are a few KiB deep even
+  unoptimized, so 64 KiB is a margin of more than ten. The local's
+  address escapes into the call, so the call cannot become a tail call
+  that would put the caller's frame below the release's, and the release
+  refuses a caller address not above its own frame;
+- 64 KiB around each of two thread-locals, one of the crate and libc's
+  `errno`: glibc's static TLS block with its surplus and the thread
+  control block, which holds the stack protector's canary on x86_64, are
+  a few KiB, musl's smaller.
+
+The `.bss` stays because code the compiler emits on its own needs it:
+the first release unmapped it and crashed with SIGSEGV in glibc's
 `memset`, which zeroed a stack buffer and read its size threshold from
-libc's `.bss` (measured from the core dump). The rest of the code after
-the first `munmap` uses only its arguments, stack memory and raw
-`syscall`s, zeroes its buffers before the first `munmap`, compares and
-resets byte by byte, and cannot panic. Then it blocks every signal,
-writes its last record, closes the report pipe and waits in
-`rt_sigsuspend` with every signal blocked, so only SIGKILL ends it. A
-libc that kept a thread's TLS where none of these addresses lies would
-make the anchor crash here, which fails `create`: fail closed.
+libc's `.bss` (measured from the core dump). The first version took an
+unnamed mapping that starts where a named one ends for a `.bss`, and
+kept the whole mapping that held the stack pointer. Review run 1 of
+part 3 showed both wrong. A 32 MiB runner buffer right above a shared
+page (the pid page of a join running in another thread) or above a
+private file mapping was kept, and a secret in it read back through
+`/proc/<anchor>/mem` after the runner had zeroed and unmapped it
+(`runner_buffers_next_to_named_mappings_are_released`,
+`concurrent_setup_pid_page_is_released`). An anchor created on the
+runner's main thread kept that thread's whole `[stack]`, the environment
+block at its top and stale frames below
+(`main_thread_anchor_keeps_no_runner_stack`, which creates the anchor
+from an `.init_array` constructor of the test binary, the one place
+before libtest's threads). The rest of the code after the first `munmap`
+uses only its arguments, stack memory and raw `syscall`s, zeroes its
+buffers before the first `munmap`, compares and resets byte by byte, and
+cannot panic. Then it blocks every signal, writes its last record,
+closes the report pipe and waits in `rt_sigsuspend` with every signal
+blocked, so only SIGKILL ends it. A libc that kept a thread's TLS
+farther than 64 KiB from both thread-locals would make the anchor crash
+here, which fails `create`: fail closed. Private file mappings stay
+whole: code, read-only data and each object's written data, which the
+code after the first `munmap` may read.
 
 The numbers: the maps file is read in passes of up to 128 ranges, so it
 is never read while it changes (a pass reads it whole, then unmaps), and
@@ -466,9 +502,11 @@ fails the setup instead of looping. `anchor_releases_runner_memory`
 dirties 268,435,456 bytes of heap before `create` and requires each
 anchor's `Anonymous` in `smaps_rollup` below 64 MiB, a quarter of the
 buffer, so a release that keeps the heap fails four times over.
-Measured on the dev host in two runs: 656 and 648 kB for the first
-anchor and 660 kB for a later one, against 263,332 and 263,248 kB in the
-runner; with the release removed, the first anchor kept 263,448 kB.
+Measured on the dev host: 560 kB for the first anchor and 564 kB for a
+later one, against 263,304 kB in the runner, and 588 kB for an anchor
+created on the main thread (656 and 660 kB before review run 1, when the
+thread's whole stack mapping stayed); with the release removed, the
+first anchor kept 263,448 kB.
 
 **The report protocol** (ADR-007, D4) becomes a stream of the same
 12-byte records, ended by EOF. A record with errno 0 is a progress
@@ -509,9 +547,13 @@ Rejected:
 - **Unmapping the `.bss` too**, with the code after the first `munmap`
   kept free of calls the compiler emits into libc (`memset`, `memcpy`,
   `memcmp`): Rust gives no way to forbid them, and the measured crash
-  was one. **A list of known libc mappings** instead of the `.bss` rule:
-  it is per libc and per version. The rule keeps a runner buffer only if
-  it starts exactly where a file mapping ends.
+  was one. **Finding the `.bss` by adjacency** (an unnamed mapping that
+  starts where a named one ends), the first version: it kept runner
+  buffers (review run 1). **Running the anchor on a small stack of its
+  own** instead of the stack window: a stack switch needs assembly per
+  architecture, and a fork-like `clone3` cannot continue a Rust frame
+  on another stack; the window bounds what stays to the release's own
+  frame plus 64 KiB.
 - **One stage with `setns` into the anchor's PID namespace**: the
   program would then share the anchor's namespace, see it and be no PID
   1, and its orphans would go to the anchor, which never reaps.
@@ -556,8 +598,8 @@ states for unswept kernels.
 - The runner is the parent of every anchor and every program (D3), so
   nothing else in its process may reap with `waitpid(-1)` or ignore
   `SIGCHLD`. Each anchor costs one task of the pod's `processes` and,
-  after the release, its stack, its TLS and the runner's `.bss` in
-  resident memory (660 kB measured).
+  after the release, a window of its stack, a window around its TLS and
+  the runner's `.bss` in resident memory (564 kB measured).
 - An anchor's root needs a procfs and a minimal `/dev` (D3); the adapter
   of part 5 always mounts both, and `Anchor::create` refuses a root
   without them before the clone.

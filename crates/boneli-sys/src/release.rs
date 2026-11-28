@@ -1,25 +1,31 @@
 //! An anchor's memory release and hold (ADR-042, D3).
 //!
 //! An anchor is a clone of the runner that never execs, so without this it
-//! would keep a copy-on-write image of the runner's anonymous memory as it
-//! was at the clone (its heap, other threads' stacks, buffers the runner has
+//! would keep a copy-on-write image of the runner's memory as it was at
+//! the clone (its heap, other threads' stacks, its own stack with the
+//! environment and stale frames, shared pages, buffers the runner has
 //! freed since) for the pod's life. Last in its setup, after the privilege
-//! drop and the filter, it unmaps every anonymous mapping but three kinds:
-//! the one that holds its stack pointer, the ones that hold a thread-local
-//! (its thread's TLS block, where libc keeps `errno`), and each unnamed
-//! mapping that starts where a file mapping ends, which is that ELF
-//! object's `.bss`. Then it blocks every signal and waits forever.
+//! drop and the filter, it unmaps every shared and every anonymous mapping
+//! but three kinds of ranges: each ELF object's `.bss`, as its `PT_LOAD`
+//! headers place it (read by the parent before the clone), the stack from
+//! [`STACK_BELOW`] under the release's frame up to its caller's frame, and
+//! [`TLS_AROUND`] around its thread's TLS (a thread-local of this crate and
+//! libc's `errno`). A mapping that holds part of a kept range loses the
+//! rest. Then it blocks every signal and waits forever.
 //!
 //! The `.bss` stays because code the compiler emits on its own needs it:
 //! a stack buffer is zeroed by a call of libc's `memset`, which reads its
 //! size thresholds from libc's `.bss` (measured: with that mapping gone,
-//! the first release crashed there with SIGSEGV). Otherwise the code below
-//! uses only its arguments, stack memory and raw `syscall`s, whose only
-//! state is `errno`; it zeroes its buffers before the first `munmap`,
-//! compares and resets byte by byte, and cannot panic: a panic would format
-//! and allocate. A libc that keeps a thread's TLS where no thread-local of
-//! this crate lives would make it crash here, which fails the anchor's
-//! setup: fail closed.
+//! the first release crashed there with SIGSEGV). Only the `PT_LOAD`
+//! ranges count: an unnamed mapping that merely starts where a named one
+//! ends is runner memory (review of part 3, run 1: a 32 MiB buffer above a
+//! shared page was kept). Otherwise the code below uses only its
+//! arguments, stack memory and raw `syscall`s, whose only state is
+//! `errno`; it zeroes its buffers before the first `munmap`, compares and
+//! resets byte by byte, and cannot panic: a panic would format and
+//! allocate. A libc that kept a thread's TLS farther than [`TLS_AROUND`]
+//! from both of its addresses would make it crash here, which fails the
+//! anchor's setup: fail closed.
 
 use std::os::raw::c_int;
 
@@ -31,7 +37,7 @@ const CHUNK: usize = 4096;
 
 /// Ranges collected per pass. A pass reads the whole file, then unmaps
 /// what it collected, so the file is never read while it changes; a
-/// process with more anonymous mappings takes more passes.
+/// process with more mappings to release takes more passes.
 const RANGES: usize = 128;
 
 /// Passes before the release gives up: `vm.max_map_count` is 65,530 by
@@ -43,6 +49,29 @@ const PASSES: usize = 1024;
 /// The bytes of a mapping's name the classification needs: `[anon:` is
 /// the longest prefix it compares.
 const NAME: usize = 8;
+
+/// The most `.bss` ranges the parent passes: one per ELF object with a
+/// `PT_LOAD` whose memory size exceeds its file size. The runner links a
+/// handful of objects (the binary, libc, libgcc_s, the dynamic loader on
+/// the dev host); more than 64 fails `create` before the clone.
+pub(crate) const BSS_MAX: usize = 64;
+
+/// The kept ranges: the `.bss` ranges, the stack window, two TLS windows.
+const KEPT: usize = BSS_MAX + 3;
+
+/// How far under the release's frame the stack stays: the frames it calls
+/// after the first `munmap` (the scan, libc's `syscall`) are a few KiB
+/// deep even unoptimized; 64 KiB leaves a margin of more than ten, and
+/// the stack grows down into the gap if it ever needed more.
+pub(crate) const STACK_BELOW: usize = 64 << 10;
+
+/// How far around each of its two addresses the TLS stays: glibc's static
+/// TLS block with its surplus and the thread control block, which holds
+/// the stack protector's canary on x86_64, are a few KiB; musl's are
+/// smaller. 64 KiB on each side covers them with a margin of more than
+/// ten, and bounds what of the mapping around them (a thread's stack top,
+/// the runner's heap) stays.
+pub(crate) const TLS_AROUND: usize = 64 << 10;
 
 std::thread_local! {
     /// A thread-local of this crate: the mapping holding it holds this
@@ -104,6 +133,10 @@ struct Line {
     /// 4 inode, 5 the name.
     field: u8,
     in_space: bool,
+    /// The bytes of the permissions seen so far.
+    perm: u8,
+    /// The fourth permission is `s`: a shared mapping.
+    shared: bool,
     name: [u8; NAME],
     name_len: usize,
     /// Any byte seen on this line.
@@ -118,6 +151,8 @@ impl Line {
             phase: 0,
             field: 0,
             in_space: false,
+            perm: 0,
+            shared: false,
             name: [0; NAME],
             name_len: 0,
             any: false,
@@ -163,6 +198,12 @@ impl Line {
                     self.in_space = false;
                     self.field = self.field.saturating_add(1);
                 }
+                if self.field == 1 {
+                    if self.perm == 3 && b == b's' {
+                        self.shared = true;
+                    }
+                    self.perm = self.perm.saturating_add(1);
+                }
                 if self.field == 5
                     && let Some(slot) = self.name.get_mut(self.name_len)
                 {
@@ -174,19 +215,18 @@ impl Line {
         }
     }
 
-    /// Whether the mapping is anonymous: no name, or the heap, a stack or
-    /// a named anonymous mapping. Files, `[vdso]`, `[vvar]` and
-    /// `[vsyscall]` are not.
-    fn anonymous(&self) -> bool {
-        self.name_len == 0
+    /// Whether the mapping is released: every shared mapping (an anonymous
+    /// shared page reads as `/dev/zero (deleted)`, a memfd and SysV memory
+    /// have names too), and every anonymous one: no name, the heap, a
+    /// stack or a named anonymous mapping. Private file mappings (code,
+    /// read-only data, the relocated and written data of each object),
+    /// `[vdso]`, `[vvar]` and `[vsyscall]` stay.
+    fn released(&self) -> bool {
+        self.shared
+            || self.name_len == 0
             || self.named(b"[heap]")
             || self.named(b"[stack")
             || self.named(b"[anon:")
-    }
-
-    /// Whether the mapping is a file's: its name is a path.
-    fn file(&self) -> bool {
-        self.named(b"/")
     }
 
     /// Whether the name starts with `prefix`, compared byte by byte: a
@@ -213,21 +253,56 @@ impl Line {
         self.phase = 0;
         self.field = 0;
         self.in_space = false;
+        self.perm = 0;
+        self.shared = false;
         self.name_len = 0;
         self.any = false;
     }
+}
 
-    /// Whether the mapping holds one of `keep`.
-    fn holds_any(&self, keep: &[usize]) -> bool {
-        keep.iter().any(|&a| self.start <= a && a < self.end)
+/// Adds the parts of `[start, end)` outside every range of `kept`
+/// (ascending by start, possibly overlapping) to `out`, as long as it has
+/// room.
+fn outside(
+    start: usize,
+    end: usize,
+    kept: &[(usize, usize)],
+    out: &mut [(usize, usize); RANGES],
+    count: &mut usize,
+) {
+    let mut push = |s: usize, e: usize, count: &mut usize| {
+        if let Some(slot) = out.get_mut(*count) {
+            *slot = (s, e);
+            *count += 1;
+        }
+    };
+    let mut cursor = start;
+    for &(ks, ke) in kept {
+        if ke <= cursor {
+            continue;
+        }
+        if ks >= end {
+            break;
+        }
+        if ks > cursor {
+            push(cursor, ks, count);
+        }
+        cursor = ke;
+        if cursor >= end {
+            return;
+        }
+    }
+    if cursor < end {
+        push(cursor, end, count);
     }
 }
 
 /// Reads the maps file once from its start and collects up to [`RANGES`]
-/// anonymous mappings that hold none of `keep`; returns how many.
+/// ranges to unmap: the parts of each released mapping outside `kept`;
+/// returns how many.
 fn scan(
     maps: c_int,
-    keep: &[usize],
+    kept: &[(usize, usize)],
     buf: &mut [u8; CHUNK],
     out: &mut [(usize, usize); RANGES],
 ) -> Result<usize, Failure> {
@@ -237,23 +312,13 @@ fn scan(
     }
     let mut line = Line::new();
     let mut count = 0;
-    // The end of the line before, if it was a file mapping: an unnamed
-    // mapping that starts there is that ELF object's `.bss`.
-    let mut file_end: Option<usize> = None;
     let mut collect = |line: &Line, count: &mut usize| -> Result<(), Failure> {
         if line.phase != 2 || line.field < 4 || line.start >= line.end {
             return Err((2, libc::EINVAL));
         }
-        let bss = line.name_len == 0 && file_end == Some(line.start);
-        if line.anonymous()
-            && !bss
-            && !line.holds_any(keep)
-            && let Some(slot) = out.get_mut(*count)
-        {
-            *slot = (line.start, line.end);
-            *count += 1;
+        if line.released() {
+            outside(line.start, line.end, kept, out, count);
         }
-        file_end = if line.file() { Some(line.end) } else { None };
         Ok(())
     };
     loop {
@@ -283,29 +348,116 @@ fn scan(
     Ok(count)
 }
 
-/// Unmaps every anonymous mapping but the ones holding the stack pointer,
-/// a thread-local or an ELF object's `.bss`, then holds: every signal
-/// blocked, the release's progress record written, the report pipe and
-/// the maps file closed, and `rt_sigsuspend` with every signal blocked
-/// forever, so only SIGKILL
+/// The kept ranges in ascending order of their start: `.bss` ranges from
+/// the parent, the stack window and the two TLS windows (ADR-042, D3).
+/// Fails with E2BIG when there are more `.bss` ranges than [`BSS_MAX`],
+/// EINVAL for a page size that is no power of two or a caller frame not
+/// above this one.
+fn kept_ranges(
+    bss: &[(usize, usize)],
+    page: usize,
+    stack: usize,
+    caller: usize,
+    tls: [usize; 2],
+    kept: &mut [(usize, usize); KEPT],
+) -> Result<usize, Failure> {
+    if page == 0 || !page.is_power_of_two() || caller <= stack {
+        return Err((6, libc::EINVAL));
+    }
+    if bss.len() > BSS_MAX {
+        return Err((6, libc::E2BIG));
+    }
+    let down = |a: usize| a & !(page - 1);
+    let up = |a: usize| a.saturating_add(page - 1) & !(page - 1);
+    let mut n = 0;
+    let mut add = |r: (usize, usize), n: &mut usize| {
+        if let Some(slot) = kept.get_mut(*n) {
+            *slot = r;
+            *n += 1;
+        }
+    };
+    for &r in bss {
+        add(r, &mut n);
+    }
+    // From below the deepest frame the code after the first munmap needs
+    // up to the caller's frame: nothing above it is ever returned to.
+    add(
+        (
+            down(stack.saturating_sub(STACK_BELOW)),
+            up(caller.saturating_add(1)),
+        ),
+        &mut n,
+    );
+    for a in tls {
+        add(
+            (
+                down(a.saturating_sub(TLS_AROUND)),
+                up(a.saturating_add(TLS_AROUND)),
+            ),
+            &mut n,
+        );
+    }
+    // Insertion sort by start, element by element.
+    let mut i = 1;
+    while i < n {
+        let mut j = i;
+        while j > 0 {
+            let (Some(&a), Some(&b)) = (kept.get(j - 1), kept.get(j)) else {
+                break;
+            };
+            if a.0 <= b.0 {
+                break;
+            }
+            if let Some(slot) = kept.get_mut(j - 1) {
+                *slot = b;
+            }
+            if let Some(slot) = kept.get_mut(j) {
+                *slot = a;
+            }
+            j -= 1;
+        }
+        i += 1;
+    }
+    Ok(n)
+}
+
+/// Unmaps every shared and every anonymous mapping of the process, but
+/// the `.bss` of each ELF object (`bss`, page-aligned, from the parent),
+/// the stack from [`STACK_BELOW`] under this frame up to `caller`, the
+/// address of a local in the caller's frame, and [`TLS_AROUND`] around this
+/// thread's TLS. Then it holds: every signal blocked, the release's
+/// progress record written, the report pipe and the maps file closed, and
+/// `rt_sigsuspend` with every signal blocked forever, so only SIGKILL
 /// (`cgroup.kill` of the pod, or the runner through the pidfd) ends it. A
 /// failure is reported as [`Step::Release`] and ends the process.
 #[inline(never)]
-pub(crate) fn release_and_hold(maps: c_int, report_fd: c_int) -> ! {
-    // Every address that must stay mapped, taken before anything is gone.
+pub(crate) fn release_and_hold(
+    maps: c_int,
+    report_fd: c_int,
+    bss: &[(usize, usize)],
+    page: usize,
+    caller: usize,
+) -> ! {
+    // Every range that must stay mapped, taken before anything is gone:
+    // `bss` is in the runner's heap and is copied here first.
     let marker = 0u8;
     let stack = std::hint::black_box(&marker) as *const u8 as usize;
     let tls = MARK.with(|m| m as *const u8 as usize);
     // SAFETY: __errno_location returns this thread's errno slot.
     let errno_at = unsafe { libc::__errno_location() } as usize;
-    let keep = [stack, tls, errno_at];
+    let mut kept = [(0usize, 0usize); KEPT];
+    let n = match kept_ranges(bss, page, stack, caller, [tls, errno_at], &mut kept) {
+        Ok(n) => n,
+        Err(f) => die(report_fd, f),
+    };
+    let kept = kept.get(..n).unwrap_or(&[]);
 
     // Both buffers are zeroed here, before anything is gone.
     let mut buf = [0u8; CHUNK];
     let mut ranges = [(0usize, 0usize); RANGES];
     let mut done = false;
     for _ in 0..PASSES {
-        let n = match scan(maps, &keep, &mut buf, &mut ranges) {
+        let n = match scan(maps, kept, &mut buf, &mut ranges) {
             Ok(n) => n,
             Err(f) => die(report_fd, f),
         };
@@ -314,9 +466,9 @@ pub(crate) fn release_and_hold(maps: c_int, report_fd: c_int) -> ! {
             break;
         }
         for &(start, end) in ranges.get(..n).unwrap_or(&[]) {
-            // SAFETY: the range is a whole mapping of this process that
-            // holds neither this stack, nor this thread's TLS, nor
-            // anything the code below reads.
+            // SAFETY: the range is part of a mapping of this process that
+            // lies outside every kept range: neither this stack, nor this
+            // thread's TLS, nor a `.bss`, nor anything the code below reads.
             if unsafe { libc::syscall(libc::SYS_munmap, start, end - start) } < 0 {
                 die(report_fd, (3, errno()));
             }
@@ -373,8 +525,8 @@ mod tests {
         let mut line = Line::new();
         for &b in text {
             if b == b'\n' {
-                out.push((line.start, line.end, line.anonymous()));
-                line = Line::new();
+                out.push((line.start, line.end, line.released()));
+                line.reset();
             } else {
                 line.push(b)?;
             }
@@ -390,21 +542,26 @@ mod tests {
 7f0000000000-7f0000100000 rw-p 00000000 00:00 0\n\
 7f0000200000-7f0000201000 rw-p 00000000 00:00 0  [anon: glibc: malloc]\n\
 7f0000300000-7f0000301000 rw-s 00000000 00:01 77 /memfd:x (deleted)\n\
+7f0000400000-7f0000401000 rw-s 00000000 00:01 78 /dev/zero (deleted)\n\
+7f0000500000-7f0000501000 r--s 00000000 00:1f 79 /usr/share/x.cache\n\
+7f0000600000-7f0000601000 rw-p 00001000 00:1f 79 /usr/lib64/libx.so\n\
 7ffc00000000-7ffc00021000 rw-p 00000000 00:00 0                          [stack]\n\
 7ffc00100000-7ffc00104000 r--p 00000000 00:00 0                          [vvar]\n\
 7ffc00104000-7ffc00106000 r-xp 00000000 00:00 0                          [vdso]\n\
 ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]\n";
         let lines = parse(text).expect("parse");
-        let anon: Vec<bool> = lines.iter().map(|l| l.2).collect();
+        let released: Vec<bool> = lines.iter().map(|l| l.2).collect();
+        // Shared mappings go whatever their name; private file mappings and
+        // the kernel's own stay.
         assert_eq!(
-            anon,
+            released,
             [
-                false, true, true, true, true, false, true, false, false, false
+                false, true, true, true, true, true, true, true, false, true, false, false, false
             ]
         );
         assert_eq!(lines[2].0, 0x55d0_c100_0000);
         assert_eq!(lines[2].1, 0x55d0_c200_0000);
-        assert_eq!(lines[9].1, 0xffff_ffff_ff60_1000);
+        assert_eq!(lines[12].1, 0xffff_ffff_ff60_1000);
     }
 
     #[test]
@@ -419,19 +576,21 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsysca
     }
 
     #[test]
-    fn scan_keeps_bss_stack_and_files() {
+    fn scan_releases_all_but_kept_ranges() {
         use std::io::Write;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        // A file mapping, its .bss right after it, a gap, an unnamed
-        // mapping, the heap, a stack-holding mapping, a vdso.
+        // x.so's code and data, its .bss, a shared page with a runner
+        // buffer right above it (review of part 3, run 1), the heap, a
+        // stack of which a window is kept, the vdso, a buffer after it.
         let text = b"1000-2000 r-xp 00000000 00:1f 1 /lib/x.so\n\
 2000-3000 rw-p 00001000 00:1f 1 /lib/x.so\n\
 3000-5000 rw-p 00000000 00:00 0 \n\
-6000-7000 rw-p 00000000 00:00 0 \n\
-7000-9000 rw-p 00000000 00:00 0 [heap]\n\
-a000-b000 rw-p 00000000 00:00 0 \n\
-b000-c000 r-xp 00000000 00:00 0 [vdso]\n\
-c000-d000 rw-p 00000000 00:00 0 \n";
+6000-7000 rw-s 00000000 00:01 9 /dev/zero (deleted)\n\
+7000-9000 rw-p 00000000 00:00 0 \n\
+9000-a000 rw-p 00000000 00:00 0 [heap]\n\
+c000-14000 rw-p 00000000 00:00 0 [stack]\n\
+14000-15000 r-xp 00000000 00:00 0 [vdso]\n\
+15000-16000 rw-p 00000000 00:00 0 \n";
         // SAFETY: the name is NUL-terminated; memfd_create takes flags.
         let fd = unsafe { libc::memfd_create(c"maps".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create");
@@ -440,27 +599,97 @@ c000-d000 rw-p 00000000 00:00 0 \n";
         std::fs::File::from(fd.try_clone().expect("dup"))
             .write_all(text)
             .expect("write");
+        let kept = [(0x3000, 0x5000), (0xe000, 0x10000), (0xf000, 0x11000)];
         let mut buf = [0u8; CHUNK];
         let mut out = [(0usize, 0usize); RANGES];
-        let n = scan(fd.as_raw_fd(), &[0xa800], &mut buf, &mut out).expect("scan");
-        // 0x3000 is the .bss of x.so; 0xa000 holds a kept address; 0xc000
-        // follows the vdso, which is no file.
+        let n = scan(fd.as_raw_fd(), &kept, &mut buf, &mut out).expect("scan");
         assert_eq!(
             out[..n],
-            [(0x6000, 0x7000), (0x7000, 0x9000), (0xc000, 0xd000)]
+            [
+                (0x6000, 0x7000),
+                (0x7000, 0x9000),
+                (0x9000, 0xa000),
+                (0xc000, 0xe000),
+                (0x11000, 0x14000),
+                (0x15000, 0x16000),
+            ]
         );
         // A second pass reads from the start again.
-        assert_eq!(scan(fd.as_raw_fd(), &[0xa800], &mut buf, &mut out), Ok(n));
+        assert_eq!(scan(fd.as_raw_fd(), &kept, &mut buf, &mut out), Ok(n));
     }
 
     #[test]
-    fn kept_addresses_by_range() {
-        let mut line = Line::new();
-        for &b in b"1000-2000 rw-p 0 00:00 0" {
-            line.push(b).expect("push");
-        }
-        assert!(line.holds_any(&[0x1000]));
-        assert!(line.holds_any(&[0x1fff]));
-        assert!(!line.holds_any(&[0x2000, 0xfff]));
+    fn outside_kept_ranges() {
+        let mut out = [(0usize, 0usize); RANGES];
+        let mut n = 0;
+        // Kept inside, at both edges, covering all, overlapping.
+        outside(
+            0x1000,
+            0x9000,
+            &[(0x2000, 0x3000), (0x5000, 0x6000)],
+            &mut out,
+            &mut n,
+        );
+        outside(0x10000, 0x12000, &[(0x10000, 0x11000)], &mut out, &mut n);
+        outside(0x20000, 0x22000, &[(0x21000, 0x23000)], &mut out, &mut n);
+        outside(0x30000, 0x31000, &[(0x2f000, 0x32000)], &mut out, &mut n);
+        outside(
+            0x40000,
+            0x48000,
+            &[(0x41000, 0x44000), (0x42000, 0x45000)],
+            &mut out,
+            &mut n,
+        );
+        assert_eq!(
+            out[..n],
+            [
+                (0x1000, 0x2000),
+                (0x3000, 0x5000),
+                (0x6000, 0x9000),
+                (0x11000, 0x12000),
+                (0x20000, 0x21000),
+                (0x40000, 0x41000),
+                (0x45000, 0x48000),
+            ]
+        );
+    }
+
+    #[test]
+    fn kept_ranges_are_windows_in_order() {
+        let mut kept = [(0usize, 0usize); KEPT];
+        let bss = [
+            (0x7f00_0000_0000, 0x7f00_0000_8000),
+            (0x5000_0000, 0x5000_2000),
+        ];
+        let stack = 0x7ffc_0010_0123;
+        let caller = 0x7ffc_0010_4567;
+        let tls = [0x7f10_0000_0800, 0x7f10_0000_0f00];
+        let n = kept_ranges(&bss, 4096, stack, caller, tls, &mut kept).expect("kept");
+        assert_eq!(
+            kept[..n],
+            [
+                (0x5000_0000, 0x5000_2000),
+                (0x7f00_0000_0000, 0x7f00_0000_8000),
+                // 64 KiB around each TLS address, page-aligned.
+                (0x7f0f_ffff_0000, 0x7f10_0001_1000),
+                (0x7f0f_ffff_0000, 0x7f10_0001_1000),
+                // From 64 KiB under this frame up to the caller's page.
+                (0x7ffc_000f_0000, 0x7ffc_0010_5000),
+            ]
+        );
+        let many = [(0usize, 0usize); BSS_MAX + 1];
+        assert_eq!(
+            kept_ranges(&many, 4096, stack, caller, tls, &mut kept),
+            Err((6, libc::E2BIG))
+        );
+        assert_eq!(
+            kept_ranges(&bss, 4096, caller, stack, tls, &mut kept),
+            Err((6, libc::EINVAL)),
+            "a caller frame below this one"
+        );
+        assert_eq!(
+            kept_ranges(&bss, 4095, stack, caller, tls, &mut kept),
+            Err((6, libc::EINVAL))
+        );
     }
 }
