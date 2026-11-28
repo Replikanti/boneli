@@ -1717,16 +1717,16 @@
    "title": "boneli-sys: two host tests flake on a loaded host (keeper cadence, buffered writes)",
    "epic": null,
    "order": 66,
-   "state": "pr-review",
-   "owner": "ae8af796",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 143,
    "note": "PR #143 open",
-   "updated_at": "2026-11-27T18:04:55+00:00",
+   "updated_at": "2026-11-28T00:53:01+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1764,14 +1764,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T17:03:07+00:00",
-   "issue": 102,
-   "from": "pr-review",
-   "to": "done",
-   "by": "3613ba8e",
-   "note": null
-  },
   {
    "at": "2026-11-25T17:03:39+00:00",
    "issue": 55,
@@ -2163,6 +2155,14 @@
    "to": "implementing",
    "by": "9c692a2a",
    "note": null
+  },
+  {
+   "at": "2026-11-28T00:53:01+00:00",
+   "issue": 142,
+   "from": "pr-review",
+   "to": "done",
+   "by": "ae8af796",
+   "note": null
   }
  ],
  "open": [
@@ -2187,11 +2187,10 @@
   45,
   49,
   69,
-  142,
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T00:03:38+00:00",
+ "updated_at": "2026-11-28T00:53:03+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2201,7 +2200,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795802695,
+  "at": 1795827184,
   "private": false
  },
  "schema": 2,
