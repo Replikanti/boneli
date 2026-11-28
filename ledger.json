@@ -401,11 +401,11 @@
    "title": "boneli-sandbox-linux: the Sandbox port on our own runtime, pods with a shared network namespace",
    "epic": 23,
    "order": 7,
-   "state": "pr-review",
+   "state": "implementing",
    "owner": "9c692a2a",
    "pr": 147,
-   "note": "PR 1/6 merged (#146); PR 2 port + contract in progress",
-   "updated_at": "2026-11-28T02:05:48+00:00",
+   "note": "PR 1/6 (#146) and PR 2/6 (#147) merged; PR 3 boneli-sys anchors next",
+   "updated_at": "2026-11-28T10:27:48+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -1765,14 +1765,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T23:04:33+00:00",
-   "issue": 129,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "9cc7896e",
-   "note": null
-  },
-  {
    "at": "2026-11-25T23:08:01+00:00",
    "issue": 137,
    "from": null,
@@ -2163,6 +2155,14 @@
    "to": "plan-review",
    "by": "7a384e70",
    "note": null
+  },
+  {
+   "at": "2026-11-28T10:27:48+00:00",
+   "issue": 8,
+   "from": "pr-review",
+   "to": "implementing",
+   "by": "9c692a2a",
+   "note": "PR 1/6 (#146) and PR 2/6 (#147) merged; PR 3 boneli-sys anchors next"
   }
  ],
  "open": [
@@ -2189,7 +2189,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T04:16:04+00:00",
+ "updated_at": "2026-11-28T10:27:48+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
@@ -2199,7 +2199,7 @@
  },
  "shared": true,
  "visibility": {
-  "at": 1795827184,
+  "at": 1795861668,
   "private": false
  },
  "schema": 2,
