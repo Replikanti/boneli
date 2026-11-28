@@ -2049,7 +2049,14 @@ code.
   CI; MK-P's behavioral run takes n = ⌈ln 0.01 ÷ ln(1 − p)⌉ = 50 runs of
   the floor test on Azure x86_64, with p = 23/260, the kill rate of
   parent reads every 5 ms at 64 MiB there (M3, KP5), so it misses a
-  kill with probability 1 % or less (R-S6).
+  kill with probability 1 % or less (R-S6). Since #142 the host pin
+  judges wiring and liveness only (own file read in at least 5 of 20
+  slots, the parent's in at most 5, a stall bound of 3 s); the
+  cadence (reads per period, late reads, longest gap) is pinned by unit
+  tests of `run` on a fake clock (the real wait by the quickest of up
+  to 200 one-period waits, under 1.5 periods), because under
+  `CPUQuota=300%` honest keepers read 60-75 % of the periods with up to
+  8.39 % late reads while the skipping mutant shows 24-29 %.
 - **MK-P's result and the decision on it.** MK1 failed all three
   buffered tests with `OomKilled` on both CI legs (run 44756507651). MK-P
   (run 44756978618) failed `keeper_reads_its_own_sandbox` and

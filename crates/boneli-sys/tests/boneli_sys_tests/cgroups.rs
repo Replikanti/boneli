@@ -410,14 +410,18 @@ fn buffered_writes_without_io_max_are_not_killed() {
     // sandbox, not only those with a write limit (#54, STOP 1 decision 2).
     // Without reads the 7.0 kernels of CI killed it in 47 of 54 runs (M1,
     // N0). No time bound: nothing limits the rate.
+    // Without a rate the write can drain before the loop's statistics are
+    // read, which makes a run inconclusive ([`buffered_inconclusive`]), so
+    // it is retried with a fresh cgroup and keeper (#142).
     let _alone = support::exclusive();
-    let f = buffered_case(
-        "buffered_writes_without_io_max_are_not_killed",
-        IO_BUF_MEMORY_MAX,
-        None,
-        IO_BUF_SIZE,
-    );
-    buffered_assert("buffered_writes_without_io_max_are_not_killed", &f);
+    buffered_assert_retrying("buffered_writes_without_io_max_are_not_killed", || {
+        buffered_case(
+            "buffered_writes_without_io_max_are_not_killed",
+            IO_BUF_MEMORY_MAX,
+            None,
+            IO_BUF_SIZE,
+        )
+    });
 }
 
 /// What `io_limit_holds_buffered_writes` writes: 512 MiB.
@@ -476,6 +480,57 @@ fn buffered_case(name: &str, memory_max: u64, wbps: Option<u64>, size: u64) -> B
     );
     let _ = cg.destroy();
     f
+}
+
+/// Attempts of `buffered_writes_without_io_max_are_not_killed` while its
+/// runs are inconclusive. Without `io.max` nothing slows the writeback, so
+/// the last MiB can drain between the loop's end and its statistics read
+/// (one run on the dev host left 1 MiB dirty, #142), which reads as
+/// [`BufferedHold::NotBuffered`]. 0 of 24 loaded runs were inconclusive,
+/// so the chance per run is under 3 / 24 = 12.5 % (rule of three, 95 %),
+/// and five inconclusive runs in a row under 0.125^5, about 3 in 10^5.
+/// Five runs of 1.3 to 5 s stay far under [`IO_BUF_HANG`] each. The
+/// precedent is `cpu_limit_throttles` and `CADENCE_ATTEMPTS` (ADR-007 D8).
+const BUFFERED_ATTEMPTS: usize = 5;
+
+/// Whether a buffered run says nothing about the keeper: only
+/// [`BufferedHold::NotBuffered`], the write was not buffered when the test
+/// looked. A dead keeper or a writer that syncs is `NotBuffered` or a
+/// keeper verdict on every attempt, so a retry cannot pass it.
+fn buffered_inconclusive(v: BufferedHold) -> bool {
+    v == BufferedHold::NotBuffered
+}
+
+/// Runs `run` until a run is conclusive ([`buffered_inconclusive`]), at
+/// most [`BUFFERED_ATTEMPTS`] times, reports every run, and fails unless
+/// the conclusive run is [`BufferedHold::Held`]; every verdict but
+/// `NotBuffered` decides at once, and `NotBuffered` on every attempt fails.
+fn buffered_assert_retrying(name: &str, mut run: impl FnMut() -> BufferedFacts) {
+    let mut inconclusive = 0;
+    let mut last = None;
+    for attempt in 1..=BUFFERED_ATTEMPTS {
+        let f = run();
+        let v = buffered_verdict(&f);
+        report(&format!(
+            "{name}: attempt {attempt}: {v:?}: {}",
+            buffered_text(&f)
+        ));
+        if !buffered_inconclusive(v) {
+            assert!(
+                v == BufferedHold::Held,
+                "attempt {attempt}: {}",
+                buffered_failure(v, &f)
+            );
+            return;
+        }
+        inconclusive += 1;
+        last = Some((v, f));
+    }
+    let (v, f) = last.expect("BUFFERED_ATTEMPTS is at least 1");
+    panic!(
+        "{name}: inconclusive in all {inconclusive} attempts: {}",
+        buffered_failure(v, &f)
+    );
 }
 
 /// Reports the facts and fails the test unless they are [`BufferedHold::Held`].
@@ -1177,6 +1232,101 @@ fn buffered_verdicts() {
     g.loop_file_dirty = u64::MAX;
     g.loop_file_writeback = 1;
     assert_eq!(buffered_verdict(&g), BufferedHold::Held);
+}
+
+/// Runs [`buffered_assert_retrying`] over `script`, one entry per run,
+/// and returns its panic message, if it failed, and how many runs it made.
+fn retried(script: Vec<BufferedFacts>) -> (Option<String>, usize) {
+    let runs = std::cell::Cell::new(0);
+    let mut script = script.into_iter();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        buffered_assert_retrying("buffered_retry", || {
+            runs.set(runs.get() + 1);
+            script.next().expect("a scripted run")
+        });
+    }));
+    let message = outcome.err().map(|e| {
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    });
+    (message, runs.get())
+}
+
+#[test]
+fn buffered_retry() {
+    let held = || buffered_facts_for(Some(14_600));
+    let not_buffered = || {
+        let mut g = held();
+        g.loop_file_dirty = 0;
+        g.loop_file_writeback = 0;
+        g
+    };
+    assert_eq!(buffered_verdict(&not_buffered()), BufferedHold::NotBuffered);
+    // Inconclusive four times, then held: passes on the fifth run.
+    let mut script: Vec<_> = (0..4).map(|_| not_buffered()).collect();
+    script.push(held());
+    assert_eq!(retried(script), (None, 5));
+    // Held at once: one run.
+    assert_eq!(retried(vec![held()]), (None, 1));
+    // Inconclusive in every attempt: fails after the last, never a sixth.
+    let (m, runs) = retried((0..6).map(|_| not_buffered()).collect());
+    assert_eq!(runs, BUFFERED_ATTEMPTS);
+    assert_eq!(runs, 5);
+    let m = m.expect("five inconclusive runs fail");
+    assert!(m.contains("inconclusive in all 5 attempts"), "{m}");
+    assert!(m.contains("not a buffered write"), "{m}");
+    // A deciding verdict after an inconclusive one fails at once.
+    let mut oom = held();
+    oom.oom_kill = 1;
+    assert_eq!(buffered_verdict(&oom), BufferedHold::OomKilled);
+    let (m, runs) = retried(vec![not_buffered(), oom.clone(), held()]);
+    assert_eq!(runs, 2);
+    assert!(m.expect("an OOM kill fails").contains("OOM-killed"));
+    // Every other verdict fails on the first attempt, without a rerun.
+    let mut idle = held();
+    idle.keeper_at_loop_end = None;
+    let mut escaped = held();
+    escaped.loop_ms = Some(7499);
+    escaped.elapsed_ms = Some(16_000);
+    let mut off = held();
+    off.wbytes = IO_BUF_SIZE - 1;
+    let mut stalled = held();
+    stalled.keeper_settled = stalled.keeper_after;
+    stalled.keeper_resumed_ms = None;
+    let mut failed = held();
+    failed.keeper_after.failed = Some(libc::EIO);
+    let mut writer = held();
+    writer.status = ExitStatus::Exited(101);
+    for (g, v) in [
+        (idle, BufferedHold::KeeperIdle),
+        (escaped, BufferedHold::Escaped),
+        (off, BufferedHold::OffDevice),
+        (stalled, BufferedHold::KeeperStalled),
+        (failed, BufferedHold::KeeperFailed),
+        (writer, BufferedHold::WriterFailed),
+        (oom, BufferedHold::OomKilled),
+    ] {
+        assert_eq!(buffered_verdict(&g), v);
+        let (m, runs) = retried(vec![g, held()]);
+        assert_eq!(runs, 1, "{v:?} was retried");
+        assert!(m.is_some(), "{v:?} passed");
+    }
+    // Only NotBuffered is inconclusive.
+    for v in [
+        BufferedHold::KeeperFailed,
+        BufferedHold::KeeperStalled,
+        BufferedHold::OomKilled,
+        BufferedHold::WriterFailed,
+        BufferedHold::Escaped,
+        BufferedHold::OffDevice,
+        BufferedHold::KeeperIdle,
+        BufferedHold::Held,
+    ] {
+        assert!(!buffered_inconclusive(v), "{v:?}");
+    }
+    assert!(buffered_inconclusive(BufferedHold::NotBuffered));
 }
 
 #[test]
