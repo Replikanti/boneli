@@ -4,15 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use boneli_app::contract::{self, SilentFailure};
 use boneli_app::{
-    BranchName, Command, DatabaseCopy, ExecResult, ExitStatus, ImageExemption, ImageOrigin,
-    ImageRef, Limits, Phase, RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId,
-    SandboxSpec, SnapshotSource, TreePath, TriageReport, Written,
+    BranchName, Broker, BrokerName, Command, ContainerName, ContainerSpec, DatabaseCopy,
+    ExecResult, ExitStatus, ImageExemption, ImageOrigin, ImageRef, Limits, Phase, PodLimits,
+    RelativePath, RepoUrl, RootCauseReport, RootfsRef, SandboxId, SandboxSpec, SnapshotSource,
+    TreePath, TriageReport, WorkspaceBytes, Written,
 };
 use boneli_domain::{CitationStatus, CommitSha, FixChecks, TriageVerdict};
 use boneli_memory::{
     AgentScript, ForgeScript, GitCommit, MemoryAgent, MemoryDataSnapshot, MemoryEventStore,
     MemoryForge, MemoryGit, MemoryImageStore, MemorySandbox, MemoryVerifier, Program, Response,
-    ScriptedFailure, SequentialIds, StepClock, Tree, VerifierScript, pack_tree, unpack_tree,
+    ScriptedFailure, SequentialIds, StepClock, Tree, VerifierScript, WORKSPACE, Write, pack_tree,
+    unpack_tree,
 };
 
 /// The status the silent-failure fixtures report.
@@ -212,54 +214,128 @@ pub fn base_files() -> Tree {
     files
 }
 
+/// The first container of the sandbox fixture.
+fn app() -> ContainerName {
+    ContainerName::parse("app").expect("a valid name")
+}
+
 fn command(program: &str) -> Command {
     Command {
+        container: app(),
         program: String::from(program),
         args: vec![],
         environment: vec![],
     }
 }
 
-/// A sandbox with a program that writes a file and one that exits 3.
+/// Pod limits that fit every spec the sandbox suite builds.
+pub fn pod_limits() -> PodLimits {
+    PodLimits {
+        memory_bytes: 1 << 30,
+        processes: 16,
+        cpu_millis: 1_000,
+        workspace_bytes: 1 << 20,
+        workspace_inodes: 1_000,
+        tmp_bytes: 1 << 20,
+        shm_bytes: 1 << 20,
+    }
+}
+
+/// A scripted program that ends with `code`.
+fn program(name: &str, code: i32) -> Program {
+    Program {
+        name: String::from(name),
+        result: ExecResult {
+            status: ExitStatus::Code(code),
+            stdout: vec![],
+            stderr: vec![],
+        },
+        writes: vec![],
+        outside: vec![],
+        copies: vec![],
+    }
+}
+
+/// The programs of the sandbox fixture: `write` writes `out/result.txt`,
+/// `exit-3` exits 3, `plant` writes `/tmp/planted/result.txt` outside the
+/// workspace, `link` makes `out/result.txt` a symlink to it, `through`
+/// makes `out` a symlink to its directory, and `read` copies
+/// `out/result.txt` to `copied.txt`.
+pub fn sandbox_programs() -> Vec<Program> {
+    vec![
+        Program {
+            writes: vec![(path("out/result.txt"), Write::File(b"written".to_vec()))],
+            ..program("write", 0)
+        },
+        program("exit-3", 3),
+        Program {
+            outside: vec![(String::from("/tmp/planted/result.txt"), b"outside".to_vec())],
+            ..program("plant", 0)
+        },
+        Program {
+            writes: vec![(
+                path("out/result.txt"),
+                Write::Symlink(b"/tmp/planted/result.txt".to_vec()),
+            )],
+            ..program("link", 0)
+        },
+        Program {
+            writes: vec![(path("out"), Write::Symlink(b"/tmp/planted".to_vec()))],
+            ..program("through", 0)
+        },
+        Program {
+            copies: vec![(format!("{WORKSPACE}/out/result.txt"), path("copied.txt"))],
+            ..program("read", 0)
+        },
+    ]
+}
+
+/// A sandbox with the programs of [`sandbox_programs`].
 pub fn workspace() -> contract::sandbox::Workspace<MemorySandbox> {
-    let done = |code| ExecResult {
-        status: ExitStatus::Code(code),
-        stdout: vec![],
-        stderr: vec![],
-    };
     contract::sandbox::Workspace {
-        adapter: MemorySandbox::new(vec![
-            Program {
-                name: String::from("write"),
-                result: done(0),
-                writes: vec![(path("out/result.txt"), b"written".to_vec())],
-            },
-            Program {
-                name: String::from("exit-3"),
-                result: done(3),
-                writes: vec![],
-            },
-        ]),
+        adapter: MemorySandbox::new(sandbox_programs()),
         spec: SandboxSpec {
             phase: Phase::Verify,
-            rootfs: RootfsRef::new(String::from("rootfs-1")),
+            containers: vec![ContainerSpec {
+                name: app(),
+                rootfs: RootfsRef::new(String::from("rootfs-1")),
+            }],
+            workspace: WorkspaceBytes::new(vec![]),
+            dependencies: vec![],
+            brokers: vec![],
+            limits: pod_limits(),
+            user: 1000,
         },
         limits: Limits {
             wall_ms: 1_000,
-            memory_bytes: 1 << 20,
-            processes: 1,
+            output_bytes: 1 << 20,
         },
         write: command("write"),
         path: path("out/result.txt"),
         content: b"written".to_vec(),
         exit: command("exit-3"),
         status: ExitStatus::Code(3),
+        container: ContainerSpec {
+            name: ContainerName::parse("db").expect("a valid name"),
+            rootfs: RootfsRef::new(String::from("rootfs-2")),
+        },
+        plant: command("plant"),
+        outside: b"outside".to_vec(),
+        link: command("link"),
+        through: command("through"),
+        broker: Broker {
+            name: BrokerName::parse("sql").expect("a valid name"),
+            socket: String::from("/run/brokers/sql.sock"),
+        },
+        dependency: path("out"),
+        read: command("read"),
+        copied: path("copied.txt"),
     }
 }
 
 #[test]
 fn in_memory_sandbox_passes_contract() {
-    assert_eq!(contract::sandbox::run(workspace), Ok(()));
+    assert_eq!(contract::sandbox::run(workspace, edit), Ok(()));
 }
 
 const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -864,14 +940,54 @@ fn vacuous_fixtures_are_violations() {
         ..workspace()
     };
     assert_eq!(
-        clause(contract::sandbox::run(empty)),
+        clause(contract::sandbox::run(empty, edit)),
         "copy-out-after-write"
     );
     let success = || contract::sandbox::Workspace {
         status: ExitStatus::Code(0),
         ..workspace()
     };
-    assert_eq!(clause(contract::sandbox::run(success)), "exit-status");
+    assert_eq!(clause(contract::sandbox::run(success, edit)), "exit-status");
+    let unplanted = || contract::sandbox::Workspace {
+        outside: vec![],
+        ..workspace()
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(unplanted, edit)),
+        "copy-out-no-symlink"
+    );
+    let elsewhere = || contract::sandbox::Workspace {
+        dependency: path("vendor"),
+        ..workspace()
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(elsewhere, edit)),
+        "seal-prepare-only"
+    );
+    let into_dependency = || contract::sandbox::Workspace {
+        copied: path("out/copy.txt"),
+        ..workspace()
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(into_dependency, edit)),
+        "seal-prepare-only"
+    );
+    let no_edit = |w: &[u8], _: &TreePath, _: Option<&[u8]>| w.to_vec();
+    assert_eq!(
+        clause(contract::sandbox::run(workspace, no_edit)),
+        "export-round-trip"
+    );
+    let taken = || {
+        let w = workspace();
+        contract::sandbox::Workspace {
+            container: w.spec.containers[0].clone(),
+            ..w
+        }
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(taken, edit)),
+        "unknown-container"
+    );
     let unchanged = || {
         let r = repository();
         contract::git::Repository {
@@ -1139,4 +1255,392 @@ fn memory_git_push_ids() {
         r.adapter.branch(&r.repo, &branch("boneli/a")),
         Some((first, vec![r.base.clone()]))
     );
+}
+
+// ------------------------------------------------- MemorySandbox edge cases
+
+/// A sandbox fixture spec with this workspace, phase and dependencies.
+fn pod(tree: &Tree, phase: Phase, dependencies: Vec<boneli_app::LayerRef>) -> SandboxSpec {
+    SandboxSpec {
+        phase,
+        workspace: WorkspaceBytes::new(pack_tree(tree)),
+        dependencies,
+        ..workspace().spec
+    }
+}
+
+/// A layer sealed at `out` with `out/result.txt` in it.
+fn out_layer(adapter: &MemorySandbox) -> boneli_app::LayerRef {
+    use boneli_app::Sandbox;
+    let p = adapter
+        .create(&pod(&Tree::new(), Phase::Prepare, vec![]))
+        .expect("created");
+    adapter
+        .exec(&p, &command("write"), &workspace().limits)
+        .expect("ran");
+    adapter.seal(&p, &[path("out")]).expect("sealed")
+}
+
+fn is_failed<T>(result: &Result<T, boneli_app::SandboxError>) -> bool {
+    matches!(result, Err(boneli_app::SandboxError::Failed { .. }))
+}
+
+#[test]
+fn empty_workspace_round_trips() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let id = w.adapter.create(&w.spec).expect("created");
+    assert_eq!(w.adapter.export(&id), Ok(vec![]));
+}
+
+#[test]
+fn seal_needs_paths() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let p = w
+        .adapter
+        .create(&pod(&Tree::new(), Phase::Prepare, vec![]))
+        .expect("created");
+    w.adapter.exec(&p, &w.write, &w.limits).expect("ran");
+    assert!(is_failed(&w.adapter.seal(&p, &[])));
+    // A path with nothing beneath it, and a file, are no directory.
+    assert!(is_failed(&w.adapter.seal(&p, &[path("vendor")])));
+    assert!(is_failed(&w.adapter.seal(&p, &[path("out/result.txt")])));
+    assert!(w.adapter.seal(&p, &[path("out")]).is_ok());
+}
+
+#[test]
+fn copy_out_empty_file() {
+    use boneli_app::Sandbox;
+    let adapter = MemorySandbox::new(vec![Program {
+        writes: vec![(path("empty"), Write::File(vec![]))],
+        ..program("touch", 0)
+    }]);
+    let id = adapter.create(&workspace().spec).expect("created");
+    adapter
+        .exec(&id, &command("touch"), &workspace().limits)
+        .expect("ran");
+    assert_eq!(adapter.copy_out(&id, &path("empty")), Ok(vec![]));
+}
+
+#[test]
+fn workspace_inodes_cover_snapshot() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let fill = Program {
+        writes: vec![(path("node_modules/x"), Write::File(b"x".to_vec()))],
+        ..program("install", 0)
+    };
+    let adapter = MemorySandbox::new(vec![fill]);
+    let p = adapter
+        .create(&pod(&Tree::new(), Phase::Prepare, vec![]))
+        .expect("created");
+    adapter
+        .exec(&p, &command("install"), &w.limits)
+        .expect("ran");
+    let layer = adapter.seal(&p, &[path("node_modules")]).expect("sealed");
+    // 10 nodes: the directory `src` and 9 files in it.
+    let tree: Tree = (0..9)
+        .map(|k| (tpath(format!("src/a{k}").as_bytes()), b"a".to_vec()))
+        .collect();
+    let with = |inodes| {
+        let mut spec = pod(&tree, Phase::Agent, vec![layer.clone()]);
+        spec.limits.workspace_inodes = inodes;
+        spec
+    };
+    // 10 nodes + the root + the mount point.
+    assert!(adapter.create(&with(12)).is_ok());
+    let got = adapter.create(&with(11));
+    assert!(
+        matches!(&got, Err(boneli_app::SandboxError::Failed { detail }) if detail.contains("12 inodes")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn output_cap_inclusive() {
+    use boneli_app::Sandbox;
+    let noisy = |name: &str, stdout: &[u8], stderr: &[u8]| Program {
+        result: ExecResult {
+            status: ExitStatus::Code(0),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        },
+        ..program(name, 0)
+    };
+    let adapter = MemorySandbox::new(vec![
+        noisy("out", b"12345678", b""),
+        noisy("err", b"", b"12345678"),
+    ]);
+    let id = adapter.create(&workspace().spec).expect("created");
+    for name in ["out", "err"] {
+        let at = |output_bytes| Limits {
+            wall_ms: 1_000,
+            output_bytes,
+        };
+        assert!(adapter.exec(&id, &command(name), &at(8)).is_ok(), "{name}");
+        assert!(
+            is_failed(&adapter.exec(&id, &command(name), &at(7))),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn dependency_over_tracked_files_refused() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let layer = out_layer(&w.adapter);
+    for tracked in [&b"out/old.txt"[..], b"out", b"out/a/b"] {
+        let tree: Tree = [(tpath(tracked), b"x".to_vec())].into_iter().collect();
+        let got = w
+            .adapter
+            .create(&pod(&tree, Phase::Agent, vec![layer.clone()]));
+        assert!(is_failed(&got), "{tracked:?}: {got:?}");
+    }
+    // A sibling with a shared prefix is not beneath the mount.
+    let tree: Tree = [(tpath(b"outer.txt"), b"x".to_vec())].into_iter().collect();
+    assert!(
+        w.adapter
+            .create(&pod(&tree, Phase::Agent, vec![layer]))
+            .is_ok()
+    );
+}
+
+#[test]
+fn dependency_paths_overlap_refused() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let both = Program {
+        writes: vec![
+            (path("out/result.txt"), Write::File(b"r".to_vec())),
+            (path("out/x/y"), Write::File(b"y".to_vec())),
+        ],
+        ..program("both", 0)
+    };
+    let adapter = MemorySandbox::new(vec![both]);
+    let p = adapter
+        .create(&pod(&Tree::new(), Phase::Prepare, vec![]))
+        .expect("created");
+    adapter.exec(&p, &command("both"), &w.limits).expect("ran");
+    // Nested in either order, and equal: refused as an overlap, not by
+    // another check.
+    for paths in [
+        [path("out"), path("out/x")],
+        [path("out/x"), path("out")],
+        [path("out"), path("out")],
+    ] {
+        let got = adapter.seal(&p, &paths);
+        assert!(
+            matches!(&got, Err(boneli_app::SandboxError::Failed { detail }) if detail.contains("overlap")),
+            "{paths:?}: {got:?}"
+        );
+    }
+    // Two layers whose paths overlap cannot be mounted together.
+    let outer = adapter.seal(&p, &[path("out")]).expect("sealed");
+    let inner = adapter.seal(&p, &[path("out/x")]).expect("sealed");
+    let got = adapter.create(&pod(&Tree::new(), Phase::Agent, vec![outer, inner]));
+    assert!(is_failed(&got), "{got:?}");
+}
+
+#[test]
+fn create_refuses_malformed_workspace() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let field = |bytes: &[u8]| {
+        let mut out = (bytes.len() as u64).to_be_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out
+    };
+    let good = [field(b"a"), field(b"x")].concat();
+    let mut partial = good.clone();
+    partial.extend_from_slice(&field(b"b"));
+    partial.extend_from_slice(&3u64.to_be_bytes());
+    partial.push(b'y');
+    let malformed = [
+        u64::MAX.to_be_bytes().to_vec(),
+        good[..good.len() - 1].to_vec(),
+        [field(b"../x"), field(b"x")].concat(),
+        [field(b"/abs"), field(b"x")].concat(),
+        [good.clone(), good.clone()].concat(),
+        partial,
+    ];
+    for bytes in malformed {
+        let spec = SandboxSpec {
+            workspace: WorkspaceBytes::new(bytes),
+            ..w.spec.clone()
+        };
+        assert!(is_failed(&w.adapter.create(&spec)), "{spec:?}");
+    }
+    // Nothing was created: the first handle is still the first.
+    let id = w.adapter.create(&w.spec).expect("created");
+    assert_eq!(id.as_str(), "sandbox-1");
+}
+
+#[test]
+fn hostile_names_round_trip() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let tree: Tree = uncitable().into_iter().collect();
+    let id = w
+        .adapter
+        .create(&pod(&tree, Phase::Agent, vec![]))
+        .expect("created");
+    assert_eq!(w.adapter.export(&id), Ok(pack_tree(&tree)));
+}
+
+#[test]
+fn workspace_metadata_carried() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let tree: Tree = [
+        (tpath(b".git/HEAD"), b"ref: refs/heads/main\n".to_vec()),
+        (tpath(b"README"), b"app".to_vec()),
+    ]
+    .into_iter()
+    .collect();
+    let id = w
+        .adapter
+        .create(&pod(&tree, Phase::Agent, vec![]))
+        .expect("created");
+    assert_eq!(w.adapter.export(&id), Ok(pack_tree(&tree)));
+    assert_eq!(
+        w.adapter.copy_out(&id, &path(".git/HEAD")),
+        Ok(b"ref: refs/heads/main\n".to_vec())
+    );
+}
+
+#[test]
+fn export_skips_dependency_mounts() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let layer = out_layer(&w.adapter);
+    let id = w
+        .adapter
+        .create(&pod(&Tree::new(), Phase::Agent, vec![layer]))
+        .expect("created");
+    w.adapter.exec(&id, &w.read, &w.limits).expect("ran");
+    assert_eq!(w.adapter.copy_out(&id, &w.copied), Ok(b"written".to_vec()));
+    // The mount is read-only: a write beneath it is dropped.
+    w.adapter.exec(&id, &w.write, &w.limits).expect("ran");
+    let only_copy: Tree = [(tpath(b"copied.txt"), b"written".to_vec())]
+        .into_iter()
+        .collect();
+    assert_eq!(w.adapter.export(&id), Ok(pack_tree(&only_copy)));
+    assert!(is_failed(&w.adapter.copy_out(&id, &w.path)));
+}
+
+#[test]
+fn second_container_has_its_own_root() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let mut spec = w.spec.clone();
+    spec.containers.push(w.container.clone());
+    let id = w.adapter.create(&spec).expect("created");
+    let in_db = |program: &str| Command {
+        container: w.container.name.clone(),
+        ..command(program)
+    };
+    w.adapter
+        .exec(&id, &in_db("write"), &w.limits)
+        .expect("ran");
+    w.adapter
+        .exec(&id, &in_db("plant"), &w.limits)
+        .expect("ran");
+    assert_eq!(
+        w.adapter.copy_out(&id, &w.path),
+        Err(boneli_app::SandboxError::NotFound)
+    );
+    // The planted file is the second container's, not the first's.
+    assert_eq!(w.adapter.entry(&id, "/tmp/planted/result.txt"), None);
+    assert_eq!(w.adapter.start(&id, &in_db("plant")), Ok(()));
+    assert!(is_failed(&w.adapter.start(&id, &command("make"))));
+}
+
+#[test]
+fn export_refuses_symlinks() {
+    use boneli_app::Sandbox;
+    let w = workspace();
+    let id = w.adapter.create(&w.spec).expect("created");
+    w.adapter.exec(&id, &w.link, &w.limits).expect("ran");
+    assert!(is_failed(&w.adapter.export(&id)));
+    assert_eq!(
+        w.adapter.entry(&id, "/workspace/out/result.txt"),
+        Some(Write::Symlink(b"/tmp/planted/result.txt".to_vec()))
+    );
+}
+
+/// Every failure detail of the in-memory sandbox is not blank (ADR-004,
+/// D4).
+#[test]
+fn sandbox_failure_details_are_never_blank() {
+    use boneli_app::{LayerRef, Sandbox, SandboxError};
+    let w = workspace();
+    let layer = out_layer(&w.adapter);
+    let id = w.adapter.create(&w.spec).expect("created");
+    let tight = Limits {
+        wall_ms: 1,
+        output_bytes: 0,
+    };
+    let noisy = MemorySandbox::new(vec![Program {
+        result: ExecResult {
+            status: ExitStatus::Code(0),
+            stdout: b"x".to_vec(),
+            stderr: vec![],
+        },
+        ..program("noisy", 0)
+    }]);
+    let noisy_id = noisy.create(&w.spec).expect("created");
+    let elsewhere = Command {
+        container: ContainerName::parse("nowhere").expect("valid"),
+        ..command("exit-3")
+    };
+    w.adapter.exec(&id, &w.link, &w.limits).expect("ran");
+    let mut errors: Vec<SandboxError> = vec![
+        w.adapter
+            .create(&SandboxSpec {
+                containers: vec![],
+                ..w.spec.clone()
+            })
+            .expect_err("refused"),
+        w.adapter
+            .create(&SandboxSpec {
+                workspace: WorkspaceBytes::new(vec![1]),
+                ..w.spec.clone()
+            })
+            .expect_err("refused"),
+        w.adapter
+            .create(&SandboxSpec {
+                dependencies: vec![LayerRef::new(String::from("layer-99"))],
+                ..w.spec.clone()
+            })
+            .expect_err("refused"),
+        w.adapter
+            .exec(&id, &elsewhere, &w.limits)
+            .expect_err("refused"),
+        w.adapter.start(&id, &command("make")).expect_err("refused"),
+        noisy
+            .exec(&noisy_id, &command("noisy"), &tight)
+            .expect_err("refused"),
+        w.adapter.copy_out(&id, &w.path).expect_err("refused"),
+        w.adapter.export(&id).expect_err("refused"),
+        w.adapter.seal(&id, &[path("out")]).expect_err("refused"),
+        w.adapter
+            .release(&LayerRef::new(String::from("layer-99")))
+            .expect_err("refused"),
+    ];
+    let user = w
+        .adapter
+        .create(&pod(&Tree::new(), Phase::Agent, vec![layer.clone()]))
+        .expect("created");
+    errors.push(w.adapter.release(&layer).expect_err("refused"));
+    errors.push(w.adapter.copy_out(&user, &w.path).expect_err("refused"));
+    for error in errors {
+        match error {
+            SandboxError::Failed { detail } => {
+                assert!(!boneli_domain::values::is_blank(&detail), "{detail:?}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 }

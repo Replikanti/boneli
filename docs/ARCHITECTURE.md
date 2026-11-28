@@ -239,7 +239,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 
 | Port | MVP adapter | Later |
 | --- | --- | --- |
-| `Sandbox` | `boneli-sandbox-linux`, our own runtime | microVM |
+| `Sandbox` | `boneli-sandbox-linux`, our own runtime: pods of containers that share loopback, the pod limits, the workspace copied in at `create` and exported in the `Git` adapter's format, read-only dependency layers sealed only from a prepare sandbox, no broker in a verify sandbox (ADR-042) | microVM |
 | `Agent` | `boneli-agent-claude-code` | own harness in Rust, Codex |
 | `Forge` | `boneli-forge-github` | GitLab |
 | `Git` | `boneli-git-cli` | native implementation |
@@ -251,7 +251,7 @@ Arrows show the direction of dependencies between crates. The domain and the app
 | `Broker` | | SQL, Sentry, logs |
 | `Clock`, `Ids` | system | |
 
-The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates. Paths that ports take are `RelativePath`s, which follow the citation path rule of the domain through one shared function (ADR-004, D1, D11). The rule is lexical: refusing symlinks that leave a workspace and paths into `.git` is the real adapters' job, each with its own contract clauses (ADR-004, D11).
+The in-memory adapter of every port lives in one adapter crate, `boneli-memory` (ADR-004); the name breaks the `boneli-<port>-<impl>` pattern because no boundary between the in-memory adapters needs separate crates. Paths that ports take are `RelativePath`s, which follow the citation path rule of the domain through one shared function (ADR-004, D1, D11). The rule is lexical: refusing symlinks that leave a workspace and paths into `.git` is the real adapters' job, each with its own contract clauses (ADR-004, D11; the sandbox's is `copy-out-no-symlink`, ADR-042 D2).
 
 **Driving adapters:** CLI, webhooks, control plane connection, bench runner.
 
@@ -261,7 +261,11 @@ The in-memory adapter of every port lives in one adapter crate, `boneli-memory` 
 pub trait Sandbox {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError>;
     fn exec(&self, id: &SandboxId, command: &Command, limits: &Limits) -> Result<ExecResult, SandboxError>;
+    fn start(&self, id: &SandboxId, command: &Command) -> Result<(), SandboxError>;
     fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError>;
+    fn export(&self, id: &SandboxId) -> Result<Vec<u8>, SandboxError>;
+    fn seal(&self, id: &SandboxId, paths: &[RelativePath]) -> Result<LayerRef, SandboxError>;
+    fn release(&self, layer: &LayerRef) -> Result<(), SandboxError>;
     fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError>;
 }
 

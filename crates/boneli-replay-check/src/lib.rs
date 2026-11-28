@@ -146,6 +146,10 @@ pub const RENDERED_APP_FMT_IMPLS: &[&str] = &[
     "git.rs: impl fmt::Display for GitError {",
     "image.rs: impl fmt::Display for ImageError {",
     "path.rs: impl fmt::Debug for TreePath {",
+    "sandbox.rs: impl fmt::Display for NameProblem {",
+    "sandbox.rs: impl fmt::Debug for WorkspaceBytes {",
+    "sandbox.rs: impl fmt::Display for LimitProblem {",
+    "sandbox.rs: impl fmt::Display for SpecProblem {",
     "sandbox.rs: impl fmt::Display for SandboxError {",
     "store.rs: impl fmt::Display for StoreError {",
 ];

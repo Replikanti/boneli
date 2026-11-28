@@ -1391,6 +1391,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `boneli-git-cli` and `boneli-https` were rewritten to them without a
   change in behaviour. `#[cfg(test)]` modules and integration tests are
   not scanned. ADR-026 and ADR-028 are superseded by ADR-030.
+- `Sandbox` port (part 2 of #8, ADR-042 D2, still proposed): a sandbox is
+  a pod. `SandboxSpec` holds containers (`ContainerName`, an RFC 1123
+  label that is not `localhost`), the workspace copied in at `create`
+  (`WorkspaceBytes`, whose `Debug` prints only the length), dependency
+  layers, brokers (`BrokerName`) and `PodLimits`; memory and the process
+  count move from the per-command `Limits` to the pod, which keeps
+  `wall_ms` and gains `output_bytes`. `Command` names its container,
+  `ExitStatus::TimedOut` is the wall limit, and `start`, `export`,
+  `seal` and `release` are new. `SandboxSpec::check` and
+  `PodLimits::check` hold the pod relations both adapters use (storage
+  sum within `memory_bytes`, `n + 2` tasks, `cpu_millis` at least 10, no
+  zero size, no broker in a verify sandbox); only a prepare sandbox can
+  be sealed. The contract suite grows from 7 to 18 clauses, with three
+  stronger ones and one mutant per new clause (73 clauses, 90 mutant
+  cases); `MemorySandbox` keeps files and symlinks, files outside the
+  workspace and sealed layers, and checks the spec, the layers and the
+  output cap.
 
 ### Fixed
 

@@ -16,13 +16,14 @@ use std::sync::Mutex;
 
 use boneli_app::contract::{self, SilentFailure, Violation};
 use boneli_app::{
-    Agent, BranchName, CheckoutId, Clock, Command as SandboxCommand, CommitInfo, DataError,
-    DataSnapshot, DatabaseCopy, EventStore, Evidence, EvidenceError, ExecResult, ExitStatus,
-    FixRequest, Forge, ForgeRef, Git, GitError, Ids, ImageError, ImageExemption, ImageOrigin,
-    ImageRef, ImageStore, JobFailure, Limits, Phase, PullRequest, Pulled, RelativePath, RepoUrl,
-    ReproductionRequest, RootCauseReport, RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox,
-    SandboxError, SandboxId, SandboxSpec, SnapshotId, SnapshotSource, StoreError, TreePath,
-    TriageReport, TriageRequest, Verifier, Written,
+    Agent, BranchName, Broker, BrokerName, CheckoutId, Clock, Command as SandboxCommand,
+    CommitInfo, ContainerName, ContainerSpec, DataError, DataSnapshot, DatabaseCopy, EventStore,
+    Evidence, EvidenceError, ExecResult, ExitStatus, FixRequest, Forge, ForgeRef, Git, GitError,
+    Ids, ImageError, ImageExemption, ImageOrigin, ImageRef, ImageStore, JobFailure, LayerRef,
+    Limits, Phase, PodLimits, PullRequest, Pulled, RelativePath, RepoUrl, ReproductionRequest,
+    RootCauseReport, RootCauseRequest, RootfsRef, RunLog, RunStart, Sandbox, SandboxError,
+    SandboxId, SandboxSpec, SnapshotId, SnapshotSource, StoreError, TreePath, TriageReport,
+    TriageRequest, Verifier, WorkspaceBytes, Written,
 };
 use boneli_domain::{
     Budget, Change, Citation, CitationStatus, CommitSha, Entry, EntryKind, EvidenceRef, FixChecks,
@@ -31,8 +32,8 @@ use boneli_domain::{
 use boneli_memory::{
     AgentScript, ForgeScript, GitCommit, MemoryAgent, MemoryDataSnapshot, MemoryEventStore,
     MemoryEvidence, MemoryForge, MemoryGit, MemoryImageStore, MemorySandbox, MemoryVerifier,
-    Program, Response, ScriptedFailure, SequentialIds, StepClock, Tree, VerifierScript, pack_tree,
-    tree_patch, unpack_tree,
+    Program, Response, ScriptedFailure, SequentialIds, StepClock, Tree, VerifierScript, WORKSPACE,
+    Write, pack_tree, tree_patch, unpack_tree,
 };
 
 const STATUS: &str = "exit status 3";
@@ -550,7 +551,7 @@ fn silent_forge() -> MemoryForge {
 // ------------------------------------------------------------------ Sandbox
 
 /// Which `Sandbox` clause the mutant breaks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxBug {
     /// Every `create` returns the first handle it issued.
     SameId,
@@ -564,17 +565,109 @@ enum SandboxBug {
     ReportsSuccess,
     /// `destroy` does nothing.
     DestroyIgnored,
+    /// A command in a container the pod does not have runs in the first.
+    IgnoresContainer,
+    /// `create` replaces the pod limits with generous ones, as an adapter
+    /// that never calls `PodLimits::check` would run them.
+    UncheckedLimits,
+    /// `export` returns an empty workspace.
+    ExportEmpty,
+    /// `export` returns the workspace the sandbox was created from.
+    ExportStale,
+    /// `copy_out` follows a symlink at the path or at a parent.
+    FollowsLinks,
+    /// A verify spec with brokers is created as an agent sandbox.
+    VerifyKeepsBrokers,
+    /// Every sandbox is created as a prepare sandbox, after the core check
+    /// of its own phase, so any of them can be sealed.
+    SealsAnyPhase,
+    /// `create` drops the dependencies.
+    DependencyNotMounted,
+    /// Every `seal` returns the first layer handle it issued.
+    ReusesLayer,
+    /// `release` reports success and keeps the layer.
+    ReleaseIgnored,
+    /// `release` of a layer a live sandbox mounts reports success.
+    ReleasesInUse,
+}
+
+/// Limits with room for anything the suite builds.
+fn generous() -> PodLimits {
+    PodLimits {
+        memory_bytes: 1 << 40,
+        processes: 1 << 20,
+        cpu_millis: 1_000,
+        workspace_bytes: 1 << 30,
+        workspace_inodes: 1 << 30,
+        tmp_bytes: 1 << 30,
+        shm_bytes: 1 << 30,
+    }
 }
 
 struct SandboxMutant {
     bug: SandboxBug,
     inner: MemorySandbox,
     issued: Mutex<Vec<SandboxId>>,
+    /// The spec of every live handle, as given.
+    specs: Mutex<Vec<(SandboxId, SandboxSpec)>>,
+    layers: Mutex<Vec<LayerRef>>,
+}
+
+impl SandboxMutant {
+    fn spec_of(&self, id: &SandboxId) -> Option<SandboxSpec> {
+        let specs = Mutex::lock(&self.specs).expect("not poisoned");
+        specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone())
+    }
+
+    /// `path` read through the symlinks the inner sandbox holds, as an
+    /// adapter that opens it with symlinks followed would.
+    fn follow(&self, id: &SandboxId, path: &RelativePath) -> Option<Vec<u8>> {
+        let components: Vec<&str> = path.as_str().split('/').collect();
+        for k in 1..=components.len() {
+            let prefix = components[..k].join("/");
+            if let Some(Write::Symlink(target)) =
+                self.inner.entry(id, &format!("{WORKSPACE}/{prefix}"))
+            {
+                let target = String::from_utf8(target).ok()?;
+                let rest = components[k..].join("/");
+                let resolved = if rest.is_empty() {
+                    target
+                } else {
+                    format!("{target}/{rest}")
+                };
+                return match self.inner.entry(id, &resolved) {
+                    Some(Write::File(content)) => Some(content),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
 }
 
 impl Sandbox for SandboxMutant {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxId, SandboxError> {
-        let id = self.inner.create(spec)?;
+        let mut given = spec.clone();
+        match self.bug {
+            SandboxBug::UncheckedLimits => given.limits = generous(),
+            SandboxBug::VerifyKeepsBrokers
+                if spec.phase == Phase::Verify && !spec.brokers.is_empty() =>
+            {
+                given.phase = Phase::Agent;
+            }
+            SandboxBug::SealsAnyPhase => {
+                spec.check().map_err(|problem| SandboxError::Failed {
+                    detail: format!("{problem}"),
+                })?;
+                given.phase = Phase::Prepare;
+            }
+            SandboxBug::DependencyNotMounted => given.dependencies.clear(),
+            _ => {}
+        }
+        let id = self.inner.create(&given)?;
+        Mutex::lock(&self.specs)
+            .expect("not poisoned")
+            .push((id.clone(), spec.clone()));
         let mut issued = Mutex::lock(&self.issued).expect("not poisoned");
         issued.push(id.clone());
         match self.bug {
@@ -589,11 +682,22 @@ impl Sandbox for SandboxMutant {
         command: &SandboxCommand,
         limits: &Limits,
     ) -> Result<ExecResult, SandboxError> {
-        let mut result = self.inner.exec(id, command, limits)?;
+        let mut command = command.clone();
+        if self.bug == SandboxBug::IgnoresContainer
+            && let Some(spec) = self.spec_of(id)
+            && spec.containers.iter().all(|c| c.name != command.container)
+        {
+            command.container = spec.containers[0].name.clone();
+        }
+        let mut result = self.inner.exec(id, &command, limits)?;
         if matches!(self.bug, SandboxBug::ReportsSuccess) {
             result.status = ExitStatus::Code(0);
         }
         Ok(result)
+    }
+
+    fn start(&self, id: &SandboxId, command: &SandboxCommand) -> Result<(), SandboxError> {
+        self.inner.start(id, command)
     }
 
     fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError> {
@@ -611,14 +715,61 @@ impl Sandbox for SandboxMutant {
                     .find_map(|other| self.inner.copy_out(other, path).ok())
                     .ok_or(SandboxError::NotFound)
             }
+            (SandboxBug::FollowsLinks, Err(error)) => self.follow(id, path).ok_or(error),
             (_, got) => got,
+        }
+    }
+
+    fn export(&self, id: &SandboxId) -> Result<Vec<u8>, SandboxError> {
+        let got = self.inner.export(id)?;
+        match self.bug {
+            SandboxBug::ExportEmpty => Ok(Vec::new()),
+            SandboxBug::ExportStale => Ok(self
+                .spec_of(id)
+                .map(|s| s.workspace.as_bytes().to_vec())
+                .unwrap_or_default()),
+            _ => Ok(got),
+        }
+    }
+
+    fn seal(&self, id: &SandboxId, paths: &[RelativePath]) -> Result<LayerRef, SandboxError> {
+        let layer = self.inner.seal(id, paths)?;
+        let mut layers = Mutex::lock(&self.layers).expect("not poisoned");
+        layers.push(layer.clone());
+        match self.bug {
+            SandboxBug::ReusesLayer => Ok(layers[0].clone()),
+            _ => Ok(layer),
+        }
+    }
+
+    fn release(&self, layer: &LayerRef) -> Result<(), SandboxError> {
+        match self.bug {
+            SandboxBug::ReleaseIgnored => Ok(()),
+            SandboxBug::ReleasesInUse => {
+                let in_use = Mutex::lock(&self.specs)
+                    .expect("not poisoned")
+                    .iter()
+                    .any(|(_, spec)| spec.dependencies.contains(layer));
+                if in_use {
+                    Ok(())
+                } else {
+                    self.inner.release(layer)
+                }
+            }
+            _ => self.inner.release(layer),
         }
     }
 
     fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError> {
         match self.bug {
             SandboxBug::DestroyIgnored => Ok(()),
-            _ => self.inner.destroy(id),
+            _ => {
+                self.inner.destroy(id)?;
+                Mutex::lock(&self.specs)
+                    .expect("not poisoned")
+                    .retain(|(i, _)| i != id);
+                Ok(())
+            }
         }
     }
 }
@@ -667,8 +818,24 @@ impl Sandbox for PooledSandbox {
         self.inner.exec(&self.inner_of(id)?, command, limits)
     }
 
+    fn start(&self, id: &SandboxId, command: &SandboxCommand) -> Result<(), SandboxError> {
+        self.inner.start(&self.inner_of(id)?, command)
+    }
+
     fn copy_out(&self, id: &SandboxId, path: &RelativePath) -> Result<Vec<u8>, SandboxError> {
         self.inner.copy_out(&self.inner_of(id)?, path)
+    }
+
+    fn export(&self, id: &SandboxId) -> Result<Vec<u8>, SandboxError> {
+        self.inner.export(&self.inner_of(id)?)
+    }
+
+    fn seal(&self, id: &SandboxId, paths: &[RelativePath]) -> Result<LayerRef, SandboxError> {
+        self.inner.seal(&self.inner_of(id)?, paths)
+    }
+
+    fn release(&self, layer: &LayerRef) -> Result<(), SandboxError> {
+        self.inner.release(layer)
     }
 
     fn destroy(&self, id: &SandboxId) -> Result<(), SandboxError> {
@@ -681,8 +848,13 @@ impl Sandbox for PooledSandbox {
     }
 }
 
+fn app() -> ContainerName {
+    ContainerName::parse("app").expect("a valid name")
+}
+
 fn sandbox_command(program: &str) -> SandboxCommand {
     SandboxCommand {
+        container: app(),
         program: String::from(program),
         args: vec![],
         environment: vec![],
@@ -697,41 +869,96 @@ fn tpath(bytes: &[u8]) -> TreePath {
     TreePath::parse(bytes).expect("a valid tree path")
 }
 
-/// The sandbox fixture around `adapter`, built from the scripted programs.
+/// A scripted program that ends with `code` and changes nothing.
+fn sandbox_program(name: &str, code: i32) -> Program {
+    Program {
+        name: String::from(name),
+        result: ExecResult {
+            status: ExitStatus::Code(code),
+            stdout: vec![],
+            stderr: vec![],
+        },
+        writes: vec![],
+        outside: vec![],
+        copies: vec![],
+    }
+}
+
+/// The sandbox fixture around `adapter`, built from the scripted programs:
+/// the ones of `boneli-memory`'s own contract test.
 fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbox::Workspace<S> {
-    let done = |code| ExecResult {
-        status: ExitStatus::Code(code),
-        stdout: vec![],
-        stderr: vec![],
-    };
     let inner = MemorySandbox::new(vec![
         Program {
-            name: String::from("write"),
-            result: done(0),
-            writes: vec![(path("out/result.txt"), b"written".to_vec())],
+            writes: vec![(path("out/result.txt"), Write::File(b"written".to_vec()))],
+            ..sandbox_program("write", 0)
+        },
+        sandbox_program("exit-3", 3),
+        Program {
+            outside: vec![(String::from("/tmp/planted/result.txt"), b"outside".to_vec())],
+            ..sandbox_program("plant", 0)
         },
         Program {
-            name: String::from("exit-3"),
-            result: done(3),
-            writes: vec![],
+            writes: vec![(
+                path("out/result.txt"),
+                Write::Symlink(b"/tmp/planted/result.txt".to_vec()),
+            )],
+            ..sandbox_program("link", 0)
+        },
+        Program {
+            writes: vec![(path("out"), Write::Symlink(b"/tmp/planted".to_vec()))],
+            ..sandbox_program("through", 0)
+        },
+        Program {
+            copies: vec![(format!("{WORKSPACE}/out/result.txt"), path("copied.txt"))],
+            ..sandbox_program("read", 0)
         },
     ]);
     contract::sandbox::Workspace {
         adapter: make(inner),
         spec: SandboxSpec {
             phase: Phase::Verify,
-            rootfs: RootfsRef::new(String::from("rootfs-1")),
+            containers: vec![ContainerSpec {
+                name: app(),
+                rootfs: RootfsRef::new(String::from("rootfs-1")),
+            }],
+            workspace: WorkspaceBytes::new(vec![]),
+            dependencies: vec![],
+            brokers: vec![],
+            limits: PodLimits {
+                memory_bytes: 1 << 30,
+                processes: 16,
+                cpu_millis: 1_000,
+                workspace_bytes: 1 << 20,
+                workspace_inodes: 1_000,
+                tmp_bytes: 1 << 20,
+                shm_bytes: 1 << 20,
+            },
+            user: 1000,
         },
         limits: Limits {
             wall_ms: 1_000,
-            memory_bytes: 1 << 20,
-            processes: 1,
+            output_bytes: 1 << 20,
         },
         write: sandbox_command("write"),
         path: path("out/result.txt"),
         content: b"written".to_vec(),
         exit: sandbox_command("exit-3"),
         status: ExitStatus::Code(3),
+        container: ContainerSpec {
+            name: ContainerName::parse("db").expect("a valid name"),
+            rootfs: RootfsRef::new(String::from("rootfs-2")),
+        },
+        plant: sandbox_command("plant"),
+        outside: b"outside".to_vec(),
+        link: sandbox_command("link"),
+        through: sandbox_command("through"),
+        broker: Broker {
+            name: BrokerName::parse("sql").expect("a valid name"),
+            socket: String::from("/run/brokers/sql.sock"),
+        },
+        dependency: path("out"),
+        read: sandbox_command("read"),
+        copied: path("copied.txt"),
     }
 }
 
@@ -740,6 +967,8 @@ fn sandbox_workspace(bug: SandboxBug) -> contract::sandbox::Workspace<SandboxMut
         bug,
         inner,
         issued: Mutex::new(Vec::new()),
+        specs: Mutex::new(Vec::new()),
+        layers: Mutex::new(Vec::new()),
     })
 }
 
@@ -1820,7 +2049,7 @@ pub fn mutants() -> Vec<Mutant> {
     ];
     let sandbox = |clause, bug| {
         mutant("Sandbox", clause, move || {
-            contract::sandbox::run(|| sandbox_workspace(bug))
+            contract::sandbox::run(|| sandbox_workspace(bug), git_edit)
         })
     };
     let git = |clause, bug| mutant("Git", clause, move || git_suite(bug));
@@ -1852,10 +2081,21 @@ pub fn mutants() -> Vec<Mutant> {
         sandbox("copy-out-missing", SandboxBug::MissingIsEmpty),
         sandbox("isolated", SandboxBug::SharedWorkspace),
         mutant("Sandbox", "fresh-after-destroy", || {
-            contract::sandbox::run(pooled_workspace)
+            contract::sandbox::run(pooled_workspace, git_edit)
         }),
         sandbox("exit-status", SandboxBug::ReportsSuccess),
         sandbox("destroyed-is-unknown", SandboxBug::DestroyIgnored),
+        sandbox("unknown-container", SandboxBug::IgnoresContainer),
+        sandbox("limits-checked", SandboxBug::UncheckedLimits),
+        sandbox("export-round-trip", SandboxBug::ExportEmpty),
+        sandbox("export-sees-write", SandboxBug::ExportStale),
+        sandbox("copy-out-no-symlink", SandboxBug::FollowsLinks),
+        sandbox("verify-without-brokers", SandboxBug::VerifyKeepsBrokers),
+        sandbox("seal-prepare-only", SandboxBug::SealsAnyPhase),
+        sandbox("sealed-layer-mounted", SandboxBug::DependencyNotMounted),
+        sandbox("distinct-layers", SandboxBug::ReusesLayer),
+        sandbox("released-layer-unknown", SandboxBug::ReleaseIgnored),
+        sandbox("layer-in-use-kept", SandboxBug::ReleasesInUse),
         git("read-at-base", GitBug::Truncates),
         git("read-missing", GitBug::MissingIsEmpty),
         git("unknown-commit", GitBug::UnknownIsOk),
