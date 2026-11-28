@@ -156,10 +156,13 @@ fn read_slots(files: &[&Path]) -> Vec<usize> {
 /// ADR-007 D8).
 const CADENCE_ATTEMPTS: usize = 3;
 
-/// The longest pause a window allows between two reads: 100 periods. A
-/// hang bound only, for a keeper that stopped; the largest honest gap
-/// measured on a loaded dev host was 56 ms (#142).
-const CADENCE_STALL: Duration = Duration::from_millis(500);
+/// The longest pause a window allows between two reads: 600 periods. A
+/// hang bound only: a keeper that stopped for good also fails the
+/// progress and descriptor checks. The largest honest pause measured was
+/// 1.0 s, with 28 CPU spinners in the test's `CPUQuota=300%` scope, where
+/// CFS froze the scope for whole periods in a row; 3 s is three times
+/// that (#142).
+const CADENCE_STALL: Duration = Duration::from_secs(3);
 
 /// What one window of `keeper_reads_its_own_sandbox` saw of one keeper:
 /// wiring and liveness, not cadence. How often and how regularly the
@@ -239,7 +242,7 @@ fn liveness_rule() {
     // The stall bound, inclusive.
     assert_eq!(rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL)), None);
     let m = rule(READ_SLOTS, keeper(210, 1, CADENCE_STALL + ms(1))).expect("a stall");
-    assert!(m.contains("paused 501ms"), "{m}");
+    assert!(m.contains("paused 3.001s"), "{m}");
 }
 
 #[test]

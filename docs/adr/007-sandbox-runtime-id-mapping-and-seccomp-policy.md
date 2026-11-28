@@ -2051,7 +2051,7 @@ code.
   parent reads every 5 ms at 64 MiB there (M3, KP5), so it misses a
   kill with probability 1 % or less (R-S6). Since #142 the host pin
   judges wiring and liveness only (own file read in at least 5 of 20
-  slots, the parent's in at most 5, a stall bound of 500 ms); the
+  slots, the parent's in at most 5, a stall bound of 3 s); the
   cadence (reads per period, late reads, longest gap) is pinned by unit
   tests of `run` on a fake clock (the real wait by the quickest of up
   to 200 one-period waits, under 1.5 periods), because under

@@ -1343,7 +1343,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer fails on a loaded host. It checks wiring and liveness (each
   keeper reads its own `memory.stat` in at least 5 of 20 slots, the
   parent's in at most 5, the keeper keeps reading, no failure, no pause
-  over 500 ms); the keeper's cadence is pinned by unit tests that drive
+  over 3 s); the keeper's cadence is pinned by unit tests that drive
   its loop on a fake clock through a private `Clock` seam, exactly
   (reads, late reads, longest gap, re-anchoring after a freeze), and the
   real wait by a unit test that the quickest of up to 200 one-period
