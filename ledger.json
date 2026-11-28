@@ -1741,16 +1741,16 @@
    "title": "boneli-sys: run the host tests on the Linux 6.1 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "1429a1ef",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "plan approved at STOP 1 2026-11-28 (comment 7233860439); waits on #149 (floor 6.1), then implement",
-   "updated_at": "2026-11-28T16:43:49+00:00",
+   "note": "",
+   "updated_at": "2026-11-28T16:43:56+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1813,14 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-27T02:04:09+00:00",
-   "issue": 6,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "bc767b73",
-   "note": null
-  },
   {
    "at": "2026-11-27T11:51:07+00:00",
    "issue": 6,
@@ -2212,6 +2204,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-28T16:43:56+00:00",
+   "issue": 144,
+   "from": "ready",
+   "to": "claimed",
+   "by": "1429a1ef",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2239,7 +2239,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T16:43:49+00:00",
+ "updated_at": "2026-11-28T16:43:56+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
