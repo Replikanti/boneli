@@ -1741,16 +1741,16 @@
    "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "ready",
-   "owner": null,
-   "user": null,
-   "machine": null,
-   "session": null,
-   "dispatched": null,
+   "state": "claimed",
+   "owner": "7a384e70",
+   "user": "ylohnitram",
+   "machine": "df82df",
+   "session": true,
+   "dispatched": true,
    "parked": null,
    "pr": null,
-   "note": "added by sync — run reorder",
-   "updated_at": "2026-11-28T03:45:53+00:00",
+   "note": "",
+   "updated_at": "2026-11-28T03:46:06+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1764,14 +1764,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T20:31:42+00:00",
-   "issue": 129,
-   "from": "ready",
-   "to": "claimed",
-   "by": "9cc7896e",
-   "note": "dispatched"
-  },
   {
    "at": "2026-11-25T20:59:09+00:00",
    "issue": 129,
@@ -2163,6 +2155,14 @@
    "to": "ready",
    "by": "sync",
    "note": null
+  },
+  {
+   "at": "2026-11-28T03:46:06+00:00",
+   "issue": 144,
+   "from": "ready",
+   "to": "claimed",
+   "by": "7a384e70",
+   "note": "dispatched"
   }
  ],
  "open": [
@@ -2189,7 +2189,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T03:45:53+00:00",
+ "updated_at": "2026-11-28T03:46:06+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
