@@ -617,9 +617,18 @@ enum SandboxBug {
     /// Regression (review run 1 of #147): destroying a sandbox drops the
     /// layers sealed from it.
     LayerDiesWithSource,
+    /// Overlapping dependencies are not refused: only the last is mounted,
+    /// over the others.
+    IgnoresOverlap,
     /// Regression (review run 1 of #147): every live layer is mounted in
     /// every sandbox.
     MountsAll,
+    /// Regression (review run 2 of #147): a seal follows a symlink with a
+    /// relative target, which resolves on the host as it does inside.
+    SealFollowsRelativeLinks,
+    /// Regression (review run 2 of #147): the error output is not capped:
+    /// it is cut and returned as whole.
+    ErrorOutputUncapped,
 }
 
 /// Limits with room for anything the suite builds.
@@ -646,6 +655,9 @@ const SEALED_FILE: &str = "/workspace/out/result.txt";
 /// copies the planted file over the link, as a copier that follows links
 /// would read it.
 const FOLLOW: &str = "mutant-follow";
+/// The same for `SealFollowsRelativeLinks`: it copies the sentinel the
+/// relative link points to over the link.
+const FOLLOW_RELATIVE: &str = "mutant-follow-relative";
 
 struct SandboxMutant {
     bug: SandboxBug,
@@ -784,6 +796,9 @@ impl Sandbox for SandboxMutant {
                     broker.socket = format!("/{}", broker.socket.replace('\u{0}', ""));
                 }
             }
+            SandboxBug::IgnoresOverlap if given.dependencies.len() > 1 => {
+                given.dependencies.drain(..given.dependencies.len() - 1);
+            }
             SandboxBug::MountsAll => {
                 let live = Mutex::lock(&self.sealed_from)
                     .expect("not poisoned")
@@ -824,7 +839,22 @@ impl Sandbox for SandboxMutant {
         if self.bug == SandboxBug::KnownInFirst {
             command = self.in_first(id, &command);
         }
-        let mut result = if self.bug == SandboxBug::TruncatesOutput {
+        let mut result = if self.bug == SandboxBug::ErrorOutputUncapped {
+            let unbounded = Limits {
+                output_bytes: u64::MAX,
+                ..*limits
+            };
+            let mut result = self.inner.exec(id, &command, &unbounded)?;
+            if u64::try_from(result.stdout.len()).map_or(true, |n| n > limits.output_bytes) {
+                return Err(SandboxError::Failed {
+                    detail: String::from("the standard output passed output_bytes"),
+                });
+            }
+            result
+                .stderr
+                .truncate(usize::try_from(limits.output_bytes).unwrap_or(usize::MAX));
+            result
+        } else if self.bug == SandboxBug::TruncatesOutput {
             let unbounded = Limits {
                 output_bytes: u64::MAX,
                 ..*limits
@@ -944,6 +974,26 @@ impl Sandbox for SandboxMutant {
             let follow = SandboxCommand {
                 container: spec.containers[0].name.clone(),
                 ..sandbox_command(FOLLOW)
+            };
+            self.inner.exec(
+                id,
+                &follow,
+                &Limits {
+                    wall_ms: 1,
+                    output_bytes: 0,
+                },
+            )?;
+        }
+        if self.bug == SandboxBug::SealFollowsRelativeLinks
+            && let Some(spec) = self.spec_of(id)
+            && matches!(
+                self.inner.entry(id, SEALED_FILE),
+                Some(Write::Symlink(target)) if !target.starts_with(b"/")
+            )
+        {
+            let follow = SandboxCommand {
+                container: spec.containers[0].name.clone(),
+                ..sandbox_command(FOLLOW_RELATIVE)
             };
             self.inner.exec(
                 id,
@@ -1170,6 +1220,14 @@ fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbo
             ..sandbox_program("print", 0)
         },
         Program {
+            result: ExecResult {
+                status: ExitStatus::Code(0),
+                stdout: vec![],
+                stderr: b"printed".to_vec(),
+            },
+            ..sandbox_program("print-err", 0)
+        },
+        Program {
             writes: vec![(path("out/result.txt"), Write::File(b"written".to_vec()))],
             ..sandbox_program("serve", 0)
         },
@@ -1180,6 +1238,10 @@ fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbo
                 path("out/result.txt"),
             )],
             ..sandbox_program(FOLLOW, 0)
+        },
+        Program {
+            copies: vec![(format!("{WORKSPACE}/sentinel.txt"), path("out/result.txt"))],
+            ..sandbox_program(FOLLOW_RELATIVE, 0)
         },
     ]);
     contract::sandbox::Workspace {
@@ -1233,6 +1295,7 @@ fn sandbox_fixture<S>(make: impl FnOnce(MemorySandbox) -> S) -> contract::sandbo
         relative: sandbox_command("relative"),
         print: sandbox_command("print"),
         printed: b"printed".to_vec(),
+        print_err: sandbox_command("print-err"),
         service: sandbox_command("serve"),
         settle: sandbox_command("settle"),
     }
@@ -2379,6 +2442,7 @@ pub fn mutants() -> Vec<Mutant> {
         sandbox("seal-no-symlink", SandboxBug::SealFollowsLinks),
         sandbox("dependency-read-only", SandboxBug::LayerWritable),
         sandbox("export-without-mounts", SandboxBug::ExportsMounts),
+        sandbox("dependency-overlap-refused", SandboxBug::IgnoresOverlap),
         git("read-at-base", GitBug::Truncates),
         git("read-missing", GitBug::MissingIsEmpty),
         git("unknown-commit", GitBug::UnknownIsOk),
@@ -2522,6 +2586,9 @@ pub fn regression_mutants() -> Vec<Mutant> {
         sandbox("sealed-layer-mounted", SandboxBug::LayerFollowsSource),
         sandbox("sealed-layer-mounted", SandboxBug::LayerDiesWithSource),
         sandbox("sealed-layer-mounted", SandboxBug::MountsAll),
+        // Review run 2 of #147.
+        sandbox("seal-no-symlink", SandboxBug::SealFollowsRelativeLinks),
+        sandbox("output-cap", SandboxBug::ErrorOutputUncapped),
     ]
 }
 

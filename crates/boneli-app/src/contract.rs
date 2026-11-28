@@ -1146,7 +1146,7 @@ pub mod sandbox {
     /// The clauses, in the order [`run`] checks them. The first seven are
     /// ADR-004's (D11); `isolated`, `fresh-after-destroy` and
     /// `destroyed-is-unknown` are stronger since ADR-042 (D2), which adds
-    /// the other sixteen.
+    /// the other seventeen.
     pub const CLAUSES: &[&str] = &[
         "distinct-ids",
         "copy-out-after-write",
@@ -1168,6 +1168,7 @@ pub mod sandbox {
         "sealed-layer-mounted",
         "dependency-read-only",
         "export-without-mounts",
+        "dependency-overlap-refused",
         "distinct-layers",
         "released-layer-unknown",
         "layer-in-use-kept",
@@ -1248,6 +1249,8 @@ pub mod sandbox {
         pub print: Command,
         /// What `print` prints; not empty.
         pub printed: Vec<u8>,
+        /// A command whose error output is [`Workspace::printed`].
+        pub print_err: Command,
         /// A service: it writes [`Workspace::content`] to
         /// [`Workspace::path`] and keeps running.
         pub service: Command,
@@ -1288,6 +1291,7 @@ pub mod sandbox {
         sealed_layer_mounted(&make())?;
         dependency_read_only(&make())?;
         export_without_mounts(&make())?;
+        dependency_overlap_refused(&make())?;
         distinct_layers(&make())?;
         released_layer_unknown(&make())?;
         layer_in_use_kept(&make())
@@ -1740,10 +1744,8 @@ pub mod sandbox {
     /// a tmpfs cap the OOM kill always beats, or a `pids.max` no exec can
     /// start under (ADR-042, D2). So is the rest of `SandboxSpec::check`:
     /// two containers of one name, two brokers of one name, a broker
-    /// socket that is relative or holds NUL. A layer listed twice is not a
-    /// variant: it overlaps itself, so `create` refuses it by the overlap
-    /// of the dependency paths as well, and no variant could tell the two
-    /// checks apart.
+    /// socket that is relative or holds NUL. A layer listed twice is in
+    /// `dependency-overlap-refused`, which needs sealed layers.
     fn limits_checked<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "limits-checked";
         let spec = two_containers(w, clause)?;
@@ -1830,6 +1832,8 @@ pub mod sandbox {
 
     /// Output of exactly `output_bytes` is returned whole, one byte more
     /// fails the exec: a cut transcript is never returned as a whole one.
+    /// Each stream is capped on its own; test runners put their failure
+    /// output on the error stream.
     fn output_cap<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "output-cap";
         ensure(!w.printed.is_empty(), PORT, clause, || {
@@ -1841,18 +1845,30 @@ pub mod sandbox {
             ..w.limits
         };
         let id = create(w, clause)?;
-        let whole = w.adapter.exec(&id, &w.print, &at(n));
-        ensure(
-            whole.as_ref().map(|r| &r.stdout) == Ok(&w.printed),
-            PORT,
-            clause,
-            || format!("exec of print with output_bytes {n} gave {whole:?}, expected its output"),
-        )?;
-        expect_failed(
-            clause,
-            &format!("exec of print with output_bytes {}", n - 1),
-            w.adapter.exec(&id, &w.print, &at(n - 1)),
-        )
+        type Stream = fn(&ExecResult) -> &Vec<u8>;
+        let streams: [(&str, &Command, Stream); 2] = [
+            ("print", &w.print, |r| &r.stdout),
+            ("print_err", &w.print_err, |r| &r.stderr),
+        ];
+        for (name, command, stream) in streams {
+            let whole = w.adapter.exec(&id, command, &at(n));
+            ensure(
+                whole.as_ref().map(stream) == Ok(&w.printed),
+                PORT,
+                clause,
+                || {
+                    format!(
+                        "exec of {name} with output_bytes {n} gave {whole:?}, expected its output"
+                    )
+                },
+            )?;
+            expect_failed(
+                clause,
+                &format!("exec of {name} with output_bytes {}", n - 1),
+                w.adapter.exec(&id, command, &at(n - 1)),
+            )?;
+        }
+        Ok(())
     }
 
     /// A started service runs: what it writes is in the workspace.
@@ -2016,7 +2032,13 @@ pub mod sandbox {
     fn seal_no_symlink<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "seal-no-symlink";
         dependency_fixture(w, clause)?;
-        for (how, command) in [("at the path", &w.link), ("at a parent", &w.through)] {
+        // The relative link resolves on the host as it does inside, so a
+        // host-side copier that follows links shows there too.
+        for (how, command) in [
+            ("at the path", &w.link),
+            ("at a parent", &w.through),
+            ("with a relative target at the path", &w.relative),
+        ] {
             let p = create_from(w, clause, &in_phase(w, Phase::Prepare))?;
             exec(w, clause, &p, &w.plant)?;
             exec(w, clause, &p, command)?;
@@ -2104,6 +2126,30 @@ pub mod sandbox {
         let layer = sealed(w, clause)?;
         let id = create_from(w, clause, &with_layer(w, &layer))?;
         export_unchanged(w, clause, &id, "which mounts a layer")
+    }
+
+    /// Dependencies that overlap are refused at `create`: a layer listed
+    /// twice, and two layers sealed from the same directory. Mounted
+    /// together, one would hide the other, and what the gates read would
+    /// depend on the mount order (ADR-042, D6).
+    fn dependency_overlap_refused<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "dependency-overlap-refused";
+        let a = sealed(w, clause)?;
+        let b = sealed(w, clause)?;
+        for (what, dependencies) in [
+            ("one layer listed twice", vec![a.clone(), a.clone()]),
+            ("two layers sealed from one directory", vec![a, b]),
+        ] {
+            expect_failed(
+                clause,
+                &format!("create with {what}"),
+                w.adapter.create(&SandboxSpec {
+                    dependencies,
+                    ..w.spec.clone()
+                }),
+            )?;
+        }
+        Ok(())
     }
 
     /// Two seals give two handles, even of the same content: a reused

@@ -262,8 +262,9 @@ fn program(name: &str, code: i32) -> Program {
 /// makes `out` a symlink to its directory, `read` copies `out/result.txt`
 /// to `copied.txt`, `overwrite` writes `out/result.txt` again, `relative`
 /// links it to `../sentinel.txt`, which it writes, `print` prints
-/// `printed`, `serve` writes like `write` as a service, and `settle` does
-/// nothing, because a scripted service has written when `start` returns.
+/// `printed`, `print-err` prints it on the error output, `serve` writes
+/// like `write` as a service, and `settle` does nothing, because a
+/// scripted service has written when `start` returns.
 pub fn sandbox_programs() -> Vec<Program> {
     vec![
         Program {
@@ -311,6 +312,14 @@ pub fn sandbox_programs() -> Vec<Program> {
                 stderr: vec![],
             },
             ..program("print", 0)
+        },
+        Program {
+            result: ExecResult {
+                status: ExitStatus::Code(0),
+                stdout: vec![],
+                stderr: b"printed".to_vec(),
+            },
+            ..program("print-err", 0)
         },
         Program {
             writes: vec![(path("out/result.txt"), Write::File(b"written".to_vec()))],
@@ -365,6 +374,7 @@ pub fn workspace() -> contract::sandbox::Workspace<MemorySandbox> {
         relative: command("relative"),
         print: command("print"),
         printed: b"printed".to_vec(),
+        print_err: command("print-err"),
         service: command("serve"),
         settle: command("settle"),
     }
