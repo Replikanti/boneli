@@ -8,8 +8,8 @@
 #8 builds `boneli-sandbox-linux`, the real adapter of the `Sandbox` port
 on the runtime of ADR-007. It lands in six pull requests, and this ADR
 grows with them: each PR adds the decision it implements, and the last
-one accepts the ADR. This revision holds D1, from part 1, and D2, from
-part 2.
+one accepts the ADR. This revision holds D1, from part 1, D2, from part
+2, and D3, from part 3.
 
 The sandbox copies a workspace in when a sandbox is created and exports
 one when the agent is done (ADR-004, D11). The format is ADR-010's (D2):
@@ -337,6 +337,290 @@ Rejected:
   `WrongPhase`). No caller branches on them yet; the extension rule can
   add one when a caller does.
 
+### D3. The pod's processes: anchors, joined commands, the memory release
+
+The real adapter needs what `spawn` (ADR-007, D4) cannot give: several
+containers that share one loopback, commands that run in a container
+that already exists, and a holder for the layer pins of ADR-025 (D2)
+that lives exactly as long as the pod. Part 3 adds this to `boneli-sys`
+(`src/anchor.rs`, `src/release.rs`); the adapter that uses it is part 5.
+
+**A pod** is one user namespace with ADR-007's single id mapping (D1)
+and one network namespace with only `lo`, inside one cgroup (ADR-007,
+D8). **Each container has an anchor**: a clone of the runner that never
+execs, PID 1 of a PID namespace of its own, which owns the container's
+mount, UTS and IPC namespaces and holds its pins as open descriptors.
+
+- **The first anchor** (`Anchor::create`) is cloned as `spawn` clones a
+  sandbox: `clone3` with the namespaces of ADR-007 (D7) and
+  `CLONE_INTO_CGROUP`, the id maps, a session keyring of its own, the
+  `oom_score_adj` raise and the cgroup namespace. Its steps differ in
+  one place: `lo` comes up before the root, so the anchor can report at
+  its fill point which loopback addresses exist (`/etc/hosts` lists
+  `::1` only where `lo` has it, D7).
+- **A later anchor** (`Anchor::join`) and **every command**
+  (`Anchor::exec`, and `Anchor::start` for a service, whose three
+  standard descriptors are `/dev/null`) start in two stages. Stage 1 is
+  cloned into the pod's cgroup with no namespace. It calls `setns` on
+  the anchor's pidfd and then `unshare`, then clones stage 2 with
+  `CLONE_PARENT | CLONE_PARENT_SETTID`, records its pid and exits:
+
+  | | joins (`setns`) | creates (`unshare`) |
+  | --- | --- | --- |
+  | exec | user, network, cgroup, mount, UTS, IPC | mount (a copy of the anchor's), PID |
+  | later anchor | user, network, cgroup | mount, PID, UTS, IPC |
+
+  An exec's stage 2 is PID 1 of its own PID namespace, as a `spawn`ed
+  program is: it takes its orphans and ends them when it exits. It mounts
+  a procfs of that namespace over each procfs of the container's root,
+  with ADR-007's covers over `keys` and `key-users`, so it never sees the
+  anchor; then it runs ADR-007 D4's sequence from `setsid` to `execve`,
+  under the notifying program whose denials a supervisor of the runner
+  records (ADR-043). The procfs is mounted through the working directory
+  (`fchdir`, then `mount` on `.`), because `/proc/self/fd/<n>`, which
+  `spawn`'s child uses, resolves in the container's `/proc`, the
+  anchor's, which does not show stage 2. A later anchor's stage 2 runs
+  the first anchor's sequence from the root on.
+
+**Why two stages and `CLONE_PARENT`.** `unshare(CLONE_NEWPID)` puts only
+the caller's children into the new PID namespace, so the program must
+be a child of the process that joined. With `CLONE_PARENT` that child
+is the runner's, which reaps it through a pidfd of its own
+(`pidfd_open`): race-free, because only the parent reaps, and an
+unreaped child keeps its pid. The kernel writes stage 2's pid into a
+page the runner mapped shared before the first clone
+(`CLONE_PARENT_SETTID`), during the clone. So the runner knows its second
+child even when stage 1 dies before its record (an OOM group kill or a
+`cgroup.kill` during a setup), and checks the record against the page;
+without the page that child stayed a zombie for the runner's life
+(`lost_first_stage_leaves_no_second`). A gate pipe holds stage 2 until
+stage 1 has written its record, so the records arrive in order. Code
+in the runner's process that reaps with `waitpid(-1)` or sets `SIGCHLD`
+to `SIG_IGN` would take these exits; std does neither, and the crate
+docs say so.
+
+**The fill point.** An anchor runs its mounts up to `AnchorSpec::fill_at`,
+then reports and waits for one byte on a socket pair. Meanwhile the runner
+works in the new root through `Fill::open`: `/proc/<pid>/root` of the
+anchor, which has not pivoted, checked against its pidfd after the open,
+then `openat2` beneath it with `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS`, so a symlink in an image cannot point the runner,
+which holds the git token, at a host path (`fill_follows_no_symlink`).
+There it copies the workspace in and creates the mount points of the
+dependency binds (part 5). Then it resumes the anchor, which mounts the
+rest, pivots, sets its hostname, calls `setsid`, drops every privilege
+(ADR-007, D9) and loads the plain seccomp program. An anchor installs it
+without a listener: it runs no workload, so there is no denied call to
+record, and a listener would cost a supervisor thread per container for
+the pod's life. The copy-in is not counted in the setup bound, because
+the anchor only waits while the runner writes. A socket pair rather than
+a pipe, so a resume sent to a dead anchor is EPIPE through
+`MSG_NOSIGNAL`, not a SIGPIPE in a runner that does not ignore it. A
+later anchor stays dumpable after `setns`: `commit_creds` counts the
+runner's credentials, the namespace owner's in the parent, as a superset
+(measured: a variant that set `PR_SET_DUMPABLE` again changed nothing,
+and the tests fill later anchors through `/proc/<pid>/root`).
+
+**Descriptors.** Right after its clone, an anchor and a join's stage 1
+close every descriptor but the ones they keep (the report pipe, the
+resume socket, the pins, a join's stdio and listener socket). Without
+that, an anchor waiting at its fill point held copies of the runner's
+other descriptors, among them the report pipes of other pods' setups,
+whose EOF then waited for that fill
+(`anchors_at_the_fill_point_hold_no_runner_descriptor`,
+`join_stages_hold_no_runner_descriptor`). Before the release, the anchor
+closes everything but its pins and the report pipe, which it closes
+after its last record: a holding anchor has exactly its pins open
+(`anchor_descriptors_are_its_pins`), and its pins stay held when the
+runner is killed, until `cgroup.kill` (`anchor_pins_outlive_the_runner`;
+#33 sweeps such pods after a crash).
+
+**A fresh stack for every anchor.** A clone without `CLONE_VM`
+continues on a copy of the calling thread's stack, with that thread's
+TLS. So `create` and `join` clone the anchor (or a later anchor's first
+stage) from a thread of their own, whose stack is an anonymous mapping
+made for it alone (`pthread_attr_setstack`, 1 MiB with a `PROT_NONE`
+guard page at each end). The thread is joined before the call returns,
+and the mapping is unmapped after the join. The C library puts the
+thread's TLS and
+control block at the top of a stack it is given (glibc; musl does the
+same where they fit and maps a fresh region of its own otherwise), so the
+anchor's stack and TLS hold nothing but this crate's frames. 1 MiB: every
+test passed with a 128 KiB stack and failed with 64 KiB (measured,
+unoptimized), so 1 MiB is eight times what was enough. Not `std::thread`:
+glibc keeps the stacks of exited threads in a cache and hands them to new
+threads with their contents. Execs need no such thread: `execve`
+replaces their memory. Review run 2 of part 3 showed why this is
+needed. An anchor created from a runner thread kept a live marker in the
+frame that called `create` and the thread's own thread-local, because
+the TLS window lay at the top of that thread's stack. On the main thread
+the window reached into the mapping next to rtld's TLS, the top of the
+crate's own `memcg-keeper` thread stack. Stale frames under the release
+were kept too (1,759 copies of a marker; 1,697 on the main thread)
+(`worker_thread_anchor_keeps_no_runner_secret`,
+`main_thread_anchor_keeps_no_runner_stack`).
+
+**The memory release.** An anchor never execs, so without a release it
+keeps a copy-on-write image of the runner's memory as it was at the
+clone, for the pod's life and past the runner's own exit: up to that
+much memory per container, buffers the runner has freed or zeroed since
+included. Last in its setup, it reads its own `/proc/self/maps` (in its
+own procfs, which is why an anchor's root needs a `Mount::Proc`; it also
+needs a `Mount::Dev`, whose `null` covers an exec's procfs keys) and
+unmaps every shared mapping, whatever its name (an anonymous shared page
+reads as `/dev/zero (deleted)`, a memfd and SysV memory have names too),
+and every anonymous one (no name, `[heap]`, `[stack…]`, `[anon:…]`),
+except three kinds of ranges; a mapping that holds part of one loses
+the rest:
+
+- each ELF object's `.bss`, from its `PT_LOAD` headers, which the parent
+  reads before the clone (`dl_iterate_phdr`): for each segment whose
+  memory size exceeds its file size, the pages from the end of its file
+  part to the end of its memory, both rounded up to a page, which is
+  what the loader maps as anonymous memory. At most 64 such ranges
+  (`BSS_MAX`; the dev host's runner has four objects, the binary, libc,
+  libgcc_s and the loader), else `create` fails before the clone;
+- the stack from 64 KiB under the release's frame up to a local of its
+  caller's frame: nothing above is ever returned to, and the calls after
+  the first `munmap` (the scan, libc's `syscall`) are a few KiB deep even
+  unoptimized, so 64 KiB is a margin of more than ten. The local's
+  address escapes into the call, so the call cannot become a tail call
+  that would put the caller's frame below the release's, and the release
+  refuses a caller address not above its own frame. Before the first
+  `munmap` the release zeroes this window with volatile writes, from its
+  bottom up to 4 KiB under a frame one call deeper than its own
+  (`ZERO_MARGIN`; the calls it makes from there use a few hundred bytes,
+  so 4 KiB is a margin of more than ten). That keeps no stale frame of
+  earlier, deeper calls (`release_zeroes_stale_frames_under_it`: 1,280
+  copies of a marker survive without it);
+- 64 KiB around each of two thread-locals, one of the crate and libc's
+  `errno`: glibc's static TLS block with its surplus and the thread
+  control block, which holds the stack protector's canary on x86_64, are
+  a few KiB, musl's smaller.
+
+Each window ends at the mapping that holds its address, which the
+release reads from its maps file before the first `munmap`, and a window
+whose address no mapping holds fails the setup. A window around an
+address on the fresh stack also ends at that stack's read-write part,
+whose bounds the plan carries; the stack address must lie there. Both
+ends of that part are guarded, because one mapping line is no proof of
+one mapping: with a guard only under it, the fresh stack's top merged
+with a runner mapping right above it into one line, and the TLS window
+kept that neighbour's lowest 64 KiB (review run 3 of part 3, 2,048
+copies of a marker, `fresh_stack_neighbour_is_released`). The
+neighbour in the test is a `MAP_STACK` mapping, which since Linux 6.7
+carries the same flags as the fresh stack. On 5.19 to 6.6, and on a
+kernel without transparent huge pages, any private anonymous mapping
+does, a malloc chunk of 128 KiB or more for one. Either the upper guard
+or the clip alone keeps the neighbour out (measured: 0 copies each);
+with both removed, 1,920 copies stay.
+
+The `.bss` stays because code the compiler emits on its own needs it:
+the first release unmapped it and crashed with SIGSEGV in glibc's
+`memset`, which zeroed a stack buffer and read its size threshold from
+libc's `.bss` (measured from the core dump). The first version took an
+unnamed mapping that starts where a named one ends for a `.bss`, and
+kept the whole mapping that held the stack pointer. Review run 1 of
+part 3 showed both wrong. A 32 MiB runner buffer right above a shared
+page (the pid page of a join running in another thread) or above a
+private file mapping was kept, and a secret in it read back through
+`/proc/<anchor>/mem` after the runner had zeroed and unmapped it
+(`runner_buffers_next_to_named_mappings_are_released`,
+`concurrent_setup_pid_page_is_released`). An anchor created on the
+runner's main thread kept that thread's whole `[stack]`, the environment
+block at its top and stale frames below
+(`main_thread_anchor_keeps_no_runner_stack`, which creates the anchor
+from an `.init_array` constructor of the test binary, the one place
+before libtest's threads). The rest of the code after the first `munmap`
+uses only its arguments, stack memory and raw `syscall`s, zeroes its
+buffers before the first `munmap`, compares and resets byte by byte, and
+cannot panic. Then it blocks every signal, writes its last record,
+closes the report pipe and waits in `rt_sigsuspend` with every signal
+blocked, so only SIGKILL ends it. A libc that kept a thread's TLS
+farther than 64 KiB from both thread-locals would make the anchor crash
+here, which fails `create`: fail closed. Private file mappings stay
+whole: code, read-only data and each object's written data, which the
+code after the first `munmap` may read.
+
+The numbers: the maps file is read in passes of up to 128 ranges, so it
+is never read while it changes (a pass reads it whole, then unmaps), and
+with at most 1,024 passes (131,072 ranges, twice the default
+`vm.max_map_count` of 65,530) a host that raised the limit past that
+fails the setup instead of looping. `anchor_releases_runner_memory`
+dirties 268,435,456 bytes of heap before `create` and requires each
+anchor's `Anonymous` in `smaps_rollup` below 64 MiB, a quarter of the
+buffer, so a release that keeps the heap fails four times over.
+Measured on the dev host in two runs: 568 and 572 kB for the first
+anchor and 572 and 576 kB for a later one, against 263,272 and 263,380 kB
+in the runner, and 568 and 572 kB for an anchor created on the main
+thread (656 and 660 kB before review run 1, when the
+thread's whole stack mapping stayed; 560 and 564 kB after run 1, before
+the fresh stack); with the release removed, the first anchor kept
+263,448 kB.
+
+**The report protocol** (ADR-007, D4) becomes a stream of the same
+12-byte records, ended by EOF. A record with errno 0 is a progress
+record, of one of three steps only: `Forked` (stage 1's record, the
+item stage 2's pid), `Fill` (the fill point, the item the loopback
+families, bit 0 IPv4 and bit 1 IPv6) and `Release` (the hold, item 0).
+Every other record is a failure, which never carries errno 0 (an errno
+the call left at 0 is reported as EIO). A first anchor sends `Fill`,
+then `Release`, then EOF; a later one `Forked`, `Fill`, `Release`, EOF;
+an exec `Forked`, then EOF at its `execve`. Anything else is
+`ProtocolError::Unexpected`, `Ended` or `Value`, after which every stage
+is killed and reaped. `spawn`'s child sends no progress, and its decoder
+refuses one. New step codes 31 to 36: `Setns`, `Unshare`, `InnerClone`,
+`Forked`, `Fill`, `Release`; the sequences are
+`Step::ANCHOR_SEQUENCE`, `JOIN_SEQUENCE` and `EXEC_SEQUENCE`, and a unit
+test fails every step of each and gets its report back.
+
+**`Mount::Tmpfs` gains `inodes`**, `nr_inodes` or `None` for the kernel's
+default (half the host's RAM pages); `Some(0)`, which the kernel reads as
+unlimited, is refused like a size of 0. The workspace's tmpfs takes
+`PodLimits::workspace_inodes` (D2).
+
+**Setup times** for D8's hang bounds (`setup_timing_report`, 50 runs of
+each kind, printed on both CI legs too), min / median / p95 / max in two
+runs on the dev host: a first anchor from the clone to its hold, created
+and resumed with nothing to fill, 7.3 / 9.7 / 13.3 / 47.4 ms and
+4.0 / 5.6 / 10.9 / 16.0 ms; a later one 6.8 / 8.9 / 11.6 / 12.8 ms and
+3.3 / 5.1 / 6.9 / 7.5 ms; an exec from the clone to `execve`
+3.5 / 5.3 / 7.7 / 9.6 ms and 2.5 / 3.2 / 4.4 / 4.8 ms. After review run 2,
+with the clone on a thread of its own: 5.8 / 7.2 / 8.9 / 13.6 ms,
+7.2 / 13.6 / 20.2 / 21.7 ms and 4.4 / 7.2 / 10.9 / 11.8 ms. Part 5 fixes the
+bounds from these and the CI legs' numbers by D8's rule.
+
+Rejected:
+
+- **An exec'd helper binary as the anchor** (STOP 1, decision 2): it
+  needs no memory release, but it is one more binary to ship, to find
+  at run time and to put under an AppArmor profile, and it cannot use
+  ADR-007 D4's allocation-free child as it is.
+- **Unmapping the `.bss` too**, with the code after the first `munmap`
+  kept free of calls the compiler emits into libc (`memset`, `memcpy`,
+  `memcmp`): Rust gives no way to forbid them, and the measured crash
+  was one. **Finding the `.bss` by adjacency** (an unnamed mapping that
+  starts where a named one ends), the first version: it kept runner
+  buffers (review run 1). **Switching the anchor to a stack of its own
+  inside the clone**: a stack switch needs assembly per architecture,
+  and a fork-like `clone3` cannot continue a Rust frame on another
+  stack; a thread on its own stack gets the same without either.
+  **A `std::thread` for the clone**: glibc reuses the stacks of exited
+  threads with their contents (review run 2).
+- **One stage with `setns` into the anchor's PID namespace**: the
+  program would then share the anchor's namespace, see it and be no PID
+  1, and its orphans would go to the anchor, which never reaps.
+- **Stage 1 sending stage 2's pidfd over a socket** instead of the shared
+  page: stage 1 can die between the clone and the send, which is the
+  window the page closes.
+
+Known limit: the kernel behaviour this relies on (`setns` with several
+namespaces through a pidfd, Linux 5.8; a new procfs over the anchor's
+in a mount namespace of the same user namespace, whose mounts are not
+locked; `CLONE_PARENT_SETTID` with `clone3`) is verified on the dev host
+(Linux 7.2) and the CI legs only, not on the 5.19 floor, as ADR-007
+states for unswept kernels.
+
 ## Consequences
 
 - `boneli-workspace` is on the always-review list (decided at #8 STOP 1):
@@ -364,6 +648,18 @@ Rejected:
 - The in-memory adapter cannot export a symlink: its snapshot format
   holds files only. No clause exports one, and the real adapter carries
   symlinks raw (D5).
+- The runner is the parent of every anchor and every program (D3), so
+  nothing else in its process may reap with `waitpid(-1)` or ignore
+  `SIGCHLD`. Each anchor costs one task of the pod's `processes` and,
+  after the release, a window of its stack, a window around its TLS and
+  the runner's `.bss` in resident memory (572 kB measured). Creating
+  an anchor starts a thread of the runner for the clone, on a 1 MiB
+  mapping that is unmapped once the thread has been joined.
+- An anchor's root needs a procfs and a minimal `/dev` (D3); the adapter
+  of part 5 always mounts both, and `Anchor::create` refuses a root
+  without them before the clone.
+- `Mount::Tmpfs` has a new field, `inodes`; the existing mounts pass
+  `None`, which is the kernel's default and the behaviour before.
 
 ## Alternatives considered
 

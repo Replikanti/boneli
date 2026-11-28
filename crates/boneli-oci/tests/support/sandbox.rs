@@ -169,6 +169,7 @@ pub fn image_mounts() -> Vec<Mount> {
         Mount::Tmpfs {
             target: inside("/tmp"),
             size_bytes: 64 << 20,
+            inodes: None,
             mode: 0o1777,
         },
         Mount::Proc {

@@ -1140,6 +1140,33 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with its sandbox, the runner's own `setgid` returns while a sandbox
   runs (the supervisor leaves the C library's signals unblocked), and
   `notification_cost` prints the cost on both CI legs. boneli-oci's `node` and `postgres` runs print their records.
+- `boneli-sys` anchors (part 3 of #8, ADR-042 D3, still proposed): a pod
+  is one user and network namespace in one cgroup, and each container has
+  an anchor, a clone of the runner that never execs, PID 1 of its own PID
+  namespace, which owns the container's mount, UTS and IPC namespaces and
+  holds its layer pins. `Anchor::create` clones the first one like
+  `spawn` with `lo` up before the root; `Anchor::join` (a later anchor)
+  and `Anchor::exec` / `Anchor::start` (a command, a service) start in
+  two stages: `setns` on the anchor's pidfd, `unshare`, and
+  `clone3(CLONE_PARENT | CLONE_PARENT_SETTID)`, so the program is PID 1
+  of a PID namespace of its own, the runner's child, and reaped through
+  its own pidfd. An anchor waits at its fill point (`Fill::open` beneath
+  its new root through `/proc/<pid>/root` without following any symlink,
+  `Fill::loopback`, `Fill::resume`), then pivots, drops every privilege,
+  loads the plain seccomp program, keeps only its pins and unmaps every
+  shared and anonymous mapping of the runner but a 64 KiB stack window
+  under its own frame (zeroed under it), 64 KiB around its TLS (each
+  window clipped to its mapping) and each ELF object's `.bss` from its
+  `PT_LOAD` headers. An anchor is cloned from a thread of its own on a
+  freshly mapped 1 MiB stack, guarded at both ends and whose bounds the
+  release clips to, so its stack and TLS hold nothing of the runner's
+  (568 kB left of 263,272 kB measured; no marker of a runner frame,
+  thread-local, neighbour thread or neighbouring mapping survives). The
+  setup report gains progress records and steps 31 to 36;
+  `Mount::Tmpfs` gains `inodes`. Host tests on both CI legs, among them
+  every step's failure report for the three new sequences,
+  `setup_timing_report`, and the memory, descriptor, privilege,
+  PID-namespace and loopback checks.
 
 ### Changed
 

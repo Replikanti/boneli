@@ -308,6 +308,7 @@ fn tmpfs_size_inclusive() {
             Mount::Tmpfs { target, mode, .. } => Mount::Tmpfs {
                 target,
                 size_bytes: SIZE,
+                inodes: None,
                 mode,
             },
             other => other,
@@ -433,6 +434,7 @@ fn mount_target_symlink_rejected() {
     mounts.push(Mount::Tmpfs {
         target: inside("/lnk/sub"),
         size_bytes: 4096,
+        inodes: None,
         mode: 0o755,
     });
     let index = index_of(&mounts, "/lnk/sub");
@@ -455,6 +457,7 @@ fn mount_target_missing() {
     mounts.push(Mount::Tmpfs {
         target: inside("/nonexistent"),
         size_bytes: 4096,
+        inodes: None,
         mode: 0o755,
     });
     let index = index_of(&mounts, "/nonexistent");

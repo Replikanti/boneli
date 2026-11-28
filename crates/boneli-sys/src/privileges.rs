@@ -49,14 +49,18 @@ pub(crate) fn parse_cap_last_cap(text: &str) -> Option<u32> {
 /// Everything the child's privilege steps need, prepared before the clone.
 pub(crate) struct PrivilegeDrop<'a> {
     pub cap_last_cap: u32,
-    /// The assembled notifying program (ADR-043, D2); the child points
-    /// `sock_fprog` at it.
+    /// The assembled program; the child points `sock_fprog` at it. The
+    /// notifying one (ADR-043, D2) where `listener` is set, the plain one
+    /// for an anchor, which runs no workload (ADR-042, D3).
     pub filter: &'a [Insn],
+    /// Whether the filter is installed with [`LISTENER_FLAGS`].
+    pub listener: bool,
 }
 
 /// The steps from [`Step::Securebits`] to [`Step::Seccomp`], in order.
-/// Returns the filter's listener: the filter is installed with
-/// [`LISTENER_FLAGS`] (ADR-043, D3).
+/// With `listener` set, the filter is installed with [`LISTENER_FLAGS`]
+/// (ADR-043, D3) and its listener is returned; without, with no flag, and
+/// the result is -1.
 pub(crate) fn drop_all(
     plan: &PrivilegeDrop<'_>,
     fault: Fault,
@@ -141,7 +145,7 @@ pub(crate) fn drop_all(
         libc::syscall(
             libc::SYS_seccomp,
             libc::SECCOMP_SET_MODE_FILTER,
-            LISTENER_FLAGS,
+            if plan.listener { LISTENER_FLAGS } else { 0 },
             &prog as *const libc::sock_fprog,
         )
     };
@@ -149,7 +153,7 @@ pub(crate) fn drop_all(
         return Err(fail(Step::Seccomp, 0, errno()));
     }
     // With NEW_LISTENER the install returns the listener.
-    Ok(rc as libc::c_int)
+    Ok(if plan.listener { rc as libc::c_int } else { -1 })
 }
 
 #[cfg(test)]

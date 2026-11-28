@@ -105,7 +105,7 @@ impl InsidePath {
     }
 
     /// The path without its leading `/`, for `openat2` beneath the root.
-    fn relative(&self) -> &str {
+    pub(crate) fn relative(&self) -> &str {
         &self.0[1..]
     }
 }
@@ -158,6 +158,12 @@ pub enum Mount {
         /// Its size limit; no default, zero (unlimited for the kernel) is
         /// refused.
         size_bytes: u64,
+        /// Its inode limit (`nr_inodes`), or `None` for the kernel's
+        /// default, half the host's RAM pages. Zero (unlimited for the
+        /// kernel) is refused. A pod's workspace sets it, so a tree of
+        /// empty files cannot exhaust the host's inodes (ADR-042, D3 and
+        /// D4).
+        inodes: Option<u64>,
         /// The mode of its root, at most `0o7777`.
         mode: u32,
     },
@@ -289,6 +295,14 @@ pub(crate) enum Op {
     Hostname { name: CString },
     /// `lo` up.
     Loopback,
+    /// The calling process's current root as the base of the operations
+    /// after it: an exec joined to an anchor that already pivoted
+    /// ([`plan_joined`]). Filesystems are then mounted through the working
+    /// directory, not `/proc/self/fd`, because the container's `/proc` is
+    /// the anchor's and does not show the caller.
+    CurrentRoot,
+    /// `chdir` to the working directory, for an exec joined to an anchor.
+    Cwd { cwd: CString },
 }
 
 fn c_string(bytes: &[u8], err: Error) -> Result<CString> {
@@ -383,10 +397,18 @@ fn validate_root(root: &Root) -> Result<()> {
                 }
             }
             Mount::Tmpfs {
-                size_bytes, mode, ..
+                size_bytes,
+                inodes,
+                mode,
+                ..
             } => {
                 if *size_bytes == 0 {
                     return Err(bad("tmpfs size 0 means unlimited; give a size"));
+                }
+                if *inodes == Some(0) {
+                    return Err(bad(
+                        "tmpfs nr_inodes 0 means unlimited; give a count or None",
+                    ));
                 }
                 if *mode > 0o7777 {
                     return Err(bad("tmpfs mode above 0o7777"));
@@ -466,6 +488,74 @@ pub(crate) fn refuse_hugetlbfs(root: &Root) -> Result<()> {
     Ok(())
 }
 
+/// The options of a [`Mount::Tmpfs`]: `size`, `nr_inodes` when given, and
+/// the mode of its root.
+pub(crate) fn tmpfs_data(size_bytes: u64, inodes: Option<u64>, mode: u32) -> String {
+    match inodes {
+        Some(n) => format!("size={size_bytes},nr_inodes={n},mode={mode:04o}"),
+        None => format!("size={size_bytes},mode={mode:04o}"),
+    }
+}
+
+/// The operations of an anchor (ADR-042, D3) and the index of its fill
+/// point: `lo` first when `loopback` (the pod's first anchor creates the
+/// network namespace; a later one shares it), then the operations of
+/// [`plan`] without its `lo`, so the root, the mounts, `pivot_root` and
+/// the hostname. `fill_at` mounts of `root.mounts` come before the fill
+/// point, the rest after it: the runner creates their mount points while
+/// the anchor waits there. `fill_at` above the mount count is refused.
+pub(crate) fn plan_anchor(root: &Root, fill_at: usize, loopback: bool) -> Result<(Vec<Op>, usize)> {
+    if fill_at > root.mounts.len() {
+        return Err(Error::InvalidAnchor(
+            "the fill point lies past the last mount",
+        ));
+    }
+    let mut ops = plan(root)?;
+    // plan() ends with lo; an anchor brings it up before the root.
+    ops.pop();
+    // MakePrivate and the root come before the first mount.
+    let mut split = 2 + fill_at;
+    if loopback {
+        ops.insert(0, Op::Loopback);
+        split += 1;
+    }
+    Ok((ops, split))
+}
+
+/// The operations of an exec's second stage in a container whose anchor
+/// already pivoted (ADR-042, D3): its root as the base, a new procfs over
+/// each procfs mount of the anchor's root (with the covers of
+/// [`PROC_MASKED`]), so the exec sees its own PID namespace and never the
+/// anchor's, then the working directory.
+pub(crate) fn plan_joined(root: &Root, cwd: &InsidePath) -> Result<Vec<Op>> {
+    let mut ops = vec![Op::CurrentRoot];
+    for (i, mount) in root.mounts.iter().enumerate() {
+        if let Mount::Proc { target } = mount {
+            let index = u32::try_from(i).map_err(|_| Error::InvalidMount {
+                index: i,
+                reason: "more than 2^32 mounts",
+            })?;
+            ops.push(Op::Proc {
+                index,
+                target: c_string(
+                    target.relative().as_bytes(),
+                    Error::InvalidMount {
+                        index: i,
+                        reason: "the target contains NUL",
+                    },
+                )?,
+            });
+        }
+    }
+    ops.push(Op::Cwd {
+        cwd: c_string(
+            cwd.as_str().as_bytes(),
+            Error::InvalidRoot("the cwd contains NUL"),
+        )?,
+    });
+    Ok(ops)
+}
+
 /// Validates the root and prepares the child's operations: make every
 /// mount private, the root, the mounts in order, `pivot_root`, the
 /// hostname, `lo`.
@@ -517,12 +607,15 @@ pub(crate) fn plan(root: &Root) -> Result<Vec<Op>> {
                     | if *writable { 0 } else { ffi::MOUNT_ATTR_RDONLY },
             },
             Mount::Tmpfs {
-                size_bytes, mode, ..
+                size_bytes,
+                inodes,
+                mode,
+                ..
             } => Op::Tmpfs {
                 index,
                 target,
                 data: c_string(
-                    format!("size={size_bytes},mode={mode:04o}").as_bytes(),
+                    tmpfs_data(*size_bytes, *inodes, *mode).as_bytes(),
                     mount_nul("tmpfs data"),
                 )?,
             },
@@ -895,6 +988,35 @@ fn mount_on(
     if rc < 0 { Err(errno()) } else { Ok(()) }
 }
 
+/// A new filesystem mounted onto the target descriptor through the
+/// working directory: `fchdir` to the target, then `mount` onto `.`. For
+/// an exec joined to an anchor ([`Op::CurrentRoot`]), whose `/proc` does
+/// not show it, so `/proc/self/fd` resolves to nothing. The working
+/// directory is set again by [`Op::Cwd`].
+fn mount_via_cwd(
+    target: &Fd,
+    source: &CStr,
+    fstype: &CStr,
+    flags: libc::c_ulong,
+) -> std::result::Result<(), i32> {
+    // SAFETY: fchdir takes a descriptor; O_PATH directories are accepted.
+    if unsafe { libc::fchdir(target.0) } < 0 {
+        return Err(errno());
+    }
+    // SAFETY: every string is NUL-terminated and lives for the call's
+    // duration; no data is passed.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            c".".as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 { Err(errno()) } else { Ok(()) }
+}
+
 fn step<T>(r: std::result::Result<T, i32>, step: Step, index: u32) -> Result2<T> {
     r.map_err(|e| fail(step, index, e))
 }
@@ -1105,9 +1227,34 @@ fn loopback(fault: Fault) -> Result2<()> {
     Ok(())
 }
 
+/// What the operations carry from one run to the next: an anchor runs its
+/// operations in two parts, before and after its fill point (ADR-042, D3).
+pub(crate) struct State {
+    /// The new root (or, after [`Op::CurrentRoot`], the current one).
+    root: Option<Fd>,
+    /// Whether procfs mounts go through the working directory
+    /// ([`Op::CurrentRoot`]).
+    via_cwd: bool,
+}
+
+impl State {
+    /// Before the first operation.
+    pub(crate) fn new() -> State {
+        State {
+            root: None,
+            via_cwd: false,
+        }
+    }
+}
+
 /// Runs the operations in order. Runs in the cloned child.
 pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
-    let mut root: Option<Fd> = None;
+    run_with(ops, fault, &mut State::new())
+}
+
+/// [`run`] with the state of an earlier part. Runs in the cloned child.
+pub(crate) fn run_with(ops: &[Op], fault: Fault, state: &mut State) -> Result2<()> {
+    let State { root, via_cwd } = state;
     for op in ops {
         match op {
             Op::MakePrivate => {
@@ -1131,7 +1278,7 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                 let at = step(open_host(staging), Step::Root, 0)?;
                 let layer = step(open_host(layer), Step::Root, 0)?;
                 step(bind(&layer, &at, ROOT_ATTRS), Step::Root, 0)?;
-                root = Some(step(open_host(staging), Step::Root, 0)?);
+                *root = Some(step(open_host(staging), Step::Root, 0)?);
             }
             Op::RootOverlay { layers, staging } => {
                 inject(fault, Step::Root)?;
@@ -1161,8 +1308,21 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                 )?;
                 // The kernel has pinned the layers; the descriptors may go.
                 drop(dirs);
-                root = Some(step(open_host(staging), Step::Root, 0)?);
+                *root = Some(step(open_host(staging), Step::Root, 0)?);
             }
+            Op::CurrentRoot => {
+                inject(fault, Step::Root)?;
+                *root = Some(step(open_host(c"/"), Step::Root, 1)?);
+                *via_cwd = true;
+            }
+            Op::Cwd { cwd } => {
+                // SAFETY: cwd is NUL-terminated and prepared before the clone.
+                if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+                    return Err(fail(Step::Pivot, 4, errno()));
+                }
+            }
+            // An anchor brings lo up before its root (ADR-042, D3).
+            Op::Loopback => loopback(fault)?,
             op => {
                 let Some(new_root) = root.as_ref() else {
                     // plan() always puts the root first.
@@ -1247,17 +1407,13 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                         // visible one in the mount namespace.
                         let at = target(new_root, rel, *index, fault)?;
                         inject(fault, Step::Proc)?;
-                        step(
-                            mount_on(
-                                &at,
-                                c"proc",
-                                c"proc",
-                                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                                None,
-                            ),
-                            Step::Proc,
-                            *index,
-                        )?;
+                        let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+                        let mounted = if *via_cwd {
+                            mount_via_cwd(&at, c"proc", c"proc", flags)
+                        } else {
+                            mount_on(&at, c"proc", c"proc", flags, None)
+                        };
+                        step(mounted, Step::Proc, *index)?;
                         mask_proc(new_root, rel, *index)?;
                     }
                     Op::Dev {
@@ -1299,8 +1455,12 @@ pub(crate) fn run(ops: &[Op], fault: Fault) -> Result2<()> {
                             return Err(fail(Step::Hostname, 0, errno()));
                         }
                     }
-                    Op::Loopback => loopback(fault)?,
-                    Op::MakePrivate | Op::RootBind { .. } | Op::RootOverlay { .. } => {}
+                    Op::MakePrivate
+                    | Op::Loopback
+                    | Op::RootBind { .. }
+                    | Op::RootOverlay { .. }
+                    | Op::CurrentRoot
+                    | Op::Cwd { .. } => {}
                 }
             }
         }
@@ -1427,9 +1587,22 @@ mod tests {
         let tmpfs = |size_bytes, mode| Mount::Tmpfs {
             target: p("/tmp"),
             size_bytes,
+            inodes: None,
             mode,
         };
         assert!(plan(&root_with(&["/l/a"], vec![tmpfs(1, 0o1777)])).is_ok());
+        // nr_inodes=0 is unlimited for the kernel, like size=0.
+        let counted = |inodes| Mount::Tmpfs {
+            target: p("/tmp"),
+            size_bytes: 1,
+            inodes,
+            mode: 0o700,
+        };
+        assert!(plan(&root_with(&["/l/a"], vec![counted(Some(1))])).is_ok());
+        assert!(matches!(
+            plan(&root_with(&["/l/a"], vec![counted(Some(0))])),
+            Err(Error::InvalidMount { index: 0, .. })
+        ));
         assert!(matches!(
             plan(&root_with(&["/l/a"], vec![tmpfs(0, 0o1777)])),
             Err(Error::InvalidMount { index: 0, .. })
@@ -1628,6 +1801,116 @@ mod tests {
             matches!(single[1], Op::RootBind { .. }),
             "one layer is a bind"
         );
+    }
+
+    #[test]
+    fn tmpfs_options() {
+        assert_eq!(tmpfs_data(4096, None, 0o1777), "size=4096,mode=1777");
+        assert_eq!(
+            tmpfs_data(536_870_912, Some(12), 0o700),
+            "size=536870912,nr_inodes=12,mode=0700"
+        );
+        let root = root_with(
+            &["/l/a"],
+            vec![Mount::Tmpfs {
+                target: p("/workspace"),
+                size_bytes: 1 << 20,
+                inodes: Some(200_002),
+                mode: 0o700,
+            }],
+        );
+        let ops = plan(&root).expect("plan");
+        match &ops[2] {
+            Op::Tmpfs { data, .. } => {
+                assert_eq!(data.to_bytes(), b"size=1048576,nr_inodes=200002,mode=0700");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_operations_split_at_the_fill_point() {
+        let mounts = vec![
+            proc_at("/proc"),
+            Mount::Tmpfs {
+                target: p("/workspace"),
+                size_bytes: 1 << 20,
+                inodes: Some(16),
+                mode: 0o700,
+            },
+            Mount::Bind {
+                source: PathBuf::from("/layers/1"),
+                target: p("/workspace/node_modules"),
+                writable: false,
+            },
+        ];
+        let root = root_with(&["/l/a"], mounts);
+        // The first anchor: lo before everything, so the families are known
+        // at the fill point; two mounts before it, the bind after it.
+        let (ops, split) = plan_anchor(&root, 2, true).expect("plan");
+        assert_eq!(ops[0], Op::Loopback);
+        assert_eq!(ops[1], Op::MakePrivate);
+        assert!(matches!(ops[2], Op::RootBind { .. }));
+        assert!(matches!(ops[3], Op::Proc { index: 0, .. }));
+        assert!(matches!(ops[4], Op::Tmpfs { index: 1, .. }));
+        assert_eq!(split, 5);
+        assert!(matches!(ops[5], Op::Bind { index: 2, .. }));
+        assert!(matches!(ops[6], Op::Pivot { .. }));
+        assert!(matches!(ops[7], Op::Hostname { .. }));
+        assert_eq!(ops.len(), 8, "no lo after the hostname");
+        // A later anchor shares the network namespace: no lo at all.
+        let (ops, split) = plan_anchor(&root, 0, false).expect("plan");
+        assert!(!ops.contains(&Op::Loopback));
+        assert_eq!(split, 2, "right after the root");
+        let (_, split) = plan_anchor(&root, 3, false).expect("plan");
+        assert!(matches!(
+            plan_anchor(&root, 3, false).expect("plan").0[split],
+            Op::Pivot { .. }
+        ));
+        assert!(matches!(
+            plan_anchor(&root, 4, true),
+            Err(Error::InvalidAnchor(_))
+        ));
+    }
+
+    #[test]
+    fn joined_operations_cover_every_procfs() {
+        let root = root_with(
+            &["/l/a"],
+            vec![
+                Mount::Dev {
+                    target: p("/dev"),
+                    shm_size_bytes: 1 << 20,
+                },
+                proc_at("/proc"),
+                proc_at("/other/proc"),
+            ],
+        );
+        let ops = plan_joined(&root, &p("/workspace")).expect("plan");
+        assert_eq!(ops[0], Op::CurrentRoot);
+        match (&ops[1], &ops[2]) {
+            (
+                Op::Proc {
+                    index: 1,
+                    target: a,
+                },
+                Op::Proc {
+                    index: 2,
+                    target: b,
+                },
+            ) => {
+                assert_eq!(a.to_bytes(), b"proc");
+                assert_eq!(b.to_bytes(), b"other/proc");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            ops[3],
+            Op::Cwd {
+                cwd: c"/workspace".to_owned()
+            }
+        );
+        assert_eq!(ops.len(), 4, "nothing but the procfs mounts and the cwd");
     }
 
     #[test]

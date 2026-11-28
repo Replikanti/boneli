@@ -21,6 +21,13 @@ pub const TMP_SIZE: u64 = 64 << 20;
 /// Size of the fixture's `/dev/shm`.
 pub const SHM_SIZE: u64 = 16 << 20;
 
+/// Size of an anchor fixture's `/workspace` tmpfs.
+pub const WORKSPACE_SIZE: u64 = 16 << 20;
+
+/// Inodes of an anchor fixture's `/workspace` tmpfs: room for the few
+/// files a test writes.
+pub const WORKSPACE_INODES: u64 = 256;
+
 /// The directories of the base layer, mount points included.
 const DIRS: [&str; 11] = [
     "usr",
@@ -187,6 +194,7 @@ impl Fixture {
             Mount::Tmpfs {
                 target: inside("/tmp"),
                 size_bytes: TMP_SIZE,
+                inodes: None,
                 mode: 0o1777,
             },
             Mount::Proc {
@@ -197,6 +205,30 @@ impl Fixture {
                 shm_size_bytes: SHM_SIZE,
             },
         ]);
+        mounts
+    }
+
+    /// The mounts of an anchor's root (ADR-042, D3): [`Fixture::mounts`]
+    /// with a tmpfs of [`WORKSPACE_SIZE`] and [`WORKSPACE_INODES`] at
+    /// `/workspace` instead of the host directory, and the container's
+    /// cgroup read-only at `/sys/fs/cgroup`.
+    pub fn anchor_mounts(&self) -> Vec<Mount> {
+        let mut mounts: Vec<Mount> = self
+            .mounts()
+            .into_iter()
+            .map(|m| match m {
+                Mount::Bind { target, .. } if target.as_str() == "/workspace" => Mount::Tmpfs {
+                    target,
+                    size_bytes: WORKSPACE_SIZE,
+                    inodes: Some(WORKSPACE_INODES),
+                    mode: 0o700,
+                },
+                other => other,
+            })
+            .collect();
+        mounts.push(Mount::Cgroup2 {
+            target: inside("/sys/fs/cgroup"),
+        });
         mounts
     }
 
