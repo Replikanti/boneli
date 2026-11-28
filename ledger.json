@@ -1741,7 +1741,7 @@
    "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "7a384e70",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1750,7 +1750,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-28T03:46:06+00:00",
+   "updated_at": "2026-11-28T04:16:04+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1764,14 +1764,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T20:59:09+00:00",
-   "issue": 129,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "9cc7896e",
-   "note": null
-  },
   {
    "at": "2026-11-25T23:04:33+00:00",
    "issue": 129,
@@ -2163,6 +2155,14 @@
    "to": "claimed",
    "by": "7a384e70",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-28T04:16:04+00:00",
+   "issue": 144,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "7a384e70",
+   "note": null
   }
  ],
  "open": [
@@ -2189,7 +2189,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T03:46:34+00:00",
+ "updated_at": "2026-11-28T04:16:04+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
