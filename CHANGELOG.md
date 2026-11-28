@@ -1167,6 +1167,30 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every step's failure report for the three new sequences,
   `setup_timing_report`, and the memory, descriptor, privilege,
   PID-namespace and loopback checks.
+- `boneli-sandbox-linux` (part 4 of #8, ADR-042 D5 and the copier of D6,
+  still proposed): the adapter crate with its `tree` module, which reads
+  the trees a pod wrote. `read_file` (`copy_out`), `export` (the workspace
+  format under `TreeRule`, the tree path rule pinned to `TreePath`) and
+  `copy_tree` (`seal`'s copier, streamed into a new 0700 layer
+  directory) resolve every name through `openat2` beneath the workspace
+  without following a symlink, a magic link or a mount point, open each
+  entry as itself (`O_PATH`) and classify it by `fstat`, carry symlinks
+  raw, read hardlinks as content, map the owner's exec bit to `x`, skip
+  FIFOs, sockets, devices, empty directories and mount points, and walk
+  in git tree order into `Workspace::from_sorted`. Caps: 200,000 nodes,
+  400,000 names, `workspace_bytes + 51,800,000` bytes, paths of 4,095
+  bytes. Unit tests on plain host directories for every edge case of
+  D5, among them the exact caps, a 1,900-directory chain whose work is
+  counted, hostile names, modes, specials that never block; one host
+  test mounts a dependency in `unshare -Urm`.
+- `boneli-sys` (part 4 of #8, ADR-042 D5): `fs::open_beneath` (`openat2`
+  with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+  RESOLVE_NO_XDEV` always set), `fs::read_link` (`readlinkat(fd, "")`),
+  `fs::read_dir` (`getdents64` with an entry cap) and `fs::Met`;
+  `Cgroup::freeze` with a `Frozen` that thaws on every path, through a
+  `cgroup.freeze` descriptor `create` holds open
+  (`Error::CgroupFreezeTimeout`); feature `test-seam` with
+  `Cgroup::fail_stats_keeper`.
 
 ### Changed
 
@@ -1179,6 +1203,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so. ADR-007's sweeps of older kernels gain a `linux-6.1` column; no
   seccomp row changes. **Breaking:** `boneli_sys::Missing` and
   `MissingId` have the variant `KernelFloor` (unreleased, pre-1.0).
+- `boneli-sys` anchors (part 4 of #8, ADR-042 D3, STOP 2 of part 3): the
+  memory release refuses a TLS address off the fresh stack (setup item
+  7, EFAULT), so a C library that maps a large TLS apart (musl) fails
+  `create` instead of keeping a window only its mapping line bounds; a
+  failed `pthread_join` of the clone's thread waits until the thread is
+  gone, detaches it, kills and reaps what it launched and unmaps the
+  fresh stack, where it used to return at once with the mapping kept.
 - `boneli-sys` seccomp program (part 1 of #45, ADR-043 D2, amending
   ADR-007 D2): every errno row returns at an instruction of its own
   (`Program::row_at`), so the program has 104 instructions instead of 88;

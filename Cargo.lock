@@ -139,6 +139,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boneli-sandbox-linux"
+version = "0.0.0"
+dependencies = [
+ "boneli-app",
+ "boneli-sys",
+ "boneli-workspace",
+]
+
+[[package]]
 name = "boneli-sigstore"
 version = "0.0.0"
 dependencies = [

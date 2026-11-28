@@ -26,9 +26,10 @@
 //! arguments, stack memory and raw `syscall`s, whose only state is
 //! `errno`; it zeroes its buffers before the first `munmap`, compares and
 //! resets byte by byte, and cannot panic: a panic would format and
-//! allocate. A libc that kept a thread's TLS farther than [`TLS_AROUND`]
-//! from both of its addresses would make it crash here, which fails the
-//! anchor's setup: fail closed.
+//! allocate. A libc that kept a thread's TLS anywhere but on the fresh
+//! stack fails the anchor's setup before the first `munmap`, and one that
+//! kept it farther than [`TLS_AROUND`] from both of its addresses would
+//! make it crash here, which fails the setup too: fail closed.
 
 use std::os::raw::c_int;
 
@@ -77,7 +78,8 @@ pub(crate) const STACK_BELOW: usize = 64 << 10;
 /// ten. Each window ends at the mapping that holds its address, which for
 /// an anchor is the stack it was cloned on, where the C library put the
 /// thread's TLS (review of part 3, run 2: unclipped, it reached into the
-/// mapping next to the TLS, another runner thread's stack).
+/// mapping next to the TLS, another runner thread's stack). A TLS address
+/// off that stack fails the setup (part 4).
 pub(crate) const TLS_AROUND: usize = 64 << 10;
 
 std::thread_local! {
@@ -394,26 +396,31 @@ fn holding(
 }
 
 /// Narrows each mapping of `held` to `fresh`, the read-write part of the
-/// stack the anchor was cloned on, where its address lies there: a mapping
-/// line can be that stack merged with a neighbour (review of part 3, run
-/// 3), and the fresh stack is all of it that is the anchor's. A TLS
-/// address outside it (a C library that mapped the thread's TLS apart)
-/// keeps its mapping line. The stack address must lie in `fresh`, else
-/// item 6, EFAULT.
+/// stack the anchor was cloned on: a mapping line can be that stack merged
+/// with a neighbour (review of part 3, run 3), and the fresh stack is all
+/// of it that is the anchor's. The stack address must lie in `fresh`, else
+/// item 6, EFAULT; so must both TLS addresses, else item 7, EFAULT. A C
+/// library that mapped the thread's TLS apart from the stack it was given
+/// (musl does, for a TLS too large for that stack) would leave a window
+/// that only its mapping line bounds, and a line can be two mappings
+/// merged, so such an anchor fails its setup instead (part 4, STOP 2 of
+/// part 3). glibc always puts the TLS on the given stack.
 fn within_fresh(
     held: [(usize, usize); 3],
     addrs: [usize; 3],
     fresh: (usize, usize),
 ) -> Result<[(usize, usize); 3], Failure> {
     let inside = |a: usize| fresh.0 <= a && a < fresh.1;
-    if !inside(addrs[0]) {
+    let [stack, tls @ ..] = addrs;
+    if !inside(stack) {
         return Err((6, libc::EFAULT));
     }
+    if !tls.iter().all(|&a| inside(a)) {
+        return Err((7, libc::EFAULT));
+    }
     let mut out = held;
-    for (slot, &a) in out.iter_mut().zip(addrs.iter()) {
-        if inside(a) {
-            *slot = (slot.0.max(fresh.0), slot.1.min(fresh.1));
-        }
+    for slot in &mut out {
+        *slot = (slot.0.max(fresh.0), slot.1.min(fresh.1));
     }
     Ok(out)
 }
@@ -861,19 +868,31 @@ c000-14000 rw-p 00000000 00:00 0 [stack]\n\
         let merged = (0x10_0000, 0x30_0000);
         let apart = (0x50_0000, 0x50_2000);
         assert_eq!(
-            within_fresh(
-                [merged, merged, apart],
-                [0x1f_0000, 0x1f_f000, 0x50_0100],
-                fresh
-            ),
-            Ok([fresh, fresh, apart]),
-            "a TLS mapped apart keeps its line"
+            within_fresh([merged; 3], [0x1f_0000, 0x1f_f000, 0x10_0100], fresh),
+            Ok([fresh; 3]),
+            "every window ends at the fresh stack"
         );
         assert_eq!(
             within_fresh([merged; 3], [0x20_0000, 0x1f_f000, 0x1f_f000], fresh),
             Err((6, libc::EFAULT)),
             "a stack address outside the fresh stack"
         );
+        // Part 4 (STOP 2 of part 3): a TLS mapped apart from the fresh
+        // stack (musl, for a TLS too large for the stack it was given) is
+        // refused, either of the two addresses, so its window can never
+        // keep an unclipped neighbour.
+        for addrs in [
+            [0x1f_0000, 0x50_0100, 0x1f_f000],
+            [0x1f_0000, 0x1f_f000, 0x50_0100],
+            [0x1f_0000, 0x0f_ffff, 0x1f_f000],
+            [0x1f_0000, 0x1f_f000, 0x20_0000],
+        ] {
+            assert_eq!(
+                within_fresh([merged, merged, apart], addrs, fresh),
+                Err((7, libc::EFAULT)),
+                "{addrs:x?}: a TLS address off the fresh stack"
+            );
+        }
     }
 
     #[test]

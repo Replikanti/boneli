@@ -254,6 +254,19 @@ impl StatsKeeper {
         }
     }
 
+    /// Ends the keeper as a failed read with `errno` does: the errno is
+    /// recorded in [`KeeperReport::failed`] and the thread stops (the test
+    /// seam of [`crate::Cgroup::fail_stats_keeper`]).
+    #[cfg(any(test, feature = "test-seam"))]
+    pub(crate) fn fail(&self, errno: c_int) {
+        {
+            let mut s = self.shared.guard();
+            s.report.failed = Some(errno);
+            s.stop = true;
+        }
+        self.shared.wake.notify_all();
+    }
+
     /// The report so far.
     pub(crate) fn report(&self) -> KeeperReport {
         self.shared.guard().report

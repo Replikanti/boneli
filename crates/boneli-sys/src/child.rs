@@ -535,6 +535,9 @@ pub(crate) enum Fault {
     /// [`STALE_MARKER`] and returns from it: stale data under the frame
     /// that runs next, which the release must zero (ADR-042, D3).
     Stale(Step),
+    /// The runner side of an anchor's launch skips `pthread_join` and takes
+    /// it as failed with EINVAL, while the thread may still run (part 4).
+    JoinFails,
 }
 
 /// The bytes [`Fault::Stale`] writes, XOR-masked with 0xa5 so that the

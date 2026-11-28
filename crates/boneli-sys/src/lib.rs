@@ -42,6 +42,7 @@ mod cgroup;
 mod child;
 mod error;
 mod ffi;
+pub mod fs;
 mod host;
 mod ids;
 mod keeper;
@@ -57,7 +58,8 @@ mod thread;
 
 pub use anchor::{Anchor, AnchorSpec, ExecSpec, Families, Fill};
 pub use cgroup::{
-    Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
+    Cgroup, CpuMax, DeviceNumber, Frozen, IoLimits, IoMax, Limits, Parent, block_device_of,
+    leaked_cgroups,
 };
 pub use child::Step;
 pub use error::{Error, ListenerError, ProtocolError, Result};
