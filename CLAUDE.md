@@ -177,6 +177,19 @@ sandbox; `notification_cost` prints what a denied call costs with and
 without the listener. `Unproven` census entries print with
 their reason outside libtest's capture on every run.
 
+### Host tests (boneli-sandbox-linux)
+
+The tree reader of part 4 of #8 (ADR-042, D5) is tested on plain host
+directories in every `cargo test`. The one case that needs a mount point,
+`export_skips_dependency_mounts`, is `#[ignore = "host: ..."]` and runs
+itself again under `unshare -Urm`, so it needs unprivileged user
+namespaces (`unshare` and `mount` on PATH) and nothing else; part 5 adds
+the pod's host tests and their CI step.
+
+```sh
+cargo test -p boneli-sandbox-linux -- --ignored
+```
+
 ### Host tests (boneli-oci)
 
 `boneli-oci`'s host and network tests live in one target,

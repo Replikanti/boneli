@@ -42,6 +42,14 @@ libc = "0.2.191"
 # (ADR-008), test-only, so `[dependencies]` keeps libc alone.
 boneli-json.workspace = true
 
+[features]
+# `Cgroup::fail_stats_keeper`, which makes a sandbox's statistics keeper
+# fail as a read would, for the adapter's tests of its fail-closed outcome
+# (ADR-042, D5 and D8). Only `[dev-dependencies]` enable it; resolver 3
+# keeps dev-dependency features out of normal builds, as for
+# `boneli-private-dir` (ADR-030, D4).
+test-seam = []
+
 # Its own `main`: only the main thread can end itself with
 # `exit_main_thread`, and libtest runs every test on a spawned thread
 # (#35, ADR-015 D10).

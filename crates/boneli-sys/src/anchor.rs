@@ -19,6 +19,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cgroup::Cgroup;
@@ -329,6 +330,8 @@ impl FreshStack {
             return Err(Error::last("mmap(anchor stack)"));
         }
         let stack = FreshStack { base, len, page };
+        #[cfg(test)]
+        FRESH.with(|f| f.set((base as usize, 0)));
         let top = base.cast::<u8>().wrapping_add(len - page).cast();
         for guard in [base, top] {
             // SAFETY: a page of the mapping made above.
@@ -353,42 +356,68 @@ impl FreshStack {
     /// control block at the top of a stack it was given, so they are fresh
     /// too. Not `std::thread`: glibc caches the stacks of exited threads
     /// and hands them out again with their contents (review of part 3, run
-    /// 2). A thread that could not be joined, which only a bug causes,
-    /// keeps its stack: it is never unmapped from under it.
+    /// 2). A join that fails, which only a bug causes, still ends with the
+    /// mapping unmapped: [`run_on`] returns only once the thread is gone
+    /// (part 4, STOP 2 of part 3).
     fn launch(self, plan: &ChildPlan<'_>) -> Result<Launched> {
-        let (result, joined) = match run_on(plan, self.base, self.page) {
-            Ok(result) => (result, true),
-            Err((e, joined)) => (Err(e), joined),
-        };
-        if !joined {
-            std::mem::forget(self);
-        }
-        result
+        run_on(plan, self.base, self.page)
     }
 }
 
 impl Drop for FreshStack {
     fn drop(&mut self) {
         // SAFETY: the mapping was made by new() with this length, and no
-        // thread runs on it any more; an anchor holds its own copy.
+        // thread runs on it any more: `run_on` returns only after its
+        // thread was joined or is gone; an anchor holds its own copy.
         unsafe { libc::munmap(self.base, self.len) };
+        #[cfg(test)]
+        FRESH.with(|f| f.set((f.get().0, self.base as usize)));
     }
 }
 
-/// [`FreshStack::launch`]: `Ok` with the launch's result once the thread
-/// was joined, `Err` with the error and whether no thread runs on the
-/// stack.
-fn run_on(
-    plan: &ChildPlan<'_>,
-    base: *mut libc::c_void,
-    page: usize,
-) -> std::result::Result<Result<Launched>, (Error, bool)> {
+#[cfg(test)]
+std::thread_local! {
+    /// The base of the last fresh stack this thread mapped and of the last
+    /// one it unmapped, for `failed_join_unmaps_the_fresh_stack`.
+    static FRESH: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How often [`run_on`] looks whether a thread whose join failed is gone.
+/// The thread runs only [`launch`], a clone and a few descriptor calls that
+/// wait for nothing, so it ends within microseconds of its start.
+const GONE_POLL: Duration = Duration::from_millis(1);
+
+/// [`FreshStack::launch`]: the launch's result once the thread was joined.
+///
+/// If the join fails, the thread may still run, on the fresh stack and
+/// writing into this frame, so this does not return before it is gone:
+/// it recorded its kernel thread id first, and `tgkill(pid, tid, 0)`
+/// answers ESRCH once the kernel has released it, which is after the
+/// last write it makes to user memory (the clear of its tid word at its
+/// exit included). For a positive tid of this process the only other
+/// answer is success. Then the thread is detached, which frees the C
+/// library's record of a joinable thread that has ended (glibc keeps it
+/// in a list on the fresh stack itself until a join or a detach), and
+/// what it launched is killed and reaped, so the error leaves neither a
+/// mapping nor a process behind. A tid is reused only once the kernel's
+/// cyclic allocation has gone round all of `pid_max`, so the wait cannot
+/// mistake a new thread for this one in that time.
+fn run_on(plan: &ChildPlan<'_>, base: *mut libc::c_void, page: usize) -> Result<Launched> {
     let mut result: Option<Result<Launched>> = None;
-    let mut job = || result = Some(launch(plan));
+    let tid = AtomicI32::new(0);
+    let done = AtomicBool::new(false);
+    let mut job = || {
+        // SAFETY: gettid has no preconditions and cannot fail.
+        let me = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        tid.store(me, Ordering::Release);
+        result = Some(launch(plan));
+        done.store(true, Ordering::Release);
+    };
     let mut job: &mut dyn FnMut() = &mut job;
     extern "C" fn run(arg: *mut libc::c_void) -> *mut libc::c_void {
         // SAFETY: arg is the `&mut dyn FnMut()` below, which outlives the
-        // thread: the caller joins it before the closure goes out of scope.
+        // thread: the caller joins it, or waits until it is gone, before
+        // the closure goes out of scope.
         let job = unsafe { &mut *arg.cast::<&mut dyn FnMut()>() };
         job();
         std::ptr::null_mut()
@@ -398,13 +427,10 @@ fn run_on(
     // SAFETY: attr is valid storage.
     let rc = unsafe { libc::pthread_attr_init(&mut attr) };
     if rc != 0 {
-        return Err((
-            Error::Sys {
-                call: "pthread_attr_init",
-                errno: rc,
-            },
-            true,
-        ));
+        return Err(Error::Sys {
+            call: "pthread_attr_init",
+            errno: rc,
+        });
     }
     // SAFETY: the stack is the mapping between its guard pages, ANCHOR_STACK
     // bytes, page-aligned and used by nothing else.
@@ -435,29 +461,68 @@ fn run_on(
     // SAFETY: attr was initialized above and is destroyed once.
     unsafe { libc::pthread_attr_destroy(&mut attr) };
     if rc != 0 {
-        return Err((
-            Error::Sys {
-                call: "pthread_create(anchor stack)",
-                errno: rc,
-            },
-            true,
-        ));
+        return Err(Error::Sys {
+            call: "pthread_create(anchor stack)",
+            errno: rc,
+        });
     }
-    // SAFETY: thread was created above and is joined once.
-    let rc = unsafe { libc::pthread_join(thread, std::ptr::null_mut()) };
+    #[cfg(test)]
+    let skip = matches!(plan.fault, Fault::JoinFails | Fault::JoinFailsAfterExit);
+    #[cfg(not(test))]
+    let skip = false;
+    let rc = if skip {
+        libc::EINVAL
+    } else {
+        // SAFETY: thread was created above and is joined once.
+        unsafe { libc::pthread_join(thread, std::ptr::null_mut()) }
+    };
     if rc != 0 {
-        return Err((
-            Error::Sys {
-                call: "pthread_join(anchor stack)",
-                errno: rc,
-            },
-            false,
-        ));
+        wait_gone(&tid);
+        // SAFETY: the thread was created joinable above and has ended; a
+        // detach frees what the C library keeps of it. If the failed join
+        // already freed or detached it, the call fails and changes nothing.
+        unsafe { libc::pthread_detach(thread) };
+        if done.load(Ordering::Acquire)
+            && let Some(Ok(launched)) = result.take()
+        {
+            #[cfg(test)]
+            if matches!(plan.fault, Fault::JoinFailsAfterExit) {
+                let _ = ready_by(&launched.pidfd, Instant::now() + Duration::from_secs(10));
+            }
+            kill_and_reap(&launched);
+        }
+        return Err(Error::Sys {
+            call: "pthread_join(anchor stack)",
+            errno: rc,
+        });
     }
-    Ok(result.unwrap_or(Err(Error::Sys {
-        call: "pthread_create(anchor stack)",
-        errno: libc::EIO,
-    })))
+    let finished = done.load(Ordering::Acquire);
+    match result {
+        Some(r) if finished => r,
+        _ => Err(Error::Sys {
+            call: "pthread_create(anchor stack)",
+            errno: libc::EIO,
+        }),
+    }
+}
+
+/// Waits until the thread that stored its kernel thread id in `tid` (or
+/// will: it does so first) is gone, polling every [`GONE_POLL`].
+fn wait_gone(tid: &AtomicI32) {
+    // SAFETY: getpid has no preconditions and cannot fail.
+    let pid = unsafe { libc::getpid() };
+    loop {
+        let t = tid.load(Ordering::Acquire);
+        if t > 0 {
+            // SAFETY: tgkill with signal 0 sends nothing; it only looks the
+            // thread up in this process.
+            let rc = unsafe { libc::syscall(libc::SYS_tgkill, pid, t, 0) };
+            if rc < 0 && errno() == libc::ESRCH {
+                return;
+            }
+        }
+        std::thread::sleep(GONE_POLL);
+    }
 }
 
 /// Whether `fd` became readable before `deadline`: a pidfd once its
@@ -864,7 +929,20 @@ impl Anchor {
             report_fd: write.as_raw_fd(),
             fault,
         };
-        let first = stack.launch(&plan)?;
+        let first = match stack.launch(&plan) {
+            Ok(first) => first,
+            Err(e) => {
+                // The launch killed and reaped the first stage if it had
+                // cloned one (a failed join of its thread, part 4); once it
+                // is gone, the page holds the second stage's pid, if the
+                // first had cloned it, and nothing else reaps that child.
+                let pid = tid.pid();
+                if pid > 0 {
+                    kill_pid(pid);
+                }
+                return Err(e);
+            }
+        };
         drop(write);
         drop(resume_child);
         let mut reports = Reports {
@@ -1364,6 +1442,58 @@ mod tests {
             cg.destroy().expect("destroy the cgroup");
             assert_eq!(open_fds(), before, "{step:?}: no descriptor leaked");
         }
+    }
+
+    /// Part 4 (STOP 2 of part 3): when `pthread_join` fails, the fresh
+    /// stack is still unmapped, once the thread is gone, and what the
+    /// thread launched is killed and reaped; for a first anchor and for a
+    /// later one. The seam skips the join and reports EINVAL, so the
+    /// thread may still run when the failure path starts.
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn failed_join_unmaps_the_fresh_stack() {
+        let _host = host_lock();
+        let unit = UnitRoot::new();
+        cgroup_parent();
+        let before = open_fds();
+        let cg = sandbox_cgroup("join-fails");
+        let s = spec(&unit, &cg, Duration::from_secs(10));
+        let pod = holding(&s);
+        // A later anchor's first stage may have cloned the second before
+        // it is killed: `JoinFailsAfterExit` makes that certain (CI showed
+        // the second stage left unreaped where the race went that way).
+        for (later, fault) in [
+            (false, Fault::JoinFails),
+            (true, Fault::JoinFails),
+            (true, Fault::JoinFailsAfterExit),
+        ] {
+            FRESH.with(|f| f.set((0, 0)));
+            let result = if later {
+                pod.join_inner(&s, fault).map(|_| ())
+            } else {
+                Anchor::create_inner(&s, fault).map(|_| ())
+            };
+            match result {
+                Err(Error::Sys {
+                    call: "pthread_join(anchor stack)",
+                    errno: libc::EINVAL,
+                }) => {}
+                other => panic!("{fault:?}, later {later}: {other:?}"),
+            }
+            let (mapped, unmapped) = FRESH.with(std::cell::Cell::get);
+            assert_ne!(mapped, 0, "{fault:?}: a fresh stack was mapped");
+            assert_eq!(unmapped, mapped, "{fault:?}: and unmapped");
+            assert_eq!(
+                children(),
+                vec![pod.pid()],
+                "{fault:?}, later {later}: reaped"
+            );
+        }
+        drop(pod);
+        drop(s);
+        cg.destroy().expect("destroy the cgroup");
+        assert_eq!(children(), Vec::<i32>::new());
+        assert_eq!(open_fds(), before, "no descriptor leaked");
     }
 
     #[test]

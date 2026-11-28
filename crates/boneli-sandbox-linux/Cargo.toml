@@ -1,0 +1,28 @@
+[package]
+name = "boneli-sandbox-linux"
+description = "Boneli adapter: the Sandbox port on the Linux runtime of boneli-sys, pods of containers with a workspace exchanged in the format of boneli-workspace (ADR-007, ADR-042)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Adapter crate: the application and two support crates (ADR-042). No
+# external edge. Part 4 of #8 holds only the tree module, which reads the
+# trees a pod wrote (ADR-042, D5 and D6); the pod itself is part 5.
+[dependencies]
+# `TreePath`, the path rule of the workspace format (ADR-018), and
+# `RelativePath` with `overlapping_paths`, the paths `copy_out` and `seal`
+# take (ADR-042, D2), and `SandboxError`, what a tree error becomes.
+boneli-app.workspace = true
+# `fs::open_beneath`, `fs::read_link` and `fs::read_dir`, the calls that
+# read an agent-written tree without following anything it planted
+# (ADR-042, D5); the one crate with unsafe code, a support crate.
+boneli-sys.workspace = true
+# The workspace format (ADR-010, D2) the export is built in, under this
+# crate's tree path rule (ADR-042, D1). A support crate, no external edge.
+boneli-workspace.workspace = true

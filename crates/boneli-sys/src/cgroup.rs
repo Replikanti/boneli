@@ -492,6 +492,9 @@ pub struct Cgroup {
     /// the limits, when no task can have entered yet.
     kill: Option<OwnedFd>,
     events: Option<OwnedFd>,
+    /// `cgroup.freeze` (write), opened with the two above and for the same
+    /// reason: a workload cannot keep [`Cgroup::freeze`] from thawing it.
+    freeze: Option<OwnedFd>,
     live: bool,
     /// The sandbox's statistics keeper, started as the last step of
     /// `create` and stopped once the sandbox is killed (ADR-007, D8).
@@ -574,6 +577,7 @@ impl Cgroup {
             cpu_period_us: limits.cpu.period_us,
             kill: None,
             events: None,
+            freeze: None,
             live: true,
             keeper: None,
         };
@@ -583,6 +587,7 @@ impl Cgroup {
         cg.check_limits(limits)?;
         cg.kill = Some(open_file(&cg.dir, "cgroup.kill", libc::O_WRONLY)?);
         cg.events = Some(open_file(&cg.dir, "cgroup.events", libc::O_RDONLY)?);
+        cg.freeze = Some(open_file(&cg.dir, "cgroup.freeze", libc::O_WRONLY)?);
         // Last, so that a failure drops `cg` and removes the directory.
         cg.keeper = Some(StatsKeeper::start(&cg.dir)?);
         Ok(cg)
@@ -785,9 +790,19 @@ impl Cgroup {
     }
 
     /// Waits until `cgroup.events` says `populated 0`, at most
-    /// [`KILL_BOUND`], through the held descriptor (or a fresh one while
-    /// `create` has not opened it yet).
+    /// [`KILL_BOUND`].
     fn wait_unpopulated(&self) -> Result<()> {
+        self.wait_events(
+            "populated 0",
+            KILL_BOUND,
+            Error::CgroupKillTimeout(KILL_BOUND),
+        )
+    }
+
+    /// Waits until `cgroup.events` holds the line `line`, at most `bound`,
+    /// else fails with `timeout`; through the held descriptor (or a fresh
+    /// one while `create` has not opened it yet).
+    fn wait_events(&self, line: &str, bound: Duration, timeout: Error) -> Result<()> {
         let fresh;
         let events = match &self.events {
             Some(fd) => fd,
@@ -796,15 +811,15 @@ impl Cgroup {
                 &fresh
             }
         };
-        let deadline = Instant::now() + KILL_BOUND;
+        let deadline = Instant::now() + bound;
         loop {
             let text = read_fd(events, "cgroup.events")?;
-            if text.lines().any(|l| l.trim() == "populated 0") {
+            if text.lines().any(|l| l.trim() == line) {
                 return Ok(());
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(Error::CgroupKillTimeout(KILL_BOUND));
+                return Err(timeout);
             }
             // cgroup.events signals a change with POLLPRI; the 100 ms cap
             // re-reads it even if a notification was missed.
@@ -838,6 +853,72 @@ impl Cgroup {
         }
     }
 
+    /// Freezes every process of the cgroup (ADR-042, D5): writes `1` to
+    /// `cgroup.freeze` and waits until `cgroup.events` says `frozen 1`, at
+    /// most `bound`. The returned [`Frozen`] thaws the cgroup when it is
+    /// dropped or [`Frozen::thaw`]ed, on every path, an unwinding panic
+    /// included. If the cgroup is not frozen within `bound`, it is thawed
+    /// again and the call fails with [`Error::CgroupFreezeTimeout`]; if the
+    /// write fails, nothing was frozen. Both files are reached through the
+    /// descriptors `create` held open, so a workload that changes their
+    /// modes through a cgroup2 mount of its own cannot keep a freeze or a
+    /// thaw from landing. A zero `bound` fails with
+    /// [`Error::CgroupFreezeTimeout`] before anything is written.
+    ///
+    /// While frozen, no process of the cgroup runs user code, so a tree it
+    /// wrote cannot change while the runner reads it. A task that is
+    /// killed (`cgroup.kill`, the OOM group kill) still dies.
+    pub fn freeze(&self, bound: Duration) -> Result<Frozen<'_>> {
+        self.freeze_until(bound, "frozen 1")
+    }
+
+    /// [`Cgroup::freeze`], done once `cgroup.events` holds the line `done`;
+    /// the unit tests pass a line that never comes, for the timeout path.
+    fn freeze_until(&self, bound: Duration, done: &str) -> Result<Frozen<'_>> {
+        if bound.is_zero() {
+            return Err(Error::CgroupFreezeTimeout(bound));
+        }
+        self.write_freeze(b"1")?;
+        // From here on, every return thaws.
+        let frozen = Frozen {
+            cgroup: self,
+            thawed: false,
+        };
+        self.wait_events(done, bound, Error::CgroupFreezeTimeout(bound))?;
+        Ok(frozen)
+    }
+
+    /// Writes `value` to `cgroup.freeze` through the descriptor `create`
+    /// held open.
+    fn write_freeze(&self, value: &[u8]) -> Result<()> {
+        let Some(fd) = &self.freeze else {
+            return write_file(&self.dir, "cgroup.freeze", value);
+        };
+        // SAFETY: value is valid for its length; fd is open for writing.
+        let n = unsafe { libc::pwrite(fd.as_raw_fd(), value.as_ptr().cast(), value.len(), 0) };
+        if n >= 0 && n as usize == value.len() {
+            Ok(())
+        } else {
+            Err(Error::CgroupFile {
+                file: "cgroup.freeze",
+                errno: if n < 0 { errno() } else { libc::EIO },
+            })
+        }
+    }
+
+    /// Makes the sandbox's statistics keeper fail as a read of `memory.stat`
+    /// with `errno` would: it records the errno in
+    /// [`KeeperReport::failed`] and stops (ADR-007, D8). For the adapter's
+    /// tests of its fail-closed outcome (ADR-042, D8); built only for this
+    /// crate's tests and, through the `test-seam` feature, which only
+    /// `[dev-dependencies]` enable, for other crates' tests.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn fail_stats_keeper(&self, errno: c_int) {
+        if let Some(k) = &self.keeper {
+            k.fail(errno);
+        }
+    }
+
     /// A value that never was a cgroup, for the unit tests that fail before
     /// the clone; nothing is removed on drop.
     #[cfg(test)]
@@ -853,6 +934,7 @@ impl Cgroup {
             cpu_period_us: 100_000,
             kill: None,
             events: None,
+            freeze: None,
             live: false,
             keeper: None,
         }
@@ -875,6 +957,42 @@ impl Drop for Cgroup {
             if let Error::CgroupTeardown { removed: false, .. } = e {
                 record_leak(&self.path);
             }
+        }
+    }
+}
+
+/// A frozen cgroup ([`Cgroup::freeze`]); thawed when dropped.
+#[derive(Debug)]
+#[must_use = "dropping it thaws the cgroup at once"]
+pub struct Frozen<'a> {
+    cgroup: &'a Cgroup,
+    thawed: bool,
+}
+
+impl Frozen<'_> {
+    /// Thaws the cgroup: writes `0` to `cgroup.freeze`. The processes run
+    /// again; nothing waits for `frozen 0`, since nothing the runner does
+    /// next needs them running. A failed write is returned.
+    pub fn thaw(mut self) -> Result<()> {
+        self.thawed = true;
+        self.cgroup.write_freeze(b"0")
+    }
+}
+
+impl Drop for Frozen<'_> {
+    /// Thaws like [`Frozen::thaw`]. A drop cannot return the error, so a
+    /// failure is written to stderr, as a failed [`Cgroup`] teardown is;
+    /// the pod then stays frozen until it is destroyed, which kills it.
+    fn drop(&mut self) {
+        if self.thawed {
+            return;
+        }
+        if let Err(e) = self.cgroup.write_freeze(b"0") {
+            let mut err = std::io::stderr();
+            let _ = std::io::Write::write_fmt(
+                &mut err,
+                format_args!("boneli-sys: thawing {}: {e}\n", self.cgroup.path.display()),
+            );
         }
     }
 }
@@ -1238,6 +1356,107 @@ mod tests {
             riops: None,
             wiops: None,
         }
+    }
+
+    /// Whether `cgroup.events` says `frozen 1`.
+    fn is_frozen(cg: &Cgroup) -> bool {
+        let events = read_file(&cg.dir, "cgroup.events").expect("read cgroup.events");
+        events.lines().any(|l| l.trim() == "frozen 1")
+    }
+
+    /// Waits up to 5 s for `frozen 0` after a thaw, which nothing in the
+    /// code under test waits for.
+    fn thawed(cg: &Cgroup) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !is_frozen(cg) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// ADR-042 D5: every path out of a freeze thaws the cgroup: a drop, an
+    /// explicit thaw, a timeout, a zero bound, a panic while frozen; an
+    /// empty cgroup freezes too, and a frozen one is still destroyed.
+    #[test]
+    #[ignore = "host: cgroup v2 delegation"]
+    fn freeze_thaws_on_every_path() {
+        let _host = crate::test_guard::host_lock();
+        let bound = Duration::from_secs(5);
+        let empty = crate::test_guard::sandbox_cgroup("freeze-empty");
+        drop(empty.freeze(bound).expect("an empty cgroup freezes"));
+        assert!(thawed(&empty), "empty: thawed on drop");
+        empty.destroy().expect("destroy");
+
+        let cg = crate::test_guard::sandbox_cgroup("freeze");
+        // What a workload with a cgroup2 mount of its own can do to its
+        // cgroup's files: the freeze and the thaw still land, through the
+        // descriptor `create` held open.
+        std::fs::set_permissions(
+            cg.path().join("cgroup.freeze"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("chmod cgroup.freeze");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        write_file(&cg.dir, "cgroup.procs", sleeper.id().to_string().as_bytes())
+            .expect("move sleep into the cgroup");
+
+        let frozen = cg.freeze(bound).expect("freeze");
+        assert!(is_frozen(&cg));
+        drop(frozen);
+        assert!(thawed(&cg), "thawed on drop");
+
+        let frozen = cg.freeze(bound).expect("freeze");
+        frozen.thaw().expect("thaw");
+        assert!(thawed(&cg), "thawed by thaw()");
+
+        match cg.freeze_until(Duration::from_millis(200), "frozen never") {
+            Err(Error::CgroupFreezeTimeout(t)) => assert_eq!(t, Duration::from_millis(200)),
+            other => panic!("{other:?}"),
+        }
+        assert!(thawed(&cg), "thawed after a timeout");
+
+        assert!(matches!(
+            cg.freeze(Duration::ZERO),
+            Err(Error::CgroupFreezeTimeout(Duration::ZERO))
+        ));
+        assert!(!is_frozen(&cg), "nothing written");
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _frozen = cg.freeze(bound).expect("freeze");
+            panic!("while frozen");
+        }));
+        assert!(unwound.is_err());
+        assert!(thawed(&cg), "thawed by the unwinding drop");
+
+        // Left frozen on purpose: the kill still ends the sleeper.
+        std::mem::forget(cg.freeze(bound).expect("freeze"));
+        cg.destroy().expect("a frozen cgroup is destroyed");
+        let status = sleeper.wait().expect("reap sleep");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    /// The test seam: the keeper reports the errno and stops reading.
+    #[test]
+    #[ignore = "host: cgroup v2 delegation"]
+    fn failed_stats_keeper_seam() {
+        let _host = crate::test_guard::host_lock();
+        let cg = crate::test_guard::sandbox_cgroup("keeper-seam");
+        assert_eq!(cg.stats_keeper().failed, None);
+        cg.fail_stats_keeper(libc::EIO);
+        assert_eq!(cg.stats_keeper().failed, Some(libc::EIO));
+        let reads = cg.stats_keeper().reads;
+        std::thread::sleep(crate::STATS_KEEPER_PERIOD * 5);
+        assert_eq!(cg.stats_keeper().reads, reads, "no read after the failure");
+        cg.destroy().expect("destroy");
     }
 
     #[test]

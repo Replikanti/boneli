@@ -9,7 +9,8 @@
 on the runtime of ADR-007. It lands in six pull requests, and this ADR
 grows with them: each PR adds the decision it implements, and the last
 one accepts the ADR. This revision holds D1, from part 1, D2, from part
-2, and D3, from part 3.
+2, D3, from part 3 with two follow-ups of its review in part 4, and D5
+and the copier of D6, from part 4.
 
 The sandbox copies a workspace in when a sandbox is created and exports
 one when the agent is done (ADR-004, D11). The format is ADR-010's (D2):
@@ -441,7 +442,31 @@ TLS. So `create` and `join` clone the anchor (or a later anchor's first
 stage) from a thread of their own, whose stack is an anonymous mapping
 made for it alone (`pthread_attr_setstack`, 1 MiB with a `PROT_NONE`
 guard page at each end). The thread is joined before the call returns,
-and the mapping is unmapped after the join. The C library puts the
+and the mapping is unmapped after the join. A join that fails, which
+only a bug causes, does not return while the thread may still run on the
+stack or write into the caller's frame (part 4, STOP 2 of part 3): the
+thread records its kernel thread id first, and the runner polls
+`tgkill(pid, tid, 0)` every millisecond until it answers ESRCH, which
+the kernel gives once it has released the thread, after its last write
+to user memory (the clear of its tid word at exit included). The thread
+runs only the clone and a few descriptor calls that wait for nothing, so
+the wait ends within microseconds of its start. Then it detaches the
+thread, which frees the C library's record of an ended joinable thread
+(glibc keeps that record in a list, on the fresh stack itself, until a
+join or a detach; unmapped without it, the list would point into freed
+memory), kills and reaps what the thread launched, unmaps the stack and
+fails with `pthread_join`'s errno. For a later anchor what was launched
+is the first stage, which may have cloned the second already: once the
+first is reaped, the pid page (above) holds the second's pid, and `join`
+kills and reaps it too. The first version of this left that second stage
+unreaped on both CI legs, where the race went that way, and not on the
+dev host (`failed_join_unmaps_the_fresh_stack`, which skips the join
+through a test seam, and with `JoinFailsAfterExit` waits until the first
+stage has exited by itself, so the second always exists). A tid comes back only after
+the kernel's cyclic allocation has gone round all of `pid_max`, so the
+wait cannot take a new thread for this one. Before part 4, a failed join
+returned at once and left the mapping mapped, and the thread could still
+write its result into the returned frame. The C library puts the
 thread's TLS and
 control block at the top of a stack it is given (glibc; musl does the
 same where they fit and maps a fresh region of its own otherwise), so the
@@ -500,9 +525,20 @@ the rest:
 
 Each window ends at the mapping that holds its address, which the
 release reads from its maps file before the first `munmap`, and a window
-whose address no mapping holds fails the setup. A window around an
-address on the fresh stack also ends at that stack's read-write part,
-whose bounds the plan carries; the stack address must lie there. Both
+whose address no mapping holds fails the setup. Every window also ends
+at the fresh stack's read-write part, whose bounds the plan carries, and
+all three addresses must lie there: the stack address (item 6) and both
+TLS addresses (item 7, part 4, STOP 2 of part 3), else the setup fails
+before the first `munmap`. musl puts a thread's TLS on a stack it was
+given only when the TLS and its 1,024 bytes of thread-specific data take
+under 2,048 bytes and an eighth of the stack, and maps a fresh region
+otherwise, read-write, with no guard page (review run 3 of part 3; the
+test binary's TLS is 152 bytes); a window there
+would end only at its mapping line, and a line can be two mappings
+merged, so it could keep a runner neighbour (`windows_end_at_the_fresh_stack`
+refuses either address off the fresh stack). The release ships for
+glibc only (ADR-019), whose TLS always lies on the given stack; a musl
+runner with a large TLS fails `create` instead of keeping memory. Both
 ends of that part are guarded, because one mapping line is no proof of
 one mapping: with a guard only under it, the fresh stack's top merged
 with a runner mapping right above it into one line, and the TLS window
@@ -536,9 +572,10 @@ uses only its arguments, stack memory and raw `syscall`s, zeroes its
 buffers before the first `munmap`, compares and resets byte by byte, and
 cannot panic. Then it blocks every signal, writes its last record,
 closes the report pipe and waits in `rt_sigsuspend` with every signal
-blocked, so only SIGKILL ends it. A libc that kept a thread's TLS
-farther than 64 KiB from both thread-locals would make the anchor crash
-here, which fails `create`: fail closed. Private file mappings stay
+blocked, so only SIGKILL ends it. A libc that kept a thread's TLS off
+the fresh stack fails `create` before the first `munmap` (above), and
+one that kept it farther than 64 KiB from both thread-locals would make
+the anchor crash here, which fails `create` too: fail closed. Private file mappings stay
 whole: code, read-only data and each object's written data, which the
 code after the first `munmap` may read.
 
@@ -621,6 +658,232 @@ locked; `CLONE_PARENT_SETTID` with `clone3`) is verified on the dev host
 (Linux 7.2) and the CI legs only, not on the 6.1 floor (ADR-044), as
 ADR-007 states for unswept kernels.
 
+### D5. Reading the trees a pod wrote: `copy_out`, `export`, `seal`
+
+The workspace is agent-written, and the runner that reads it back holds
+the git token. Part 4 adds the reader, which part 5's pod calls: the
+module `tree` of `boneli-sandbox-linux` (`read_file` is `copy_out`,
+`export`, `copy_tree` is `seal`'s copier, D6) over three new calls of
+`boneli-sys` (`src/fs.rs`), and `Cgroup::freeze`.
+
+**Nothing is followed.** Every name is resolved by `fs::open_beneath`:
+`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` always set, and `O_NOFOLLOW |
+O_CLOEXEC`. The path must be relative, without NUL and without an empty,
+`.` or `..` component, checked before the call, so a lookup never walks
+`..`, the one step for which the kernel answers EAGAIN when a rename or
+a mount anywhere on the host races it. `copy_out` resolves its path in
+one call; the walk opens one component at a time from the directory
+descriptor of the level it is in (the descriptors it keeps are below). A
+symlink at any component is ELOOP
+(as a directory, ENOTDIR at the last one), a mount point EXDEV.
+
+**Each entry is opened as itself first.** `O_PATH`, which never blocks on
+a FIFO and never reaches a device driver, then `fstat` on that
+descriptor decides what it is; neither the name nor `getdents64`'s
+`d_type` does. A regular file is opened again by name with `O_RDONLY |
+O_NOFOLLOW | O_NONBLOCK` and must be the same inode; a directory with
+`O_DIRECTORY`, likewise; a symlink is read with `readlinkat(fd, "")` on
+its `O_PATH` descriptor and carried raw, target bytes as they are. The
+pod is frozen while this runs, so a changed inode means the tree changed
+anyway, and it fails (`Changed`).
+
+**What git keeps, and nothing else.** FIFOs, sockets, devices (the 0:0
+whiteout included) and empty directories are skipped, as git skips them;
+ADR-010 left that to #8. A mount point is not part of the workspace: a
+dependency bind (D6) at a directory or a file is skipped by the export
+(`export_skips_dependency_mounts`, which mounts in a user and mount
+namespace of its own through `unshare -Urm`), and `copy_out` and a seal
+beneath one are refused, so the export never holds a dependency and a
+diff never deletes the tracked files a bind would hide (D6 refuses that
+bind at `create`). A hardlink is read as its content, once per name. A
+file is `x` when its owner may execute it, else `f`; setuid, setgid and
+sticky do not count, so the mode bits that git cannot carry cannot make
+an export differ from a checkout. Repository metadata is carried: the
+snapshot's `.git` is part of the workspace (ADR-010, D1), and `Git::diff`
+drops it.
+
+**Git order.** Siblings are sorted as a git tree sorts them, a directory
+as `name/`, and walked depth first, so the entries come out in the byte
+order of their full paths (`a-b`, `a.txt`, `a/b`, `a0`) and go to
+`Workspace::from_sorted` as they are; an order that is not, a bug of the
+walk, fails there instead of being sorted silently.
+
+**`copy_out`.** Nothing at the path, a file as a parent and a directory
+at the path are `NotFound`, as in the in-memory adapter; a symlink at the
+path or a parent, a mount point, a FIFO, a socket, a device, a mode that
+forbids the read and a file over its cap are `Failed`. A FIFO fails at
+once, without waiting for a writer (`copy_out_fifo_does_not_block`).
+
+**Caps** (`Caps::for_workspace`):
+
+- Nodes: `DEFAULT_MAX_NODES`, 200,000 files, symlinks and the directories
+  they imply, as the format counts them (ADR-010, D2). The walk counts a
+  directory once the first entry beneath it is accepted, so empty
+  directories cost nothing, and stops at the first entry past the cap.
+- Bytes: `workspace_bytes + 51,800,000` for the encoded export, the magic
+  included. 51,800,000 is 200,000 nodes × 259 bytes, where 259 is the 17
+  bytes of an entry's kind and two lengths plus 242, the longest path of
+  the largest measured candidate tree (ADR-010, D2). `workspace_bytes`
+  is what the tmpfs holds, so a workspace of real files fits; the 51.8 MB
+  bound the paths and link targets, which the tmpfs size does not. Without
+  it a hostile tree at the node cap reaches 200,000 × (17 + 4,096 +
+  4,095) = 1,641,600,000 bytes of metadata. The cap, not the tmpfs, is
+  what bounds the export: a sparse file (`truncate -s`) takes no tmpfs
+  space and reads as zeros of its full size (review run 1 of part 4). A
+  file is read at most one byte past what is left, so a file over the
+  budget is never read whole.
+- Names: 400,000, twice the node cap. Every name the walk sees costs an
+  open and an `fstat`, skipped or not, and the tmpfs's inode cap does not
+  bound names: hardlinks of one FIFO are one inode and any number of
+  names, each a dentry charged only to the pod's memory. With the cap, a
+  tree at the node cap may still hold as many names again that git would
+  skip; a checkout holds none of them, so a tree that needs more is not
+  a workspace a diff should see. `getdents64` stops at the cap, before
+  the next read.
+- Path length: 4,095 bytes, `PATH_MAX` without its NUL. The git adapter
+  writes every exported path with path-based calls (`materialize`,
+  ADR-010 D3), and git does the same; both fail past it, so a longer path
+  could never reach a diff. It also bounds the walk's depth: with
+  one-byte names, 2,048 levels.
+
+**Descriptors: at most 34 directories, whatever the depth.** The first
+version held one descriptor per level. Review run 1 of part 4 ran it
+under the default soft `RLIMIT_NOFILE` of 1,024, which ADR-006, 009 and
+025 assume for the runner: a chain of 1,100 directories, inside the path
+cap, failed with EMFILE, and at 1,018 levels another runner thread that
+only opened `/dev/null` got EMFILE 7 times in 20 exports. Now the walk
+keeps the descriptor of its top level and of every level at a multiple
+of 64 below it (the checkpoints), and of the level it is in. Any other
+level's descriptor is closed when the walk enters a directory below it,
+and when the walk comes back to it with names left, it opens it again
+from the checkpoint above it: `openat2` beneath that checkpoint by the
+path between them, at most 63 components, with the same four `RESOLVE_*`
+flags, and `fstat` must show the inode it entered. With 2,048 levels at
+most, that is 32 checkpoints, the level it is in, and for a moment the
+directory it enters before the parent's descriptor is closed: 34
+(`HELD_MAX`). Its other descriptors are one at a time: the name it
+classifies with its `fstat` copy, or the file it reads. The seal walks
+the same way. `walk_descriptors_stay_bounded` exports a tree at the path
+cap's depth (2,047 directories, a file next to each, so the walk returns
+to every level) under a soft limit of 1,024 and of 64. It also seals a
+tree of 1,500 levels. Both hold at most 34 directories, counted. The
+mutant that never closes a level fails under both limits. Why 64: the
+checkpoints cost 2,048 / 64 = 32 descriptors, about 3 % of a soft limit
+of 1,024, and a re-open costs at most 63 lookups per directory the walk
+returns to, so the walk stays linear. 32 would hold 66, and 128 would
+re-open through 127.
+
+**Memory: the export is held once.** The first version kept every file's
+data in the entries for `Workspace::from_sorted` and then copied all of
+it into the encoding, about twice the cap at the peak (review run 1: 802
+MiB for a 400 MiB export of one sparse file). Now the output is reserved
+once, at the byte cap and one byte more. That reservation is address
+space, and its pages become resident as they are written. Each entry is
+encoded into the output as the walk accepts it, and a file's data is read
+straight into it, in 64 KiB pieces, and held nowhere else. The output
+never grows past its reservation, so it is never copied. A reservation
+the allocator refuses fails the export; it never aborts the runner. The
+checks `from_sorted` made run on the paths as they come: the tree path
+rule, a strictly increasing order, and no entry beneath a file or symlink
+entry. The order and nesting checks keep only the earlier paths that are
+a string prefix of the previous one, as `from_sorted` does, at most 4,095
+paths of at most 4,095 bytes. Empty or NUL-bearing link targets are
+refused too. So a walk that broke the format still fails closed
+(`encoder_keeps_the_format_rules`). An export's peak memory is therefore
+its output, at most `workspace_bytes + 51,800,000` bytes, plus the walk's
+name lists, which the name cap bounds. `export_holds_its_bytes_once`
+exports a sparse 128 MiB file in a process of its own. Its peak resident
+memory grew by 134,332,416 bytes for an export of 134,217,753 bytes
+(1.001 times). With a second copy held, the mutant, it fails.
+
+The walk is linear in the names and the bytes of their paths: one path
+buffer grows and shrinks with the walk, and only an accepted entry's path
+is copied. `export_deep_chain_is_linear` counts the work (every kernel
+call and every path byte written or copied) on a chain of 950 and of
+1,900 directories, not the wall clock (#128): twice the chain is twice
+the work (measured ratio 2.0; a copy of the path per level, the mutant,
+gives 4).
+
+**The pod is frozen** (`Cgroup::freeze(bound) -> Frozen`) while a tree is
+read: `cgroup.freeze` 1, then `cgroup.events` until `frozen 1`, at most
+`bound`. A `Frozen` thaws when it is dropped or `thaw`ed, on every path,
+an unwinding panic and a timeout included (`freeze_thaws_on_every_path`);
+a freeze that does not reach `frozen 1` within its bound thaws and fails
+with `Error::CgroupFreezeTimeout`. `cgroup.freeze` is opened by
+`Cgroup::create` next to `cgroup.kill` and `cgroup.events`, before any
+task enters, so a workload that changes its mode through a cgroup2 mount
+of its own cannot keep a freeze or a thaw from landing (the reason
+ADR-007 D8 gives for the kill). A frozen task still dies of SIGKILL, so
+`destroy` and the OOM group kill work on a frozen pod. The bound is one
+of D8's hang bounds, fixed with them in part 5. Operations on one pod are
+serialized by a per-pod lock, so a freeze never lands inside an `exec` of
+the same pod; the lock is the pod's, part 5.
+
+**A test seam for the keeper.** `Cgroup::fail_stats_keeper(errno)` makes
+the keeper fail as a read with that errno would (`KeeperReport::failed`,
+the thread stops), for part 5's test of D8's fail-closed outcome. It is
+built under the crate's tests and the feature `test-seam`, which only
+`[dev-dependencies]` enable, as for `boneli-private-dir` (ADR-030, D4).
+
+**The tree path rule.** The adapter passes `TreeRule`, whose functions
+are `TreePath::parse`, `TreePath::is_repository_metadata` and
+`TreePath::as_bytes`, and `sandbox_rule_is_tree_path` pins it to
+`TreePath` over the same cases as the git adapter's pin (D1).
+
+Errors are `TreeError::NotFound` or `Refused { path, problem }`; the
+path is printed with every byte outside printable ASCII escaped, and
+`From<TreeError> for SandboxError` keeps `NotFound` and makes every
+refusal `Failed` with that text, which is never blank (ADR-004, D4;
+`failure_details_are_never_blank`).
+
+Rejected:
+
+- **Classifying by `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`** instead of
+  an `O_PATH` open: it follows into a mount at the last component, so a
+  dependency bind would look like a directory of the workspace unless
+  every `st_dev` were compared; `RESOLVE_NO_XDEV` says it in one place.
+- **Reading files with a single `O_RDONLY | O_NONBLOCK` open**: a FIFO
+  opens and reads as empty, and a device open reaches its driver; the
+  `O_PATH` open first reaches neither.
+- **Reopening every directory from the root by its path**: quadratic in
+  the depth, the cost #30's `materialize` removed (500 entries under
+  1,900 directories took 150 s); the checkpoints bound a re-open at 63
+  components.
+- **One descriptor per level and a raised soft `RLIMIT_NOFILE`**: the
+  first version. The descriptors would still scale with the depth an
+  agent chooses, and every other thread of the runner shares the limit.
+- **A depth cap from a descriptor budget**: it refuses deep trees that git
+  holds, for a bound the checkpoints give without refusing anything.
+- **Collecting entries and encoding afterwards**: twice the cap at the
+  peak (above).
+- **No name cap**, relying on `workspace_inodes`: names are not inodes
+  (hardlinks), so the walk would be bounded only by the pod's memory.
+
+### D6. Dependency layers: the copier (part 4)
+
+`seal` copies the listed directories of a frozen `Prepare` pod into
+`<root>/layers/<n>/`, entry by entry as the walk yields them, under the
+rules and the caps of D5, one budget for all paths. `copy_tree` is that
+copier. It refuses no path, two paths that are equal or nested
+(`overlapping_paths`, D2), a path that is no directory of the workspace
+(a symlink, a file, a mount point, nothing) and a directory that holds
+no file and no symlink, before or while it writes. The target must be a
+new, empty, real directory of mode 0700; files get 0644 or 0755 by
+their kind, directories 0755, symlinks their raw targets, and nothing a
+walk skips is written, so a layer holds exactly what an export of the
+same directory would hold (`seal_round_trips`). The directories above a
+sealed path are not counted as nodes: at most as many as its
+components. The writes are path-based, as `materialize`'s (ADR-010,
+D3): within the private target only a process of the runner's own uid
+could plant a symlink while the copy runs. Being path-based, they take
+the layer directory's own path from `PATH_MAX`, so an entry whose path
+there is longer fails with ENAMETOOLONG, which is closed (the tests seal
+1,500 levels). On an error the target may
+hold part of the copy, and the pod removes it. The binds at `create`,
+the refusal of a dependency path at or above a tracked file and the
+release rules are part 5.
+
 ## Consequences
 
 - `boneli-workspace` is on the always-review list (decided at #8 STOP 1):
@@ -660,6 +923,18 @@ ADR-007 states for unswept kernels.
   without them before the clone.
 - `Mount::Tmpfs` has a new field, `inodes`; the existing mounts pass
   `None`, which is the kernel's default and the behaviour before.
+- A musl runner whose TLS does not fit on the anchor's fresh stack fails
+  `create` (D3, part 4); the release ships glibc builds only (ADR-019).
+- Every sandbox cgroup holds one more descriptor, `cgroup.freeze` (D5).
+- An export holds the whole workspace in the runner's memory once, at
+  most `workspace_bytes + 51,800,000` bytes, and reserves that much address
+  space up front. A runner sized for pods that export at the same time
+  needs that sum. A seal streams and holds no file's data. Both walks hold
+  at most 34 directory descriptors and a few more one at a time (D5, D6).
+- A tree with more than 400,000 names, or a path longer than 4,095
+  bytes, cannot be exported or sealed (D5).
+- `export_skips_dependency_mounts` needs `unshare -Urm`; it is a host
+  test and runs with part 5's CI step.
 
 ## Alternatives considered
 

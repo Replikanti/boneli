@@ -287,6 +287,18 @@ pub enum Error {
     /// release keeps, other ids than its pod's, an exec
     /// before the fill point was resumed, or an anchor that has failed.
     InvalidAnchor(&'static str),
+    /// A path for [`crate::fs::open_beneath`] that is empty or absolute, or
+    /// holds NUL or an empty, `.` or `..` component (ADR-042, D5).
+    InvalidBeneathPath(&'static str),
+    /// A directory listed by [`crate::fs::read_dir`] has more entries than
+    /// its cap (ADR-042, D5).
+    TooManyEntries {
+        /// The cap.
+        max: usize,
+    },
+    /// A cgroup did not report `frozen 1` within this bound after a write
+    /// of `cgroup.freeze`; it was thawed again (ADR-042, D5).
+    CgroupFreezeTimeout(Duration),
 }
 
 impl Error {
@@ -464,6 +476,14 @@ impl fmt::Display for Error {
                 "a Landlock rule allows {right}, which its ruleset does not handle"
             ),
             Error::InvalidAnchor(why) => write!(f, "invalid anchor request: {why}"),
+            Error::InvalidBeneathPath(why) => write!(f, "the path beneath a directory {why}"),
+            Error::TooManyEntries { max } => {
+                write!(f, "a directory has more than {max} entries")
+            }
+            Error::CgroupFreezeTimeout(t) => write!(
+                f,
+                "the cgroup was not frozen {t:?} after cgroup.freeze; thawed again"
+            ),
         }
     }
 }
