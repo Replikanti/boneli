@@ -1768,7 +1768,7 @@
    "title": "boneli-sys: raise the kernel floor from Linux 5.19 to 6.1",
    "epic": null,
    "order": 68,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "a0b0e5e8",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1777,7 +1777,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-28T11:35:53+00:00",
+   "updated_at": "2026-11-28T12:02:10+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [],
@@ -1789,14 +1789,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-26T00:37:12+00:00",
-   "issue": 129,
-   "from": "pr-review",
-   "to": "done",
-   "by": "9cc7896e",
-   "note": null
-  },
   {
    "at": "2026-11-26T00:37:14+00:00",
    "issue": 137,
@@ -2188,6 +2180,14 @@
    "to": "pr-review",
    "by": "9c692a2a",
    "note": null
+  },
+  {
+   "at": "2026-11-28T12:02:10+00:00",
+   "issue": 149,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "a0b0e5e8",
+   "note": null
   }
  ],
  "open": [
@@ -2215,7 +2215,7 @@
   149
  ],
  "xopen": [],
- "updated_at": "2026-11-28T11:37:52+00:00",
+ "updated_at": "2026-11-28T12:02:10+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
