@@ -63,7 +63,7 @@ Target state: during the agent phase the only way out is through the gateway to 
 - cgroups v2 through writes to `/sys/fs/cgroup`: memory, CPU, process count, IO,
 - a seccomp-bpf filter assembled in Rust that additionally blocks `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`, `keyctl` and new user namespaces, the kernel log, foreign ABIs, syscalls newer than the reviewed table, socket families other than Unix, IPv4, IPv6 and netlink, netlink protocols other than routing, IP protocols other than TCP, UDP and ICMP, huge pages, and the calls through which the workload could make the kernel load a module or a crypto algorithm (ADR-007); a supervisor thread in the runner answers each denied call with the same errno and records it per sandbox, so a refusal shows in the run report instead of passing for the bug under investigation (ADR-043),
 - `no_new_privs`, no capabilities (ADR-007), a read-only rootfs; only `/workspace` and `/tmp` are writable,
-- Landlock as a second layer, enabled by `boneli-shim` before it starts the agent; ABI 2 or newer, so Linux 5.19 (ADR-007).
+- Landlock as a second layer, enabled by `boneli-shim` before it starts the agent; ABI 2 or newer (it came with Linux 5.19); the runtime needs Linux 6.1 (ADR-044).
 
 **Pod.** The application and its services (Postgres, Redis) share one network namespace, each with its own rootfs. They see each other on `127.0.0.1` and nothing leads outside.
 

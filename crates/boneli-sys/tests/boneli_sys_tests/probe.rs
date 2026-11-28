@@ -23,7 +23,7 @@ fn expected_missing() -> BTreeSet<MissingId> {
 }
 
 #[test]
-#[ignore = "host: user namespaces, cgroup v2 delegation, Linux 5.19"]
+#[ignore = "host: user namespaces, cgroup v2 delegation, Linux 6.1"]
 fn reports_expected_missing() {
     let want = expected_missing();
     let got: BTreeSet<MissingId> = match Features::probe() {
@@ -44,7 +44,7 @@ fn reports_expected_missing() {
 }
 
 #[test]
-#[ignore = "host: user namespaces, cgroup v2 delegation, Linux 5.19"]
+#[ignore = "host: user namespaces, cgroup v2 delegation, Linux 6.1"]
 fn refuses_host_without_keyrings() {
     // A kernel without CONFIG_KEYS, as the probe sees it: keyctl gives
     // ENOSYS (a filter of the probe process's own). The host is refused up

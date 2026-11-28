@@ -1,5 +1,6 @@
-//! What the host must provide (ADR-007, D3 and D5), checked by trying each
-//! feature instead of reading the kernel version: distributions backport.
+//! What the host must provide (ADR-007, D3 and D5; the floor is Linux 6.1,
+//! ADR-044), checked by trying each feature instead of reading the kernel
+//! version: distributions backport.
 
 use std::fmt;
 use std::os::fd::AsRawFd;
@@ -54,13 +55,15 @@ pub enum MissingId {
     LandlockAbi,
     /// `keyrings`
     Keyrings,
+    /// `kernel-floor`
+    KernelFloor,
     /// `probe-failed`
     ProbeFailed,
 }
 
 impl MissingId {
     /// Every id.
-    pub const ALL: [MissingId; 16] = [
+    pub const ALL: [MissingId; 17] = [
         MissingId::UsernsApparmor,
         MissingId::UsernsDisabled,
         MissingId::UsernsOther,
@@ -76,6 +79,7 @@ impl MissingId {
         MissingId::LandlockUnavailable,
         MissingId::LandlockAbi,
         MissingId::Keyrings,
+        MissingId::KernelFloor,
         MissingId::ProbeFailed,
     ];
 
@@ -97,6 +101,7 @@ impl MissingId {
             MissingId::LandlockUnavailable => "landlock-unavailable",
             MissingId::LandlockAbi => "landlock-abi",
             MissingId::Keyrings => "keyrings",
+            MissingId::KernelFloor => "kernel-floor",
             MissingId::ProbeFailed => "probe-failed",
         }
     }
@@ -199,6 +204,16 @@ pub enum Missing {
         /// The errno.
         errno: i32,
     },
+    /// The kernel is older than Linux 6.1, the floor (ADR-044): the
+    /// caller's cgroup has the pids controller's `pids.max` but not its
+    /// `pids.peak`, which Linux 6.1 added. No interface the runtime calls
+    /// changed from 5.19 to 6.1, so this marker is what tells them apart;
+    /// a vendor kernel that backports `pids.peak` passes, as D3's backport
+    /// rule intends.
+    KernelFloor {
+        /// The cgroup directory.
+        path: String,
+    },
     /// A probe could not run its test, for a reason that says nothing
     /// about the feature (a resource limit, a failed pipe, a killed or
     /// mis-reporting probe child), so the feature is neither present nor
@@ -234,6 +249,7 @@ impl Missing {
             Missing::LandlockUnavailable { .. } => MissingId::LandlockUnavailable,
             Missing::LandlockAbi { .. } => MissingId::LandlockAbi,
             Missing::Keyrings { .. } => MissingId::Keyrings,
+            Missing::KernelFloor { .. } => MissingId::KernelFloor,
             Missing::ProbeFailed { .. } => MissingId::ProbeFailed,
         }
     }
@@ -280,19 +296,19 @@ impl fmt::Display for Missing {
             ),
             Missing::Clone3 { errno } => write!(
                 f,
-                "clone3 is not available: {} (boneli needs Linux 5.19 or newer)",
+                "clone3 is not available: {} (boneli needs Linux 6.1 or newer)",
                 os(*errno)
             ),
             Missing::CloseRange { errno } => {
                 write!(
                     f,
-                    "close_range with CLOSE_RANGE_CLOEXEC is not available: {} (boneli needs Linux 5.19 or newer)",
+                    "close_range with CLOSE_RANGE_CLOEXEC is not available: {} (boneli needs Linux 6.1 or newer)",
                     os(*errno)
                 )
             }
             Missing::SeccompKillProcess { errno } => write!(
                 f,
-                "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 5.19 or newer)",
+                "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 6.1 or newer)",
                 os(*errno)
             ),
             Missing::SeccompFilter { errno } => write!(
@@ -309,7 +325,8 @@ impl fmt::Display for Missing {
             Missing::LandlockAbi { found, required } => {
                 write!(
                     f,
-                    "Landlock ABI {found} found, {required} or newer required (Linux 5.19)"
+                    "Landlock ABI {found} found, {required} or newer required (ABI 2 came with Linux 5.19; \
+                     boneli needs Linux 6.1 or newer)"
                 )
             }
             Missing::Keyrings { item, errno } => write!(
@@ -317,6 +334,11 @@ impl fmt::Display for Missing {
                 "the kernel keyrings are not usable: {item}: {} (every sandbox joins a new session keyring \
                  and hides /proc/keys; the kernel needs CONFIG_KEYS, and keyctl must not be filtered)",
                 os(*errno)
+            ),
+            Missing::KernelFloor { path } => write!(
+                f,
+                "this kernel is older than Linux 6.1, the oldest boneli supports: {path}/pids.max exists \
+                 but pids.peak (added in Linux 6.1) does not"
             ),
             Missing::ProbeFailed {
                 probe,
@@ -374,7 +396,8 @@ impl fmt::Display for NotifyGap {
             NotifyGap::Install { errno } if *errno == libc::EINVAL => write!(
                 f,
                 "a seccomp filter with a listener and the wait-killable receive cannot be installed: {} \
-                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV needs Linux 5.19 or newer; {WHY})",
+                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV came with Linux 5.19, and boneli needs Linux 6.1 \
+                 or newer; {WHY})",
                 os(*errno)
             ),
             NotifyGap::Install { errno } if *errno == libc::EBUSY => write!(
@@ -391,7 +414,7 @@ impl fmt::Display for NotifyGap {
             ),
             NotifyGap::Action { errno } => write!(
                 f,
-                "seccomp cannot notify a supervisor (SECCOMP_RET_USER_NOTIF): {} (boneli needs Linux 5.19 or newer)",
+                "seccomp cannot notify a supervisor (SECCOMP_RET_USER_NOTIF): {} (boneli needs Linux 6.1 or newer)",
                 os(*errno)
             ),
             NotifyGap::SizesUnreadable { errno } => write!(
@@ -472,10 +495,11 @@ impl Features {
     /// notification with a listener and the wait-killable receive
     /// (ADR-043, D7), Landlock ABI 2 or
     /// newer, cgroup v2 at `/sys/fs/cgroup`, and delegation of the caller's
-    /// own cgroup with the cpu, io, memory and pids controllers, and the
-    /// kernel keyrings (`keyctl`, `/proc/keys`, `/proc/key-users`). Returns
-    /// every missing feature with its cause. Without `clone3` the user
-    /// namespace is not tried.
+    /// own cgroup with the cpu, io, memory and pids controllers, the
+    /// kernel keyrings (`keyctl`, `/proc/keys`, `/proc/key-users`), and the
+    /// floor Linux 6.1 through the pids controller's `pids.peak` (ADR-044).
+    /// Returns every missing feature with its cause. Without `clone3` the
+    /// user namespace is not tried.
     pub fn probe() -> std::result::Result<(), Vec<Missing>> {
         let mut missing = Vec::new();
         missing.extend(probe_children(Fault::None, Fault::None, PROBE_TIMEOUT));
@@ -837,17 +861,28 @@ fn probe_cgroup() -> Vec<Missing> {
     if let Err(options) = nsdelegate {
         missing.push(Missing::CgroupNsdelegate { options });
     }
-    let own = std::fs::read_to_string("/proc/self/cgroup")
+    let dir = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
-        .and_then(|text| {
-            text.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-        });
-    let Some(own) = own else {
+        .and_then(|text| own_cgroup_dir(&text));
+    let Some(dir) = dir else {
         missing.push(Missing::Cgroup2Missing);
         return missing;
     };
-    let dir = format!("/sys/fs/cgroup{}", own.trim_end_matches('/'));
+    missing.extend(probe_cgroup_dir(dir));
+    missing
+}
+
+/// The checks on the caller's cgroup directory, in order: the kernel
+/// floor, delegation, the controllers, and the floor's last word (a
+/// function of the directory alone, so a test can run it on a temp dir).
+fn probe_cgroup_dir(dir: String) -> Vec<Missing> {
+    let mut missing = Vec::new();
+    // Before the delegation check, so that a host that is not delegated
+    // and also below 6.1 is told both (ADR-044, D3).
+    let floor = kernel_floor(&dir);
+    if let Floor::Gap(gap) = &floor {
+        missing.push(gap.clone());
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     for file in [
@@ -883,7 +918,107 @@ fn probe_cgroup() -> Vec<Missing> {
                 controller,
             }),
     );
+    missing.extend(floor_after_controllers(&floor, &available));
     missing
+}
+
+/// The caller's cgroup v2 directory from `/proc/self/cgroup` (pure, so
+/// every form has a unit test): the `0::` line's path under
+/// `/sys/fs/cgroup`, without a trailing `/`; `None` without that line.
+pub(crate) fn own_cgroup_dir(text: &str) -> Option<String> {
+    let own = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+    Some(format!("/sys/fs/cgroup{}", own.trim_end_matches('/')))
+}
+
+/// What the floor check found in the caller's cgroup (ADR-044, D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Floor {
+    /// `pids.peak` holds what Linux 6.1 and newer write.
+    Met,
+    /// Neither file exists: the pids controller is not visible in this
+    /// cgroup, so the controllers check decides
+    /// ([`floor_after_controllers`]).
+    Unseen,
+    /// Below the floor, or the check could not run.
+    Gap(Missing),
+}
+
+/// The floor check on a cgroup directory: `pids.max`'s `stat` and
+/// `pids.peak`'s content. `pids.peak` is not read when the `stat` fails
+/// with an errno other than ENOENT, which is reported as it is.
+pub(crate) fn kernel_floor(dir: &str) -> Floor {
+    let max = std::fs::metadata(format!("{dir}/pids.max")).map(|_| ());
+    let peak = match &max {
+        Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Ok(Vec::new()),
+        _ => std::fs::read(format!("{dir}/pids.peak")),
+    };
+    classify_kernel_floor(dir, max, peak)
+}
+
+/// How much of an unexpected `pids.peak` a message echoes.
+const PEAK_ECHO: usize = 32;
+
+/// Names what the floor check found (pure, so every branch has a unit
+/// test), from `pids.max`'s `stat` and `pids.peak`'s content. Both files
+/// are the pids controller's and `CFTYPE_NOT_ON_ROOT`, so they exist
+/// together or not at all, from 6.1 on (`kernel/cgroup/pids.c:363` in 6.1,
+/// commit 5251c6c436ed); before 6.1 only `pids.max` does. `Met` needs the
+/// content the kernel writes, one s64 at or above 0 and a newline
+/// (`read_s64`); anything else, and any errno but ENOENT, is
+/// `probe-failed` naming the file, never `kernel-floor` and never `Met`.
+pub(crate) fn classify_kernel_floor(
+    path: &str,
+    max: std::io::Result<()>,
+    peak: std::io::Result<Vec<u8>>,
+) -> Floor {
+    const PROBE: &str = "kernel-floor";
+    let absent = |e: &std::io::Error| e.raw_os_error() == Some(libc::ENOENT);
+    match (max, peak) {
+        (Err(e), _) if !absent(&e) => Floor::Gap(probe_failed(PROBE, "pids.max", e.to_string())),
+        (Err(_), Err(e)) if absent(&e) => Floor::Unseen,
+        (Err(_), Ok(_)) => Floor::Gap(probe_failed(
+            PROBE,
+            "pids.max",
+            format!("{path}/pids.max is absent but {path}/pids.peak exists"),
+        )),
+        (Ok(()), Err(e)) if absent(&e) => Floor::Gap(Missing::KernelFloor { path: path.into() }),
+        (_, Err(e)) => Floor::Gap(probe_failed(PROBE, "pids.peak", e.to_string())),
+        (Ok(()), Ok(content)) if is_peak(&content) => Floor::Met,
+        (Ok(()), Ok(content)) => {
+            let head = content.get(..PEAK_ECHO).unwrap_or(&content);
+            let mut detail = format!("unexpected content \"{}\"", head.escape_ascii());
+            if content.len() > PEAK_ECHO {
+                detail.push_str(&format!(" (first {PEAK_ECHO} of {} bytes)", content.len()));
+            }
+            Floor::Gap(probe_failed(PROBE, "pids.peak", detail))
+        }
+    }
+}
+
+/// Whether `content` is what `read_s64` writes for a value at or above 0:
+/// 1 to 19 ASCII digits that fit an `i64`, then exactly one newline.
+fn is_peak(content: &[u8]) -> bool {
+    let Some(digits) = content.strip_suffix(b"\n") else {
+        return false;
+    };
+    (1..=19).contains(&digits.len())
+        && digits.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(digits).is_ok_and(|d| d.parse::<i64>().is_ok())
+}
+
+/// The floor check's last word, after the controllers check: a cgroup
+/// that lists `pids` in `cgroup.controllers` but had no `pids.max` fails
+/// closed, so `Features::probe` returns `Ok` only after [`Floor::Met`].
+/// Without `pids` listed, `cgroup-controller-missing` already reports it;
+/// a [`Floor::Gap`] was pushed before the delegation check.
+pub(crate) fn floor_after_controllers(floor: &Floor, available: &[&str]) -> Option<Missing> {
+    (*floor == Floor::Unseen && available.contains(&"pids")).then(|| {
+        probe_failed(
+            "kernel-floor",
+            "pids.max",
+            "pids is in cgroup.controllers, pids.max is absent".into(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -939,6 +1074,9 @@ mod tests {
                 item: "keyctl",
                 errno: libc::ENOSYS,
             },
+            MissingId::KernelFloor => Missing::KernelFloor {
+                path: "/sys/fs/cgroup/a".into(),
+            },
             MissingId::ProbeFailed => Missing::ProbeFailed {
                 probe: "seccomp-filter",
                 stage: "clone3",
@@ -962,10 +1100,10 @@ mod tests {
             "the cgroup v2 hierarchy at /sys/fs/cgroup is mounted without nsdelegate (rw,seclabel); \
              a sandbox could raise its own limits (remount with nsdelegate as root)"
                 .to_string(),
-            format!("clone3 is not available: {} (boneli needs Linux 5.19 or newer)", e(libc::ENOSYS)),
-            format!("close_range with CLOSE_RANGE_CLOEXEC is not available: {} (boneli needs Linux 5.19 or newer)", e(libc::EINVAL)),
+            format!("clone3 is not available: {} (boneli needs Linux 6.1 or newer)", e(libc::ENOSYS)),
+            format!("close_range with CLOSE_RANGE_CLOEXEC is not available: {} (boneli needs Linux 6.1 or newer)", e(libc::EINVAL)),
             format!(
-                "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 5.19 or newer)",
+                "seccomp cannot kill a whole process (SECCOMP_RET_KILL_PROCESS): {} (boneli needs Linux 6.1 or newer)",
                 e(libc::EOPNOTSUPP)
             ),
             format!(
@@ -974,17 +1112,20 @@ mod tests {
             ),
             format!(
                 "a seccomp filter with a listener and the wait-killable receive cannot be installed: {} \
-                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV needs Linux 5.19 or newer; every sandbox's \
-                 denied calls are answered by a supervisor in this process)",
+                 (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV came with Linux 5.19, and boneli needs Linux 6.1 \
+                 or newer; every sandbox's denied calls are answered by a supervisor in this process)",
                 e(libc::EINVAL)
             ),
             format!("Landlock is not available: {} (it must be built in and listed in the lsm= boot parameter)", e(libc::EOPNOTSUPP)),
-            "Landlock ABI 1 found, 2 or newer required (Linux 5.19)".to_string(),
+            "Landlock ABI 1 found, 2 or newer required (ABI 2 came with Linux 5.19; boneli needs Linux 6.1 or newer)".to_string(),
             format!(
                 "the kernel keyrings are not usable: keyctl: {} (every sandbox joins a new session keyring \
                  and hides /proc/keys; the kernel needs CONFIG_KEYS, and keyctl must not be filtered)",
                 e(libc::ENOSYS)
             ),
+            "this kernel is older than Linux 6.1, the oldest boneli supports: /sys/fs/cgroup/a/pids.max exists \
+             but pids.peak (added in Linux 6.1) does not"
+                .to_string(),
             format!(
                 "the seccomp-filter probe could not run: clone3: {} (says nothing about seccomp-filter; retry once the cause is gone)",
                 e(libc::EAGAIN)
@@ -1006,6 +1147,7 @@ mod tests {
             "landlock-unavailable",
             "landlock-abi",
             "keyrings",
+            "kernel-floor",
             "probe-failed",
         ];
         for (i, id) in MissingId::ALL.into_iter().enumerate() {
@@ -1021,6 +1163,13 @@ mod tests {
         }
         assert_eq!(MissingId::from_name("userns"), None);
         assert_eq!(MissingId::from_name(""), None);
+        assert_eq!(
+            MissingId::from_name("kernel-floor"),
+            Some(MissingId::KernelFloor)
+        );
+        assert_eq!(MissingId::from_name("kernel_floor"), None);
+        assert_eq!(MissingId::from_name("Kernel-Floor"), None);
+        assert_eq!(MissingId::ALL.len(), 17);
     }
 
     #[test]
@@ -1127,7 +1276,8 @@ mod tests {
         let einval = install(libc::EINVAL).expect("a gap");
         assert_eq!(einval.id(), MissingId::SeccompNotify);
         assert!(
-            einval.to_string().contains("needs Linux 5.19 or newer"),
+            einval.to_string().contains("came with Linux 5.19")
+                && einval.to_string().contains("needs Linux 6.1 or newer"),
             "{einval}"
         );
         let ebusy = install(libc::EBUSY).expect("a gap");
@@ -1204,6 +1354,13 @@ mod tests {
             }
             .to_string()
             .contains(&e(libc::EOPNOTSUPP))
+        );
+        assert!(
+            NotifyGap::Action {
+                errno: libc::EOPNOTSUPP
+            }
+            .to_string()
+            .ends_with("(boneli needs Linux 6.1 or newer)")
         );
     }
 
@@ -1478,6 +1635,305 @@ mod tests {
                 "clone3 errno {errno} is a user-namespace gap, not probe-failed"
             );
         }
+    }
+
+    fn io(errno: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(errno)
+    }
+
+    fn floor_failed(stage: &'static str, detail: String) -> Floor {
+        Floor::Gap(Missing::ProbeFailed {
+            probe: "kernel-floor",
+            stage,
+            detail,
+        })
+    }
+
+    #[test]
+    fn kernel_floor_classification() {
+        const DIR: &str = "/sys/fs/cgroup/a";
+        let peak = |content: &[u8]| classify_kernel_floor(DIR, Ok(()), Ok(content.to_vec()));
+        // Linux 6.1 and newer: pids.peak is one s64 at or above 0 and a
+        // newline (`read_s64`, `kernel/cgroup/pids.c:363` in 6.1).
+        for ok in [&b"0\n"[..], b"7\n", b"9223372036854775807\n"] {
+            assert_eq!(peak(ok), Floor::Met, "{:?}", ok.escape_ascii().to_string());
+        }
+        // 5.19.x and 6.0.x: the controller's files are there, pids.peak is not.
+        assert_eq!(
+            classify_kernel_floor(DIR, Ok(()), Err(io(libc::ENOENT))),
+            Floor::Gap(Missing::KernelFloor { path: DIR.into() })
+        );
+        // The pids controller is not visible in this cgroup: nothing to say
+        // about the kernel yet (the controllers check decides).
+        assert_eq!(
+            classify_kernel_floor(DIR, Err(io(libc::ENOENT)), Err(io(libc::ENOENT))),
+            Floor::Unseen
+        );
+        // pids.peak without pids.max: no kernel has that, so fail closed.
+        assert_eq!(
+            classify_kernel_floor(DIR, Err(io(libc::ENOENT)), Ok(b"7\n".to_vec())),
+            floor_failed(
+                "pids.max",
+                format!("{DIR}/pids.max is absent but {DIR}/pids.peak exists")
+            )
+        );
+        // Any other errno names the file it came from, never kernel-floor.
+        for errno in [libc::EACCES, libc::ENOTDIR, libc::EIO] {
+            assert_eq!(
+                classify_kernel_floor(DIR, Err(io(errno)), Err(io(libc::ENOENT))),
+                floor_failed("pids.max", io(errno).to_string()),
+                "pids.max errno {errno}"
+            );
+            assert_eq!(
+                classify_kernel_floor(DIR, Err(io(errno)), Ok(b"7\n".to_vec())),
+                floor_failed("pids.max", io(errno).to_string()),
+                "pids.max errno {errno}, pids.peak not read"
+            );
+            assert_eq!(
+                classify_kernel_floor(DIR, Ok(()), Err(io(errno))),
+                floor_failed("pids.peak", io(errno).to_string()),
+                "pids.peak errno {errno}"
+            );
+            assert_eq!(
+                classify_kernel_floor(DIR, Err(io(libc::ENOENT)), Err(io(errno))),
+                floor_failed("pids.peak", io(errno).to_string()),
+                "pids.max absent, pids.peak errno {errno}"
+            );
+        }
+        // Content that is not what the kernel writes is probe-failed: not
+        // Met, and not kernel-floor either.
+        let twenty = b"12345678901234567890\n";
+        let over = b"9223372036854775808\n";
+        for bad in [
+            &b""[..],
+            b"7",
+            b"7\n\n",
+            b" 7\n",
+            b"+7\n",
+            b"-1\n",
+            b"max\n",
+            "\u{0663}\n".as_bytes(),
+            "7\u{200b}\n".as_bytes(),
+            twenty,
+            over,
+        ] {
+            assert_eq!(
+                peak(bad),
+                floor_failed(
+                    "pids.peak",
+                    format!("unexpected content \"{}\"", bad.escape_ascii())
+                ),
+                "{:?}",
+                bad.escape_ascii().to_string()
+            );
+        }
+        // The echo is capped at 32 bytes.
+        let long = [b'x'; 100];
+        match peak(&long) {
+            Floor::Gap(Missing::ProbeFailed { detail, .. }) => assert_eq!(
+                detail,
+                format!(
+                    "unexpected content \"{}\" (first 32 of 100 bytes)",
+                    "x".repeat(32)
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn kernel_floor_after_controllers() {
+        let pids = ["cpu", "io", "memory", "pids"];
+        let no_pids = ["cpu", "io", "memory"];
+        // pids is listed but pids.max was absent: fail closed, never Ok.
+        assert_eq!(
+            floor_after_controllers(&Floor::Unseen, &pids),
+            Some(Missing::ProbeFailed {
+                probe: "kernel-floor",
+                stage: "pids.max",
+                detail: "pids is in cgroup.controllers, pids.max is absent".into(),
+            })
+        );
+        // pids is not listed: cgroup-controller-missing (pids) says it.
+        assert_eq!(floor_after_controllers(&Floor::Unseen, &no_pids), None);
+        assert_eq!(floor_after_controllers(&Floor::Unseen, &[]), None);
+        // Met adds nothing; a gap was pushed before the delegation check.
+        assert_eq!(floor_after_controllers(&Floor::Met, &pids), None);
+        let gap = Floor::Gap(Missing::KernelFloor {
+            path: "/sys/fs/cgroup/a".into(),
+        });
+        assert_eq!(floor_after_controllers(&gap, &pids), None);
+        assert_eq!(floor_after_controllers(&gap, &no_pids), None);
+    }
+
+    #[test]
+    fn own_cgroup_dir_forms() {
+        assert_eq!(own_cgroup_dir("0::/\n").as_deref(), Some("/sys/fs/cgroup"));
+        assert_eq!(
+            own_cgroup_dir("0::/user.slice/a\n").as_deref(),
+            Some("/sys/fs/cgroup/user.slice/a")
+        );
+        assert_eq!(
+            own_cgroup_dir("0::/a/\n").as_deref(),
+            Some("/sys/fs/cgroup/a")
+        );
+        assert_eq!(
+            own_cgroup_dir("1:name=systemd:/\n0::/b\n").as_deref(),
+            Some("/sys/fs/cgroup/b")
+        );
+        assert_eq!(own_cgroup_dir("1:name=systemd:/\n"), None);
+        assert_eq!(own_cgroup_dir(""), None);
+    }
+
+    /// A directory removed on drop, standing in for a cgroup directory.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p =
+                std::env::temp_dir().join(format!("boneli-host-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir(&p).expect("create a temp dir");
+            TempDir(p)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().expect("a UTF-8 temp dir")
+        }
+
+        fn write(&self, name: &str, content: &[u8]) {
+            std::fs::write(self.0.join(name), content).expect("write a file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn kernel_floor_reads_a_cgroup_directory() {
+        // Regular files stand in for cgroupfs: what matters is which of the
+        // two exists and what pids.peak holds.
+        let met = TempDir::new("met");
+        met.write("pids.max", b"max\n");
+        met.write("pids.peak", b"3\n");
+        assert_eq!(kernel_floor(met.path()), Floor::Met);
+
+        let old = TempDir::new("old");
+        old.write("pids.max", b"max\n");
+        assert_eq!(
+            kernel_floor(old.path()),
+            Floor::Gap(Missing::KernelFloor {
+                path: old.path().into()
+            })
+        );
+        assert!(
+            Missing::KernelFloor {
+                path: old.path().into()
+            }
+            .to_string()
+            .ends_with(&format!(
+                "{}/pids.max exists but pids.peak (added in Linux 6.1) does not",
+                old.path()
+            ))
+        );
+
+        let unseen = TempDir::new("unseen");
+        assert_eq!(kernel_floor(unseen.path()), Floor::Unseen);
+
+        // pids.peak unreadable (a directory here): probe-failed naming it.
+        let unreadable = TempDir::new("unreadable");
+        unreadable.write("pids.max", b"max\n");
+        std::fs::create_dir(unreadable.0.join("pids.peak")).expect("mkdir");
+        assert_eq!(
+            kernel_floor(unreadable.path()),
+            floor_failed("pids.peak", io(libc::EISDIR).to_string())
+        );
+
+        // The cgroup path is not a directory: pids.max gives ENOTDIR.
+        let file = TempDir::new("file");
+        file.write("cg", b"");
+        let not_dir = format!("{}/cg", file.path());
+        assert_eq!(
+            kernel_floor(&not_dir),
+            floor_failed("pids.max", io(libc::ENOTDIR).to_string())
+        );
+    }
+
+    /// A temp dir laid out as a delegated cgroup: the three files the
+    /// delegation check needs, writable, and `cgroup.controllers`.
+    fn delegated(tag: &str, controllers: &str) -> TempDir {
+        let dir = TempDir::new(tag);
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            dir.write(file, b"");
+        }
+        dir.write("cgroup.controllers", controllers.as_bytes());
+        dir
+    }
+
+    #[test]
+    fn probe_cgroup_dir_wires_the_floor_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let all = "cpu io memory pids\n";
+        let floor = |dir: &TempDir| Missing::KernelFloor {
+            path: dir.path().into(),
+        };
+
+        // Below 6.1 and not delegated: both, the floor first (ADR-044 D3).
+        // Mode 0444 makes access(W_OK) fail for the non-root test user.
+        let old = delegated("dir-old-undelegated", all);
+        old.write("pids.max", b"max\n");
+        let procs = old.0.join("cgroup.procs");
+        std::fs::set_permissions(&procs, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod cgroup.procs");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            probe_cgroup_dir(old.path().into()),
+            vec![
+                floor(&old),
+                Missing::CgroupNotDelegated {
+                    path: old.path().into(),
+                    file: format!("{}/cgroup.procs", old.path()),
+                    uid,
+                },
+            ]
+        );
+
+        // Below 6.1 and delegated with every controller: the floor alone.
+        let old = delegated("dir-old", all);
+        old.write("pids.max", b"max\n");
+        assert_eq!(probe_cgroup_dir(old.path().into()), vec![floor(&old)]);
+
+        // Neither pids file, but pids listed: fail closed, never Ok.
+        let unseen = delegated("dir-unseen", all);
+        assert_eq!(
+            probe_cgroup_dir(unseen.path().into()),
+            vec![Missing::ProbeFailed {
+                probe: "kernel-floor",
+                stage: "pids.max",
+                detail: "pids is in cgroup.controllers, pids.max is absent".into(),
+            }]
+        );
+
+        // Neither pids file and pids not listed: the controllers check says it.
+        let unlisted = delegated("dir-unlisted", "cpu io memory\n");
+        assert_eq!(
+            probe_cgroup_dir(unlisted.path().into()),
+            vec![Missing::CgroupControllerMissing {
+                path: unlisted.path().into(),
+                controller: "pids",
+            }]
+        );
+
+        // Met, delegated, every controller: nothing missing.
+        let met = delegated("dir-met", all);
+        met.write("pids.max", b"max\n");
+        met.write("pids.peak", b"3\n");
+        assert_eq!(probe_cgroup_dir(met.path().into()), Vec::new());
     }
 
     #[test]

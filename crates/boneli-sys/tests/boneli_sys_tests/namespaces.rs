@@ -5,7 +5,7 @@ use crate::support::rootfs::HOSTNAME;
 use crate::support::{ids, run_probe};
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn pid_namespace_probe_is_pid_1() {
     let p = run_probe("pid", ids(0, 0), &[]);
     p.assert_ok();
@@ -15,7 +15,7 @@ fn pid_namespace_probe_is_pid_1() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn network_namespace_loopback_only() {
     let p = run_probe("net", ids(0, 0), &[]);
     p.assert_ok();
@@ -32,7 +32,7 @@ fn network_namespace_loopback_only() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn ipc_namespace_isolated() {
     static N: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -67,7 +67,7 @@ fn host_name() -> String {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn uts_namespace_hostname() {
     let before = host_name();
     let p = run_probe("uname", ids(0, 0), &[]);
@@ -77,7 +77,7 @@ fn uts_namespace_hostname() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn cgroup_namespace_created() {
     let p = run_probe("cgroup", ids(0, 0), &[]);
     p.assert_ok();

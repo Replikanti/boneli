@@ -46,9 +46,9 @@ pub const DOCKER_CAPS: [&str; 14] = [
     "CAP_AUDIT_WRITE",
 ];
 
-/// The kernel floor (ADR-007, D3): rules with a higher `minKernel` do not
-/// apply.
-pub const FLOOR: (u32, u32) = (5, 19);
+/// The kernel floor (ADR-007 D3, raised to Linux 6.1 by ADR-044 D1 and D4):
+/// rules with a higher `minKernel` do not apply.
+pub const FLOOR: (u32, u32) = (6, 1);
 
 /// Names that Docker allows only for some arguments and this policy for
 /// more, but only in bits the kernel ignores: `domain` is an `int`, Docker
@@ -418,10 +418,16 @@ fn docker_rule_applicability() {
         r
     };
     let kernel = |k: &str| with(&|r| r.includes.min_kernel = Some(parse_kernel(k).expect(k)));
-    assert!(applies(&kernel("5.19"), "amd64"));
-    assert!(applies(&kernel("5.2"), "amd64"));
-    assert!(!applies(&kernel("5.20"), "amd64"));
-    assert!(!applies(&kernel("6.1"), "amd64"));
+    // Against the floor 6.1 (ADR-044 D1): 5.20 < 6.1 because 5 < 6, which
+    // a compare of each component on its own gets wrong (20 > 1); 6.10 >
+    // 6.1 because 10 > 1, which a float compare gets wrong (6.10 = 6.1);
+    // 10.0 > 6.1 because 10 > 6, which a string compare gets wrong.
+    for k in ["4.8", "5.2", "5.19", "5.20", "6.0", "6.1"] {
+        assert!(applies(&kernel(k), "amd64"), "minKernel {k}");
+    }
+    for k in ["6.2", "6.10", "7.0", "10.0"] {
+        assert!(!applies(&kernel(k), "amd64"), "minKernel {k}");
+    }
     // Capabilities: included ones must all be defaults, excluded ones none.
     let inc = |c: &str| with(&|r| r.includes.caps = vec![c.to_string()]);
     let exc = |c: &str| with(&|r| r.excludes.caps = vec![c.to_string()]);

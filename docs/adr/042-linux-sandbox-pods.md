@@ -618,8 +618,8 @@ Known limit: the kernel behaviour this relies on (`setns` with several
 namespaces through a pidfd, Linux 5.8; a new procfs over the anchor's
 in a mount namespace of the same user namespace, whose mounts are not
 locked; `CLONE_PARENT_SETTID` with `clone3`) is verified on the dev host
-(Linux 7.2) and the CI legs only, not on the 5.19 floor, as ADR-007
-states for unswept kernels.
+(Linux 7.2) and the CI legs only, not on the 6.1 floor (ADR-044), as
+ADR-007 states for unswept kernels.
 
 ## Consequences
 
