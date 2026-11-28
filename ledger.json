@@ -1738,7 +1738,7 @@
   },
   {
    "issue": 144,
-   "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
+   "title": "boneli-sys: run the host tests on the Linux 6.1 floor in a CI VM",
    "epic": null,
    "order": 67,
    "state": "blocked",
@@ -2240,7 +2240,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T15:48:53+00:00",
+ "updated_at": "2026-11-28T15:50:21+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
