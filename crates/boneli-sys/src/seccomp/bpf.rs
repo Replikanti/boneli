@@ -3,6 +3,10 @@
 //! constant, and `RET` with a constant. Jumps go forward to labels; the
 //! assembler checks the kernel's limits (`BPF_MAXINSNS`, 8-bit offsets)
 //! instead of letting the kernel refuse the program at install.
+//!
+//! [`evaluate`] runs a program of that subset on a [`Data`], so the
+//! supervisor can ask the plain program which row denied a notified call
+//! and with which errno (ADR-043, D2).
 
 /// One classic BPF instruction, laid out as `struct sock_filter`
 /// (`include/uapi/linux/filter.h`).
@@ -173,6 +177,122 @@ pub(crate) fn assemble(ops: &[Op]) -> Result<Vec<Insn>, AsmError> {
         return Err(AsmError::NoFinalReturn);
     }
     Ok(out)
+}
+
+/// The input of a filter, `struct seccomp_data`
+/// (`include/uapi/linux/seccomp.h`): 64 bytes in the byte order of both
+/// architectures, little-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Data {
+    /// The syscall number, the bits of the kernel's `int`.
+    pub nr: u32,
+    /// `AUDIT_ARCH_*` of the calling convention.
+    pub arch: u32,
+    /// The address of the call instruction.
+    pub instruction_pointer: u64,
+    /// The six arguments.
+    pub args: [u64; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<libc::seccomp_data>() == Data::SIZE);
+const _: () = assert!(core::mem::offset_of!(libc::seccomp_data, nr) == 0);
+const _: () = assert!(core::mem::offset_of!(libc::seccomp_data, arch) == 4);
+const _: () = assert!(core::mem::offset_of!(libc::seccomp_data, instruction_pointer) == 8);
+const _: () = assert!(core::mem::offset_of!(libc::seccomp_data, args) == 16);
+
+impl Data {
+    /// The size of `struct seccomp_data`.
+    pub const SIZE: usize = 64;
+
+    /// Reads the kernel's layout: `nr` at 0, `arch` at 4,
+    /// `instruction_pointer` at 8, `args[i]` at 16 + 8·i.
+    pub fn from_bytes(b: &[u8; Data::SIZE]) -> Data {
+        let word = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let quad = |at: usize| u64::from(word(at)) | (u64::from(word(at + 4)) << 32);
+        let mut args = [0u64; 6];
+        for (i, arg) in args.iter_mut().enumerate() {
+            *arg = quad(16 + 8 * i);
+        }
+        Data {
+            nr: word(0),
+            arch: word(4),
+            instruction_pointer: quad(8),
+            args,
+        }
+    }
+
+    /// Writes the kernel's layout; the inverse of [`Data::from_bytes`].
+    pub fn to_bytes(&self) -> [u8; Data::SIZE] {
+        let mut b = [0u8; Data::SIZE];
+        b[0..4].copy_from_slice(&self.nr.to_le_bytes());
+        b[4..8].copy_from_slice(&self.arch.to_le_bytes());
+        b[8..16].copy_from_slice(&self.instruction_pointer.to_le_bytes());
+        for (i, arg) in self.args.iter().enumerate() {
+            b[16 + 8 * i..24 + 8 * i].copy_from_slice(&arg.to_le_bytes());
+        }
+        b
+    }
+}
+
+/// What a program returned for one call, and the index of the return
+/// instruction that gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    /// The seccomp action.
+    pub action: u32,
+    /// The return instruction, or `None` when the program was malformed
+    /// and the evaluator answered `SECCOMP_RET_KILL_PROCESS` itself.
+    pub at: Option<usize>,
+}
+
+/// The highest offset a load may read: `args[5]`'s high word.
+const LAST_WORD: u32 = (Data::SIZE - 4) as u32;
+
+/// Runs `program` on `data` the way the kernel does, for the assembler's
+/// subset only (ADR-043, D2): loads `LD|W|ABS` at an offset from 0 to 60
+/// that is a multiple of 4, jumps `JEQ`, `JGT` and `JSET` with a constant,
+/// and `RET` with a constant. Anything else, a jump past the end, running
+/// off the end or an empty program gives `SECCOMP_RET_KILL_PROCESS` with
+/// no return index, so a program this crate did not build fails closed.
+/// Jumps only go forward, so the loop ends after at most one pass. No
+/// allocation.
+pub fn evaluate(program: &[Insn], data: &Data) -> Outcome {
+    const MALFORMED: Outcome = Outcome {
+        action: libc::SECCOMP_RET_KILL_PROCESS,
+        at: None,
+    };
+    let bytes = data.to_bytes();
+    let mut a: u32 = 0;
+    let mut pc = 0usize;
+    loop {
+        let Some(insn) = program.get(pc) else {
+            return MALFORMED;
+        };
+        let taken = match insn.code {
+            LD_W_ABS => {
+                if insn.k > LAST_WORD || !insn.k.is_multiple_of(4) {
+                    return MALFORMED;
+                }
+                let at = insn.k as usize;
+                a = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+                pc += 1;
+                continue;
+            }
+            RET => {
+                return Outcome {
+                    action: insn.k,
+                    at: Some(pc),
+                };
+            }
+            JEQ => a == insn.k,
+            JGT => a > insn.k,
+            JSET => a & insn.k != 0,
+            _ => return MALFORMED,
+        };
+        let offset = usize::from(if taken { insn.jt } else { insn.jf });
+        // A jump past the end is caught by the next `get`.
+        pc += 1 + offset;
+    }
 }
 
 #[cfg(test)]

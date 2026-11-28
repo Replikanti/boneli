@@ -121,11 +121,12 @@ impl Row {
         Row::FsCryptoIoctl,
     ];
 
-    /// The seccomp action of the row.
-    pub fn action(self) -> u32 {
-        match self {
-            Row::ForeignArch => libc::SECCOMP_RET_KILL_PROCESS,
-            Row::Ceiling | Row::Clone3 => errno_action(libc::ENOSYS),
+    /// The errno the row answers, `None` for the one row that kills
+    /// ([`Row::ForeignArch`]).
+    pub fn errno(self) -> Option<i32> {
+        Some(match self {
+            Row::ForeignArch => return None,
+            Row::Ceiling | Row::Clone3 => libc::ENOSYS,
             Row::IoUring
             | Row::BpfUserfaultfdPerf
             | Row::Keyring
@@ -136,13 +137,26 @@ impl Row {
             | Row::HugetlbMemfd
             | Row::LineDiscipline
             | Row::ModuleIoctl
-            | Row::FsCryptoIoctl => errno_action(libc::EPERM),
-            Row::SocketFamily | Row::SockPacket | Row::Socketpair => {
-                errno_action(libc::EAFNOSUPPORT)
-            }
-            Row::NetlinkProtocol | Row::InetProtocol => errno_action(libc::EPROTONOSUPPORT),
-            Row::Ktls | Row::TcpSignature | Row::Bpfilter => errno_action(ENOPROTOOPT_ERRNO),
+            | Row::FsCryptoIoctl => libc::EPERM,
+            Row::SocketFamily | Row::SockPacket | Row::Socketpair => libc::EAFNOSUPPORT,
+            Row::NetlinkProtocol | Row::InetProtocol => libc::EPROTONOSUPPORT,
+            Row::Ktls | Row::TcpSignature | Row::Bpfilter => ENOPROTOOPT_ERRNO,
+        })
+    }
+
+    /// The seccomp action of the row in the plain program.
+    pub fn action(self) -> u32 {
+        match self.errno() {
+            Some(errno) => errno_action(errno),
+            None => libc::SECCOMP_RET_KILL_PROCESS,
         }
+    }
+
+    /// Whether the notifying program hands the row's calls to the
+    /// supervisor: every errno row (ADR-043, D1). The kill row does not,
+    /// because a notification can only end in an errno or the call.
+    pub fn notifies(self) -> bool {
+        self.errno().is_some()
     }
 
     /// Whether the row denies every call of its syscalls, whatever the
@@ -153,30 +167,58 @@ impl Row {
             Row::IoUring | Row::BpfUserfaultfdPerf | Row::Keyring | Row::Syslog | Row::Clone3
         )
     }
+
+    /// The label of the row's own return instruction.
+    fn label(self) -> Label {
+        // The discriminant follows the declaration order, which is table
+        // order: labels 100 to 121, clear of the program's other labels
+        // (1 to 21).
+        Label(100 + self as u16)
+    }
 }
 
-/// An assembled program, ready for `seccomp(SECCOMP_SET_MODE_FILTER)`.
+/// An assembled program, ready for `seccomp(SECCOMP_SET_MODE_FILTER)`,
+/// with the row that each errno return belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Program(Vec<Insn>);
+pub struct Program {
+    insns: Vec<Insn>,
+    rows: Vec<(usize, Row)>,
+}
 
 impl Program {
     /// The instructions.
     pub fn instructions(&self) -> &[Insn] {
-        &self.0
+        &self.insns
     }
+
+    /// The row whose return instruction sits at `at`: each errno row has
+    /// one of its own (ADR-043, D2). `None` for the allow and kill
+    /// returns and for any other index.
+    pub fn row_at(&self, at: usize) -> Option<Row> {
+        self.rows
+            .iter()
+            .find(|(i, _)| *i == at)
+            .map(|(_, row)| *row)
+    }
+}
+
+/// How a program answers the errno rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// `SECCOMP_RET_ERRNO` with the row's errno: the plain program.
+    Errno,
+    /// `SECCOMP_RET_USER_NOTIF`: the notifying program (ADR-043, D2).
+    Notify,
 }
 
 /// The seccomp policy. There is one, without configuration (ADR-007, D2).
 #[derive(Debug, Clone, Copy)]
 pub struct Policy(());
 
-// The labels of the program.
+// The labels of the program; each errno row returns at its own
+// (`Row::label`).
 const KILL: Label = Label(1);
 const ALLOW: Label = Label(2);
-const EPERM: Label = Label(3);
-const ENOSYS: Label = Label(4);
-const EAFNOSUPPORT: Label = Label(5);
-const EPROTONOSUPPORT: Label = Label(6);
 const CLONE_FLAGS: Label = Label(7);
 const SOCKET: Label = Label(8);
 const NETLINK: Label = Label(9);
@@ -189,12 +231,16 @@ const INET6: Label = Label(15);
 const IP_PROTOCOL: Label = Label(16);
 const IOCTL: Label = Label(17);
 const SETSOCKOPT: Label = Label(18);
-const ENOPROTOOPT: Label = Label(19);
 const GETSOCKOPT: Label = Label(20);
 const IP_OPTION: Label = Label(21);
 
 fn to(label: Label) -> Target {
     Target::Label(label)
+}
+
+/// A jump to the return of `row`.
+fn deny(row: Row) -> Target {
+    Target::Label(row.label())
 }
 
 const NEXT: Target = Target::Next;
@@ -205,12 +251,41 @@ impl Policy {
         Policy(())
     }
 
-    /// The program for `arch`.
+    /// The plain program for `arch`: every errno row returns
+    /// `SECCOMP_RET_ERRNO`.
     pub fn program(&self, arch: Arch) -> Result<Program, AsmError> {
-        bpf::assemble(&self.source(arch)).map(Program)
+        self.assemble(arch, Answer::Errno)
     }
 
-    fn source(&self, arch: Arch) -> Vec<Op> {
+    /// The notifying program for `arch` (ADR-043, D2): the plain program
+    /// instruction for instruction, except that every errno return is
+    /// `SECCOMP_RET_USER_NOTIF`. Which calls it denies is therefore the
+    /// plain program's decision.
+    pub fn notifying_program(&self, arch: Arch) -> Result<Program, AsmError> {
+        self.assemble(arch, Answer::Notify)
+    }
+
+    fn assemble(&self, arch: Arch, answer: Answer) -> Result<Program, AsmError> {
+        let ops = self.source(arch, answer);
+        // The index of each row's return: the number of instructions before
+        // its mark.
+        let mut rows = Vec::new();
+        let mut n = 0usize;
+        for op in &ops {
+            match op {
+                Op::Mark(label) => {
+                    if let Some(row) = Row::ALL.iter().find(|r| r.label() == *label) {
+                        rows.push((n, *row));
+                    }
+                }
+                _ => n += 1,
+            }
+        }
+        let insns = bpf::assemble(&ops)?;
+        Ok(Program { insns, rows })
+    }
+
+    fn source(&self, arch: Arch, answer: Answer) -> Vec<Op> {
         let nr = arch.syscalls();
         let mut ops = vec![
             // Row ForeignArch: another syscall table (i386, AArch32, or
@@ -219,25 +294,25 @@ impl Policy {
             Op::Jeq(arch.audit_arch(), NEXT, to(KILL)),
             Op::Load(NR),
             // Row Ceiling, unsigned: also x32 numbers (bit 30) and -1.
-            Op::Jgt(CEILING, to(ENOSYS), NEXT),
+            Op::Jgt(CEILING, deny(Row::Ceiling), NEXT),
         ];
         // Rows that deny every call of a syscall.
-        for whole in [
-            nr.io_uring_setup,
-            nr.io_uring_enter,
-            nr.io_uring_register,
-            nr.bpf,
-            nr.userfaultfd,
-            nr.perf_event_open,
-            nr.keyctl,
-            nr.add_key,
-            nr.request_key,
-            nr.syslog,
+        for (whole, row) in [
+            (nr.io_uring_setup, Row::IoUring),
+            (nr.io_uring_enter, Row::IoUring),
+            (nr.io_uring_register, Row::IoUring),
+            (nr.bpf, Row::BpfUserfaultfdPerf),
+            (nr.userfaultfd, Row::BpfUserfaultfdPerf),
+            (nr.perf_event_open, Row::BpfUserfaultfdPerf),
+            (nr.keyctl, Row::Keyring),
+            (nr.add_key, Row::Keyring),
+            (nr.request_key, Row::Keyring),
+            (nr.syslog, Row::Syslog),
         ] {
-            ops.push(Op::Jeq(whole, to(EPERM), NEXT));
+            ops.push(Op::Jeq(whole, deny(row), NEXT));
         }
         ops.extend([
-            Op::Jeq(nr.clone3, to(ENOSYS), NEXT),
+            Op::Jeq(nr.clone3, deny(Row::Clone3), NEXT),
             // Rows that look at one argument.
             Op::Jeq(nr.clone, to(CLONE_FLAGS), NEXT),
             Op::Jeq(nr.unshare, to(CLONE_FLAGS), NEXT),
@@ -254,7 +329,7 @@ impl Policy {
             // flags, unshare rejects unknown upper bits.
             Op::Mark(CLONE_FLAGS),
             Op::Load(arg_low(0)),
-            Op::Jset(CLONE_NEWUSER, to(EPERM), to(ALLOW)),
+            Op::Jset(CLONE_NEWUSER, deny(Row::NewUserNamespace), to(ALLOW)),
             // Rows SocketFamily, NetlinkProtocol and InetProtocol: `domain`
             // and `protocol` are ints.
             Op::Mark(SOCKET),
@@ -262,19 +337,19 @@ impl Policy {
             Op::Jeq(AF_UNIX, to(ALLOW), NEXT),
             Op::Jeq(AF_INET, to(INET), NEXT),
             Op::Jeq(AF_INET6, to(INET6), NEXT),
-            Op::Jeq(AF_NETLINK, to(NETLINK), to(EAFNOSUPPORT)),
+            Op::Jeq(AF_NETLINK, to(NETLINK), deny(Row::SocketFamily)),
             Op::Mark(NETLINK),
             Op::Load(arg_low(2)),
-            Op::Jeq(NETLINK_ROUTE, to(ALLOW), to(EPROTONOSUPPORT)),
+            Op::Jeq(NETLINK_ROUTE, to(ALLOW), deny(Row::NetlinkProtocol)),
             // Row SockPacket, IPv4 only (`__sock_create` rewrites only
             // PF_INET): `type` is an int, and the kernel accepts no other
             // value with type 10 in it.
             Op::Mark(INET),
             Op::Load(arg_low(1)),
-            Op::Jeq(SOCK_PACKET_TYPES[0], to(EAFNOSUPPORT), NEXT),
-            Op::Jeq(SOCK_PACKET_TYPES[1], to(EAFNOSUPPORT), NEXT),
-            Op::Jeq(SOCK_PACKET_TYPES[2], to(EAFNOSUPPORT), NEXT),
-            Op::Jeq(SOCK_PACKET_TYPES[3], to(EAFNOSUPPORT), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[0], deny(Row::SockPacket), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[1], deny(Row::SockPacket), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[2], deny(Row::SockPacket), NEXT),
+            Op::Jeq(SOCK_PACKET_TYPES[3], deny(Row::SockPacket), NEXT),
             // Each family's ICMP, then the protocols both share.
             Op::Load(arg_low(2)),
             Op::Jeq(IPPROTO_ICMP, to(ALLOW), to(IP_PROTOCOL)),
@@ -284,50 +359,50 @@ impl Policy {
             Op::Mark(IP_PROTOCOL),
             Op::Jeq(IPPROTO_IP, to(ALLOW), NEXT),
             Op::Jeq(IPPROTO_TCP, to(ALLOW), NEXT),
-            Op::Jeq(IPPROTO_UDP, to(ALLOW), to(EPROTONOSUPPORT)),
+            Op::Jeq(IPPROTO_UDP, to(ALLOW), deny(Row::InetProtocol)),
             // Row Socketpair.
             Op::Mark(SOCKETPAIR),
             Op::Load(arg_low(0)),
-            Op::Jeq(AF_UNIX, to(ALLOW), to(EAFNOSUPPORT)),
+            Op::Jeq(AF_UNIX, to(ALLOW), deny(Row::Socketpair)),
             // Huge page rows: the kernel tests only these bits, which lie
             // in the low words.
             Op::Mark(MMAP),
             Op::Load(arg_low(3)),
-            Op::Jset(MAP_HUGETLB, to(EPERM), to(ALLOW)),
+            Op::Jset(MAP_HUGETLB, deny(Row::HugetlbMmap), to(ALLOW)),
             Op::Mark(SHMGET),
             Op::Load(arg_low(2)),
-            Op::Jset(SHM_HUGETLB, to(EPERM), to(ALLOW)),
+            Op::Jset(SHM_HUGETLB, deny(Row::HugetlbShmget), to(ALLOW)),
             Op::Mark(MEMFD),
             Op::Load(arg_low(1)),
-            Op::Jset(MFD_HUGETLB, to(EPERM), to(ALLOW)),
+            Op::Jset(MFD_HUGETLB, deny(Row::HugetlbMemfd), to(ALLOW)),
             // Rows LineDiscipline, ModuleIoctl and FsCryptoIoctl: `cmd` is
             // an unsigned int.
             Op::Mark(IOCTL),
             Op::Load(arg_low(1)),
-            Op::Jeq(TIOCSETD, to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[0], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[1], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[2], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[3], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[4], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[5], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[6], to(EPERM), NEXT),
-            Op::Jeq(MODULE_IOCTLS[7], to(EPERM), NEXT),
-            Op::Jeq(FS_CRYPTO_IOCTLS[0], to(EPERM), NEXT),
-            Op::Jeq(FS_CRYPTO_IOCTLS[1], to(EPERM), NEXT),
-            Op::Jeq(FS_CRYPTO_IOCTLS[2], to(EPERM), to(ALLOW)),
+            Op::Jeq(TIOCSETD, deny(Row::LineDiscipline), NEXT),
+            Op::Jeq(MODULE_IOCTLS[0], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[1], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[2], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[3], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[4], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[5], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[6], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(MODULE_IOCTLS[7], deny(Row::ModuleIoctl), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[0], deny(Row::FsCryptoIoctl), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[1], deny(Row::FsCryptoIoctl), NEXT),
+            Op::Jeq(FS_CRYPTO_IOCTLS[2], deny(Row::FsCryptoIoctl), to(ALLOW)),
             // Rows Ktls, TcpSignature and Bpfilter: `level` and `optname`
             // are ints. Every other level and option is judged by the
             // kernel.
             Op::Mark(SETSOCKOPT),
             Op::Load(arg_low(1)),
-            Op::Jeq(SOL_TLS, to(ENOPROTOOPT), NEXT),
+            Op::Jeq(SOL_TLS, deny(Row::Ktls), NEXT),
             Op::Jeq(IPPROTO_IP, to(IP_OPTION), NEXT),
             Op::Jeq(IPPROTO_TCP, NEXT, to(ALLOW)),
             Op::Load(arg_low(2)),
-            Op::Jeq(TCP_SIGNATURE_OPTIONS[0], to(ENOPROTOOPT), NEXT),
-            Op::Jeq(TCP_SIGNATURE_OPTIONS[1], to(ENOPROTOOPT), NEXT),
-            Op::Jeq(TCP_SIGNATURE_OPTIONS[2], to(ENOPROTOOPT), to(ALLOW)),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[0], deny(Row::TcpSignature), NEXT),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[1], deny(Row::TcpSignature), NEXT),
+            Op::Jeq(TCP_SIGNATURE_OPTIONS[2], deny(Row::TcpSignature), to(ALLOW)),
             // Row Bpfilter for getsockopt, at every level but SOL_SOCKET,
             // then the option range both calls share, unsigned: 64 to 67.
             Op::Mark(GETSOCKOPT),
@@ -336,23 +411,22 @@ impl Policy {
             Op::Mark(IP_OPTION),
             Op::Load(arg_low(2)),
             Op::Jgt(BPFILTER_OPTIONS.1, to(ALLOW), NEXT),
-            Op::Jgt(BPFILTER_OPTIONS.0 - 1, to(ENOPROTOOPT), to(ALLOW)),
-            // The returns.
+            Op::Jgt(BPFILTER_OPTIONS.0 - 1, deny(Row::Bpfilter), to(ALLOW)),
+            // The returns: allow, one per errno row in table order, kill.
             Op::Mark(ALLOW),
             Op::Ret(libc::SECCOMP_RET_ALLOW),
-            Op::Mark(EPERM),
-            Op::Ret(errno_action(libc::EPERM)),
-            Op::Mark(ENOSYS),
-            Op::Ret(errno_action(libc::ENOSYS)),
-            Op::Mark(EAFNOSUPPORT),
-            Op::Ret(errno_action(libc::EAFNOSUPPORT)),
-            Op::Mark(EPROTONOSUPPORT),
-            Op::Ret(errno_action(libc::EPROTONOSUPPORT)),
-            Op::Mark(ENOPROTOOPT),
-            Op::Ret(errno_action(ENOPROTOOPT_ERRNO)),
-            Op::Mark(KILL),
-            Op::Ret(libc::SECCOMP_RET_KILL_PROCESS),
         ]);
+        for row in Row::ALL {
+            let Some(errno) = row.errno() else {
+                continue;
+            };
+            ops.push(Op::Mark(row.label()));
+            ops.push(Op::Ret(match answer {
+                Answer::Errno => errno_action(errno),
+                Answer::Notify => libc::SECCOMP_RET_USER_NOTIF,
+            }));
+        }
+        ops.extend([Op::Mark(KILL), Op::Ret(libc::SECCOMP_RET_KILL_PROCESS)]);
         ops
     }
 }

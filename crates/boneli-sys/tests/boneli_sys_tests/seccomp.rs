@@ -918,7 +918,7 @@ fn program_shape() {
                 other => panic!("{}: opcode {other:#x} at {at}", arch.name()),
             }
         }
-        // The count ADR-007 D2 records; a change to the rows updates both.
+        // The count ADR-043 D2 records; a change to the rows updates it.
         assert_eq!(
             len,
             PROGRAM_LEN,
@@ -933,8 +933,9 @@ fn program_shape() {
     );
 }
 
-/// The assembler's instruction count, recorded in ADR-007 D2.
-const PROGRAM_LEN: usize = 88;
+/// The assembler's instruction count: ADR-007 D2 recorded 88 with five
+/// shared errno returns, ADR-043 D2 records 104 with one per errno row.
+const PROGRAM_LEN: usize = 104;
 
 /// The kernel rows (ADR-007, D2): the probe's id for each call and the
 /// result the policy must give inside, an errno or 0 for an allowed call.
@@ -1271,4 +1272,1036 @@ fn clone3_fallback_starts_threads() {
     p.assert_ok();
     assert_eq!(p.get("clone3_errno"), libc::ENOSYS.to_string(), "{}", p.raw);
     assert_eq!(p.get("thread"), "0", "{}", p.raw);
+}
+
+// ADR-043: the notifying program, the evaluator, the answer, the record.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use boneli_sys::seccomp::record::{KEY_SPACE, STATUS_MAX, comm_bytes};
+use boneli_sys::seccomp::{
+    Call, Data as SeccompData, Decision, Denial, Insn, Key, Record, Row, Selector, decide,
+    describe_call, escape_comm, evaluate, parse_status,
+};
+
+use crate::census::{CENSUS, Verdict, denied_form, extract};
+
+const USER_NOTIF: u32 = libc::SECCOMP_RET_USER_NOTIF;
+
+fn plain(arch: Arch) -> boneli_sys::seccomp::Program {
+    Policy::sandbox()
+        .program(arch)
+        .unwrap_or_else(|e| panic!("{}: {e}", arch.name()))
+}
+
+fn notifying(arch: Arch) -> boneli_sys::seccomp::Program {
+    Policy::sandbox()
+        .notifying_program(arch)
+        .unwrap_or_else(|e| panic!("{}: {e}", arch.name()))
+}
+
+fn sdata(arch: Arch, nr: u32, args: [u64; 6]) -> SeccompData {
+    SeccompData {
+        nr,
+        arch: arch.audit_arch(),
+        instruction_pointer: 0,
+        args,
+    }
+}
+
+fn errno_rows() -> Vec<Row> {
+    Row::ALL.into_iter().filter(|r| r.notifies()).collect()
+}
+
+#[test]
+fn notifying_program_differs_only_in_errno_returns() {
+    for arch in Arch::ALL {
+        let (p, n) = (plain(arch), notifying(arch));
+        let (pi, ni) = (p.instructions(), n.instructions());
+        assert_eq!(pi.len(), ni.len(), "{}", arch.name());
+        let mut differ = Vec::new();
+        for (at, (a, b)) in pi.iter().zip(ni).enumerate() {
+            if a == b {
+                continue;
+            }
+            differ.push(at);
+            assert_eq!((a.code, b.code), (0x06, 0x06), "{}: {at}", arch.name());
+            assert_eq!((a.jt, a.jf, b.jt, b.jf), (0, 0, 0, 0));
+            let row = p
+                .row_at(at)
+                .expect("a differing instruction is a row return");
+            assert_eq!(n.row_at(at), Some(row), "{}: {at}", arch.name());
+            assert_eq!(a.k, errno_action(row.errno().expect("an errno row")));
+            assert_eq!(b.k, USER_NOTIF, "{}: {at}", arch.name());
+        }
+        assert_eq!(differ.len(), 21, "{}", arch.name());
+        // The kill return and both allow returns are the same in both.
+        for prog in [pi, ni] {
+            let rets = |k: u32| prog.iter().filter(|i| i.code == 0x06 && i.k == k).count();
+            assert_eq!(rets(ALLOW), 2, "{}", arch.name());
+            assert_eq!(rets(KILL), 1, "{}", arch.name());
+        }
+    }
+}
+
+#[test]
+fn every_errno_row_has_its_own_return() {
+    for arch in Arch::ALL {
+        for (prog, notify) in [(plain(arch), false), (notifying(arch), true)] {
+            let insns = prog.instructions();
+            let mut seen: BTreeMap<Row, usize> = BTreeMap::new();
+            for (at, insn) in insns.iter().enumerate() {
+                if let Some(row) = prog.row_at(at) {
+                    assert_eq!(insn.code, 0x06, "{}: {at}", arch.name());
+                    let errno = row.errno().expect("an errno row");
+                    let want = if notify {
+                        USER_NOTIF
+                    } else {
+                        errno_action(errno)
+                    };
+                    assert_eq!(insn.k, want, "{}: {at}, {row:?}", arch.name());
+                    assert!(
+                        seen.insert(row, at).is_none(),
+                        "{}: {row:?} twice",
+                        arch.name()
+                    );
+                }
+            }
+            let rows: Vec<Row> = seen.keys().copied().collect();
+            assert_eq!(rows, errno_rows(), "{}", arch.name());
+            let at: BTreeSet<usize> = seen.values().copied().collect();
+            assert_eq!(at.len(), 21);
+            assert_eq!(prog.row_at(insns.len()), None);
+            assert_eq!(prog.row_at(usize::MAX), None);
+        }
+    }
+    for row in Row::ALL {
+        assert_eq!(row.notifies(), row != Row::ForeignArch, "{row:?}");
+        assert_eq!(row.errno().is_some(), row.notifies(), "{row:?}");
+        match row.errno() {
+            Some(e) => assert_eq!(row.action(), errno_action(e), "{row:?}"),
+            None => assert_eq!(row.action(), KILL),
+        }
+    }
+}
+
+/// Forms each argument row leaves allowed, written out: (syscall field,
+/// arguments).
+fn allowed_forms(n: &Numbers) -> Vec<(u32, [u64; 6])> {
+    vec![
+        (n.clone, [0x11, 0, 0, 0, 0, 0]),
+        (n.unshare, [0x2_0000, 0, 0, 0, 0, 0]),
+        (n.socket, [1, 1, 0, 0, 0, 0]),
+        (n.socket, [2, 1, 6, 0, 0, 0]),
+        (n.socket, [10, 2, 58, 0, 0, 0]),
+        (n.socket, [16, 3, 0, 0, 0, 0]),
+        (n.socketpair, [1, 1, 0, 0, 0, 0]),
+        (n.mmap, [0, 4096, 3, 0x22, 0, 0]),
+        (n.shmget, [0, 4096, 0o1666, 0, 0, 0]),
+        (n.memfd_create, [0, 1, 0, 0, 0, 0]),
+        (n.ioctl, [0, 0x5424, 0, 0, 0, 0]),
+        (n.setsockopt, [3, 1, 2, 0, 0, 0]),
+        (n.getsockopt, [3, 1, 64, 0, 0, 0]),
+    ]
+}
+
+#[test]
+fn evaluator_matches_interpreter() {
+    for arch in Arch::ALL {
+        let audit = arch.audit_arch();
+        let table = extract(arch);
+        for prog in [plain(arch), notifying(arch)] {
+            let insns = prog.instructions();
+            let check = |nr: u32, a: u32, args: [u64; 6]| {
+                let out = evaluate(
+                    insns,
+                    &SeccompData {
+                        nr,
+                        arch: a,
+                        instruction_pointer: 0x7fff_0000_1234,
+                        args,
+                    },
+                );
+                let want = run(insns, &Data { nr, arch: a, args });
+                assert_eq!(out.action, want, "{}: nr {nr} arch {a:#x}", arch.name());
+                let at = out.at.expect("a program of the policy always returns");
+                assert_eq!(insns[at].code, 0x06);
+                assert_eq!(insns[at].k, out.action);
+                (out.action, prog.row_at(at))
+            };
+            for nr in 0..=CEILING + 8 {
+                let (action, row) = check(nr, audit, [0; 6]);
+                assert_eq!(row.is_none(), action == ALLOW, "{}: nr {nr}", arch.name());
+            }
+            assert_eq!(check(471, audit, [0; 6]), (ALLOW, None));
+            for nr in [472, 0x4000_0001, 0xFFFF_FFFF] {
+                assert_eq!(check(nr, audit, [0; 6]).1, Some(Row::Ceiling), "nr {nr:#x}");
+            }
+            let other = match arch {
+                Arch::X86_64 => Arch::Aarch64.audit_arch(),
+                Arch::Aarch64 => Arch::X86_64.audit_arch(),
+            };
+            for foreign in [AUDIT_ARCH_I386, AUDIT_ARCH_ARM, other] {
+                assert_eq!(check(41, foreign, [40, 0, 0, 0, 0, 0]), (KILL, None));
+            }
+            // Each row's denied form names the census row.
+            for e in CENSUS {
+                let (Some(nr), Verdict::Row { rows, .. }) = (table.number(e.name), &e.verdict)
+                else {
+                    continue;
+                };
+                for &row in rows.iter() {
+                    let form = denied_form(row).expect("a row with a form");
+                    assert_eq!(check(nr, audit, form).1, Some(row), "{}", e.name);
+                }
+            }
+            for (nr, args) in allowed_forms(numbers(arch)) {
+                assert_eq!(check(nr, audit, args), (ALLOW, None), "nr {nr} {args:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn evaluator_fails_closed() {
+    const RET: u16 = 0x06;
+    let insn = |code: u16, jt: u8, jf: u8, k: u32| Insn { code, jt, jf, k };
+    let data = SeccompData::default();
+    let killed = |prog: &[Insn]| {
+        let out = evaluate(prog, &data);
+        assert_eq!((out.action, out.at), (KILL, None), "{prog:?}");
+    };
+    killed(&[]);
+    // BPF_ALU | BPF_ADD | BPF_K, outside the subset.
+    killed(&[insn(0x04, 0, 0, 1), insn(RET, 0, 0, ALLOW)]);
+    // A load past seccomp_data and one that is not word-aligned.
+    killed(&[insn(0x20, 0, 0, 64), insn(RET, 0, 0, ALLOW)]);
+    killed(&[insn(0x20, 0, 0, 2), insn(RET, 0, 0, ALLOW)]);
+    // A jump past the end and one to exactly the end.
+    killed(&[insn(0x15, 5, 0, 0), insn(RET, 0, 0, ALLOW)]);
+    killed(&[insn(0x15, 1, 1, 0), insn(RET, 0, 0, ALLOW)]);
+    // Running off the end.
+    killed(&[insn(0x20, 0, 0, 0)]);
+    // RET with A (BPF_RET | BPF_A), outside the subset.
+    killed(&[insn(0x16, 0, 0, 0)]);
+    // In the subset: the last word (args[5], high half) and the
+    // instruction pointer are readable.
+    let d = SeccompData {
+        args: [0, 0, 0, 0, 0, 7 << 32],
+        instruction_pointer: 9,
+        ..SeccompData::default()
+    };
+    let prog = [
+        insn(0x20, 0, 0, 60),
+        insn(0x15, 0, 2, 7),
+        insn(0x20, 0, 0, 8),
+        insn(0x15, 1, 0, 9),
+        insn(RET, 0, 0, KILL),
+        insn(RET, 0, 0, ALLOW),
+    ];
+    let out = evaluate(&prog, &d);
+    assert_eq!((out.action, out.at), (ALLOW, Some(5)));
+}
+
+#[test]
+fn seccomp_data_round_trip() {
+    assert_eq!(std::mem::size_of::<libc::seccomp_data>(), SeccompData::SIZE);
+    assert_eq!(std::mem::offset_of!(libc::seccomp_data, nr), 0);
+    assert_eq!(std::mem::offset_of!(libc::seccomp_data, arch), 4);
+    assert_eq!(
+        std::mem::offset_of!(libc::seccomp_data, instruction_pointer),
+        8
+    );
+    assert_eq!(std::mem::offset_of!(libc::seccomp_data, args), 16);
+    let mut b = [0u8; 64];
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(37) ^ 0xA5;
+    }
+    let d = SeccompData::from_bytes(&b);
+    assert_eq!(d.to_bytes(), b);
+    assert_eq!(d.nr, u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    assert_eq!(d.arch, u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
+    let quad = |at: usize| {
+        let mut q = [0u8; 8];
+        q.copy_from_slice(&b[at..at + 8]);
+        u64::from_le_bytes(q)
+    };
+    assert_eq!(d.instruction_pointer, quad(8));
+    for (i, arg) in d.args.iter().enumerate() {
+        assert_eq!(*arg, quad(16 + 8 * i), "args[{i}]");
+    }
+    let e = sdata(Arch::X86_64, 0xFFFF_FFFF, [u64::MAX, 0, 1, 2, 3, 1 << 63]);
+    assert_eq!(SeccompData::from_bytes(&e.to_bytes()), e);
+}
+
+#[test]
+fn answer_derivation() {
+    for arch in Arch::ALL {
+        let (p, n) = (plain(arch), notifying(arch));
+        let nums = numbers(arch);
+        let table = extract(arch);
+        // Every census form of every errno row: the row's errno.
+        for e in CENSUS {
+            let (Some(nr), Verdict::Row { rows, .. }) = (table.number(e.name), &e.verdict) else {
+                continue;
+            };
+            for &row in rows.iter() {
+                let d = sdata(arch, nr, denied_form(row).expect("a form"));
+                match decide(arch, &p, &d) {
+                    Decision::Deny { row: r, errno, key } => {
+                        assert_eq!(r, row, "{}", e.name);
+                        assert_eq!(Some(errno), row.errno());
+                        assert_eq!(key.row(), row);
+                    }
+                    other => panic!("{}: {other:?}", e.name),
+                }
+            }
+        }
+        let d = decide(arch, &p, &sdata(arch, 472, [0; 6]));
+        assert_eq!(d.errno(), libc::ENOSYS);
+        assert!(!d.fails_supervisor());
+        // A call the plain program allows (a forged notification): ENOSYS
+        // and failed, never allowed.
+        let allowed = decide(arch, &p, &sdata(arch, nums.socket, [1, 1, 0, 0, 0, 0]));
+        assert_eq!(allowed, Decision::Inconsistent { action: ALLOW });
+        assert_eq!(allowed.errno(), libc::ENOSYS);
+        assert!(allowed.fails_supervisor());
+        // A foreign architecture: the plain program kills.
+        let mut foreign = sdata(arch, nums.socket, [40, 0, 0, 0, 0, 0]);
+        foreign.arch = AUDIT_ARCH_I386;
+        assert_eq!(
+            decide(arch, &p, &foreign),
+            Decision::Inconsistent { action: KILL }
+        );
+        // The notifying program in the plain program's place: its returns
+        // carry no errno, so nothing it answers is consistent.
+        let notified = decide(arch, &n, &sdata(arch, nums.socket, [40, 0, 0, 0, 0, 0]));
+        assert_eq!(notified, Decision::Inconsistent { action: USER_NOTIF });
+        assert_eq!(notified.errno(), libc::ENOSYS);
+        // The other architecture's program for this architecture's call.
+        let wrong = match arch {
+            Arch::X86_64 => Arch::Aarch64,
+            Arch::Aarch64 => Arch::X86_64,
+        };
+        let d = decide(
+            arch,
+            &plain(wrong),
+            &sdata(arch, nums.socket, [40, 0, 0, 0, 0, 0]),
+        );
+        assert_eq!(d, Decision::Inconsistent { action: KILL });
+    }
+}
+
+fn keys_of_row(arch: Arch, row: Row) -> usize {
+    Key::all(arch).iter().filter(|k| k.row() == row).count()
+}
+
+#[test]
+fn key_space_is_bounded() {
+    let per_row = [
+        (Row::Ceiling, 41),
+        (Row::IoUring, 3),
+        (Row::BpfUserfaultfdPerf, 3),
+        (Row::Keyring, 3),
+        (Row::Syslog, 1),
+        (Row::NewUserNamespace, 2),
+        (Row::Clone3, 1),
+        (Row::SocketFamily, 43),
+        (Row::SockPacket, 1),
+        (Row::NetlinkProtocol, 32),
+        (Row::InetProtocol, 520),
+        (Row::Socketpair, 46),
+        (Row::HugetlbMmap, 1),
+        (Row::HugetlbShmget, 1),
+        (Row::HugetlbMemfd, 1),
+        (Row::LineDiscipline, 1),
+        (Row::ModuleIoctl, 8),
+        (Row::Ktls, 1),
+        (Row::TcpSignature, 3),
+        (Row::Bpfilter, 8),
+        (Row::FsCryptoIoctl, 3),
+    ];
+    // 10 + 41 + 2 + 1 + 43 + 1 + 32 + 520 + 46 + 3 + 1 + 8 + 3 + 1 + 3 + 8.
+    assert_eq!(per_row.iter().map(|(_, n)| n).sum::<usize>(), 723);
+    assert_eq!(KEY_SPACE, 723);
+    for arch in Arch::ALL {
+        let all = Key::all(arch);
+        assert_eq!(all.len(), KEY_SPACE, "{}", arch.name());
+        let set: BTreeSet<Key> = all.iter().copied().collect();
+        assert_eq!(set.len(), KEY_SPACE, "{}: duplicate keys", arch.name());
+        for (row, n) in per_row {
+            assert_eq!(keys_of_row(arch, row), n, "{}: {row:?}", arch.name());
+        }
+        assert_eq!(keys_of_row(arch, Row::ForeignArch), 0);
+        // Every call the plain program denies has a key, and it is one of
+        // the set: a sweep over every selector field.
+        let p = plain(arch);
+        let nums = numbers(arch);
+        let mut syscalls: Vec<u32> = nums.deny_eperm.to_vec();
+        syscalls.extend([
+            nums.clone,
+            nums.unshare,
+            nums.clone3,
+            nums.socket,
+            nums.socketpair,
+            nums.mmap,
+            nums.shmget,
+            nums.memfd_create,
+            nums.ioctl,
+            nums.setsockopt,
+            nums.getsockopt,
+            0,
+            39,
+            472,
+            511,
+            512,
+            0x4000_0001,
+            0xFFFF_FFFF,
+        ]);
+        let a0 = [
+            0,
+            1,
+            2,
+            10,
+            16,
+            40,
+            45,
+            46,
+            99,
+            0x1000_0000,
+            0xFFFF_FFFF,
+            (1 << 32) | 40,
+        ];
+        let a1 = [
+            0,
+            1,
+            6,
+            10,
+            0x80A,
+            41,
+            0x5423,
+            0x8940,
+            0x89a3,
+            0xc050_6617,
+            0x4080_6685,
+            282,
+        ];
+        let a2 = [0, 1, 12, 14, 32, 38, 58, 64, 67, 68, 132, 262, 263, 0o4000];
+        let a3 = [0, 0x4_0000];
+        let mut denied = 0usize;
+        let mut check = |nr: u32, args: [u64; 6]| {
+            let d = sdata(arch, nr, args);
+            let out = evaluate(p.instructions(), &d);
+            if out.action == ALLOW {
+                return;
+            }
+            denied += 1;
+            match decide(arch, &p, &d) {
+                Decision::Deny { key, .. } => {
+                    assert!(
+                        set.contains(&key),
+                        "{}: {key:?} not in the set",
+                        arch.name()
+                    )
+                }
+                other => panic!("{}: nr {nr} {args:?}: {other:?}", arch.name()),
+            }
+        };
+        for &nr in &syscalls {
+            for x0 in a0 {
+                for x1 in a1 {
+                    for x2 in a2 {
+                        for x3 in a3 {
+                            check(nr, [x0, x1, x2, x3, 0, 0]);
+                        }
+                    }
+                }
+            }
+        }
+        for family in (0..=50).chain([0xFFFF_FFFF]) {
+            for protocol in (0..=300).chain([0xFFFF_FFFF]) {
+                check(nums.socket, [family, 1, protocol, 0, 0, 0]);
+                check(nums.socketpair, [family, 1, protocol, 0, 0, 0]);
+            }
+        }
+        assert!(
+            denied > 10_000,
+            "{}: the sweep denied only {denied}",
+            arch.name()
+        );
+    }
+    // The record's memory bound: KEY_SPACE entries of this size.
+    let size = std::mem::size_of::<Denial>();
+    assert!(size <= 160, "a Denial is {size} bytes");
+    eprintln!(
+        "record bound: {KEY_SPACE} keys x {size} bytes = {} bytes",
+        KEY_SPACE * size
+    );
+}
+
+fn call(nr: u32, args: [u64; 6], ms: u64) -> Call {
+    Call {
+        since_spawn: Duration::from_millis(ms),
+        nr,
+        args,
+        errno: libc::EAFNOSUPPORT,
+        pid: Some(17),
+        comm: Some(*b"probe\0\0\0\0\0\0\0\0\0\0\0"),
+    }
+}
+
+fn key(arch: Arch, row: Row, nr: u32, args: [u64; 6]) -> Key {
+    Key::of(arch, row, &sdata(arch, nr, args)).expect("a key")
+}
+
+#[test]
+fn record_aggregates_by_key() {
+    let arch = Arch::X86_64;
+    let socket = X86_64.socket;
+    let vsock = [40, 1, 0, 0, 0, 0];
+    let mut r = Record::new();
+    let k = key(arch, Row::SocketFamily, socket, vsock);
+    assert!(!r.contains(&k));
+    r.note(k, call(socket, vsock, 1));
+    assert!(r.contains(&k));
+    // The same key with other raw values: counted, the first kept.
+    let vsock_dgram = [40, 2, 0, 0, 0, 0];
+    assert_eq!(key(arch, Row::SocketFamily, socket, vsock_dgram), k);
+    r.note(k, call(socket, vsock_dgram, 2));
+    let s = r.snapshot();
+    assert_eq!(s.entries().len(), 1);
+    assert_eq!(s.entries()[0].count, 2);
+    assert_eq!(s.entries()[0].first.call, call(socket, vsock, 1));
+    assert_eq!(s.entries()[0].first.seq, 0);
+    // A second key: a second entry, in first-seen order.
+    let alg = [38, 5, 0, 0, 0, 0];
+    let k2 = key(arch, Row::SocketFamily, socket, alg);
+    assert_ne!(k2, k);
+    r.note(k2, call(socket, alg, 3));
+    let s = r.snapshot();
+    assert_eq!(s.entries().len(), 2);
+    assert_eq!(s.entries()[1].key, k2);
+    assert_eq!(s.entries()[1].first.seq, 2);
+    // Every key of the space is recorded, the last one included.
+    let mut full = Record::new();
+    for (i, k) in Key::all(arch).into_iter().enumerate() {
+        full.note(k, call(0, [0; 6], i as u64));
+    }
+    let s = full.snapshot();
+    assert_eq!(s.entries().len(), KEY_SPACE);
+    let last = Key::all(arch)[KEY_SPACE - 1];
+    assert_eq!(s.entries()[KEY_SPACE - 1].key, last);
+    let seqs: Vec<u64> = s.entries().iter().map(|e| e.first.seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seq strictly increases"
+    );
+    // Unanswered calls and the first failure.
+    assert_eq!((s.unanswered(), s.failed()), (0, None));
+    full.note_unanswered();
+    full.fail(boneli_sys::seccomp::SupervisorFailure::Stopped);
+    full.fail(boneli_sys::seccomp::SupervisorFailure::Panicked);
+    let s = full.snapshot();
+    assert_eq!(s.unanswered(), 1);
+    assert_eq!(
+        s.failed(),
+        Some(&boneli_sys::seccomp::SupervisorFailure::Stopped)
+    );
+}
+
+#[test]
+fn ceiling_keys() {
+    let arch = Arch::X86_64;
+    let d = |nr: u32| sdata(arch, nr, [0; 6]);
+    assert_eq!(Key::of(arch, Row::Ceiling, &d(471)), None);
+    for nr in [472, 511] {
+        let k = Key::of(arch, Row::Ceiling, &d(nr)).expect("a key");
+        assert_eq!(k.selector(), Selector::Value(nr));
+    }
+    let others: Vec<Key> = [512, 0x4000_0001, 0xFFFF_FFFF]
+        .into_iter()
+        .map(|nr| Key::of(arch, Row::Ceiling, &d(nr)).expect("a key"))
+        .collect();
+    assert!(others.iter().all(|k| k.selector() == Selector::Other));
+    let mut r = Record::new();
+    r.note(others[0], call(512, [0; 6], 1));
+    r.note(others[1], call(0x4000_0001, [0; 6], 2));
+    r.note(others[2], call(0xFFFF_FFFF, [0; 6], 3));
+    let s = r.snapshot();
+    assert_eq!(s.entries().len(), 1);
+    assert_eq!(s.entries()[0].count, 3);
+    assert_eq!(
+        s.entries()[0].first.call.nr,
+        512,
+        "the first raw nr is kept"
+    );
+    assert_eq!(
+        describe_call(arch, Row::Ceiling, 0xFFFF_FFFF, &[0; 6]),
+        "syscall(nr=-1)"
+    );
+    assert_eq!(
+        describe_call(arch, Row::Ceiling, 0x4000_0001, &[0; 6]),
+        "syscall(nr=1073741825)"
+    );
+}
+
+#[test]
+fn decode_socket_forms() {
+    let arch = Arch::X86_64;
+    let n = &X86_64;
+    let sock = |args: [u64; 6]| describe_call(arch, Row::SocketFamily, n.socket, &args);
+    assert_eq!(
+        sock([40, 1, 0, 0, 0, 0]),
+        "socket(domain=AF_VSOCK, type=SOCK_STREAM, protocol=0)"
+    );
+    assert_eq!(
+        sock([99, 2, 0, 0, 0, 0]),
+        "socket(domain=99, type=SOCK_DGRAM, protocol=0)"
+    );
+    assert_eq!(
+        sock([0xFFFF_FFFF, 0x4_0001, 0, 0, 0, 0]),
+        "socket(domain=-1, type=SOCK_STREAM|0x40000, protocol=0)"
+    );
+    // A set high word: ignored as the kernel ignores it, raw value kept.
+    let high = [(1 << 32) | 40, 1, 0, 0, 0, 0];
+    assert_eq!(
+        sock(high),
+        "socket(domain=AF_VSOCK, type=SOCK_STREAM, protocol=0)"
+    );
+    let k = key(arch, Row::SocketFamily, n.socket, high);
+    assert_eq!(k.selector(), Selector::Value(40));
+    let mut r = Record::new();
+    r.note(k, call(n.socket, high, 0));
+    assert_eq!(r.snapshot().entries()[0].first.call.args[0], (1 << 32) | 40);
+    for (family, selector) in [
+        (45, Selector::Value(45)),
+        (46, Selector::Other),
+        (99, Selector::Other),
+        (0xFFFF_FFFF, Selector::Other),
+    ] {
+        let k = key(arch, Row::SocketFamily, n.socket, [family, 1, 0, 0, 0, 0]);
+        assert_eq!(k.selector(), selector, "family {family}");
+    }
+    assert_eq!(
+        describe_call(arch, Row::SockPacket, n.socket, &[2, 0x8_080A, 0, 0, 0, 0]),
+        "socket(domain=AF_INET, type=SOCK_PACKET|SOCK_NONBLOCK|SOCK_CLOEXEC, protocol=0)"
+    );
+    // IP protocols up to MPTCP have keys of their own.
+    let inet = |f: u64, p: u64| {
+        Key::of(
+            arch,
+            Row::InetProtocol,
+            &sdata(arch, n.socket, [f, 1, p, 0, 0, 0]),
+        )
+    };
+    assert_eq!(
+        inet(2, 262).map(|k| k.selector()),
+        Some(Selector::Pair(2, 262))
+    );
+    assert_eq!(
+        inet(2, 263).map(|k| k.selector()),
+        Some(Selector::OtherOf(2))
+    );
+    assert_eq!(
+        inet(10, 0xFFFF_FFFF).map(|k| k.selector()),
+        Some(Selector::OtherOf(10))
+    );
+    assert_eq!(inet(2, 6), None, "TCP is allowed");
+    assert_eq!(
+        inet(10, 1).map(|k| k.selector()),
+        Some(Selector::Pair(10, 1))
+    );
+    assert_eq!(
+        describe_call(arch, Row::InetProtocol, n.socket, &[10, 3, 132, 0, 0, 0]),
+        "socket(domain=AF_INET6, type=SOCK_RAW, protocol=132)"
+    );
+    // Netlink protocols 1 to 31, then one key.
+    let nl = |p: u64| {
+        Key::of(
+            arch,
+            Row::NetlinkProtocol,
+            &sdata(arch, n.socket, [16, 3, p, 0, 0, 0]),
+        )
+        .map(|k| k.selector())
+    };
+    assert_eq!(nl(0), None);
+    assert_eq!(nl(31), Some(Selector::Value(31)));
+    assert_eq!(nl(32), Some(Selector::Other));
+    assert_eq!(
+        describe_call(arch, Row::Socketpair, n.socketpair, &[2, 1, 0, 0, 0, 0]),
+        "socketpair(domain=AF_INET, type=SOCK_STREAM, protocol=0)"
+    );
+}
+
+#[test]
+fn decode_flag_args() {
+    let arch = Arch::X86_64;
+    let n = &X86_64;
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::NewUserNamespace,
+            n.clone,
+            &[0x1002_0004, 0, 0, 0, 0, 0]
+        ),
+        "clone(flags=CLONE_NEWUSER|CLONE_NEWNS|0x4)"
+    );
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::NewUserNamespace,
+            n.unshare,
+            &[0x5000_0000, 0, 0, 0, 0, 0]
+        ),
+        "unshare(flags=CLONE_NEWNET|CLONE_NEWUSER)"
+    );
+    // The high word is not the kernel's, but it is shown.
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::NewUserNamespace,
+            n.clone,
+            &[(1 << 40) | 0x1000_0000, 0, 0, 0, 0, 0]
+        ),
+        "clone(flags=CLONE_NEWUSER|0x10000000000)"
+    );
+    let mmap = |flags: u64| describe_call(arch, Row::HugetlbMmap, n.mmap, &[0, 0, 0, flags, 0, 0]);
+    assert_eq!(
+        mmap(0x4_0000 | (21 << 26) | 0x22),
+        "mmap(flags=MAP_HUGETLB|MAP_HUGE_2MB|0x22)"
+    );
+    assert_eq!(
+        mmap(0x4_0000 | (30 << 26)),
+        "mmap(flags=MAP_HUGETLB|MAP_HUGE_1GB)"
+    );
+    assert_eq!(mmap(0x4_0000), "mmap(flags=MAP_HUGETLB)");
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::HugetlbMemfd,
+            n.memfd_create,
+            &[0, 0x4 | 0x1, 0, 0, 0, 0]
+        ),
+        "memfd_create(flags=MFD_HUGETLB|0x1)"
+    );
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::HugetlbMemfd,
+            n.memfd_create,
+            &[0, 0x4 | (16 << 26), 0, 0, 0, 0]
+        ),
+        "memfd_create(flags=MFD_HUGETLB|MFD_HUGE_64KB)"
+    );
+    assert_eq!(
+        describe_call(
+            arch,
+            Row::HugetlbShmget,
+            n.shmget,
+            &[0, 0, 0o4000 | 0o1666, 0, 0, 0]
+        ),
+        "shmget(shmflg=SHM_HUGETLB|0x3b6)"
+    );
+}
+
+#[test]
+fn decode_sockopt_and_ioctl() {
+    let arch = Arch::X86_64;
+    let n = &X86_64;
+    let set = |row: Row, level: u64, opt: u64| {
+        describe_call(arch, row, n.setsockopt, &[3, level, opt, 0, 0, 0])
+    };
+    let get = |level: u64, opt: u64| {
+        describe_call(arch, Row::Bpfilter, n.getsockopt, &[3, level, opt, 0, 0, 0])
+    };
+    assert_eq!(
+        set(Row::Ktls, 282, 1),
+        "setsockopt(level=SOL_TLS, optname=TLS_TX)"
+    );
+    assert_eq!(
+        set(Row::Ktls, 282, 9),
+        "setsockopt(level=SOL_TLS, optname=9)"
+    );
+    assert_eq!(
+        set(Row::TcpSignature, 6, 38),
+        "setsockopt(level=SOL_TCP, optname=TCP_AO_ADD_KEY)"
+    );
+    assert_eq!(
+        set(Row::TcpSignature, 6, 14),
+        "setsockopt(level=SOL_TCP, optname=TCP_MD5SIG)"
+    );
+    assert_eq!(
+        set(Row::Bpfilter, 0, 64),
+        "setsockopt(level=SOL_IP, optname=BPFILTER_IPT_SO_SET_REPLACE)"
+    );
+    assert_eq!(
+        set(Row::Bpfilter, 0, 66),
+        "setsockopt(level=SOL_IP, optname=66)"
+    );
+    assert_eq!(
+        get(41, 67),
+        "getsockopt(level=SOL_IPV6, optname=IPV6_TCLASS)"
+    );
+    assert_eq!(
+        get(6, 65),
+        "getsockopt(level=SOL_TCP, optname=BPFILTER_IPT_SO_GET_ENTRIES)"
+    );
+    assert_eq!(
+        get(255, 67),
+        "getsockopt(level=255, optname=BPFILTER_IPT_SO_GET_REVISION_TARGET)"
+    );
+    // Bpfilter keys: the call and the option.
+    let k = key(arch, Row::Bpfilter, n.getsockopt, [3, 41, 67, 0, 0, 0]);
+    assert_eq!(k.selector(), Selector::Pair(n.getsockopt, 67));
+    assert_eq!(
+        Key::of(
+            arch,
+            Row::Bpfilter,
+            &sdata(arch, n.getsockopt, [3, 1, 67, 0, 0, 0])
+        ),
+        None,
+        "SOL_SOCKET is allowed"
+    );
+    let ioctls: [(u64, &str, Row); 12] = [
+        (0x5423, "TIOCSETD", Row::LineDiscipline),
+        (0x8940, "SIOCGIFBR", Row::ModuleIoctl),
+        (0x8941, "SIOCSIFBR", Row::ModuleIoctl),
+        (0x8982, "SIOCGIFVLAN", Row::ModuleIoctl),
+        (0x8983, "SIOCSIFVLAN", Row::ModuleIoctl),
+        (0x89a0, "SIOCBRADDBR", Row::ModuleIoctl),
+        (0x89a1, "SIOCBRDELBR", Row::ModuleIoctl),
+        (0x89a2, "SIOCBRADDIF", Row::ModuleIoctl),
+        (0x89a3, "SIOCBRDELIF", Row::ModuleIoctl),
+        (0xc050_6617, "FS_IOC_ADD_ENCRYPTION_KEY", Row::FsCryptoIoctl),
+        (
+            0x800c_6613,
+            "FS_IOC_SET_ENCRYPTION_POLICY",
+            Row::FsCryptoIoctl,
+        ),
+        (0x4080_6685, "FS_IOC_ENABLE_VERITY", Row::FsCryptoIoctl),
+    ];
+    let p = plain(arch);
+    for (cmd, name, row) in ioctls {
+        let args = [3, cmd, 0, 0, 0, 0];
+        assert_eq!(
+            describe_call(arch, row, n.ioctl, &args),
+            format!("ioctl(cmd={name})")
+        );
+        match decide(arch, &p, &sdata(arch, n.ioctl, args)) {
+            Decision::Deny { row: r, .. } => assert_eq!(r, row, "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        describe_call(arch, Row::ModuleIoctl, n.ioctl, &[3, 0x1234, 0, 0, 0, 0]),
+        "ioctl(cmd=0x1234)"
+    );
+}
+
+/// A status file of the dev host's form, with `name` (already escaped as
+/// the kernel escapes it), `pid` and the `NStgid` fields.
+fn status(name: &str, pid: u32, nstgid: &str) -> String {
+    format!(
+        "Name:\t{name}\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{pid}\nNgid:\t0\n\
+         Pid:\t{pid}\nPPid:\t1\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n\
+         Gid:\t1000\t1000\t1000\t1000\nFDSize:\t64\nGroups:\t1000 \n\
+         NStgid:\t{nstgid}\nNSpid:\t{nstgid}\nNSpgid:\t{nstgid}\nNSsid:\t{nstgid}\n\
+         Kthread:\t0\nVmPeak:\t  10000 kB\n"
+    )
+}
+
+fn comm16(b: &[u8]) -> [u8; 16] {
+    let mut c = [0u8; 16];
+    c[..b.len()].copy_from_slice(b);
+    c
+}
+
+#[test]
+fn parse_status_forms() {
+    let s = parse_status(status("probe", 4711, "4711\t17").as_bytes(), 4711);
+    assert_eq!(s.pid, Some(17));
+    assert_eq!(s.comm, Some(comm16(b"probe")));
+    // The runner's own namespace: one field.
+    assert_eq!(
+        parse_status(status("x", 4711, "4711").as_bytes(), 4711).pid,
+        Some(4711)
+    );
+    // Pid mismatch: a procfs of another namespace shows someone else.
+    let s = parse_status(status("probe", 4711, "4711\t17").as_bytes(), 4712);
+    assert_eq!((s.pid, s.comm), (None, None));
+    // No NStgid line (a kernel before 4.1).
+    let no_ns = status("probe", 4711, "4711\t17").replace("NStgid:", "Other:");
+    let s = parse_status(no_ns.as_bytes(), 4711);
+    assert_eq!((s.pid, s.comm), (None, Some(comm16(b"probe"))));
+    // A comm holding a newline and a forged field: escaped by the kernel,
+    // so it stays on its line.
+    let forged = status("x\\nNStgid:\t1", 4711, "4711\t17");
+    let s = parse_status(forged.as_bytes(), 4711);
+    assert_eq!(s.pid, Some(17));
+    assert_eq!(s.comm, Some(comm16(b"x\nNStgid:\t1")));
+    // A backslash, escaped; an unknown escape gives no comm; 15 bytes fit,
+    // 16 do not.
+    let s = parse_status(status("a\\\\b", 4711, "4711\t17").as_bytes(), 4711);
+    assert_eq!(s.comm, Some(comm16(b"a\\b")));
+    let s = parse_status(status("a\\tb", 4711, "4711\t17").as_bytes(), 4711);
+    assert_eq!((s.pid, s.comm), (Some(17), None));
+    let s = parse_status(status("fifteen-bytes-x", 4711, "4711\t17").as_bytes(), 4711);
+    assert_eq!(s.comm, Some(comm16(b"fifteen-bytes-x")));
+    let s = parse_status(
+        status("sixteen-bytes-xx", 4711, "4711\t17").as_bytes(),
+        4711,
+    );
+    assert_eq!(s.comm, None);
+    // Not a number.
+    let s = parse_status(status("p", 4711, "4711\t1x").as_bytes(), 4711);
+    assert_eq!(s.pid, None);
+    let s = parse_status(status("p", 4711, "4711\t").as_bytes(), 4711);
+    assert_eq!(s.pid, None);
+    // The bound: a long Groups line pushes NStgid's line end to exactly
+    // STATUS_MAX bytes (parsed) or one past it (unknown pid, the comm kept).
+    let base = status("probe", 4711, "4711\t17");
+    let cut = base.find("NSpid:").expect("NSpid");
+    for (extra, pid) in [(0usize, Some(17)), (1, None)] {
+        let pad = STATUS_MAX + extra - cut;
+        let groups = format!("Groups:\t1000 {}\n", "1".repeat(pad));
+        let long = base.replace("Groups:\t1000 \n", &groups);
+        // NStgid's newline is the byte before NSpid's line.
+        let end = long.find("NSpid:").expect("NSpid");
+        assert_eq!(end, STATUS_MAX + extra);
+        let s = parse_status(long.as_bytes(), 4711);
+        assert_eq!(s.pid, pid, "NStgid line ends at {end}");
+        assert_eq!(s.comm, Some(comm16(b"probe")));
+    }
+    assert_eq!(STATUS_MAX, 8192);
+}
+
+#[test]
+fn comm_rendering_escapes_hostile_bytes() {
+    assert_eq!(escape_comm(b"\n"), "\\x0a");
+    assert_eq!(escape_comm(b"\x1b[2J"), "\\x1b[2J");
+    // U+202E (right-to-left override) and U+200B (zero-width space).
+    assert_eq!(escape_comm("\u{202E}".as_bytes()), "\\xe2\\x80\\xae");
+    assert_eq!(escape_comm("\u{200B}".as_bytes()), "\\xe2\\x80\\x8b");
+    assert_eq!(escape_comm(b"\xff"), "\\xff");
+    assert_eq!(escape_comm(b"a\\b\"c"), "a\\x5cb\\x22c");
+    assert_eq!(escape_comm(b"\x7f\x00 ~"), "\\x7f\\x00 ~");
+    assert_eq!(escape_comm(b"printable-15-ch"), "printable-15-ch");
+    let all: Vec<u8> = (0..=255).collect();
+    let out = escape_comm(&all);
+    assert!(out.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{out}");
+    assert_eq!(comm_bytes(&comm16(b"probe")), b"probe");
+    assert_eq!(comm_bytes(&[b'x'; 16]), &[b'x'; 16]);
+}
+
+#[test]
+fn render_one_entry_per_row() {
+    let arch = Arch::X86_64;
+    let n = &X86_64;
+    // (row, nr) for the census form of each errno row.
+    let forms: [(Row, u32); 21] = [
+        (Row::Ceiling, 472),
+        (Row::IoUring, 425),
+        (Row::BpfUserfaultfdPerf, 321),
+        (Row::Keyring, 250),
+        (Row::Syslog, 103),
+        (Row::NewUserNamespace, n.clone),
+        (Row::Clone3, n.clone3),
+        (Row::SocketFamily, n.socket),
+        (Row::SockPacket, n.socket),
+        (Row::NetlinkProtocol, n.socket),
+        (Row::InetProtocol, n.socket),
+        (Row::Socketpair, n.socketpair),
+        (Row::HugetlbMmap, n.mmap),
+        (Row::HugetlbShmget, n.shmget),
+        (Row::HugetlbMemfd, n.memfd_create),
+        (Row::LineDiscipline, n.ioctl),
+        (Row::ModuleIoctl, n.ioctl),
+        (Row::Ktls, n.setsockopt),
+        (Row::TcpSignature, n.setsockopt),
+        (Row::Bpfilter, n.getsockopt),
+        (Row::FsCryptoIoctl, n.ioctl),
+    ];
+    let tail = ", first at +1.234s, pid 17, comm \"probe\"";
+    let golden: [&str; 21] = [
+        "syscall(nr=472) -> ENOSYS, row Ceiling, 1 call",
+        "io_uring_setup() -> EPERM, row IoUring, 1 call",
+        "bpf() -> EPERM, row BpfUserfaultfdPerf, 1 call",
+        "keyctl() -> EPERM, row Keyring, 1 call",
+        "syslog() -> EPERM, row Syslog, 1 call",
+        "clone(flags=CLONE_NEWUSER) -> EPERM, row NewUserNamespace, 1 call",
+        "clone3() -> ENOSYS, row Clone3, 1 call",
+        "socket(domain=AF_VSOCK, type=0x0, protocol=0) -> EAFNOSUPPORT, row SocketFamily, 1 call",
+        "socket(domain=AF_INET, type=SOCK_PACKET, protocol=0) -> EAFNOSUPPORT, row SockPacket, 1 call",
+        "socket(domain=AF_NETLINK, type=0x0, protocol=12) -> EPROTONOSUPPORT, row NetlinkProtocol, 1 call",
+        "socket(domain=AF_INET, type=SOCK_STREAM, protocol=132) -> EPROTONOSUPPORT, row InetProtocol, 1 call",
+        "socketpair(domain=AF_INET, type=0x0, protocol=0) -> EAFNOSUPPORT, row Socketpair, 1 call",
+        "mmap(flags=MAP_HUGETLB) -> EPERM, row HugetlbMmap, 1 call",
+        "shmget(shmflg=SHM_HUGETLB) -> EPERM, row HugetlbShmget, 1 call",
+        "memfd_create(flags=MFD_HUGETLB) -> EPERM, row HugetlbMemfd, 1 call",
+        "ioctl(cmd=TIOCSETD) -> EPERM, row LineDiscipline, 1 call",
+        "ioctl(cmd=SIOCGIFBR) -> EPERM, row ModuleIoctl, 1 call",
+        "setsockopt(level=SOL_TLS, optname=TLS_TX) -> ENOPROTOOPT, row Ktls, 1 call",
+        "setsockopt(level=SOL_TCP, optname=TCP_AO_ADD_KEY) -> ENOPROTOOPT, row TcpSignature, 1 call",
+        "getsockopt(level=SOL_IP, optname=BPFILTER_IPT_SO_GET_INFO) -> ENOPROTOOPT, row Bpfilter, 1 call",
+        "ioctl(cmd=FS_IOC_ADD_ENCRYPTION_KEY) -> EPERM, row FsCryptoIoctl, 1 call",
+    ];
+    let p = plain(arch);
+    let mut seen = BTreeSet::new();
+    for ((row, nr), want) in forms.into_iter().zip(golden) {
+        let args = denied_form(row).unwrap_or([0; 6]);
+        let Decision::Deny { row: r, errno, key } = decide(arch, &p, &sdata(arch, nr, args)) else {
+            panic!("{row:?} is not denied");
+        };
+        assert_eq!(r, row);
+        let mut rec = Record::new();
+        rec.note(
+            key,
+            Call {
+                since_spawn: Duration::from_millis(1234),
+                errno,
+                ..call(nr, args, 0)
+            },
+        );
+        let line = rec.snapshot().entries()[0].render(arch);
+        let mut expected = format!("{want}{tail}");
+        if row == Row::Clone3 {
+            expected.push_str(
+                "; libc falls back to clone, where the NewUserNamespace row sees the flags",
+            );
+        }
+        assert_eq!(line, expected, "{row:?}");
+        assert!(line.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{line}");
+        seen.insert(row);
+    }
+    assert_eq!(seen.len(), 21);
+    // Unknown pid and comm, a count above 1, a hostile comm.
+    let k = key(arch, Row::SocketFamily, n.socket, [40, 1, 0, 0, 0, 0]);
+    let mut rec = Record::new();
+    let first = Call {
+        pid: None,
+        comm: None,
+        ..call(n.socket, [40, 1, 0, 0, 0, 0], 5)
+    };
+    rec.note(k, first);
+    rec.note(k, first);
+    rec.note(k, first);
+    assert_eq!(
+        rec.snapshot().entries()[0].render(arch),
+        "socket(domain=AF_VSOCK, type=SOCK_STREAM, protocol=0) -> EAFNOSUPPORT, row SocketFamily, \
+         3 calls, first at +0.005s, pid ?, comm ?"
+    );
+    let mut rec = Record::new();
+    rec.note(
+        k,
+        Call {
+            comm: Some(comm16(b"a\n\x1b\"")),
+            ..call(n.socket, [40, 1, 0, 0, 0, 0], 61_000)
+        },
+    );
+    assert!(
+        rec.snapshot().entries()[0]
+            .render(arch)
+            .ends_with(", first at +61.000s, pid 17, comm \"a\\x0a\\x1b\\x22\""),
+    );
 }

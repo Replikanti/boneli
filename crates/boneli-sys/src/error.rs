@@ -175,6 +175,17 @@ pub enum Error {
     CapLastCap(String),
     /// The seccomp program could not be assembled (ADR-007, D2).
     SeccompProgram(crate::seccomp::AsmError),
+    /// The kernel's seccomp notification structs are smaller than the
+    /// ones this crate is built against (80, 24 and 64 bytes; ADR-043, D7):
+    /// the sizes `SECCOMP_GET_NOTIF_SIZES` reported.
+    NotifySizes {
+        /// The notification struct.
+        notif: u16,
+        /// The reply struct.
+        resp: u16,
+        /// `struct seccomp_data`.
+        data: u16,
+    },
     /// Landlock is not built into the kernel or not enabled (ADR-007, D10).
     LandlockUnavailable {
         /// The `errno` of `landlock_create_ruleset`.
@@ -353,6 +364,10 @@ impl fmt::Display for Error {
                 "cannot read /proc/sys/kernel/cap_last_cap to drop every capability: {why}"
             ),
             Error::SeccompProgram(e) => write!(f, "the seccomp program does not assemble: {e}"),
+            Error::NotifySizes { notif, resp, data } => write!(
+                f,
+                "the kernel's seccomp notification sizes {notif}/{resp}/{data} are below 80/24/64"
+            ),
             Error::LandlockUnavailable { errno } => {
                 write!(f, "Landlock is unavailable: {}", strerror(*errno))
             }
