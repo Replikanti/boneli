@@ -1741,7 +1741,7 @@
    "title": "boneli-sys: run the host tests on the Linux 6.1 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1750,7 +1750,7 @@
    "parked": null,
    "pr": null,
    "note": "plan approved at STOP 1 2026-11-28 (comment 7233860439); waits on #149 (floor 6.1), then implement",
-   "updated_at": "2026-11-28T15:48:30+00:00",
+   "updated_at": "2026-11-28T16:43:49+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1768,16 +1768,16 @@
    "title": "boneli-sys: raise the kernel floor from Linux 5.19 to 6.1",
    "epic": null,
    "order": 68,
-   "state": "pr-review",
-   "owner": "a0b0e5e8",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "done",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": 152,
    "note": "",
-   "updated_at": "2026-11-28T16:08:55+00:00",
+   "updated_at": "2026-11-28T16:43:47+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [],
@@ -1813,22 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-27T00:57:36+00:00",
-   "issue": 6,
-   "from": "claimed",
-   "to": "plan-review",
-   "by": "bc767b73",
-   "note": null
-  },
-  {
-   "at": "2026-11-27T01:21:20+00:00",
-   "issue": 6,
-   "from": "plan-review",
-   "to": "implementing",
-   "by": "bc767b73",
-   "note": null
-  },
   {
    "at": "2026-11-27T02:04:09+00:00",
    "issue": 6,
@@ -2212,6 +2196,22 @@
    "to": "pr-review",
    "by": "9c692a2a",
    "note": null
+  },
+  {
+   "at": "2026-11-28T16:43:47+00:00",
+   "issue": 149,
+   "from": "pr-review",
+   "to": "done",
+   "by": "a0b0e5e8",
+   "note": null
+  },
+  {
+   "at": "2026-11-28T16:43:49+00:00",
+   "issue": 144,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2236,11 +2236,10 @@
   49,
   69,
   144,
-  149,
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T16:30:15+00:00",
+ "updated_at": "2026-11-28T16:43:49+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
