@@ -259,8 +259,11 @@ fn program(name: &str, code: i32) -> Program {
 /// The programs of the sandbox fixture: `write` writes `out/result.txt`,
 /// `exit-3` exits 3, `plant` writes `/tmp/planted/result.txt` outside the
 /// workspace, `link` makes `out/result.txt` a symlink to it, `through`
-/// makes `out` a symlink to its directory, and `read` copies
-/// `out/result.txt` to `copied.txt`.
+/// makes `out` a symlink to its directory, `read` copies `out/result.txt`
+/// to `copied.txt`, `overwrite` writes `out/result.txt` again, `relative`
+/// links it to `../sentinel.txt`, which it writes, `print` prints
+/// `printed`, `serve` writes like `write` as a service, and `settle` does
+/// nothing, because a scripted service has written when `start` returns.
 pub fn sandbox_programs() -> Vec<Program> {
     vec![
         Program {
@@ -287,6 +290,33 @@ pub fn sandbox_programs() -> Vec<Program> {
             copies: vec![(format!("{WORKSPACE}/out/result.txt"), path("copied.txt"))],
             ..program("read", 0)
         },
+        Program {
+            writes: vec![(path("out/result.txt"), Write::File(b"overwritten".to_vec()))],
+            ..program("overwrite", 0)
+        },
+        Program {
+            writes: vec![
+                (path("sentinel.txt"), Write::File(b"outside".to_vec())),
+                (
+                    path("out/result.txt"),
+                    Write::Symlink(b"../sentinel.txt".to_vec()),
+                ),
+            ],
+            ..program("relative", 0)
+        },
+        Program {
+            result: ExecResult {
+                status: ExitStatus::Code(0),
+                stdout: b"printed".to_vec(),
+                stderr: vec![],
+            },
+            ..program("print", 0)
+        },
+        Program {
+            writes: vec![(path("out/result.txt"), Write::File(b"written".to_vec()))],
+            ..program("serve", 0)
+        },
+        program("settle", 0),
     ]
 }
 
@@ -330,6 +360,13 @@ pub fn workspace() -> contract::sandbox::Workspace<MemorySandbox> {
         dependency: path("out"),
         read: command("read"),
         copied: path("copied.txt"),
+        overwrite: command("overwrite"),
+        overwritten: b"overwritten".to_vec(),
+        relative: command("relative"),
+        print: command("print"),
+        printed: b"printed".to_vec(),
+        service: command("serve"),
+        settle: command("settle"),
     }
 }
 
@@ -976,6 +1013,35 @@ fn vacuous_fixtures_are_violations() {
     assert_eq!(
         clause(contract::sandbox::run(workspace, no_edit)),
         "export-round-trip"
+    );
+    let same_overwrite = || contract::sandbox::Workspace {
+        overwritten: b"written".to_vec(),
+        ..workspace()
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(same_overwrite, edit)),
+        "seal-prepare-only"
+    );
+    let silent = || contract::sandbox::Workspace {
+        printed: vec![],
+        ..workspace()
+    };
+    assert_eq!(clause(contract::sandbox::run(silent, edit)), "output-cap");
+    // Review run 1 of #147: a workspace that already holds the copy
+    // target would let an adapter pass without mounting the layer.
+    let preseeded = || {
+        let mut w = workspace();
+        let bytes = edit(
+            w.spec.workspace.as_bytes(),
+            &TreePath::from(&w.copied),
+            Some(&w.content),
+        );
+        w.spec.workspace = WorkspaceBytes::new(bytes);
+        w
+    };
+    assert_eq!(
+        clause(contract::sandbox::run(preseeded, edit)),
+        "sealed-layer-mounted"
     );
     let taken = || {
         let w = workspace();

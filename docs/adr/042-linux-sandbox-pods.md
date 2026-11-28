@@ -231,44 +231,74 @@ can be sealed. A layer is the one thing that travels from one sandbox
 into another, so with this rule nothing the agent wrote can become a
 layer the verify sandbox mounts (invariant 6).
 
-**The contract** grows from 7 to 18 clauses; each new one has its own
+**The contract** grows from 7 to 23 clauses; each new one has its own
 mutant in `boneli-replay-check`, and the mutant table stays a bijection
-(73 clauses, 90 mutant cases over all ports):
+(78 clauses, 95 mutant cases over all ports):
 
 | Clause | What it requires | Mutant |
 | --- | --- | --- |
-| `unknown-container` | an exec or start in a container the pod does not have is `Failed`; an exec in the second container runs there | `IgnoresContainer`: runs it in the first |
-| `limits-checked` | a two-container spec with 3 tasks, memory one byte below the storage sum, `cpu_millis` 9, a `tmp_bytes` of 0 or the user 4,294,967,295 is `Failed` | `UncheckedLimits`: creates with generous limits |
+| `unknown-container` | an exec or start in a container the pod does not have is `Failed`; an exec in the second container runs there, and a `write` there leaves the workspace as it was (`copy_out` `NotFound`, export unchanged) | `IgnoresContainer`: runs it in the first |
+| `limits-checked` | a two-container spec with 3 tasks, memory one byte below the storage sum, `cpu_millis` 9, a `tmp_bytes` of 0, the user 4,294,967,295, two containers of one name, two brokers of one name, or a broker socket that is relative or holds NUL is `Failed` | `UncheckedLimits`: creates with generous limits |
+| `output-cap` | output of exactly `output_bytes` is returned whole, one byte more is `Failed` | `TruncatesOutput`: cuts it and returns it |
+| `start-runs` | what a started service writes is in the workspace once the fixture's `settle` command returns | `StartIgnored`: runs nothing |
 | `export-round-trip` | a sandbox created from a workspace holds its file and exports that workspace byte for byte | `ExportEmpty` |
 | `export-sees-write` | after `write`, the export is the workspace with the file set | `ExportStale`: exports the workspace it was created from |
-| `copy-out-no-symlink` | `copy_out` through a symlink at the path or at a parent, each to a planted file outside the workspace, is `Failed` | `FollowsLinks` |
+| `copy-out-no-symlink` | `copy_out` through a symlink at the path or at a parent, each to a planted file outside the workspace, and through a link at the path with a relative target inside the workspace, is `Failed` | `FollowsLinks` |
 | `verify-without-brokers` | a `Verify` spec with a broker is `Failed`, an `Agent` spec with it is created | `VerifyKeepsBrokers`: creates it as `Agent` |
 | `seal-prepare-only` | sealing an `Agent` or `Verify` sandbox is `Failed`, a `Prepare` one is sealed | `SealsAnyPhase`: creates every sandbox as `Prepare` |
-| `sealed-layer-mounted` | a sandbox with the layer reads the sealed file | `DependencyNotMounted`: drops the dependencies |
+| `seal-no-symlink` | with a symlink at the sealed file or at the sealed directory, the seal is `Failed` or gives a layer whose file is not the planted one | `SealFollowsLinks`: copies the planted file in |
+| `sealed-layer-mounted` | a sandbox with the layer reads the sealed file, as it was at the seal, after the sealed sandbox wrote again and was destroyed; a sandbox without it reads nothing, and the copy target is empty before the read | `DependencyNotMounted`: drops the dependencies |
+| `dependency-read-only` | after a write beneath the mount in an `Agent` sandbox, that sandbox and a `Verify` sandbox with the same layer read the sealed content | `LayerWritable`: the write reaches the layer |
+| `export-without-mounts` | the export of a sandbox that mounts a layer is the workspace it was created from | `ExportsMounts`: walks into the mount |
 | `distinct-layers` | three seals give three handles, two of them of the same sandbox | `ReusesLayer` |
 | `released-layer-unknown` | after `release`, a spec naming the layer and a second release are `Failed` | `ReleaseIgnored`: reports success, keeps it |
 | `layer-in-use-kept` | `release` of a layer a live sandbox mounts is `Failed`, the sandbox still reads it, and after `destroy` it is released | `ReleasesInUse` |
 
-Three clauses are stronger: `isolated` and `fresh-after-destroy` also
-require the other sandbox's export to equal the workspace it was created
-from, so a write that leaked into another sandbox's export is caught and
-not only one that leaked into its `copy_out`; `destroyed-is-unknown`
-also covers `start`, `export` and `seal`.
+Three of ADR-004's clauses are stronger: `isolated` and
+`fresh-after-destroy` also require the other sandbox's export to equal
+the workspace it was created from, so a write that leaked into another
+sandbox's export is caught and not only one that leaked into its
+`copy_out`; `destroyed-is-unknown` also covers `start`, `export` and
+`seal`.
+
+Review of part 2 (run 1) showed broken adapters that passed the first
+version of 18 clauses; each now fails a clause, and six of them stay in
+the table as regression mutants: `KnownInFirst` (a known container's
+command runs in the first) fails `unknown-container`, `LimitsOnly` (an
+adapter that calls `PodLimits::check` and not `SandboxSpec::check`) fails
+`limits-checked`, `FollowsRelativeLinks` fails `copy-out-no-symlink`, and
+`LayerFollowsSource` (a layer that is a live view of its sandbox),
+`LayerDiesWithSource` (a layer that dies with it) and `MountsAll` (every
+layer in every sandbox) fail `sealed-layer-mounted`. A layer listed twice
+is no variant of `limits-checked`: it overlaps itself, so `create`
+refuses it by the overlap of the dependency paths as well, and no variant
+could tell the two checks apart. The wall limit has no clause yet: no
+in-memory program runs long, and part 5 adds the clause with the adapter
+that kills at `wall_ms` (D8).
 
 `copy-out-no-symlink` closes what ADR-004 (D11) left to #8. It requires
 `Failed`, not `NotFound`: an adapter cannot report a refused symlink as a
 missing file, and a fixture whose `link` command planted nothing fails
-the clause instead of passing it. The fixture brings what only the
-adapter's test knows: a second container, commands that plant a file
-outside the workspace, link to it at the path and at a parent, a broker,
-a dependency directory that the path lies beneath, and a command that
-copies the path out of a mounted layer to a path outside it (the real
-adapter's `copy_out` does not cross a mount, D5). Like the `Git` suite,
-`run` takes an `edit` hook over the adapter's snapshot format. Fixture
-guards turn the vacuous cases into violations: empty planted content, an
-`edit` that changes nothing, a second container whose name the spec
-already uses, a path not beneath the dependency and a copy target inside
-it.
+the clause instead of passing it. Its relative link points to a sentinel
+inside the workspace, which the container and the host resolve to the
+same bytes, so an adapter that follows links where the absolute targets
+do not resolve (on the host, as the runner user) shows too. A seal is
+not required to refuse every link: D6 carries links in a layer raw, so
+`seal-no-symlink` requires only that the planted file never reaches the
+layer. The fixture brings what only the adapter's test knows: a second
+container, commands that plant a file outside the workspace and link to
+it at the path and at a parent, one that links the path to a sentinel by
+a relative target, a broker, a dependency directory that the path lies
+beneath, a command that copies the path out of a mounted layer to a path
+outside it (the real adapter's `copy_out` does not cross a mount, D5), a
+command that writes other content over the path, one that prints known
+output, and a service with a command that waits until the service has
+written. Like the `Git` suite, `run` takes an `edit` hook over the
+adapter's snapshot format. Fixture guards turn the vacuous cases into
+violations: empty planted content, an `edit` that changes nothing, a
+second container whose name the spec already uses, a path not beneath
+the dependency, a copy target inside it, overwritten content equal to
+the content, and empty printed output.
 
 **The in-memory adapter.** `MemorySandbox` reads and writes the workspace
 in `MemoryGit`'s packed tree format. A scripted `Program` now writes
@@ -325,7 +355,7 @@ Rejected:
   the storage sum of D2 into `memory_bytes`; all pod storage is memory
   (D4, STOP 1 decision 1).
 - Until part 5 lands, the suite runs on `MemorySandbox` and the mutants
-  only; the real adapter must pass the same 18 clauses on the host.
+  only; the real adapter must pass the same 23 clauses on the host.
 - The in-memory adapter cannot export a symlink: its snapshot format
   holds files only. No clause exports one, and the real adapter carries
   symlinks raw (D5).

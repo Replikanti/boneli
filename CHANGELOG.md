@@ -1403,9 +1403,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PodLimits::check` hold the pod relations both adapters use (storage
   sum within `memory_bytes`, `n + 2` tasks, `cpu_millis` at least 10, no
   zero size, no broker in a verify sandbox); only a prepare sandbox can
-  be sealed. The contract suite grows from 7 to 18 clauses, with three
-  stronger ones and one mutant per new clause (73 clauses, 90 mutant
-  cases); `MemorySandbox` keeps files and symlinks, files outside the
+  be sealed. The contract suite grows from 7 to 23 clauses, with three
+  stronger ones and one mutant per new clause (78 clauses, 95 mutant
+  cases): read-only layers that outlive and do not follow the sandbox
+  they were sealed from, seals and copy-outs that follow no symlink (a
+  relative one included), the output cap, a running service, exports
+  without the mounts and commands that run in the container they name; `MemorySandbox` keeps files and symlinks, files outside the
   workspace and sealed layers, and checks the spec, the layers and the
   output cap.
 

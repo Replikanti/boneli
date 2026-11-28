@@ -1146,7 +1146,7 @@ pub mod sandbox {
     /// The clauses, in the order [`run`] checks them. The first seven are
     /// ADR-004's (D11); `isolated`, `fresh-after-destroy` and
     /// `destroyed-is-unknown` are stronger since ADR-042 (D2), which adds
-    /// the other eleven.
+    /// the other sixteen.
     pub const CLAUSES: &[&str] = &[
         "distinct-ids",
         "copy-out-after-write",
@@ -1157,12 +1157,17 @@ pub mod sandbox {
         "destroyed-is-unknown",
         "unknown-container",
         "limits-checked",
+        "output-cap",
+        "start-runs",
         "export-round-trip",
         "export-sees-write",
         "copy-out-no-symlink",
         "verify-without-brokers",
         "seal-prepare-only",
+        "seal-no-symlink",
         "sealed-layer-mounted",
+        "dependency-read-only",
+        "export-without-mounts",
         "distinct-layers",
         "released-layer-unknown",
         "layer-in-use-kept",
@@ -1223,8 +1228,33 @@ pub mod sandbox {
         /// A command that copies the file at [`Workspace::path`], which a
         /// mounted dependency provides, to [`Workspace::copied`].
         pub read: Command,
-        /// Where `read` copies to: not beneath `dependency`.
+        /// Where `read` copies to: not beneath `dependency`, and no file
+        /// there until `read` runs.
         pub copied: RelativePath,
+        /// A command that writes [`Workspace::overwritten`] to
+        /// [`Workspace::path`]: after a seal in the sandbox that was
+        /// sealed, and beneath the mount in one that mounts the layer.
+        pub overwrite: Command,
+        /// What `overwrite` writes; not empty and not
+        /// [`Workspace::content`], or a layer that took the write could not
+        /// be told from one that did not.
+        pub overwritten: Vec<u8>,
+        /// A command that makes [`Workspace::path`] a symlink with a
+        /// relative target to a file inside the workspace that it writes
+        /// with [`Workspace::outside`], so that the container and the host
+        /// resolve the link to the same bytes.
+        pub relative: Command,
+        /// A command whose standard output is [`Workspace::printed`].
+        pub print: Command,
+        /// What `print` prints; not empty.
+        pub printed: Vec<u8>,
+        /// A service: it writes [`Workspace::content`] to
+        /// [`Workspace::path`] and keeps running.
+        pub service: Command,
+        /// A command that exits once [`Workspace::path`] exists, within
+        /// [`Workspace::limits`]: the suite runs it after starting
+        /// `service`, so a service that writes late is not a failure.
+        pub settle: Command,
     }
 
     /// Checks every clause; each clause gets a fresh adapter from `make`.
@@ -1247,12 +1277,17 @@ pub mod sandbox {
         destroyed_is_unknown(&make())?;
         unknown_container(&make())?;
         limits_checked(&make())?;
+        output_cap(&make())?;
+        start_runs(&make())?;
         export_round_trip(&make(), &edit)?;
         export_sees_write(&make(), &edit)?;
         copy_out_no_symlink(&make())?;
         verify_without_brokers(&make())?;
         seal_prepare_only(&make())?;
+        seal_no_symlink(&make())?;
         sealed_layer_mounted(&make())?;
+        dependency_read_only(&make())?;
+        export_without_mounts(&make())?;
         distinct_layers(&make())?;
         released_layer_unknown(&make())?;
         layer_in_use_kept(&make())
@@ -1331,12 +1366,18 @@ pub mod sandbox {
             })
     }
 
-    /// A `Prepare` sandbox in which `write` ran, sealed into a layer.
+    /// A `Prepare` sandbox in which `write` ran, sealed into a layer. Then
+    /// `overwrite` runs in it and it is destroyed, as the prepare sandbox
+    /// is before the agent's: a layer is the snapshot at the seal, and it
+    /// outlives the sandbox it was sealed from.
     fn sealed<S: Sandbox>(w: &Workspace<S>, clause: &'static str) -> Result<LayerRef, Violation> {
         dependency_fixture(w, clause)?;
         let p = create_from(w, clause, &in_phase(w, Phase::Prepare))?;
         exec(w, clause, &p, &w.write)?;
-        seal(w, clause, &p)
+        let layer = seal(w, clause, &p)?;
+        exec(w, clause, &p, &w.overwrite)?;
+        destroy(w, clause, &p)?;
+        Ok(layer)
     }
 
     /// The fixture's spec with `layer` as its one dependency.
@@ -1365,9 +1406,21 @@ pub mod sandbox {
         })
     }
 
-    /// `path` lies beneath `dependency`, and `copied` does not: otherwise
-    /// the dependency clauses would test nothing.
+    /// `path` lies beneath `dependency`, `copied` does not, and
+    /// `overwritten` differs from `content`: otherwise the dependency
+    /// clauses would test nothing.
     fn dependency_fixture<S>(w: &Workspace<S>, clause: &'static str) -> Result<(), Violation> {
+        ensure(
+            !w.overwritten.is_empty() && w.overwritten != w.content,
+            PORT,
+            clause,
+            || {
+                String::from(
+                    "fixture: the overwritten content is empty or equals the content, so a \
+                     layer that took the write could not be told from one that did not",
+                )
+            },
+        )?;
         let beneath = |path: &RelativePath| {
             path.as_str()
                 .strip_prefix(w.dependency.as_str())
@@ -1421,12 +1474,21 @@ pub mod sandbox {
     }
 
     /// `read` ran in `id`, which mounts the sealed layer, and its copy
-    /// holds the content the layer was sealed with.
+    /// holds the content the layer was sealed with. `copied` has no file
+    /// before `read` runs, so a workspace that already held it cannot
+    /// pass for a mounted layer.
     fn expect_read<S: Sandbox>(
         w: &Workspace<S>,
         clause: &'static str,
         id: &SandboxId,
     ) -> Result<(), Violation> {
+        let before = w.adapter.copy_out(id, &w.copied);
+        ensure(before == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} from {id:?} before read gave {before:?}, expected NotFound",
+                w.copied
+            )
+        })?;
         exec(w, clause, id, &w.read)?;
         let got = w.adapter.copy_out(id, &w.copied);
         ensure(got.as_ref() == Ok(&w.content), PORT, clause, || {
@@ -1628,6 +1690,25 @@ pub mod sandbox {
                 w.exit.program, result.status, w.status
             )
         })?;
+        // The second container does not hold the workspace: a `write` run
+        // there leaves it as it was. An adapter that checked the name and
+        // then ran the command in the first container would hand the
+        // second image's program the workspace, the layers and the
+        // brokers.
+        let write = Command {
+            container: w.container.name.clone(),
+            ..w.write.clone()
+        };
+        exec(w, clause, &id, &write)?;
+        let got = w.adapter.copy_out(&id, &w.path);
+        ensure(got == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} after write in the second container gave {got:?}, expected \
+                 NotFound",
+                w.path
+            )
+        })?;
+        export_unchanged(w, clause, &id, "after a write in the second container")?;
         let unknown = (0u32..)
             .filter_map(|k| ContainerName::parse(&format!("contract-unknown-{k}")).ok())
             .find(|name| spec.containers.iter().all(|c| c.name != *name))
@@ -1657,7 +1738,12 @@ pub mod sandbox {
     /// Pod limits the core check refuses are refused by `create`, counted
     /// over every container: an adapter that skipped the check would set
     /// a tmpfs cap the OOM kill always beats, or a `pids.max` no exec can
-    /// start under (ADR-042, D2).
+    /// start under (ADR-042, D2). So is the rest of `SandboxSpec::check`:
+    /// two containers of one name, two brokers of one name, a broker
+    /// socket that is relative or holds NUL. A layer listed twice is not a
+    /// variant: it overlaps itself, so `create` refuses it by the overlap
+    /// of the dependency paths as well, and no variant could tell the two
+    /// checks apart.
     fn limits_checked<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "limits-checked";
         let spec = two_containers(w, clause)?;
@@ -1675,7 +1761,15 @@ pub mod sandbox {
                     String::from("fixture: the storage sizes overflow"),
                 )
             })?;
-        let variants: [(&str, SandboxSpec); 5] = [
+        let agent = SandboxSpec {
+            phase: Phase::Agent,
+            ..spec.clone()
+        };
+        let mut relative = w.broker.clone();
+        relative.socket = String::from(relative.socket.trim_start_matches('/'));
+        let mut nul = w.broker.clone();
+        nul.socket.push('\u{0}');
+        let variants: [(&str, SandboxSpec); 9] = [
             // 3 tasks are enough for one container, not for two.
             ("processes for one container only", {
                 let mut s = spec.clone();
@@ -1702,6 +1796,27 @@ pub mod sandbox {
                 s.user = u32::MAX;
                 s
             }),
+            // The rest of `SandboxSpec::check`, on specs whose limits fit.
+            ("two containers of one name", {
+                let mut s = spec.clone();
+                s.containers[1].name = s.containers[0].name.clone();
+                s
+            }),
+            ("two brokers of one name", {
+                let mut s = agent.clone();
+                s.brokers = vec![w.broker.clone(), w.broker.clone()];
+                s
+            }),
+            ("a broker socket at a relative path", {
+                let mut s = agent.clone();
+                s.brokers = vec![relative];
+                s
+            }),
+            ("a broker socket with NUL", {
+                let mut s = agent;
+                s.brokers = vec![nul];
+                s
+            }),
         ];
         for (what, variant) in variants {
             expect_failed(
@@ -1711,6 +1826,55 @@ pub mod sandbox {
             )?;
         }
         Ok(())
+    }
+
+    /// Output of exactly `output_bytes` is returned whole, one byte more
+    /// fails the exec: a cut transcript is never returned as a whole one.
+    fn output_cap<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "output-cap";
+        ensure(!w.printed.is_empty(), PORT, clause, || {
+            String::from("fixture: the printed output is empty, so no cap below it exists")
+        })?;
+        let n = u64::try_from(w.printed.len()).unwrap_or(u64::MAX);
+        let at = |output_bytes| Limits {
+            output_bytes,
+            ..w.limits
+        };
+        let id = create(w, clause)?;
+        let whole = w.adapter.exec(&id, &w.print, &at(n));
+        ensure(
+            whole.as_ref().map(|r| &r.stdout) == Ok(&w.printed),
+            PORT,
+            clause,
+            || format!("exec of print with output_bytes {n} gave {whole:?}, expected its output"),
+        )?;
+        expect_failed(
+            clause,
+            &format!("exec of print with output_bytes {}", n - 1),
+            w.adapter.exec(&id, &w.print, &at(n - 1)),
+        )
+    }
+
+    /// A started service runs: what it writes is in the workspace.
+    fn start_runs<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "start-runs";
+        let id = create(w, clause)?;
+        w.adapter.start(&id, &w.service).map_err(|error| {
+            violation(
+                PORT,
+                clause,
+                format!("start of {:?} failed: {error:?}", w.service.program),
+            )
+        })?;
+        exec(w, clause, &id, &w.settle)?;
+        let got = w.adapter.copy_out(&id, &w.path);
+        ensure(got.as_ref() == Ok(&w.content), PORT, clause, || {
+            format!(
+                "copy_out of {:?} after the service started gave {got:?}, expected {} bytes",
+                w.path,
+                w.content.len()
+            )
+        })
     }
 
     /// A sandbox exports the workspace it was created from, byte for byte,
@@ -1770,7 +1934,9 @@ pub mod sandbox {
 
     /// `copy_out` follows no symlink, neither at the path nor at a parent,
     /// and refuses it as `Failed` rather than `NotFound`, so a fixture
-    /// that planted nothing cannot pass (ADR-004, D11).
+    /// that planted nothing cannot pass (ADR-004, D11). The relative link
+    /// points inside the workspace, so an adapter that follows links where
+    /// the absolute targets do not resolve (on the host, say) still shows.
     fn copy_out_no_symlink<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "copy-out-no-symlink";
         ensure(!w.outside.is_empty(), PORT, clause, || {
@@ -1779,7 +1945,11 @@ pub mod sandbox {
                  could not be told from an empty file",
             )
         })?;
-        for (how, command) in [("at the path", &w.link), ("at a parent", &w.through)] {
+        for (how, command) in [
+            ("at the path", &w.link),
+            ("at a parent", &w.through),
+            ("with a relative target at the path", &w.relative),
+        ] {
             let id = create(w, clause)?;
             exec(w, clause, &id, &w.plant)?;
             exec(w, clause, &id, command)?;
@@ -1837,13 +2007,103 @@ pub mod sandbox {
         sealed(w, clause).map(|_| ())
     }
 
+    /// A seal follows no symlink: a sealed directory that is a link, or a
+    /// link in it, never brings the file behind it into the layer. The
+    /// adapter refuses the seal or carries the link as it is; either way a
+    /// sandbox that mounts the layer does not read the planted file. A
+    /// seal runs on the host as the runner user, so a followed link there
+    /// would seal host files into every later sandbox.
+    fn seal_no_symlink<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "seal-no-symlink";
+        dependency_fixture(w, clause)?;
+        for (how, command) in [("at the path", &w.link), ("at a parent", &w.through)] {
+            let p = create_from(w, clause, &in_phase(w, Phase::Prepare))?;
+            exec(w, clause, &p, &w.plant)?;
+            exec(w, clause, &p, command)?;
+            let layer = match w.adapter.seal(&p, core::slice::from_ref(&w.dependency)) {
+                Err(SandboxError::Failed { .. }) => continue,
+                Err(error) => {
+                    return Err(violation(
+                        PORT,
+                        clause,
+                        format!(
+                            "seal with a symlink {how} gave {error:?}, expected Failed or a layer"
+                        ),
+                    ));
+                }
+                Ok(layer) => layer,
+            };
+            let id = create_from(w, clause, &with_layer(w, &layer))?;
+            exec(w, clause, &id, &w.read)?;
+            let got = w.adapter.copy_out(&id, &w.copied);
+            ensure(got.as_ref() != Ok(&w.outside), PORT, clause, || {
+                format!(
+                    "a layer sealed with a symlink {how} holds the planted file: read gave \
+                     {got:?}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// A sealed layer is mounted in a sandbox that names it: its files are
-    /// there for a command to read.
+    /// there for a command to read, as they were at the seal, after the
+    /// sealed sandbox wrote again and was destroyed. A sandbox without the
+    /// layer reads nothing.
     fn sealed_layer_mounted<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
         let clause = "sealed-layer-mounted";
         let layer = sealed(w, clause)?;
+        let bare = create(w, clause)?;
+        exec(w, clause, &bare, &w.read)?;
+        let got = w.adapter.copy_out(&bare, &w.copied);
+        ensure(got == Err(SandboxError::NotFound), PORT, clause, || {
+            format!(
+                "copy_out of {:?} after read in a sandbox without the layer gave {got:?}, \
+                 expected NotFound",
+                w.copied
+            )
+        })?;
         let id = create_from(w, clause, &with_layer(w, &layer))?;
         expect_read(w, clause, &id)
+    }
+
+    /// A mounted layer is read-only: a write beneath the mount in one
+    /// sandbox changes neither that sandbox's view nor another's. A layer
+    /// is the one thing that travels between sandboxes, so a writable one
+    /// would carry the agent's bytes into the verify sandbox (invariant
+    /// 6).
+    fn dependency_read_only<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "dependency-read-only";
+        let layer = sealed(w, clause)?;
+        let mounting = |phase| SandboxSpec {
+            phase,
+            ..with_layer(w, &layer)
+        };
+        let agent = create_from(w, clause, &mounting(Phase::Agent))?;
+        // The write is refused; whether the command reports that is the
+        // command's business.
+        match w.adapter.exec(&agent, &w.overwrite, &w.limits) {
+            Ok(_) | Err(SandboxError::Failed { .. }) => {}
+            Err(error) => {
+                return Err(violation(
+                    PORT,
+                    clause,
+                    format!("exec of overwrite beneath the mount gave {error:?}"),
+                ));
+            }
+        }
+        expect_read(w, clause, &agent)?;
+        let verify = create_from(w, clause, &mounting(Phase::Verify))?;
+        expect_read(w, clause, &verify)
+    }
+
+    /// The export of a sandbox that mounts a layer is its own workspace,
+    /// without the layer: the agent's diff never carries the dependencies.
+    fn export_without_mounts<S: Sandbox>(w: &Workspace<S>) -> Result<(), Violation> {
+        let clause = "export-without-mounts";
+        let layer = sealed(w, clause)?;
+        let id = create_from(w, clause, &with_layer(w, &layer))?;
+        export_unchanged(w, clause, &id, "which mounts a layer")
     }
 
     /// Two seals give two handles, even of the same content: a reused
