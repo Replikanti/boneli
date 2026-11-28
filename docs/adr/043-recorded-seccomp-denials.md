@@ -408,7 +408,7 @@ larger structs work: the crate reads and writes only its own prefix
 | Number | Value | Where it comes from, and what breaks at another value |
 |---|---|---|
 | Program length | 104 | 88 (ADR-007 D2) − 5 shared returns + 21 row returns, measured by `program_shape`. A shared return would need a Rust map from argument values to rows instead (D2). |
-| Denied call cost | p50 0.19–0.43 µs plain, p50 8.4–10.2 µs and p99 12.7–16.4 µs notified | 3 runs × 20,000 calls with a minimal supervisor. About 9 µs per round trip. With the real supervisor (`notification_cost`, "Accept when"): p50 13.6–30.0 µs on the dev host, and the CI legs' numbers there. |
+| Denied call cost | p50 0.19–0.43 µs plain, p50 8.4–10.2 µs and p99 12.7–16.4 µs notified | 3 runs × 20,000 calls with a minimal supervisor. About 9 µs per round trip. With the real supervisor (`notification_cost`, "Accept when"): p50 13.6–30.0 µs on the dev host, 19.9 µs on CI x86_64 and 17.8 µs on CI arm64. |
 | Spawn cost | 706–777 µs plain, 694–726 µs notified (3 of 4 runs; 1,071 µs in one) | `posix_spawn` + `waitpid` of `/bin/true`; within noise, because one `clone3` notification per spawn costs about 9 µs against about 700 µs. |
 | Keys | 723 | D6's table. A larger table costs memory linearly; a smaller one would merge keys the agent needs apart (a family per key is what tells AF_VSOCK from AF_ALG). |
 | Record bound | 723 × 144 bytes = 104,112 bytes per sandbox | `size_of::<Denial>()` is 144 on x86_64 (printed by `key_space_is_bounded`, which fails above 160). A flood cannot grow it. |
@@ -502,14 +502,15 @@ numbers and boneli-oci's `node` and `postgres` records recorded here.
 
 Met on 2026-11-28 by part 2's PR. Every host test of boneli-sys, the
 unit tests with a seam included, is green on the dev host (Fedora 44,
-Linux 7.2.10 x86_64) and on both CI legs (Linux 7.0, x86_64 and arm64). Where each criterion is shown:
+Linux 7.2.10 x86_64) and on both CI legs (Linux 7.0, x86_64 and arm64, CI run 46097425588: 20 unit and 85
+integration host tests on each leg). Where each criterion is shown:
 
 | Criterion | Test |
 |---|---|
 | Same errno with and without the listener, every notifying row (AC2) | `notified_rows_answer_as_plain_filter`: every form of `seccomp_rows`, the eight module ioctls on a memfd, the twelve Bpfilter forms on a Unix socket, `TCP_MD5SIG_EXT` and three ceiling forms, under the plain program on the host and in a sandbox for inside ids 0 and 999; each form's key is in the record, and the forms cover all 21 notifying rows (SockPacket only where af_packet is there) |
 | The record names the call, its pid inside and its comm (AC1) | `record_names_the_inside_pid_and_comm`: a forked child's `socket(AF_ALG)`, pid 3 inside, comm `bnl-child` |
 | Every notification is answered (AC4) | `every_notification_is_answered`: 8 threads × 1,000 calls, all EAFNOSUPPORT, count 8,000, one Clone3 entry |
-| A lost supervisor leaves calls denied (AC4) | `stopped_supervisor_leaves_calls_denied`, `panicked_supervisor_leaves_calls_denied`, `inconsistent_notification_is_denied_and_fails` (unit tests with a seam, `src/seccomp/notify.rs`): the call it held or received and the next one get ENOSYS, `failed` says why; the held call returned 3 ms after the stop on the dev host (printed, not asserted) |
+| A lost supervisor leaves calls denied (AC4) | `stopped_supervisor_leaves_calls_denied`, `panicked_supervisor_leaves_calls_denied`, `inconsistent_notification_is_denied_and_fails` (unit tests with a seam, `src/seccomp/notify.rs`): the call it held or received and the next one get ENOSYS, `failed` says why; the held call returned 3 ms after the stop on the dev host and 4 ms on both CI legs (printed, not asserted) |
 | A killed caller is not a failure | `killed_caller_is_not_a_failure`: `unanswered` 1, `failed` none |
 | Signals | `signal_after_receive_keeps_the_errno`: the row's errno and the handler ran; `signal_before_receive_restarts_or_interrupts`: EINTR with no entry, or a restart with one (D4) |
 | The workload's filters never allow a call | `stacked_filters_never_allow`: EBUSY for a second listener, EACCES under its ERRNO filter, ENOSYS under its USER_NOTIF without a listener, neither recorded |
@@ -519,15 +520,19 @@ Linux 7.2.10 x86_64) and on both CI legs (Linux 7.0, x86_64 and arm64). Where ea
 
 `notification_cost` (20,000 denied `socket(AF_VSOCK)` calls, each timed
 in the probe; the supervisor's time on the CPU from its `schedstat`
-divided by the notifications; 3 runs each):
+divided by the notifications; 3 runs each on the dev host, one per CI
+leg):
 
 | Host | Build | Plain p50 / p99 | Notified p50 / p99 | Supervisor CPU per notification |
 |---|---|---|---|---|
 | dev host, `heavy.slice` | debug (as CI) | 0.24–0.62 / 0.49–1.26 µs | 13.6–30.0 / 24.6–141.6 µs | 8.9–20.1 µs |
 | dev host, `heavy.slice` | release | 0.37–0.50 / 0.59–0.88 µs | 14.6–18.1 / 25.7–45.5 µs | 7.9–11.1 µs |
+| CI `sandbox (x86_64)`, Linux 7.0 | debug | 0.39 / 0.46 µs | 19.9 / 30.4 µs | 11.4 µs |
+| CI `sandbox (arm64)`, Linux 7.0 | debug | 0.27 / 0.30 µs | 17.8 / 21.1 µs | 8.5 µs |
 
-So a denied call costs about 15 µs with the real supervisor against the
-planning harness's 9 µs: the supervisor polls, receives, evaluates the
+The CI rows are one run each (the `sandbox` job runs the test once). So
+a denied call costs about 15 to 20 µs with the real supervisor against
+the planning harness's 9 µs: the supervisor polls, receives, evaluates the
 plain program, takes the record's lock and replies, where the harness
 only received and replied. The spawn cost of D8 is unchanged in kind:
 one `clone3` notification per `posix_spawn` against about 700 µs.
