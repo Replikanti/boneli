@@ -1741,16 +1741,16 @@
    "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "plan-review",
-   "owner": "7a384e70",
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "state": "blocked",
+   "owner": null,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null,
    "pr": null,
-   "note": "",
-   "updated_at": "2026-11-28T04:16:04+00:00",
+   "note": "plan approved at STOP 1 2026-11-28 (comment 7233860439); waits on #149 (floor 6.1), then implement",
+   "updated_at": "2026-11-28T15:48:30+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1813,14 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-26T22:44:52+00:00",
-   "issue": 137,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #139 open"
-  },
   {
    "at": "2026-11-26T23:50:56+00:00",
    "issue": 137,
@@ -2212,6 +2204,14 @@
    "to": "implementing",
    "by": "a0b0e5e8",
    "note": null
+  },
+  {
+   "at": "2026-11-28T15:48:30+00:00",
+   "issue": 144,
+   "from": "plan-review",
+   "to": "blocked",
+   "by": "7a384e70",
+   "note": "plan approved at STOP 1 2026-11-28 (comment 7233860439); waits on #149 (floor 6.1), then implement"
   }
  ],
  "open": [
@@ -2240,7 +2240,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T15:30:36+00:00",
+ "updated_at": "2026-11-28T15:48:30+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
