@@ -401,11 +401,11 @@
    "title": "boneli-sandbox-linux: the Sandbox port on our own runtime, pods with a shared network namespace",
    "epic": 23,
    "order": 7,
-   "state": "plan-review",
+   "state": "implementing",
    "owner": "9c692a2a",
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-27T17:47:30+00:00",
+   "updated_at": "2026-11-28T00:03:38+00:00",
    "priority": "P1",
    "size": "large",
    "deps": [
@@ -1765,14 +1765,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T15:10:34+00:00",
-   "issue": 102,
-   "from": "implementing",
-   "to": "pr-review",
-   "by": "sync",
-   "note": "PR #134 open"
-  },
-  {
    "at": "2026-11-25T17:03:07+00:00",
    "issue": 102,
    "from": "pr-review",
@@ -2163,6 +2155,14 @@
    "to": "pr-review",
    "by": "909fb540",
    "note": null
+  },
+  {
+   "at": "2026-11-28T00:03:38+00:00",
+   "issue": 8,
+   "from": "plan-review",
+   "to": "implementing",
+   "by": "9c692a2a",
+   "note": null
   }
  ],
  "open": [
@@ -2191,7 +2191,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-27T23:52:23+00:00",
+ "updated_at": "2026-11-28T00:03:38+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
