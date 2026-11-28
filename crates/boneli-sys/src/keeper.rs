@@ -666,6 +666,54 @@ mod tests {
         assert!(within(|| keepers() == before));
     }
 
+    /// The real wait waits the time asked and not a period more (#143
+    /// review): the tests of [`run`] replace it with [`Fake`], so a
+    /// `Real::wait` that overslept (`wait_timeout(s, d * 2)`, or
+    /// `d + 9 * STATS_KEEPER_PERIOD`) passed them all. Of up to
+    /// [`REAL_WAITS`] one-period waits on a condition variable nobody
+    /// notifies, the quickest must end within 1.5 periods; the first that
+    /// does ends the test. Only that upper bound on the minimum is
+    /// asserted, and it holds on a loaded host: a spurious wakeup ends a
+    /// wait early and load ends it late, so neither makes the quickest
+    /// wait longer than an on-time one, and one wake on time is enough. A
+    /// lower bound would fail on a spurious wakeup.
+    ///
+    /// Not seen here: a wait that oversleeps on some calls only. `Real`
+    /// has no state and `wait` is one `wait_timeout` call, so that would
+    /// need new state in it, which a diff shows.
+    #[test]
+    fn real_wait_does_not_oversleep() {
+        let bound = STATS_KEEPER_PERIOD * 3 / 2;
+        let shared = Shared::default();
+        let mut s = shared.guard();
+        let mut quickest = Duration::MAX;
+        let mut waits = 0;
+        while waits < REAL_WAITS && quickest >= bound {
+            let at = Instant::now();
+            s = Real.wait(&shared.wake, s, STATS_KEEPER_PERIOD);
+            quickest = quickest.min(at.elapsed());
+            waits += 1;
+        }
+        drop(s);
+        assert!(
+            quickest < bound,
+            "the quickest of {waits} waits of {STATS_KEEPER_PERIOD:?} took {quickest:?}"
+        );
+    }
+
+    /// How many waits [`real_wait_does_not_oversleep`] may take to find
+    /// one on time. Measured with 28 CPU spinners in the test's scope
+    /// under `CPUQuota=300%` (#143): about a quarter of the waits end on
+    /// time (42-69 of 200 in 12 runs), but in some runs none of 20 does,
+    /// every wait taking about 98 ms, a whole CFS period, because the
+    /// scope ran for less than one keeper period in each; the quickest of
+    /// 20 failed 4 of 72 runs (96-99 ms in 3, 10 ms in 1). 200 waits that
+    /// all miss take at least 1 s (5 ms each) and, at about one CFS period
+    /// each when throttled, up to 20 s, so the test outlasts such a phase;
+    /// unloaded it ends after the first wait. Both review mutants never wake on time: `d * 2`
+    /// takes 10 ms per wait, `d + 9 * STATS_KEEPER_PERIOD` 50 ms.
+    const REAL_WAITS: usize = 200;
+
     /// How long every read takes on the fake clock.
     const READ: Duration = Duration::from_millis(1);
 
