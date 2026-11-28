@@ -1792,7 +1792,7 @@
    "title": "boneli-sys: destroy_lifts_cpu_throttle flakes with SetupTimeout under a loaded host",
    "epic": null,
    "order": 69,
-   "state": "claimed",
+   "state": "plan-review",
    "owner": "734ee990",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1801,7 +1801,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-28T15:30:06+00:00",
+   "updated_at": "2026-11-28T15:48:53+00:00",
    "priority": "P3",
    "size": "small",
    "deps": [],
@@ -1813,14 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-26T23:50:56+00:00",
-   "issue": 137,
-   "from": "pr-review",
-   "to": "done",
-   "by": "7e21b49c",
-   "note": null
-  },
   {
    "at": "2026-11-27T00:31:05+00:00",
    "issue": 6,
@@ -2212,6 +2204,14 @@
    "to": "blocked",
    "by": "7a384e70",
    "note": "plan approved at STOP 1 2026-11-28 (comment 7233860439); waits on #149 (floor 6.1), then implement"
+  },
+  {
+   "at": "2026-11-28T15:48:53+00:00",
+   "issue": 151,
+   "from": "claimed",
+   "to": "plan-review",
+   "by": "734ee990",
+   "note": null
   }
  ],
  "open": [
@@ -2240,7 +2240,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T15:48:30+00:00",
+ "updated_at": "2026-11-28T15:48:53+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
