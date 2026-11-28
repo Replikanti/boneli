@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use crate::cgroup::Cgroup;
 use crate::child::{self, Action, ChildPlan, ExecPlan, Fault};
-use crate::error::{Error, Result, errno};
+use crate::error::{Error, ListenerError, ProtocolError, Result, errno};
 use crate::ffi;
 use crate::ids::Ids;
 use crate::mount::{self, Op, Root};
 use crate::privileges::{self, PrivilegeDrop};
 use crate::report;
-use crate::seccomp::{Arch, Policy, Program};
+use crate::seccomp::notify::{Buffers, Listener, Seam, Supervisor, SupervisorPlan, kernel_sizes};
+use crate::seccomp::{Arch, Denials, Policy, Program};
 
 /// The three standard descriptors of the program. They are duplicated
 /// while spawning; the spec keeps owning them, so dropping the spec after
@@ -66,12 +67,16 @@ pub enum ExitStatus {
 }
 
 /// A running child, addressed by its pidfd so a recycled pid is never hit.
-/// Dropping a child that was not waited for kills and reaps it.
+/// Dropping a child that was not waited for kills and reaps it, then stops
+/// its seccomp supervisor.
 #[derive(Debug)]
 pub struct Child {
     pid: libc::pid_t,
     pidfd: OwnedFd,
     waited: bool,
+    /// The supervisor that answers and records the sandbox's denied calls
+    /// (ADR-043, D4); `None` for the host probe's children.
+    supervisor: Option<Supervisor>,
 }
 
 impl Child {
@@ -80,6 +85,30 @@ impl Child {
             pid: launched.pid,
             pidfd: launched.pidfd,
             waited: false,
+            supervisor: None,
+        }
+    }
+
+    /// The record of the calls the seccomp policy denied in the sandbox
+    /// (ADR-043, D6): a snapshot, complete once [`Child::wait`] returned.
+    /// [`Denials::failed`] is `Some` when the supervisor stopped answering
+    /// before the sandbox ended; the kernel then answered every later
+    /// denied call with ENOSYS, so the calls stayed denied but the record
+    /// misses them, and a caller that needs it complete treats that as a
+    /// failed run.
+    pub fn denials(&self) -> Denials {
+        self.supervisor
+            .as_ref()
+            .map(Supervisor::denials)
+            .unwrap_or_default()
+    }
+
+    /// Stops the supervisor while the sandbox may still run: the unit
+    /// tests' way to lose it.
+    #[cfg(test)]
+    pub(crate) fn stop_supervisor(&mut self) {
+        if let Some(s) = self.supervisor.as_mut() {
+            s.finish();
         }
     }
 
@@ -93,14 +122,19 @@ impl Child {
         self.pidfd.as_fd()
     }
 
-    /// Waits for the child to exit and reaps it. A second call is
-    /// [`Error::AlreadyWaited`].
+    /// Waits for the child to exit and reaps it, then stops and joins its
+    /// supervisor: once the child, the init of its PID namespace, is
+    /// reaped, no task is left that the filter could notify. A second call
+    /// is [`Error::AlreadyWaited`].
     pub fn wait(&mut self) -> Result<ExitStatus> {
         if self.waited {
             return Err(Error::AlreadyWaited);
         }
         let status = reap(&self.pidfd)?;
         self.waited = true;
+        if let Some(s) = self.supervisor.as_mut() {
+            s.finish();
+        }
         Ok(status)
     }
 
@@ -118,6 +152,10 @@ impl Drop for Child {
         if !self.waited {
             let _ = send_kill(&self.pidfd);
             let _ = reap(&self.pidfd);
+        }
+        // After the reap; the supervisor's own drop would do it too.
+        if let Some(s) = self.supervisor.as_mut() {
+            s.finish();
         }
     }
 }
@@ -223,7 +261,12 @@ struct Prepared {
     gid_line: Vec<u8>,
     stdio: [OwnedFd; 3],
     ops: Vec<Op>,
+    /// The notifying program the child installs (ADR-043, D2).
     filter: Program,
+    /// The plain program the supervisor answers from (ADR-043, D2).
+    plain: Program,
+    /// The supervisor's buffers in the kernel's sizes (ADR-043, D7).
+    buffers: Buffers,
     cap_last_cap: u32,
 }
 
@@ -238,9 +281,18 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
     check_caller(ruid, euid, rgid, egid)?;
     let ops = mount::plan(&spec.root)?;
     mount::refuse_hugetlbfs(&spec.root)?;
-    let filter = Policy::sandbox()
+    let policy = Policy::sandbox();
+    let filter = policy
+        .notifying_program(Arch::NATIVE)
+        .map_err(Error::SeccompProgram)?;
+    let plain = policy
         .program(Arch::NATIVE)
         .map_err(Error::SeccompProgram)?;
+    let sizes = kernel_sizes().map_err(|errno| Error::Sys {
+        call: "seccomp(SECCOMP_GET_NOTIF_SIZES)",
+        errno,
+    })?;
+    let buffers = Buffers::for_sizes(sizes)?;
     let cap_last_cap = privileges::cap_last_cap()?;
 
     let program = c_string(
@@ -285,6 +337,8 @@ fn prepare(spec: &Spec<'_>) -> Result<Prepared> {
         stdio,
         ops,
         filter,
+        plain,
+        buffers,
         cap_last_cap,
     })
 }
@@ -313,9 +367,112 @@ pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok((read, write))
 }
 
+/// The listener socket (ADR-043, D3): a Unix stream pair, both ends
+/// close-on-exec, `(parent, child)`; the child's end is moved to >= 3 for
+/// the same reason as the report pipe's write end.
+pub(crate) fn listener_socket() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds is a valid array of two ints for socketpair to fill.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(Error::last("socketpair"));
+    }
+    // SAFETY: socketpair succeeded, so fds[0] is open and owned by nobody
+    // else.
+    let parent = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: as above, for the child's end.
+    let child = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let child = dup_high(&child)?;
+    Ok((parent, child))
+}
+
+/// Receives the listener the child sent before `execve` (ADR-043, D3):
+/// exactly one byte and one `SCM_RIGHTS` message holding exactly one
+/// descriptor, without `MSG_CTRUNC`. The message is queued before the
+/// report pipe's EOF, so this never waits (`MSG_DONTWAIT`). Every
+/// descriptor that arrived is owned at once (close-on-exec through
+/// `MSG_CMSG_CLOEXEC`), so a malformed message leaks none.
+pub(crate) fn recv_listener(sock: &OwnedFd) -> std::result::Result<OwnedFd, ListenerError> {
+    let mut payload = [0u8; 2];
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: cmsghdr is plain integers (and private padding on musl), for
+    // which all zeroes is a valid value.
+    let mut control: ffi::FdMessage = unsafe { std::mem::zeroed() };
+    // SAFETY: msghdr is plain integers and pointers (and private padding on
+    // musl), for which all zeroes is a valid value.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = (&mut control as *mut ffi::FdMessage).cast();
+    msg.msg_controllen = std::mem::size_of::<ffi::FdMessage>() as _;
+    let n = loop {
+        // SAFETY: msg, iov, payload and control are valid for the call's
+        // duration and of the lengths msg names.
+        let n = unsafe {
+            libc::recvmsg(
+                sock.as_raw_fd(),
+                &mut msg,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        if n < 0 && errno() == libc::EINTR {
+            continue;
+        }
+        break n;
+    };
+    if n < 0 {
+        return Err(match errno() {
+            libc::EAGAIN => ListenerError::Missing,
+            e => ListenerError::Recv(e),
+        });
+    }
+    // The descriptors the kernel installed, owned before anything is
+    // judged: the first header's data, at most the two that fit.
+    let mut received: Vec<OwnedFd> = Vec::new();
+    let controllen = msg.msg_controllen as usize;
+    let cmsg_len = control.hdr.cmsg_len as usize;
+    if controllen >= ffi::CMSG_LEN_0
+        && control.hdr.cmsg_level == libc::SOL_SOCKET
+        && control.hdr.cmsg_type == libc::SCM_RIGHTS
+        && cmsg_len >= ffi::CMSG_LEN_0
+    {
+        let count = ((cmsg_len.min(controllen) - ffi::CMSG_LEN_0) / 4).min(control.fds.len());
+        for &fd in &control.fds[..count] {
+            if fd >= 0 {
+                // SAFETY: the kernel installed fd in this process for this
+                // message; nothing else knows it.
+                received.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    if n == 0 {
+        return Err(ListenerError::Missing);
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(ListenerError::Truncated);
+    }
+    if n != 1 {
+        return Err(ListenerError::Payload(n as usize));
+    }
+    if received.len() != 1 || cmsg_len != ffi::CMSG_LEN_1 || controllen != ffi::CMSG_SPACE_1 {
+        return Err(ListenerError::Descriptors(received.len()));
+    }
+    received.pop().ok_or(ListenerError::Descriptors(0))
+}
+
 /// Sets the calling thread's signal mask with the raw syscall, which also
 /// covers the signals glibc reserves; returns the previous mask.
-fn set_signal_mask(mask: u64) -> Result<u64> {
+pub(crate) fn set_signal_mask(mask: u64) -> Result<u64> {
     let mut old: u64 = 0;
     // SAFETY: both sets are valid kernel signal sets of the size passed.
     let rc = unsafe {
@@ -497,17 +654,20 @@ pub(crate) fn await_report(read: &OwnedFd, launched: &Launched, timeout: Duratio
 /// up (ADR-007, D7), a new session, default signal dispositions, an empty
 /// signal mask and only descriptors 0-2 (ADR-007, D4), without any
 /// capability, with `no_new_privs` and under the seccomp policy (ADR-007,
-/// D9 and D2). Returns once the program was exec'd.
+/// D9 and D2), whose errno rows a supervisor thread of this process
+/// answers and records ([`Child::denials`], ADR-043). Returns once the
+/// program was exec'd and the supervisor runs.
 ///
 /// Errors before the clone: [`Error::ZeroSetupTimeout`],
 /// [`Error::RelativeProgram`], [`Error::RunningAsRoot`],
 /// [`Error::SetuidCaller`], [`Error::Nul`], [`Error::InvalidEnvName`], and
 /// for the root [`Error::InvalidRoot`], [`Error::InvalidMount`],
-/// [`Error::MountOptionsTooLong`] and [`Error::HugetlbfsSource`], and
-/// [`Error::CapLastCap`].
+/// [`Error::MountOptionsTooLong`] and [`Error::HugetlbfsSource`],
+/// [`Error::CapLastCap`], and [`Error::NotifySizes`].
 /// After it: [`Error::Setup`] with the failed step, or
-/// [`Error::SetupTimeout`] and [`Error::Protocol`], after which the child
-/// was killed; in every error case it was reaped.
+/// [`Error::SetupTimeout`], [`Error::Protocol`] (also for a malformed
+/// listener message) and [`Error::Supervisor`], after which the child was
+/// killed; in every error case it was reaped.
 pub fn spawn(spec: &Spec<'_>) -> Result<Child> {
     let mut pid = 0;
     spawn_inner(spec, Fault::None, &mut pid)
@@ -516,8 +676,20 @@ pub fn spawn(spec: &Spec<'_>) -> Result<Child> {
 /// [`spawn`] with a fault for the unit tests; `pid` receives the cloned
 /// child's pid, so tests can check that it was reaped.
 pub(crate) fn spawn_inner(spec: &Spec<'_>, fault: Fault, pid: &mut libc::pid_t) -> Result<Child> {
+    spawn_with(spec, fault, Seam::None, pid)
+}
+
+/// [`spawn_inner`] with a supervisor seam for the unit tests.
+pub(crate) fn spawn_with(
+    spec: &Spec<'_>,
+    fault: Fault,
+    seam: Seam,
+    pid: &mut libc::pid_t,
+) -> Result<Child> {
+    let started = Instant::now();
     let prepared = prepare(spec)?;
     let (read, write) = report_pipe()?;
+    let (sock, sock_child) = listener_socket()?;
     let stdio: [RawFd; 3] = [
         prepared.stdio[0].as_raw_fd(),
         prepared.stdio[1].as_raw_fd(),
@@ -537,6 +709,7 @@ pub(crate) fn spawn_inner(spec: &Spec<'_>, fault: Fault, pid: &mut libc::pid_t) 
                 cap_last_cap: prepared.cap_last_cap,
                 filter: prepared.filter.instructions(),
             },
+            listener_sock: sock_child.as_raw_fd(),
         }),
         report_fd: write.as_raw_fd(),
         fault,
@@ -544,10 +717,34 @@ pub(crate) fn spawn_inner(spec: &Spec<'_>, fault: Fault, pid: &mut libc::pid_t) 
     let launched = launch(&plan)?;
     *pid = launched.pid;
     // The child holds the only other write end now; EOF comes at its exec
-    // or exit.
+    // or exit. Its end of the listener socket likewise.
     drop(write);
+    drop(sock_child);
     await_report(&read, &launched, spec.setup_timeout)?;
-    Ok(Child::from_launched(launched))
+    // The program runs now; from here every failure kills and reaps it.
+    let fail = |e: Error| {
+        let _ = send_kill(&launched.pidfd);
+        let _ = reap(&launched.pidfd);
+        Err(e)
+    };
+    let listener = match recv_listener(&sock) {
+        Ok(fd) => Listener::new(fd),
+        Err(e) => return fail(Error::Protocol(ProtocolError::Listener(e))),
+    };
+    drop(sock);
+    let plan = SupervisorPlan {
+        arch: Arch::NATIVE,
+        plain: prepared.plain,
+        buffers: prepared.buffers,
+        started,
+    };
+    let supervisor = match Supervisor::start(listener, plan, seam) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let mut child = Child::from_launched(launched);
+    child.supervisor = Some(supervisor);
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -661,6 +858,7 @@ mod tests {
                 cap_last_cap: 40,
                 filter: &[],
             },
+            listener_sock: 6,
         });
         let (flags, cgroup) = clone_flags(&exec);
         assert_eq!(
@@ -749,6 +947,97 @@ mod tests {
 
     #[test]
     #[ignore = "host: unprivileged user namespaces"]
+    fn listener_hand_off_fails_closed() {
+        let _host = crate::test_guard::host_lock();
+        let unit = crate::test_guard::UnitRoot::new();
+        crate::test_guard::cgroup_parent();
+        let listener = |e| Error::Protocol(ProtocolError::Listener(e));
+        let cases = [
+            (
+                Fault::Fail(Step::Listener),
+                Error::Setup {
+                    step: Step::Listener,
+                    index: 0,
+                    errno: libc::EIO,
+                },
+            ),
+            (Fault::NoListener, listener(ListenerError::Missing)),
+            (
+                Fault::ListenerWithoutFd,
+                listener(ListenerError::Descriptors(0)),
+            ),
+            (Fault::TwoListeners, listener(ListenerError::Descriptors(2))),
+            (Fault::EmptyListener, listener(ListenerError::Missing)),
+        ];
+        for (fault, want) in cases {
+            let before = open_fds();
+            let mut pid = 0;
+            let cg = crate::test_guard::sandbox_cgroup("hand-off");
+            let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root, &cg);
+            match spawn_inner(&s, fault, &mut pid) {
+                Err(got) => assert_eq!(got.to_string(), want.to_string(), "{fault:?}"),
+                Ok(_) => panic!("{fault:?}: spawned"),
+            }
+            drop(s);
+            cg.destroy().expect("destroy the cgroup");
+            assert!(pid > 0 && reaped(pid), "{fault:?}: child {pid} reaped");
+            assert_eq!(open_fds(), before, "{fault:?}: no descriptor leaked");
+        }
+    }
+
+    /// The runner's descriptors that are seccomp listeners, with their
+    /// descriptor flags.
+    fn listeners() -> Vec<(i32, i32)> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd").expect("list /proc/self/fd") {
+            let entry = entry.expect("an fd entry");
+            let link = std::fs::read_link(entry.path()).unwrap_or_default();
+            if link.as_os_str() == "anon_inode:seccomp notify" {
+                let fd: i32 = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse().ok())
+                    .expect("a number");
+                // SAFETY: F_GETFD reads the flags of a descriptor of this
+                // process; a closed one gives -1.
+                found.push((fd, unsafe { libc::fcntl(fd, libc::F_GETFD) }));
+            }
+        }
+        found
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
+    fn listener_is_close_on_exec_in_the_runner() {
+        let _host = crate::test_guard::host_lock();
+        let unit = crate::test_guard::UnitRoot::new();
+        let cg = crate::test_guard::sandbox_cgroup("cloexec");
+        assert_eq!(listeners(), Vec::new(), "no listener before the spawn");
+        let mut s = spec_on("/bin/sleep", Duration::from_secs(10), &unit.root, &cg);
+        s.args.push("30".into());
+        let mut child = spawn(&s).expect("spawn sleep");
+        // One listener, held by the supervisor, close-on-exec: a host
+        // process the runner starts later (git) does not inherit it.
+        let held = listeners();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].1 & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "{held:?}");
+        child.kill().expect("kill");
+        assert_eq!(
+            child.wait().expect("wait"),
+            ExitStatus::Signaled(libc::SIGKILL)
+        );
+        assert_eq!(
+            listeners(),
+            Vec::new(),
+            "the listener closes with the sandbox"
+        );
+        assert_eq!(child.denials().failed(), None);
+        drop(s);
+        cg.destroy().expect("destroy the cgroup");
+    }
+
+    #[test]
+    #[ignore = "host: unprivileged user namespaces"]
     fn setup_timeout_kills_hung_child() {
         let _host = crate::test_guard::host_lock();
         let unit = crate::test_guard::UnitRoot::new();
@@ -781,15 +1070,29 @@ mod tests {
         let cg = crate::test_guard::sandbox_cgroup("alloc");
         let s = spec_on("/bin/true", Duration::from_secs(10), &unit.root, &cg);
         let mut pid = 0;
-        // The guard ends the child before it reaches exec or writes a
-        // report; the parent cannot tell that EOF from an exec, so the
-        // exit code is what shows it.
+        // At the last step, after the listener hand-off: the guard ends the
+        // child before it reaches exec or writes a report; the parent
+        // cannot tell that EOF from an exec, so the exit code is what shows
+        // it.
         let mut child =
-            spawn_inner(&s, Fault::Allocate(Step::Setsid), &mut pid).expect("EOF without a report");
+            spawn_inner(&s, Fault::Allocate(Step::Exec), &mut pid).expect("EOF without a report");
         assert_eq!(
             child.wait().expect("wait"),
             ExitStatus::Exited(crate::test_guard::EXIT_ALLOCATED)
         );
+        // Before the hand-off the same EOF comes without a listener, and
+        // the spawn fails closed (ADR-043, D3).
+        let result = spawn_inner(&s, Fault::Allocate(Step::Setsid), &mut pid);
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(ProtocolError::Listener(
+                    ListenerError::Missing
+                )))
+            ),
+            "{result:?}"
+        );
+        assert!(reaped(pid), "child {pid} reaped");
     }
 
     static HANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

@@ -117,6 +117,7 @@ fn apparmor_profile_is_narrow() {
         },
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        denials: Default::default(),
     });
     p.assert_ok();
     assert!(

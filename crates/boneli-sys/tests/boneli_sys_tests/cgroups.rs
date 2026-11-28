@@ -659,6 +659,7 @@ fn buffered_writer_run(fixture: &Fixture, cg: &Cgroup, size: u64) -> BufferedRun
                 status,
                 stdout,
                 stderr,
+                denials: Default::default(),
             }),
             keeper_before,
             keeper_at_loop_end,
@@ -1443,6 +1444,7 @@ fn buffered_failure_messages() {
                  BONELI_PROBE progress=48:12:470\n"
             .to_string(),
         stderr: String::new(),
+        denials: Default::default(),
     });
     let before = f(None).keeper_before;
     let mut oom = buffered_facts(
@@ -3573,6 +3575,7 @@ fn oom_score_adj_never_lowered() {
         },
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        denials: Default::default(),
     });
     p.assert_ok();
     assert_eq!(p.get("inside"), "500", "{}", p.raw);

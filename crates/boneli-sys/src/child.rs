@@ -42,11 +42,13 @@ pub enum Step {
     CloseFds = 7,
     /// `execve` of the program.
     Exec = 8,
-    /// The seccomp filter, the last step before `Exec`: in `spawn` the
-    /// policy of ADR-007 D2 (item 0, after [`Step::NoNewPrivs`], D9); in the
-    /// host probe's filter child `PR_SET_NO_NEW_PRIVS` (item 0) and an
+    /// The seccomp filter, the last step but the listener hand-off before
+    /// `Exec`: in `spawn` the notifying program of ADR-043 D2 with a
+    /// listener (item 0, after [`Step::NoNewPrivs`], ADR-007 D9); in the
+    /// host probe's filter child `PR_SET_NO_NEW_PRIVS` (item 0), an
     /// allow-all filter (item 1), which prove the kernel installs filters
-    /// at all (D3).
+    /// at all (ADR-007 D3), and the same filter with the notifying
+    /// program's flags (item 2, ADR-043 D7).
     Seccomp = 9,
     /// `unshare(CLONE_NEWCGROUP)`: the cgroup namespace, created in the
     /// child and not by `clone3` (ADR-007, D7).
@@ -100,11 +102,15 @@ pub enum Step {
     /// keyring, so the program holds no reference to the runner's (ADR-007,
     /// D2).
     SessionKeyring = 29,
+    /// The notifying filter's listener sent to the parent over the
+    /// listener socket and closed (ADR-043, D3); item 0 the send, item 1
+    /// the close.
+    Listener = 30,
 }
 
 impl Step {
     /// Every step, by code.
-    pub const ALL: [Step; 29] = [
+    pub const ALL: [Step; 30] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -134,11 +140,12 @@ impl Step {
         Step::Capset,
         Step::NoNewPrivs,
         Step::SessionKeyring,
+        Step::Listener,
     ];
 
     /// The steps of `spawn` in the order the child runs them.
     /// [`Step::MountTarget`] precedes each mount.
-    pub const SEQUENCE: [Step; 29] = [
+    pub const SEQUENCE: [Step; 30] = [
         Step::SetGroups,
         Step::GidMap,
         Step::UidMap,
@@ -167,6 +174,7 @@ impl Step {
         Step::Capset,
         Step::NoNewPrivs,
         Step::Seccomp,
+        Step::Listener,
         Step::Exec,
     ];
 
@@ -212,6 +220,7 @@ impl Step {
             Step::Capset => "capset",
             Step::NoNewPrivs => "no-new-privs",
             Step::SessionKeyring => "session-keyring",
+            Step::Listener => "listener",
         }
     }
 }
@@ -233,6 +242,10 @@ pub(crate) struct ExecPlan<'a> {
     pub cgroup: c_int,
     /// The privilege drop and the seccomp filter (ADR-007, D9 and D2).
     pub privileges: PrivilegeDrop<'a>,
+    /// The child's end of the listener socket (close-on-exec, >= 3): the
+    /// notifying filter's listener goes to the parent through it
+    /// (ADR-043, D3).
+    pub listener_sock: c_int,
 }
 
 /// What the child does.
@@ -282,6 +295,14 @@ pub(crate) enum Fault {
     Hang(Step),
     /// The child allocates at the step (the allocation guard ends it).
     Allocate(Step),
+    /// The child sends no listener message.
+    NoListener,
+    /// The listener message carries no descriptor.
+    ListenerWithoutFd,
+    /// The listener message carries the listener twice.
+    TwoListeners,
+    /// The listener message has no payload byte.
+    EmptyListener,
 }
 
 /// Without tests there is nothing to inject.
@@ -376,7 +397,8 @@ fn write_proc(path: &CStr, data: &[u8], step: Step) -> Result<(), Failure> {
 
 /// `PR_SET_NO_NEW_PRIVS`, then a one-instruction filter that allows every
 /// syscall: a kernel with `CONFIG_SECCOMP` but without
-/// `CONFIG_SECCOMP_FILTER` knows the action values but refuses this.
+/// `CONFIG_SECCOMP_FILTER` knows the action values but refuses this. Then
+/// the same filter once more with the notifying filter's flags (item 2).
 fn allow_all_filter() -> Result<(), Failure> {
     // SAFETY: PR_SET_NO_NEW_PRIVS takes plain integers.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
@@ -404,6 +426,97 @@ fn allow_all_filter() -> Result<(), Failure> {
     };
     if rc < 0 {
         return Err(fail(Step::Seccomp, 1, errno()));
+    }
+    // The same filter with a listener and the wait-killable receive
+    // (ADR-043, D7): EINVAL on a kernel below 5.19, EBUSY where this
+    // process already sits under a filter with a listener. No call is
+    // ever notified; the listener is closed at once.
+    // SAFETY: as above.
+    let listener = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            crate::seccomp::notify::LISTENER_FLAGS,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if listener < 0 {
+        return Err(fail(Step::Seccomp, 2, errno()));
+    }
+    // SAFETY: the install returned a new descriptor that only this
+    // function uses.
+    unsafe { libc::close(listener as c_int) };
+    Ok(())
+}
+
+/// The payload length and the descriptor count of the listener message:
+/// one byte and the listener (ADR-043, D3); the fault tests change both.
+#[cfg(test)]
+fn listener_message(fault: Fault) -> Option<(usize, usize)> {
+    match fault {
+        Fault::NoListener => None,
+        Fault::ListenerWithoutFd => Some((1, 0)),
+        Fault::TwoListeners => Some((1, 2)),
+        Fault::EmptyListener => Some((0, 1)),
+        _ => Some((1, 1)),
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn listener_message(_fault: Fault) -> Option<(usize, usize)> {
+    Some((1, 1))
+}
+
+/// The step [`Step::Listener`]: sends `listener` to the parent as one byte
+/// with one `SCM_RIGHTS` descriptor, from stack memory, then closes it, so
+/// the program never holds it (it is close-on-exec as well, 5.19 `:1876`).
+fn send_listener(sock: c_int, listener: c_int, fault: Fault) -> Result<(), Failure> {
+    let step = Step::Listener;
+    if let Some((len, count)) = listener_message(fault) {
+        let byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_ptr().cast_mut().cast(),
+            iov_len: len,
+        };
+        // SAFETY: cmsghdr is plain integers (and private padding on musl),
+        // for which all zeroes is a valid value.
+        let mut control: ffi::FdMessage = unsafe { std::mem::zeroed() };
+        control.hdr.cmsg_level = libc::SOL_SOCKET;
+        control.hdr.cmsg_type = libc::SCM_RIGHTS;
+        control.hdr.cmsg_len = (ffi::CMSG_LEN_0 + 4 * count) as _;
+        control.fds = [listener; 2];
+        // SAFETY: msghdr is plain integers and pointers (and private
+        // padding on musl), for which all zeroes is a valid value.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if count > 0 {
+            msg.msg_control = (&mut control as *mut ffi::FdMessage).cast();
+            // CMSG_SPACE of the data: 24 bytes for one or two descriptors.
+            msg.msg_controllen = (ffi::CMSG_LEN_0 + 4 * count).next_multiple_of(8) as _;
+        }
+        let sent = loop {
+            // SAFETY: msg, iov, byte and control are valid for the call's
+            // duration; MSG_NOSIGNAL keeps a closed peer from raising
+            // SIGPIPE, which has its default disposition by now.
+            let n = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+            if n < 0 && errno() == libc::EINTR {
+                continue;
+            }
+            break n;
+        };
+        if sent < 0 {
+            return Err(fail(step, 0, errno()));
+        }
+        if sent as usize != len {
+            return Err(fail(step, 0, libc::EIO));
+        }
+    }
+    // SAFETY: listener is the descriptor the filter install returned, which
+    // only this function uses.
+    if unsafe { libc::close(listener) } < 0 && errno() != libc::EINTR {
+        return Err(fail(step, 1, errno()));
     }
     Ok(())
 }
@@ -620,8 +733,12 @@ fn steps(plan: &ChildPlan<'_>) -> Result<(), Failure> {
     }
 
     // Capabilities, no_new_privs and the seccomp filter last, so that only
-    // execve runs under the filter before the program (ADR-007, D9).
-    privileges::drop_all(&exec.privileges, fault)?;
+    // the listener hand-off and execve run under the filter before the
+    // program (ADR-007 D9, ADR-043 D3).
+    let listener = privileges::drop_all(&exec.privileges, fault)?;
+
+    inject(fault, Step::Listener)?;
+    send_listener(exec.listener_sock, listener, fault)?;
 
     inject(fault, Step::Exec)?;
     // SAFETY: program is NUL-terminated and argv and envp are
@@ -686,14 +803,15 @@ mod tests {
         }
         assert_eq!(Step::from_code(0), None);
         assert_eq!(Step::from_code(Step::ALL.len() as u32 + 1), None);
-        // The sequence holds every step once; the filter is the last step
-        // before the exec, after no_new_privs (ADR-007, D9).
+        // The sequence holds every step once; the filter comes after
+        // no_new_privs (ADR-007, D9), and only the listener hand-off sits
+        // between it and the exec (ADR-043, D3); the listener's code is 30.
         let mut seen: Vec<Step> = Step::SEQUENCE.to_vec();
         seen.sort_by_key(|s| s.code());
         assert_eq!(seen, Step::ALL);
         let n = Step::SEQUENCE.len();
         assert_eq!(
-            Step::SEQUENCE[n - 8..],
+            Step::SEQUENCE[n - 9..],
             [
                 Step::CloseFds,
                 Step::Securebits,
@@ -702,9 +820,12 @@ mod tests {
                 Step::Capset,
                 Step::NoNewPrivs,
                 Step::Seccomp,
+                Step::Listener,
                 Step::Exec
             ]
         );
+        assert_eq!(Step::Listener.code(), 30);
+        assert_eq!(Step::Listener.name(), "listener");
         assert_eq!(Step::from_code(9999), None);
     }
 }

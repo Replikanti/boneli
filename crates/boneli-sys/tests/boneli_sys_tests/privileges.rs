@@ -157,6 +157,7 @@ fn runner_keyring_hidden_in_own_thread() {
         status: boneli_sys::ExitStatus::Exited(out.status.code().unwrap_or(-1)),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        denials: Default::default(),
     });
     p.assert_ok();
     assert_eq!(p.get("keys_lists_serial"), "1", "{}", p.raw);
@@ -220,6 +221,7 @@ fn runner_keyring_hidden_in_own_thread() {
             status,
             stdout,
             stderr,
+            denials: child.denials(),
         });
         p.assert_ok();
         // Both files are masked: empty, so neither the runner's keys nor

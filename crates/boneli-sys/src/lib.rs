@@ -11,7 +11,9 @@
 //! statistics fresh, so that a buffered writer is slowed rather than
 //! OOM-killed ([`STATS_KEEPER_PERIOD`], ADR-007 D8), without any
 //! capability, with `no_new_privs` and under a seccomp-bpf policy it
-//! assembles itself ([`seccomp`], ADR-007 D2 and D9). It applies Landlock
+//! assembles itself ([`seccomp`], ADR-007 D2 and D9), whose denied calls a
+//! supervisor thread of the caller answers and records
+//! ([`Child::denials`], ADR-043). It applies Landlock
 //! to the calling process ([`Ruleset`], ADR-007 D10), and it checks that a
 //! host has what the runtime needs ([`Features::probe`], ADR-007 D3). For
 //! tests that need a process whose main thread has exited while another
@@ -49,8 +51,8 @@ pub use cgroup::{
     Cgroup, CpuMax, DeviceNumber, IoLimits, IoMax, Limits, Parent, block_device_of, leaked_cgroups,
 };
 pub use child::Step;
-pub use error::{Error, ProtocolError, Result};
-pub use host::{Features, Missing, MissingId};
+pub use error::{Error, ListenerError, ProtocolError, Result};
+pub use host::{Features, Missing, MissingId, NotifyGap};
 pub use ids::Ids;
 pub use keeper::{KeeperReport, STATS_KEEPER_PERIOD};
 pub use landlock::{ABI_KNOWN, ABI_REQUIRED, Abi, AccessFs, AccessNet, Ruleset, Scope};

@@ -102,6 +102,9 @@ pub fn wait_for_child(bound: std::time::Duration) -> i32 {
     }
 }
 
+/// Where [`UnitRoot::with_probe`] binds this test binary.
+pub const UNIT_PROBE: &str = "/probe";
+
 /// A sandbox root for the unit tests, with one mount of every kind so that
 /// a fault at any step is reached; removed on drop. It lives next to the
 /// test binary (on the target directory's file system), because overlay
@@ -182,6 +185,25 @@ impl UnitRoot {
             cwd: InsidePath::root(),
         };
         UnitRoot { dir, root }
+    }
+
+    /// [`UnitRoot::new`] with this test binary bound read-only at
+    /// [`UNIT_PROBE`], so a test can run it in the sandbox as a probe.
+    pub fn with_probe() -> UnitRoot {
+        let mut unit = UnitRoot::new();
+        let layer = unit.root.layers[0].clone();
+        std::fs::write(layer.join(UNIT_PROBE.trim_start_matches('/')), b"")
+            .expect("create the probe's mount point");
+        let exe = std::env::current_exe()
+            .expect("current_exe")
+            .canonicalize()
+            .expect("canonicalize current_exe");
+        unit.root.mounts.push(crate::Mount::Bind {
+            source: exe,
+            target: crate::InsidePath::new(UNIT_PROBE).expect("path"),
+            writable: false,
+        });
+        unit
     }
 }
 

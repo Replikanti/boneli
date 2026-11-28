@@ -914,6 +914,14 @@ mod network {
                 out.status,
                 out.stdout.trim()
             );
+            // ADR-043: what the policy denied the image's program.
+            for d in out.denials.entries() {
+                println!(
+                    "oci-acceptance {name} denied: {}",
+                    d.render(boneli_sys::seccomp::Arch::NATIVE)
+                );
+            }
+            assert_eq!(out.denials.failed(), None, "{name}");
             assert_eq!(out.status, ExitStatus::Exited(0), "{out:?}");
             assert!(out.stdout.starts_with(expect), "{out:?}");
         }

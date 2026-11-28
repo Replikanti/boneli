@@ -4,11 +4,12 @@
 //! ([`policy`]). `spawn` installs it as the child's last step before
 //! `execve` (D9).
 //!
-//! ADR-043 (proposed) answers the errno rows through a supervisor that
-//! records each denied call: the notifying program
-//! ([`Policy::notifying_program`]), the record of denied calls
-//! ([`record`]) and the supervisor's deny-only reply ([`notify`]). Until
-//! the supervisor lands, `spawn` installs the plain program.
+//! ADR-043 answers the errno rows through a supervisor that records each
+//! denied call: `spawn` installs the notifying program
+//! ([`Policy::notifying_program`]) with a listener, the child hands the
+//! listener to the caller, and a thread there ([`notify`]) replies with
+//! the plain program's errno only and fills the record of denied calls
+//! ([`record`], read through `Child::denials`).
 
 pub mod bpf;
 pub mod notify;

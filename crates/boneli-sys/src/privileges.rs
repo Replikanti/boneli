@@ -1,7 +1,8 @@
 //! The privilege drop of the cloned child (ADR-007, D9): locked
 //! securebits, an empty bounding set, no ambient, permitted, effective or
 //! inheritable capabilities, `no_new_privs`, and the seccomp filter last,
-//! so that only `execve` runs under it before the program does.
+//! so that only the listener hand-off (ADR-043, D3) and `execve` run under
+//! it before the program does.
 //!
 //! The child side ([`drop_all`]) allocates nothing; the parent reads
 //! `cap_last_cap` and assembles the filter before the clone.
@@ -10,6 +11,7 @@ use crate::child::{Failure, Fault, Step, fail, inject};
 use crate::error::{Error, Result, errno};
 use crate::ffi;
 use crate::seccomp::Insn;
+use crate::seccomp::notify::LISTENER_FLAGS;
 
 /// The securebits the child sets, 0xEF (`include/uapi/linux/securebits.h`):
 /// `NOROOT` (1) and its lock (2), so uid 0 gains no capabilities at
@@ -47,12 +49,18 @@ pub(crate) fn parse_cap_last_cap(text: &str) -> Option<u32> {
 /// Everything the child's privilege steps need, prepared before the clone.
 pub(crate) struct PrivilegeDrop<'a> {
     pub cap_last_cap: u32,
-    /// The assembled filter; the child points `sock_fprog` at it.
+    /// The assembled notifying program (ADR-043, D2); the child points
+    /// `sock_fprog` at it.
     pub filter: &'a [Insn],
 }
 
 /// The steps from [`Step::Securebits`] to [`Step::Seccomp`], in order.
-pub(crate) fn drop_all(plan: &PrivilegeDrop<'_>, fault: Fault) -> std::result::Result<(), Failure> {
+/// Returns the filter's listener: the filter is installed with
+/// [`LISTENER_FLAGS`] (ADR-043, D3).
+pub(crate) fn drop_all(
+    plan: &PrivilegeDrop<'_>,
+    fault: Fault,
+) -> std::result::Result<libc::c_int, Failure> {
     inject(fault, Step::Securebits)?;
     // SAFETY: PR_SET_SECUREBITS takes plain integers.
     if unsafe {
@@ -133,14 +141,15 @@ pub(crate) fn drop_all(plan: &PrivilegeDrop<'_>, fault: Fault) -> std::result::R
         libc::syscall(
             libc::SYS_seccomp,
             libc::SECCOMP_SET_MODE_FILTER,
-            0u32,
+            LISTENER_FLAGS,
             &prog as *const libc::sock_fprog,
         )
     };
     if rc < 0 {
         return Err(fail(Step::Seccomp, 0, errno()));
     }
-    Ok(())
+    // With NEW_LISTENER the install returns the listener.
+    Ok(rc as libc::c_int)
 }
 
 #[cfg(test)]
