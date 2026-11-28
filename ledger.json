@@ -1741,7 +1741,7 @@
    "title": "boneli-sys: run the host tests on the Linux 6.1 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "claimed",
+   "state": "implementing",
    "owner": "1429a1ef",
    "user": "ylohnitram",
    "machine": "df82df",
@@ -1750,7 +1750,7 @@
    "parked": null,
    "pr": null,
    "note": "",
-   "updated_at": "2026-11-28T16:43:56+00:00",
+   "updated_at": "2026-11-28T16:45:45+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1813,14 +1813,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-27T11:51:07+00:00",
-   "issue": 6,
-   "from": "pr-review",
-   "to": "ready",
-   "by": "bc767b73",
-   "note": "PR 4 merged (#140, e084d2b). Next: PR 5 (census, Docker comparison, kTLS+fscrypt rows, residual risk, ADR-007 accepted, Closes #6) per plan amendment; census WIP on local branch wip/boneli-sys-part5-census"
-  },
   {
    "at": "2026-11-27T11:51:16+00:00",
    "issue": 6,
@@ -2212,6 +2204,14 @@
    "to": "claimed",
    "by": "1429a1ef",
    "note": "dispatched"
+  },
+  {
+   "at": "2026-11-28T16:45:45+00:00",
+   "issue": 144,
+   "from": "claimed",
+   "to": "implementing",
+   "by": "1429a1ef",
+   "note": null
   }
  ],
  "open": [
@@ -2239,7 +2239,7 @@
   151
  ],
  "xopen": [],
- "updated_at": "2026-11-28T16:44:30+00:00",
+ "updated_at": "2026-11-28T16:45:45+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
