@@ -5,10 +5,13 @@
 //!
 //! - The target must be a new, empty directory with mode 0700, checked
 //!   without following a symlink.
-//! - Everything is checked before anything is written: repository metadata
-//!   (ADR-010, D1) is refused as defense in depth, although `diff` drops it
-//!   first, and so is an entry at or under a gitlink and a gitlink beneath
-//!   an entry or in repository metadata.
+//! - Everything is checked before anything is written: an entry at or under
+//!   a gitlink and a gitlink beneath an entry are refused. Repository
+//!   metadata (ADR-010, D1), entries and gitlinks alike, is refused under
+//!   [`Metadata::Refuse`], as defense in depth for the git adapter, whose
+//!   `diff` drops it first; under [`Metadata::Carry`] it is written like
+//!   any other entry, for the sandbox, whose snapshot carries a generated
+//!   `.git` on purpose (ADR-042, D1).
 //! - Parents are made one component at a time with `create_dir`; one that
 //!   already exists must be a real directory by `symlink_metadata`, so a
 //!   symlink the workspace planted is never a parent. The workspace keeps
@@ -52,9 +55,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 
-use boneli_app::TreePath;
+use crate::workspace::{PathRule, Workspace, common_prefix, slashes};
 
-use crate::workspace::{Workspace, common_prefix, slashes};
+/// What [`materialize`] does with repository metadata
+/// ([`PathRule::is_metadata`], ADR-010 D1), in entries and gitlinks alike
+/// (ADR-042, D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Metadata {
+    /// Refused before anything is written: the git adapter, whose `diff`
+    /// drops metadata first, so a metadata entry here is a bug upstream.
+    Refuse,
+    /// Written like any other entry: the sandbox, whose snapshot carries
+    /// its generated one-commit `.git` on purpose (ADR-010, D1).
+    Carry,
+}
 
 /// Why the target directory is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,20 +160,22 @@ impl std::error::Error for MaterializeError {}
 /// and an empty directory at each of `gitlinks`, unless that makes more
 /// than `max_nodes` files, symlinks and directories. A decoded workspace
 /// already holds its own cap ([`Workspace::decode`]); this one also
-/// counts the gitlinks and holds for a workspace built in code.
-pub fn materialize(
-    workspace: &Workspace,
+/// counts the gitlinks and holds for a workspace built in code. Repository
+/// metadata is refused or written as `metadata` says.
+pub fn materialize<R: PathRule>(
+    workspace: &Workspace<R>,
     dir: &Path,
-    gitlinks: &[TreePath],
+    gitlinks: &[R::Path],
     max_nodes: usize,
+    metadata: Metadata,
 ) -> Result<(), MaterializeError> {
     check_target(dir)?;
-    check_items(workspace, gitlinks, max_nodes)?;
+    check_items(workspace, gitlinks, max_nodes, metadata)?;
     write_entries(workspace, dir)?;
     for (n, gitlink) in gitlinks.iter().enumerate() {
         let item = Item::Gitlink(n);
-        create_parents(dir, gitlink.as_bytes(), 0, item)?;
-        create_directory(dir, gitlink.as_bytes(), item)?;
+        create_parents(dir, R::bytes(gitlink), 0, item)?;
+        create_directory(dir, R::bytes(gitlink), item)?;
     }
     Ok(())
 }
@@ -189,20 +205,22 @@ fn check_target(dir: &Path) -> Result<(), MaterializeError> {
 }
 
 /// Everything that can be refused without touching the disk.
-fn check_items(
-    workspace: &Workspace,
-    gitlinks: &[TreePath],
+fn check_items<R: PathRule>(
+    workspace: &Workspace<R>,
+    gitlinks: &[R::Path],
     max_nodes: usize,
+    metadata: Metadata,
 ) -> Result<(), MaterializeError> {
-    let links: BTreeSet<&[u8]> = gitlinks.iter().map(TreePath::as_bytes).collect();
+    let refused = |text: &[u8]| metadata == Metadata::Refuse && R::is_metadata(text);
+    let links: BTreeSet<&[u8]> = gitlinks.iter().map(R::bytes).collect();
     // No ancestor longer than the longest gitlink can be one, so a deep
     // agent-written path costs at most that many bytes of lookups.
     let longest = links.iter().map(|g| g.len()).max().unwrap_or(0);
     for (n, (path, _, _)) in workspace.iter().enumerate() {
-        if path.is_repository_metadata() {
+        let text = R::bytes(path);
+        if refused(text) {
             return Err(MaterializeError::Metadata(Item::Entry(n)));
         }
-        let text = path.as_bytes();
         let at = text.len() <= longest && links.contains(text);
         let under = slashes(text)
             .take_while(|i| *i <= longest)
@@ -213,15 +231,11 @@ fn check_items(
     }
     // An entry at a gitlink's own path was refused above.
     for (n, gitlink) in gitlinks.iter().enumerate() {
-        if gitlink.is_repository_metadata() {
+        let text = R::bytes(gitlink);
+        if refused(text) {
             return Err(MaterializeError::Metadata(Item::Gitlink(n)));
         }
-        let text = gitlink.as_bytes();
-        let beneath = slashes(text).any(|i| {
-            // A proper ancestor of a tree path always parses; were it
-            // refused, it would be no entry's path.
-            TreePath::parse(&text[..i]).is_ok_and(|p| workspace.get(&p).is_some())
-        });
+        let beneath = slashes(text).any(|i| workspace.get_bytes(&text[..i]).is_some());
         if beneath {
             return Err(MaterializeError::GitlinkBeneathEntry(Item::Gitlink(n)));
         }
@@ -231,7 +245,7 @@ fn check_items(
     // base tree, so this set stays small.
     let mut gitlink_directories = BTreeSet::new();
     for gitlink in gitlinks {
-        let text = gitlink.as_bytes();
+        let text = R::bytes(gitlink);
         let parents = slashes(text).map(|i| &text[..i]);
         gitlink_directories.extend(parents.chain([text]));
     }
@@ -255,12 +269,15 @@ fn check_items(
 /// Creating every parent again for every entry cost O(depth^2) path
 /// lookups per entry: 500 entries under one chain of 1,900 directories
 /// took 150 s (review of part 2).
-fn write_entries(workspace: &Workspace, dir: &Path) -> Result<(), MaterializeError> {
+fn write_entries<R: PathRule>(
+    workspace: &Workspace<R>,
+    dir: &Path,
+) -> Result<(), MaterializeError> {
     let mut previous: Option<&[u8]> = None;
     for (n, (path, kind, data)) in workspace.iter().enumerate() {
         let item = Item::Entry(n);
         let io = |e| MaterializeError::Io(Some(item), e);
-        let text = path.as_bytes();
+        let text = R::bytes(path);
         let shared = previous.map_or(0, |p| common_prefix(p, text));
         create_parents(dir, text, shared, item)?;
         previous = Some(text);
@@ -318,10 +335,25 @@ mod tests {
 
     use super::*;
     use crate::scratch::ScratchDir;
+    use crate::test_rule::{TestPath, TestRule};
     use crate::workspace::{DEFAULT_MAX_NODES, Kind};
 
-    fn path(text: &str) -> TreePath {
-        TreePath::parse(text.as_bytes()).expect("a valid path")
+    type Workspace = super::Workspace<TestRule>;
+
+    /// The tests written for the git adapter run under its mode,
+    /// [`Metadata::Refuse`]; the tests of [`Metadata::Carry`] call
+    /// `super::materialize` themselves.
+    fn materialize(
+        workspace: &Workspace,
+        dir: &Path,
+        gitlinks: &[TestPath],
+        max_nodes: usize,
+    ) -> Result<(), MaterializeError> {
+        super::materialize(workspace, dir, gitlinks, max_nodes, Metadata::Refuse)
+    }
+
+    fn path(text: &str) -> TestPath {
+        TestPath::parse(text.as_bytes()).expect("a valid path")
     }
 
     fn workspace(entries: &[(&str, Kind, &[u8])]) -> Workspace {
@@ -370,7 +402,7 @@ mod tests {
     }
 
     /// Set in the child that re-runs the modes test under `umask 077`.
-    const UMASK_CHILD: &str = "BONELI_GIT_CLI_UMASK_CHILD";
+    const UMASK_CHILD: &str = "BONELI_WORKSPACE_UMASK_CHILD";
 
     /// The modes do not depend on the umask: the test runs here and again
     /// in a child under `umask 077`, where a directory left to the umask
@@ -510,7 +542,7 @@ mod tests {
         let names: Vec<String> = (0..500).map(|n| format!("{chain}f{n:05}")).collect();
         // Built through `decode`, which is linear; `insert` looks every
         // ancestor up and is meant for short paths.
-        let mut bytes = crate::workspace::MAGIC.to_vec();
+        let mut bytes = crate::MAGIC.to_vec();
         for name in &names {
             bytes.push(b'f');
             bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
@@ -732,13 +764,13 @@ mod tests {
         ];
         let mut w = Workspace::new();
         for name in names.iter().filter(|n| **n != b"d\\e") {
-            let p = TreePath::parse(name).expect("a tree path");
+            let p = TestPath::parse(name).expect("a tree path");
             w.insert(p, Kind::File, name.to_vec()).expect("valid");
         }
-        let link = TreePath::parse(b"l\\x").expect("a tree path");
+        let link = TestPath::parse(b"l\\x").expect("a tree path");
         w.insert(link, Kind::Symlink, b"x\xff".to_vec())
             .expect("valid");
-        let nested = TreePath::parse(b"d\\e/f").expect("a tree path");
+        let nested = TestPath::parse(b"d\\e/f").expect("a tree path");
         w.insert(nested, Kind::Executable, b"f".to_vec())
             .expect("valid");
         materialize(&w, &dir, &[], w.nodes()).expect("written");
@@ -798,5 +830,112 @@ mod tests {
             "{refused:?}"
         );
         assert!(listing(&dir).is_empty());
+    }
+
+    /// The sandbox's snapshot: the base tree and its generated one-commit
+    /// `.git`, a nested repository's `.git` file and a link inside `.git`.
+    fn snapshot_with_metadata() -> Workspace {
+        workspace(&[
+            (".git/HEAD", Kind::File, b"ref: refs/heads/main\n"),
+            (".git/hooks/x", Kind::Executable, b"#!/bin/sh\n"),
+            (".git/link", Kind::Symlink, b"/"),
+            (".gitignore", Kind::File, b"dist/"),
+            ("src/x.rs", Kind::File, b"fn x() {}"),
+            ("sub/.git", Kind::File, b"gitdir: ../.git/modules/sub"),
+        ])
+    }
+
+    /// Under `Carry` repository metadata is written like any other entry,
+    /// entries and gitlinks alike, with the same modes, and a link inside
+    /// `.git` is created raw, never followed (ADR-042, D1).
+    #[test]
+    fn materialize_carry_keeps_dot_git() {
+        let (_scratch, dir, outside) = target("carry");
+        let w = snapshot_with_metadata();
+        let gitlinks = [path(".git/modules/lib")];
+        super::materialize(&w, &dir, &gitlinks, DEFAULT_MAX_NODES, Metadata::Carry)
+            .expect("written");
+        assert_eq!(
+            listing(&dir),
+            [
+                ".git",
+                ".git/HEAD",
+                ".git/hooks",
+                ".git/hooks/x",
+                ".git/link",
+                ".git/modules",
+                ".git/modules/lib",
+                ".gitignore",
+                "src",
+                "src/x.rs",
+                "sub",
+                "sub/.git",
+            ]
+        );
+        assert_eq!(
+            fs::read(dir.join(".git/HEAD")).expect("read"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(
+            fs::read(dir.join("sub/.git")).expect("read"),
+            b"gitdir: ../.git/modules/sub"
+        );
+        assert_eq!(mode(&dir.join(".git/HEAD")), 0o644);
+        assert_eq!(mode(&dir.join(".git/hooks/x")), 0o755);
+        assert_eq!(mode(&dir.join(".git")), 0o755);
+        let link = fs::read_link(dir.join(".git/link")).expect("a symlink");
+        assert_eq!(link, PathBuf::from("/"));
+        assert!(fs::read_dir(&outside).expect("outside").next().is_none());
+        // The node cap still counts metadata: 12 nodes, refused at 11.
+        let (_scratch, dir, _) = target("carry-cap");
+        let refused = super::materialize(&w, &dir, &gitlinks, 11, Metadata::Carry);
+        assert!(
+            matches!(refused, Err(MaterializeError::TooManyNodes { max: 11 })),
+            "{refused:?}"
+        );
+        assert!(listing(&dir).is_empty());
+    }
+
+    /// Under `Refuse`, the git adapter's mode, the same snapshot is refused
+    /// at its first metadata entry and a metadata gitlink at its index,
+    /// before anything is written: today's behavior, unchanged by the move.
+    #[test]
+    fn materialize_refuse_still_refuses_metadata() {
+        let w = snapshot_with_metadata();
+        let (_scratch, dir, _) = target("refuse");
+        let refused = super::materialize(&w, &dir, &[], DEFAULT_MAX_NODES, Metadata::Refuse);
+        assert!(
+            matches!(refused, Err(MaterializeError::Metadata(Item::Entry(0)))),
+            "{refused:?}"
+        );
+        assert!(listing(&dir).is_empty());
+        // Only the nested `.git` left: still refused, as entry 2.
+        let w = workspace(&[
+            (".gitignore", Kind::File, b"dist/"),
+            ("src/x.rs", Kind::File, b"fn x() {}"),
+            ("sub/.git", Kind::File, b"gitdir: x"),
+        ]);
+        let (_scratch, dir, _) = target("refuse-nested");
+        let refused = super::materialize(&w, &dir, &[], DEFAULT_MAX_NODES, Metadata::Refuse);
+        assert!(
+            matches!(refused, Err(MaterializeError::Metadata(Item::Entry(2)))),
+            "{refused:?}"
+        );
+        assert!(listing(&dir).is_empty());
+        // A clean workspace with a metadata gitlink: refused at the gitlink.
+        let w = workspace(&[("src/x.rs", Kind::File, b"fn x() {}")]);
+        let gitlinks = [path("vendor/lib"), path(".git/modules/lib")];
+        let (_scratch, dir, _) = target("refuse-gitlink");
+        let refused = super::materialize(&w, &dir, &gitlinks, DEFAULT_MAX_NODES, Metadata::Refuse);
+        assert!(
+            matches!(refused, Err(MaterializeError::Metadata(Item::Gitlink(1)))),
+            "{refused:?}"
+        );
+        assert!(listing(&dir).is_empty());
+        // The same input under `Carry` is written.
+        let (_scratch, dir, _) = target("carry-gitlink");
+        super::materialize(&w, &dir, &gitlinks, DEFAULT_MAX_NODES, Metadata::Carry)
+            .expect("written");
+        assert_eq!(listing(&dir).len(), 7);
     }
 }

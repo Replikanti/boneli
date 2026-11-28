@@ -20,7 +20,7 @@ use std::iter::Peekable;
 use boneli_app::TreePath;
 use boneli_domain::{BaseLink, Change, Entry, EntryKind, Patch, UnreadablePath};
 
-use crate::workspace::{Kind, Workspace};
+use crate::{Kind, Workspace};
 
 /// The path as the policy's text, if it is UTF-8.
 fn text(path: &TreePath) -> Option<String> {

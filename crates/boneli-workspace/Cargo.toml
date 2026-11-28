@@ -1,0 +1,24 @@
+[package]
+name = "boneli-workspace"
+description = "Boneli support crate: the workspace format the sandbox and the git adapter exchange, and the writer that puts a workspace onto the host (ADR-010, ADR-042)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: the codec and the writer need only std, and the path
+# rule comes in as a `PathRule` from the adapter, so a support crate never
+# names a core type (ADR-042, D1).
+
+[features]
+# `Workspace::insert`, the constructor that looks every ancestor up, for
+# the unit tests of the adapters that build small workspaces by hand. Only
+# `[dev-dependencies]` enable it; resolver 3 keeps dev-dependency features
+# out of normal builds, so no production path reaches its O(depth *
+# length) cost per entry (ADR-010, D2).
+test-seam = []

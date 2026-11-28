@@ -53,10 +53,9 @@ use boneli_domain::{BaseLink, Change, CommitSha, Entry, EntryKind, Patch, Unread
 
 use crate::credentials::{Credentials, refused};
 use crate::lookalike::names_git_elsewhere;
-use crate::materialize::materialize;
 use crate::run::{Authorization, Call, MIN_GIT_VERSION, Runner, parse_version};
 use crate::url::Transports;
-use crate::workspace::{Kind, Workspace};
+use crate::{Kind, Metadata, Workspace, materialize};
 
 /// What `GitCli::open` needs.
 #[derive(Clone)]
@@ -1092,8 +1091,14 @@ impl Git for GitCli {
         let gitlinks = self.gitlinks(store, &c.tree)?;
         let scratch = self.fresh("scratch")?;
         let tmp = self.fresh("tmp")?;
-        materialize(&workspace, &scratch.path, &gitlinks, self.max_nodes)
-            .map_err(|e| failed(format!("the workspace cannot be written: {e}")))?;
+        materialize(
+            &workspace,
+            &scratch.path,
+            &gitlinks,
+            self.max_nodes,
+            Metadata::Refuse,
+        )
+        .map_err(|e| failed(format!("the workspace cannot be written: {e}")))?;
         let index = tmp.path.join("index");
         // The workspace's blobs and trees go here and are removed with
         // `tmp`; the store is only read.

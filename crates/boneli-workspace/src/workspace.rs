@@ -21,16 +21,91 @@
 //! both bounds what [`materialize`](crate::materialize) creates on the
 //! host.
 //!
-//! A path is a [`TreePath`] (ADR-018, D2): a backslash, a blank name and
-//! bytes that are not UTF-8 are name bytes, because a repository may hold
-//! such a file and the replica must hold it too. Only `/` makes a
-//! directory, on the host as in git.
+//! A path is what the caller's [`PathRule`] accepts (ADR-042, D1). Both
+//! adapters pass the tree path rule of ADR-018 (D2): a backslash, a blank
+//! name and bytes that are not UTF-8 are name bytes, because a repository
+//! may hold such a file and the replica must hold it too. Whatever the
+//! rule, only `/` makes a directory, on the host as in git, and entries
+//! are ordered by the bytes of their paths, never by the rule's own type.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Bound;
 
-use boneli_app::{TreePath, TreePathProblem};
+/// The path rule a workspace is checked against (ADR-042, D1): which
+/// bytes are a path, the type a path is kept as, and which paths are
+/// repository metadata. The adapter passes it as a type parameter, so this
+/// crate never names a core type; the rule is a set of functions, never a
+/// value, and a workspace holds none.
+///
+/// A rule must keep what the format relies on: a path it accepts is not
+/// empty, does not start with `/`, holds no NUL and no empty, `.` or `..`
+/// component between its `/` bytes, and [`PathRule::bytes`] gives back
+/// exactly the bytes [`PathRule::check`] accepted. The tree path rule of
+/// ADR-018 is that rule.
+pub trait PathRule {
+    /// A path the rule accepted.
+    type Path: Clone + fmt::Debug;
+    /// Why the rule refuses bytes.
+    type Problem: fmt::Debug;
+
+    /// The bytes as a path, or why they are not one.
+    fn check(path: &[u8]) -> Result<Self::Path, Self::Problem>;
+
+    /// Whether the path is repository metadata (ADR-010, D1).
+    fn is_metadata(path: &[u8]) -> bool;
+
+    /// The bytes of a path, as [`PathRule::check`] accepted them.
+    fn bytes(path: &Self::Path) -> &[u8];
+}
+
+/// A path as a map key, ordered and compared by its bytes, so the order of
+/// a workspace and every range over it never depend on the rule's type.
+struct Key<R: PathRule>(R::Path);
+
+impl<R: PathRule> Key<R> {
+    fn bytes(&self) -> &[u8] {
+        R::bytes(&self.0)
+    }
+}
+
+impl<R: PathRule> Clone for Key<R> {
+    fn clone(&self) -> Key<R> {
+        Key(self.0.clone())
+    }
+}
+
+impl<R: PathRule> PartialEq for Key<R> {
+    fn eq(&self, other: &Key<R>) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl<R: PathRule> Eq for Key<R> {}
+
+impl<R: PathRule> PartialOrd for Key<R> {
+    fn partial_cmp(&self, other: &Key<R>) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<R: PathRule> Ord for Key<R> {
+    fn cmp(&self, other: &Key<R>) -> Ordering {
+        self.bytes().cmp(other.bytes())
+    }
+}
+
+/// Consistent with `Eq` and `Ord`: both are those of the bytes.
+impl<R: PathRule> Borrow<[u8]> for Key<R> {
+    fn borrow(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+/// What a workspace keeps for each path: its kind and its data.
+type Value = (Kind, Vec<u8>);
 
 /// The first bytes of every encoded workspace.
 pub const MAGIC: &[u8] = b"boneli-workspace 1\n";
@@ -107,11 +182,12 @@ impl fmt::Display for EntryProblem {
     }
 }
 
-/// Why bytes are not an encoded workspace. Entries are counted from 0 in
+/// Why bytes are not an encoded workspace, with `P` the path rule's
+/// problem type ([`PathRule::Problem`]). Entries are counted from 0 in
 /// encoding order; a detail quotes indexes and lengths, never the
 /// agent-written bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DecodeError {
+pub enum DecodeError<P> {
     /// The bytes do not start with [`MAGIC`].
     Magic,
     /// A length or field runs past the end of the bytes.
@@ -132,12 +208,12 @@ pub enum DecodeError {
         /// The byte.
         byte: u8,
     },
-    /// The path breaks the tree path rule ([`TreePath`]).
+    /// The path breaks the path rule ([`PathRule::check`]).
     Path {
         /// The entry.
         entry: usize,
         /// The rule's reason.
-        problem: TreePathProblem,
+        problem: P,
     },
     /// The path equals the previous entry's.
     Duplicate {
@@ -163,7 +239,7 @@ pub enum DecodeError {
     },
 }
 
-impl fmt::Display for DecodeError {
+impl<P: fmt::Debug> fmt::Display for DecodeError<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecodeError::Magic => write!(f, "not a boneli workspace (wrong or missing magic)"),
@@ -197,19 +273,65 @@ impl fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl<P: fmt::Debug> std::error::Error for DecodeError<P> {}
 
-/// A workspace: every entry's kind and data by path. No entry lies beneath
-/// a file or symlink entry, and no symlink target is empty or contains
-/// NUL; [`Workspace::insert`] and [`Workspace::decode`] keep both.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Workspace {
-    entries: BTreeMap<TreePath, (Kind, Vec<u8>)>,
+/// A workspace under the path rule `R`: every entry's kind and data by
+/// path, in the byte order of the paths. No entry lies beneath a file or
+/// symlink entry, and no symlink target is empty or contains NUL;
+/// [`Workspace::decode`] and [`Workspace::from_sorted`] keep both.
+pub struct Workspace<R: PathRule> {
+    entries: BTreeMap<Key<R>, Value>,
 }
 
-impl Workspace {
+impl<R: PathRule> Clone for Workspace<R> {
+    fn clone(&self) -> Workspace<R> {
+        Workspace {
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+impl<R: PathRule> Default for Workspace<R> {
+    fn default() -> Workspace<R> {
+        Workspace {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+/// Two workspaces are equal when they hold the same paths, by their
+/// bytes, with the same kinds and data.
+impl<R: PathRule> PartialEq for Workspace<R> {
+    fn eq(&self, other: &Workspace<R>) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl<R: PathRule> Eq for Workspace<R> {}
+
+/// The entries in path order, each path in the rule's own `Debug`.
+impl<R: PathRule> fmt::Debug for Workspace<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Workspace")
+            .field("entries", &Entries(&self.entries))
+            .finish()
+    }
+}
+
+/// The entry map as `Debug` prints it: each path in the rule's `Debug`.
+struct Entries<'a, R: PathRule>(&'a BTreeMap<Key<R>, Value>);
+
+impl<R: PathRule> fmt::Debug for Entries<'_, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(key, value)| (&key.0, value)))
+            .finish()
+    }
+}
+
+impl<R: PathRule> Workspace<R> {
     /// An empty workspace.
-    pub fn new() -> Workspace {
+    pub fn new() -> Workspace<R> {
         Workspace::default()
     }
 
@@ -224,17 +346,22 @@ impl Workspace {
     }
 
     /// The entry at `path`.
-    pub fn get(&self, path: &TreePath) -> Option<(Kind, &[u8])> {
+    pub fn get(&self, path: &R::Path) -> Option<(Kind, &[u8])> {
+        self.get_bytes(R::bytes(path))
+    }
+
+    /// The entry whose path has these bytes.
+    pub(crate) fn get_bytes(&self, path: &[u8]) -> Option<(Kind, &[u8])> {
         self.entries
             .get(path)
             .map(|(kind, data)| (*kind, data.as_slice()))
     }
 
     /// Every entry in path order.
-    pub fn iter(&self) -> impl Iterator<Item = (&TreePath, Kind, &[u8])> {
+    pub fn iter(&self) -> impl Iterator<Item = (&R::Path, Kind, &[u8])> {
         self.entries
             .iter()
-            .map(|(path, (kind, data))| (path, *kind, data.as_slice()))
+            .map(|(path, (kind, data))| (&path.0, *kind, data.as_slice()))
     }
 
     /// Adds or replaces the entry at `path`, unless that breaks an
@@ -243,45 +370,34 @@ impl Workspace {
     /// (a workspace, or a checkout after `apply`) could make that hours of
     /// CPU (review of part 2). Code builds a workspace with
     /// [`Workspace::decode`] or [`Workspace::from_sorted`], both linear.
-    #[cfg(test)]
-    pub(crate) fn insert(
-        &mut self,
-        path: TreePath,
-        kind: Kind,
-        data: Vec<u8>,
-    ) -> Result<(), EntryProblem> {
+    /// Built only for this crate's tests and, through the `test-seam`
+    /// feature, for the adapters' tests.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn insert(&mut self, path: R::Path, kind: Kind, data: Vec<u8>) -> Result<(), EntryProblem> {
         target_problem(kind, &data).map_or(Ok(()), Err)?;
-        let text = path.as_bytes();
+        let text = R::bytes(&path);
         // Every proper ancestor of `path`, at each `/`.
-        let beneath = slashes(text).any(|at| {
-            TreePath::parse(&text[..at])
-                .map(|ancestor| self.entries.contains_key(&ancestor))
-                .unwrap_or(false)
-        });
+        let beneath = slashes(text).any(|at| self.entries.contains_key(&text[..at]));
         if beneath {
             return Err(EntryProblem::BeneathEntry);
         }
         if self.implies_directory(text) {
             return Err(EntryProblem::HasEntriesBeneath);
         }
-        self.entries.insert(path, (kind, data));
+        self.entries.insert(Key(path), (kind, data));
         Ok(())
     }
 
     /// Whether some entry lies beneath `dir`, which makes it a directory.
     pub(crate) fn implies_directory(&self, dir: &[u8]) -> bool {
-        // Paths beneath `dir` all start with `dir/`, so they sort together,
-        // and `dir/\x01` is the least valid one: NUL is the only smaller
-        // byte, and no path holds it. It always parses; were it refused,
-        // the answer is yes, which fails closed for every caller.
+        // Paths beneath `dir` all start with `dir/`, so they sort together
+        // in byte order, the order of the map, and the first path at or
+        // after `dir/` is beneath `dir` exactly when some path is.
         let prefix = [dir, b"/"].concat();
-        let Ok(least_child) = TreePath::parse(&[prefix.as_slice(), b"\x01"].concat()) else {
-            return true;
-        };
         self.entries
-            .range(least_child..)
+            .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
             .next()
-            .is_some_and(|(next, _)| next.as_bytes().starts_with(&prefix))
+            .is_some_and(|(next, _)| next.bytes().starts_with(&prefix))
     }
 
     /// The files, symlinks and directories the workspace makes on disk:
@@ -291,7 +407,7 @@ impl Workspace {
         let mut previous = None;
         let mut nodes = 0usize;
         for path in self.entries.keys() {
-            let text = path.as_bytes();
+            let text = path.bytes();
             nodes = nodes.saturating_add(1 + new_directories(previous, text));
             previous = Some(text);
         }
@@ -299,15 +415,14 @@ impl Workspace {
     }
 
     /// Removes the entry at `path` and returns it.
-    pub fn remove(&mut self, path: &TreePath) -> Option<(Kind, Vec<u8>)> {
-        self.entries.remove(path)
+    pub fn remove(&mut self, path: &R::Path) -> Option<(Kind, Vec<u8>)> {
+        self.entries.remove(R::bytes(path))
     }
 
     /// The workspace without repository metadata
-    /// ([`TreePath::is_repository_metadata`], ADR-010 D1).
-    pub fn without_metadata(mut self) -> Workspace {
-        self.entries
-            .retain(|path, _| !path.is_repository_metadata());
+    /// ([`PathRule::is_metadata`], ADR-010 D1).
+    pub fn without_metadata(mut self) -> Workspace<R> {
+        self.entries.retain(|path, _| !R::is_metadata(path.bytes()));
         self
     }
 
@@ -316,7 +431,7 @@ impl Workspace {
         let mut out = MAGIC.to_vec();
         for (path, (kind, data)) in &self.entries {
             out.push(kind.byte());
-            put_field(&mut out, path.as_bytes());
+            put_field(&mut out, path.bytes());
             put_field(&mut out, data);
         }
         out
@@ -331,14 +446,17 @@ impl Workspace {
     /// it claims fails closed. Errors count entries from 0 in input order.
     /// This is the constructor for a tree read from git, the snapshot of
     /// an applied checkout included, whose paths the agent chose.
-    pub fn from_sorted<I>(entries: I, max_nodes: usize) -> Result<Workspace, DecodeError>
+    pub fn from_sorted<I>(
+        entries: I,
+        max_nodes: usize,
+    ) -> Result<Workspace<R>, DecodeError<R::Problem>>
     where
-        I: IntoIterator<Item = (TreePath, Kind, Vec<u8>)>,
+        I: IntoIterator<Item = (R::Path, Kind, Vec<u8>)>,
     {
         let mut sorted = Sorted::new(max_nodes);
         for (path, kind, data) in entries {
             sorted.room()?;
-            sorted.check_path(path.as_bytes())?;
+            sorted.check_path(R::bytes(&path))?;
             sorted.push(path, kind, data)?;
         }
         Ok(sorted.finish())
@@ -355,7 +473,7 @@ impl Workspace {
     /// path lies beneath one of them exactly when the byte after it is
     /// `/`. Looking every ancestor up in the map instead costs quadratic
     /// time on a deep path next to a sibling that shares its prefixes.
-    pub fn decode(bytes: &[u8], max_nodes: usize) -> Result<Workspace, DecodeError> {
+    pub fn decode(bytes: &[u8], max_nodes: usize) -> Result<Workspace<R>, DecodeError<R::Problem>> {
         let rest = bytes.strip_prefix(MAGIC).ok_or(DecodeError::Magic)?;
         let mut reader = Reader { rest, entry: 0 };
         let mut sorted = Sorted::new(max_nodes);
@@ -365,9 +483,8 @@ impl Workspace {
             let byte = reader.bytes("kind", 1)?[0];
             let kind = Kind::from_byte(byte).ok_or(DecodeError::UnknownKind { entry, byte })?;
             let raw = reader.field("path")?;
-            let path =
-                TreePath::parse(raw).map_err(|problem| DecodeError::Path { entry, problem })?;
-            sorted.check_path(raw)?;
+            let path = R::check(raw).map_err(|problem| DecodeError::Path { entry, problem })?;
+            sorted.check_path(R::bytes(&path))?;
             let data = reader.field("data")?;
             sorted.push(path, kind, data.to_vec())?;
             reader.entry += 1;
@@ -386,15 +503,15 @@ impl Workspace {
 /// the path lies beneath one of them exactly when the byte after it is
 /// `/`. Looking every ancestor up in the map instead costs quadratic time
 /// on a deep path next to a sibling that shares its prefixes.
-struct Sorted {
-    entries: Vec<(TreePath, (Kind, Vec<u8>))>,
+struct Sorted<R: PathRule> {
+    entries: Vec<(Key<R>, Value)>,
     prefixes: Vec<usize>,
     nodes: usize,
     max_nodes: usize,
 }
 
-impl Sorted {
-    fn new(max_nodes: usize) -> Sorted {
+impl<R: PathRule> Sorted<R> {
+    fn new(max_nodes: usize) -> Sorted<R> {
         Sorted {
             entries: Vec::new(),
             prefixes: Vec::new(),
@@ -403,14 +520,14 @@ impl Sorted {
         }
     }
 
-    fn too_many(&self) -> DecodeError {
+    fn too_many(&self) -> DecodeError<R::Problem> {
         DecodeError::TooManyNodes {
             max: self.max_nodes,
         }
     }
 
     /// Before the next entry is read: every entry adds at least itself.
-    fn room(&self) -> Result<(), DecodeError> {
+    fn room(&self) -> Result<(), DecodeError<R::Problem>> {
         if self.nodes >= self.max_nodes {
             return Err(self.too_many());
         }
@@ -420,9 +537,9 @@ impl Sorted {
     /// Checks the next path against the earlier ones: order, the node cap
     /// and the ancestors. It then sits on the stack as the entry
     /// [`Sorted::push`] adds next.
-    fn check_path(&mut self, text: &[u8]) -> Result<(), DecodeError> {
+    fn check_path(&mut self, text: &[u8]) -> Result<(), DecodeError<R::Problem>> {
         let entry = self.entries.len();
-        let previous = self.entries.last().map(|(p, _)| p.as_bytes());
+        let previous = self.entries.last().map(|(p, _)| p.bytes());
         if let Some(previous) = previous {
             match text.cmp(previous) {
                 Ordering::Equal => return Err(DecodeError::Duplicate { entry }),
@@ -437,7 +554,7 @@ impl Sorted {
             return Err(self.too_many());
         }
         let entries = &self.entries;
-        let path_of = |i: usize| entries[i].0.as_bytes();
+        let path_of = |i: usize| entries[i].0.bytes();
         while self
             .prefixes
             .last()
@@ -461,18 +578,23 @@ impl Sorted {
     }
 
     /// Adds the entry whose path [`Sorted::check_path`] just accepted.
-    fn push(&mut self, path: TreePath, kind: Kind, data: Vec<u8>) -> Result<(), DecodeError> {
+    fn push(
+        &mut self,
+        path: R::Path,
+        kind: Kind,
+        data: Vec<u8>,
+    ) -> Result<(), DecodeError<R::Problem>> {
         let entry = self.entries.len();
         if let Some(problem) = target_problem(kind, &data) {
             return Err(DecodeError::Entry { entry, problem });
         }
-        self.entries.push((path, (kind, data)));
+        self.entries.push((Key(path), (kind, data)));
         Ok(())
     }
 
     /// Already sorted, so the map is built in one pass, without a search
     /// per entry.
-    fn finish(self) -> Workspace {
+    fn finish(self) -> Workspace<R> {
         Workspace {
             entries: self.entries.into_iter().collect(),
         }
@@ -526,7 +648,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn bytes(&mut self, field: &'static str, n: u64) -> Result<&'a [u8], DecodeError> {
+    fn bytes<P>(&mut self, field: &'static str, n: u64) -> Result<&'a [u8], DecodeError<P>> {
         let left = self.rest.len();
         // Compared as u64, so a length past usize never wraps.
         if n > left as u64 {
@@ -542,7 +664,7 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn field(&mut self, field: &'static str) -> Result<&'a [u8], DecodeError> {
+    fn field<P>(&mut self, field: &'static str) -> Result<&'a [u8], DecodeError<P>> {
         let length_field = if field == "path" {
             "path length"
         } else {
@@ -557,13 +679,17 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_rule::{TestPath, TestProblem, TestRule};
 
-    fn path(text: &str) -> TreePath {
+    type Workspace = super::Workspace<TestRule>;
+    type DecodeError = super::DecodeError<TestProblem>;
+
+    fn path(text: &str) -> TestPath {
         bpath(text.as_bytes())
     }
 
-    fn bpath(bytes: &[u8]) -> TreePath {
-        TreePath::parse(bytes).expect("a valid path")
+    fn bpath(bytes: &[u8]) -> TestPath {
+        TestPath::parse(bytes).expect("a valid path")
     }
 
     fn bworkspace(entries: &[(&[u8], Kind, &[u8])]) -> Workspace {
@@ -657,6 +783,32 @@ mod tests {
         expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 3]);
         expected.extend_from_slice(b"xyz");
         assert_eq!(one, expected);
+    }
+
+    /// A workspace of `MAGIC` alone is the empty workspace, both ways, and
+    /// makes no node; one byte after it is a truncated entry.
+    #[test]
+    fn empty_workspace_round_trips() {
+        let empty = Workspace::decode(MAGIC, DEFAULT_MAX_NODES).expect("decodes");
+        assert!(empty.is_empty());
+        assert_eq!(empty.nodes(), 0);
+        assert_eq!(empty, Workspace::new());
+        assert_eq!(empty.encode(), MAGIC);
+        assert_eq!(
+            Workspace::from_sorted(Vec::new(), 0).map(|w| w.encode()),
+            Ok(MAGIC.to_vec())
+        );
+        let mut one_more = MAGIC.to_vec();
+        one_more.push(b'f');
+        assert_eq!(
+            Workspace::decode(&one_more, DEFAULT_MAX_NODES),
+            Err(DecodeError::Truncated {
+                entry: 0,
+                field: "path length",
+                wanted: 8,
+                left: 0,
+            })
+        );
     }
 
     #[test]
@@ -840,32 +992,32 @@ mod tests {
             (
                 "absolute",
                 raw(&[(f, b"/abs", b"")]),
-                path_problem(TreePathProblem::Absolute),
+                path_problem(TestProblem::Absolute),
             ),
             (
                 "parent",
                 raw(&[(f, b"../x", b"")]),
-                path_problem(TreePathProblem::ParentComponent),
+                path_problem(TestProblem::ParentComponent),
             ),
             (
                 "dot",
                 raw(&[(f, b"a/./x", b"")]),
-                path_problem(TreePathProblem::DotComponent),
+                path_problem(TestProblem::DotComponent),
             ),
             (
                 "empty component",
                 raw(&[(f, b"a//b", b"")]),
-                path_problem(TreePathProblem::EmptyComponent),
+                path_problem(TestProblem::EmptyComponent),
             ),
             (
                 "NUL",
                 raw(&[(f, b"a\0b", b"")]),
-                path_problem(TreePathProblem::Nul),
+                path_problem(TestProblem::Nul),
             ),
             (
                 "empty path",
                 raw(&[(f, b"", b"")]),
-                path_problem(TreePathProblem::Empty),
+                path_problem(TestProblem::Empty),
             ),
             (
                 "duplicate",
@@ -1146,7 +1298,7 @@ mod tests {
     fn from_sorted_is_linear_in_path_depth() {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
         let chain = "a/".repeat(1900);
-        let paths: Vec<TreePath> = (0..3000)
+        let paths: Vec<TestPath> = (0..3000)
             .map(|n| path(&format!("{chain}f{n:05}")))
             .collect();
         let start = std::time::Instant::now();
