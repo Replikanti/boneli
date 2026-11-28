@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "implementing",
+   "state": "pr-review",
    "owner": "909fb540",
-   "pr": 145,
-   "note": "PR 1 #145 merged (25238a6, ADR-043 proposed); PR 2 next: FFI, supervisor, host tests, ADR accepted",
-   "updated_at": "2026-11-28T01:03:13+00:00",
+   "pr": 148,
+   "note": "PR #148 open",
+   "updated_at": "2026-11-28T02:05:29+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -1765,14 +1765,6 @@
  ],
  "log": [
   {
-   "at": "2026-11-25T18:33:18+00:00",
-   "issue": 55,
-   "from": "pr-review",
-   "to": "implementing",
-   "by": "ae67d3e8",
-   "note": "PR 1 merged (#135, 825d2aa); PR 2 (credentials in boneli-oci, Squid CI step, ADR-039 accepted) next"
-  },
-  {
    "at": "2026-11-25T19:24:26+00:00",
    "issue": 55,
    "from": "implementing",
@@ -2163,6 +2155,14 @@
    "to": "implementing",
    "by": "9c692a2a",
    "note": "PR 1/6 merged (#146); PR 2 port + contract in progress"
+  },
+  {
+   "at": "2026-11-28T02:05:29+00:00",
+   "issue": 45,
+   "from": "implementing",
+   "to": "pr-review",
+   "by": "sync",
+   "note": "PR #148 open"
   }
  ],
  "open": [
@@ -2190,7 +2190,7 @@
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T01:22:31+00:00",
+ "updated_at": "2026-11-28T02:05:29+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
