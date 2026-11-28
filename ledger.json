@@ -879,11 +879,11 @@
    "title": "boneli-sys: record seccomp denials so sandbox refusals show up in the run report",
    "epic": null,
    "order": 30,
-   "state": "pr-review",
-   "owner": "909fb540",
+   "state": "done",
+   "owner": null,
    "pr": 148,
    "note": "PR #148 open",
-   "updated_at": "2026-11-28T02:05:29+00:00",
+   "updated_at": "2026-11-28T03:45:51+00:00",
    "priority": "P2",
    "size": "medium",
    "deps": [
@@ -894,10 +894,10 @@
     "sandbox"
    ],
    "manual": false,
-   "user": "ylohnitram",
-   "machine": "df82df",
-   "session": true,
-   "dispatched": true,
+   "user": null,
+   "machine": null,
+   "session": null,
+   "dispatched": null,
    "parked": null
   },
   {
@@ -1741,7 +1741,7 @@
    "title": "boneli-sys: run the host tests on the Linux 5.19 floor in a CI VM",
    "epic": null,
    "order": 67,
-   "state": "blocked",
+   "state": "ready",
    "owner": null,
    "user": null,
    "machine": null,
@@ -1750,7 +1750,7 @@
    "parked": null,
    "pr": null,
    "note": "added by sync — run reorder",
-   "updated_at": "2026-11-27T23:07:51+00:00",
+   "updated_at": "2026-11-28T03:45:53+00:00",
    "priority": "P3",
    "size": "medium",
    "deps": [
@@ -1764,22 +1764,6 @@
   }
  ],
  "log": [
-  {
-   "at": "2026-11-25T20:31:34+00:00",
-   "issue": 55,
-   "from": "pr-review",
-   "to": "done",
-   "by": "ae67d3e8",
-   "note": null
-  },
-  {
-   "at": "2026-11-25T20:31:36+00:00",
-   "issue": 129,
-   "from": "blocked",
-   "to": "ready",
-   "by": "sync",
-   "note": null
-  },
   {
    "at": "2026-11-25T20:31:42+00:00",
    "issue": 129,
@@ -2163,6 +2147,22 @@
    "to": "pr-review",
    "by": "9c692a2a",
    "note": null
+  },
+  {
+   "at": "2026-11-28T03:45:51+00:00",
+   "issue": 45,
+   "from": "pr-review",
+   "to": "done",
+   "by": "909fb540",
+   "note": null
+  },
+  {
+   "at": "2026-11-28T03:45:53+00:00",
+   "issue": 144,
+   "from": "blocked",
+   "to": "ready",
+   "by": "sync",
+   "note": null
   }
  ],
  "open": [
@@ -2184,13 +2184,12 @@
   31,
   32,
   33,
-  45,
   49,
   69,
   144
  ],
  "xopen": [],
- "updated_at": "2026-11-28T02:28:03+00:00",
+ "updated_at": "2026-11-28T03:45:53+00:00",
  "wip_auto": true,
  "pushers": {
   "at": "2026-11-20T12:19:33+00:00",
