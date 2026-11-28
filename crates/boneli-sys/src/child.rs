@@ -913,8 +913,8 @@ fn new_cgroup_namespace(fault: Fault) -> Result<(), Failure> {
     // Linux 5.7 (commit ef2c41cf38a7, which added CLONE_INTO_CGROUP)
     // cgroup_post_fork() re-roots a new cgroup namespace at the target
     // css_set, so CLONE_NEWCGROUP in clone3 would be equivalent on every
-    // kernel above the 5.19 floor; the step is kept as the simpler reading
-    // (ADR-007, D7 and D8).
+    // kernel above the 6.1 floor (ADR-044); the step is kept as the simpler
+    // reading (ADR-007, D7 and D8).
     inject(fault, Step::CgroupNs)?;
     // SAFETY: unshare takes plain flags.
     if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } < 0 {

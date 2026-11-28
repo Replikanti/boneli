@@ -82,7 +82,7 @@ fn index_of(mounts: &[Mount], target: &str) -> u32 {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn pivot_root_hides_host() {
     let fixture = Fixture::new("pivot");
     // A host file outside every layer and bind.
@@ -140,7 +140,7 @@ fn pivot_root_hides_host() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn root_is_read_only() {
     let fixture = Fixture::new("ro-root");
     let p = run_probe_on("writes", ids(0, 0), &[], fixture.root());
@@ -183,7 +183,7 @@ fn set_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn overlay_layers_whiteout_and_opaque() {
     let fixture = Fixture::new("layers");
     let bottom = &fixture.layer;
@@ -236,7 +236,7 @@ fn overlay_layers_whiteout_and_opaque() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn single_layer_root_is_bind() {
     let fixture = Fixture::new("one-layer");
     let p = run_probe_on("mounts", ids(0, 0), &[], fixture.root());
@@ -257,7 +257,7 @@ fn single_layer_root_is_bind() {
 // test for it here.
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn writable_overlay_mount() {
     let fixture = Fixture::new("rw-overlay");
     let lower = fixture.tree().dir("ov/lower");
@@ -297,7 +297,7 @@ fn writable_overlay_mount() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn tmpfs_size_inclusive() {
     const SIZE: u64 = 1_048_576;
     let fixture = Fixture::new("tmpfs-size");
@@ -334,7 +334,7 @@ fn tmpfs_size_inclusive() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn mount_flags() {
     let fixture = Fixture::new("flags");
     let p = run_probe_on("mounts", ids(0, 0), &[], fixture.root());
@@ -357,7 +357,7 @@ fn mount_flags() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn ro_bind_keeps_locked_flags() {
     let host = host_mountinfo();
     let shm_opts: BTreeSet<String> = host
@@ -403,7 +403,7 @@ fn replace_with_symlink(path: &Path, to: &str) {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn mount_target_symlink_rejected() {
     let before = host_mountinfo();
     // A trailing symlink to a host path, a trailing symlink out of the
@@ -450,7 +450,7 @@ fn mount_target_symlink_rejected() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn mount_target_missing() {
     let fixture = Fixture::new("missing-target");
     let mut mounts = fixture.mounts();
@@ -472,7 +472,7 @@ fn mount_target_missing() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn bind_kind_mismatch() {
     let fixture = Fixture::new("kind");
     let file = fixture.tree().path().join("a-file");
@@ -504,7 +504,7 @@ fn bind_kind_mismatch() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn bind_source_symlink_rejected() {
     // Bind sources are host paths resolved without following symlinks, so
     // a swapped component cannot redirect a bind.
@@ -564,7 +564,7 @@ fn listen(tree: &crate::support::rootfs::Tree) -> Listener {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn broker_socket_reachable_through_ro_bind() {
     for inside_id in [0, 999] {
         let fixture = Fixture::new("broker");
@@ -592,7 +592,7 @@ fn broker_socket_reachable_through_ro_bind() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn host_abstract_sockets_unreachable() {
     use std::os::linux::net::SocketAddrExt;
     let name = format!("boneli-sys-test-{}", std::process::id());
@@ -619,7 +619,7 @@ fn host_abstract_sockets_unreachable() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn dev_minimal() {
     let fixture = Fixture::new("dev");
     let p = run_probe_on("dev", ids(0, 0), &[], fixture.root());
@@ -635,7 +635,7 @@ fn dev_minimal() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn program_resolves_inside_the_root() {
     // The program path is resolved after pivot_root: a host path that is
     // not in the root does not exist inside.
@@ -669,7 +669,7 @@ fn program_resolves_inside_the_root() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn overlay_dir_symlink_rejected() {
     // A writable overlay whose upper (then lower, then work) is a symlink
     // to another host directory. A bind source fails ELOOP; the overlay
@@ -716,7 +716,7 @@ fn overlay_dir_symlink_rejected() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn root_layer_symlink_rejected() {
     // A root layer that is a symlink to a host directory outside the layer
     // store (holding a secret). The overlay must not follow it and expose
@@ -771,7 +771,7 @@ fn swap_loop(
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn overlay_upper_swap_race_never_escapes() {
     // `upper` is a real directory; a host thread exchanges it with a
     // symlink to `elsewhere` while sandboxes start. Because the child opens
@@ -824,7 +824,7 @@ fn overlay_upper_swap_race_never_escapes() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn root_layer_swap_race_never_escapes() {
     // The top root layer is exchanged with a symlink to a host directory
     // holding a secret. The child opens each layer without symlinks and
@@ -869,7 +869,7 @@ fn root_layer_swap_race_never_escapes() {
 }
 
 #[test]
-#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 5.19"]
+#[ignore = "host: unprivileged user namespaces, overlayfs, Linux 6.1"]
 fn fd_based_multi_layer_root_mounts() {
     // Three fd-named lower layers stack correctly: the top file wins and a
     // bottom-only file is still visible. Proves the fd-path option form

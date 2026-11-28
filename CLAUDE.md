@@ -124,10 +124,9 @@ machine: `rustup target add` both).
 namespaces (on Ubuntu 23.10+ an AppArmor profile that allows them), a
 cgroup v2 hierarchy mounted with `nsdelegate` whose cgroup the tests run in
 is delegated to the user with the cpu, io, memory and pids controllers,
-Landlock ABI 2 and Linux
-5.19 (ADR-007, D3 and D5). They never need root and never call `sudo`; a
-missing feature fails them with the probe's message instead of skipping
-them. Run them in a delegated scope:
+Landlock ABI 2 and Linux 6.1 (ADR-007 D5, ADR-044). They never need root
+and never call `sudo`; a missing feature fails them with the probe's
+message instead of skipping them. Run them in a delegated scope:
 
 ```sh
 systemd-run --user --scope -q -p Delegate=yes \
@@ -168,9 +167,10 @@ Every sandbox these tests start runs without capabilities, with
 boneli-oci's sandbox runs below. Its errno rows are answered by a
 supervisor thread (`seccomp-notify`) in the test process, which records
 each denied call (ADR-043); the probe id `seccomp-notify` names a host
-whose kernel lacks the wait-killable receive (below 5.19) or whose
-runner already sits under a seccomp filter with a listener. The
-supervisor tests that need a seam (a lost supervisor, a killed caller,
+whose kernel lacks the wait-killable receive (a feature of 5.19) or
+whose runner already sits under a seccomp filter with a listener, and
+`kernel-floor` a kernel whose pids controller has no `pids.peak`, so one
+older than 6.1 (ADR-044). The supervisor tests that need a seam (a lost supervisor, a killed caller,
 signals around the receive) are unit tests in
 `src/seccomp/notify.rs`, which re-run the unit-test binary in the
 sandbox; `notification_cost` prints what a denied call costs with and

@@ -687,7 +687,8 @@ namespaces (D7) leave open, by name:
    `request_module` or by-name crypto allocation added and removed
    between them, or backported, is not in these lists.
    `kernel.modules_disabled=1` after boot is the mitigation that holds on
-   any kernel.
+   any kernel. ADR-044 raises the floor to 6.1 and adds `linux-6.1` to
+   these sweeps.
 6. **Rows a test host cannot observe**: `syslog` (wherever
    `dmesg_restrict` is 1), `shmget-hugetlb` (outside
    `vm.hugetlb_shm_group`), `setsockopt-tls` (where the `tls` ULP is not

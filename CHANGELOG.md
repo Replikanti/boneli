@@ -1170,6 +1170,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The kernel floor is Linux 6.1 (was 5.19), ADR-044, amending ADR-007 D3:
+  `Features::probe` refuses a kernel whose cgroup has the pids
+  controller's `pids.max` but not `pids.peak` (added in 6.1) with the new
+  id `kernel-floor`, and an unreadable or malformed `pids.peak` with
+  `probe-failed`. The feature minimums stay 5.19 (Landlock ABI 2,
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`), and the probe messages say
+  so. ADR-007's sweeps of older kernels gain a `linux-6.1` column; no
+  seccomp row changes. **Breaking:** `boneli_sys::Missing` and
+  `MissingId` have the variant `KernelFloor` (unreleased, pre-1.0).
 - `boneli-sys` seccomp program (part 1 of #45, ADR-043 D2, amending
   ADR-007 D2): every errno row returns at an instruction of its own
   (`Program::row_at`), so the program has 104 instructions instead of 88;

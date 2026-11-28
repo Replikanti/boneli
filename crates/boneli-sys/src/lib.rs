@@ -21,8 +21,9 @@
 //! process may reap with `waitpid(-1)` or ignore `SIGCHLD`. It applies
 //! Landlock to the calling process ([`Ruleset`], ADR-007 D10), and it
 //! checks that a host has what the runtime needs ([`Features::probe`],
-//! ADR-007 D3). For tests that need a process whose main thread has
-//! exited while another thread runs, it can end the main thread alone
+//! ADR-007 D3, the floor Linux 6.1 by ADR-044). For tests that need a
+//! process whose main thread has exited while another thread runs, it
+//! can end the main thread alone
 //! ([`exit_main_thread`], ADR-015 D10). The kernel is reached through `libc` only.
 //!
 //! The crate builds only for little-endian Linux on x86_64 and aarch64:

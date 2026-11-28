@@ -1,8 +1,9 @@
 //! Landlock for the calling process (ADR-007, D10): an in-process API that
 //! the shim (#9) applies to itself as PID 1 before the agent starts.
 //!
-//! ABI 2 is the minimum (Linux 5.19, D3); ABIs above 10, the newest the
-//! 7.2.4 headers describe, are treated as 10, because rights only grow.
+//! ABI 2 is the minimum (it came with Linux 5.19; the floor is 6.1,
+//! ADR-044); ABIs above 10, the newest the 7.2.4 headers describe, are
+//! treated as 10, because rights only grow.
 //! Every request is checked against the ABI: a right the kernel does not
 //! know is an error, never a silent best effort.
 

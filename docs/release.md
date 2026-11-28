@@ -69,9 +69,10 @@ tools/test-release.sh` tests all of the tooling; CI runs it in `check`.
 
 Linux on x86_64 or aarch64 with glibc 2.35 or newer: the binaries are built
 natively on Ubuntu 22.04, and a binary needs at least the glibc of its
-builder. The sandbox runtime needs Linux 5.19 (ADR-007), so the hosts that
-can run it have this glibc in practice (Ubuntu 22.04 has 2.35, Debian 12
-has 2.36). Hosts on an older glibc build from source.
+builder. The sandbox runtime needs Linux 6.1 (ADR-044), so the hosts that
+can run it mostly have this glibc (Ubuntu 22.04 has 2.35, Debian 12
+has 2.36). Hosts on an older glibc build from source; Amazon Linux 2023
+is one of them: its kernel is 6.1 or newer, its glibc 2.34 (ADR-044).
 
 ## Dry run
 
