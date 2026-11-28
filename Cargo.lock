@@ -73,6 +73,7 @@ dependencies = [
  "boneli-app",
  "boneli-domain",
  "boneli-private-dir",
+ "boneli-workspace",
 ]
 
 [[package]]
@@ -181,6 +182,10 @@ dependencies = [
  "boneli-private-dir",
  "boneli-sigstore",
 ]
+
+[[package]]
+name = "boneli-workspace"
+version = "0.0.0"
 
 [[package]]
 name = "cc"

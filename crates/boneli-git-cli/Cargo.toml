@@ -1,6 +1,6 @@
 [package]
 name = "boneli-git-cli"
-description = "Boneli adapter: the Git port over the git binary, with the workspace format the sandbox exchanges (ADR-010)."
+description = "Boneli adapter: the Git port over the git binary, reading and writing the workspace format of boneli-workspace (ADR-010, ADR-042)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# Adapter crate: the domain, the application and one support crate
-# (ADR-010, ADR-024). No external edge; git is a process, not a dependency.
+# Adapter crate: the domain, the application and two support crates
+# (ADR-010, ADR-024, ADR-042). No external edge; git is a process, not a
+# dependency.
 [dependencies]
 # `CitationProblem`, the reason the path rule gives when a workspace path
 # is refused, and `CommitSha`, the base `fetch_base` takes.
@@ -24,3 +25,13 @@ boneli-app.workspace = true
 # resolved parent whose ancestors no one else can rename. A support crate,
 # no external edge.
 boneli-private-dir.workspace = true
+# The workspace format and its writer (ADR-010, D2 and D3), which the
+# sandbox adapter shares, under the tree path rule this crate passes in
+# (ADR-042, D1). A support crate, no external edge.
+boneli-workspace.workspace = true
+
+[dev-dependencies]
+# The same crate with its test seam, `Workspace::insert`, which the unit
+# tests of `patch_between` build small workspaces with. Dev-only, so normal
+# builds never see the feature (resolver 3).
+boneli-workspace = { workspace = true, features = ["test-seam"] }

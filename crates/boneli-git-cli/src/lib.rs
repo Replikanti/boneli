@@ -4,7 +4,8 @@
 //! and this crate reads it on the host as the runner user, who will hold
 //! the git token.
 //!
-//! - [`Workspace`] is the snapshot and workspace format (ADR-010, D2): a
+//! - [`Workspace`] is the snapshot and workspace format (ADR-010, D2) of
+//!   `boneli-workspace` under this crate's [`TreeRule`] (ADR-042, D1): a
 //!   magic line and canonical, length-prefixed entries, each a file, an
 //!   executable or a symlink. [`Workspace::decode`] refuses every
 //!   malformed or non-canonical encoding, bounds the nodes (files,
@@ -15,8 +16,9 @@
 //! - [`materialize`] writes a workspace into a new, empty, private
 //!   directory under the rules of ADR-010, D3: no symlink it created is
 //!   ever followed, modes are explicit, each directory is made once, and
-//!   repository metadata, an entry at or under a gitlink or more nodes
-//!   than the cap is refused.
+//!   an entry at or under a gitlink or more nodes than the cap is refused;
+//!   this crate passes `Metadata::Refuse`, so repository metadata is
+//!   refused too.
 //! - [`GitCli`] implements the port by running git (D4 to D7): every call
 //!   gets a cleared, fixed environment and command-scope config and names
 //!   its repository explicitly, so nothing in a workspace or in the host's
@@ -38,18 +40,24 @@
 mod cli;
 mod credentials;
 mod lookalike;
-mod materialize;
 mod patch;
+mod rule;
 mod run;
-#[cfg(test)]
-mod scratch;
 mod url;
-mod workspace;
 
+pub use boneli_workspace::{
+    DEFAULT_MAX_NODES, DirectoryProblem, EntryProblem, Item, Kind, MAGIC, MaterializeError,
+    Metadata, PathRule, materialize,
+};
 pub use cli::{GitCli, GitCliConfig, OpenError};
 pub use credentials::{Credentials, MAX_AUTHORIZATION};
-pub use materialize::{DirectoryProblem, Item, MaterializeError, materialize};
 pub use patch::patch_between;
+pub use rule::TreeRule;
 pub use run::MIN_GIT_VERSION;
 pub use url::{Transports, UrlProblem};
-pub use workspace::{DEFAULT_MAX_NODES, DecodeError, EntryProblem, Kind, MAGIC, Workspace};
+
+/// A workspace under the tree path rule (ADR-010 D2, ADR-018, ADR-042 D1).
+pub type Workspace = boneli_workspace::Workspace<TreeRule>;
+
+/// Why bytes are not an encoded workspace under the tree path rule.
+pub type DecodeError = boneli_workspace::DecodeError<boneli_app::TreePathProblem>;

@@ -34,7 +34,11 @@ core = ["boneli-domain", "boneli-app"]
 # TUF repository (ADR-033) and GitHub's (ADR-041), on boneli-https,
 # boneli-http, boneli-json, boneli-private-dir and boneli-sigstore; no
 # external crate.
-support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-toml", "boneli-private-dir", "boneli-sigstore", "boneli-tuf"]
+# boneli-workspace holds the workspace format and its writer, moved out of
+# boneli-git-cli so that the sandbox adapter can share them (ADR-042, D1):
+# std only, the path rule comes in from the adapter, so it names no core
+# type and has no edge at all.
+support = ["boneli-sys", "boneli-http", "boneli-https", "boneli-json", "boneli-toml", "boneli-private-dir", "boneli-sigstore", "boneli-tuf", "boneli-workspace"]
 # Composition roots: wire adapters, nothing depends on them.
 # boneli-replay-check is the test-only root of ADR-002: the two-process
 # replay gate for address leaks. As a root it is a leaf, so no production

@@ -43,3 +43,4 @@ boneli-forge-github = { path = "crates/boneli-forge-github" }
 boneli-private-dir = { path = "crates/boneli-private-dir" }
 boneli-sigstore = { path = "crates/boneli-sigstore" }
 boneli-tuf = { path = "crates/boneli-tuf" }
+boneli-workspace = { path = "crates/boneli-workspace" }

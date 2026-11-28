@@ -1105,6 +1105,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   test that bans the names and numbers of the reply flag that lets a
   call run and of descriptor injection in every boneli-sys file. `spawn`
   still installs the plain program; the supervisor lands in part 2.
+- `boneli-workspace` (part 1 of #8, ADR-042 proposed): the workspace
+  format (`Workspace`, `DecodeError`, `Kind`, `MAGIC`, `DEFAULT_MAX_NODES`)
+  and `materialize`, moved out of `boneli-git-cli` with their unit tests
+  into a std-only support crate the sandbox adapter can share. The path
+  rule comes in as a `PathRule` type, entries are ordered by their bytes,
+  and `materialize` takes a `Metadata` mode: `Refuse`, which the git
+  adapter passes (the behavior before the move), or `Carry`, which writes
+  repository metadata like any other entry for the sandbox's snapshot.
+  `boneli-git-cli` passes `TreeRule` (`TreePath::parse` and
+  `TreePath::is_repository_metadata`, pinned by a test) and re-exports the
+  moved types. No external crate or dependency edge.
 
 ### Changed
 
